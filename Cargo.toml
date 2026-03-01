@@ -1,0 +1,38 @@
+[workspace]
+members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard"]
+resolver = "2"
+
+[package]
+name = "tonepoet"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Standalone CLI + TUI audio conversion toolkit"
+
+[dependencies]
+tonepoet-backend = { path = "crates/tonepoet-backend" }
+tonepoet-features = { path = "crates/tonepoet-features" }
+tonepoet-wizard = { path = "crates/tonepoet-wizard" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.18", features = ["v4"] }
+lofty = "0.21"
+log = "0.4"
+env_logger = "0.10"
+anyhow = "1"
+thiserror = "1"
+dirs = "5"
+regex = "1"
+lazy_static = "1"
+html-escape = "0.2"
+metaflac = "0.2"
+num_cpus = "1"
+walkdir = "2"
+tempfile = "3"
+indicatif = "0.17"
+ratatui = "0.26"
+crossterm = "0.27"

@@ -1,0 +1,363 @@
+//! Audio format detection and conversion options
+
+use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
+use crate::convert::simple_wizard::{ReplayGainMode, DitherType, NyquistTransition};
+
+/// Supported file formats (archives and audio)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FileFormat {
+    /// 7-Zip archive (may contain audio files)
+    SevenZip,
+    /// Audio formats
+    Audio(AudioFormat),
+}
+
+/// Supported audio formats
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AudioFormat {
+    /// Free Lossless Audio Codec
+    Flac,
+    /// Waveform Audio File Format
+    Wav,
+    /// Audio Interchange File Format
+    Aiff,
+    /// WavPack lossless compression
+    WavPack,
+    /// MPEG-1/2 Audio Layer III
+    Mp3,
+    /// Advanced Audio Coding
+    Aac,
+    /// Opus Interactive Audio Codec
+    Opus,
+}
+
+impl AudioFormat {
+    /// Get the file extension for this format
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::Flac => "flac",
+            Self::Wav => "wav",
+            Self::Aiff => "aiff",
+            Self::WavPack => "wv",
+            Self::Mp3 => "mp3",
+            Self::Aac => "m4a",
+            Self::Opus => "opus",
+        }
+    }
+    
+    /// Get a human-readable name
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Flac => "FLAC",
+            Self::Wav => "WAV",
+            Self::Aiff => "AIFF",
+            Self::WavPack => "WavPack",
+            Self::Mp3 => "MP3",
+            Self::Aac => "AAC",
+            Self::Opus => "Opus",
+        }
+    }
+    
+    /// Check if this is a lossless format
+    pub fn is_lossless(&self) -> bool {
+        matches!(self, Self::Flac | Self::Wav | Self::Aiff | Self::WavPack)
+    }
+    
+    /// Get all supported formats
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Flac,
+            Self::Wav,
+            Self::Aiff,
+            Self::WavPack,
+            Self::Mp3,
+            Self::Aac,
+            Self::Opus,
+        ]
+    }
+}
+
+impl std::fmt::Display for AudioFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Options for audio conversion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversionOptions {
+    /// Target output format
+    pub output_format: AudioFormat,
+    
+    /// Quality settings
+    pub quality: QualitySettings,
+    
+    /// Whether to preserve metadata
+    pub preserve_metadata: bool,
+    
+    /// Whether to calculate ReplayGain
+    pub calculate_replaygain: bool,
+
+    /// ReplayGain mode (Track, Album, or Both)
+    pub replaygain_mode: Option<ReplayGainMode>,
+
+    /// Output naming template
+    pub naming_template: Option<String>,
+    
+    /// Whether to overwrite existing files
+    pub overwrite: bool,
+    
+    /// Output directory for converted files
+    pub output_dir: Option<PathBuf>,
+    
+    /// Resampling quality (0-4: LQ, MQ, HQ, VHQ, Ultra)
+    pub resample_quality: Option<u8>,
+
+    /// Nyquist filter transition for resampling (Gentle, Steep, BrickWall)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nyquist_transition: Option<NyquistTransition>,
+
+    /// Dither type for bit depth reduction
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dither_type: Option<DitherType>,
+
+    /// Target sample rate for resampling (applies to all formats)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_sample_rate: Option<u32>,
+
+    /// Target bit depth for conversion (applies to all formats)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bit_depth: Option<u32>,
+
+    /// Copy auxiliary files (txt, cue, log, etc.) - defaults to true
+    pub copy_auxiliary_files: bool,
+    
+    /// Copy subdirectories from source - defaults to true
+    pub copy_subdirectories: bool,
+
+    /// Force FLAC re-encoding instead of copying - defaults to false
+    pub reencode_flac: bool,
+
+    /// Merge all tracks into single file - defaults to false
+    pub merge_to_single: bool,
+
+    /// Preferred conversion backend (FFmpeg or Sox)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_backend: Option<tonepoet_backend::Backend>,
+
+    /// Original preset settings (for comprehensive logging)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_settings: Option<Box<tonepoet_backend::types::ConversionSettings>>,
+
+    /// Enable SSRC Insane mode (requires BrickWall nyquist transition)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssrc_insane_mode: Option<bool>,
+
+    /// Append content from Lineage.txt to COMMENT tag
+    pub append_lineage_to_comment: bool,
+
+    /// Whether to write a conversion log file
+    #[serde(default)]
+    pub write_log_file: bool,
+
+    /// Whether to generate CUE files
+    #[serde(default)]
+    pub generate_cue_files: bool,
+
+    /// CUE generation mode: "Always" or "IfMerging"
+    #[serde(default = "default_cue_generation_mode")]
+    pub cue_generation_mode: String,
+}
+
+impl Default for ConversionOptions {
+    fn default() -> Self {
+        Self {
+            output_format: AudioFormat::Flac,
+            quality: QualitySettings::default(),
+            preserve_metadata: true,
+            calculate_replaygain: false,
+            replaygain_mode: None,
+            naming_template: None,
+            overwrite: false,
+            output_dir: None,
+            resample_quality: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            copy_auxiliary_files: true,  // Match wizard default
+            copy_subdirectories: true,   // Match wizard default
+            reencode_flac: false,  // Match wizard default (don't re-encode, copy is default)
+            merge_to_single: false,
+            preferred_backend: None,
+            original_settings: None,
+            ssrc_insane_mode: None,
+            append_lineage_to_comment: false,  // Default to off
+            write_log_file: false,
+            generate_cue_files: false,
+            cue_generation_mode: "IfMerging".to_string(),
+        }
+    }
+}
+
+/// Quality settings for different formats
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum QualitySettings {
+    /// FLAC compression level (0-8, where 8 is best compression)
+    Flac { compression_level: u8 },
+    
+    /// WAV settings
+    Wav { bit_depth: u16, sample_rate: u32 },
+
+    /// AIFF settings
+    Aiff { bit_depth: u16, sample_rate: u32 },
+    
+    /// WavPack settings
+    WavPack { 
+        compression_mode: WavPackMode,
+        hybrid_mode: bool,
+        correction_file: bool,
+    },
+    
+    /// MP3 settings
+    Mp3 { 
+        bitrate_mode: Mp3BitrateMode,
+        quality: u8, // 0-9, where 0 is best
+    },
+    
+    /// AAC settings
+    Aac {
+        bitrate: u32, // kbps
+        profile: AacProfile,
+    },
+    
+    /// Opus settings
+    Opus {
+        bitrate: u32, // 6-510 kbps
+        complexity: u8, // 0-10
+    },
+}
+
+impl Default for QualitySettings {
+    fn default() -> Self {
+        Self::Flac { compression_level: 5 }
+    }
+}
+
+/// WavPack compression modes
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum WavPackMode {
+    Fast,
+    Normal,
+    High,
+    VeryHigh,
+}
+
+/// MP3 bitrate modes
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Mp3BitrateMode {
+    /// Constant bitrate
+    Cbr { bitrate: u32 },
+    /// Variable bitrate
+    Vbr { quality: u8 },
+    /// Average bitrate
+    Abr { bitrate: u32 },
+}
+
+/// AAC profiles
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum AacProfile {
+    /// Low Complexity
+    Lc,
+    /// High Efficiency
+    He,
+    /// High Efficiency v2
+    HeV2,
+}
+
+/// Format detector
+pub struct FormatDetector;
+
+impl FormatDetector {
+    /// Detect file format from file path (archive or audio)
+    pub fn detect(path: &Path) -> Result<FileFormat, super::ConversionError> {
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_lowercase())
+            .ok_or_else(|| {
+                super::ConversionError::UnsupportedFormat(
+                    format!("No file extension found for: {}", path.display())
+                )
+            })?;
+        
+        match extension.as_str() {
+            "7z" => Ok(FileFormat::SevenZip),
+            "flac" => Ok(FileFormat::Audio(AudioFormat::Flac)),
+            "wav" | "wave" => Ok(FileFormat::Audio(AudioFormat::Wav)),
+            "aiff" | "aif" | "aifc" => Ok(FileFormat::Audio(AudioFormat::Aiff)),
+            "wv" => Ok(FileFormat::Audio(AudioFormat::WavPack)),
+            "mp3" => Ok(FileFormat::Audio(AudioFormat::Mp3)),
+            "m4a" | "aac" | "mp4" => Ok(FileFormat::Audio(AudioFormat::Aac)),
+            "opus" => Ok(FileFormat::Audio(AudioFormat::Opus)),
+            _ => Err(super::ConversionError::UnsupportedFormat(
+                format!("Unsupported format: .{}", extension)
+            )),
+        }
+    }
+    
+    /// Detect audio format specifically
+    pub fn detect_audio(path: &Path) -> Result<AudioFormat, super::ConversionError> {
+        match Self::detect(path)? {
+            FileFormat::Audio(format) => Ok(format),
+            FileFormat::SevenZip => Err(super::ConversionError::UnsupportedFormat(
+                "Expected audio file, found archive".to_string()
+            )),
+        }
+    }
+    
+    /// Check if a file is a supported format
+    pub fn is_supported(path: &Path) -> bool {
+        Self::detect(path).is_ok()
+    }
+}
+
+/// Get default quality settings for a format
+impl AudioFormat {
+    pub fn default_quality(&self) -> QualitySettings {
+        match self {
+            AudioFormat::Flac => QualitySettings::Flac { compression_level: 5 },
+            AudioFormat::Wav => QualitySettings::Wav { 
+                bit_depth: 16, 
+                sample_rate: 44100 
+            },
+            AudioFormat::Aiff => QualitySettings::Aiff { 
+                bit_depth: 16, 
+                sample_rate: 44100 
+            },
+            AudioFormat::WavPack => QualitySettings::WavPack {
+                compression_mode: WavPackMode::Normal,
+                hybrid_mode: false,
+                correction_file: false,
+            },
+            AudioFormat::Mp3 => QualitySettings::Mp3 {
+                bitrate_mode: Mp3BitrateMode::Vbr { quality: 2 },
+                quality: 2,
+            },
+            AudioFormat::Aac => QualitySettings::Aac {
+                bitrate: 256,
+                profile: AacProfile::Lc,
+            },
+            AudioFormat::Opus => QualitySettings::Opus {
+                bitrate: 128,
+                complexity: 10,
+            },
+        }
+    }
+}
+
+/// Default CUE generation mode for backward compatibility
+fn default_cue_generation_mode() -> String {
+    "IfMerging".to_string()
+}
