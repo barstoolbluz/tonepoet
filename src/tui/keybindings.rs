@@ -10,7 +10,13 @@ use super::message::AppMessage;
 
 /// Handle a key event, dispatching to the appropriate screen handler
 pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
-    // Handle overlay inputs first
+    // Handle preset overlay first (uses its own flag, not ActiveOverlay)
+    if app.preset.overlay_open {
+        handle_preset_overlay_key(app, key);
+        return;
+    }
+
+    // Handle other overlay inputs
     if !matches!(app.active_overlay, ActiveOverlay::None) {
         handle_overlay_key(app, key, tx);
         return;
@@ -117,6 +123,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             if was_format {
                 app.convert.format.apply_format_constraints();
             }
+            app.preset.mark_modified();
         }
         (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
             let was_format = app.convert.format.field_focus == FormatField::Format;
@@ -124,6 +131,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             if was_format {
                 app.convert.format.apply_format_constraints();
             }
+            app.preset.mark_modified();
         }
 
         // Within Output Options pane: Up/Down moves between fields
@@ -138,10 +146,12 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions
             && app.convert.output_options.field_focus == OutputOptionsField::MergeMode => {
             app.convert.output_options.merge.select_prev();
+            app.preset.mark_modified();
         }
         (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions
             && app.convert.output_options.field_focus == OutputOptionsField::MergeMode => {
             app.convert.output_options.merge.select_next();
+            app.preset.mark_modified();
         }
 
         // Edit source file path
@@ -194,11 +204,185 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             super::convert_actions::convert_or_queue(app, tx, false);
         }
 
-        // Presets (stub)
+        // Open presets overlay
         (KeyCode::Char('p'), KeyModifiers::NONE) => {
-            app.preset.overlay_open = !app.preset.overlay_open;
+            app.preset.overlay_list = super::presets::list_presets();
+            app.preset.overlay_selected = 0;
+            app.preset.naming_input = None;
+            app.preset.overlay_open = true;
         }
 
+        // Save preset
+        (KeyCode::Char('s'), KeyModifiers::NONE) => {
+            if let Some(name) = &app.preset.active_preset.clone() {
+                let preset = super::presets::TuiPreset::from_pill_state(
+                    name,
+                    &app.convert.format,
+                    &app.convert.output_options,
+                );
+                match super::presets::save_preset(&preset) {
+                    Ok(_) => {
+                        app.preset.modified = false;
+                        app.set_status(format!("Saved preset: {}", name));
+                    }
+                    Err(e) => app.set_status(format!("Save failed: {}", e)),
+                }
+            } else {
+                // No active preset — open overlay in naming mode
+                app.preset.overlay_list = super::presets::list_presets();
+                app.preset.overlay_selected = 0;
+                app.preset.naming_input = Some((String::new(), 0));
+                app.preset.overlay_open = true;
+            }
+        }
+
+        _ => {}
+    }
+}
+
+// ── Preset overlay keybindings ────────────────────────────────────────
+
+fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
+    // If in naming mode, handle text input
+    if let Some((ref mut input, ref mut cursor_pos)) = app.preset.naming_input {
+        match key.code {
+            KeyCode::Enter => {
+                let name = input.trim().to_string();
+                if name.is_empty() {
+                    app.preset.naming_input = None;
+                    return;
+                }
+                let preset = super::presets::TuiPreset::from_pill_state(
+                    &name,
+                    &app.convert.format,
+                    &app.convert.output_options,
+                );
+                match super::presets::save_preset(&preset) {
+                    Ok(_) => {
+                        app.preset.active_preset = Some(name.clone());
+                        app.preset.modified = false;
+                        app.preset.naming_input = None;
+                        app.preset.overlay_open = false;
+                        app.set_status(format!("Saved preset: {}", name));
+                    }
+                    Err(e) => {
+                        app.preset.naming_input = None;
+                        app.set_status(format!("Save failed: {}", e));
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                app.preset.naming_input = None;
+            }
+            KeyCode::Char(c) => {
+                input.insert(*cursor_pos, c);
+                *cursor_pos += 1;
+            }
+            KeyCode::Backspace => {
+                if *cursor_pos > 0 {
+                    *cursor_pos -= 1;
+                    input.remove(*cursor_pos);
+                }
+            }
+            KeyCode::Left => {
+                *cursor_pos = cursor_pos.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                if *cursor_pos < input.len() {
+                    *cursor_pos += 1;
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Normal overlay navigation
+    match key.code {
+        KeyCode::Esc => {
+            app.preset.overlay_open = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.preset.overlay_selected > 0 {
+                app.preset.overlay_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.preset.overlay_selected + 1 < app.preset.overlay_list.len() {
+                app.preset.overlay_selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            // Load selected preset
+            if let Some(name) = app.preset.overlay_list.get(app.preset.overlay_selected).cloned() {
+                match super::presets::load_preset(&name) {
+                    Ok(preset) => {
+                        preset.apply_to_pills(
+                            &mut app.convert.format,
+                            &mut app.convert.output_options,
+                        );
+                        app.preset.active_preset = Some(name.clone());
+                        app.preset.modified = false;
+                        app.preset.overlay_open = false;
+                        app.set_status(format!("Loaded preset: {}", name));
+                    }
+                    Err(e) => {
+                        app.set_status(format!("Load failed: {}", e));
+                    }
+                }
+            }
+        }
+        KeyCode::Char('n') => {
+            // Save as new preset
+            app.preset.naming_input = Some((String::new(), 0));
+        }
+        KeyCode::Char('d') => {
+            // Duplicate selected preset
+            if let Some(name) = app.preset.overlay_list.get(app.preset.overlay_selected).cloned() {
+                match super::presets::load_preset(&name) {
+                    Ok(mut preset) => {
+                        let base = format!("{}-copy", name);
+                        let new_name = super::presets::find_unique_preset_name(
+                            &base,
+                            &app.preset.overlay_list,
+                        );
+                        preset.name = new_name;
+                        match super::presets::save_preset(&preset) {
+                            Ok(_) => {
+                                let saved_name = preset.name.clone();
+                                app.preset.overlay_list = super::presets::list_presets();
+                                app.set_status(format!("Duplicated: {} → {}", name, saved_name));
+                            }
+                            Err(e) => app.set_status(format!("Duplicate failed: {}", e)),
+                        }
+                    }
+                    Err(e) => app.set_status(format!("Load failed: {}", e)),
+                }
+            }
+        }
+        KeyCode::Char('x') => {
+            // Delete selected preset
+            if let Some(name) = app.preset.overlay_list.get(app.preset.overlay_selected).cloned() {
+                match super::presets::delete_preset(&name) {
+                    Ok(_) => {
+                        // If we deleted the active preset, clear it
+                        if app.preset.active_preset.as_deref() == Some(&name) {
+                            app.preset.active_preset = None;
+                            app.preset.modified = false;
+                        }
+                        app.preset.overlay_list = super::presets::list_presets();
+                        // Clamp selection
+                        if app.preset.overlay_selected >= app.preset.overlay_list.len()
+                            && !app.preset.overlay_list.is_empty()
+                        {
+                            app.preset.overlay_selected = app.preset.overlay_list.len() - 1;
+                        }
+                        app.set_status(format!("Deleted preset: {}", name));
+                    }
+                    Err(e) => app.set_status(format!("Delete failed: {}", e)),
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -757,6 +941,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 {
                     app.convert.format.format.selected = i;
                     app.convert.format.apply_format_constraints();
+                    app.preset.mark_modified();
                 }
             }
             TuiButton::RatePill(i) => {
@@ -766,6 +951,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     && app.convert.format.sample_rate.options[i].enabled
                 {
                     app.convert.format.sample_rate.selected = i;
+                    app.preset.mark_modified();
                 }
             }
             TuiButton::DepthPill(i) => {
@@ -775,6 +961,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     && app.convert.format.bit_depth.options[i].enabled
                 {
                     app.convert.format.bit_depth.selected = i;
+                    app.preset.mark_modified();
                 }
             }
             TuiButton::DitherPill(i) => {
@@ -784,6 +971,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     && app.convert.format.dither.options[i].enabled
                 {
                     app.convert.format.dither.selected = i;
+                    app.preset.mark_modified();
                 }
             }
             TuiButton::ReplayGainPill(i) => {
@@ -793,6 +981,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     && app.convert.format.replaygain.options[i].enabled
                 {
                     app.convert.format.replaygain.selected = i;
+                    app.preset.mark_modified();
                 }
             }
             TuiButton::MergePill(i) => {
@@ -802,6 +991,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     && app.convert.output_options.merge.options[i].enabled
                 {
                     app.convert.output_options.merge.selected = i;
+                    app.preset.mark_modified();
                 }
             }
 

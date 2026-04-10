@@ -85,17 +85,27 @@ pub fn execute_command(
             app.should_quit = true;
         }
         Command::Write => {
-            if let Some(name) = &app.preset.active_preset {
-                app.set_status(format!("Saved preset: {}", name));
-                // TODO: actual preset save
+            if let Some(name) = &app.preset.active_preset.clone() {
+                let preset = super::presets::TuiPreset::from_pill_state(
+                    name, &app.convert.format, &app.convert.output_options,
+                );
+                match super::presets::save_preset(&preset) {
+                    Ok(_) => {
+                        app.preset.modified = false;
+                        app.set_status(format!("Saved preset: {}", name));
+                    }
+                    Err(e) => app.set_status(format!("Save failed: {}", e)),
+                }
             } else {
                 app.set_status("No active preset. Use :saveas <name>");
             }
         }
         Command::WriteQuit => {
-            if app.preset.active_preset.is_some() {
-                app.set_status("Saved preset");
-                // TODO: actual preset save
+            if let Some(name) = &app.preset.active_preset.clone() {
+                let preset = super::presets::TuiPreset::from_pill_state(
+                    name, &app.convert.format, &app.convert.output_options,
+                );
+                super::presets::save_preset(&preset).ok();
             }
             app.should_quit = true;
         }
@@ -172,21 +182,44 @@ pub fn execute_command(
             if name.is_empty() {
                 app.set_status("Usage: :preset <name>");
             } else {
-                app.set_status(format!("Preset loading not yet implemented: {}", name));
-                // TODO: load preset
+                match super::presets::load_preset(&name) {
+                    Ok(preset) => {
+                        preset.apply_to_pills(
+                            &mut app.convert.format,
+                            &mut app.convert.output_options,
+                        );
+                        app.preset.active_preset = Some(name.clone());
+                        app.preset.modified = false;
+                        app.set_status(format!("Loaded preset: {}", name));
+                    }
+                    Err(e) => app.set_status(format!("Load failed: {}", e)),
+                }
             }
         }
         Command::SaveAs(name) => {
             if name.is_empty() {
                 app.set_status("Usage: :saveas <name>");
             } else {
-                app.set_status(format!("Preset save not yet implemented: {}", name));
-                // TODO: save preset
+                let preset = super::presets::TuiPreset::from_pill_state(
+                    &name, &app.convert.format, &app.convert.output_options,
+                );
+                match super::presets::save_preset(&preset) {
+                    Ok(_) => {
+                        app.preset.active_preset = Some(name.clone());
+                        app.preset.modified = false;
+                        app.set_status(format!("Saved preset: {}", name));
+                    }
+                    Err(e) => app.set_status(format!("Save failed: {}", e)),
+                }
             }
         }
         Command::Presets => {
-            app.set_status("Preset listing not yet implemented");
-            // TODO: list presets
+            let names = super::presets::list_presets();
+            if names.is_empty() {
+                app.set_status("No presets saved. Use :saveas <name>");
+            } else {
+                app.set_status(format!("Presets: {}", names.join(", ")));
+            }
         }
         Command::Set(key, value) => {
             execute_set(app, &key, &value);
@@ -271,13 +304,13 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             if let Some(f) = fmt {
                 app.convert.format.format.select_value(&f);
                 app.convert.format.apply_format_constraints();
+                app.preset.mark_modified();
                 app.set_status(format!("format = {}", f.name()));
             } else {
                 app.set_status(format!("Unknown format: {}. Try: flac, opus, aac, mp3, alac, wav, wavpack, aiff", value));
             }
         }
         "r" | "rate" => {
-            // Accept values like "44.1", "48", "48000", "44100"
             let rate: Option<u32> = match value {
                 "44.1" | "44100" => Some(44_100),
                 "48" | "48000" => Some(48_000),
@@ -293,6 +326,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             };
             if let Some(r) = rate {
                 app.convert.format.sample_rate.select_value(&r);
+                app.preset.mark_modified();
                 app.set_status(format!("rate = {} kHz", value));
             } else {
                 app.set_status(format!("Unknown rate: {}. Try: 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, 768", value));
@@ -309,6 +343,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             };
             if let Some(d) = depth {
                 app.convert.format.bit_depth.select_value(&d);
+                app.preset.mark_modified();
                 app.set_status(format!("depth = {}", value));
             } else {
                 app.set_status(format!("Unknown depth: {}. Try: 16, 24, 32, 32f, 64f", value));
@@ -323,6 +358,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             };
             if let Some(d) = dt {
                 app.convert.format.dither.select_value(&d);
+                app.preset.mark_modified();
                 app.set_status(format!("dither = {}", value));
             } else {
                 app.set_status(format!("Unknown dither: {}. Try: tpdf, none, shaped", value));
@@ -338,6 +374,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             };
             if let Some(r) = rg {
                 app.convert.format.replaygain.select_value(&r);
+                app.preset.mark_modified();
                 app.set_status(format!("replaygain = {}", value));
             } else {
                 app.set_status(format!("Unknown rg mode: {}. Try: album, track, both, off", value));

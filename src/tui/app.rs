@@ -487,6 +487,19 @@ pub struct PresetState {
     pub overlay_open: bool,
     pub overlay_list: Vec<String>,
     pub overlay_selected: usize,
+    /// Text input for "save as new" within the overlay
+    pub naming_input: Option<(String, usize)>, // (text, cursor_pos)
+}
+
+impl PresetState {
+    /// Mark the preset as modified, but only if a preset is actually active.
+    /// Changes without an active preset don't need tracking — there's nothing
+    /// to compare against.
+    pub fn mark_modified(&mut self) {
+        if self.active_preset.is_some() {
+            self.modified = true;
+        }
+    }
 }
 
 impl Default for PresetState {
@@ -497,6 +510,7 @@ impl Default for PresetState {
             overlay_open: false,
             overlay_list: Vec::new(),
             overlay_selected: 0,
+            naming_input: None,
         }
     }
 }

@@ -37,6 +37,11 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             draw_command_input(f, &input, cursor_pos);
         }
     }
+
+    // Preset overlay (independent of ActiveOverlay — uses its own flag)
+    if app.preset.overlay_open {
+        super::presets_overlay::draw_presets_overlay(f, &app.preset);
+    }
 }
 
 /// Center a rect within a parent area

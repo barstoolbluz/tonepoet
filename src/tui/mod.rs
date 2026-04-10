@@ -20,5 +20,7 @@ pub mod event_loop;
 pub mod keybindings;
 pub mod message;
 pub mod pill;
+pub mod presets;
+pub mod presets_overlay;
 pub mod probe;
 pub mod theme;
