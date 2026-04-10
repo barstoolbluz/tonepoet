@@ -116,15 +116,15 @@ pub fn render_pill_spans<T: Clone>(
 
         let label = format!(" {} ", opt.label);
 
-        let style = if i == state.selected {
-            // Active/selected pill
+        let style = if !opt.enabled {
+            // Disabled — always dimmed, even if selected
+            Style::default().fg(theme::BORDER_DIM)
+        } else if i == state.selected {
+            // Active/selected pill (and enabled)
             Style::default()
                 .fg(theme::PILL_ACTIVE_FG)
                 .bg(theme::PILL_ACTIVE_BG)
                 .add_modifier(ratatui::style::Modifier::BOLD)
-        } else if !opt.enabled {
-            // Disabled pill
-            Style::default().fg(theme::BORDER_DIM)
         } else if row_focused {
             // Available pill in focused row — brighter to show navigable
             Style::default().fg(theme::TEXT_MUTED)

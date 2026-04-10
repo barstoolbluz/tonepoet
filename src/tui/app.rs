@@ -259,15 +259,13 @@ impl FormatState {
             (768_000, "768"),
         ]);
 
-        let mut bit_depth = PillState::new(vec![
+        let bit_depth = PillState::new(vec![
             (BitDepthChoice::Int16, "16"),
             (BitDepthChoice::Int24, "24"),
             (BitDepthChoice::Int32, "32"),
             (BitDepthChoice::Float32, "32f"),
             (BitDepthChoice::Float64, "64f"),
         ]);
-        // Float64 not yet supported by backend
-        bit_depth.set_enabled(&BitDepthChoice::Float64, false);
 
         let dither = PillState::new(vec![
             (DitherType::TPDF, "TPDF"),
@@ -282,7 +280,7 @@ impl FormatState {
             (ReplayGainChoice::Off, "off"),
         ]);
 
-        Self {
+        let mut state = Self {
             format,
             sample_rate,
             bit_depth,
@@ -290,7 +288,9 @@ impl FormatState {
             replaygain,
             field_focus: FormatField::Format,
             advanced_open: false,
-        }
+        };
+        state.apply_format_constraints();
+        state
     }
 
     /// Recalculate which options are enabled based on the selected format.
@@ -347,6 +347,9 @@ impl FormatState {
                 // WAV and WavPack: support all depths including float
             }
         }
+
+        // Always disabled — backend doesn't support 64-bit float yet
+        self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
 
         self.clamp_disabled_selections();
     }
