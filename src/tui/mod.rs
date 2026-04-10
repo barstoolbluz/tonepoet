@@ -3,6 +3,7 @@
 pub mod app;
 pub mod button_map;
 pub mod command;
+pub mod convert_actions;
 pub mod convert_screen;
 pub mod draw;
 pub mod draw_footer;

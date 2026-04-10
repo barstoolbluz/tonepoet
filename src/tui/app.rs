@@ -121,6 +121,17 @@ impl BitDepthChoice {
         }
     }
 
+    /// Map to the backend's bit depth convention (320 = float32)
+    pub fn to_backend_depth(&self) -> u32 {
+        match self {
+            Self::Int16 => 16,
+            Self::Int24 => 24,
+            Self::Int32 => 32,
+            Self::Float32 => 320,
+            Self::Float64 => 640, // not yet supported by backend
+        }
+    }
+
     pub fn is_float(&self) -> bool {
         matches!(self, Self::Float32 | Self::Float64)
     }
@@ -248,13 +259,15 @@ impl FormatState {
             (768_000, "768"),
         ]);
 
-        let bit_depth = PillState::new(vec![
+        let mut bit_depth = PillState::new(vec![
             (BitDepthChoice::Int16, "16"),
             (BitDepthChoice::Int24, "24"),
             (BitDepthChoice::Int32, "32"),
             (BitDepthChoice::Float32, "32f"),
             (BitDepthChoice::Float64, "64f"),
         ]);
+        // Float64 not yet supported by backend
+        bit_depth.set_enabled(&BitDepthChoice::Float64, false);
 
         let dither = PillState::new(vec![
             (DitherType::TPDF, "TPDF"),

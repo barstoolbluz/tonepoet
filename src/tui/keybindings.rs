@@ -92,7 +92,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
 
 // ── Convert screen keybindings ───────────────────────────────────────
 
-fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     match (key.code, key.modifiers) {
         // Tab between panes
         (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -182,6 +182,16 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
                     app.convert.output_options.advanced_open = !app.convert.output_options.advanced_open;
                 }
             }
+        }
+
+        // Start conversion (Enter when not editing source)
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            super::convert_actions::convert_or_queue(app, tx, true);
+        }
+
+        // Add to queue without starting (+ key)
+        (KeyCode::Char('+'), _) => {
+            super::convert_actions::convert_or_queue(app, tx, false);
         }
 
         // Presets (stub)
@@ -407,7 +417,7 @@ fn handle_wizard_key(app: &mut AppState, key: KeyEvent) {
 
 // ── Overlay keybindings ──────────────────────────────────────────────
 
-fn handle_overlay_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     let overlay = app.active_overlay.clone();
     match overlay {
         ActiveOverlay::Confirmation { action, .. } => {
@@ -480,7 +490,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
                     app.active_overlay = ActiveOverlay::None;
                     if !input.trim().is_empty() {
                         let cmd = super::command::parse_command(&input);
-                        super::command::execute_command(app, cmd, _tx);
+                        super::command::execute_command(app, cmd, tx);
                     }
                     return;
                 }
@@ -644,55 +654,21 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
 }
 
 fn start_conversion(app: &mut AppState, tx: mpsc::Sender<AppMessage>) {
-    let ready_count = app.items_snapshot.iter()
-        .filter(|i| matches!(i.status, ConversionStatus::Queued))
+    // Check for not-configured items (queue-screen-specific message)
+    let not_configured = app.items_snapshot.iter()
+        .filter(|i| matches!(i.status, ConversionStatus::NotConfigured))
         .count();
-
-    if ready_count == 0 {
-        let not_configured = app.items_snapshot.iter()
-            .filter(|i| matches!(i.status, ConversionStatus::NotConfigured))
+    if not_configured > 0 {
+        let queued = app.items_snapshot.iter()
+            .filter(|i| matches!(i.status, ConversionStatus::Queued))
             .count();
-        if not_configured > 0 {
+        if queued == 0 {
             app.set_status("Items not configured. Press 'c' to configure first.");
-        } else {
-            app.set_status("No items ready for conversion");
+            return;
         }
-        return;
     }
 
-    app.processing_active = true;
-    app.manager.clear_stop_request();
-    app.set_status(format!("Starting conversion of {} items...", ready_count));
-
-    let queue = app.manager.queue.clone();
-    let processor_config = crate::convert::ProcessorConfig {
-        worker_count: app.config.conversion.worker_count,
-        tool_paths: std::collections::HashMap::new(),
-        default_destination_directory: app.config.conversion.default_destination.clone(),
-        scratch_directory: app.config.conversion.scratch_directory.clone(),
-    };
-
-    tokio::spawn(async move {
-        let mut processor = crate::convert::ConversionProcessor::new(processor_config);
-
-        if let Err(e) = processor.process_queue_with_progress(queue.clone(), None).await {
-            let _ = tx.send(AppMessage::ConversionError {
-                message: format!("Conversion error: {}", e),
-            }).await;
-        }
-
-        if let Ok(q) = queue.try_read() {
-            let completed = q.all_items().iter()
-                .filter(|i| matches!(i.status, ConversionStatus::Completed { .. }))
-                .count();
-            let failed = q.all_items().iter()
-                .filter(|i| matches!(i.status, ConversionStatus::Failed { .. }))
-                .count();
-            let _ = tx.send(AppMessage::ConversionComplete { completed, failed }).await;
-        } else {
-            let _ = tx.send(AppMessage::ConversionComplete { completed: 0, failed: 0 }).await;
-        }
-    });
+    super::convert_actions::start_processing(app, &tx);
 }
 
 fn retry_failed(app: &mut AppState) {

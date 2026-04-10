@@ -320,7 +320,8 @@ impl FormatDetector {
             "aiff" | "aif" | "aifc" => Ok(FileFormat::Audio(AudioFormat::Aiff)),
             "wv" => Ok(FileFormat::Audio(AudioFormat::WavPack)),
             "mp3" => Ok(FileFormat::Audio(AudioFormat::Mp3)),
-            "m4a" | "aac" | "mp4" => Ok(FileFormat::Audio(AudioFormat::Aac)),
+            "m4a" | "mp4" => Ok(FileFormat::Audio(Self::detect_m4a_codec(path))),
+            "aac" => Ok(FileFormat::Audio(AudioFormat::Aac)),
             "opus" => Ok(FileFormat::Audio(AudioFormat::Opus)),
             _ => Err(super::ConversionError::UnsupportedFormat(
                 format!("Unsupported format: .{}", extension)
@@ -328,6 +329,30 @@ impl FormatDetector {
         }
     }
     
+    /// Distinguish ALAC from AAC in .m4a/.mp4 containers using ffmpeg-next
+    fn detect_m4a_codec(path: &Path) -> AudioFormat {
+        // Ensure ffmpeg is initialized
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| { ffmpeg_next::init().ok(); });
+
+        // Try in-process ffmpeg probe to check the actual codec
+        if let Ok(ctx) = ffmpeg_next::format::input(&path) {
+            if let Some(stream) = ctx.streams().best(ffmpeg_next::media::Type::Audio) {
+                if let Ok(codec_ctx) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+                    if let Ok(audio) = codec_ctx.decoder().audio() {
+                        if let Some(codec) = audio.codec() {
+                            if codec.name() == "alac" {
+                                return AudioFormat::Alac;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Default to AAC if probe fails or codec isn't ALAC
+        AudioFormat::Aac
+    }
+
     /// Detect audio format specifically
     pub fn detect_audio(path: &Path) -> Result<AudioFormat, super::ConversionError> {
         match Self::detect(path)? {

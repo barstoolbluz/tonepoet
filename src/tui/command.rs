@@ -78,7 +78,7 @@ pub fn parse_command(input: &str) -> Command {
 pub fn execute_command(
     app: &mut AppState,
     cmd: Command,
-    _tx: &mpsc::Sender<AppMessage>,
+    tx: &mpsc::Sender<AppMessage>,
 ) {
     match cmd {
         Command::Quit => {
@@ -156,12 +156,10 @@ pub fn execute_command(
             }
         }
         Command::Convert => {
-            app.set_status("Conversion not yet wired up from command mode");
-            // TODO: trigger conversion
+            super::convert_actions::convert_or_queue(app, tx, true);
         }
         Command::Queue => {
-            app.set_status("Queue add not yet wired up from command mode");
-            // TODO: add current source to queue
+            super::convert_actions::convert_or_queue(app, tx, false);
         }
         Command::Batch(dir) => {
             if dir.is_empty() {
