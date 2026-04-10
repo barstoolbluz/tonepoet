@@ -74,9 +74,12 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 }
                 return;
             }
-            AppScreen::Browse | AppScreen::Library | AppScreen::Config => {
+            AppScreen::Library | AppScreen::Config => {
                 app.current_screen = AppScreen::Convert;
                 return;
+            }
+            AppScreen::Browse => {
+                // Let handle_browse_key handle Esc — it clears multi-selection first
             }
             AppScreen::Queue => {
                 app.current_screen = AppScreen::Convert;
@@ -89,6 +92,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
     // Screen-specific handling
     match app.current_screen {
         AppScreen::Convert => handle_convert_key(app, key, tx),
+        AppScreen::Browse => handle_browse_key(app, key, tx),
         AppScreen::Queue => handle_queue_key(app, key, tx),
         AppScreen::Wizard => handle_wizard_key(app, key),
         _ => {} // placeholder screens
@@ -361,6 +365,145 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+// ── Browse screen keybindings ────────────────────────────────────────
+
+fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+    use super::browse::EntryKind;
+
+    match (key.code, key.modifiers) {
+        // Navigation
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            app.browse.move_up();
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            app.browse.move_down();
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            app.browse.move_top();
+        }
+        (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
+            app.browse.move_bottom();
+        }
+        (KeyCode::PageUp, _) => {
+            app.browse.page_up();
+        }
+        (KeyCode::PageDown, _) => {
+            app.browse.page_down();
+        }
+
+        // Go up (parent directory)
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Backspace, _) => {
+            app.browse.go_parent();
+        }
+
+        // Enter directory or select file
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => {
+            if let Some(entry) = app.browse.selected_entry() {
+                if entry.is_dir() {
+                    app.browse.enter_selected();
+                }
+            }
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            if let Some(entry) = app.browse.selected_entry() {
+                match &entry.kind {
+                    EntryKind::Directory | EntryKind::ParentDir => {
+                        app.browse.enter_selected();
+                    }
+                    EntryKind::AudioFile(_) | EntryKind::Archive => {
+                        let path = entry.path.clone();
+                        let target = app.browse.return_target;
+                        load_browse_selection(app, path, target);
+                    }
+                    EntryKind::OtherFile => {
+                        app.set_status("Not an audio file");
+                    }
+                }
+            }
+        }
+
+        // Toggle multi-select (for audio files only)
+        (KeyCode::Char(' '), KeyModifiers::NONE) => {
+            app.browse.toggle_selection();
+            app.browse.move_down();
+        }
+
+        // Toggle hidden files
+        (KeyCode::Char('.'), KeyModifiers::NONE) => {
+            app.browse.toggle_hidden();
+        }
+
+        // Esc: clear multi-selection, or switch back to convert
+        (KeyCode::Esc, _) => {
+            if !app.browse.multi_selected.is_empty() {
+                app.browse.clear_multi_selection();
+            } else {
+                app.current_screen = AppScreen::Convert;
+            }
+        }
+
+        _ => {}
+    }
+}
+
+/// Load the selected browse entry based on the return target
+fn load_browse_selection(
+    app: &mut AppState,
+    path: std::path::PathBuf,
+    target: super::browse::BrowseReturnTarget,
+) {
+    use super::browse::BrowseReturnTarget;
+
+    match target {
+        BrowseReturnTarget::ConvertSource | BrowseReturnTarget::None => {
+            // Probe and load into source pane
+            match crate::tui::probe::probe_audio(&path) {
+                Ok(info) => {
+                    app.convert.source.file_path = Some(path.clone());
+                    app.convert.source.info = Some(info);
+                    if let Ok(meta) = crate::tui::probe::read_metadata(&path) {
+                        app.convert.metadata.title = meta.title.clone();
+                        app.convert.metadata.artist = meta.artist.clone();
+                        app.convert.metadata.album = meta.album.clone();
+                        app.convert.metadata.genre = meta.genre.clone();
+                        app.convert.metadata.year = meta.year.clone();
+                        app.convert.source.metadata = meta;
+                    }
+                    app.set_status(format!(
+                        "Loaded: {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    app.current_screen = AppScreen::Convert;
+                }
+                Err(e) => {
+                    app.set_status(format!("Probe error: {}", e));
+                }
+            }
+        }
+        BrowseReturnTarget::ConvertQueue => {
+            // Add all multi-selected files (or just this one) to the queue
+            let mut paths_to_add = app.browse.multi_selected.clone();
+            if paths_to_add.is_empty() {
+                paths_to_add.push(path);
+            }
+            let mut count = 0;
+            let options = crate::convert::ConversionOptions::default();
+            for p in paths_to_add {
+                if app
+                    .manager
+                    .add_file_ready_for_processing(p, options.clone())
+                    .is_ok()
+                {
+                    count += 1;
+                }
+            }
+            app.browse.clear_multi_selection();
+            app.set_status(format!("Queued {} files", count));
+            app.current_screen = AppScreen::Queue;
+        }
     }
 }
 

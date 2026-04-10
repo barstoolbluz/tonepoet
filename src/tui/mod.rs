@@ -1,11 +1,13 @@
 //! TUI module for standalone tonepoet interface
 
 pub mod app;
+pub mod browse;
 pub mod button_map;
 pub mod command;
 pub mod convert_actions;
 pub mod convert_screen;
 pub mod draw;
+pub mod draw_browse;
 pub mod draw_footer;
 pub mod draw_header;
 pub mod draw_metadata;

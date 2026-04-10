@@ -46,7 +46,10 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
         AppScreen::Config => {
             draw_settings_screen(f, f.size(), app);
         }
-        AppScreen::Browse | AppScreen::Library => {
+        AppScreen::Browse => {
+            super::draw_browse::draw_browse_screen(f, f.size(), app);
+        }
+        AppScreen::Library => {
             draw_placeholder_screen(f, f.size(), app);
         }
     }

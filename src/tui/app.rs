@@ -599,6 +599,9 @@ pub struct AppState {
     pub convert: ConvertState,
     pub preset: PresetState,
 
+    // Browse screen state
+    pub browse: crate::tui::browse::BrowseState,
+
     // Queue screen state
     pub queue_focus: QueueFocus,
     pub selected_index: usize,
@@ -653,6 +656,7 @@ impl AppState {
                 focus: ConvertFocus::Source,
             },
             preset: PresetState::default(),
+            browse: crate::tui::browse::BrowseState::new(),
             queue_focus: QueueFocus::FileList,
             selected_index: 0,
             scroll_offset: 0,
