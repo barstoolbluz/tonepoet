@@ -35,6 +35,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             }
             (KeyCode::Char('2'), KeyModifiers::NONE) => {
                 app.current_screen = AppScreen::Browse;
+                app.browse.probe_current();
                 return;
             }
             (KeyCode::Char('3'), KeyModifiers::NONE) => {
@@ -373,30 +374,40 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
 fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
     use super::browse::EntryKind;
 
+    // Track whether selection may have changed; if so, probe the new selection.
+    let mut selection_may_have_changed = false;
+
     match (key.code, key.modifiers) {
         // Navigation
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
             app.browse.move_up();
+            selection_may_have_changed = true;
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
             app.browse.move_down();
+            selection_may_have_changed = true;
         }
         (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
             app.browse.move_top();
+            selection_may_have_changed = true;
         }
         (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
             app.browse.move_bottom();
+            selection_may_have_changed = true;
         }
         (KeyCode::PageUp, _) => {
             app.browse.page_up();
+            selection_may_have_changed = true;
         }
         (KeyCode::PageDown, _) => {
             app.browse.page_down();
+            selection_may_have_changed = true;
         }
 
         // Go up (parent directory)
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Backspace, _) => {
             app.browse.go_parent();
+            selection_may_have_changed = true;
         }
 
         // Enter directory or select file
@@ -404,6 +415,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMe
             if let Some(entry) = app.browse.selected_entry() {
                 if entry.is_dir() {
                     app.browse.enter_selected();
+                    selection_may_have_changed = true;
                 }
             }
         }
@@ -412,6 +424,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMe
                 match &entry.kind {
                     EntryKind::Directory | EntryKind::ParentDir => {
                         app.browse.enter_selected();
+                        selection_may_have_changed = true;
                     }
                     EntryKind::AudioFile(_) | EntryKind::Archive => {
                         let path = entry.path.clone();
@@ -429,11 +442,13 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMe
         (KeyCode::Char(' '), KeyModifiers::NONE) => {
             app.browse.toggle_selection();
             app.browse.move_down();
+            selection_may_have_changed = true;
         }
 
         // Toggle hidden files
         (KeyCode::Char('.'), KeyModifiers::NONE) => {
             app.browse.toggle_hidden();
+            selection_may_have_changed = true;
         }
 
         // Esc: clear multi-selection, or switch back to convert
@@ -446,6 +461,10 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMe
         }
 
         _ => {}
+    }
+
+    if selection_may_have_changed {
+        app.browse.probe_current();
     }
 }
 
@@ -1044,7 +1063,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::Tab(n) => {
                 match n {
                     1 => app.current_screen = AppScreen::Convert,
-                    2 => app.current_screen = AppScreen::Browse,
+                    2 => {
+                        app.current_screen = AppScreen::Browse;
+                        app.browse.probe_current();
+                    }
                     3 => app.current_screen = AppScreen::Library,
                     4 => app.current_screen = AppScreen::Queue,
                     5 => app.current_screen = AppScreen::Config,

@@ -7,8 +7,23 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::convert::formats::AudioFormat;
-use crate::tui::probe::SourceInfo;
+use crate::tui::probe::{SourceInfo, SourceMetadata};
 use crate::tui::text_input::TextInputState;
+
+/// Cached info for an audio file: probe data + metadata tags
+#[derive(Debug, Clone)]
+pub struct CachedInfo {
+    pub source: SourceInfo,
+    pub metadata: SourceMetadata,
+}
+
+/// Cached statistics for a directory
+#[derive(Debug, Clone, Default)]
+pub struct DirStats {
+    pub file_count: usize,
+    pub audio_count: usize,
+    pub total_size: u64,
+}
 
 /// What to do when the user selects a file in the browse screen
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,8 +99,11 @@ pub struct BrowseState {
     pub filter_text: String,
     pub show_hidden: bool,
 
-    /// Probe cache: path → source info
-    pub probe_cache: HashMap<PathBuf, Arc<SourceInfo>>,
+    /// Probe cache: path → Some(info) if probed, None if probe failed
+    pub probe_cache: HashMap<PathBuf, Option<Arc<CachedInfo>>>,
+
+    /// Directory stats cache: path → (file_count, audio_count, total_size)
+    pub dir_stats_cache: HashMap<PathBuf, Arc<DirStats>>,
 
     /// Where to send selected files
     pub return_target: BrowseReturnTarget,
@@ -111,6 +129,7 @@ impl BrowseState {
             filter_text: String::new(),
             show_hidden: false,
             probe_cache: HashMap::new(),
+            dir_stats_cache: HashMap::new(),
             return_target: BrowseReturnTarget::None,
             error: None,
         };
@@ -320,6 +339,78 @@ impl BrowseState {
         self.show_hidden = !self.show_hidden;
         self.refresh();
     }
+
+    /// Probe the currently selected entry (audio files only).
+    /// Caches the result; cached entries are not re-probed.
+    pub fn probe_current(&mut self) {
+        let path = match self.entries.get(self.selected_index) {
+            Some(entry) if entry.is_audio() => entry.path.clone(),
+            Some(entry) if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) => {
+                // Compute directory stats lazily
+                if !self.dir_stats_cache.contains_key(&entry.path) {
+                    let stats = compute_dir_stats(&entry.path);
+                    self.dir_stats_cache.insert(entry.path.clone(), Arc::new(stats));
+                }
+                return;
+            }
+            _ => return,
+        };
+
+        if self.probe_cache.contains_key(&path) {
+            return; // already probed (successfully or not)
+        }
+
+        match crate::tui::probe::probe_audio(&path) {
+            Ok(source) => {
+                let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
+                self.probe_cache.insert(
+                    path,
+                    Some(Arc::new(CachedInfo { source, metadata })),
+                );
+            }
+            Err(_) => {
+                self.probe_cache.insert(path, None);
+            }
+        }
+    }
+
+    /// Get cached info for the currently selected audio file, if probed
+    pub fn current_cached_info(&self) -> Option<&Arc<CachedInfo>> {
+        let entry = self.entries.get(self.selected_index)?;
+        if !entry.is_audio() {
+            return None;
+        }
+        self.probe_cache.get(&entry.path)?.as_ref()
+    }
+
+    /// Get cached directory stats for the current selection (if it's a directory)
+    pub fn current_dir_stats(&self) -> Option<&Arc<DirStats>> {
+        let entry = self.entries.get(self.selected_index)?;
+        if !matches!(entry.kind, EntryKind::Directory) {
+            return None;
+        }
+        self.dir_stats_cache.get(&entry.path)
+    }
+}
+
+/// Compute stats for a directory: file count, audio count, total size.
+/// Reads the directory once. Does not recurse.
+fn compute_dir_stats(path: &Path) -> DirStats {
+    let mut stats = DirStats::default();
+    if let Ok(read) = fs::read_dir(path) {
+        for entry in read.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    stats.file_count += 1;
+                    stats.total_size += meta.len();
+                    if matches!(classify_file(&entry.path()), EntryKind::AudioFile(_)) {
+                        stats.audio_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    stats
 }
 
 impl Default for BrowseState {

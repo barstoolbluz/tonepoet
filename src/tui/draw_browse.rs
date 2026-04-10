@@ -266,8 +266,10 @@ fn draw_browse_info(f: &mut Frame, area: Rect, browse: &BrowseState) {
 
     let mut lines: Vec<Line> = vec![top_line];
 
+    // Available width for content (inside borders, after the 3-space indent)
+    let content_width = w.saturating_sub(2);
     let content_lines = if let Some(entry) = browse.selected_entry() {
-        entry_info_lines(entry)
+        entry_info_lines(entry, browse, content_width)
     } else {
         vec![vec![Span::styled("   (no selection)", theme::muted())]]
     };
@@ -289,18 +291,36 @@ fn draw_browse_info(f: &mut Frame, area: Rect, browse: &BrowseState) {
     f.render_widget(paragraph, area);
 }
 
-/// Build content lines for the info pane based on the entry kind
-fn entry_info_lines(entry: &BrowseEntry) -> Vec<Vec<Span<'static>>> {
+/// Truncate a string to fit within `max_chars` columns, adding ellipsis if needed.
+fn truncate_to(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars || max_chars < 2 {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars - 1).collect();
+    format!("{}…", truncated)
+}
+
+/// Build content lines for the info pane based on the entry kind.
+/// `content_width` is the width available inside the pane borders.
+fn entry_info_lines(
+    entry: &BrowseEntry,
+    browse: &BrowseState,
+    content_width: usize,
+) -> Vec<Vec<Span<'static>>> {
+    // Maximum width for free-form text values: subtract the 3-space indent
+    let max_value_chars = content_width.saturating_sub(3);
+
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
 
     // Blank
     lines.push(vec![]);
 
-    // Name
+    // Name section
     lines.push(vec![Span::styled("   name", theme::muted())]);
     lines.push(vec![
         Span::raw("   "),
-        Span::styled(entry.name.clone(), theme::bright()),
+        Span::styled(truncate_to(&entry.name, max_value_chars), theme::bright()),
     ]);
     lines.push(vec![]);
 
@@ -313,16 +333,108 @@ fn entry_info_lines(entry: &BrowseEntry) -> Vec<Vec<Span<'static>>> {
                 Span::styled("   kind    ", theme::muted()),
                 Span::styled("directory", theme::text()),
             ]);
+            // Show directory stats if cached
+            if let Some(stats) = browse.current_dir_stats() {
+                lines.push(vec![
+                    Span::styled("   files   ", theme::muted()),
+                    Span::styled(stats.file_count.to_string(), theme::text()),
+                ]);
+                if stats.audio_count > 0 {
+                    lines.push(vec![
+                        Span::styled("   audio   ", theme::muted()),
+                        Span::styled(stats.audio_count.to_string(), theme::accent()),
+                    ]);
+                }
+                lines.push(vec![
+                    Span::styled("   size    ", theme::muted()),
+                    Span::styled(size_str(stats.total_size), theme::text()),
+                ]);
+            }
         }
         EntryKind::AudioFile(fmt) => {
-            lines.push(vec![
-                Span::styled("   format  ", theme::muted()),
-                Span::styled(fmt.name().to_string(), theme::bold(theme::BLUE)),
-            ]);
-            lines.push(vec![
-                Span::styled("   size    ", theme::muted()),
-                Span::styled(size_str(entry.size), theme::text()),
-            ]);
+            // Show cached probe info if available
+            if let Some(cached) = browse.current_cached_info() {
+                let info = &cached.source;
+                lines.push(vec![
+                    Span::styled("   format  ", theme::muted()),
+                    Span::styled(info.format_name.clone(), theme::bold(theme::BLUE)),
+                ]);
+                lines.push(vec![
+                    Span::styled("   codec   ", theme::muted()),
+                    Span::styled(info.codec_display(), theme::text()),
+                ]);
+                if info.sample_rate > 0 {
+                    lines.push(vec![
+                        Span::styled("   rate    ", theme::muted()),
+                        Span::styled(info.sample_rate_display(), theme::text()),
+                    ]);
+                }
+                if info.channels > 0 {
+                    lines.push(vec![
+                        Span::styled("   channels", theme::muted()),
+                        Span::raw(" "),
+                        Span::styled(info.channels_display(), theme::text()),
+                    ]);
+                }
+                if info.duration_secs > 0.0 {
+                    lines.push(vec![
+                        Span::styled("   duration", theme::muted()),
+                        Span::raw(" "),
+                        Span::styled(info.duration_display(), theme::text()),
+                    ]);
+                }
+                lines.push(vec![
+                    Span::styled("   size    ", theme::muted()),
+                    Span::styled(info.size_display(), theme::text()),
+                ]);
+
+                // Metadata tags
+                let meta = &cached.metadata;
+                let has_meta = meta.title.is_some()
+                    || meta.artist.is_some()
+                    || meta.album.is_some()
+                    || meta.year.is_some();
+                if has_meta {
+                    // Inline labels (artist/album/year) get less room because of the label prefix
+                    let inline_max = max_value_chars.saturating_sub(11); // " ARTIST  " = 11 chars
+                    lines.push(vec![]);
+                    if let Some(title) = &meta.title {
+                        lines.push(vec![Span::styled("   title", theme::muted())]);
+                        lines.push(vec![
+                            Span::raw("   "),
+                            Span::styled(truncate_to(title, max_value_chars), theme::bright()),
+                        ]);
+                    }
+                    if let Some(artist) = &meta.artist {
+                        lines.push(vec![
+                            Span::styled("   artist  ", theme::muted()),
+                            Span::styled(truncate_to(artist, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(album) = &meta.album {
+                        lines.push(vec![
+                            Span::styled("   album   ", theme::muted()),
+                            Span::styled(truncate_to(album, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(year) = &meta.year {
+                        lines.push(vec![
+                            Span::styled("   year    ", theme::muted()),
+                            Span::styled(truncate_to(year, inline_max), theme::text()),
+                        ]);
+                    }
+                }
+            } else {
+                // Not yet probed or probe failed — show basic info
+                lines.push(vec![
+                    Span::styled("   format  ", theme::muted()),
+                    Span::styled(fmt.name().to_string(), theme::bold(theme::BLUE)),
+                ]);
+                lines.push(vec![
+                    Span::styled("   size    ", theme::muted()),
+                    Span::styled(size_str(entry.size), theme::text()),
+                ]);
+            }
         }
         EntryKind::Archive => {
             lines.push(vec![
