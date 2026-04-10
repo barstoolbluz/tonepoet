@@ -195,12 +195,18 @@ impl FFmpegBuilder {
             AudioFormat::WavPack => {
                 args.push("-c:a".to_string());
                 args.push("wavpack".to_string());
-                
+
                 // Compression level
                 if let Some(level) = settings.compression_level {
                     args.push("-compression_level".to_string());
                     args.push(level.to_string());
                 }
+                return Ok(());
+            }
+
+            AudioFormat::Alac => {
+                args.push("-c:a".to_string());
+                args.push("alac".to_string());
                 return Ok(());
             }
         };

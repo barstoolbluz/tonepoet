@@ -1,0 +1,901 @@
+//! Key event dispatch by screen/focus
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use tokio::sync::mpsc;
+
+use crate::convert::{ConversionOptions, ConversionStatus};
+use super::app::*;
+use super::button_map::TuiButton;
+use super::message::AppMessage;
+
+/// Handle a key event, dispatching to the appropriate screen handler
+pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    // Handle overlay inputs first
+    if !matches!(app.active_overlay, ActiveOverlay::None) {
+        handle_overlay_key(app, key, tx);
+        return;
+    }
+
+    // Global keys (except in Wizard mode)
+    if app.current_screen != AppScreen::Wizard {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.should_quit = true;
+                return;
+            }
+            (KeyCode::Char('1'), KeyModifiers::NONE) => {
+                app.current_screen = AppScreen::Convert;
+                return;
+            }
+            (KeyCode::Char('2'), KeyModifiers::NONE) => {
+                app.current_screen = AppScreen::Browse;
+                return;
+            }
+            (KeyCode::Char('3'), KeyModifiers::NONE) => {
+                app.current_screen = AppScreen::Library;
+                return;
+            }
+            (KeyCode::Char('4'), KeyModifiers::NONE) => {
+                app.current_screen = AppScreen::Queue;
+                return;
+            }
+            (KeyCode::Char('5'), KeyModifiers::NONE) => {
+                app.current_screen = AppScreen::Config;
+                return;
+            }
+            // Command mode
+            (KeyCode::Char(':'), KeyModifiers::SHIFT) | (KeyCode::Char(':'), KeyModifiers::NONE) => {
+                app.active_overlay = ActiveOverlay::CommandInput {
+                    input: String::new(),
+                    cursor_pos: 0,
+                };
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Esc handling
+    if key.code == KeyCode::Esc {
+        match app.current_screen {
+            AppScreen::Wizard => {
+                if let Some(wizard) = &mut app.wizard {
+                    wizard.handle_key(key);
+                    if wizard.should_exit {
+                        app.wizard = None;
+                        app.wizard_mouse_areas = None;
+                        app.current_screen = AppScreen::Convert;
+                    }
+                }
+                return;
+            }
+            AppScreen::Browse | AppScreen::Library | AppScreen::Config => {
+                app.current_screen = AppScreen::Convert;
+                return;
+            }
+            AppScreen::Queue => {
+                app.current_screen = AppScreen::Convert;
+                return;
+            }
+            AppScreen::Convert => {}
+        }
+    }
+
+    // Screen-specific handling
+    match app.current_screen {
+        AppScreen::Convert => handle_convert_key(app, key, tx),
+        AppScreen::Queue => handle_queue_key(app, key, tx),
+        AppScreen::Wizard => handle_wizard_key(app, key),
+        _ => {} // placeholder screens
+    }
+}
+
+// ── Convert screen keybindings ───────────────────────────────────────
+
+fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+    match (key.code, key.modifiers) {
+        // Tab between panes
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            app.convert.focus = app.convert.focus.next();
+        }
+        (KeyCode::BackTab, KeyModifiers::SHIFT) => {
+            app.convert.focus = app.convert.focus.prev();
+        }
+
+        // Within Format pane: Up/Down moves between pill rows
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
+            app.convert.format.field_focus = app.convert.format.field_focus.prev();
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
+            app.convert.format.field_focus = app.convert.format.field_focus.next();
+        }
+
+        // Within Format pane: Left/Right changes pill selection
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
+            let was_format = app.convert.format.field_focus == FormatField::Format;
+            app.convert.format.focused_pill_mut().select_prev();
+            if was_format {
+                app.convert.format.apply_format_constraints();
+            }
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
+            let was_format = app.convert.format.field_focus == FormatField::Format;
+            app.convert.format.focused_pill_mut().select_next();
+            if was_format {
+                app.convert.format.apply_format_constraints();
+            }
+        }
+
+        // Within Output Options pane: Up/Down moves between fields
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions => {
+            app.convert.output_options.field_focus = app.convert.output_options.field_focus.prev();
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions => {
+            app.convert.output_options.field_focus = app.convert.output_options.field_focus.next();
+        }
+
+        // Within Output Options: Left/Right on merge mode pill
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions
+            && app.convert.output_options.field_focus == OutputOptionsField::MergeMode => {
+            app.convert.output_options.merge.select_prev();
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions
+            && app.convert.output_options.field_focus == OutputOptionsField::MergeMode => {
+            app.convert.output_options.merge.select_next();
+        }
+
+        // Edit source file path
+        (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Source =>
+        {
+            app.active_overlay = ActiveOverlay::FileInput {
+                input: app
+                    .convert
+                    .source
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                cursor_pos: app
+                    .convert
+                    .source
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.display().to_string().len())
+                    .unwrap_or(0),
+            };
+        }
+
+        // Advanced toggle (stub)
+        (KeyCode::Char('a'), KeyModifiers::NONE) => {
+            match app.convert.focus {
+                ConvertFocus::Source => {
+                    app.convert.source.advanced_open = !app.convert.source.advanced_open;
+                }
+                ConvertFocus::Metadata => {
+                    app.convert.metadata.advanced_open = !app.convert.metadata.advanced_open;
+                }
+                ConvertFocus::Format => {
+                    app.convert.format.advanced_open = !app.convert.format.advanced_open;
+                }
+                ConvertFocus::OutputOptions => {
+                    app.convert.output_options.advanced_open = !app.convert.output_options.advanced_open;
+                }
+            }
+        }
+
+        // Presets (stub)
+        (KeyCode::Char('p'), KeyModifiers::NONE) => {
+            app.preset.overlay_open = !app.preset.overlay_open;
+        }
+
+        _ => {}
+    }
+}
+
+// ── Queue screen keybindings ─────────────────────────────────────────
+
+fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    match (key.code, key.modifiers) {
+        // Navigation
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            if app.selected_index > 0 {
+                app.selected_index -= 1;
+                app.ensure_visible();
+            }
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            if app.selected_index + 1 < app.items_snapshot.len() {
+                app.selected_index += 1;
+                app.ensure_visible();
+            }
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            app.selected_index = 0;
+            app.scroll_offset = 0;
+        }
+        (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
+            if !app.items_snapshot.is_empty() {
+                app.selected_index = app.items_snapshot.len() - 1;
+                app.ensure_visible();
+            }
+        }
+        (KeyCode::PageUp, _) => {
+            let jump = app.visible_height.max(1);
+            app.selected_index = app.selected_index.saturating_sub(jump);
+            app.ensure_visible();
+        }
+        (KeyCode::PageDown, _) => {
+            let jump = app.visible_height.max(1);
+            app.selected_index = (app.selected_index + jump).min(
+                app.items_snapshot.len().saturating_sub(1),
+            );
+            app.ensure_visible();
+        }
+
+        // Selection
+        (KeyCode::Char(' '), KeyModifiers::NONE) => {
+            app.toggle_current_selection();
+            if app.selected_index + 1 < app.items_snapshot.len() {
+                app.selected_index += 1;
+                app.ensure_visible();
+            }
+        }
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+            app.manager.select_all();
+            app.set_status("Selected all items");
+        }
+
+        // Item info
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            if let Some(item) = app.items_snapshot.get(app.selected_index) {
+                match &item.status {
+                    ConversionStatus::Failed { error } => {
+                        app.active_overlay = ActiveOverlay::ErrorDetail {
+                            item_id: item.id.clone(),
+                            error: error.clone(),
+                        };
+                    }
+                    _ => {
+                        app.active_overlay = ActiveOverlay::ItemInfo {
+                            item: item.clone(),
+                        };
+                    }
+                }
+            }
+        }
+
+        // Add files
+        (KeyCode::Char('a'), KeyModifiers::NONE) | (KeyCode::Char('f'), KeyModifiers::NONE) => {
+            app.active_overlay = ActiveOverlay::FileInput {
+                input: String::new(),
+                cursor_pos: 0,
+            };
+        }
+
+        // Configure (open wizard)
+        (KeyCode::Char('c'), KeyModifiers::NONE) => {
+            let has_selected = app.items_snapshot.iter().any(|i| i.selected);
+            app.wizard_target = if has_selected {
+                WizardTarget::ConfigureSelected
+            } else {
+                WizardTarget::ConfigureAll
+            };
+            app.wizard = Some(tonepoet_wizard::SimpleWizard::new());
+            app.current_screen = AppScreen::Wizard;
+        }
+
+        // Start conversion
+        (KeyCode::Char('s'), KeyModifiers::NONE) => {
+            if !app.processing_active {
+                let tx_clone = tx.clone();
+                start_conversion(app, tx_clone);
+            } else {
+                app.set_status("Conversion already running");
+            }
+        }
+
+        // Pause/Resume
+        (KeyCode::Char('p'), KeyModifiers::NONE) => {
+            if app.processing_active {
+                if app.manager.is_paused() {
+                    app.manager.resume_conversions();
+                    app.set_status("Resumed conversions");
+                } else {
+                    app.manager.pause_conversions();
+                    app.set_status("Paused conversions");
+                }
+            }
+        }
+
+        // Stop
+        (KeyCode::Char('x'), KeyModifiers::NONE) => {
+            if app.processing_active {
+                app.active_overlay = ActiveOverlay::Confirmation {
+                    message: "Stop all active conversions?".to_string(),
+                    action: ConfirmAction::StopAll,
+                };
+            }
+        }
+
+        // Delete/Remove selected
+        (KeyCode::Delete, _) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
+            let selected_count = app.items_snapshot.iter().filter(|i| i.selected).count();
+            if selected_count > 0 {
+                app.active_overlay = ActiveOverlay::Confirmation {
+                    message: format!("Remove {} selected item(s)?", selected_count),
+                    action: ConfirmAction::RemoveSelected,
+                };
+            }
+        }
+
+        // Clear completed
+        (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+            let completed_count = app.items_snapshot.iter()
+                .filter(|i| matches!(i.status, ConversionStatus::Completed { .. }))
+                .count();
+            if completed_count > 0 {
+                app.manager.clear_completed();
+                app.set_status(format!("Cleared {} completed items", completed_count));
+            }
+        }
+
+        // Retry failed
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            retry_failed(app);
+        }
+
+        // Tab between file list and action bar
+        (KeyCode::Tab, _) => {
+            app.queue_focus = match app.queue_focus {
+                QueueFocus::FileList => QueueFocus::ActionBar,
+                QueueFocus::ActionBar => QueueFocus::FileList,
+            };
+        }
+
+        _ => {}
+    }
+}
+
+// ── Wizard keybindings ───────────────────────────────────────────────
+
+fn handle_wizard_key(app: &mut AppState, key: KeyEvent) {
+    if let Some(wizard) = &mut app.wizard {
+        wizard.handle_key(key);
+
+        if wizard.should_start_conversion {
+            let (format, options) = crate::convert::extract_wizard_settings(wizard);
+            app.wizard = None;
+            app.wizard_mouse_areas = None;
+            app.current_screen = AppScreen::Queue;
+
+            let queue = app.manager.queue.clone();
+            let has_selected = if let Ok(q) = queue.try_read() {
+                q.all_items().iter().any(|i| i.selected)
+            } else {
+                false
+            };
+
+            if let Ok(mut q) = queue.try_write() {
+                for item in q.all_items_mut() {
+                    if has_selected && !item.selected {
+                        continue;
+                    }
+                    match item.status {
+                        ConversionStatus::NotConfigured
+                        | ConversionStatus::Queued
+                        | ConversionStatus::Paused => {
+                            item.output_format = options.output_format;
+                            item.options = options.clone();
+                            item.status = ConversionStatus::Queued;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            app.set_status(format!("Configured items for {} conversion", format.name()));
+            return;
+        }
+
+        if wizard.should_exit {
+            app.wizard = None;
+            app.wizard_mouse_areas = None;
+            app.current_screen = AppScreen::Convert;
+        }
+    }
+}
+
+// ── Overlay keybindings ──────────────────────────────────────────────
+
+fn handle_overlay_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+    let overlay = app.active_overlay.clone();
+    match overlay {
+        ActiveOverlay::Confirmation { action, .. } => {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.active_overlay = ActiveOverlay::None;
+                    execute_confirm_action(app, &action);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                _ => {}
+            }
+        }
+        ActiveOverlay::ErrorDetail { .. } | ActiveOverlay::ItemInfo { .. } => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                app.active_overlay = ActiveOverlay::None;
+            }
+        }
+        ActiveOverlay::FileInput { mut input, mut cursor_pos } => {
+            match key.code {
+                KeyCode::Enter => {
+                    let path = std::path::PathBuf::from(input.trim());
+                    app.active_overlay = ActiveOverlay::None;
+                    if !input.trim().is_empty() {
+                        handle_file_input(app, &path);
+                    }
+                    return;
+                }
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    input.insert(cursor_pos, c);
+                    cursor_pos += 1;
+                }
+                KeyCode::Backspace => {
+                    if cursor_pos > 0 {
+                        cursor_pos -= 1;
+                        input.remove(cursor_pos);
+                    }
+                }
+                KeyCode::Delete => {
+                    if cursor_pos < input.len() {
+                        input.remove(cursor_pos);
+                    }
+                }
+                KeyCode::Left => {
+                    cursor_pos = cursor_pos.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    if cursor_pos < input.len() {
+                        cursor_pos += 1;
+                    }
+                }
+                KeyCode::Home => {
+                    cursor_pos = 0;
+                }
+                KeyCode::End => {
+                    cursor_pos = input.len();
+                }
+                _ => {}
+            }
+            app.active_overlay = ActiveOverlay::FileInput { input, cursor_pos };
+        }
+        ActiveOverlay::CommandInput { mut input, mut cursor_pos } => {
+            match key.code {
+                KeyCode::Enter => {
+                    app.active_overlay = ActiveOverlay::None;
+                    if !input.trim().is_empty() {
+                        let cmd = super::command::parse_command(&input);
+                        super::command::execute_command(app, cmd, _tx);
+                    }
+                    return;
+                }
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    input.insert(cursor_pos, c);
+                    cursor_pos += 1;
+                }
+                KeyCode::Backspace => {
+                    if cursor_pos > 0 {
+                        cursor_pos -= 1;
+                        input.remove(cursor_pos);
+                    }
+                }
+                KeyCode::Delete => {
+                    if cursor_pos < input.len() {
+                        input.remove(cursor_pos);
+                    }
+                }
+                KeyCode::Left => {
+                    cursor_pos = cursor_pos.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    if cursor_pos < input.len() {
+                        cursor_pos += 1;
+                    }
+                }
+                KeyCode::Home => {
+                    cursor_pos = 0;
+                }
+                KeyCode::End => {
+                    cursor_pos = input.len();
+                }
+                _ => {}
+            }
+            app.active_overlay = ActiveOverlay::CommandInput { input, cursor_pos };
+        }
+        ActiveOverlay::None => {}
+    }
+}
+
+/// Handle file input completion — either set source file (convert screen) or add to queue
+fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
+    if !path.exists() {
+        app.set_status(format!("Path not found: {}", path.display()));
+        return;
+    }
+
+    match app.current_screen {
+        AppScreen::Convert => {
+            // Probe the file first
+            match crate::tui::probe::probe_audio(path) {
+                Ok(info) => {
+                    app.convert.source.file_path = Some(path.to_path_buf());
+                    app.convert.source.info = Some(info);
+                    app.set_status(format!(
+                        "Loaded: {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+                Err(e) => {
+                    app.convert.source.file_path = None;
+                    app.convert.source.info = None;
+                    app.set_status(format!("Probe error: {}", e));
+                    return;
+                }
+            }
+
+            // Read metadata (best-effort, don't fail the load)
+            if let Ok(meta) = crate::tui::probe::read_metadata(path) {
+                app.convert.metadata.title = meta.title.clone();
+                app.convert.metadata.artist = meta.artist.clone();
+                app.convert.metadata.album = meta.album.clone();
+                app.convert.metadata.genre = meta.genre.clone();
+                app.convert.metadata.year = meta.year.clone();
+                app.convert.source.metadata = meta;
+            }
+        }
+        _ => {
+            // Add to queue (existing behavior)
+            add_path_to_queue(app, path);
+        }
+    }
+}
+
+// ── Helper functions ─────────────────────────────────────────────────
+
+fn execute_confirm_action(app: &mut AppState, action: &ConfirmAction) {
+    match action {
+        ConfirmAction::RemoveSelected => {
+            let removed = app.manager.remove_selected();
+            app.set_status(format!("Removed {} items", removed));
+        }
+        ConfirmAction::ClearCompleted => {
+            app.manager.clear_completed();
+            app.set_status("Cleared completed items");
+        }
+        ConfirmAction::StopAll => {
+            app.manager.stop_all_conversions();
+            app.processing_active = false;
+            app.set_status("Stopped all conversions");
+        }
+        ConfirmAction::ClearQueue => {
+            app.manager.clear_queue();
+            app.set_status("Cleared queue");
+        }
+    }
+}
+
+fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
+    if !path.exists() {
+        app.set_status(format!("Path not found: {}", path.display()));
+        return;
+    }
+
+    let mut options = ConversionOptions::default();
+    options.append_lineage_to_comment = app.config.conversion.append_lineage_to_comment;
+    options.write_log_file = app.config.conversion.write_log_file;
+    options.generate_cue_files = app.config.conversion.generate_cue_files;
+    options.cue_generation_mode = app.config.conversion.cue_generation_mode.clone();
+
+    if path.is_dir() {
+        let mut count = 0;
+        let mut errors = 0;
+        for entry in walkdir::WalkDir::new(path)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let file_path = entry.path();
+            if file_path.is_file() {
+                if let Some(ext) = file_path.extension() {
+                    let ext_str = ext.to_string_lossy().to_lowercase();
+                    if matches!(ext_str.as_str(),
+                        "7z" | "flac" | "wav" | "aiff" | "aif" | "wv" | "mp3" | "m4a" | "aac" | "opus" | "ogg"
+                    ) {
+                        match app.manager.add_file_blocking(file_path.to_path_buf(), options.clone()) {
+                            Ok(_) => count += 1,
+                            Err(_) => errors += 1,
+                        }
+                    }
+                }
+            }
+        }
+        if errors > 0 {
+            app.set_status(format!("Added {} files ({} errors)", count, errors));
+        } else {
+            app.set_status(format!("Added {} files from folder", count));
+        }
+    } else {
+        match app.manager.add_file_blocking(path.to_path_buf(), options) {
+            Ok(_) => app.set_status(format!("Added: {}", path.file_name().unwrap_or_default().to_string_lossy())),
+            Err(e) => app.set_status(format!("Error: {}", e)),
+        }
+    }
+
+    app.manager.save_queue(app.config.conversion.persist_queue).ok();
+}
+
+fn start_conversion(app: &mut AppState, tx: mpsc::Sender<AppMessage>) {
+    let ready_count = app.items_snapshot.iter()
+        .filter(|i| matches!(i.status, ConversionStatus::Queued))
+        .count();
+
+    if ready_count == 0 {
+        let not_configured = app.items_snapshot.iter()
+            .filter(|i| matches!(i.status, ConversionStatus::NotConfigured))
+            .count();
+        if not_configured > 0 {
+            app.set_status("Items not configured. Press 'c' to configure first.");
+        } else {
+            app.set_status("No items ready for conversion");
+        }
+        return;
+    }
+
+    app.processing_active = true;
+    app.manager.clear_stop_request();
+    app.set_status(format!("Starting conversion of {} items...", ready_count));
+
+    let queue = app.manager.queue.clone();
+    let processor_config = crate::convert::ProcessorConfig {
+        worker_count: app.config.conversion.worker_count,
+        tool_paths: std::collections::HashMap::new(),
+        default_destination_directory: app.config.conversion.default_destination.clone(),
+        scratch_directory: app.config.conversion.scratch_directory.clone(),
+    };
+
+    tokio::spawn(async move {
+        let mut processor = crate::convert::ConversionProcessor::new(processor_config);
+
+        if let Err(e) = processor.process_queue_with_progress(queue.clone(), None).await {
+            let _ = tx.send(AppMessage::ConversionError {
+                message: format!("Conversion error: {}", e),
+            }).await;
+        }
+
+        if let Ok(q) = queue.try_read() {
+            let completed = q.all_items().iter()
+                .filter(|i| matches!(i.status, ConversionStatus::Completed { .. }))
+                .count();
+            let failed = q.all_items().iter()
+                .filter(|i| matches!(i.status, ConversionStatus::Failed { .. }))
+                .count();
+            let _ = tx.send(AppMessage::ConversionComplete { completed, failed }).await;
+        } else {
+            let _ = tx.send(AppMessage::ConversionComplete { completed: 0, failed: 0 }).await;
+        }
+    });
+}
+
+fn retry_failed(app: &mut AppState) {
+    if let Ok(mut queue) = app.manager.queue.try_write() {
+        queue.retry_failed();
+    }
+    app.set_status("Re-queued failed items for retry");
+}
+
+/// Handle mouse events
+pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+
+    let x = mouse.column;
+    let y = mouse.row;
+
+    // If wizard is active, forward to wizard
+    if app.current_screen == AppScreen::Wizard {
+        if let Some(wizard) = &mut app.wizard {
+            let button_id = app.wizard_mouse_areas.as_ref()
+                .and_then(|areas| areas.get_button_at(x, y));
+            wizard.handle_mouse(mouse, button_id);
+
+            if wizard.should_start_conversion {
+                let (format, options) = crate::convert::extract_wizard_settings(wizard);
+                app.wizard = None;
+                app.wizard_mouse_areas = None;
+                app.current_screen = AppScreen::Queue;
+
+                let queue = app.manager.queue.clone();
+                if let Ok(mut q) = queue.try_write() {
+                    let has_selected = q.all_items().iter().any(|i| i.selected);
+                    for item in q.all_items_mut() {
+                        if has_selected && !item.selected { continue; }
+                        match item.status {
+                            ConversionStatus::NotConfigured
+                            | ConversionStatus::Queued
+                            | ConversionStatus::Paused => {
+                                item.output_format = options.output_format;
+                                item.options = options.clone();
+                                item.status = ConversionStatus::Queued;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                app.set_status(format!("Configured items for {} conversion", format.name()));
+            } else if wizard.should_exit {
+                app.wizard = None;
+                app.wizard_mouse_areas = None;
+                app.current_screen = AppScreen::Convert;
+            }
+        }
+        return;
+    }
+
+    // Check button map
+    if let Some(button) = app.button_map.find_button_at(x, y) {
+        match button {
+            // ── Convert screen: pane focus ──
+            TuiButton::Pane(focus) => {
+                app.convert.focus = focus;
+                app.current_screen = AppScreen::Convert;
+            }
+
+            // ── Convert screen: tab bar ──
+            TuiButton::Tab(n) => {
+                match n {
+                    1 => app.current_screen = AppScreen::Convert,
+                    2 => app.current_screen = AppScreen::Browse,
+                    3 => app.current_screen = AppScreen::Library,
+                    4 => app.current_screen = AppScreen::Queue,
+                    5 => app.current_screen = AppScreen::Config,
+                    _ => {}
+                }
+            }
+
+            // ── Convert screen: format pane pills ──
+            TuiButton::FormatPill(i) => {
+                app.convert.focus = ConvertFocus::Format;
+                app.convert.format.field_focus = FormatField::Format;
+                if i < app.convert.format.format.options.len()
+                    && app.convert.format.format.options[i].enabled
+                {
+                    app.convert.format.format.selected = i;
+                    app.convert.format.apply_format_constraints();
+                }
+            }
+            TuiButton::RatePill(i) => {
+                app.convert.focus = ConvertFocus::Format;
+                app.convert.format.field_focus = FormatField::SampleRate;
+                if i < app.convert.format.sample_rate.options.len()
+                    && app.convert.format.sample_rate.options[i].enabled
+                {
+                    app.convert.format.sample_rate.selected = i;
+                }
+            }
+            TuiButton::DepthPill(i) => {
+                app.convert.focus = ConvertFocus::Format;
+                app.convert.format.field_focus = FormatField::BitDepth;
+                if i < app.convert.format.bit_depth.options.len()
+                    && app.convert.format.bit_depth.options[i].enabled
+                {
+                    app.convert.format.bit_depth.selected = i;
+                }
+            }
+            TuiButton::DitherPill(i) => {
+                app.convert.focus = ConvertFocus::Format;
+                app.convert.format.field_focus = FormatField::Dither;
+                if i < app.convert.format.dither.options.len()
+                    && app.convert.format.dither.options[i].enabled
+                {
+                    app.convert.format.dither.selected = i;
+                }
+            }
+            TuiButton::ReplayGainPill(i) => {
+                app.convert.focus = ConvertFocus::Format;
+                app.convert.format.field_focus = FormatField::ReplayGain;
+                if i < app.convert.format.replaygain.options.len()
+                    && app.convert.format.replaygain.options[i].enabled
+                {
+                    app.convert.format.replaygain.selected = i;
+                }
+            }
+            TuiButton::MergePill(i) => {
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::MergeMode;
+                if i < app.convert.output_options.merge.options.len()
+                    && app.convert.output_options.merge.options[i].enabled
+                {
+                    app.convert.output_options.merge.selected = i;
+                }
+            }
+
+            // ── Queue screen buttons ──
+            TuiButton::QueueItem(idx) => {
+                app.selected_index = idx;
+                app.queue_focus = QueueFocus::FileList;
+            }
+            TuiButton::AddFiles | TuiButton::AddFolder => {
+                app.active_overlay = ActiveOverlay::FileInput {
+                    input: String::new(),
+                    cursor_pos: 0,
+                };
+            }
+            TuiButton::Configure => {
+                let has_selected = app.items_snapshot.iter().any(|i| i.selected);
+                app.wizard_target = if has_selected {
+                    WizardTarget::ConfigureSelected
+                } else {
+                    WizardTarget::ConfigureAll
+                };
+                app.wizard = Some(tonepoet_wizard::SimpleWizard::new());
+                app.current_screen = AppScreen::Wizard;
+            }
+            TuiButton::Convert => {
+                if !app.processing_active {
+                    let tx_clone = tx.clone();
+                    start_conversion(app, tx_clone);
+                }
+            }
+            TuiButton::Pause => {
+                if app.processing_active {
+                    if app.manager.is_paused() {
+                        app.manager.resume_conversions();
+                        app.set_status("Resumed conversions");
+                    } else {
+                        app.manager.pause_conversions();
+                        app.set_status("Paused conversions");
+                    }
+                }
+            }
+            TuiButton::Stop => {
+                if app.processing_active {
+                    app.active_overlay = ActiveOverlay::Confirmation {
+                        message: "Stop all active conversions?".to_string(),
+                        action: ConfirmAction::StopAll,
+                    };
+                }
+            }
+            TuiButton::ClearCompleted => {
+                app.manager.clear_completed();
+                app.set_status("Cleared completed items");
+            }
+            TuiButton::RetryFailed => {
+                retry_failed(app);
+            }
+
+            // ── Overlay buttons ──
+            TuiButton::OverlayConfirm => {
+                if let ActiveOverlay::Confirmation { action, .. } = &app.active_overlay {
+                    let action = action.clone();
+                    app.active_overlay = ActiveOverlay::None;
+                    execute_confirm_action(app, &action);
+                }
+            }
+            TuiButton::OverlayCancel => {
+                app.active_overlay = ActiveOverlay::None;
+            }
+
+            _ => {}
+        }
+    }
+}

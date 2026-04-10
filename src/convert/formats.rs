@@ -30,6 +30,8 @@ pub enum AudioFormat {
     Aac,
     /// Opus Interactive Audio Codec
     Opus,
+    /// Apple Lossless Audio Codec
+    Alac,
 }
 
 impl AudioFormat {
@@ -43,9 +45,10 @@ impl AudioFormat {
             Self::Mp3 => "mp3",
             Self::Aac => "m4a",
             Self::Opus => "opus",
+            Self::Alac => "m4a",
         }
     }
-    
+
     /// Get a human-readable name
     pub fn name(&self) -> &'static str {
         match self {
@@ -56,15 +59,16 @@ impl AudioFormat {
             Self::Mp3 => "MP3",
             Self::Aac => "AAC",
             Self::Opus => "Opus",
+            Self::Alac => "ALAC",
         }
     }
-    
+
     /// Check if this is a lossless format
     pub fn is_lossless(&self) -> bool {
-        matches!(self, Self::Flac | Self::Wav | Self::Aiff | Self::WavPack)
+        matches!(self, Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac)
     }
-    
-    /// Get all supported formats
+
+    /// Get all supported output formats
     pub fn all() -> Vec<Self> {
         vec![
             Self::Flac,
@@ -74,6 +78,20 @@ impl AudioFormat {
             Self::Mp3,
             Self::Aac,
             Self::Opus,
+            Self::Alac,
+        ]
+    }
+
+    /// Formats shown as pills in the main TUI convert screen
+    pub fn common_output() -> Vec<Self> {
+        vec![
+            Self::Flac,
+            Self::Opus,
+            Self::Aac,
+            Self::Mp3,
+            Self::Alac,
+            Self::Wav,
+            Self::WavPack,
         ]
     }
 }
@@ -237,6 +255,9 @@ pub enum QualitySettings {
         bitrate: u32, // 6-510 kbps
         complexity: u8, // 0-10
     },
+
+    /// ALAC (lossless, no user-configurable quality)
+    Alac,
 }
 
 impl Default for QualitySettings {
@@ -328,13 +349,13 @@ impl AudioFormat {
     pub fn default_quality(&self) -> QualitySettings {
         match self {
             AudioFormat::Flac => QualitySettings::Flac { compression_level: 5 },
-            AudioFormat::Wav => QualitySettings::Wav { 
-                bit_depth: 16, 
-                sample_rate: 44100 
+            AudioFormat::Wav => QualitySettings::Wav {
+                bit_depth: 16,
+                sample_rate: 44100
             },
-            AudioFormat::Aiff => QualitySettings::Aiff { 
-                bit_depth: 16, 
-                sample_rate: 44100 
+            AudioFormat::Aiff => QualitySettings::Aiff {
+                bit_depth: 16,
+                sample_rate: 44100
             },
             AudioFormat::WavPack => QualitySettings::WavPack {
                 compression_mode: WavPackMode::Normal,
@@ -353,6 +374,7 @@ impl AudioFormat {
                 bitrate: 128,
                 complexity: 10,
             },
+            AudioFormat::Alac => QualitySettings::Alac,
         }
     }
 }

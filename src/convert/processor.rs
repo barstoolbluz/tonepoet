@@ -1472,6 +1472,7 @@ fn create_backend_conversion_item(
         crate::convert::AudioFormat::Mp3 => tonepoet_backend::integration::MainAudioFormat::Mp3,
         crate::convert::AudioFormat::Aac => tonepoet_backend::integration::MainAudioFormat::Aac,
         crate::convert::AudioFormat::Opus => tonepoet_backend::integration::MainAudioFormat::Opus,
+        crate::convert::AudioFormat::Alac => tonepoet_backend::integration::MainAudioFormat::Alac,
     };
     
     // Map quality settings
@@ -1523,11 +1524,14 @@ fn create_backend_conversion_item(
                 super::formats::WavPackMode::High => tonepoet_backend::integration::MainWavPackMode::High,
                 super::formats::WavPackMode::VeryHigh => tonepoet_backend::integration::MainWavPackMode::VeryHigh,
             };
-            tonepoet_backend::integration::MainQualitySettings::WavPack { 
-                compression_mode: mapped_mode, 
-                hybrid_mode: *hybrid_mode, 
-                correction_file: *correction_file 
+            tonepoet_backend::integration::MainQualitySettings::WavPack {
+                compression_mode: mapped_mode,
+                hybrid_mode: *hybrid_mode,
+                correction_file: *correction_file
             }
+        }
+        QualitySettings::Alac => {
+            tonepoet_backend::integration::MainQualitySettings::Alac
         }
     };
     

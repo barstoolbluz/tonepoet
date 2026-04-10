@@ -267,6 +267,7 @@ fn format_description(format: AudioFormat) -> String {
         AudioFormat::Mp3 => "Most compatible lossy format - Small files, good quality",
         AudioFormat::Aac => "Modern lossy format - Better than MP3 at same bitrate",
         AudioFormat::Opus => "Best lossy codec - Excellent quality at low bitrates",
+        AudioFormat::Alac => "Apple Lossless Audio Codec - Lossless compression, Apple ecosystem",
     }.to_string()
 }
 
@@ -297,6 +298,9 @@ fn quality_description(settings: &QualitySettings) -> String {
         }
         QualitySettings::Opus { bitrate, .. } => {
             format!("{} kbps", bitrate)
+        }
+        QualitySettings::Alac => {
+            "Lossless (no configurable quality)".to_string()
         }
     }
 }

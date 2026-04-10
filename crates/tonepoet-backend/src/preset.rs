@@ -52,6 +52,7 @@ pub fn parse_preset_toml(content: &str) -> Result<ConversionSettings> {
         "mp3" => AudioFormat::Mp3,
         "aac" => AudioFormat::Aac,
         "opus" => AudioFormat::Opus,
+        "alac" => AudioFormat::Alac,
         other => return Err(ConversionError::InvalidSettings(
             format!("Unknown audio format: {}", other)
         )),

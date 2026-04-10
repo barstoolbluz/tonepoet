@@ -15,6 +15,7 @@ pub enum AudioFormat {
     Mp3,
     Aac,
     Opus,
+    Alac,
 }
 
 impl AudioFormat {
@@ -28,6 +29,7 @@ impl AudioFormat {
             AudioFormat::Mp3 => false,
             AudioFormat::Aac => false,
             AudioFormat::Opus => false,
+            AudioFormat::Alac => false,
         }
     }
     
@@ -41,6 +43,7 @@ impl AudioFormat {
             AudioFormat::Mp3 => "mp3",
             AudioFormat::Aac => "m4a",
             AudioFormat::Opus => "opus",
+            AudioFormat::Alac => "m4a",
         }
     }
 }

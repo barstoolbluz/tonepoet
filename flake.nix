@@ -94,8 +94,17 @@
             lockFile = ./Cargo.lock;
           };
 
-          nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
-          inherit buildInputs;
+          nativeBuildInputs = nativeBuildInputs ++ [
+            pkgs.makeWrapper
+            pkgs.llvmPackages.libclang
+            pkgs.clang
+          ];
+          buildInputs = buildInputs ++ [
+            (pkgs.ffmpeg_7-full.override { withUnfree = true; })
+          ];
+
+          env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          env.BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.getVersion pkgs.llvmPackages.clang}/include -isystem ${pkgs.glibc.dev}/include";
 
           postInstall = ''
             wrapProgram $out/bin/tonepoet \
@@ -115,7 +124,11 @@
             cargo-watch
             cargo-edit
             rust-analyzer
+            llvmPackages.libclang
+            clang
           ]);
+
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           shellHook = ''
             echo "tonepoet development environment"

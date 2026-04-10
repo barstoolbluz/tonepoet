@@ -1,0 +1,88 @@
+//! Button position tracking for mouse click detection in the TUI
+
+use ratatui::layout::Rect;
+use super::app::ConvertFocus;
+
+/// Identifies a clickable element in the TUI
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TuiButton {
+    // Tab bar (footer)
+    Tab(u8), // 1-5
+
+    // Convert screen panes (click to focus)
+    Pane(ConvertFocus),
+
+    // Convert screen pills
+    FormatPill(usize),
+    RatePill(usize),
+    DepthPill(usize),
+    DitherPill(usize),
+    ReplayGainPill(usize),
+    MergePill(usize),
+
+    // Convert screen controls
+    PresetsButton,
+    SaveButton,
+    AdvancedToggle(ConvertFocus),
+
+    // Queue action bar
+    AddFiles,
+    AddFolder,
+    Configure,
+    Convert,
+    Pause,
+    Stop,
+    ClearCompleted,
+    RetryFailed,
+
+    // Queue items
+    QueueItem(usize),
+
+    // Overlay buttons
+    OverlayConfirm,
+    OverlayCancel,
+}
+
+/// Maps rendered button positions to their identities for mouse click detection
+#[derive(Debug, Clone)]
+pub struct ButtonRenderMap {
+    button_bounds: Vec<(TuiButton, Rect)>,
+}
+
+impl ButtonRenderMap {
+    pub fn new() -> Self {
+        Self {
+            button_bounds: Vec::new(),
+        }
+    }
+
+    /// Clear all recorded button positions (call at start of each render)
+    pub fn clear(&mut self) {
+        self.button_bounds.clear();
+    }
+
+    /// Record that a button was rendered at the given screen coordinates
+    pub fn record_button(&mut self, button: TuiButton, screen_rect: Rect) {
+        self.button_bounds.push((button, screen_rect));
+    }
+
+    /// Find which button (if any) contains the given screen coordinates.
+    /// Returns the LAST recorded button at that position (topmost in draw order).
+    pub fn find_button_at(&self, x: u16, y: u16) -> Option<TuiButton> {
+        // Iterate in reverse so overlays/later-drawn elements take priority
+        for (button, rect) in self.button_bounds.iter().rev() {
+            if x >= rect.x && x < rect.x + rect.width
+                && y >= rect.y && y < rect.y + rect.height
+            {
+                return Some(*button);
+            }
+        }
+        None
+    }
+}
+
+impl Default for ButtonRenderMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}

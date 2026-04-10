@@ -127,6 +127,10 @@ pub fn extract_wizard_settings(wizard: &tonepoet_wizard::SimpleWizard) -> (Audio
                 correction_file: false,
             }
         },
+
+        AudioFormat::Alac => {
+            QualitySettings::Alac
+        },
     };
     
     // Extract destination path from wizard
@@ -379,6 +383,7 @@ pub fn preset_to_conversion_options(
         BackendFormat::Mp3 => AudioFormat::Mp3,
         BackendFormat::Aac => AudioFormat::Aac,
         BackendFormat::Opus => AudioFormat::Opus,
+        BackendFormat::Alac => AudioFormat::Alac,
     };
 
     // Convert quality settings based on format
@@ -444,6 +449,9 @@ pub fn preset_to_conversion_options(
             };
             let complexity = 10; // Maximum quality
             QualitySettings::Opus { bitrate, complexity }
+        }
+        AudioFormat::Alac => {
+            QualitySettings::Alac
         }
     };
 

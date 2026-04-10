@@ -87,6 +87,9 @@ enum Commands {
         generate_cue: bool,
     },
 
+    /// Launch full interactive TUI
+    Tui,
+
     /// Launch interactive TUI wizard
     Wizard,
 
@@ -121,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
     let config = TonepoetConfig::load().unwrap_or_default();
 
     match cli.command {
+        Commands::Tui => {
+            run_tui(config).await?;
+        }
         Commands::Convert {
             paths, format, output, workers, replaygain,
             archive_password, preset, compression_level, bitrate,
@@ -157,7 +163,8 @@ fn parse_format(s: &str) -> anyhow::Result<AudioFormat> {
         "mp3" => Ok(AudioFormat::Mp3),
         "aac" | "m4a" => Ok(AudioFormat::Aac),
         "opus" => Ok(AudioFormat::Opus),
-        _ => anyhow::bail!("Unknown format: {}. Supported: flac, wav, aiff, wavpack, mp3, aac, opus", s),
+        "alac" => Ok(AudioFormat::Alac),
+        _ => anyhow::bail!("Unknown format: {}. Supported: flac, wav, aiff, wavpack, mp3, aac, opus, alac", s),
     }
 }
 
@@ -593,4 +600,38 @@ fn run_config(show: bool, reset: bool, path: bool, config: &TonepoetConfig) -> a
     }
 
     Ok(())
+}
+
+async fn run_tui(config: TonepoetConfig) -> anyhow::Result<()> {
+    use crossterm::{
+        event::{EnableMouseCapture, DisableMouseCapture},
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    };
+    use ratatui::prelude::*;
+    use tonepoet::tui::app::AppState;
+    use tonepoet::tui::event_loop::run_app;
+
+    // Set up terminal
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app state
+    let mut app = AppState::new(config);
+
+    // Create message channel
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+    // Run the event loop
+    let result = run_app(&mut terminal, &mut app, tx, rx).await;
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    terminal.show_cursor()?;
+
+    result.map_err(|e| anyhow::anyhow!("{}", e))
 }

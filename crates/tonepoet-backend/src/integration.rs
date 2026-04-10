@@ -17,6 +17,7 @@ pub fn map_conversion_item_to_settings(item: &ConversionItem) -> ConversionSetti
         MainAudioFormat::Mp3 => AudioFormat::Mp3,
         MainAudioFormat::Aac => AudioFormat::Aac,
         MainAudioFormat::Opus => AudioFormat::Opus,
+        MainAudioFormat::Alac => AudioFormat::Alac,
     };
     
     // Extract settings from quality settings
@@ -60,6 +61,9 @@ pub fn map_conversion_item_to_settings(item: &ConversionItem) -> ConversionSetti
                     MainWavPackMode::VeryHigh => Some(6),
                 };
                 (None, compression_level, None, None, None, None)
+            },
+            MainQualitySettings::Alac => {
+                (None, None, None, None, None, None)
             },
         };
 
@@ -233,7 +237,7 @@ pub struct ConversionItem {
 
 #[derive(Debug, Clone, Copy)]
 pub enum MainAudioFormat {
-    Flac, Wav, Aiff, WavPack, Mp3, Aac, Opus,
+    Flac, Wav, Aiff, WavPack, Mp3, Aac, Opus, Alac,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,6 +272,7 @@ pub enum MainQualitySettings {
     Mp3 { bitrate_mode: MainMp3BitrateMode, quality: u8 },
     Aac { bitrate: u32, profile: MainAacProfile },
     Opus { bitrate: u32, complexity: u8 },
+    Alac,
 }
 
 #[derive(Debug, Clone, Copy)]
