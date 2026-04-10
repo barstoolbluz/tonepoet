@@ -39,14 +39,17 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
     let mut lines: Vec<Line> = Vec::new();
 
     // Check if we're in naming mode
-    if let Some((input, cursor_pos)) = &preset.naming_input {
+    if let Some(input) = &preset.naming_input {
         lines.push(Line::from(Span::styled(
             "save as:",
             Style::default().fg(theme::TEXT_MUTED),
         )));
+        // Scrolled view: leave 2 cols for leading/trailing space
+        let visible_width = (inner.width as usize).saturating_sub(2);
+        let (view, cursor_col) = input.view(visible_width);
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {} ", input),
+                format!(" {} ", view),
                 Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE),
             ),
         ]));
@@ -61,8 +64,8 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
         let p = Paragraph::new(lines);
         f.render_widget(p, inner);
 
-        // Position cursor
-        f.set_cursor(inner.x + 1 + *cursor_pos as u16, inner.y + 1);
+        // Position cursor (after the leading space)
+        f.set_cursor(inner.x + 1 + cursor_col, inner.y + 1);
         return;
     }
 

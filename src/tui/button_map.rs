@@ -3,6 +3,16 @@
 use ratatui::layout::Rect;
 use super::app::ConvertFocus;
 
+/// Which metadata field is being referenced (for clicks and edit overlays)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MetadataFieldKind {
+    Title,
+    Artist,
+    Album,
+    Genre,
+    Year,
+}
+
 /// Identifies a clickable element in the TUI
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TuiButton {
@@ -24,6 +34,12 @@ pub enum TuiButton {
     PresetsButton,
     SaveButton,
     AdvancedToggle(ConvertFocus),
+
+    // Convert screen editable fields
+    DestPathField,
+    FolderTemplateField,
+    FilenameTemplateField,
+    MetadataField(MetadataFieldKind),
 
     // Queue action bar
     AddFiles,

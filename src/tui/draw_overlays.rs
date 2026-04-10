@@ -28,13 +28,18 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::ItemInfo { ref item } => {
             draw_item_info(f, item);
         }
-        ActiveOverlay::FileInput { ref input, cursor_pos } => {
+        ActiveOverlay::FileInput { ref input } => {
             let input = input.clone();
-            draw_file_input(f, &input, cursor_pos);
+            draw_file_input(f, &input);
         }
-        ActiveOverlay::CommandInput { ref input, cursor_pos } => {
+        ActiveOverlay::CommandInput { ref input } => {
             let input = input.clone();
-            draw_command_input(f, &input, cursor_pos);
+            draw_command_input(f, &input);
+        }
+        ActiveOverlay::TextEdit { ref input, ref label, .. } => {
+            let input = input.clone();
+            let label = label.clone();
+            draw_text_edit(f, &label, &input);
         }
     }
 
@@ -195,7 +200,7 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
 }
 
 /// Draw file input overlay for adding files
-fn draw_file_input(f: &mut Frame, input: &str, cursor_pos: usize) {
+fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
     let area = f.size();
     let popup = centered_rect(60, 7, area);
 
@@ -221,19 +226,17 @@ fn draw_file_input(f: &mut Frame, input: &str, cursor_pos: usize) {
     ]));
     f.render_widget(hint, chunks[0]);
 
-    // Input field with cursor
-    let display_input = if input.is_empty() { " " } else { input };
+    // Scrolled view of the input
+    let visible_width = chunks[1].width as usize;
+    let (view, cursor_col) = input.view(visible_width);
+    let display_input = if view.is_empty() { " ".to_string() } else { view };
     let input_widget = Paragraph::new(Line::from(vec![
-        Span::styled(display_input.to_string(), Style::default().fg(Color::White)),
+        Span::styled(display_input, Style::default().fg(Color::White)),
     ]))
     .style(Style::default().bg(Color::Rgb(40, 40, 40)));
     f.render_widget(input_widget, chunks[1]);
 
-    // Position cursor
-    f.set_cursor(
-        chunks[1].x + cursor_pos as u16,
-        chunks[1].y,
-    );
+    f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
 
     let help = Paragraph::new(Line::from(vec![
         Span::styled("Enter to confirm, Esc to cancel", Style::default().fg(Color::DarkGray)),
@@ -241,8 +244,63 @@ fn draw_file_input(f: &mut Frame, input: &str, cursor_pos: usize) {
     f.render_widget(help, chunks[2]);
 }
 
+/// Draw a generic text edit overlay (for editing a single field)
+fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInputState) {
+    let area = f.size();
+    // Dynamic popup width: 80 if terminal allows it, otherwise shrink to fit.
+    // Reserve 4 cols of margin (2 each side) when room allows.
+    let popup_width = area.width.saturating_sub(4).min(80);
+    let popup = centered_rect(popup_width, 7, area);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(Span::styled(
+            format!(" Edit {} ", label),
+            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // hint
+            Constraint::Length(1), // input
+            Constraint::Length(1), // help
+        ])
+        .split(inner);
+
+    let hint = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("Enter new {}:", label),
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+    f.render_widget(hint, chunks[0]);
+
+    let visible_width = chunks[1].width as usize;
+    let (view, cursor_col) = input.view(visible_width);
+    let display_input = if view.is_empty() { " ".to_string() } else { view };
+    let input_widget = Paragraph::new(Line::from(vec![Span::styled(
+        display_input,
+        Style::default().fg(Color::White),
+    )]))
+    .style(Style::default().bg(Color::Rgb(40, 40, 40)));
+    f.render_widget(input_widget, chunks[1]);
+
+    f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
+
+    let help = Paragraph::new(Line::from(vec![Span::styled(
+        "Enter to save, Esc to cancel",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    f.render_widget(help, chunks[2]);
+}
+
 /// Draw the vim-style command line at the bottom of the screen
-fn draw_command_input(f: &mut Frame, input: &str, cursor_pos: usize) {
+fn draw_command_input(f: &mut Frame, input: &super::text_input::TextInputState) {
     let area = f.size();
     // Command line occupies the very last row
     let cmd_area = Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1);
@@ -250,10 +308,14 @@ fn draw_command_input(f: &mut Frame, input: &str, cursor_pos: usize) {
     // Clear the line
     f.render_widget(Clear, cmd_area);
 
+    // Leave 1 col for ":" prefix
+    let visible_width = (cmd_area.width as usize).saturating_sub(1);
+    let (view, cursor_col) = input.view(visible_width);
+
     // Render ": <input>"
     let line = Line::from(vec![
         Span::styled(":", Style::default().fg(Color::Rgb(122, 162, 247))), // blue
-        Span::styled(input.to_string(), Style::default().fg(Color::Rgb(192, 202, 245))), // bright
+        Span::styled(view, Style::default().fg(Color::Rgb(192, 202, 245))), // bright
     ]);
 
     let cmd = Paragraph::new(line)
@@ -261,5 +323,5 @@ fn draw_command_input(f: &mut Frame, input: &str, cursor_pos: usize) {
     f.render_widget(cmd, cmd_area);
 
     // Position cursor after the ':'
-    f.set_cursor(cmd_area.x + 1 + cursor_pos as u16, cmd_area.y);
+    f.set_cursor(cmd_area.x + 1 + cursor_col, cmd_area.y);
 }

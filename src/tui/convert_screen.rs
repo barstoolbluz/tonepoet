@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use super::app::{AppState, ConvertFocus};
-use super::button_map::{ButtonRenderMap, TuiButton};
+use super::button_map::{ButtonRenderMap, MetadataFieldKind, TuiButton};
 use super::draw_header::draw_header;
 use super::draw_preset_bar::draw_preset_bar;
 use super::draw_source::draw_source_pane;
@@ -36,7 +36,11 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
 
     // Pass 1: Draw everything (immutable reads from app state)
     draw_header(f, chunks[0]);
-    draw_preset_bar(f, chunks[2], &app.preset);
+    {
+        let preset = &app.preset;
+        let buttons = &mut app.button_map;
+        draw_preset_bar(f, chunks[2], preset, buttons);
+    }
     draw_source_pane(
         f, chunks[4], &app.convert.source,
         app.convert.focus == ConvertFocus::Source,
@@ -126,6 +130,83 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
             buttons.record_button(TuiButton::Tab(i as u8 + 1), Rect::new(x, tab_row_y, tab_w, 1));
         }
     }
+
+    // Advanced toggle buttons (top border of each pane)
+    // The "a dvanced" text spans 8 chars at area.x + area.width - 10
+    register_advanced_toggle(&mut app.button_map, source_area, ConvertFocus::Source);
+    register_advanced_toggle(&mut app.button_map, metadata_area, ConvertFocus::Metadata);
+    register_advanced_toggle(&mut app.button_map, format_area, ConvertFocus::Format);
+    register_advanced_toggle(&mut app.button_map, output_options_area, ConvertFocus::OutputOptions);
+
+    // Output options editable text fields (rows 1-3 of the pane)
+    {
+        let buttons = &mut app.button_map;
+        let inner_x = output_options_area.x + 1;
+        let inner_w = output_options_area.width.saturating_sub(2);
+        buttons.record_button(
+            TuiButton::DestPathField,
+            Rect::new(inner_x, output_options_area.y + 1, inner_w, 1),
+        );
+        buttons.record_button(
+            TuiButton::FolderTemplateField,
+            Rect::new(inner_x, output_options_area.y + 2, inner_w, 1),
+        );
+        buttons.record_button(
+            TuiButton::FilenameTemplateField,
+            Rect::new(inner_x, output_options_area.y + 3, inner_w, 1),
+        );
+    }
+
+    // Metadata editable fields (rows 1-3 of the pane)
+    // Row 1: title (full width)
+    // Row 2: artist (left half) + album (right half)
+    // Row 3: genre (left half) + year (right half)
+    {
+        let buttons = &mut app.button_map;
+        let inner_x = metadata_area.x + 1;
+        let inner_w = metadata_area.width.saturating_sub(2);
+        let half_w = inner_w / 2;
+
+        // Row 1: title (full width)
+        buttons.record_button(
+            TuiButton::MetadataField(MetadataFieldKind::Title),
+            Rect::new(inner_x, metadata_area.y + 1, inner_w, 1),
+        );
+        // Row 2: artist (left half), album (right half)
+        buttons.record_button(
+            TuiButton::MetadataField(MetadataFieldKind::Artist),
+            Rect::new(inner_x, metadata_area.y + 2, half_w, 1),
+        );
+        buttons.record_button(
+            TuiButton::MetadataField(MetadataFieldKind::Album),
+            Rect::new(inner_x + half_w, metadata_area.y + 2, inner_w - half_w, 1),
+        );
+        // Row 3: genre (left half), year (right half)
+        buttons.record_button(
+            TuiButton::MetadataField(MetadataFieldKind::Genre),
+            Rect::new(inner_x, metadata_area.y + 3, half_w, 1),
+        );
+        buttons.record_button(
+            TuiButton::MetadataField(MetadataFieldKind::Year),
+            Rect::new(inner_x + half_w, metadata_area.y + 3, inner_w - half_w, 1),
+        );
+    }
+}
+
+/// Register an "advanced" toggle button at the top-right of a pane.
+/// Text layout: "...─── a dvanced ┐"
+/// Clickable "advanced" spans 8 chars starting at area.x + area.width - 10.
+fn register_advanced_toggle(
+    buttons: &mut ButtonRenderMap,
+    pane_area: Rect,
+    focus: ConvertFocus,
+) {
+    if pane_area.width < 12 {
+        return;
+    }
+    let x = pane_area.x + pane_area.width - 10;
+    let rect = Rect::new(x, pane_area.y, 8, 1);
+    buttons.record_button(TuiButton::AdvancedToggle(focus), rect);
 }
 
 /// Register button areas for each pill in a row.

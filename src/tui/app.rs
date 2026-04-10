@@ -488,7 +488,7 @@ pub struct PresetState {
     pub overlay_list: Vec<String>,
     pub overlay_selected: usize,
     /// Text input for "save as new" within the overlay
-    pub naming_input: Option<(String, usize)>, // (text, cursor_pos)
+    pub naming_input: Option<crate::tui::text_input::TextInputState>,
 }
 
 impl PresetState {
@@ -550,13 +550,29 @@ pub enum ActiveOverlay {
         item: ConversionItem,
     },
     FileInput {
-        input: String,
-        cursor_pos: usize,
+        input: crate::tui::text_input::TextInputState,
     },
     CommandInput {
-        input: String,
-        cursor_pos: usize,
+        input: crate::tui::text_input::TextInputState,
     },
+    TextEdit {
+        input: crate::tui::text_input::TextInputState,
+        target: TextEditTarget,
+        label: String,
+    },
+}
+
+/// Which field a TextEdit overlay is editing
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TextEditTarget {
+    DestPath,
+    FolderTemplate,
+    FilenameTemplate,
+    MetaTitle,
+    MetaArtist,
+    MetaAlbum,
+    MetaGenre,
+    MetaYear,
 }
 
 /// What action a confirmation dialog will perform

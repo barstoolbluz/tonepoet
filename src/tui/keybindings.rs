@@ -52,8 +52,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             // Command mode
             (KeyCode::Char(':'), KeyModifiers::SHIFT) | (KeyCode::Char(':'), KeyModifiers::NONE) => {
                 app.active_overlay = ActiveOverlay::CommandInput {
-                    input: String::new(),
-                    cursor_pos: 0,
+                    input: super::text_input::TextInputState::empty(),
                 };
                 return;
             }
@@ -158,21 +157,15 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source =>
         {
+            let initial = app
+                .convert
+                .source
+                .file_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
             app.active_overlay = ActiveOverlay::FileInput {
-                input: app
-                    .convert
-                    .source
-                    .file_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-                cursor_pos: app
-                    .convert
-                    .source
-                    .file_path
-                    .as_ref()
-                    .map(|p| p.display().to_string().len())
-                    .unwrap_or(0),
+                input: super::text_input::TextInputState::new(initial),
             };
         }
 
@@ -231,7 +224,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 // No active preset — open overlay in naming mode
                 app.preset.overlay_list = super::presets::list_presets();
                 app.preset.overlay_selected = 0;
-                app.preset.naming_input = Some((String::new(), 0));
+                app.preset.naming_input = Some(super::text_input::TextInputState::empty());
                 app.preset.overlay_open = true;
             }
         }
@@ -244,10 +237,10 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
 
 fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
     // If in naming mode, handle text input
-    if let Some((ref mut input, ref mut cursor_pos)) = app.preset.naming_input {
+    if let Some(input) = &mut app.preset.naming_input {
         match key.code {
             KeyCode::Enter => {
-                let name = input.trim().to_string();
+                let name = input.text.trim().to_string();
                 if name.is_empty() {
                     app.preset.naming_input = None;
                     return;
@@ -274,25 +267,9 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
             KeyCode::Esc => {
                 app.preset.naming_input = None;
             }
-            KeyCode::Char(c) => {
-                input.insert(*cursor_pos, c);
-                *cursor_pos += 1;
+            _ => {
+                super::text_input::handle_text_input_key(input, &key);
             }
-            KeyCode::Backspace => {
-                if *cursor_pos > 0 {
-                    *cursor_pos -= 1;
-                    input.remove(*cursor_pos);
-                }
-            }
-            KeyCode::Left => {
-                *cursor_pos = cursor_pos.saturating_sub(1);
-            }
-            KeyCode::Right => {
-                if *cursor_pos < input.len() {
-                    *cursor_pos += 1;
-                }
-            }
-            _ => {}
         }
         return;
     }
@@ -334,7 +311,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
         }
         KeyCode::Char('n') => {
             // Save as new preset
-            app.preset.naming_input = Some((String::new(), 0));
+            app.preset.naming_input = Some(super::text_input::TextInputState::empty());
         }
         KeyCode::Char('d') => {
             // Duplicate selected preset
@@ -462,8 +439,7 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
         // Add files
         (KeyCode::Char('a'), KeyModifiers::NONE) | (KeyCode::Char('f'), KeyModifiers::NONE) => {
             app.active_overlay = ActiveOverlay::FileInput {
-                input: String::new(),
-                cursor_pos: 0,
+                input: super::text_input::TextInputState::empty(),
             };
         }
 
@@ -621,12 +597,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 app.active_overlay = ActiveOverlay::None;
             }
         }
-        ActiveOverlay::FileInput { mut input, mut cursor_pos } => {
+        ActiveOverlay::FileInput { mut input } => {
             match key.code {
                 KeyCode::Enter => {
-                    let path = std::path::PathBuf::from(input.trim());
+                    let path = std::path::PathBuf::from(input.text.trim());
                     app.active_overlay = ActiveOverlay::None;
-                    if !input.trim().is_empty() {
+                    if !input.text.trim().is_empty() {
                         handle_file_input(app, &path);
                     }
                     return;
@@ -635,45 +611,18 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.active_overlay = ActiveOverlay::None;
                     return;
                 }
-                KeyCode::Char(c) => {
-                    input.insert(cursor_pos, c);
-                    cursor_pos += 1;
+                _ => {
+                    super::text_input::handle_text_input_key(&mut input, &key);
                 }
-                KeyCode::Backspace => {
-                    if cursor_pos > 0 {
-                        cursor_pos -= 1;
-                        input.remove(cursor_pos);
-                    }
-                }
-                KeyCode::Delete => {
-                    if cursor_pos < input.len() {
-                        input.remove(cursor_pos);
-                    }
-                }
-                KeyCode::Left => {
-                    cursor_pos = cursor_pos.saturating_sub(1);
-                }
-                KeyCode::Right => {
-                    if cursor_pos < input.len() {
-                        cursor_pos += 1;
-                    }
-                }
-                KeyCode::Home => {
-                    cursor_pos = 0;
-                }
-                KeyCode::End => {
-                    cursor_pos = input.len();
-                }
-                _ => {}
             }
-            app.active_overlay = ActiveOverlay::FileInput { input, cursor_pos };
+            app.active_overlay = ActiveOverlay::FileInput { input };
         }
-        ActiveOverlay::CommandInput { mut input, mut cursor_pos } => {
+        ActiveOverlay::CommandInput { mut input } => {
             match key.code {
                 KeyCode::Enter => {
                     app.active_overlay = ActiveOverlay::None;
-                    if !input.trim().is_empty() {
-                        let cmd = super::command::parse_command(&input);
+                    if !input.text.trim().is_empty() {
+                        let cmd = super::command::parse_command(&input.text);
                         super::command::execute_command(app, cmd, tx);
                     }
                     return;
@@ -682,40 +631,68 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.active_overlay = ActiveOverlay::None;
                     return;
                 }
-                KeyCode::Char(c) => {
-                    input.insert(cursor_pos, c);
-                    cursor_pos += 1;
+                _ => {
+                    super::text_input::handle_text_input_key(&mut input, &key);
                 }
-                KeyCode::Backspace => {
-                    if cursor_pos > 0 {
-                        cursor_pos -= 1;
-                        input.remove(cursor_pos);
-                    }
-                }
-                KeyCode::Delete => {
-                    if cursor_pos < input.len() {
-                        input.remove(cursor_pos);
-                    }
-                }
-                KeyCode::Left => {
-                    cursor_pos = cursor_pos.saturating_sub(1);
-                }
-                KeyCode::Right => {
-                    if cursor_pos < input.len() {
-                        cursor_pos += 1;
-                    }
-                }
-                KeyCode::Home => {
-                    cursor_pos = 0;
-                }
-                KeyCode::End => {
-                    cursor_pos = input.len();
-                }
-                _ => {}
             }
-            app.active_overlay = ActiveOverlay::CommandInput { input, cursor_pos };
+            app.active_overlay = ActiveOverlay::CommandInput { input };
+        }
+        ActiveOverlay::TextEdit { mut input, target, label } => {
+            match key.code {
+                KeyCode::Enter => {
+                    let text = input.text.clone();
+                    apply_text_edit(app, target, &text);
+                    app.active_overlay = ActiveOverlay::None;
+                    return;
+                }
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                    return;
+                }
+                _ => {
+                    super::text_input::handle_text_input_key(&mut input, &key);
+                }
+            }
+            app.active_overlay = ActiveOverlay::TextEdit { input, target, label };
         }
         ActiveOverlay::None => {}
+    }
+}
+
+/// Apply a text edit to the target field, setting modified flag as needed
+fn apply_text_edit(app: &mut AppState, target: TextEditTarget, value: &str) {
+    let trimmed = value.trim();
+    let value_opt = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+
+    match target {
+        TextEditTarget::DestPath => {
+            // dest_path is not in the preset, don't mark modified
+            app.convert.output_options.dest_path =
+                if trimmed.is_empty() { None } else { Some(std::path::PathBuf::from(trimmed)) };
+        }
+        TextEditTarget::FolderTemplate => {
+            app.convert.output_options.folder_template = trimmed.to_string();
+            app.preset.mark_modified();
+        }
+        TextEditTarget::FilenameTemplate => {
+            app.convert.output_options.filename_template = trimmed.to_string();
+            app.preset.mark_modified();
+        }
+        TextEditTarget::MetaTitle => {
+            app.convert.metadata.title = value_opt;
+        }
+        TextEditTarget::MetaArtist => {
+            app.convert.metadata.artist = value_opt;
+        }
+        TextEditTarget::MetaAlbum => {
+            app.convert.metadata.album = value_opt;
+        }
+        TextEditTarget::MetaGenre => {
+            app.convert.metadata.genre = value_opt;
+        }
+        TextEditTarget::MetaYear => {
+            app.convert.metadata.year = value_opt;
+        }
     }
 }
 
@@ -932,6 +909,124 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
 
+            // ── Convert screen: preset bar ──
+            TuiButton::PresetsButton => {
+                app.preset.overlay_list = super::presets::list_presets();
+                app.preset.overlay_selected = 0;
+                app.preset.naming_input = None;
+                app.preset.overlay_open = true;
+            }
+            TuiButton::SaveButton => {
+                if let Some(name) = &app.preset.active_preset.clone() {
+                    let preset = super::presets::TuiPreset::from_pill_state(
+                        name,
+                        &app.convert.format,
+                        &app.convert.output_options,
+                    );
+                    match super::presets::save_preset(&preset) {
+                        Ok(_) => {
+                            app.preset.modified = false;
+                            app.set_status(format!("Saved preset: {}", name));
+                        }
+                        Err(e) => app.set_status(format!("Save failed: {}", e)),
+                    }
+                } else {
+                    // No active preset — open overlay in naming mode
+                    app.preset.overlay_list = super::presets::list_presets();
+                    app.preset.overlay_selected = 0;
+                    app.preset.naming_input = Some(super::text_input::TextInputState::empty());
+                    app.preset.overlay_open = true;
+                }
+            }
+
+            // ── Convert screen: editable text fields ──
+            TuiButton::DestPathField => {
+                let initial = app.convert.output_options.dest_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.active_overlay = ActiveOverlay::TextEdit {
+                    input: super::text_input::TextInputState::new(initial),
+                    target: TextEditTarget::DestPath,
+                    label: "destination path".to_string(),
+                };
+            }
+            TuiButton::FolderTemplateField => {
+                let initial = app.convert.output_options.folder_template.clone();
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.active_overlay = ActiveOverlay::TextEdit {
+                    input: super::text_input::TextInputState::new(initial),
+                    target: TextEditTarget::FolderTemplate,
+                    label: "folder template".to_string(),
+                };
+            }
+            TuiButton::FilenameTemplateField => {
+                let initial = app.convert.output_options.filename_template.clone();
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.active_overlay = ActiveOverlay::TextEdit {
+                    input: super::text_input::TextInputState::new(initial),
+                    target: TextEditTarget::FilenameTemplate,
+                    label: "filename template".to_string(),
+                };
+            }
+            TuiButton::MetadataField(field) => {
+                use super::button_map::MetadataFieldKind::*;
+                let (initial, target, label) = match field {
+                    Title => (
+                        app.convert.metadata.title.clone().unwrap_or_default(),
+                        TextEditTarget::MetaTitle,
+                        "title",
+                    ),
+                    Artist => (
+                        app.convert.metadata.artist.clone().unwrap_or_default(),
+                        TextEditTarget::MetaArtist,
+                        "artist",
+                    ),
+                    Album => (
+                        app.convert.metadata.album.clone().unwrap_or_default(),
+                        TextEditTarget::MetaAlbum,
+                        "album",
+                    ),
+                    Genre => (
+                        app.convert.metadata.genre.clone().unwrap_or_default(),
+                        TextEditTarget::MetaGenre,
+                        "genre",
+                    ),
+                    Year => (
+                        app.convert.metadata.year.clone().unwrap_or_default(),
+                        TextEditTarget::MetaYear,
+                        "year",
+                    ),
+                };
+                app.convert.focus = ConvertFocus::Metadata;
+                app.active_overlay = ActiveOverlay::TextEdit {
+                    input: super::text_input::TextInputState::new(initial),
+                    target,
+                    label: label.to_string(),
+                };
+            }
+
+            // ── Convert screen: advanced toggle per pane ──
+            TuiButton::AdvancedToggle(focus) => {
+                app.convert.focus = focus;
+                match focus {
+                    ConvertFocus::Source => {
+                        app.convert.source.advanced_open = !app.convert.source.advanced_open;
+                    }
+                    ConvertFocus::Metadata => {
+                        app.convert.metadata.advanced_open = !app.convert.metadata.advanced_open;
+                    }
+                    ConvertFocus::Format => {
+                        app.convert.format.advanced_open = !app.convert.format.advanced_open;
+                    }
+                    ConvertFocus::OutputOptions => {
+                        app.convert.output_options.advanced_open =
+                            !app.convert.output_options.advanced_open;
+                    }
+                }
+            }
+
             // ── Convert screen: format pane pills ──
             TuiButton::FormatPill(i) => {
                 app.convert.focus = ConvertFocus::Format;
@@ -1002,8 +1097,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::AddFiles | TuiButton::AddFolder => {
                 app.active_overlay = ActiveOverlay::FileInput {
-                    input: String::new(),
-                    cursor_pos: 0,
+                    input: super::text_input::TextInputState::empty(),
                 };
             }
             TuiButton::Configure => {
@@ -1060,8 +1154,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::OverlayCancel => {
                 app.active_overlay = ActiveOverlay::None;
             }
-
-            _ => {}
         }
     }
 }
