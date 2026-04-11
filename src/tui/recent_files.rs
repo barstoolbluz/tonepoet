@@ -83,6 +83,14 @@ impl RecentFilesState {
     /// Record a file as recently used: prepend (deduping), trim to MAX_ENTRIES,
     /// persist to disk. Safe to call frequently.
     pub fn record_use(&mut self, path: &Path) {
+        self.record_use_in_memory(path);
+        let _ = self.save();
+    }
+
+    /// In-memory half of `record_use`: state mutation only, no disk IO.
+    /// Extracted so unit tests can exercise the logic without touching the
+    /// filesystem.
+    fn record_use_in_memory(&mut self, path: &Path) {
         // Remove any existing entry for the same path.
         self.entries.retain(|e| e.path != path);
         // Prepend the new entry.
@@ -96,23 +104,30 @@ impl RecentFilesState {
         if self.overlay_scroll >= self.entries.len() {
             self.overlay_scroll = 0;
         }
-        // Persist.
-        let _ = self.save();
     }
 
     /// Remove the entry at `index`. Persists to disk.
     pub fn remove(&mut self, index: usize) {
-        if index < self.entries.len() {
-            self.entries.remove(index);
-            if self.overlay_selected >= self.entries.len() && self.overlay_selected > 0 {
-                self.overlay_selected = self.entries.len().saturating_sub(1);
-            }
-            if self.overlay_scroll > 0 && self.overlay_scroll >= self.entries.len() {
-                self.overlay_scroll = self.entries.len().saturating_sub(1);
-            }
-            self.ensure_visible();
+        if self.remove_in_memory(index) {
             let _ = self.save();
         }
+    }
+
+    /// In-memory half of `remove`: state mutation only, no disk IO.
+    /// Returns true if the index was valid and an entry was removed.
+    fn remove_in_memory(&mut self, index: usize) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
+        self.entries.remove(index);
+        if self.overlay_selected >= self.entries.len() && self.overlay_selected > 0 {
+            self.overlay_selected = self.entries.len().saturating_sub(1);
+        }
+        if self.overlay_scroll > 0 && self.overlay_scroll >= self.entries.len() {
+            self.overlay_scroll = self.entries.len().saturating_sub(1);
+        }
+        self.ensure_visible();
+        true
     }
 
     /// Persist current entries to disk. Best-effort: returns Err on I/O failure
@@ -208,3 +223,250 @@ impl RecentFilesState {
         self.overlay_open = false;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a state with N dummy entries [/tmp/0, /tmp/1, ...] and a given
+    /// visible_rows budget, without touching disk.
+    fn make_state(n: usize, visible_rows: usize) -> RecentFilesState {
+        let mut s = RecentFilesState::default();
+        s.entries = (0..n)
+            .map(|i| RecentEntry {
+                path: PathBuf::from(format!("/tmp/{}", i)),
+                timestamp: i as u64,
+            })
+            .collect();
+        s.overlay_visible_rows = visible_rows;
+        s
+    }
+
+    // ── Navigation: move_up / move_down ──────────────────────────────
+
+    #[test]
+    fn move_down_advances_within_visible_window() {
+        let mut s = make_state(10, 5);
+        assert_eq!(s.overlay_selected, 0);
+        assert_eq!(s.overlay_scroll, 0);
+        s.overlay_move_down();
+        assert_eq!(s.overlay_selected, 1);
+        assert_eq!(s.overlay_scroll, 0); // still visible
+    }
+
+    #[test]
+    fn move_down_scrolls_when_cursor_leaves_window() {
+        let mut s = make_state(10, 5);
+        // Move down 5 times: cursor goes 0→1→2→3→4→5.
+        // At 5, cursor is at (0 + 5) which equals scroll(0) + visible(5) → must scroll.
+        for _ in 0..5 {
+            s.overlay_move_down();
+        }
+        assert_eq!(s.overlay_selected, 5);
+        assert_eq!(s.overlay_scroll, 1); // scrolled by one
+    }
+
+    #[test]
+    fn move_down_stops_at_last_entry() {
+        let mut s = make_state(3, 5);
+        for _ in 0..10 {
+            s.overlay_move_down();
+        }
+        assert_eq!(s.overlay_selected, 2); // last valid index
+    }
+
+    #[test]
+    fn move_up_from_zero_is_noop() {
+        let mut s = make_state(5, 5);
+        s.overlay_move_up();
+        assert_eq!(s.overlay_selected, 0);
+    }
+
+    #[test]
+    fn move_up_scrolls_when_cursor_leaves_top() {
+        let mut s = make_state(10, 3);
+        // Scroll down to position 5 (scroll should be 3).
+        for _ in 0..5 {
+            s.overlay_move_down();
+        }
+        assert_eq!(s.overlay_selected, 5);
+        assert_eq!(s.overlay_scroll, 3);
+        // Now move up past the visible window (cursor goes to 2, scroll must follow).
+        for _ in 0..3 {
+            s.overlay_move_up();
+        }
+        assert_eq!(s.overlay_selected, 2);
+        assert_eq!(s.overlay_scroll, 2);
+    }
+
+    // ── Navigation: page_up / page_down ──────────────────────────────
+
+    #[test]
+    fn page_down_jumps_visible_rows() {
+        let mut s = make_state(20, 5);
+        s.overlay_page_down();
+        assert_eq!(s.overlay_selected, 5);
+        assert_eq!(s.overlay_scroll, 1); // cursor just past visible (0..5) → scroll to 1
+    }
+
+    #[test]
+    fn page_down_clamps_to_last() {
+        let mut s = make_state(7, 5);
+        s.overlay_page_down();
+        s.overlay_page_down();
+        assert_eq!(s.overlay_selected, 6); // clamped to len-1
+    }
+
+    #[test]
+    fn page_up_at_top_is_noop_on_selection() {
+        let mut s = make_state(20, 5);
+        s.overlay_page_up();
+        assert_eq!(s.overlay_selected, 0);
+        assert_eq!(s.overlay_scroll, 0);
+    }
+
+    #[test]
+    fn page_up_from_middle_scrolls() {
+        let mut s = make_state(30, 5);
+        s.overlay_selected = 15;
+        s.overlay_scroll = 13;
+        s.overlay_page_up();
+        assert_eq!(s.overlay_selected, 10);
+        // ensure_visible: 10 < scroll=13 → scroll = 10
+        assert_eq!(s.overlay_scroll, 10);
+    }
+
+    // ── Navigation: move_top / move_bottom ───────────────────────────
+
+    #[test]
+    fn move_top_resets_selection_and_scroll() {
+        let mut s = make_state(50, 10);
+        s.overlay_selected = 30;
+        s.overlay_scroll = 25;
+        s.overlay_move_top();
+        assert_eq!(s.overlay_selected, 0);
+        assert_eq!(s.overlay_scroll, 0);
+    }
+
+    #[test]
+    fn move_bottom_jumps_to_last_and_scrolls() {
+        let mut s = make_state(30, 10);
+        s.overlay_move_bottom();
+        assert_eq!(s.overlay_selected, 29);
+        assert_eq!(s.overlay_scroll, 20); // 29 - 10 + 1
+    }
+
+    #[test]
+    fn move_bottom_on_empty_list_stays_at_zero() {
+        let mut s = make_state(0, 10);
+        s.overlay_move_bottom();
+        assert_eq!(s.overlay_selected, 0);
+    }
+
+    // ── ensure_visible edge cases ───────────────────────────────────
+
+    #[test]
+    fn ensure_visible_bails_when_visible_rows_is_zero() {
+        let mut s = make_state(10, 0);
+        s.overlay_selected = 5;
+        s.overlay_scroll = 0;
+        // Call through a navigation method (they all invoke ensure_visible).
+        s.overlay_move_down();
+        // Scroll should not have moved because visible_rows = 0.
+        assert_eq!(s.overlay_scroll, 0);
+    }
+
+    // ── record_use_in_memory: dedup and ordering ─────────────────────
+
+    #[test]
+    fn record_use_prepends_new_entry() {
+        let mut s = RecentFilesState::default();
+        s.record_use_in_memory(Path::new("/a.flac"));
+        s.record_use_in_memory(Path::new("/b.flac"));
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.entries[0].path, PathBuf::from("/b.flac")); // most recent first
+        assert_eq!(s.entries[1].path, PathBuf::from("/a.flac"));
+    }
+
+    #[test]
+    fn record_use_dedups_and_floats_to_top() {
+        let mut s = RecentFilesState::default();
+        s.record_use_in_memory(Path::new("/a.flac"));
+        s.record_use_in_memory(Path::new("/b.flac"));
+        s.record_use_in_memory(Path::new("/a.flac")); // re-record first entry
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.entries[0].path, PathBuf::from("/a.flac"));
+        assert_eq!(s.entries[1].path, PathBuf::from("/b.flac"));
+    }
+
+    #[test]
+    fn record_use_caps_at_max_entries() {
+        let mut s = RecentFilesState::default();
+        for i in 0..(MAX_ENTRIES + 10) {
+            s.record_use_in_memory(&PathBuf::from(format!("/f{}.flac", i)));
+        }
+        assert_eq!(s.entries.len(), MAX_ENTRIES);
+        // Most recent is the last-inserted one.
+        assert_eq!(
+            s.entries[0].path,
+            PathBuf::from(format!("/f{}.flac", MAX_ENTRIES + 9))
+        );
+    }
+
+    // ── remove_in_memory: bounds and cursor clamping ─────────────────
+
+    #[test]
+    fn remove_out_of_bounds_returns_false() {
+        let mut s = make_state(3, 5);
+        assert!(!s.remove_in_memory(99));
+        assert_eq!(s.entries.len(), 3); // unchanged
+    }
+
+    #[test]
+    fn remove_last_entry_clamps_selection() {
+        let mut s = make_state(3, 5);
+        s.overlay_selected = 2;
+        assert!(s.remove_in_memory(2));
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.overlay_selected, 1);
+    }
+
+    #[test]
+    fn remove_middle_entry_keeps_index() {
+        let mut s = make_state(5, 5);
+        s.overlay_selected = 2;
+        assert!(s.remove_in_memory(2));
+        assert_eq!(s.entries.len(), 4);
+        // Selection stays at 2 (which now points to what was at index 3).
+        assert_eq!(s.overlay_selected, 2);
+    }
+
+    #[test]
+    fn remove_only_entry_stays_at_zero() {
+        let mut s = make_state(1, 5);
+        s.overlay_selected = 0;
+        assert!(s.remove_in_memory(0));
+        assert_eq!(s.entries.len(), 0);
+        assert_eq!(s.overlay_selected, 0);
+    }
+
+    // ── relative_time boundaries ─────────────────────────────────────
+
+    #[test]
+    fn relative_time_just_now_for_fresh_entry() {
+        let e = RecentEntry::new(PathBuf::from("/x"));
+        assert_eq!(e.relative_time(), "just now");
+    }
+
+    #[test]
+    fn relative_time_future_timestamp_shows_just_now() {
+        // Clock-skew protection: a timestamp in the future shouldn't panic.
+        let e = RecentEntry {
+            path: PathBuf::from("/x"),
+            timestamp: u64::MAX,
+        };
+        // saturating_sub makes delta = 0 → "just now"
+        assert_eq!(e.relative_time(), "just now");
+    }
+}
+
