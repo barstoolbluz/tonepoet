@@ -10,6 +10,9 @@ use super::message::AppMessage;
 
 /// Handle a key event, dispatching to the appropriate screen handler
 pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    // Any keyboard activity cancels a pending browse rename (user moved on).
+    app.pending_browse_rename = None;
+
     // Handle preset overlay first (uses its own flag, not ActiveOverlay)
     if app.preset.overlay_open {
         handle_preset_overlay_key(app, key);
@@ -1615,6 +1618,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     // Anchor unchanged. Clear click tracking so alt+click never
                     // contributes to rename/double-click timing.
                     app.last_browse_click = None;
+                    app.pending_browse_rename = None;
                     app.browse.probe_current();
                 } else if shift {
                     // ── Shift+click: toggle clicked entry in multi_selected ──
@@ -1623,74 +1627,83 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.browse.toggle_selection();
                     // Anchor unchanged. Clear click tracking.
                     app.last_browse_click = None;
+                    app.pending_browse_rename = None;
                     app.browse.probe_current();
                 } else {
-                    // ── Plain click: open vs rename vs fresh ──
+                    // ── Plain click: open vs schedule-rename vs fresh ──
                     //
-                    // Desktop convention (Finder / Explorer): a click on an
-                    // already-selected item fires rename, with no upper time
-                    // bound. The distinguishing state is "same path as last
-                    // click", not "how long ago". Within the double-click
-                    // window the second click is treated as double-click
-                    // instead.
+                    // Windows/macOS semantics:
+                    // - Click within the double-click window of the prior click
+                    //   on the same path → open immediately (cancel any pending
+                    //   rename).
+                    // - Any click on the same path as the prior click OUTSIDE
+                    //   the double-click window SCHEDULES a rename, which
+                    //   commits after another double-click-window delay unless
+                    //   a subsequent click cancels it.
+                    // - Click on a different path → fresh click. Cancel pending.
                     //
-                    // Implementation:
-                    //   last-click path == this path, delta < OPEN_MS → open
-                    //   last-click path == this path, delta >= OPEN_MS → rename
-                    //   different path / no last click                → fresh
-                    //
-                    // OPEN_MS matches the Windows/macOS desktop standard.
-                    const OPEN_MS: u128 = 500;
+                    // This preserves the "click, wait 5s, double-click = open"
+                    // flow: the wait-then-click schedules rename, but the
+                    // immediate follow-up click cancels it and fires open.
+                    const OPEN_MS: u64 = 500;
 
                     let now = std::time::Instant::now();
-                    let delta_ms = app
+                    let is_double_click = app
                         .last_browse_click
                         .as_ref()
-                        .filter(|(prev_path, _)| *prev_path == clicked_path)
-                        .map(|(_, t)| now.duration_since(*t).as_millis());
+                        .filter(|(p, _)| *p == clicked_path)
+                        .map(|(_, t)| now.duration_since(*t).as_millis() < OPEN_MS as u128)
+                        .unwrap_or(false);
 
-                    match delta_ms {
-                        Some(d) if d < OPEN_MS => {
-                            // Double-click: open/load
-                            app.last_browse_click = None;
-                            let entry_kind = app.browse.entries[idx].kind.clone();
-                            match entry_kind {
-                                EntryKind::Directory | EntryKind::ParentDir => {
-                                    app.browse.enter_selected();
-                                    app.browse.probe_current();
-                                }
-                                EntryKind::AudioFile(_) | EntryKind::Archive => {
-                                    let target = app.browse.return_target;
-                                    load_browse_selection(app, clicked_path, target);
-                                }
-                                EntryKind::OtherFile => {
-                                    app.set_status("Not an audio file");
-                                }
+                    if is_double_click {
+                        // Double-click: open/load immediately, cancel any pending rename.
+                        app.last_browse_click = None;
+                        app.pending_browse_rename = None;
+                        let entry_kind = app.browse.entries[idx].kind.clone();
+                        match entry_kind {
+                            EntryKind::Directory | EntryKind::ParentDir => {
+                                app.browse.enter_selected();
+                                app.browse.probe_current();
+                            }
+                            EntryKind::AudioFile(_) | EntryKind::Archive => {
+                                let target = app.browse.return_target;
+                                load_browse_selection(app, clicked_path, target);
+                            }
+                            EntryKind::OtherFile => {
+                                app.set_status("Not an audio file");
                             }
                         }
-                        Some(_) => {
-                            // Repeat click on the same entry outside the
-                            // double-click window → rename. Open the rename
-                            // overlay seeded with the current name.
-                            app.last_browse_click = None;
-                            let entry = app.browse.entries[idx].clone();
-                            if matches!(entry.kind, EntryKind::ParentDir) {
-                                app.set_status("rename: cannot rename parent directory (..)");
-                            } else {
-                                app.active_overlay = ActiveOverlay::TextEdit {
-                                    input: super::text_input::TextInputState::new(entry.name),
-                                    target: TextEditTarget::BrowseRename(entry.path),
-                                    label: "rename".to_string(),
-                                };
+                    } else {
+                        // Not a double-click. Any click cancels any pending
+                        // rename (the user is acting, not waiting).
+                        app.pending_browse_rename = None;
+
+                        let same_path_as_last = app
+                            .last_browse_click
+                            .as_ref()
+                            .map(|(p, _)| *p == clicked_path)
+                            .unwrap_or(false);
+
+                        if same_path_as_last {
+                            // Same-path click outside the double-click window.
+                            // Schedule a rename for +OPEN_MS. A subsequent
+                            // click within that window will cancel it (→ open).
+                            // Don't schedule for ParentDir.
+                            if !matches!(
+                                app.browse.entries[idx].kind,
+                                EntryKind::ParentDir
+                            ) {
+                                app.pending_browse_rename = Some((
+                                    clicked_path.clone(),
+                                    now + std::time::Duration::from_millis(OPEN_MS),
+                                ));
                             }
                         }
-                        None => {
-                            // Fresh click (different path or no prior click).
-                            // Record timing, update anchor, probe.
-                            app.last_browse_click = Some((clicked_path.clone(), now));
-                            app.browse.multi_select_anchor = Some(clicked_path);
-                            app.browse.probe_current();
-                        }
+
+                        // Record this click and anchor.
+                        app.last_browse_click = Some((clicked_path.clone(), now));
+                        app.browse.multi_select_anchor = Some(clicked_path);
+                        app.browse.probe_current();
                     }
                 }
             }

@@ -631,6 +631,14 @@ pub struct AppState {
     /// clicks don't trigger false double-clicks on different entries.
     pub last_browse_click: Option<(std::path::PathBuf, std::time::Instant)>,
 
+    /// Pending rename action: a same-path click outside the double-click window
+    /// schedules a rename for `deadline`. A subsequent click before the deadline
+    /// cancels the pending rename (e.g. to allow the second click to complete a
+    /// double-click). When the deadline passes without cancellation, the event
+    /// loop tick fires the rename overlay. Matches Windows/macOS "rename-on-
+    /// click-after-pause, but double-click-to-open preempts" semantics.
+    pub pending_browse_rename: Option<(std::path::PathBuf, std::time::Instant)>,
+
     /// Recent files list + overlay state (persisted to ~/.cache/tonepoet/recent.json).
     pub recent: crate::tui::recent_files::RecentFilesState,
 
@@ -682,6 +690,7 @@ impl AppState {
             processing_active: false,
             should_quit: false,
             last_browse_click: None,
+            pending_browse_rename: None,
             recent: crate::tui::recent_files::RecentFilesState::load(),
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }

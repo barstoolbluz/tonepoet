@@ -7,10 +7,12 @@ use crossterm::event::{self, Event};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
-use super::app::AppState;
+use super::app::{ActiveOverlay, AppScreen, AppState, TextEditTarget};
+use super::browse::EntryKind;
 use super::draw::draw_ui;
 use super::keybindings::{handle_key, handle_mouse};
 use super::message::AppMessage;
+use super::text_input::TextInputState;
 
 /// Run the main TUI event loop
 pub async fn run_app(
@@ -24,6 +26,7 @@ pub async fn run_app(
         app.refresh_items();
         app.clamp_selection();
         app.clear_expired_status();
+        check_pending_browse_rename(app);
 
         // 2. Render
         terminal.draw(|f| draw_ui(f, app))?;
@@ -52,6 +55,54 @@ pub async fn run_app(
     }
 
     Ok(())
+}
+
+/// Check the pending-browse-rename timer. If the deadline has passed and we're
+/// still on the browse screen with no overlay active, open the rename overlay
+/// for the pending path. If the user has navigated away or opened another
+/// overlay, silently drop the pending state.
+fn check_pending_browse_rename(app: &mut AppState) {
+    let (path, deadline) = match app.pending_browse_rename.as_ref() {
+        Some(pr) => (pr.0.clone(), pr.1),
+        None => return,
+    };
+
+    // Cancel if the user left the browse screen or has an overlay open already.
+    if app.current_screen != AppScreen::Browse
+        || !matches!(app.active_overlay, ActiveOverlay::None)
+    {
+        app.pending_browse_rename = None;
+        return;
+    }
+
+    if std::time::Instant::now() < deadline {
+        return;
+    }
+
+    // Look up the entry by path in the current view. If it's gone (filtered
+    // out, deleted, or user navigated), drop silently.
+    let entry_info = app
+        .browse
+        .entries
+        .iter()
+        .find(|e| e.path == path)
+        .map(|e| (e.name.clone(), e.kind.clone()));
+
+    app.pending_browse_rename = None;
+    app.last_browse_click = None;
+
+    match entry_info {
+        Some((name, kind)) if !matches!(kind, EntryKind::ParentDir) => {
+            app.active_overlay = ActiveOverlay::TextEdit {
+                input: TextInputState::new(name),
+                target: TextEditTarget::BrowseRename(path),
+                label: "rename".to_string(),
+            };
+        }
+        _ => {
+            // Entry no longer visible or is ParentDir — silently drop.
+        }
+    }
 }
 
 /// Handle async messages from background tasks
