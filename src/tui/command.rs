@@ -283,7 +283,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e <path> :o <path> :cd <path> :rename <name> :set <key> <val> :preset :saveas :convert :sort :filter :help");
+            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :convert :preset :saveas :set :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
