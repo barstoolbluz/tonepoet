@@ -50,16 +50,16 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             // Quit is ONLY available via `:q` / `:quit` command mode — no bare-letter
             // quit key to prevent accidental exits.
             (KeyCode::Char('1'), KeyModifiers::NONE) => {
-                app.current_screen = AppScreen::Convert;
-                return;
-            }
-            (KeyCode::Char('2'), KeyModifiers::NONE) => {
                 app.current_screen = AppScreen::Browse;
                 app.browse.probe_current(tx);
                 return;
             }
-            (KeyCode::Char('3'), KeyModifiers::NONE) => {
+            (KeyCode::Char('2'), KeyModifiers::NONE) => {
                 app.current_screen = AppScreen::Library;
+                return;
+            }
+            (KeyCode::Char('3'), KeyModifiers::NONE) => {
+                app.current_screen = AppScreen::Convert;
                 return;
             }
             (KeyCode::Char('4'), KeyModifiers::NONE) => {
@@ -96,14 +96,26 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 return;
             }
             AppScreen::Library | AppScreen::Config => {
-                app.current_screen = AppScreen::Convert;
+                // Esc from a placeholder/settings screen returns to the user's
+                // configured default screen (home). Default: Browse.
+                app.current_screen =
+                    AppScreen::from_config_name(&app.config.ui.default_screen);
+                if app.current_screen == AppScreen::Browse {
+                    app.browse.probe_current(tx);
+                }
                 return;
             }
             AppScreen::Browse => {
                 // Let handle_browse_key handle Esc — it clears multi-selection first
             }
             AppScreen::Queue => {
-                app.current_screen = AppScreen::Convert;
+                // Esc from Queue returns to the user's configured default
+                // screen (home). Default: Browse.
+                app.current_screen =
+                    AppScreen::from_config_name(&app.config.ui.default_screen);
+                if app.current_screen == AppScreen::Browse {
+                    app.browse.probe_current(tx);
+                }
                 return;
             }
             AppScreen::Convert => {}
@@ -484,9 +496,8 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             } else if !app.browse.filter_text.is_empty() {
                 app.browse.clear_filter();
                 selection_may_have_changed = true;
-            } else {
-                app.current_screen = AppScreen::Convert;
             }
+            // Browse is home — Esc with nothing to clear is a no-op.
         }
 
         _ => {}
@@ -1424,12 +1435,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             // ── Convert screen: tab bar ──
             TuiButton::Tab(n) => {
                 match n {
-                    1 => app.current_screen = AppScreen::Convert,
-                    2 => {
+                    1 => {
                         app.current_screen = AppScreen::Browse;
                         app.browse.probe_current(tx);
                     }
-                    3 => app.current_screen = AppScreen::Library,
+                    2 => app.current_screen = AppScreen::Library,
+                    3 => app.current_screen = AppScreen::Convert,
                     4 => app.current_screen = AppScreen::Queue,
                     5 => app.current_screen = AppScreen::Config,
                     _ => {}

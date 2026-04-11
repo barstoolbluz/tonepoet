@@ -108,7 +108,7 @@ tonepoet (main binary + lib)
 - `ConvertState` contains 4 pane states: `SourceState`, `MetadataState`, `FormatState`, `OutputOptionsState`
 - `FormatState` uses `PillState<T>` for format, sample rate, bit depth, dither, ReplayGain pills
 - `PillState<T>` is a generic pill selector with per-option enable/disable and format constraint cascading
-- `AppScreen` enum: Convert (tab 1), Browse (2, placeholder), Library (3, placeholder), Queue (4), Config (5), Wizard (overlay)
+- `AppScreen` enum: Browse (tab 1, default home), Library (2, placeholder), Convert (3, conversion settings/staging), Queue (4), Config (5), Wizard (overlay). Default screen is configurable via `[ui] default_screen` in config.toml; new users open on Browse.
 - Two-pass rendering: draw first (immutable state), then register mouse buttons (mutable button_map)
 - Vi command mode: `:` opens command input at bottom of screen, parsed by `command.rs`
 

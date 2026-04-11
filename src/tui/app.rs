@@ -15,21 +15,25 @@ use crate::tui::probe::{SourceInfo, SourceMetadata};
 /// Which screen is currently displayed
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppScreen {
-    Convert,   // Tab 1 — main convert view
-    Browse,    // Tab 2 — placeholder
-    Library,   // Tab 3 — placeholder
+    Browse,    // Tab 1 — default home; file browsing + selection
+    Library,   // Tab 2 — placeholder
+    Convert,   // Tab 3 — conversion settings / staging area for new batches
     Queue,     // Tab 4 — file queue
     Config,    // Tab 5 — settings
     Wizard,    // Full-screen overlay (not a tab)
 }
 
 impl AppScreen {
-    /// Tab number (1-5), or None for overlays like Wizard
+    /// Tab number (1-5), or None for overlays like Wizard.
+    /// Order: Browse=1, Library=2, Convert=3, Queue=4, Config=5.
+    /// Convert sits between Library and Queue because it's the conversion-
+    /// settings staging area that committed items pass through on their way
+    /// to the queue.
     pub fn tab_number(&self) -> Option<u8> {
         match self {
-            Self::Convert => Some(1),
-            Self::Browse => Some(2),
-            Self::Library => Some(3),
+            Self::Browse => Some(1),
+            Self::Library => Some(2),
+            Self::Convert => Some(3),
             Self::Queue => Some(4),
             Self::Config => Some(5),
             Self::Wizard => None,
@@ -47,15 +51,27 @@ impl AppScreen {
         }
     }
 
-    /// All tab screens in order
+    /// All tab screens in display order.
     pub fn tabs() -> &'static [AppScreen] {
         &[
-            Self::Convert,
             Self::Browse,
             Self::Library,
+            Self::Convert,
             Self::Queue,
             Self::Config,
         ]
+    }
+
+    /// Map a `ui.default_screen` config string to an `AppScreen`.
+    /// Case-insensitive; unknown values fall back to `Browse` (the default).
+    pub fn from_config_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "library" => Self::Library,
+            "convert" | "settings" | "conversion" => Self::Convert,
+            "queue" => Self::Queue,
+            "config" => Self::Config,
+            _ => Self::Browse,
+        }
     }
 }
 
@@ -665,10 +681,12 @@ impl AppState {
         let mut output_options = OutputOptionsState::new();
         output_options.dest_path = config.conversion.default_destination.clone();
 
+        let initial_screen = AppScreen::from_config_name(&config.ui.default_screen);
+
         Self {
             config,
             manager,
-            current_screen: AppScreen::Convert,
+            current_screen: initial_screen,
             previous_screen: None,
             convert: ConvertState {
                 source: SourceState::default(),

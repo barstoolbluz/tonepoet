@@ -4,6 +4,29 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TonepoetConfig {
     pub conversion: ConversionSettings,
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// UI-related configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// Screen shown when the TUI starts. One of: browse, library, convert, queue, config.
+    /// Case-insensitive; unknown values fall back to "browse".
+    #[serde(default = "default_initial_screen")]
+    pub default_screen: String,
+}
+
+fn default_initial_screen() -> String {
+    "browse".to_string()
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            default_screen: default_initial_screen(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +80,7 @@ impl Default for TonepoetConfig {
     fn default() -> Self {
         Self {
             conversion: ConversionSettings::default(),
+            ui: UiConfig::default(),
         }
     }
 }
