@@ -27,6 +27,10 @@ pub async fn run_app(
         app.clamp_selection();
         app.clear_expired_status();
         check_pending_browse_rename(app);
+        // Close browse-only overlays if the user has left the browse screen.
+        if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
+            app.bookmarks.close_overlay();
+        }
 
         // 2. Render
         terminal.draw(|f| draw_ui(f, app))?;

@@ -43,6 +43,10 @@ pub enum Command {
     Browse,
     /// Open the recent-files overlay.
     Recent,
+    /// Open the bookmarks overlay (browse-only). With no args, opens in
+    /// browsing mode. With "add [name]", quick-adds the current browse
+    /// directory as a bookmark without opening the overlay.
+    Bookmarks(String),
     Unknown(String),
 }
 
@@ -100,6 +104,7 @@ pub fn parse_command(input: &str) -> Command {
         "rename" | "mv" => Command::Rename(args.to_string()),
         "browse" | "b" => Command::Browse,
         "recent" | "recents" => Command::Recent,
+        "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -287,7 +292,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :recent :convert :preset :saveas :set :sort :filter :help");
+            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :recent :bookmarks :bm :convert :preset :saveas :set :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
@@ -323,6 +328,9 @@ pub fn execute_command(
         }
         Command::Recent => {
             app.recent.open_overlay();
+        }
+        Command::Bookmarks(args) => {
+            execute_bookmarks(app, &args);
         }
         Command::Unknown(input) => {
             app.set_status(format!("Unknown command: {}", input));
@@ -430,6 +438,45 @@ fn execute_filter(app: &mut AppState, arg: Option<&str>) {
     app.browse.set_format_filter(new_filter);
     let msg = format!("Filter: {}", app.browse.format_filter.label());
     app.set_status(msg);
+}
+
+/// Execute a `:bookmarks` / `:bm` command. Browse-only.
+///   `:bm`              → open the bookmarks overlay
+///   `:bm add`          → quick-add current browse dir with default name (last
+///                        path component), no overlay
+///   `:bm add <name>`   → quick-add current browse dir with the given name
+fn execute_bookmarks(app: &mut AppState, args: &str) {
+    if app.current_screen != AppScreen::Browse {
+        app.set_status(":bookmarks only works on the browse screen");
+        return;
+    }
+
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        app.bookmarks.open_overlay();
+        return;
+    }
+
+    // Parse subcommand.
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("").to_lowercase();
+    let rest = parts.next().unwrap_or("").trim();
+
+    match sub.as_str() {
+        "add" => {
+            let path = app.browse.current_dir.clone();
+            let name = if rest.is_empty() {
+                super::bookmarks::BookmarksState::default_name_for_path(&path)
+            } else {
+                rest.to_string()
+            };
+            app.bookmarks.add(name.clone(), path);
+            app.set_status(format!("bookmark added: {}", name));
+        }
+        other => {
+            app.set_status(format!("unknown :bm subcommand: {}", other));
+        }
+    }
 }
 
 /// Execute a `:queue` / `:queue!` command. Context-sensitive:

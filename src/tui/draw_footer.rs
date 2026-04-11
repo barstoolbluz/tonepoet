@@ -190,6 +190,7 @@ fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
                 h(":cd", "", theme::CYAN, 2),
                 h(":rename", "", theme::AMBER, 2),
                 h(":recent", "", theme::CYAN, 2),
+                h(":bm", "", theme::GREEN, 2),
                 h(".", "hidden", theme::PURPLE, 2),
             ],
             vec![

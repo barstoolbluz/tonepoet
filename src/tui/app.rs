@@ -642,6 +642,9 @@ pub struct AppState {
     /// Recent files list + overlay state (persisted to ~/.cache/tonepoet/recent.json).
     pub recent: crate::tui::recent_files::RecentFilesState,
 
+    /// Bookmarks list + overlay state (persisted to ~/.config/tonepoet/bookmarks.toml).
+    pub bookmarks: crate::tui::bookmarks::BookmarksState,
+
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
@@ -692,6 +695,7 @@ impl AppState {
             last_browse_click: None,
             pending_browse_rename: None,
             recent: crate::tui::recent_files::RecentFilesState::load(),
+            bookmarks: crate::tui::bookmarks::BookmarksState::load(),
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }

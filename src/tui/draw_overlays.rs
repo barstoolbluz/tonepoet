@@ -52,6 +52,11 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     if app.recent.overlay_open {
         super::recent_overlay::draw_recent_overlay(f, &mut app.recent);
     }
+
+    // Bookmarks overlay (independent of ActiveOverlay — uses its own flag)
+    if app.bookmarks.overlay_open {
+        super::bookmarks_overlay::draw_bookmarks_overlay(f, &mut app.bookmarks);
+    }
 }
 
 /// Center a rect within a parent area

@@ -25,6 +25,12 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // Bookmarks overlay (independent flag, browse-only)
+    if app.bookmarks.overlay_open {
+        handle_bookmarks_overlay_key(app, key);
+        return;
+    }
+
     // Handle other overlay inputs
     if !matches!(app.active_overlay, ActiveOverlay::None) {
         handle_overlay_key(app, key, tx);
@@ -1052,6 +1058,101 @@ fn handle_recent_overlay_key(app: &mut AppState, key: KeyEvent) {
             }
             // Load as source via the existing load path.
             load_recent_as_source(app, &path);
+        }
+        _ => {}
+    }
+}
+
+/// Handle key events while the bookmarks overlay is open.
+/// Has two modes:
+/// - Browse mode: list navigation + add/delete/rename/cd actions
+/// - Naming mode (Add or Rename): text input with Enter=commit, Esc=cancel
+fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent) {
+    use super::bookmarks::BookmarkNaming;
+    use super::text_input::handle_text_input_key;
+
+    // Naming sub-mode routes text-input keys to the TextInputState.
+    if app.bookmarks.naming.is_some() {
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, _) => {
+                if !app.bookmarks.commit_naming() {
+                    app.set_status("bookmark: name cannot be empty");
+                }
+            }
+            (KeyCode::Esc, _) => {
+                app.bookmarks.cancel_naming();
+            }
+            _ => {
+                if let Some(naming) = &mut app.bookmarks.naming {
+                    let input = match naming {
+                        BookmarkNaming::Add { input, .. } => input,
+                        BookmarkNaming::Rename { input, .. } => input,
+                    };
+                    handle_text_input_key(input, &key);
+                }
+            }
+        }
+        return;
+    }
+
+    // Browse mode.
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            app.bookmarks.close_overlay();
+        }
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            app.bookmarks.overlay_move_up();
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            app.bookmarks.overlay_move_down();
+        }
+        (KeyCode::PageUp, _) => {
+            app.bookmarks.overlay_page_up();
+        }
+        (KeyCode::PageDown, _) => {
+            app.bookmarks.overlay_page_down();
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            app.bookmarks.overlay_move_top();
+        }
+        (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
+            app.bookmarks.overlay_move_bottom();
+        }
+        (KeyCode::Char('a'), KeyModifiers::NONE) => {
+            // Add current browse directory as a bookmark.
+            let path = app.browse.current_dir.clone();
+            app.bookmarks.start_add(path);
+        }
+        (KeyCode::Char('d'), KeyModifiers::NONE) => {
+            let idx = app.bookmarks.overlay_selected;
+            app.bookmarks.remove(idx);
+            if app.bookmarks.entries.is_empty() {
+                // Keep overlay open; user sees "(no bookmarks)" placeholder.
+            }
+        }
+        (KeyCode::Char('e'), KeyModifiers::NONE) => {
+            let idx = app.bookmarks.overlay_selected;
+            app.bookmarks.start_rename(idx);
+        }
+        (KeyCode::Enter, _) => {
+            let path = match app.bookmarks.selected() {
+                Some(b) => b.path.clone(),
+                None => {
+                    app.bookmarks.close_overlay();
+                    return;
+                }
+            };
+            app.bookmarks.close_overlay();
+            // Navigate the browse screen to that path.
+            match app.browse.navigate_to_str(&path.display().to_string()) {
+                Ok(()) => {
+                    app.set_status(format!("cd: {}", path.display()));
+                    app.browse.probe_current();
+                }
+                Err(e) => {
+                    app.set_status(format!("bookmark: {}", e));
+                }
+            }
         }
         _ => {}
     }

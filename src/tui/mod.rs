@@ -1,6 +1,8 @@
 //! TUI module for standalone tonepoet interface
 
 pub mod app;
+pub mod bookmarks;
+pub mod bookmarks_overlay;
 pub mod browse;
 pub mod button_map;
 pub mod command;
