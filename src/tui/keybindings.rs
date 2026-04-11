@@ -1571,13 +1571,35 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 let alt = mouse.modifiers.contains(KeyModifiers::ALT);
                 let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
 
+                // For alt-click, we need the anchor *before* moving the cursor.
+                // Otherwise resolve_anchor_index's fallback (which uses
+                // selected_index) would collapse to `idx` and give an empty range.
+                // Also persist the anchor if it's not yet set, so a sequence of
+                // alt-clicks behaves Finder-like (fixed origin until a plain click).
+                let prev_cursor = app.browse.selected_index;
+                let alt_anchor_idx = if alt {
+                    let idx_from_path = app.browse.multi_select_anchor.as_ref().and_then(
+                        |p| app.browse.entries.iter().position(|e| e.path == *p),
+                    );
+                    let resolved = idx_from_path.unwrap_or(prev_cursor);
+                    // Persist the anchor so subsequent alt-clicks keep this origin.
+                    if app.browse.multi_select_anchor.is_none() {
+                        if let Some(entry) = app.browse.entries.get(resolved) {
+                            app.browse.multi_select_anchor = Some(entry.path.clone());
+                        }
+                    }
+                    Some(resolved)
+                } else {
+                    None
+                };
+
                 // All three click modes move the cursor to the clicked entry.
                 app.browse.selected_index = idx;
                 app.browse.ensure_visible();
 
                 if alt {
                     // ── Alt+click: range-select from anchor to clicked entry ──
-                    let anchor_idx = app.browse.resolve_anchor_index();
+                    let anchor_idx = alt_anchor_idx.unwrap();
                     let lo = anchor_idx.min(idx);
                     let hi = anchor_idx.max(idx);
                     let to_add: Vec<std::path::PathBuf> = (lo..=hi)
@@ -1603,12 +1625,20 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.last_browse_click = None;
                     app.browse.probe_current();
                 } else {
-                    // ── Plain click: timing tiers for open / rename / fresh ──
-                    // < 500ms from prior click on same entry  → open (double-click)
-                    // 500–1500ms                              → rename-click
-                    // otherwise                                → fresh first click
+                    // ── Plain click: open vs rename vs fresh ──
+                    //
+                    // Desktop convention (Finder / Explorer): a click on an
+                    // already-selected item fires rename, with no upper time
+                    // bound. The distinguishing state is "same path as last
+                    // click", not "how long ago". Within the double-click
+                    // window the second click is treated as double-click
+                    // instead.
+                    //
+                    // Implementation:
+                    //   last-click path == this path, delta < OPEN_MS → open
+                    //   last-click path == this path, delta >= OPEN_MS → rename
+                    //   different path / no last click                → fresh
                     const OPEN_MS: u128 = 500;
-                    const RENAME_MS: u128 = 1500;
 
                     let now = std::time::Instant::now();
                     let delta_ms = app
@@ -1636,9 +1666,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                                 }
                             }
                         }
-                        Some(d) if d < RENAME_MS => {
-                            // Rename-click: open the rename overlay seeded with
-                            // the current name.
+                        Some(_) => {
+                            // Repeat click on the same entry outside the
+                            // double-click window → rename. Open the rename
+                            // overlay seeded with the current name.
                             app.last_browse_click = None;
                             let entry = app.browse.entries[idx].clone();
                             if matches!(entry.kind, EntryKind::ParentDir) {
@@ -1651,8 +1682,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                                 };
                             }
                         }
-                        _ => {
-                            // Fresh click: record timing, update anchor, probe.
+                        None => {
+                            // Fresh click (different path or no prior click).
+                            // Record timing, update anchor, probe.
                             app.last_browse_click = Some((clicked_path.clone(), now));
                             app.browse.multi_select_anchor = Some(clicked_path);
                             app.browse.probe_current();
