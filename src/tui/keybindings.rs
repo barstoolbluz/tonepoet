@@ -22,6 +22,13 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // Browse filter input preempts global keys: while typing in the filter,
+    // characters like `q`, `1`-`5`, `:` go to the input, not to global handlers.
+    if app.current_screen == AppScreen::Browse && app.browse.filter_input.is_some() {
+        handle_browse_filter_key(app, key);
+        return;
+    }
+
     // Global keys (except in Wizard mode)
     if app.current_screen != AppScreen::Wizard {
         match (key.code, key.modifiers) {
@@ -449,10 +456,19 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMe
             selection_may_have_changed = true;
         }
 
-        // Esc: clear multi-selection, or switch back to convert
+        // Open the live text-filter input. Match both NONE and SHIFT modifiers
+        // because some terminals/layouts report `/` as a shifted char.
+        (KeyCode::Char('/'), KeyModifiers::NONE) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
+            app.browse.open_filter_input();
+        }
+
+        // Esc escalation: multi-selection → text filter → return to convert
         (KeyCode::Esc, _) => {
             if !app.browse.multi_selected.is_empty() {
                 app.browse.clear_multi_selection();
+            } else if !app.browse.filter_text.is_empty() {
+                app.browse.clear_filter();
+                selection_may_have_changed = true;
             } else {
                 app.current_screen = AppScreen::Convert;
             }
@@ -463,6 +479,50 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMe
 
     if selection_may_have_changed {
         app.browse.probe_current();
+    }
+}
+
+/// Hybrid dispatcher used while the live text filter input is open.
+/// Arrow keys / page keys navigate the filtered list; everything else is
+/// fed into the text input. Enter commits, Esc cancels (restores prior filter).
+fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent) {
+    use super::text_input::handle_text_input_key;
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, _) => {
+            app.browse.close_filter_input(true);
+            app.browse.probe_current();
+        }
+        (KeyCode::Esc, _) => {
+            app.browse.close_filter_input(false);
+            app.browse.probe_current();
+        }
+        // List navigation while filter input is open
+        (KeyCode::Up, _) => {
+            app.browse.move_up();
+            app.browse.probe_current();
+        }
+        (KeyCode::Down, _) => {
+            app.browse.move_down();
+            app.browse.probe_current();
+        }
+        (KeyCode::PageUp, _) => {
+            app.browse.page_up();
+            app.browse.probe_current();
+        }
+        (KeyCode::PageDown, _) => {
+            app.browse.page_down();
+            app.browse.probe_current();
+        }
+        // Everything else: feed to the text input, then re-apply view
+        _ => {
+            if let Some(input) = &mut app.browse.filter_input {
+                if handle_text_input_key(input, &key) {
+                    app.browse.update_filter_from_input();
+                    app.browse.probe_current();
+                }
+            }
+        }
     }
 }
 

@@ -115,6 +115,7 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
 }
 
 /// Draw the breadcrumb bar showing the current directory path
+/// (and the active text filter, if any).
 fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
     if area.width < 10 {
         return;
@@ -128,14 +129,53 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
         path_str
     };
 
-    let mut spans = vec![Span::styled("  path  ", theme::muted())];
-    spans.push(Span::styled(display, theme::bright()));
+    // Filter suffix appears only when a text filter is active.
+    let filter_suffix = if !browse.filter_text.is_empty() {
+        format!("   filter: {}", browse.filter_text)
+    } else {
+        String::new()
+    };
+
+    // Reserve space for prefix + filter suffix; truncate the path from the left
+    // so the most contextual portion (current directory) stays visible.
+    let prefix = "  path  ";
+    let prefix_w = prefix.chars().count();
+    let suffix_w = filter_suffix.chars().count();
+    let path_max = (area.width as usize)
+        .saturating_sub(prefix_w)
+        .saturating_sub(suffix_w)
+        .saturating_sub(1); // safety margin
+    let display_truncated = truncate_left(&display, path_max);
+
+    let mut spans = vec![
+        Span::styled(prefix, theme::muted()),
+        Span::styled(display_truncated, theme::bright()),
+    ];
+    if !filter_suffix.is_empty() {
+        spans.push(Span::styled(filter_suffix, Style::default().fg(theme::AMBER)));
+    }
 
     let line = Paragraph::new(Line::from(spans));
     f.render_widget(line, area);
 }
 
+/// Truncate a string from the LEFT to fit `max` chars, prepending `…` if cut.
+/// Used so the end of paths (most contextual portion) stays visible.
+fn truncate_left(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    if max < 2 {
+        return s.chars().rev().take(max).collect::<String>().chars().rev().collect();
+    }
+    let skip = count - (max - 1);
+    let truncated: String = s.chars().skip(skip).collect();
+    format!("…{}", truncated)
+}
+
 /// Draw the directory listing (left pane) with a sortable column header row.
+/// Reserves an extra row for the live filter input when one is active.
 fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
     if area.height < 4 || area.width < 20 {
         return;
@@ -165,9 +205,10 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
         theme::border(border_color),
     ));
 
-    // Content: top border, header row, N entry rows, bottom border.
-    // Reserve 1 row for the header inside the border.
-    let content_height = (area.height as usize).saturating_sub(3);
+    // Content rows = total - top border - header - bottom border (-1 if filter row).
+    let has_filter = browse.filter_input.is_some();
+    let reserved = if has_filter { 4 } else { 3 };
+    let content_height = (area.height as usize).saturating_sub(reserved);
     browse.visible_height = content_height;
 
     // Compute name column width, guarding against narrow widths.
@@ -230,10 +271,38 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
         }
     }
 
+    // Filter input row (just above the bottom border) when active.
+    let mut filter_cursor: Option<u16> = None;
+    if let Some(input) = &browse.filter_input {
+        // Inside row layout: │ + " / " + <input view> + padding + │
+        // Reserve 1 (left border) + 3 (" / ") + 2 (right padding + border) = 6
+        let input_width = inner_w.saturating_sub(4); // " / " prefix takes 3 + 1 trailing space
+        let (visible, cursor_col_in_view) = input.view(input_width);
+        filter_cursor = Some(cursor_col_in_view);
+
+        let visible_w = visible.chars().count();
+        let pad = input_width.saturating_sub(visible_w);
+        lines.push(Line::from(vec![
+            Span::styled("│", theme::border(border_color)),
+            Span::styled(" / ", Style::default().fg(theme::CYAN)),
+            Span::styled(visible, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::raw(" ".repeat(pad)),
+            Span::raw(" "),
+            Span::styled("│", theme::border(border_color)),
+        ]));
+    }
+
     lines.push(bot_line);
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+
+    // Position the terminal cursor inside the filter input row.
+    if let Some(col_in_view) = filter_cursor {
+        let cursor_x = area.x + 1 + 3 + col_in_view; // border + " / " prefix
+        let cursor_y = area.y + area.height - 2; // row above the bottom border
+        f.set_cursor(cursor_x, cursor_y);
+    }
 }
 
 /// Render the column header row with sort indicator (▲/▼) on the active column.

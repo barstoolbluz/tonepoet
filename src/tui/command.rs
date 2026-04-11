@@ -172,14 +172,21 @@ pub fn execute_command(
             app.set_status(format!("Output destination: {}", expanded));
         }
         Command::Cd(path) => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":cd only works on the browse screen");
+                return;
+            }
             if path.is_empty() {
                 app.set_status("Usage: :cd <path>");
                 return;
             }
-            let expanded = expand_path(&path);
-            match std::env::set_current_dir(&expanded) {
-                Ok(_) => app.set_status(format!("Changed directory: {}", expanded)),
-                Err(e) => app.set_status(format!("cd failed: {}", e)),
+            match app.browse.navigate_to_str(&path) {
+                Ok(()) => {
+                    let p = app.browse.current_dir.display().to_string();
+                    app.set_status(format!("cd: {}", p));
+                    app.browse.probe_current();
+                }
+                Err(e) => app.set_status(format!("cd: {}", e)),
             }
         }
         Command::Convert => {
@@ -266,7 +273,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e <path> :o <path> :set <key> <val> :preset :saveas :convert :sort :filter :help");
+            app.set_status(":q :e <path> :o <path> :cd <path> :set <key> <val> :preset :saveas :convert :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());

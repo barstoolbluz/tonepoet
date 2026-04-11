@@ -158,12 +158,26 @@ impl FormatFilter {
 pub struct BrowseEntry {
     pub path: PathBuf,
     pub name: String,
+    /// Lowercased copy of `name` cached for fast filter matching.
+    pub name_lower: String,
     pub kind: EntryKind,
     pub size: u64,
     pub modified: Option<SystemTime>,
 }
 
 impl BrowseEntry {
+    /// Construct a new entry, computing the lowercased name for filter matching.
+    pub fn new(
+        path: PathBuf,
+        name: String,
+        kind: EntryKind,
+        size: u64,
+        modified: Option<SystemTime>,
+    ) -> Self {
+        let name_lower = name.to_lowercase();
+        Self { path, name, name_lower, kind, size, modified }
+    }
+
     pub fn is_dir(&self) -> bool {
         matches!(self.kind, EntryKind::Directory | EntryKind::ParentDir)
     }
@@ -210,6 +224,17 @@ impl BrowseEntry {
 #[derive(Debug, Clone)]
 pub struct BrowseState {
     pub current_dir: PathBuf,
+
+    // ── Scan results (refreshed only by scan(), i.e. on cd) ─────────
+    /// ParentDir entry, if `current_dir` has a parent. Always passed
+    /// through view filtering unchanged.
+    parent_entry: Option<BrowseEntry>,
+    /// All directory entries from current_dir, unfiltered.
+    all_dirs: Vec<BrowseEntry>,
+    /// All file entries from current_dir, unfiltered (including hidden).
+    all_files: Vec<BrowseEntry>,
+
+    // ── View result (refilled by apply_view from scan results) ───────
     pub entries: Vec<BrowseEntry>,
     pub selected_index: usize,
     pub scroll_offset: usize,
@@ -222,6 +247,8 @@ pub struct BrowseState {
     pub filter_input: Option<TextInputState>,
     /// Committed filter text (empty = no filter)
     pub filter_text: String,
+    /// Saved `filter_text` from before opening the input — used to restore on cancel.
+    filter_text_prior: Option<String>,
     pub show_hidden: bool,
 
     /// Sort field and direction
@@ -252,6 +279,9 @@ impl BrowseState {
 
         let mut state = Self {
             current_dir: start_dir,
+            parent_entry: None,
+            all_dirs: Vec::new(),
+            all_files: Vec::new(),
             entries: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
@@ -259,6 +289,7 @@ impl BrowseState {
             multi_selected: Vec::new(),
             filter_input: None,
             filter_text: String::new(),
+            filter_text_prior: None,
             show_hidden: false,
             sort_by: SortBy::Name,
             sort_dir: SortDir::Asc,
@@ -272,36 +303,37 @@ impl BrowseState {
         state
     }
 
-    /// Re-scan the current directory
+    /// Full refresh: re-scan disk, then re-apply the view filters/sort.
     pub fn refresh(&mut self) {
-        self.entries.clear();
+        self.scan();
+        self.apply_view();
+    }
+
+    /// Read the directory from disk into `parent_entry` / `all_dirs` / `all_files`.
+    /// Stores ALL entries (including hidden) — view-layer filters apply later.
+    /// Slow; only call on cd or explicit refresh.
+    fn scan(&mut self) {
+        self.parent_entry = None;
+        self.all_dirs.clear();
+        self.all_files.clear();
         self.error = None;
 
-        // Add parent entry if not at root (never filtered or sorted — always first)
-        if self.current_dir.parent().is_some() {
-            self.entries.push(BrowseEntry {
-                path: self.current_dir.parent().unwrap().to_path_buf(),
-                name: "..".to_string(),
-                kind: EntryKind::ParentDir,
-                size: 0,
-                modified: None,
-            });
+        // Capture parent entry if not at root.
+        if let Some(parent) = self.current_dir.parent() {
+            self.parent_entry = Some(BrowseEntry::new(
+                parent.to_path_buf(),
+                "..".to_string(),
+                EntryKind::ParentDir,
+                0,
+                None,
+            ));
         }
 
-        // Read directory entries
         match fs::read_dir(&self.current_dir) {
             Ok(read) => {
-                let mut dirs: Vec<BrowseEntry> = Vec::new();
-                let mut files: Vec<BrowseEntry> = Vec::new();
-
                 for entry in read.flatten() {
                     let path = entry.path();
                     let name = entry.file_name().to_string_lossy().to_string();
-
-                    // Skip hidden files unless show_hidden is true
-                    if !self.show_hidden && name.starts_with('.') {
-                        continue;
-                    }
 
                     let metadata = match entry.metadata() {
                         Ok(m) => m,
@@ -317,86 +349,106 @@ impl BrowseState {
                         classify_file(&path)
                     };
 
-                    // Apply format filter to files only (dirs always show)
-                    if !matches!(kind, EntryKind::Directory) && !self.format_filter.allows(&kind) {
-                        continue;
-                    }
-
-                    let browse_entry = BrowseEntry {
-                        path,
-                        name,
-                        kind: kind.clone(),
-                        size,
-                        modified,
-                    };
+                    let browse_entry = BrowseEntry::new(path, name, kind.clone(), size, modified);
 
                     if matches!(kind, EntryKind::Directory) {
-                        dirs.push(browse_entry);
+                        self.all_dirs.push(browse_entry);
                     } else {
-                        files.push(browse_entry);
+                        self.all_files.push(browse_entry);
                     }
                 }
-
-                // Sort dirs and files independently (dirs-first invariant preserved)
-                let sort_by = self.sort_by;
-                let sort_dir = self.sort_dir;
-                sort_entries(&mut dirs, sort_by, sort_dir);
-                sort_entries(&mut files, sort_by, sort_dir);
-
-                self.entries.extend(dirs);
-                self.entries.extend(files);
             }
             Err(e) => {
                 self.error = Some(format!("Cannot read directory: {}", e));
             }
         }
+    }
 
-        // Clamp selection
+    /// Rebuild `entries` from the cached scan results, applying:
+    /// - hidden filter (`show_hidden`)
+    /// - format filter (`format_filter`)
+    /// - text filter (`filter_text`, case-insensitive substring on `name_lower`)
+    /// Then sorting dirs and files independently (dirs-first invariant).
+    /// ParentDir is always first and never filtered.
+    fn apply_view(&mut self) {
+        self.entries.clear();
+
+        // Lowercase the filter text once per view application.
+        let filter_lower_owned = if self.filter_text.is_empty() {
+            None
+        } else {
+            Some(self.filter_text.to_lowercase())
+        };
+        let filter_lower = filter_lower_owned.as_deref();
+
+        // Parent entry always present (if scan found one), never filtered.
+        if let Some(parent) = &self.parent_entry {
+            self.entries.push(parent.clone());
+        }
+
+        let mut dirs: Vec<BrowseEntry> = self
+            .all_dirs
+            .iter()
+            .filter(|e| entry_passes_view(e, self.show_hidden, &self.format_filter, filter_lower))
+            .cloned()
+            .collect();
+        let mut files: Vec<BrowseEntry> = self
+            .all_files
+            .iter()
+            .filter(|e| entry_passes_view(e, self.show_hidden, &self.format_filter, filter_lower))
+            .cloned()
+            .collect();
+
+        sort_entries(&mut dirs, self.sort_by, self.sort_dir);
+        sort_entries(&mut files, self.sort_by, self.sort_dir);
+
+        self.entries.extend(dirs);
+        self.entries.extend(files);
+
+        // Clamp selection (cursor preservation is the caller's responsibility).
         if self.selected_index >= self.entries.len() {
             self.selected_index = self.entries.len().saturating_sub(1);
         }
         self.scroll_offset = 0;
     }
 
+    /// Apply the view layer while keeping the cursor on the same entry path
+    /// (or clamping if it's been filtered out).
+    fn apply_view_preserving_cursor(&mut self) {
+        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
+        self.apply_view();
+        self.restore_cursor_on_path(prev_path);
+    }
+
     /// Cycle to the next sort field and re-apply, preserving cursor on current entry
     pub fn cycle_sort_by(&mut self) {
-        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
         self.sort_by = self.sort_by.next();
-        self.refresh();
-        self.restore_cursor_on_path(prev_path);
+        self.apply_view_preserving_cursor();
     }
 
     /// Toggle sort direction and re-apply, preserving cursor on current entry
     pub fn toggle_sort_dir(&mut self) {
-        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
         self.sort_dir = self.sort_dir.toggle();
-        self.refresh();
-        self.restore_cursor_on_path(prev_path);
+        self.apply_view_preserving_cursor();
     }
 
     /// Set sort field and direction explicitly, preserving cursor
     pub fn set_sort(&mut self, by: SortBy, dir: SortDir) {
-        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
         self.sort_by = by;
         self.sort_dir = dir;
-        self.refresh();
-        self.restore_cursor_on_path(prev_path);
+        self.apply_view_preserving_cursor();
     }
 
     /// Cycle to the next format filter and re-apply, preserving cursor if possible
     pub fn cycle_format_filter(&mut self) {
-        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
         self.format_filter = self.format_filter.next();
-        self.refresh();
-        self.restore_cursor_on_path(prev_path);
+        self.apply_view_preserving_cursor();
     }
 
     /// Set format filter explicitly, preserving cursor
     pub fn set_format_filter(&mut self, filter: FormatFilter) {
-        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
         self.format_filter = filter;
-        self.refresh();
-        self.restore_cursor_on_path(prev_path);
+        self.apply_view_preserving_cursor();
     }
 
     /// After a refresh, try to reposition the cursor on the entry with the given path.
@@ -416,6 +468,7 @@ impl BrowseState {
             if entry.is_dir() {
                 self.current_dir = entry.path.clone();
                 self.selected_index = 0;
+                self.reset_filter_state();
                 self.refresh();
                 return true;
             }
@@ -431,6 +484,7 @@ impl BrowseState {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string());
             self.current_dir = parent.to_path_buf();
+            self.reset_filter_state();
             self.refresh();
 
             // Try to position cursor on the directory we came from
@@ -450,8 +504,50 @@ impl BrowseState {
         if path.is_dir() {
             self.current_dir = path;
             self.selected_index = 0;
+            self.reset_filter_state();
             self.refresh();
         }
+    }
+
+    /// Navigate to a path expressed as a string. Resolves `~` and relative paths
+    /// against `current_dir`. Returns Err with a user-friendly message on failure.
+    ///
+    /// Supported tilde forms: bare `~` and `~/foo`. The `~user` form (per-user
+    /// home directory) is NOT supported and is rejected with a clear error
+    /// rather than silently mangled into an invalid path.
+    pub fn navigate_to_str(&mut self, input: &str) -> Result<(), String> {
+        // Tilde expansion: only `~` and `~/...` forms.
+        let expanded = if input == "~" {
+            std::env::var("HOME").map_err(|_| "HOME not set".to_string())?
+        } else if let Some(rest) = input.strip_prefix("~/") {
+            let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+            format!("{}/{}", home, rest)
+        } else if input.starts_with('~') {
+            return Err("~user paths are not supported (use ~/...)".to_string());
+        } else {
+            input.to_string()
+        };
+
+        // Relative paths resolve against current_dir
+        let candidate = PathBuf::from(&expanded);
+        let resolved = if candidate.is_absolute() {
+            candidate
+        } else {
+            self.current_dir.join(candidate)
+        };
+
+        // Canonicalize if possible; fall back to raw resolved on failure
+        let final_path = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+
+        if !final_path.is_dir() {
+            return Err(format!("not a directory: {}", final_path.display()));
+        }
+
+        self.current_dir = final_path;
+        self.selected_index = 0;
+        self.reset_filter_state();
+        self.refresh();
+        Ok(())
     }
 
     pub fn selected_entry(&self) -> Option<&BrowseEntry> {
@@ -545,7 +641,55 @@ impl BrowseState {
 
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
-        self.refresh();
+        // Hidden files were captured by scan(); just re-apply the view layer.
+        self.apply_view_preserving_cursor();
+    }
+
+    // ── Text filter (live, case-insensitive substring on entry name) ─
+
+    /// Open the filter input, seeded with the current `filter_text` so it
+    /// can be edited. Saves the prior `filter_text` for cancellation.
+    pub fn open_filter_input(&mut self) {
+        self.filter_text_prior = Some(self.filter_text.clone());
+        self.filter_input = Some(TextInputState::new(self.filter_text.clone()));
+    }
+
+    /// Sync `filter_text` from the open input and re-apply the view.
+    /// No-op if no input is active.
+    pub fn update_filter_from_input(&mut self) {
+        if let Some(input) = &self.filter_input {
+            self.filter_text = input.text.clone();
+            self.apply_view_preserving_cursor();
+        }
+    }
+
+    /// Close the filter input. If `commit`, keep `filter_text` as-is and drop
+    /// the saved prior value. If `!commit`, restore the prior `filter_text`.
+    pub fn close_filter_input(&mut self, commit: bool) {
+        self.filter_input = None;
+        if commit {
+            self.filter_text_prior = None;
+        } else {
+            let prior = self.filter_text_prior.take().unwrap_or_default();
+            if prior != self.filter_text {
+                self.filter_text = prior;
+                self.apply_view_preserving_cursor();
+            }
+        }
+    }
+
+    /// Drop all filter state and re-apply the view.
+    pub fn clear_filter(&mut self) {
+        self.reset_filter_state();
+        self.apply_view_preserving_cursor();
+    }
+
+    /// Reset filter state without re-applying the view (used by navigation
+    /// methods that will refresh anyway).
+    fn reset_filter_state(&mut self) {
+        self.filter_text.clear();
+        self.filter_input = None;
+        self.filter_text_prior = None;
     }
 
     /// Probe the currently selected entry (audio files only).
@@ -599,6 +743,33 @@ impl BrowseState {
         }
         self.dir_stats_cache.get(&entry.path)
     }
+}
+
+/// View-layer filter check: returns true if the entry passes the hidden,
+/// format, and text filters. Pure function — no state captured, easy to test.
+fn entry_passes_view(
+    entry: &BrowseEntry,
+    show_hidden: bool,
+    format_filter: &FormatFilter,
+    filter_lower: Option<&str>,
+) -> bool {
+    // Hidden filter
+    if !show_hidden && entry.name.starts_with('.') {
+        return false;
+    }
+    // Format filter (only applies to non-directory entries)
+    if !matches!(entry.kind, EntryKind::Directory)
+        && !format_filter.allows(&entry.kind)
+    {
+        return false;
+    }
+    // Text filter (case-insensitive substring)
+    if let Some(needle) = filter_lower {
+        if !entry.name_lower.contains(needle) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Sort a vec of entries by the given field and direction

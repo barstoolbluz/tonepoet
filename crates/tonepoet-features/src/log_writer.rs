@@ -994,8 +994,11 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             error_message: None,
+            replaygain_values: None,
+            source_info: None,
+            conversion_pipeline: None,
         };
-        
+
         assert_eq!(result.compression_ratio(), 80.0); // 80% of original size
     }
 }

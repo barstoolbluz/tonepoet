@@ -115,62 +115,19 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_messag
         return;
     }
 
-    let bindings: Vec<(&str, &str, ratatui::style::Color)> = match current {
-        AppScreen::Convert => vec![
-            ("↑↓", "navigate", theme::BLUE),
-            ("tab", "pane", theme::BLUE),
-            ("←→", "select", theme::BLUE),
-            ("e", "edit", theme::BLUE),
-            ("a", "advanced", theme::PURPLE),
-            ("|", "", theme::BORDER_DIM),
-            ("p", "presets", theme::CYAN),
-            ("s", "save", theme::CYAN),
-            ("f", "effects", theme::AMBER),
-            ("|", "", theme::BORDER_DIM),
-            ("enter", "convert", theme::GREEN),
-            ("+", "queue", theme::AMBER),
-            ("|", "", theme::BORDER_DIM),
-            (":q", "quit", theme::RED),
-        ],
-        AppScreen::Browse => vec![
-            ("↑↓", "navigate", theme::BLUE),
-            ("←→", "up/enter", theme::BLUE),
-            ("space", "select", theme::BLUE),
-            ("enter", "load", theme::GREEN),
-            ("|", "", theme::BORDER_DIM),
-            (":sort", "", theme::CYAN),
-            (":filter", "", theme::CYAN),
-            (".", "hidden", theme::PURPLE),
-            ("|", "", theme::BORDER_DIM),
-            (":q", "quit", theme::RED),
-        ],
-        AppScreen::Queue => vec![
-            ("↑↓", "navigate", theme::BLUE),
-            ("space", "select", theme::BLUE),
-            ("a", "add files", theme::BLUE),
-            ("c", "configure", theme::PURPLE),
-            ("|", "", theme::BORDER_DIM),
-            ("s", "start", theme::GREEN),
-            ("p", "pause", theme::AMBER),
-            ("|", "", theme::BORDER_DIM),
-            (":q", "quit", theme::RED),
-        ],
-        _ => vec![
-            (":q", "quit", theme::RED),
-            ("1", "convert", theme::BLUE),
-        ],
-    };
+    let groups = hint_groups_for(current);
+    let visible = truncate_groups_to_width(&groups, area.width as usize);
 
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
-
-    for (key, label, color) in &bindings {
-        if *key == "|" {
+    for (gi, group) in visible.iter().enumerate() {
+        if gi > 0 {
             spans.push(Span::styled(" │ ", Style::default().fg(theme::BORDER_DIM)));
-        } else {
-            spans.push(Span::styled(*key, Style::default().fg(*color)));
-            if !label.is_empty() {
+        }
+        for hint in group {
+            spans.push(Span::styled(hint.key, Style::default().fg(hint.color)));
+            if !hint.label.is_empty() {
                 spans.push(Span::styled(
-                    format!(" {} ", label),
+                    format!(" {} ", hint.label),
                     Style::default().fg(theme::TEXT_MUTED),
                 ));
             }
@@ -179,4 +136,124 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_messag
 
     let bar = Paragraph::new(Line::from(spans));
     f.render_widget(bar, area);
+}
+
+/// A single keybinding hint shown in the context bar.
+#[derive(Debug, Clone, Copy)]
+struct Hint {
+    key: &'static str,
+    label: &'static str,
+    color: ratatui::style::Color,
+    /// 0 = essential (never dropped), 1 = important, 2 = optional (dropped first).
+    priority: u8,
+}
+
+const fn h(key: &'static str, label: &'static str, color: ratatui::style::Color, priority: u8) -> Hint {
+    Hint { key, label, color, priority }
+}
+
+/// Hint groups per screen. Groups are separated by ` │ ` dividers when rendered.
+fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
+    match current {
+        AppScreen::Convert => vec![
+            vec![
+                h("↑↓", "navigate", theme::BLUE, 0),
+                h("tab", "pane", theme::BLUE, 0),
+                h("←→", "select", theme::BLUE, 1),
+                h("e", "edit", theme::BLUE, 1),
+                h("a", "advanced", theme::PURPLE, 2),
+            ],
+            vec![
+                h("p", "presets", theme::CYAN, 1),
+                h("s", "save", theme::CYAN, 1),
+                h("f", "effects", theme::AMBER, 2),
+            ],
+            vec![
+                h("enter", "convert", theme::GREEN, 0),
+                h("+", "queue", theme::AMBER, 2),
+            ],
+            vec![h(":q", "quit", theme::RED, 0)],
+        ],
+        AppScreen::Browse => vec![
+            vec![
+                h("↑↓", "navigate", theme::BLUE, 0),
+                h("←→", "up/enter", theme::BLUE, 1),
+                h("space", "select", theme::BLUE, 1),
+                h("enter", "load", theme::GREEN, 0),
+            ],
+            vec![
+                h("/", "filter", theme::BLUE, 1),
+                h(":sort", "", theme::CYAN, 2),
+                h(":filter", "", theme::CYAN, 2),
+                h(":cd", "", theme::CYAN, 2),
+                h(".", "hidden", theme::PURPLE, 2),
+            ],
+            vec![h(":q", "quit", theme::RED, 0)],
+        ],
+        AppScreen::Queue => vec![
+            vec![
+                h("↑↓", "navigate", theme::BLUE, 0),
+                h("space", "select", theme::BLUE, 1),
+                h("a", "add files", theme::BLUE, 1),
+                h("c", "configure", theme::PURPLE, 1),
+            ],
+            vec![
+                h("s", "start", theme::GREEN, 0),
+                h("p", "pause", theme::AMBER, 1),
+            ],
+            vec![h(":q", "quit", theme::RED, 0)],
+        ],
+        _ => vec![
+            vec![
+                h(":q", "quit", theme::RED, 0),
+                h("1", "convert", theme::BLUE, 1),
+            ],
+        ],
+    }
+}
+
+/// Width of one hint when rendered: key + (` ` + label + ` ` if label non-empty).
+fn hint_width(h: &Hint) -> usize {
+    let mut w = h.key.chars().count();
+    if !h.label.is_empty() {
+        w += 2 + h.label.chars().count();
+    }
+    w
+}
+
+/// Total rendered width of grouped hints: leading space + hints + group dividers.
+fn total_groups_width(groups: &[Vec<Hint>]) -> usize {
+    let leading = 1;
+    let dividers = groups.len().saturating_sub(1) * 3; // " │ "
+    let hints: usize = groups.iter().flatten().map(hint_width).sum();
+    leading + hints + dividers
+}
+
+/// Drop the rightmost hint with the highest priority value (>= 1) so the bar shrinks
+/// from the end first. Priority-0 hints are protected. Returns true if something was dropped.
+fn drop_one_hint(groups: &mut Vec<Vec<Hint>>) -> bool {
+    for pri in [2u8, 1u8] {
+        for gi in (0..groups.len()).rev() {
+            for hi in (0..groups[gi].len()).rev() {
+                if groups[gi][hi].priority == pri {
+                    groups[gi].remove(hi);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Drop hints from the end (lowest priority first) until the rendered width fits.
+/// Removes empty groups so dividers don't orphan.
+fn truncate_groups_to_width(groups: &[Vec<Hint>], available: usize) -> Vec<Vec<Hint>> {
+    let mut working: Vec<Vec<Hint>> = groups.to_vec();
+    while total_groups_width(&working) > available {
+        if !drop_one_hint(&mut working) {
+            break;
+        }
+        working.retain(|g| !g.is_empty());
+    }
+    working
 }
