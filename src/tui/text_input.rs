@@ -96,6 +96,83 @@ impl TextInputState {
         Some(i)
     }
 
+    /// Walk back from `cursor` skipping whitespace then non-whitespace,
+    /// then delete the resulting range. Implements readline `unix-word-rubout`.
+    pub fn delete_word_back(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let original = self.cursor;
+
+        // Phase 1: skip whitespace immediately before cursor
+        while self.cursor > 0 {
+            let prev = self.prev_char_boundary().unwrap();
+            let c = self.text[prev..self.cursor].chars().next().unwrap();
+            if !c.is_whitespace() {
+                break;
+            }
+            self.cursor = prev;
+        }
+        // Phase 2: skip non-whitespace
+        while self.cursor > 0 {
+            let prev = self.prev_char_boundary().unwrap();
+            let c = self.text[prev..self.cursor].chars().next().unwrap();
+            if c.is_whitespace() {
+                break;
+            }
+            self.cursor = prev;
+        }
+
+        self.text.drain(self.cursor..original);
+    }
+
+    /// Walk forward from `cursor` skipping non-whitespace then whitespace,
+    /// then delete the resulting range. Cursor stays at its current position.
+    pub fn delete_word_forward(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let start = self.cursor;
+        let mut end = start;
+
+        // Phase 1: skip non-whitespace at cursor
+        while end < self.text.len() {
+            let next = next_boundary_after(&self.text, end).unwrap();
+            let c = self.text[end..next].chars().next().unwrap();
+            if c.is_whitespace() {
+                break;
+            }
+            end = next;
+        }
+        // Phase 2: skip whitespace
+        while end < self.text.len() {
+            let next = next_boundary_after(&self.text, end).unwrap();
+            let c = self.text[end..next].chars().next().unwrap();
+            if !c.is_whitespace() {
+                break;
+            }
+            end = next;
+        }
+
+        self.text.drain(start..end);
+    }
+
+    /// Delete everything from cursor back to the start of the input.
+    pub fn kill_to_start(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.text.drain(..self.cursor);
+        self.cursor = 0;
+    }
+
+    /// Delete everything from cursor to the end of the input.
+    pub fn kill_to_end(&mut self) {
+        if self.cursor < self.text.len() {
+            self.text.truncate(self.cursor);
+        }
+    }
+
     /// Number of display columns from the start of the text to the cursor.
     /// Assumes 1 col per char (correct for ASCII + most Latin; approximate for CJK).
     pub fn cursor_display_col(&self) -> usize {
@@ -122,37 +199,103 @@ impl TextInputState {
     }
 }
 
+/// Walk forward from a byte index, returning the next char boundary.
+/// Standalone helper so it can be used without holding a `&mut TextInputState`.
+fn next_boundary_after(text: &str, pos: usize) -> Option<usize> {
+    if pos >= text.len() {
+        return None;
+    }
+    let mut i = pos + 1;
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    Some(i)
+}
+
 /// Handle a key event for a text input. Returns `true` if the key was consumed.
 ///
-/// Handles: Char, Backspace, Delete, Left, Right, Home, End.
+/// Plain keys: Char, Backspace, Delete, Left, Right, Home, End.
+/// Readline-style Ctrl bindings (case-insensitive on the letter):
+///   Ctrl+A=home, Ctrl+E=end, Ctrl+B=left, Ctrl+F=right,
+///   Ctrl+H=backspace, Ctrl+D=delete-fwd,
+///   Ctrl+W=delete-prev-word, Ctrl+U=kill-to-start, Ctrl+K=kill-to-end.
+/// Word-deletion alternatives: Ctrl+Backspace and Alt+Backspace also delete
+/// the previous word; Ctrl+Delete and Alt+D delete the next word.
+/// Unrecognized Ctrl/Alt combos are ignored (NOT inserted as literal chars).
 /// Does NOT handle Enter or Esc — those are overlay-specific.
 pub fn handle_text_input_key(input: &mut TextInputState, key: &KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Char(c) => {
+    use crossterm::event::KeyModifiers as M;
+
+    let ctrl = key.modifiers.contains(M::CONTROL);
+    let alt = key.modifiers.contains(M::ALT);
+
+    match (ctrl, alt, key.code) {
+        // ── Ctrl+letter / Ctrl+Backspace / Ctrl+Delete ──
+        (true, false, KeyCode::Char(c)) => {
+            match c.to_ascii_lowercase() {
+                'a' => input.cursor_home(),
+                'e' => input.cursor_end(),
+                'b' => input.cursor_left(),
+                'f' => input.cursor_right(),
+                'h' => input.backspace(),
+                'd' => input.delete(),
+                'w' => input.delete_word_back(),
+                'u' => input.kill_to_start(),
+                'k' => input.kill_to_end(),
+                _ => return false,
+            }
+            true
+        }
+        (true, false, KeyCode::Backspace) => {
+            input.delete_word_back();
+            true
+        }
+        (true, false, KeyCode::Delete) => {
+            input.delete_word_forward();
+            true
+        }
+        (true, false, _) => false,
+
+        // ── Alt combos: Alt+Backspace and Alt+D ──
+        (false, true, KeyCode::Backspace) => {
+            input.delete_word_back();
+            true
+        }
+        (false, true, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'d') => {
+            input.delete_word_forward();
+            true
+        }
+        (false, true, _) => false,
+
+        // ── Ctrl+Alt+anything → ignore (system shortcut territory) ──
+        (true, true, _) => false,
+
+        // ── Plain keys (SHIFT may be set; that's fine for capitalization) ──
+        (false, false, KeyCode::Char(c)) => {
             input.insert_char(c);
             true
         }
-        KeyCode::Backspace => {
+        (false, false, KeyCode::Backspace) => {
             input.backspace();
             true
         }
-        KeyCode::Delete => {
+        (false, false, KeyCode::Delete) => {
             input.delete();
             true
         }
-        KeyCode::Left => {
+        (false, false, KeyCode::Left) => {
             input.cursor_left();
             true
         }
-        KeyCode::Right => {
+        (false, false, KeyCode::Right) => {
             input.cursor_right();
             true
         }
-        KeyCode::Home => {
+        (false, false, KeyCode::Home) => {
             input.cursor_home();
             true
         }
-        KeyCode::End => {
+        (false, false, KeyCode::End) => {
             input.cursor_end();
             true
         }
@@ -238,5 +381,222 @@ mod tests {
         let (view, col) = s.view(5);
         assert_eq!(view, "01234");
         assert_eq!(col, 0);
+    }
+
+    // ── delete_word_back / delete_word_forward / kill_to_* ──
+
+    #[test]
+    fn delete_word_back_simple() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor_end();
+        s.delete_word_back();
+        assert_eq!(s.text, "hello ");
+        assert_eq!(s.cursor, 6);
+    }
+
+    #[test]
+    fn delete_word_back_skips_trailing_whitespace() {
+        let mut s = TextInputState::new("hello world  ".to_string());
+        s.cursor_end();
+        s.delete_word_back();
+        // Skips trailing whitespace then "world", leaves "hello "
+        assert_eq!(s.text, "hello ");
+        assert_eq!(s.cursor, 6);
+    }
+
+    #[test]
+    fn delete_word_back_at_start() {
+        let mut s = TextInputState::new("hello".to_string());
+        s.cursor_home();
+        s.delete_word_back();
+        assert_eq!(s.text, "hello");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn delete_word_back_only_whitespace() {
+        let mut s = TextInputState::new("   ".to_string());
+        s.cursor_end();
+        s.delete_word_back();
+        assert_eq!(s.text, "");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn delete_word_back_multibyte() {
+        let mut s = TextInputState::new("café world".to_string());
+        s.cursor_end();
+        s.delete_word_back();
+        assert_eq!(s.text, "café ");
+        // "café " is 6 bytes (5 for café, 1 for space)
+        assert_eq!(s.cursor, 6);
+        s.delete_word_back();
+        assert_eq!(s.text, "");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn delete_word_forward_simple() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor_home();
+        s.delete_word_forward();
+        // Deletes "hello " (word + trailing whitespace), leaves "world"
+        assert_eq!(s.text, "world");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn delete_word_forward_at_end() {
+        let mut s = TextInputState::new("hello".to_string());
+        s.cursor_end();
+        s.delete_word_forward();
+        assert_eq!(s.text, "hello");
+        assert_eq!(s.cursor, 5);
+    }
+
+    #[test]
+    fn delete_word_forward_multibyte() {
+        let mut s = TextInputState::new("café 日本語".to_string());
+        s.cursor_home();
+        s.delete_word_forward();
+        // "café " (6 bytes) deleted, leaves "日本語"
+        assert_eq!(s.text, "日本語");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn kill_to_start_basic() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor = 6; // after "hello "
+        s.kill_to_start();
+        assert_eq!(s.text, "world");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn kill_to_start_at_start_noop() {
+        let mut s = TextInputState::new("hello".to_string());
+        s.cursor_home();
+        s.kill_to_start();
+        assert_eq!(s.text, "hello");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn kill_to_end_basic() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor = 5; // after "hello"
+        s.kill_to_end();
+        assert_eq!(s.text, "hello");
+        assert_eq!(s.cursor, 5);
+    }
+
+    #[test]
+    fn kill_to_end_at_end_noop() {
+        let mut s = TextInputState::new("hello".to_string());
+        s.cursor_end();
+        s.kill_to_end();
+        assert_eq!(s.text, "hello");
+        assert_eq!(s.cursor, 5);
+    }
+
+    // ── handle_text_input_key dispatch ──
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn ctrl_a_moves_to_home() {
+        let mut s = TextInputState::new("hello".to_string());
+        s.cursor_end();
+        let consumed = handle_text_input_key(&mut s, &key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(consumed);
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_e_moves_to_end() {
+        let mut s = TextInputState::new("hello".to_string());
+        s.cursor_home();
+        handle_text_input_key(&mut s, &key(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(s.cursor, 5);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_back() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor_end();
+        handle_text_input_key(&mut s, &key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(s.text, "hello ");
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_word_back() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor_end();
+        handle_text_input_key(&mut s, &key(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(s.text, "hello ");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_back() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor_end();
+        handle_text_input_key(&mut s, &key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(s.text, "hello ");
+    }
+
+    #[test]
+    fn ctrl_u_kills_to_start() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor = 6;
+        handle_text_input_key(&mut s, &key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(s.text, "world");
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_end() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor = 5;
+        handle_text_input_key(&mut s, &key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(s.text, "hello");
+    }
+
+    #[test]
+    fn unknown_ctrl_letter_is_ignored() {
+        // Pre-fix bug: Ctrl+X used to insert literal 'x'. Now it should be a no-op.
+        let mut s = TextInputState::new("hi".to_string());
+        s.cursor_end();
+        let consumed = handle_text_input_key(&mut s, &key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(!consumed);
+        assert_eq!(s.text, "hi");
+    }
+
+    #[test]
+    fn shift_letter_still_inserts() {
+        // Capitalized chars (SHIFT modifier set) must still be inserted normally.
+        let mut s = TextInputState::empty();
+        handle_text_input_key(&mut s, &key(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert_eq!(s.text, "A");
+    }
+
+    #[test]
+    fn ctrl_shift_letter_uses_lowercase_binding() {
+        // Ctrl+Shift+A should still trigger cursor_home (the Ctrl binding wins).
+        let mut s = TextInputState::new("hello".to_string());
+        s.cursor_end();
+        handle_text_input_key(
+            &mut s,
+            &key(KeyCode::Char('A'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+        assert_eq!(s.cursor, 0);
     }
 }
