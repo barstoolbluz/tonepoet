@@ -1638,7 +1638,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     //   last-click path == this path, delta < OPEN_MS → open
                     //   last-click path == this path, delta >= OPEN_MS → rename
                     //   different path / no last click                → fresh
-                    const OPEN_MS: u128 = 500;
+                    //
+                    // OPEN_MS is generous (1000ms) to make double-click forgiving
+                    // — longer than desktop defaults (Windows 500, macOS ~500)
+                    // but matches user preference for this app.
+                    const OPEN_MS: u128 = 1000;
 
                     let now = std::time::Instant::now();
                     let delta_ms = app
