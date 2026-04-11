@@ -1,7 +1,8 @@
-//! Source pane: file path, format info, duration (amber border)
+//! Source pane: file path, format info, duration + browse pill (amber border)
 
 use ratatui::{
     layout::Rect,
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -9,6 +10,9 @@ use ratatui::{
 
 use super::app::SourceState;
 use super::theme;
+
+/// Label shown on the clickable "browse files" pill on the source pane.
+pub const BROWSE_PILL_LABEL: &str = " browse files ";
 
 /// Draw the source pane with amber border
 pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused: bool) {
@@ -98,6 +102,7 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
                 Span::styled("   duration  ", theme::muted()),
                 Span::styled(info.duration_display(), theme::text()),
             ]),
+            browse_pill_row(border_color, w),
         ]
     } else {
         // No file loaded
@@ -105,11 +110,12 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
             bordered_line(border_color, w, vec![]),
             bordered_line(border_color, w, vec![
                 Span::styled(
-                    "   press Enter or 'e' to select a source file",
+                    "   press :browse or click the pill below to pick a source file",
                     theme::muted(),
                 ),
             ]),
             bordered_line(border_color, w, vec![]),
+            browse_pill_row(border_color, w),
         ]
     };
 
@@ -119,6 +125,28 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+}
+
+/// Render the "browse files" pill row, centered inside the source pane borders.
+fn browse_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'static> {
+    let pill_style = Style::default()
+        .fg(theme::PILL_ACTIVE_FG)
+        .bg(theme::PILL_ACTIVE_BG)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+
+    let pill_w = BROWSE_PILL_LABEL.chars().count();
+    let inner_w = width.saturating_sub(2);
+    // Right-align the pill with a 3-space right margin.
+    let right_margin = 3;
+    let left_pad = inner_w.saturating_sub(pill_w + right_margin);
+
+    Line::from(vec![
+        Span::styled("│", theme::border(border_color)),
+        Span::raw(" ".repeat(left_pad)),
+        Span::styled(BROWSE_PILL_LABEL, pill_style),
+        Span::raw(" ".repeat(right_margin)),
+        Span::styled("│", theme::border(border_color)),
+    ])
 }
 
 /// Create a line with │ content ... │ border

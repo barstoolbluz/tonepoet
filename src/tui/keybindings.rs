@@ -554,6 +554,9 @@ fn load_browse_selection(
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
                     app.current_screen = AppScreen::Convert;
+                    // Clear the return target so subsequent browse visits don't
+                    // auto-load into the source pane.
+                    app.browse.return_target = BrowseReturnTarget::None;
                 }
                 Err(e) => {
                     app.set_status(format!("Probe error: {}", e));
@@ -580,6 +583,7 @@ fn load_browse_selection(
             app.browse.clear_multi_selection();
             app.set_status(format!("Queued {} files", count));
             app.current_screen = AppScreen::Queue;
+            app.browse.return_target = BrowseReturnTarget::None;
         }
     }
 }
@@ -1270,6 +1274,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     target: TextEditTarget::FilenameTemplate,
                     label: "filename template".to_string(),
                 };
+            }
+            TuiButton::SourceBrowseButton => {
+                app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
+                app.current_screen = AppScreen::Browse;
+                app.browse.probe_current();
             }
             TuiButton::MetadataField(field) => {
                 use super::button_map::MetadataFieldKind::*;

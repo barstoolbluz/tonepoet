@@ -50,6 +50,9 @@ pub enum TuiButton {
     FilenameTemplateField,
     MetadataField(MetadataFieldKind),
 
+    // Convert screen: "browse files..." pill on source pane → opens browse screen
+    SourceBrowseButton,
+
     // Queue action bar
     AddFiles,
     AddFolder,

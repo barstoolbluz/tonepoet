@@ -25,7 +25,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
             Constraint::Length(1),  // blank
             Constraint::Length(1),  // preset bar
             Constraint::Length(1),  // blank
-            Constraint::Length(5),  // source pane (compact)
+            Constraint::Length(6),  // source pane (path + format + duration + browse pill)
             Constraint::Length(5),  // metadata pane
             Constraint::Length(10), // format pane
             Constraint::Length(7),  // output options pane
@@ -145,6 +145,21 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
             TuiButton::FilenameTemplateField,
             Rect::new(inner_x, output_options_area.y + 3, inner_w, 1),
         );
+    }
+
+    // Source pane "browse files" pill (row 4 of the pane, right-aligned with 3-space margin)
+    {
+        let buttons = &mut app.button_map;
+        let inner_w = source_area.width.saturating_sub(2);
+        let pill_label_w = super::draw_source::BROWSE_PILL_LABEL.chars().count() as u16;
+        let right_margin = 3u16;
+        if inner_w as u16 >= pill_label_w + right_margin {
+            let pill_x = source_area.x + 1 + (inner_w as u16 - pill_label_w - right_margin);
+            buttons.record_button(
+                TuiButton::SourceBrowseButton,
+                Rect::new(pill_x, source_area.y + 4, pill_label_w, 1),
+            );
+        }
     }
 
     // Metadata editable fields (rows 1-3 of the pane)

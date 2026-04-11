@@ -37,6 +37,9 @@ pub enum Command {
     /// Rename the current browse selection to the given name.
     /// Empty arg opens the rename overlay seeded with the current name.
     Rename(String),
+    /// Switch to the browse screen. On the convert screen, sets
+    /// the return target so a selected file loads back into the source pane.
+    Browse,
     Unknown(String),
 }
 
@@ -91,6 +94,7 @@ pub fn parse_command(input: &str) -> Command {
             Command::Filter(arg)
         }
         "rename" | "mv" => Command::Rename(args.to_string()),
+        "browse" | "b" => Command::Browse,
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -300,6 +304,16 @@ pub fn execute_command(
         }
         Command::Rename(new_name) => {
             execute_rename(app, &new_name);
+        }
+        Command::Browse => {
+            // If invoked from the convert screen, set return_target so the
+            // selected file loads back into the source pane. From any other
+            // screen, just switch to browse without a return target.
+            if app.current_screen == AppScreen::Convert {
+                app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
+            }
+            app.current_screen = AppScreen::Browse;
+            app.browse.probe_current();
         }
         Command::Unknown(input) => {
             app.set_status(format!("Unknown command: {}", input));
