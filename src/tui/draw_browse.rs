@@ -9,10 +9,22 @@ use ratatui::{
 };
 
 use super::app::AppState;
-use super::browse::{BrowseEntry, BrowseState, EntryKind};
+use super::browse::{BrowseEntry, BrowseState, EntryKind, SortBy, SortDir};
+use super::button_map::{ButtonRenderMap, ColumnKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
 use super::theme;
+
+/// Fixed column widths (inside the list border). Name is flexible.
+const COL_SIZE_W: usize = 9;
+const COL_DATE_W: usize = 12;
+const COL_TYPE_W: usize = 8;
+/// Spaces between name|size, size|date, date|type columns.
+const COL_GAPS: usize = 3;
+/// Prefix: cursor(2) + check(1) + space(1).
+const ROW_PREFIX: usize = 4;
+/// Trailing space before the right border.
+const ROW_TRAILING: usize = 2;
 
 /// Draw the full browse screen
 pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
@@ -37,10 +49,69 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
         .split(chunks[4]);
 
-    draw_browse_list(f, content_chunks[0], &mut app.browse);
+    let list_area = content_chunks[0];
+    draw_browse_list(f, list_area, &mut app.browse);
     draw_browse_info(f, content_chunks[1], &app.browse);
 
-    draw_footer(f, chunks[5], app.current_screen);
+    let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
+    draw_footer(f, chunks[5], app.current_screen, &mut app.button_map, status_msg);
+
+    // Register clickable regions for mouse support (split borrow)
+    register_browse_buttons(&mut app.button_map, list_area, &app.browse);
+}
+
+/// Register mouse click targets for the browse list: column headers,
+/// individual entry rows, and a catch-all list area for scroll wheel routing.
+fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &BrowseState) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+
+    // The whole list area (outer rect) is the scroll-wheel catch-all.
+    buttons.record_button(TuiButton::BrowseList, area);
+
+    let w = area.width as usize;
+    let inner_w = w.saturating_sub(2);
+    if inner_w <= ROW_PREFIX + ROW_TRAILING + COL_SIZE_W + COL_DATE_W + COL_TYPE_W + COL_GAPS {
+        return;
+    }
+    let name_w = inner_w - ROW_PREFIX - ROW_TRAILING - COL_SIZE_W - COL_DATE_W - COL_TYPE_W - COL_GAPS;
+
+    // Column x-offsets (relative to area.x). Header row is area.y + 1 (inside top border).
+    let name_x0 = area.x + 1 + ROW_PREFIX as u16;
+    let size_x0 = name_x0 + name_w as u16 + 1;
+    let date_x0 = size_x0 + COL_SIZE_W as u16 + 1;
+    let type_x0 = date_x0 + COL_DATE_W as u16 + 1;
+
+    let header_y = area.y + 1;
+    buttons.record_button(
+        TuiButton::BrowseColumn(ColumnKind::Name),
+        Rect::new(name_x0, header_y, name_w as u16, 1),
+    );
+    buttons.record_button(
+        TuiButton::BrowseColumn(ColumnKind::Size),
+        Rect::new(size_x0, header_y, COL_SIZE_W as u16, 1),
+    );
+    buttons.record_button(
+        TuiButton::BrowseColumn(ColumnKind::Date),
+        Rect::new(date_x0, header_y, COL_DATE_W as u16, 1),
+    );
+    buttons.record_button(
+        TuiButton::BrowseColumn(ColumnKind::Type),
+        Rect::new(type_x0, header_y, COL_TYPE_W as u16, 1),
+    );
+
+    // Entry rows: lines below the header row, above the bottom border.
+    let content_height = (area.height as usize).saturating_sub(3); // top border + header + bottom border
+    let start = browse.scroll_offset;
+    let end = (start + content_height).min(browse.entries.len());
+    for (row, i) in (start..end).enumerate() {
+        let y = area.y + 2 + row as u16;
+        buttons.record_button(
+            TuiButton::BrowseEntry(i),
+            Rect::new(area.x + 1, y, (inner_w) as u16, 1),
+        );
+    }
 }
 
 /// Draw the breadcrumb bar showing the current directory path
@@ -64,7 +135,7 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
     f.render_widget(line, area);
 }
 
-/// Draw the directory listing (left pane)
+/// Draw the directory listing (left pane) with a sortable column header row.
 fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
     if area.height < 4 || area.width < 20 {
         return;
@@ -72,6 +143,7 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
 
     let border_color = theme::CYAN;
     let w = area.width as usize;
+    let inner_w = w.saturating_sub(2);
 
     // Top border with title
     let title = " browse ";
@@ -93,11 +165,25 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
         theme::border(border_color),
     ));
 
-    // Content area: inside border, inside 1-row top/bottom padding
-    let content_height = (area.height as usize).saturating_sub(2);
+    // Content: top border, header row, N entry rows, bottom border.
+    // Reserve 1 row for the header inside the border.
+    let content_height = (area.height as usize).saturating_sub(3);
     browse.visible_height = content_height;
 
+    // Compute name column width, guarding against narrow widths.
+    let fixed = ROW_PREFIX + ROW_TRAILING + COL_SIZE_W + COL_DATE_W + COL_TYPE_W + COL_GAPS;
+    let name_w = inner_w.saturating_sub(fixed);
+
     let mut lines: Vec<Line> = vec![top_line];
+
+    // Header row
+    lines.push(render_header_row(
+        border_color,
+        w,
+        name_w,
+        browse.sort_by,
+        browse.sort_dir,
+    ));
 
     if let Some(err) = &browse.error {
         lines.push(bordered_line(
@@ -108,7 +194,6 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
                 Style::default().fg(theme::RED),
             )],
         ));
-        // Fill remaining space
         for _ in 1..content_height {
             lines.push(bordered_line(border_color, w, vec![]));
         }
@@ -129,10 +214,16 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
             let entry = &browse.entries[i];
             let is_selected = i == browse.selected_index;
             let is_checked = browse.is_multi_selected(&entry.path);
-            lines.push(render_entry_line(border_color, w, entry, is_selected, is_checked));
+            lines.push(render_entry_line(
+                border_color,
+                w,
+                name_w,
+                entry,
+                is_selected,
+                is_checked,
+            ));
         }
 
-        // Fill remaining space with empty bordered lines
         let rendered = end - start;
         for _ in rendered..content_height {
             lines.push(bordered_line(border_color, w, vec![]));
@@ -145,14 +236,85 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
     f.render_widget(paragraph, area);
 }
 
-/// Render a single entry row
-fn render_entry_line<'a>(
+/// Render the column header row with sort indicator (▲/▼) on the active column.
+fn render_header_row(
     border_color: ratatui::style::Color,
     width: usize,
-    entry: &'a BrowseEntry,
+    name_w: usize,
+    sort_by: SortBy,
+    sort_dir: SortDir,
+) -> Line<'static> {
+    let arrow = match sort_dir {
+        SortDir::Asc => "▲",
+        SortDir::Desc => "▼",
+    };
+
+    let header_cell = |label: &'static str, col: SortBy, col_w: usize, right_align: bool| -> Vec<Span<'static>> {
+        let is_active = sort_by == col;
+        let style = if is_active {
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted()
+        };
+        // Cell text: "label ▲" if active, else "label"
+        let text: String = if is_active {
+            format!("{} {}", label, arrow)
+        } else {
+            label.to_string()
+        };
+        let text_w = text.chars().count();
+        let pad = col_w.saturating_sub(text_w);
+        if right_align {
+            vec![
+                Span::raw(" ".repeat(pad)),
+                Span::styled(text, style),
+            ]
+        } else {
+            vec![
+                Span::styled(text, style),
+                Span::raw(" ".repeat(pad)),
+            ]
+        }
+    };
+
+    let mut spans = vec![
+        Span::styled("│", theme::border(border_color)),
+        Span::raw(" ".repeat(ROW_PREFIX)),
+    ];
+    spans.extend(header_cell("name", SortBy::Name, name_w, false));
+    spans.push(Span::raw(" "));
+    spans.extend(header_cell("size", SortBy::Size, COL_SIZE_W, true));
+    spans.push(Span::raw(" "));
+    spans.extend(header_cell("date", SortBy::Date, COL_DATE_W, false));
+    spans.push(Span::raw(" "));
+    spans.extend(header_cell("type", SortBy::Type, COL_TYPE_W, false));
+    spans.push(Span::raw(" ".repeat(ROW_TRAILING)));
+    spans.push(Span::styled("│", theme::border(border_color)));
+
+    // Pad any shortfall to reach the right border cleanly (safety net).
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    if used < width {
+        // Insert padding before the closing border
+        let pad = width - used;
+        let last = spans.pop().unwrap();
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(last);
+    }
+
+    Line::from(spans)
+}
+
+/// Render a single entry row with fixed columns: name | size | date | type
+fn render_entry_line(
+    border_color: ratatui::style::Color,
+    width: usize,
+    name_w: usize,
+    entry: &BrowseEntry,
     is_selected: bool,
     is_checked: bool,
-) -> Line<'a> {
+) -> Line<'static> {
     // Cursor indicator
     let cursor = if is_selected { "▸ " } else { "  " };
     let cursor_style = if is_selected {
@@ -184,32 +346,21 @@ fn render_entry_line<'a>(
         EntryKind::OtherFile => Style::default().fg(theme::TEXT_DIM),
     };
 
-    // Display name (truncated to leave room for right-aligned info)
-    let info_text = match &entry.kind {
-        EntryKind::ParentDir => String::new(),
-        EntryKind::Directory => String::from("dir"),
-        EntryKind::AudioFile(fmt) => format!("{}  {}", fmt.name(), size_str(entry.size)),
-        EntryKind::Archive => format!("7z  {}", size_str(entry.size)),
-        EntryKind::OtherFile => size_str(entry.size),
+    // Name (truncated to name_w)
+    let name_display = pad_or_truncate(&entry.name, name_w, false);
+
+    // Size (right-aligned, hidden for dirs/parent)
+    let size_text = match &entry.kind {
+        EntryKind::ParentDir | EntryKind::Directory => String::new(),
+        _ => size_str(entry.size),
     };
+    let size_display = pad_or_truncate(&size_text, COL_SIZE_W, true);
 
-    // Layout: │ cursor(2) check(1) space(1) name... info │
-    let prefix_width = 2 + 1 + 1; // cursor + check + space
-    let info_width = info_text.len() + 2; // +2 for trailing spaces
-    let name_max = width
-        .saturating_sub(2) // borders
-        .saturating_sub(prefix_width)
-        .saturating_sub(info_width);
+    // Date (left-aligned)
+    let date_display = pad_or_truncate(&entry.date_label(), COL_DATE_W, false);
 
-    let name_display = if entry.name.chars().count() > name_max && name_max > 3 {
-        let truncated: String = entry.name.chars().take(name_max - 1).collect();
-        format!("{}…", truncated)
-    } else {
-        entry.name.clone()
-    };
-
-    let name_width = name_display.chars().count();
-    let gap = name_max.saturating_sub(name_width);
+    // Type (left-aligned)
+    let type_display = pad_or_truncate(&entry.type_label(), COL_TYPE_W, false);
 
     let mut spans = vec![
         Span::styled("│", theme::border(border_color)),
@@ -217,16 +368,28 @@ fn render_entry_line<'a>(
         Span::styled(check, check_style),
         Span::raw(" "),
         Span::styled(name_display, name_style),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(info_text, theme::muted()),
-        Span::raw("  "),
+        Span::raw(" "),
+        Span::styled(size_display, theme::muted()),
+        Span::raw(" "),
+        Span::styled(date_display, theme::muted()),
+        Span::raw(" "),
+        Span::styled(type_display, theme::muted()),
+        Span::raw(" ".repeat(ROW_TRAILING)),
         Span::styled("│", theme::border(border_color)),
     ];
+
+    // Pad any shortfall before the right border (safety net on narrow widths).
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    if used < width {
+        let pad = width - used;
+        let last = spans.pop().unwrap();
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(last);
+    }
 
     // Selected row gets a subtle bg highlight
     if is_selected {
         for span in spans.iter_mut() {
-            // Only add bg to the content spans, not the borders
             if !matches!(span.content.as_ref(), "│") {
                 let current = span.style;
                 span.style = current.bg(theme::BORDER_DIM);
@@ -235,6 +398,28 @@ fn render_entry_line<'a>(
     }
 
     Line::from(spans)
+}
+
+/// Pad a string to `width` chars, or truncate with ellipsis if too long.
+/// `right_align` pads on the left when true.
+fn pad_or_truncate(s: &str, width: usize, right_align: bool) -> String {
+    let count = s.chars().count();
+    if count == width {
+        return s.to_string();
+    }
+    if count > width {
+        if width < 2 {
+            return s.chars().take(width).collect();
+        }
+        let truncated: String = s.chars().take(width - 1).collect();
+        return format!("{}…", truncated);
+    }
+    let pad = width - count;
+    if right_align {
+        format!("{}{}", " ".repeat(pad), s)
+    } else {
+        format!("{}{}", s, " ".repeat(pad))
+    }
 }
 
 /// Draw the info pane (right pane) showing details for the selected entry

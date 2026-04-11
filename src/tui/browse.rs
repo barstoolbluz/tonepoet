@@ -175,6 +175,35 @@ impl BrowseEntry {
     pub fn is_archive(&self) -> bool {
         matches!(self.kind, EntryKind::Archive)
     }
+
+    /// Short type/format label for display in the type column.
+    /// Audio files show their format (FLAC/MP3/etc), archives show "7z",
+    /// directories show "dir", other files show their lowercase extension.
+    pub fn type_label(&self) -> String {
+        match &self.kind {
+            EntryKind::ParentDir => String::new(),
+            EntryKind::Directory => "dir".to_string(),
+            EntryKind::AudioFile(fmt) => fmt.name().to_string(),
+            EntryKind::Archive => "7z".to_string(),
+            EntryKind::OtherFile => self
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// `YYYY-MM-DD` representation of the entry's modified time, or empty if unknown.
+    pub fn date_label(&self) -> String {
+        match self.modified {
+            Some(t) => {
+                let dt: chrono::DateTime<chrono::Local> = t.into();
+                dt.format("%Y-%m-%d").to_string()
+            }
+            None => String::new(),
+        }
+    }
 }
 
 /// State for the browse screen
@@ -465,6 +494,19 @@ impl BrowseState {
         let jump = self.visible_height.max(1);
         self.selected_index = (self.selected_index + jump).min(self.entries.len().saturating_sub(1));
         self.ensure_visible();
+    }
+
+    /// Scroll the viewport by `delta` rows without moving the cursor.
+    /// Positive delta scrolls down; negative scrolls up. Clamped to valid range.
+    pub fn scroll_viewport(&mut self, delta: i32) {
+        if self.visible_height == 0 || self.entries.is_empty() {
+            return;
+        }
+        let max_offset = self.entries.len().saturating_sub(self.visible_height);
+        let new_offset = (self.scroll_offset as i32 + delta)
+            .max(0)
+            .min(max_offset as i32) as usize;
+        self.scroll_offset = new_offset;
     }
 
     /// Scroll to keep the selected index visible

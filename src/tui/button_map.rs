@@ -13,6 +13,15 @@ pub enum MetadataFieldKind {
     Year,
 }
 
+/// Sortable column in the browse screen
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColumnKind {
+    Name,
+    Size,
+    Date,
+    Type,
+}
+
 /// Identifies a clickable element in the TUI
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TuiButton {
@@ -57,6 +66,11 @@ pub enum TuiButton {
     // Overlay buttons
     OverlayConfirm,
     OverlayCancel,
+
+    // Browse screen
+    BrowseEntry(usize),
+    BrowseColumn(ColumnKind),
+    BrowseList, // catch-all region for scroll wheel routing
 }
 
 /// Maps rendered button positions to their identities for mouse click detection

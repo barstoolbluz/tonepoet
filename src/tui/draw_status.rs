@@ -1,52 +1,23 @@
-//! Legacy header bar and status bar rendering (used by Queue screen)
+//! Queue screen stats strip: persistent conversion progress display.
+//!
+//! Transient status messages are shown globally via the footer context bar,
+//! so this strip is concerned only with queue-specific progress stats.
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
-use super::app::{AppScreen, AppState};
+use super::app::AppState;
 use super::theme;
 
-/// Draw a simple header bar for non-convert screens
-pub fn draw_header(f: &mut Frame, area: Rect, app: &mut AppState) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(20),
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled("tonepoet", Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)),
-    ]));
-    f.render_widget(title, chunks[0]);
-
-    let tab_spans: Vec<Span> = vec![
-        Span::styled(" Queue ", if app.current_screen == AppScreen::Queue {
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            theme::muted()
-        }),
-        Span::styled(" | ", Style::default().fg(theme::TEXT_DIM)),
-        Span::styled(" Config ", if app.current_screen == AppScreen::Config {
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            theme::muted()
-        }),
-    ];
-
-    let tab_line = Paragraph::new(Line::from(tab_spans));
-    f.render_widget(tab_line, chunks[1]);
-}
-
-/// Draw the status bar at the bottom
-pub fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
+/// Draw a 1-row strip showing persistent queue conversion stats.
+/// Transient `status_message` content is intentionally NOT rendered here —
+/// it belongs in the footer context bar so every screen can display it.
+pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState) {
     let items = &app.items_snapshot;
 
     let total = items.len();
@@ -65,11 +36,9 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
 
     let workers = app.config.conversion.worker_count;
 
-    let mut spans = Vec::new();
+    let mut spans: Vec<Span> = vec![Span::raw("  ")];
 
-    if let Some((msg, _)) = &app.status_message {
-        spans.push(Span::styled(msg.clone(), Style::default().fg(theme::AMBER)));
-    } else if total > 0 {
+    if total > 0 {
         spans.push(Span::styled(
             format!("{}/{} completed", completed, total),
             Style::default().fg(theme::GREEN),
@@ -90,7 +59,7 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
         spans.push(Span::styled(format!("{} workers", workers), theme::muted()));
     } else {
         spans.push(Span::styled(
-            "Empty queue - press 'a' to add files",
+            "empty queue — press a to add files",
             theme::muted(),
         ));
     }
@@ -98,13 +67,19 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
     if app.processing_active {
         if app.manager.is_paused() {
             spans.push(Span::raw(" | "));
-            spans.push(Span::styled("PAUSED", Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(
+                "PAUSED",
+                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            ));
         } else {
             spans.push(Span::raw(" | "));
-            spans.push(Span::styled("CONVERTING", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(
+                "CONVERTING",
+                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+            ));
         }
     }
 
-    let status = Paragraph::new(Line::from(spans));
-    f.render_widget(status, area);
+    let line = Paragraph::new(Line::from(spans));
+    f.render_widget(line, area);
 }

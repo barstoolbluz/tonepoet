@@ -30,15 +30,20 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1), // header
-                    Constraint::Min(10),   // content
-                    Constraint::Length(1), // status bar
+                    Constraint::Length(7),  // header banner
+                    Constraint::Length(1),  // blank
+                    Constraint::Length(1),  // stats strip
+                    Constraint::Length(1),  // blank
+                    Constraint::Min(10),    // content
+                    Constraint::Length(2),  // footer (tabs + context)
                 ])
                 .split(f.size());
 
-            super::draw_status::draw_header(f, chunks[0], app);
-            draw_queue_screen(f, chunks[1], app);
-            super::draw_status::draw_status_bar(f, chunks[2], app);
+            super::draw_header::draw_header(f, chunks[0]);
+            super::draw_status::draw_queue_stats_strip(f, chunks[2], app);
+            draw_queue_screen(f, chunks[4], app);
+            let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
+            super::draw_footer::draw_footer(f, chunks[5], app.current_screen, &mut app.button_map, status_msg);
         }
         AppScreen::Wizard => {
             draw_wizard_screen(f, app);
@@ -70,7 +75,7 @@ fn draw_wizard_screen(f: &mut Frame, app: &mut AppState) {
 }
 
 /// Draw settings screen showing conversion configuration
-fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
+fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut AppState) {
     use ratatui::widgets::{Block, Borders};
     use ratatui::style::Modifier;
     use super::theme;
@@ -159,11 +164,12 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &AppSta
     f.render_widget(p, inner);
 
     // Footer
-    super::draw_footer::draw_footer(f, chunks[1], app.current_screen);
+    let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
+    super::draw_footer::draw_footer(f, chunks[1], app.current_screen, &mut app.button_map, status_msg);
 }
 
 /// Draw a placeholder screen for unimplemented tabs
-fn draw_placeholder_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
+fn draw_placeholder_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut AppState) {
     use super::theme;
 
     let chunks = Layout::default()
@@ -183,5 +189,6 @@ fn draw_placeholder_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &App
     ]));
     f.render_widget(msg, chunks[0]);
 
-    super::draw_footer::draw_footer(f, chunks[1], app.current_screen);
+    let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
+    super::draw_footer::draw_footer(f, chunks[1], app.current_screen, &mut app.button_map, status_msg);
 }

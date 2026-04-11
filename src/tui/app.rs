@@ -623,6 +623,11 @@ pub struct AppState {
     pub processing_active: bool,
     pub should_quit: bool,
 
+    /// Last browse-entry click: (entry_path, click_time). Used for double-click detection.
+    /// Path-based rather than index-based so directory refreshes / sort changes between
+    /// clicks don't trigger false double-clicks on different entries.
+    pub last_browse_click: Option<(std::path::PathBuf, std::time::Instant)>,
+
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
@@ -670,6 +675,7 @@ impl AppState {
             status_message: None,
             processing_active: false,
             should_quit: false,
+            last_browse_click: None,
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }

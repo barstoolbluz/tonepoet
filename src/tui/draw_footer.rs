@@ -9,10 +9,19 @@ use ratatui::{
 };
 
 use super::app::AppScreen;
+use super::button_map::{ButtonRenderMap, TuiButton};
 use super::theme;
 
-/// Draw both footer rows (tabs + context bar) into a 2-line area
-pub fn draw_footer(f: &mut Frame, area: Rect, current_screen: AppScreen) {
+/// Draw both footer rows (tabs + context bar) into a 2-line area.
+/// Also registers clickable regions for the tab bar into `buttons`.
+/// When `status_message` is Some, the context bar shows the message instead of hints.
+pub fn draw_footer(
+    f: &mut Frame,
+    area: Rect,
+    current_screen: AppScreen,
+    buttons: &mut ButtonRenderMap,
+    status_message: Option<&str>,
+) {
     if area.height < 2 {
         return;
     }
@@ -22,14 +31,23 @@ pub fn draw_footer(f: &mut Frame, area: Rect, current_screen: AppScreen) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
-    draw_tab_bar(f, chunks[0], current_screen);
-    draw_context_bar(f, chunks[1], current_screen);
+    draw_tab_bar(f, chunks[0], current_screen, buttons);
+    draw_context_bar(f, chunks[1], current_screen, status_message);
 }
 
 /// Draw the numbered tab bar: 1 convert | 2 browse | 3 library | 4 queue | 5 config
-fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen) {
+fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen, buttons: &mut ButtonRenderMap) {
     let tabs = AppScreen::tabs();
     let tab_width = area.width as usize / tabs.len();
+
+    // Register clickable regions for each tab slot (matches rendering math).
+    for i in 0..tabs.len() {
+        let x = area.x + (i * tab_width) as u16;
+        buttons.record_button(
+            TuiButton::Tab(i as u8 + 1),
+            Rect::new(x, area.y, tab_width as u16, 1),
+        );
+    }
 
     let mut spans: Vec<Span> = Vec::new();
 
@@ -77,8 +95,26 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen) {
     f.render_widget(bar, area);
 }
 
-/// Draw the context-sensitive keybinding bar
-fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen) {
+/// Draw the context-sensitive keybinding bar.
+/// If `status_message` is Some, render the message in amber instead of keybinding hints.
+fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_message: Option<&str>) {
+    // When a transient status message is set, it replaces the hints on this row.
+    if let Some(msg) = status_message {
+        let max_chars = (area.width as usize).saturating_sub(2);
+        let display: String = if msg.chars().count() > max_chars && max_chars >= 2 {
+            let t: String = msg.chars().take(max_chars - 1).collect();
+            format!(" {}…", t)
+        } else {
+            format!(" {}", msg)
+        };
+        let bar = Paragraph::new(Line::from(Span::styled(
+            display,
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(bar, area);
+        return;
+    }
+
     let bindings: Vec<(&str, &str, ratatui::style::Color)> = match current {
         AppScreen::Convert => vec![
             ("↑↓", "navigate", theme::BLUE),
@@ -94,7 +130,7 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen) {
             ("enter", "convert", theme::GREEN),
             ("+", "queue", theme::AMBER),
             ("|", "", theme::BORDER_DIM),
-            ("q", "quit", theme::RED),
+            (":q", "quit", theme::RED),
         ],
         AppScreen::Browse => vec![
             ("↑↓", "navigate", theme::BLUE),
@@ -106,7 +142,7 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen) {
             (":filter", "", theme::CYAN),
             (".", "hidden", theme::PURPLE),
             ("|", "", theme::BORDER_DIM),
-            ("q", "quit", theme::RED),
+            (":q", "quit", theme::RED),
         ],
         AppScreen::Queue => vec![
             ("↑↓", "navigate", theme::BLUE),
@@ -117,10 +153,10 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen) {
             ("s", "start", theme::GREEN),
             ("p", "pause", theme::AMBER),
             ("|", "", theme::BORDER_DIM),
-            ("q", "quit", theme::RED),
+            (":q", "quit", theme::RED),
         ],
         _ => vec![
-            ("q", "quit", theme::RED),
+            (":q", "quit", theme::RED),
             ("1", "convert", theme::BLUE),
         ],
     };

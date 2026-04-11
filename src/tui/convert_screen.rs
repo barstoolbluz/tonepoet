@@ -57,7 +57,8 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         f, chunks[7], &app.convert.output_options,
         app.convert.focus == ConvertFocus::OutputOptions,
     );
-    draw_footer(f, chunks[9], app.current_screen);
+    let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
+    draw_footer(f, chunks[9], app.current_screen, &mut app.button_map, status_msg);
 
     // Pass 2: Register mouse button areas (mutable access to button_map)
     register_buttons(app, &chunks);
@@ -70,7 +71,6 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
     let metadata_area = chunks[5];
     let format_area = chunks[6];
     let output_options_area = chunks[7];
-    let footer_area = chunks[9];
 
     // Pane focus areas
     app.button_map.record_button(TuiButton::Pane(ConvertFocus::Source), source_area);
@@ -119,17 +119,7 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         register_pill_row(buttons, &state.merge, output_options_area.y + 4, label_col, output_options_area.width, |i| TuiButton::MergePill(i));
     }
 
-    // Tab bar buttons (footer first row)
-    {
-        let tab_row_y = footer_area.y;
-        let tab_count = 5u16;
-        let tab_w = footer_area.width / tab_count;
-        let buttons = &mut app.button_map;
-        for i in 0..5 {
-            let x = footer_area.x + i * tab_w;
-            buttons.record_button(TuiButton::Tab(i as u8 + 1), Rect::new(x, tab_row_y, tab_w, 1));
-        }
-    }
+    // Tab bar buttons are registered by draw_footer() itself.
 
     // Advanced toggle buttons (top border of each pane)
     // The "a dvanced" text spans 8 chars at area.x + area.width - 10

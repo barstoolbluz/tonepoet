@@ -25,10 +25,8 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
     // Global keys (except in Wizard mode)
     if app.current_screen != AppScreen::Wizard {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                app.should_quit = true;
-                return;
-            }
+            // Quit is ONLY available via `:q` / `:quit` command mode — no bare-letter
+            // quit key to prevent accidental exits.
             (KeyCode::Char('1'), KeyModifiers::NONE) => {
                 app.current_screen = AppScreen::Convert;
                 return;
@@ -1003,6 +1001,26 @@ fn retry_failed(app: &mut AppState) {
 
 /// Handle mouse events
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
+    // Scroll wheel: route to the browse list if the cursor is over it.
+    if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        if app.current_screen == AppScreen::Browse {
+            let over_list = matches!(
+                app.button_map.find_button_at(mouse.column, mouse.row),
+                Some(TuiButton::BrowseList)
+                    | Some(TuiButton::BrowseEntry(_))
+                    | Some(TuiButton::BrowseColumn(_))
+            );
+            if over_list {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => app.browse.scroll_viewport(-3),
+                    MouseEventKind::ScrollDown => app.browse.scroll_viewport(3),
+                    _ => {}
+                }
+            }
+        }
+        return;
+    }
+
     if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
         return;
     }
@@ -1306,6 +1324,65 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::RetryFailed => {
                 retry_failed(app);
+            }
+
+            // ── Browse screen ──
+            TuiButton::BrowseEntry(idx) => {
+                use super::browse::EntryKind;
+                if idx < app.browse.entries.len() {
+                    // Double-click detection: same entry (by path) clicked within 400ms.
+                    // Path-based so refresh/sort between clicks can't cause false positives.
+                    let now = std::time::Instant::now();
+                    let clicked_path = app.browse.entries[idx].path.clone();
+                    let is_double = app.last_browse_click
+                        .as_ref()
+                        .map(|(prev_path, t)| *prev_path == clicked_path
+                            && now.duration_since(*t) < std::time::Duration::from_millis(400))
+                        .unwrap_or(false);
+
+                    app.browse.selected_index = idx;
+                    app.browse.ensure_visible();
+
+                    if is_double {
+                        // Consume the double-click so a third click doesn't chain.
+                        app.last_browse_click = None;
+                        let entry_kind = app.browse.entries[idx].kind.clone();
+                        match entry_kind {
+                            EntryKind::Directory | EntryKind::ParentDir => {
+                                app.browse.enter_selected();
+                                app.browse.probe_current();
+                            }
+                            EntryKind::AudioFile(_) | EntryKind::Archive => {
+                                let target = app.browse.return_target;
+                                load_browse_selection(app, clicked_path, target);
+                            }
+                            EntryKind::OtherFile => {
+                                app.set_status("Not an audio file");
+                            }
+                        }
+                    } else {
+                        app.last_browse_click = Some((clicked_path, now));
+                        app.browse.probe_current();
+                    }
+                }
+            }
+            TuiButton::BrowseColumn(col) => {
+                use super::browse::{SortBy, SortDir};
+                use super::button_map::ColumnKind;
+                let target = match col {
+                    ColumnKind::Name => SortBy::Name,
+                    ColumnKind::Size => SortBy::Size,
+                    ColumnKind::Date => SortBy::Date,
+                    ColumnKind::Type => SortBy::Type,
+                };
+                if app.browse.sort_by == target {
+                    app.browse.toggle_sort_dir();
+                } else {
+                    app.browse.set_sort(target, SortDir::Asc);
+                }
+            }
+            TuiButton::BrowseList => {
+                // Catch-all for scroll routing only; ignore on left click.
             }
 
             // ── Overlay buttons ──
