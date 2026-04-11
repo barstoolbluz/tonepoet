@@ -1126,9 +1126,8 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent) {
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
             let idx = app.bookmarks.overlay_selected;
             app.bookmarks.remove(idx);
-            if app.bookmarks.entries.is_empty() {
-                // Keep overlay open; user sees "(no bookmarks)" placeholder.
-            }
+            // Overlay stays open; if entries became empty, next render shows
+            // the "(no bookmarks)" placeholder.
         }
         (KeyCode::Char('e'), KeyModifiers::NONE) => {
             let idx = app.bookmarks.overlay_selected;
@@ -1143,16 +1142,19 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent) {
                 }
             };
             app.bookmarks.close_overlay();
-            // Navigate the browse screen to that path.
-            match app.browse.navigate_to_str(&path.display().to_string()) {
-                Ok(()) => {
-                    app.set_status(format!("cd: {}", path.display()));
-                    app.browse.probe_current();
-                }
-                Err(e) => {
-                    app.set_status(format!("bookmark: {}", e));
-                }
+            // Navigate directly with the stored PathBuf — no string round-trip
+            // needed since bookmark paths are absolute.
+            if !path.is_dir() {
+                app.set_status(format!(
+                    "bookmark: path no longer exists: {}",
+                    path.display()
+                ));
+                return;
             }
+            let display = path.display().to_string();
+            app.browse.navigate_to(path);
+            app.browse.probe_current();
+            app.set_status(format!("cd: {}", display));
         }
         _ => {}
     }
