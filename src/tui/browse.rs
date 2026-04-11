@@ -57,6 +57,102 @@ pub enum EntryKind {
     OtherFile,
 }
 
+/// Sort field for browse listings
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SortBy {
+    Name,
+    Date,
+    Type,
+    Size,
+}
+
+impl SortBy {
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Name => Self::Date,
+            Self::Date => Self::Type,
+            Self::Type => Self::Size,
+            Self::Size => Self::Name,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Date => "date",
+            Self::Type => "type",
+            Self::Size => "size",
+        }
+    }
+}
+
+/// Sort direction
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    pub fn toggle(&self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+
+/// Format filter: None = all audio formats, Some(fmt) = only that format,
+/// or use the special sentinel via `AudioOnly` to hide non-audio files.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FormatFilter {
+    Off,
+    AudioOnly,
+    Only(AudioFormat),
+}
+
+impl FormatFilter {
+    /// Cycle to the next filter: Off → AudioOnly → each audio format → Off
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Off => Self::AudioOnly,
+            Self::AudioOnly => Self::Only(AudioFormat::Flac),
+            Self::Only(AudioFormat::Flac) => Self::Only(AudioFormat::Opus),
+            Self::Only(AudioFormat::Opus) => Self::Only(AudioFormat::Aac),
+            Self::Only(AudioFormat::Aac) => Self::Only(AudioFormat::Mp3),
+            Self::Only(AudioFormat::Mp3) => Self::Only(AudioFormat::Alac),
+            Self::Only(AudioFormat::Alac) => Self::Only(AudioFormat::Wav),
+            Self::Only(AudioFormat::Wav) => Self::Only(AudioFormat::WavPack),
+            Self::Only(AudioFormat::WavPack) => Self::Only(AudioFormat::Aiff),
+            Self::Only(AudioFormat::Aiff) => Self::Off,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Off => "off".to_string(),
+            Self::AudioOnly => "audio".to_string(),
+            Self::Only(fmt) => fmt.name().to_string(),
+        }
+    }
+
+    /// Whether a given entry passes the filter
+    pub fn allows(&self, kind: &EntryKind) -> bool {
+        match self {
+            Self::Off => true,
+            Self::AudioOnly => matches!(kind, EntryKind::AudioFile(_)),
+            Self::Only(fmt) => matches!(kind, EntryKind::AudioFile(f) if f == fmt),
+        }
+    }
+}
+
 /// A single entry in the browse listing
 #[derive(Debug, Clone)]
 pub struct BrowseEntry {
@@ -99,6 +195,13 @@ pub struct BrowseState {
     pub filter_text: String,
     pub show_hidden: bool,
 
+    /// Sort field and direction
+    pub sort_by: SortBy,
+    pub sort_dir: SortDir,
+
+    /// Format filter (cycle with `f`)
+    pub format_filter: FormatFilter,
+
     /// Probe cache: path → Some(info) if probed, None if probe failed
     pub probe_cache: HashMap<PathBuf, Option<Arc<CachedInfo>>>,
 
@@ -128,6 +231,9 @@ impl BrowseState {
             filter_input: None,
             filter_text: String::new(),
             show_hidden: false,
+            sort_by: SortBy::Name,
+            sort_dir: SortDir::Asc,
+            format_filter: FormatFilter::Off,
             probe_cache: HashMap::new(),
             dir_stats_cache: HashMap::new(),
             return_target: BrowseReturnTarget::None,
@@ -142,7 +248,7 @@ impl BrowseState {
         self.entries.clear();
         self.error = None;
 
-        // Add parent entry if not at root
+        // Add parent entry if not at root (never filtered or sorted — always first)
         if self.current_dir.parent().is_some() {
             self.entries.push(BrowseEntry {
                 path: self.current_dir.parent().unwrap().to_path_buf(),
@@ -182,6 +288,11 @@ impl BrowseState {
                         classify_file(&path)
                     };
 
+                    // Apply format filter to files only (dirs always show)
+                    if !matches!(kind, EntryKind::Directory) && !self.format_filter.allows(&kind) {
+                        continue;
+                    }
+
                     let browse_entry = BrowseEntry {
                         path,
                         name,
@@ -197,8 +308,11 @@ impl BrowseState {
                     }
                 }
 
-                dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                // Sort dirs and files independently (dirs-first invariant preserved)
+                let sort_by = self.sort_by;
+                let sort_dir = self.sort_dir;
+                sort_entries(&mut dirs, sort_by, sort_dir);
+                sort_entries(&mut files, sort_by, sort_dir);
 
                 self.entries.extend(dirs);
                 self.entries.extend(files);
@@ -213,6 +327,58 @@ impl BrowseState {
             self.selected_index = self.entries.len().saturating_sub(1);
         }
         self.scroll_offset = 0;
+    }
+
+    /// Cycle to the next sort field and re-apply, preserving cursor on current entry
+    pub fn cycle_sort_by(&mut self) {
+        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
+        self.sort_by = self.sort_by.next();
+        self.refresh();
+        self.restore_cursor_on_path(prev_path);
+    }
+
+    /// Toggle sort direction and re-apply, preserving cursor on current entry
+    pub fn toggle_sort_dir(&mut self) {
+        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
+        self.sort_dir = self.sort_dir.toggle();
+        self.refresh();
+        self.restore_cursor_on_path(prev_path);
+    }
+
+    /// Set sort field and direction explicitly, preserving cursor
+    pub fn set_sort(&mut self, by: SortBy, dir: SortDir) {
+        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
+        self.sort_by = by;
+        self.sort_dir = dir;
+        self.refresh();
+        self.restore_cursor_on_path(prev_path);
+    }
+
+    /// Cycle to the next format filter and re-apply, preserving cursor if possible
+    pub fn cycle_format_filter(&mut self) {
+        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
+        self.format_filter = self.format_filter.next();
+        self.refresh();
+        self.restore_cursor_on_path(prev_path);
+    }
+
+    /// Set format filter explicitly, preserving cursor
+    pub fn set_format_filter(&mut self, filter: FormatFilter) {
+        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
+        self.format_filter = filter;
+        self.refresh();
+        self.restore_cursor_on_path(prev_path);
+    }
+
+    /// After a refresh, try to reposition the cursor on the entry with the given path.
+    /// If the entry no longer exists (e.g., filtered out), leave cursor at current index.
+    fn restore_cursor_on_path(&mut self, path: Option<PathBuf>) {
+        if let Some(p) = path {
+            if let Some(idx) = self.entries.iter().position(|e| e.path == p) {
+                self.selected_index = idx;
+                self.ensure_visible();
+            }
+        }
     }
 
     /// Enter a directory (or the parent if index points to `..`)
@@ -390,6 +556,54 @@ impl BrowseState {
             return None;
         }
         self.dir_stats_cache.get(&entry.path)
+    }
+}
+
+/// Sort a vec of entries by the given field and direction
+fn sort_entries(entries: &mut [BrowseEntry], by: SortBy, dir: SortDir) {
+    use std::cmp::Ordering;
+
+    entries.sort_by(|a, b| {
+        let ord = match by {
+            SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortBy::Date => match (a.modified, b.modified) {
+                (Some(at), Some(bt)) => at.cmp(&bt),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            SortBy::Size => a.size.cmp(&b.size),
+            SortBy::Type => {
+                // Sort by kind first (audio formats grouped), then by name within group
+                let a_rank = entry_type_rank(&a.kind);
+                let b_rank = entry_type_rank(&b.kind);
+                a_rank
+                    .cmp(&b_rank)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }
+        };
+        match dir {
+            SortDir::Asc => ord,
+            SortDir::Desc => ord.reverse(),
+        }
+    });
+}
+
+/// Numeric rank for type sorting: audio files grouped by format, then archive, then other
+fn entry_type_rank(kind: &EntryKind) -> u8 {
+    match kind {
+        EntryKind::ParentDir => 0,
+        EntryKind::Directory => 1,
+        EntryKind::AudioFile(AudioFormat::Flac) => 10,
+        EntryKind::AudioFile(AudioFormat::Wav) => 11,
+        EntryKind::AudioFile(AudioFormat::Aiff) => 12,
+        EntryKind::AudioFile(AudioFormat::WavPack) => 13,
+        EntryKind::AudioFile(AudioFormat::Alac) => 14,
+        EntryKind::AudioFile(AudioFormat::Mp3) => 15,
+        EntryKind::AudioFile(AudioFormat::Aac) => 16,
+        EntryKind::AudioFile(AudioFormat::Opus) => 17,
+        EntryKind::Archive => 20,
+        EntryKind::OtherFile => 30,
     }
 }
 

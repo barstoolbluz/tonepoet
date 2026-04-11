@@ -28,6 +28,12 @@ pub enum Command {
     Info,
     Tools,
     Help,
+    /// Sort command for the browse screen. Args: (field?, dir?)
+    Sort(Option<String>, Option<String>),
+    /// Toggle sort direction
+    SortDir,
+    /// Filter command for the browse screen. Arg: format name or empty (cycle)
+    Filter(Option<String>),
     Unknown(String),
 }
 
@@ -70,6 +76,17 @@ pub fn parse_command(input: &str) -> Command {
         "info" => Command::Info,
         "tools" => Command::Tools,
         "h" | "help" => Command::Help,
+        "sort" => {
+            let mut sort_parts = args.split_whitespace();
+            let field = sort_parts.next().map(|s| s.to_string());
+            let dir = sort_parts.next().map(|s| s.to_string());
+            Command::Sort(field, dir)
+        }
+        "sortdir" => Command::SortDir,
+        "filter" => {
+            let arg = if args.is_empty() { None } else { Some(args.to_string()) };
+            Command::Filter(arg)
+        }
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -249,12 +266,133 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e <path> :o <path> :set <key> <val> :preset :saveas :convert :help");
+            app.set_status(":q :e <path> :o <path> :set <key> <val> :preset :saveas :convert :sort :filter :help");
+        }
+        Command::Sort(field, dir) => {
+            execute_sort(app, field.as_deref(), dir.as_deref());
+        }
+        Command::SortDir => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":sortdir only works on the browse screen");
+                return;
+            }
+            app.browse.toggle_sort_dir();
+            let msg = format!(
+                "Sort: {} {}",
+                app.browse.sort_by.label(),
+                app.browse.sort_dir.label()
+            );
+            app.set_status(msg);
+        }
+        Command::Filter(arg) => {
+            execute_filter(app, arg.as_deref());
         }
         Command::Unknown(input) => {
             app.set_status(format!("Unknown command: {}", input));
         }
     }
+}
+
+/// Execute a :sort command for the browse screen
+fn execute_sort(app: &mut AppState, field: Option<&str>, dir: Option<&str>) {
+    use super::browse::{SortBy, SortDir};
+
+    if app.current_screen != AppScreen::Browse {
+        app.set_status(":sort only works on the browse screen");
+        return;
+    }
+
+    // No args → cycle to next field
+    if field.is_none() {
+        app.browse.cycle_sort_by();
+        let msg = format!(
+            "Sort: {} {}",
+            app.browse.sort_by.label(),
+            app.browse.sort_dir.label()
+        );
+        app.set_status(msg);
+        return;
+    }
+
+    // Parse explicit field
+    let new_field = match field.unwrap().to_lowercase().as_str() {
+        "name" | "n" => SortBy::Name,
+        "date" | "d" | "modified" | "m" => SortBy::Date,
+        "type" | "t" | "kind" => SortBy::Type,
+        "size" | "s" => SortBy::Size,
+        other => {
+            app.set_status(format!(
+                "Unknown sort field: {}. Try: name, date, type, size",
+                other
+            ));
+            return;
+        }
+    };
+
+    // Parse optional direction
+    let new_dir = match dir {
+        None => app.browse.sort_dir, // preserve current
+        Some(d) => match d.to_lowercase().as_str() {
+            "asc" | "a" | "ascending" => SortDir::Asc,
+            "desc" | "d" | "descending" => SortDir::Desc,
+            other => {
+                app.set_status(format!("Unknown sort direction: {}. Try: asc, desc", other));
+                return;
+            }
+        },
+    };
+
+    app.browse.set_sort(new_field, new_dir);
+    let msg = format!(
+        "Sort: {} {}",
+        app.browse.sort_by.label(),
+        app.browse.sort_dir.label()
+    );
+    app.set_status(msg);
+}
+
+/// Execute a :filter command for the browse screen
+fn execute_filter(app: &mut AppState, arg: Option<&str>) {
+    use super::browse::FormatFilter;
+    use crate::convert::formats::AudioFormat;
+
+    if app.current_screen != AppScreen::Browse {
+        app.set_status(":filter only works on the browse screen");
+        return;
+    }
+
+    // No arg → cycle to next filter
+    if arg.is_none() {
+        app.browse.cycle_format_filter();
+        let msg = format!("Filter: {}", app.browse.format_filter.label());
+        app.set_status(msg);
+        return;
+    }
+
+    // Parse explicit filter value
+    let new_filter = match arg.unwrap().to_lowercase().as_str() {
+        "off" | "none" | "all" => FormatFilter::Off,
+        "audio" => FormatFilter::AudioOnly,
+        "flac" => FormatFilter::Only(AudioFormat::Flac),
+        "opus" => FormatFilter::Only(AudioFormat::Opus),
+        "aac" => FormatFilter::Only(AudioFormat::Aac),
+        "mp3" => FormatFilter::Only(AudioFormat::Mp3),
+        "alac" => FormatFilter::Only(AudioFormat::Alac),
+        "wav" => FormatFilter::Only(AudioFormat::Wav),
+        "wavpack" | "wv" => FormatFilter::Only(AudioFormat::WavPack),
+        "aiff" => FormatFilter::Only(AudioFormat::Aiff),
+        other => {
+            app.set_status(format!(
+                "Unknown filter: {}. Try: off, audio, flac, opus, aac, mp3, alac, wav, wavpack, aiff",
+                other
+            ));
+            return;
+        }
+    };
+
+    app.browse.set_format_filter(new_filter);
+    let msg = format!("Filter: {}", app.browse.format_filter.label());
+    app.set_status(msg);
 }
 
 /// Execute a :set command

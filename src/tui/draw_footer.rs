@@ -96,6 +96,18 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen) {
             ("|", "", theme::BORDER_DIM),
             ("q", "quit", theme::RED),
         ],
+        AppScreen::Browse => vec![
+            ("↑↓", "navigate", theme::BLUE),
+            ("←→", "up/enter", theme::BLUE),
+            ("space", "select", theme::BLUE),
+            ("enter", "load", theme::GREEN),
+            ("|", "", theme::BORDER_DIM),
+            (":sort", "", theme::CYAN),
+            (":filter", "", theme::CYAN),
+            (".", "hidden", theme::PURPLE),
+            ("|", "", theme::BORDER_DIM),
+            ("q", "quit", theme::RED),
+        ],
         AppScreen::Queue => vec![
             ("↑↓", "navigate", theme::BLUE),
             ("space", "select", theme::BLUE),
