@@ -56,6 +56,12 @@ pub struct RecentFilesState {
     pub entries: Vec<RecentEntry>,
     /// Currently selected index in the overlay (when it's open).
     pub overlay_selected: usize,
+    /// Scroll offset (top visible index) when the overlay list exceeds
+    /// the visible row budget.
+    pub overlay_scroll: usize,
+    /// Number of entry rows visible in the overlay. Set by the renderer
+    /// so `ensure_visible` can adjust scroll correctly after navigation.
+    pub overlay_visible_rows: usize,
     /// True when the overlay is displayed.
     pub overlay_open: bool,
 }
@@ -83,9 +89,12 @@ impl RecentFilesState {
         self.entries.insert(0, RecentEntry::new(path.to_path_buf()));
         // Cap at MAX_ENTRIES.
         self.entries.truncate(MAX_ENTRIES);
-        // Clamp selection for consistency.
+        // Clamp selection + scroll for consistency.
         if self.overlay_selected >= self.entries.len() {
             self.overlay_selected = self.entries.len().saturating_sub(1);
+        }
+        if self.overlay_scroll >= self.entries.len() {
+            self.overlay_scroll = 0;
         }
         // Persist.
         let _ = self.save();
@@ -98,6 +107,10 @@ impl RecentFilesState {
             if self.overlay_selected >= self.entries.len() && self.overlay_selected > 0 {
                 self.overlay_selected = self.entries.len().saturating_sub(1);
             }
+            if self.overlay_scroll > 0 && self.overlay_scroll >= self.entries.len() {
+                self.overlay_scroll = self.entries.len().saturating_sub(1);
+            }
+            self.ensure_visible();
             let _ = self.save();
         }
     }
@@ -126,6 +139,7 @@ impl RecentFilesState {
     pub fn overlay_move_up(&mut self) {
         if self.overlay_selected > 0 {
             self.overlay_selected -= 1;
+            self.ensure_visible();
         }
     }
 
@@ -133,6 +147,47 @@ impl RecentFilesState {
     pub fn overlay_move_down(&mut self) {
         if self.overlay_selected + 1 < self.entries.len() {
             self.overlay_selected += 1;
+            self.ensure_visible();
+        }
+    }
+
+    /// Page up — jump one visible page.
+    pub fn overlay_page_up(&mut self) {
+        let step = self.overlay_visible_rows.max(1);
+        self.overlay_selected = self.overlay_selected.saturating_sub(step);
+        self.ensure_visible();
+    }
+
+    /// Page down — jump one visible page.
+    pub fn overlay_page_down(&mut self) {
+        let step = self.overlay_visible_rows.max(1);
+        self.overlay_selected = (self.overlay_selected + step)
+            .min(self.entries.len().saturating_sub(1));
+        self.ensure_visible();
+    }
+
+    /// Jump to first entry.
+    pub fn overlay_move_top(&mut self) {
+        self.overlay_selected = 0;
+        self.overlay_scroll = 0;
+    }
+
+    /// Jump to last entry.
+    pub fn overlay_move_bottom(&mut self) {
+        self.overlay_selected = self.entries.len().saturating_sub(1);
+        self.ensure_visible();
+    }
+
+    /// Adjust `overlay_scroll` so the selected entry is visible. Called after
+    /// navigation. Assumes `overlay_visible_rows` is set by the renderer.
+    fn ensure_visible(&mut self) {
+        if self.overlay_visible_rows == 0 {
+            return;
+        }
+        if self.overlay_selected < self.overlay_scroll {
+            self.overlay_scroll = self.overlay_selected;
+        } else if self.overlay_selected >= self.overlay_scroll + self.overlay_visible_rows {
+            self.overlay_scroll = self.overlay_selected - self.overlay_visible_rows + 1;
         }
     }
 
@@ -141,10 +196,11 @@ impl RecentFilesState {
         self.entries.get(self.overlay_selected)
     }
 
-    /// Open the overlay and reset selection to the top.
+    /// Open the overlay and reset selection + scroll to the top.
     pub fn open_overlay(&mut self) {
         self.overlay_open = true;
         self.overlay_selected = 0;
+        self.overlay_scroll = 0;
     }
 
     /// Close the overlay.

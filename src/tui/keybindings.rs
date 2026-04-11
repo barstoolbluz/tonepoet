@@ -1002,6 +1002,18 @@ fn handle_recent_overlay_key(app: &mut AppState, key: KeyEvent) {
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
             app.recent.overlay_move_down();
         }
+        (KeyCode::PageUp, _) => {
+            app.recent.overlay_page_up();
+        }
+        (KeyCode::PageDown, _) => {
+            app.recent.overlay_page_down();
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            app.recent.overlay_move_top();
+        }
+        (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
+            app.recent.overlay_move_bottom();
+        }
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
             let idx = app.recent.overlay_selected;
             app.recent.remove(idx);
@@ -1106,6 +1118,8 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
                 app.convert.metadata.year = meta.year.clone();
                 app.convert.source.metadata = meta;
             }
+            // Record in the recent-files history.
+            app.recent.record_use(path);
         }
         _ => {
             // Add to queue (existing behavior)

@@ -12,7 +12,9 @@ use super::recent_files::RecentFilesState;
 use super::theme;
 
 /// Draw the recent files overlay as a centered floating panel.
-pub fn draw_recent_overlay(f: &mut Frame, state: &RecentFilesState) {
+/// Takes `&mut RecentFilesState` so it can publish the visible row count
+/// back into the state (used by `ensure_visible` for scroll math).
+pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
     let area = f.size();
     let width: u16 = 60.min(area.width.saturating_sub(4));
     let list_height = state.entries.len() as u16;
@@ -56,10 +58,23 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &RecentFilesState) {
             .saturating_sub(age_col_w)
             .saturating_sub(3); // gaps
 
-        // Slice the list to what fits vertically.
-        let max_visible_rows = (inner.height as usize).saturating_sub(3); // header blank + bottom blank + help
-        let visible_rows = state.entries.len().min(max_visible_rows);
-        for i in 0..visible_rows {
+        // Compute vertical budget for entry rows (leading blank + trailing blank + help = 3).
+        let max_visible_rows = (inner.height as usize).saturating_sub(3);
+        // Publish the row budget so ensure_visible (called from navigation) works.
+        state.overlay_visible_rows = max_visible_rows;
+
+        // Clamp scroll in case entries shrank after a previous render.
+        if state.overlay_scroll + max_visible_rows > state.entries.len()
+            && state.entries.len() > max_visible_rows
+        {
+            state.overlay_scroll = state.entries.len() - max_visible_rows;
+        } else if state.entries.len() <= max_visible_rows {
+            state.overlay_scroll = 0;
+        }
+
+        let start = state.overlay_scroll;
+        let end = (start + max_visible_rows).min(state.entries.len());
+        for i in start..end {
             let entry = &state.entries[i];
             let is_selected = i == state.overlay_selected;
 

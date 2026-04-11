@@ -50,7 +50,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
 
     // Recent files overlay (independent of ActiveOverlay — uses its own flag)
     if app.recent.overlay_open {
-        super::recent_overlay::draw_recent_overlay(f, &app.recent);
+        super::recent_overlay::draw_recent_overlay(f, &mut app.recent);
     }
 }
 
