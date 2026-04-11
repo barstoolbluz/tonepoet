@@ -1562,40 +1562,101 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             // ── Browse screen ──
             TuiButton::BrowseEntry(idx) => {
                 use super::browse::EntryKind;
-                if idx < app.browse.entries.len() {
-                    // Double-click detection: same entry (by path) clicked within 400ms.
-                    // Path-based so refresh/sort between clicks can't cause false positives.
+
+                if idx >= app.browse.entries.len() {
+                    return;
+                }
+
+                let clicked_path = app.browse.entries[idx].path.clone();
+                let alt = mouse.modifiers.contains(KeyModifiers::ALT);
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+
+                // All three click modes move the cursor to the clicked entry.
+                app.browse.selected_index = idx;
+                app.browse.ensure_visible();
+
+                if alt {
+                    // ── Alt+click: range-select from anchor to clicked entry ──
+                    let anchor_idx = app.browse.resolve_anchor_index();
+                    let lo = anchor_idx.min(idx);
+                    let hi = anchor_idx.max(idx);
+                    let to_add: Vec<std::path::PathBuf> = (lo..=hi)
+                        .filter_map(|i| app.browse.entries.get(i))
+                        .filter(|e| !e.is_dir())
+                        .map(|e| e.path.clone())
+                        .collect();
+                    for p in to_add {
+                        if !app.browse.multi_selected.iter().any(|sp| *sp == p) {
+                            app.browse.multi_selected.push(p);
+                        }
+                    }
+                    // Anchor unchanged. Clear click tracking so alt+click never
+                    // contributes to rename/double-click timing.
+                    app.last_browse_click = None;
+                    app.browse.probe_current();
+                } else if shift {
+                    // ── Shift+click: toggle clicked entry in multi_selected ──
+                    // toggle_selection operates on the current cursor (which we
+                    // just moved to `idx`).
+                    app.browse.toggle_selection();
+                    // Anchor unchanged. Clear click tracking.
+                    app.last_browse_click = None;
+                    app.browse.probe_current();
+                } else {
+                    // ── Plain click: timing tiers for open / rename / fresh ──
+                    // < 500ms from prior click on same entry  → open (double-click)
+                    // 500–1500ms                              → rename-click
+                    // otherwise                                → fresh first click
+                    const OPEN_MS: u128 = 500;
+                    const RENAME_MS: u128 = 1500;
+
                     let now = std::time::Instant::now();
-                    let clicked_path = app.browse.entries[idx].path.clone();
-                    let is_double = app.last_browse_click
+                    let delta_ms = app
+                        .last_browse_click
                         .as_ref()
-                        .map(|(prev_path, t)| *prev_path == clicked_path
-                            && now.duration_since(*t) < std::time::Duration::from_millis(400))
-                        .unwrap_or(false);
+                        .filter(|(prev_path, _)| *prev_path == clicked_path)
+                        .map(|(_, t)| now.duration_since(*t).as_millis());
 
-                    app.browse.selected_index = idx;
-                    app.browse.ensure_visible();
-
-                    if is_double {
-                        // Consume the double-click so a third click doesn't chain.
-                        app.last_browse_click = None;
-                        let entry_kind = app.browse.entries[idx].kind.clone();
-                        match entry_kind {
-                            EntryKind::Directory | EntryKind::ParentDir => {
-                                app.browse.enter_selected();
-                                app.browse.probe_current();
-                            }
-                            EntryKind::AudioFile(_) | EntryKind::Archive => {
-                                let target = app.browse.return_target;
-                                load_browse_selection(app, clicked_path, target);
-                            }
-                            EntryKind::OtherFile => {
-                                app.set_status("Not an audio file");
+                    match delta_ms {
+                        Some(d) if d < OPEN_MS => {
+                            // Double-click: open/load
+                            app.last_browse_click = None;
+                            let entry_kind = app.browse.entries[idx].kind.clone();
+                            match entry_kind {
+                                EntryKind::Directory | EntryKind::ParentDir => {
+                                    app.browse.enter_selected();
+                                    app.browse.probe_current();
+                                }
+                                EntryKind::AudioFile(_) | EntryKind::Archive => {
+                                    let target = app.browse.return_target;
+                                    load_browse_selection(app, clicked_path, target);
+                                }
+                                EntryKind::OtherFile => {
+                                    app.set_status("Not an audio file");
+                                }
                             }
                         }
-                    } else {
-                        app.last_browse_click = Some((clicked_path, now));
-                        app.browse.probe_current();
+                        Some(d) if d < RENAME_MS => {
+                            // Rename-click: open the rename overlay seeded with
+                            // the current name.
+                            app.last_browse_click = None;
+                            let entry = app.browse.entries[idx].clone();
+                            if matches!(entry.kind, EntryKind::ParentDir) {
+                                app.set_status("rename: cannot rename parent directory (..)");
+                            } else {
+                                app.active_overlay = ActiveOverlay::TextEdit {
+                                    input: super::text_input::TextInputState::new(entry.name),
+                                    target: TextEditTarget::BrowseRename(entry.path),
+                                    label: "rename".to_string(),
+                                };
+                            }
+                        }
+                        _ => {
+                            // Fresh click: record timing, update anchor, probe.
+                            app.last_browse_click = Some((clicked_path.clone(), now));
+                            app.browse.multi_select_anchor = Some(clicked_path);
+                            app.browse.probe_current();
+                        }
                     }
                 }
             }

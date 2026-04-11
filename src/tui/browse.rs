@@ -243,6 +243,10 @@ pub struct BrowseState {
     /// Multi-selected file paths
     pub multi_selected: Vec<PathBuf>,
 
+    /// Anchor for range selection (Alt+click): the last plain-clicked entry.
+    /// Path-based so it survives refresh/sort/filter. `None` when no anchor is set.
+    pub multi_select_anchor: Option<PathBuf>,
+
     /// Filter input (when /-mode is active)
     pub filter_input: Option<TextInputState>,
     /// Committed filter text (empty = no filter)
@@ -287,6 +291,7 @@ impl BrowseState {
             scroll_offset: 0,
             visible_height: 0,
             multi_selected: Vec::new(),
+            multi_select_anchor: None,
             filter_input: None,
             filter_text: String::new(),
             filter_text_prior: None,
@@ -468,7 +473,7 @@ impl BrowseState {
             if entry.is_dir() {
                 self.current_dir = entry.path.clone();
                 self.selected_index = 0;
-                self.reset_filter_state();
+                self.reset_nav_state();
                 self.refresh();
                 return true;
             }
@@ -484,7 +489,7 @@ impl BrowseState {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string());
             self.current_dir = parent.to_path_buf();
-            self.reset_filter_state();
+            self.reset_nav_state();
             self.refresh();
 
             // Try to position cursor on the directory we came from
@@ -504,7 +509,7 @@ impl BrowseState {
         if path.is_dir() {
             self.current_dir = path;
             self.selected_index = 0;
-            self.reset_filter_state();
+            self.reset_nav_state();
             self.refresh();
         }
     }
@@ -545,7 +550,7 @@ impl BrowseState {
 
         self.current_dir = final_path;
         self.selected_index = 0;
-        self.reset_filter_state();
+        self.reset_nav_state();
         self.refresh();
         Ok(())
     }
@@ -690,6 +695,27 @@ impl BrowseState {
         self.filter_text.clear();
         self.filter_input = None;
         self.filter_text_prior = None;
+    }
+
+    /// Reset filter state AND clear the multi-select anchor, used by navigation
+    /// methods. The anchor is for range-select (Alt+click) and is a
+    /// per-directory context.
+    fn reset_nav_state(&mut self) {
+        self.reset_filter_state();
+        self.multi_select_anchor = None;
+    }
+
+    /// Resolve the range-select anchor to an index in the current `entries` vec.
+    /// Returns the anchor's current index if its path is still present, otherwise
+    /// falls back to the current cursor (`selected_index`). Useful when the
+    /// anchor path has been filtered out or removed since it was set.
+    pub fn resolve_anchor_index(&self) -> usize {
+        if let Some(anchor_path) = &self.multi_select_anchor {
+            if let Some(idx) = self.entries.iter().position(|e| e.path == *anchor_path) {
+                return idx;
+            }
+        }
+        self.selected_index
     }
 
     /// Probe the currently selected entry (audio files only).
