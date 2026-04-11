@@ -978,24 +978,71 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
     }
 }
 
-/// Compute stats for a directory: file count, audio count, total size.
-/// Reads the directory once. Does not recurse.
+/// Compute stats for a directory: total file count, audio count, total size.
+/// Walks recursively into all subdirectories. Symlinks are skipped (avoids
+/// loops). Bounded by `MAX_WALK_DEPTH` and `MAX_WALK_FILES` to prevent
+/// runaway computation on huge trees. Always called from a background task.
 fn compute_dir_stats(path: &Path) -> DirStats {
+    const MAX_WALK_DEPTH: u32 = 20;
+    const MAX_WALK_FILES: usize = 1_000_000;
+
     let mut stats = DirStats::default();
-    if let Ok(read) = fs::read_dir(path) {
-        for entry in read.flatten() {
+    walk_dir_for_stats(path, &mut stats, 0, MAX_WALK_DEPTH, MAX_WALK_FILES);
+    stats
+}
+
+/// Recursive helper for `compute_dir_stats`. Stops descending when:
+/// - depth reaches `max_depth`
+/// - file_count reaches `max_files`
+/// - the directory can't be read
+/// Symlinks are detected via `entry.file_type()` (which doesn't follow them)
+/// and skipped entirely to prevent infinite loops on cyclic symlinks.
+fn walk_dir_for_stats(
+    path: &Path,
+    stats: &mut DirStats,
+    depth: u32,
+    max_depth: u32,
+    max_files: usize,
+) {
+    if depth >= max_depth || stats.file_count >= max_files {
+        return;
+    }
+    let read = match fs::read_dir(path) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue; // skip symlinks (could be loops)
+        }
+        if file_type.is_file() {
             if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    stats.file_count += 1;
-                    stats.total_size += meta.len();
-                    if matches!(classify_file(&entry.path()), EntryKind::AudioFile(_)) {
-                        stats.audio_count += 1;
-                    }
+                stats.file_count += 1;
+                stats.total_size += meta.len();
+                if matches!(classify_file(&entry.path()), EntryKind::AudioFile(_)) {
+                    stats.audio_count += 1;
                 }
+                if stats.file_count >= max_files {
+                    return;
+                }
+            }
+        } else if file_type.is_dir() {
+            walk_dir_for_stats(
+                &entry.path(),
+                stats,
+                depth + 1,
+                max_depth,
+                max_files,
+            );
+            if stats.file_count >= max_files {
+                return;
             }
         }
     }
-    stats
 }
 
 impl Default for BrowseState {
