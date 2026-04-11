@@ -400,19 +400,23 @@ fn render_entry_line(
         Style::default().fg(theme::TEXT_DIM)
     };
 
-    // Entry name color
-    let name_style = match &entry.kind {
-        EntryKind::ParentDir => Style::default().fg(theme::TEXT_MUTED),
-        EntryKind::Directory => Style::default().fg(theme::BLUE),
-        EntryKind::AudioFile(_) => {
-            if is_selected {
-                Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::TEXT)
+    // Entry name color. Broken symlinks override to red regardless of kind.
+    let name_style = if entry.is_broken_symlink {
+        Style::default().fg(theme::RED)
+    } else {
+        match &entry.kind {
+            EntryKind::ParentDir => Style::default().fg(theme::TEXT_MUTED),
+            EntryKind::Directory => Style::default().fg(theme::BLUE),
+            EntryKind::AudioFile(_) => {
+                if is_selected {
+                    Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::TEXT)
+                }
             }
+            EntryKind::Archive => Style::default().fg(theme::AMBER),
+            EntryKind::OtherFile => Style::default().fg(theme::TEXT_DIM),
         }
-        EntryKind::Archive => Style::default().fg(theme::AMBER),
-        EntryKind::OtherFile => Style::default().fg(theme::TEXT_DIM),
     };
 
     // Name (truncated to name_w)
@@ -678,6 +682,73 @@ fn entry_info_lines(
                         ]);
                     }
                 }
+
+                // ReplayGain / R128 section. Only render if at least one
+                // gain field is present. The label clarifies the type.
+                let has_rg = meta.rg_track_gain.is_some()
+                    || meta.rg_album_gain.is_some()
+                    || meta.rg_track_peak.is_some()
+                    || meta.rg_album_peak.is_some();
+                let has_r128 = meta.r128_track_gain.is_some() || meta.r128_album_gain.is_some();
+                if has_rg || has_r128 {
+                    lines.push(vec![]);
+                    let label = match (has_rg, has_r128) {
+                        (true, true) => "replaygain + r128",
+                        (true, false) => match (
+                            meta.rg_track_gain.is_some(),
+                            meta.rg_album_gain.is_some(),
+                        ) {
+                            (true, true) => "replaygain (track + album)",
+                            (false, true) => "replaygain (album)",
+                            _ => "replaygain (track)",
+                        },
+                        (false, true) => "r128",
+                        _ => "loudness",
+                    };
+                    lines.push(vec![Span::styled(
+                        format!("   {}", label),
+                        theme::muted(),
+                    )]);
+
+                    let inline_max = max_value_chars.saturating_sub(11);
+
+                    if let Some(g) = &meta.rg_track_gain {
+                        lines.push(vec![
+                            Span::styled("   tk gain ", theme::muted()),
+                            Span::styled(truncate_to(g, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(p) = &meta.rg_track_peak {
+                        lines.push(vec![
+                            Span::styled("   tk peak ", theme::muted()),
+                            Span::styled(truncate_to(p, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(g) = &meta.rg_album_gain {
+                        lines.push(vec![
+                            Span::styled("   al gain ", theme::muted()),
+                            Span::styled(truncate_to(g, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(p) = &meta.rg_album_peak {
+                        lines.push(vec![
+                            Span::styled("   al peak ", theme::muted()),
+                            Span::styled(truncate_to(p, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(g) = &meta.r128_track_gain {
+                        lines.push(vec![
+                            Span::styled("   r128 tk ", theme::muted()),
+                            Span::styled(truncate_to(g, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(g) = &meta.r128_album_gain {
+                        lines.push(vec![
+                            Span::styled("   r128 al ", theme::muted()),
+                            Span::styled(truncate_to(g, inline_max), theme::text()),
+                        ]);
+                    }
+                }
             } else {
                 // Not yet probed or probe failed — show basic info
                 lines.push(vec![
@@ -710,6 +781,20 @@ fn entry_info_lines(
                 Span::styled(size_str(entry.size), theme::text()),
             ]);
         }
+    }
+
+    // Symlink indicator (applies to all entry kinds).
+    if entry.is_symlink {
+        lines.push(vec![]);
+        let (label, color) = if entry.is_broken_symlink {
+            ("symlink (broken)", theme::RED)
+        } else {
+            ("symlink", theme::AMBER)
+        };
+        lines.push(vec![
+            Span::styled("   ", theme::muted()),
+            Span::styled(label, Style::default().fg(color)),
+        ]);
     }
 
     lines

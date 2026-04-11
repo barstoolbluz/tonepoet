@@ -163,6 +163,11 @@ pub struct BrowseEntry {
     pub kind: EntryKind,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// True if this entry is a symlink (determined via `symlink_metadata`).
+    pub is_symlink: bool,
+    /// True if the entry is a broken symlink (target doesn't exist). Only
+    /// meaningful when `is_symlink` is true.
+    pub is_broken_symlink: bool,
 }
 
 impl BrowseEntry {
@@ -175,7 +180,39 @@ impl BrowseEntry {
         modified: Option<SystemTime>,
     ) -> Self {
         let name_lower = name.to_lowercase();
-        Self { path, name, name_lower, kind, size, modified }
+        Self {
+            path,
+            name,
+            name_lower,
+            kind,
+            size,
+            modified,
+            is_symlink: false,
+            is_broken_symlink: false,
+        }
+    }
+
+    /// Construct a new entry with explicit symlink flags.
+    pub fn new_with_symlink(
+        path: PathBuf,
+        name: String,
+        kind: EntryKind,
+        size: u64,
+        modified: Option<SystemTime>,
+        is_symlink: bool,
+        is_broken_symlink: bool,
+    ) -> Self {
+        let name_lower = name.to_lowercase();
+        Self {
+            path,
+            name,
+            name_lower,
+            kind,
+            size,
+            modified,
+            is_symlink,
+            is_broken_symlink,
+        }
     }
 
     pub fn is_dir(&self) -> bool {
@@ -193,8 +230,9 @@ impl BrowseEntry {
     /// Short type/format label for display in the type column.
     /// Audio files show their format (FLAC/MP3/etc), archives show "7z",
     /// directories show "dir", other files show their lowercase extension.
+    /// Symlinks are prefixed with `↪`.
     pub fn type_label(&self) -> String {
-        match &self.kind {
+        let base = match &self.kind {
             EntryKind::ParentDir => String::new(),
             EntryKind::Directory => "dir".to_string(),
             EntryKind::AudioFile(fmt) => fmt.name().to_string(),
@@ -205,6 +243,11 @@ impl BrowseEntry {
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_lowercase())
                 .unwrap_or_default(),
+        };
+        if self.is_symlink {
+            format!("↪{}", base)
+        } else {
+            base
         }
     }
 
@@ -340,21 +383,50 @@ impl BrowseState {
                     let path = entry.path();
                     let name = entry.file_name().to_string_lossy().to_string();
 
-                    let metadata = match entry.metadata() {
+                    // Use symlink_metadata to detect symlinks WITHOUT following them.
+                    // For non-symlinks this returns the same data as metadata().
+                    let symlink_meta = match fs::symlink_metadata(&path) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
+                    let is_symlink = symlink_meta.file_type().is_symlink();
 
-                    let size = metadata.len();
-                    let modified = metadata.modified().ok();
+                    // For non-symlinks: use symlink_meta directly (it's the file).
+                    // For symlinks: try to follow with metadata() to determine kind
+                    // and broken-ness. If metadata() fails (broken link), the entry
+                    // is rendered as a broken symlink.
+                    let (metadata, is_broken_symlink) = if is_symlink {
+                        match fs::metadata(&path) {
+                            Ok(m) => (Some(m), false),
+                            Err(_) => (None, true),
+                        }
+                    } else {
+                        (Some(symlink_meta.clone()), false)
+                    };
 
-                    let kind = if metadata.is_dir() {
+                    // Use the followed metadata for size/modified/kind when valid;
+                    // otherwise fall back to the symlink's own data.
+                    let effective = metadata.as_ref().unwrap_or(&symlink_meta);
+                    let size = effective.len();
+                    let modified = effective.modified().ok();
+
+                    let kind = if is_broken_symlink {
+                        EntryKind::OtherFile // broken symlink → treat as plain
+                    } else if effective.is_dir() {
                         EntryKind::Directory
                     } else {
                         classify_file(&path)
                     };
 
-                    let browse_entry = BrowseEntry::new(path, name, kind.clone(), size, modified);
+                    let browse_entry = BrowseEntry::new_with_symlink(
+                        path,
+                        name,
+                        kind.clone(),
+                        size,
+                        modified,
+                        is_symlink,
+                        is_broken_symlink,
+                    );
 
                     if matches!(kind, EntryKind::Directory) {
                         self.all_dirs.push(browse_entry);

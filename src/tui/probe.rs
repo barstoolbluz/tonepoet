@@ -24,6 +24,27 @@ pub struct SourceMetadata {
     pub album: Option<String>,
     pub genre: Option<String>,
     pub year: Option<String>,
+
+    /// Gain/peak values from REPLAYGAIN_* tags. Raw strings as stored in the
+    /// file (e.g. `"-6.57 dB"` for gain, `"0.988281"` for peak).
+    pub rg_track_gain: Option<String>,
+    pub rg_track_peak: Option<String>,
+    pub rg_album_gain: Option<String>,
+    pub rg_album_peak: Option<String>,
+
+    /// EBU R 128 loudness values from R128_*_GAIN tags (Opus/Vorbis).
+    /// Stored as display strings in dB form (e.g. `"-6.50 dB"`).
+    /// Computed from the Q7.8 fixed-point integers by dividing by 256.
+    pub r128_track_gain: Option<String>,
+    pub r128_album_gain: Option<String>,
+}
+
+/// Convert an R128 Q7.8 fixed-point integer (stored as a string) into a
+/// human-readable dB string like `"-6.50 dB"`. Returns None on parse failure.
+fn r128_raw_to_db(raw: &str) -> Option<String> {
+    let parsed: i32 = raw.trim().parse().ok()?;
+    let db = parsed as f32 / 256.0;
+    Some(format!("{:+.2} dB", db))
 }
 
 // Ensure ffmpeg is initialized exactly once
@@ -277,13 +298,17 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
 /// Read metadata tags from an audio file using lofty
 pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
     use lofty::file::TaggedFileExt;
-    use lofty::tag::Accessor;
+    use lofty::tag::{Accessor, ItemKey};
 
     let tagged_file = lofty::read_from_path(path)
         .map_err(|e| format!("Failed to read tags from '{}': {}", path.display(), e))?;
 
     // Try each tag in the file, take the first one that has data
     let tags = tagged_file.tags();
+
+    // R128 ItemKeys (Vorbis comment style; not a dedicated lofty variant).
+    let r128_track_key = ItemKey::Unknown("R128_TRACK_GAIN".to_string());
+    let r128_album_key = ItemKey::Unknown("R128_ALBUM_GAIN".to_string());
 
     let mut meta = SourceMetadata::default();
     for tag in tags {
@@ -302,7 +327,79 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
         if meta.year.is_none() {
             meta.year = tag.year().map(|y| y.to_string());
         }
+
+        // ReplayGain (raw strings, format-preserving)
+        if meta.rg_track_gain.is_none() {
+            meta.rg_track_gain = tag
+                .get_string(&ItemKey::ReplayGainTrackGain)
+                .map(|s| s.to_string());
+        }
+        if meta.rg_track_peak.is_none() {
+            meta.rg_track_peak = tag
+                .get_string(&ItemKey::ReplayGainTrackPeak)
+                .map(|s| s.to_string());
+        }
+        if meta.rg_album_gain.is_none() {
+            meta.rg_album_gain = tag
+                .get_string(&ItemKey::ReplayGainAlbumGain)
+                .map(|s| s.to_string());
+        }
+        if meta.rg_album_peak.is_none() {
+            meta.rg_album_peak = tag
+                .get_string(&ItemKey::ReplayGainAlbumPeak)
+                .map(|s| s.to_string());
+        }
+
+        // R128 (Q7.8 fixed-point integer converted to dB on read)
+        if meta.r128_track_gain.is_none() {
+            meta.r128_track_gain = tag
+                .get_string(&r128_track_key)
+                .and_then(r128_raw_to_db);
+        }
+        if meta.r128_album_gain.is_none() {
+            meta.r128_album_gain = tag
+                .get_string(&r128_album_key)
+                .and_then(r128_raw_to_db);
+        }
     }
 
     Ok(meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r128_raw_to_db_positive() {
+        assert_eq!(r128_raw_to_db("1664").as_deref(), Some("+6.50 dB"));
+    }
+
+    #[test]
+    fn r128_raw_to_db_negative() {
+        assert_eq!(r128_raw_to_db("-1664").as_deref(), Some("-6.50 dB"));
+    }
+
+    #[test]
+    fn r128_raw_to_db_zero() {
+        assert_eq!(r128_raw_to_db("0").as_deref(), Some("+0.00 dB"));
+    }
+
+    #[test]
+    fn r128_raw_to_db_fractional() {
+        // 128 / 256 = 0.5 dB
+        assert_eq!(r128_raw_to_db("128").as_deref(), Some("+0.50 dB"));
+    }
+
+    #[test]
+    fn r128_raw_to_db_invalid_returns_none() {
+        assert!(r128_raw_to_db("not a number").is_none());
+        assert!(r128_raw_to_db("").is_none());
+        assert!(r128_raw_to_db("-6.5").is_none()); // Not an integer
+    }
+
+    #[test]
+    fn r128_raw_to_db_whitespace_trimmed() {
+        assert_eq!(r128_raw_to_db("  -1664  ").as_deref(), Some("-6.50 dB"));
+    }
 }
