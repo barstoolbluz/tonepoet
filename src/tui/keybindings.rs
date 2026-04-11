@@ -863,17 +863,16 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     let text = input.text.clone();
                     apply_text_edit(app, target, &text);
                     app.active_overlay = ActiveOverlay::None;
-                    return;
                 }
                 KeyCode::Esc => {
                     app.active_overlay = ActiveOverlay::None;
-                    return;
                 }
                 _ => {
                     super::text_input::handle_text_input_key(&mut input, &key);
+                    // Only reach here when input was modified (no consuming ops).
+                    app.active_overlay = ActiveOverlay::TextEdit { input, target, label };
                 }
             }
-            app.active_overlay = ActiveOverlay::TextEdit { input, target, label };
         }
         ActiveOverlay::None => {}
     }
@@ -912,6 +911,65 @@ fn apply_text_edit(app: &mut AppState, target: TextEditTarget, value: &str) {
         }
         TextEditTarget::MetaYear => {
             app.convert.metadata.year = value_opt;
+        }
+        TextEditTarget::BrowseRename(original_path) => {
+            commit_browse_rename(app, original_path, trimmed);
+        }
+    }
+}
+
+/// Commit a rename for a browse entry: validates the new name, constructs the
+/// target path from the original path's parent, calls fs::rename, refreshes the
+/// browse listing, and repositions the cursor on the renamed entry.
+pub(super) fn commit_browse_rename(app: &mut AppState, original_path: std::path::PathBuf, new_name: &str) {
+    let old_name = original_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    // Validation: empty name
+    if new_name.is_empty() {
+        app.set_status("rename: name cannot be empty");
+        return;
+    }
+    // Validation: no path separators (would be a move, not a rename)
+    if new_name.contains('/') || new_name.contains('\\') {
+        app.set_status("rename: name cannot contain path separators");
+        return;
+    }
+    // No-op if unchanged
+    if new_name == old_name {
+        return;
+    }
+
+    let parent = match original_path.parent() {
+        Some(p) => p.to_path_buf(),
+        None => {
+            app.set_status("rename: cannot rename filesystem root");
+            return;
+        }
+    };
+    let target = parent.join(new_name);
+
+    if target.exists() {
+        app.set_status(format!("rename: target already exists: {}", new_name));
+        return;
+    }
+
+    match std::fs::rename(&original_path, &target) {
+        Ok(()) => {
+            // Refresh the directory and reposition cursor on the renamed entry.
+            app.browse.refresh();
+            if let Some(idx) = app.browse.entries.iter().position(|e| e.path == target) {
+                app.browse.selected_index = idx;
+                app.browse.ensure_visible();
+            }
+            app.browse.probe_current();
+            app.set_status(format!("renamed: {} → {}", old_name, new_name));
+        }
+        Err(e) => {
+            app.set_status(format!("rename failed: {}", e));
         }
     }
 }

@@ -34,6 +34,9 @@ pub enum Command {
     SortDir,
     /// Filter command for the browse screen. Arg: format name or empty (cycle)
     Filter(Option<String>),
+    /// Rename the current browse selection to the given name.
+    /// Empty arg opens the rename overlay seeded with the current name.
+    Rename(String),
     Unknown(String),
 }
 
@@ -87,6 +90,7 @@ pub fn parse_command(input: &str) -> Command {
             let arg = if args.is_empty() { None } else { Some(args.to_string()) };
             Command::Filter(arg)
         }
+        "rename" | "mv" => Command::Rename(args.to_string()),
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -273,7 +277,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e <path> :o <path> :cd <path> :set <key> <val> :preset :saveas :convert :sort :filter :help");
+            app.set_status(":q :e <path> :o <path> :cd <path> :rename <name> :set <key> <val> :preset :saveas :convert :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
@@ -293,6 +297,9 @@ pub fn execute_command(
         }
         Command::Filter(arg) => {
             execute_filter(app, arg.as_deref());
+        }
+        Command::Rename(new_name) => {
+            execute_rename(app, &new_name);
         }
         Command::Unknown(input) => {
             app.set_status(format!("Unknown command: {}", input));
@@ -400,6 +407,46 @@ fn execute_filter(app: &mut AppState, arg: Option<&str>) {
     app.browse.set_format_filter(new_filter);
     let msg = format!("Filter: {}", app.browse.format_filter.label());
     app.set_status(msg);
+}
+
+/// Execute a `:rename` command for the browse screen.
+/// - With no argument: opens a TextEdit overlay seeded with the current name
+///   so the user can edit and press Enter to commit.
+/// - With an argument: commits the rename directly.
+fn execute_rename(app: &mut AppState, new_name: &str) {
+    if app.current_screen != AppScreen::Browse {
+        app.set_status(":rename only works on the browse screen");
+        return;
+    }
+
+    // Capture the currently selected entry's path (must be a real entry,
+    // not the ".." parent pseudo-entry).
+    let (original_path, current_name) = match app.browse.selected_entry() {
+        Some(e) if !matches!(e.kind, super::browse::EntryKind::ParentDir) => {
+            (e.path.clone(), e.name.clone())
+        }
+        Some(_) => {
+            app.set_status("rename: cannot rename parent directory (..)");
+            return;
+        }
+        None => {
+            app.set_status("rename: no selection");
+            return;
+        }
+    };
+
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        // No arg → open the overlay seeded with the current name.
+        app.active_overlay = ActiveOverlay::TextEdit {
+            input: super::text_input::TextInputState::new(current_name),
+            target: TextEditTarget::BrowseRename(original_path),
+            label: "rename".to_string(),
+        };
+    } else {
+        // Arg provided → commit directly.
+        super::keybindings::commit_browse_rename(app, original_path, trimmed);
+    }
 }
 
 /// Execute a :set command

@@ -563,7 +563,7 @@ pub enum ActiveOverlay {
 }
 
 /// Which field a TextEdit overlay is editing
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TextEditTarget {
     DestPath,
     FolderTemplate,
@@ -573,6 +573,9 @@ pub enum TextEditTarget {
     MetaAlbum,
     MetaGenre,
     MetaYear,
+    /// Rename a browse entry. Carries the original path (not index) so a
+    /// directory refresh between open and commit can't corrupt the target.
+    BrowseRename(std::path::PathBuf),
 }
 
 /// What action a confirmation dialog will perform
