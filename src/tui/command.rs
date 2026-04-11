@@ -18,7 +18,8 @@ pub enum Command {
     Output(String),
     Cd(String),
     Convert,
-    Queue,
+    /// Add to queue. The bool is "switch after" — true for `:queue!` variant.
+    Queue(bool),
     Batch(String),
     Preset(String),
     SaveAs(String),
@@ -64,7 +65,8 @@ pub fn parse_command(input: &str) -> Command {
         "o" | "output" => Command::Output(args.to_string()),
         "cd" => Command::Cd(args.to_string()),
         "c" | "convert" => Command::Convert,
-        "qa" | "queue" => Command::Queue,
+        "qa" | "queue" => Command::Queue(false),
+        "qa!" | "queue!" => Command::Queue(true),
         "batch" => Command::Batch(args.to_string()),
         "preset" => Command::Preset(args.to_string()),
         "saveas" => Command::SaveAs(args.to_string()),
@@ -200,8 +202,8 @@ pub fn execute_command(
         Command::Convert => {
             super::convert_actions::convert_or_queue(app, tx, true);
         }
-        Command::Queue => {
-            super::convert_actions::convert_or_queue(app, tx, false);
+        Command::Queue(switch_after) => {
+            execute_queue(app, tx, switch_after);
         }
         Command::Batch(dir) => {
             if dir.is_empty() {
@@ -421,6 +423,64 @@ fn execute_filter(app: &mut AppState, arg: Option<&str>) {
     app.browse.set_format_filter(new_filter);
     let msg = format!("Filter: {}", app.browse.format_filter.label());
     app.set_status(msg);
+}
+
+/// Execute a `:queue` / `:queue!` command. Context-sensitive:
+/// - On the browse screen: adds the multi-selected files (or the current
+///   entry, if nothing is multi-selected) to the conversion queue with
+///   default options. Stays on browse unless `switch_after` is true.
+/// - On the convert screen: adds the currently loaded source file to the
+///   queue (via the existing convert_or_queue path). Stays on convert
+///   unless `switch_after` is true.
+/// - Anywhere else: status error.
+fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, switch_after: bool) {
+    match app.current_screen {
+        AppScreen::Browse => {
+            // Collect paths: multi-selected if any, else the current entry
+            // (provided it's an audio file or archive).
+            let mut paths: Vec<PathBuf> = app.browse.multi_selected.clone();
+            if paths.is_empty() {
+                if let Some(entry) = app.browse.selected_entry() {
+                    use super::browse::EntryKind;
+                    match &entry.kind {
+                        EntryKind::AudioFile(_) | EntryKind::Archive => {
+                            paths.push(entry.path.clone());
+                        }
+                        _ => {
+                            app.set_status("queue: selection is not an audio file");
+                            return;
+                        }
+                    }
+                } else {
+                    app.set_status("queue: no selection");
+                    return;
+                }
+            }
+
+            let options = crate::convert::ConversionOptions::default();
+            let mut count = 0;
+            for p in paths {
+                if app.manager.add_file_ready_for_processing(p, options.clone()).is_ok() {
+                    count += 1;
+                }
+            }
+            app.browse.clear_multi_selection();
+            app.set_status(format!("Queued {} files", count));
+            if switch_after {
+                app.current_screen = AppScreen::Queue;
+            }
+        }
+        AppScreen::Convert => {
+            // Use the existing convert-to-queue path (`false` = queue, don't start).
+            let ok = super::convert_actions::convert_or_queue(app, tx, false);
+            if ok && switch_after {
+                app.current_screen = AppScreen::Queue;
+            }
+        }
+        _ => {
+            app.set_status(":queue only works on the browse or convert screen");
+        }
+    }
 }
 
 /// Execute a `:rename` command for the browse screen.
