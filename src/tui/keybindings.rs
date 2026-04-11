@@ -27,7 +27,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
 
     // Bookmarks overlay (independent flag, browse-only)
     if app.bookmarks.overlay_open {
-        handle_bookmarks_overlay_key(app, key);
+        handle_bookmarks_overlay_key(app, key, tx);
         return;
     }
 
@@ -40,7 +40,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
     // Browse filter input preempts global keys: while typing in the filter,
     // characters like `q`, `1`-`5`, `:` go to the input, not to global handlers.
     if app.current_screen == AppScreen::Browse && app.browse.filter_input.is_some() {
-        handle_browse_filter_key(app, key);
+        handle_browse_filter_key(app, key, tx);
         return;
     }
 
@@ -55,7 +55,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             }
             (KeyCode::Char('2'), KeyModifiers::NONE) => {
                 app.current_screen = AppScreen::Browse;
-                app.browse.probe_current();
+                app.browse.probe_current(tx);
                 return;
             }
             (KeyCode::Char('3'), KeyModifiers::NONE) => {
@@ -391,7 +391,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
 
 // ── Browse screen keybindings ────────────────────────────────────────
 
-fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use super::browse::EntryKind;
 
     // Track whether selection may have changed; if so, probe the new selection.
@@ -493,48 +493,48 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMe
     }
 
     if selection_may_have_changed {
-        app.browse.probe_current();
+        app.browse.probe_current(tx);
     }
 }
 
 /// Hybrid dispatcher used while the live text filter input is open.
 /// Arrow keys / page keys navigate the filtered list; everything else is
 /// fed into the text input. Enter commits, Esc cancels (restores prior filter).
-fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent) {
+fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use super::text_input::handle_text_input_key;
 
     match (key.code, key.modifiers) {
         (KeyCode::Enter, _) => {
             app.browse.close_filter_input(true);
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
         }
         (KeyCode::Esc, _) => {
             app.browse.close_filter_input(false);
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
         }
         // List navigation while filter input is open
         (KeyCode::Up, _) => {
             app.browse.move_up();
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
         }
         (KeyCode::Down, _) => {
             app.browse.move_down();
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
         }
         (KeyCode::PageUp, _) => {
             app.browse.page_up();
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
         }
         (KeyCode::PageDown, _) => {
             app.browse.page_down();
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
         }
         // Everything else: feed to the text input, then re-apply view
         _ => {
             if let Some(input) = &mut app.browse.filter_input {
                 if handle_text_input_key(input, &key) {
                     app.browse.update_filter_from_input();
-                    app.browse.probe_current();
+                    app.browse.probe_current(tx);
                 }
             }
         }
@@ -882,7 +882,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             match key.code {
                 KeyCode::Enter => {
                     let text = input.text.clone();
-                    apply_text_edit(app, target, &text);
+                    apply_text_edit(app, target, &text, tx);
                     app.active_overlay = ActiveOverlay::None;
                 }
                 KeyCode::Esc => {
@@ -900,7 +900,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
 }
 
 /// Apply a text edit to the target field, setting modified flag as needed
-fn apply_text_edit(app: &mut AppState, target: TextEditTarget, value: &str) {
+fn apply_text_edit(
+    app: &mut AppState,
+    target: TextEditTarget,
+    value: &str,
+    tx: &mpsc::Sender<AppMessage>,
+) {
     let trimmed = value.trim();
     let value_opt = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
 
@@ -934,7 +939,7 @@ fn apply_text_edit(app: &mut AppState, target: TextEditTarget, value: &str) {
             app.convert.metadata.year = value_opt;
         }
         TextEditTarget::BrowseRename(original_path) => {
-            commit_browse_rename(app, original_path, trimmed);
+            commit_browse_rename(app, original_path, trimmed, tx);
         }
     }
 }
@@ -942,7 +947,12 @@ fn apply_text_edit(app: &mut AppState, target: TextEditTarget, value: &str) {
 /// Commit a rename for a browse entry: validates the new name, constructs the
 /// target path from the original path's parent, calls fs::rename, refreshes the
 /// browse listing, and repositions the cursor on the renamed entry.
-pub(super) fn commit_browse_rename(app: &mut AppState, original_path: std::path::PathBuf, new_name: &str) {
+pub(super) fn commit_browse_rename(
+    app: &mut AppState,
+    original_path: std::path::PathBuf,
+    new_name: &str,
+    tx: &mpsc::Sender<AppMessage>,
+) {
     let old_name = original_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -986,7 +996,7 @@ pub(super) fn commit_browse_rename(app: &mut AppState, original_path: std::path:
                 app.browse.selected_index = idx;
                 app.browse.ensure_visible();
             }
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
             app.set_status(format!("renamed: {} → {}", old_name, new_name));
         }
         Err(e) => {
@@ -1067,7 +1077,7 @@ fn handle_recent_overlay_key(app: &mut AppState, key: KeyEvent) {
 /// Has two modes:
 /// - Browse mode: list navigation + add/delete/rename/cd actions
 /// - Naming mode (Add or Rename): text input with Enter=commit, Esc=cancel
-fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent) {
+fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use super::bookmarks::BookmarkNaming;
     use super::text_input::handle_text_input_key;
 
@@ -1153,7 +1163,7 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent) {
             }
             let display = path.display().to_string();
             app.browse.navigate_to(path);
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
             app.set_status(format!("cd: {}", display));
         }
         _ => {}
@@ -1417,7 +1427,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     1 => app.current_screen = AppScreen::Convert,
                     2 => {
                         app.current_screen = AppScreen::Browse;
-                        app.browse.probe_current();
+                        app.browse.probe_current(tx);
                     }
                     3 => app.current_screen = AppScreen::Library,
                     4 => app.current_screen = AppScreen::Queue,
@@ -1490,7 +1500,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::SourceBrowseButton => {
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
                 app.current_screen = AppScreen::Browse;
-                app.browse.probe_current();
+                app.browse.probe_current(tx);
             }
             TuiButton::MetadataField(field) => {
                 use super::button_map::MetadataFieldKind::*;
@@ -1722,7 +1732,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     // contributes to rename/double-click timing.
                     app.last_browse_click = None;
                     app.pending_browse_rename = None;
-                    app.browse.probe_current();
+                    app.browse.probe_current(tx);
                 } else if shift {
                     // ── Shift+click: toggle clicked entry in multi_selected ──
                     // toggle_selection operates on the current cursor (which we
@@ -1731,7 +1741,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     // Anchor unchanged. Clear click tracking.
                     app.last_browse_click = None;
                     app.pending_browse_rename = None;
-                    app.browse.probe_current();
+                    app.browse.probe_current(tx);
                 } else {
                     // ── Plain click: open vs schedule-rename vs fresh ──
                     //
@@ -1766,7 +1776,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         match entry_kind {
                             EntryKind::Directory | EntryKind::ParentDir => {
                                 app.browse.enter_selected();
-                                app.browse.probe_current();
+                                app.browse.probe_current(tx);
                             }
                             EntryKind::AudioFile(_) | EntryKind::Archive => {
                                 let target = app.browse.return_target;
@@ -1806,7 +1816,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         // Record this click and anchor.
                         app.last_browse_click = Some((clicked_path.clone(), now));
                         app.browse.multi_select_anchor = Some(clicked_path);
-                        app.browse.probe_current();
+                        app.browse.probe_current(tx);
                     }
                 }
             }

@@ -308,6 +308,10 @@ pub struct BrowseState {
     /// Probe cache: path → Some(info) if probed, None if probe failed
     pub probe_cache: HashMap<PathBuf, Option<Arc<CachedInfo>>>,
 
+    /// Set of paths whose probe is currently in flight on a background task.
+    /// Prevents duplicate spawns when the cursor moves rapidly.
+    pub probe_pending: std::collections::HashSet<PathBuf>,
+
     /// Directory stats cache: path → (file_count, audio_count, total_size)
     pub dir_stats_cache: HashMap<PathBuf, Arc<DirStats>>,
 
@@ -343,6 +347,7 @@ impl BrowseState {
             sort_dir: SortDir::Asc,
             format_filter: FormatFilter::Off,
             probe_cache: HashMap::new(),
+            probe_pending: std::collections::HashSet::new(),
             dir_stats_cache: HashMap::new(),
             return_target: BrowseReturnTarget::None,
             error: None,
@@ -790,17 +795,16 @@ impl BrowseState {
         self.selected_index
     }
 
-    /// Probe the currently selected entry (audio files only).
-    /// Caches the result; cached entries are not re-probed.
+    /// Probe the currently selected entry (audio files only) on a background
+    /// tokio task. The result arrives via `AppMessage::AudioProbeComplete`,
+    /// which the event loop handles by inserting into `probe_cache`.
     ///
-    /// Directory stats are NOT computed here — they're a synchronous
-    /// `fs::read_dir` loop that blocks the event loop for several seconds
-    /// on very large directories (e.g. ~/Downloads), which breaks click
-    /// timing (two clicks end up separated by the full probe duration
-    /// from the event loop's perspective). Directory stats can be computed
-    /// on demand via `compute_dir_stats_current` from a deferred context
-    /// when that's built out.
-    pub fn probe_current(&mut self) {
+    /// No-op if the entry is already in the cache OR if a probe for the same
+    /// path is already in flight.
+    ///
+    /// Directory stats are NOT computed here — see `compute_dir_stats_current`
+    /// for an explicit, deferred-execution entry point.
+    pub fn probe_current(&mut self, tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>) {
         let path = match self.entries.get(self.selected_index) {
             Some(entry) if entry.is_audio() => entry.path.clone(),
             _ => return,
@@ -809,19 +813,12 @@ impl BrowseState {
         if self.probe_cache.contains_key(&path) {
             return; // already probed (successfully or not)
         }
-
-        match crate::tui::probe::probe_audio(&path) {
-            Ok(source) => {
-                let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
-                self.probe_cache.insert(
-                    path,
-                    Some(Arc::new(CachedInfo { source, metadata })),
-                );
-            }
-            Err(_) => {
-                self.probe_cache.insert(path, None);
-            }
+        if self.probe_pending.contains(&path) {
+            return; // probe already in flight
         }
+
+        self.probe_pending.insert(path.clone());
+        spawn_audio_probe(path, tx.clone());
     }
 
     /// Compute directory stats for the currently-selected entry, if it's a
@@ -857,6 +854,34 @@ impl BrowseState {
         }
         self.dir_stats_cache.get(&entry.path)
     }
+}
+
+/// Spawn a background tokio task that probes the audio file at `path` and
+/// sends the result back to the main loop via `AudioProbeComplete`. The
+/// blocking probe (`probe_audio` + `read_metadata`) runs on `spawn_blocking`
+/// so it doesn't tie up an async worker thread.
+pub fn spawn_audio_probe(
+    path: PathBuf,
+    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let path_for_task = path.clone();
+        let result: Result<CachedInfo, String> = tokio::task::spawn_blocking(move || {
+            let source = crate::tui::probe::probe_audio(&path_for_task)
+                .map_err(|e| format!("{}", e))?;
+            let metadata = crate::tui::probe::read_metadata(&path_for_task).unwrap_or_default();
+            Ok(CachedInfo { source, metadata })
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(format!("probe task panicked: {}", join_err)));
+
+        let _ = tx
+            .send(super::message::AppMessage::AudioProbeComplete {
+                path,
+                result: Box::new(result),
+            })
+            .await;
+    });
 }
 
 /// View-layer filter check: returns true if the entry passes the hidden,

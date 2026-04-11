@@ -203,7 +203,7 @@ pub fn execute_command(
                 Ok(()) => {
                     let p = app.browse.current_dir.display().to_string();
                     app.set_status(format!("cd: {}", p));
-                    app.browse.probe_current();
+                    app.browse.probe_current(tx);
                 }
                 Err(e) => app.set_status(format!("cd: {}", e)),
             }
@@ -314,7 +314,7 @@ pub fn execute_command(
             execute_filter(app, arg.as_deref());
         }
         Command::Rename(new_name) => {
-            execute_rename(app, &new_name);
+            execute_rename(app, &new_name, tx);
         }
         Command::Browse => {
             // If invoked from the convert screen, set return_target so the
@@ -324,7 +324,7 @@ pub fn execute_command(
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
             }
             app.current_screen = AppScreen::Browse;
-            app.browse.probe_current();
+            app.browse.probe_current(tx);
         }
         Command::Recent => {
             app.recent.open_overlay();
@@ -541,7 +541,7 @@ fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, switch_after
 /// - With no argument: opens a TextEdit overlay seeded with the current name
 ///   so the user can edit and press Enter to commit.
 /// - With an argument: commits the rename directly.
-fn execute_rename(app: &mut AppState, new_name: &str) {
+fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessage>) {
     if app.current_screen != AppScreen::Browse {
         app.set_status(":rename only works on the browse screen");
         return;
@@ -573,7 +573,7 @@ fn execute_rename(app: &mut AppState, new_name: &str) {
         };
     } else {
         // Arg provided → commit directly.
-        super::keybindings::commit_browse_rename(app, original_path, trimmed);
+        super::keybindings::commit_browse_rename(app, original_path, trimmed, tx);
     }
 }
 

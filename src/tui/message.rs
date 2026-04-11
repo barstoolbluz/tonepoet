@@ -25,4 +25,12 @@ pub enum AppMessage {
     StatusMessage(String),
     /// Force a redraw
     Redraw,
+    /// Result of an asynchronous audio probe (lofty + ffmpeg) launched by
+    /// `BrowseState::probe_current`. The main loop updates `probe_cache` and
+    /// removes the path from `probe_pending`.
+    AudioProbeComplete {
+        path: std::path::PathBuf,
+        /// Owned cached-info on success; error string on failure.
+        result: Box<Result<crate::tui::browse::CachedInfo, String>>,
+    },
 }

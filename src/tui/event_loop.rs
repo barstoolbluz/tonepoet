@@ -152,5 +152,20 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
             app.set_status(msg);
         }
         AppMessage::Redraw => {} // Just triggers a redraw via the loop
+        AppMessage::AudioProbeComplete { path, result } => {
+            app.browse.probe_pending.remove(&path);
+            match *result {
+                Ok(info) => {
+                    app.browse
+                        .probe_cache
+                        .insert(path, Some(std::sync::Arc::new(info)));
+                }
+                Err(_) => {
+                    // Cache the failure so we don't retry; renderer falls back
+                    // to basic info (path + size) when the value is None.
+                    app.browse.probe_cache.insert(path, None);
+                }
+            }
+        }
     }
 }
