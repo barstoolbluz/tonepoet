@@ -16,6 +16,12 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // Recent files overlay (independent flag, global)
+    if app.recent.overlay_open {
+        handle_recent_overlay_key(app, key);
+        return;
+    }
+
     // Handle other overlay inputs
     if !matches!(app.active_overlay, ActiveOverlay::None) {
         handle_overlay_key(app, key, tx);
@@ -557,6 +563,8 @@ fn load_browse_selection(
                     // Clear the return target so subsequent browse visits don't
                     // auto-load into the source pane.
                     app.browse.return_target = BrowseReturnTarget::None;
+                    // Record this file in the recent-files history.
+                    app.recent.record_use(&path);
                 }
                 Err(e) => {
                     app.set_status(format!("Probe error: {}", e));
@@ -974,6 +982,90 @@ pub(super) fn commit_browse_rename(app: &mut AppState, original_path: std::path:
         }
         Err(e) => {
             app.set_status(format!("rename failed: {}", e));
+        }
+    }
+}
+
+/// Handle key events while the recent-files overlay is open.
+/// - Up/Down / k/j: navigate
+/// - Enter: load the selected file as source and switch to convert
+/// - d: delete the selected entry from history
+/// - Esc: close the overlay without loading anything
+fn handle_recent_overlay_key(app: &mut AppState, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            app.recent.close_overlay();
+        }
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            app.recent.overlay_move_up();
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            app.recent.overlay_move_down();
+        }
+        (KeyCode::Char('d'), KeyModifiers::NONE) => {
+            let idx = app.recent.overlay_selected;
+            app.recent.remove(idx);
+            if app.recent.entries.is_empty() {
+                app.recent.close_overlay();
+            }
+        }
+        (KeyCode::Enter, _) => {
+            let path = match app.recent.selected() {
+                Some(e) => e.path.clone(),
+                None => {
+                    app.recent.close_overlay();
+                    return;
+                }
+            };
+            app.recent.close_overlay();
+            // If the file no longer exists, drop it from history and report.
+            if !path.exists() {
+                app.set_status(format!(
+                    "recent: file no longer exists: {}",
+                    path.display()
+                ));
+                // Drop the dead entry.
+                let idx = app
+                    .recent
+                    .entries
+                    .iter()
+                    .position(|e| e.path == path);
+                if let Some(i) = idx {
+                    app.recent.remove(i);
+                }
+                return;
+            }
+            // Load as source via the existing load path.
+            load_recent_as_source(app, &path);
+        }
+        _ => {}
+    }
+}
+
+/// Load a file from the recent list as the current source and switch to convert.
+fn load_recent_as_source(app: &mut AppState, path: &std::path::Path) {
+    match crate::tui::probe::probe_audio(path) {
+        Ok(info) => {
+            app.convert.source.file_path = Some(path.to_path_buf());
+            app.convert.source.info = Some(info);
+            if let Ok(meta) = crate::tui::probe::read_metadata(path) {
+                app.convert.metadata.title = meta.title.clone();
+                app.convert.metadata.artist = meta.artist.clone();
+                app.convert.metadata.album = meta.album.clone();
+                app.convert.metadata.genre = meta.genre.clone();
+                app.convert.metadata.year = meta.year.clone();
+                app.convert.source.metadata = meta;
+            }
+            app.set_status(format!(
+                "Loaded: {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            app.current_screen = AppScreen::Convert;
+            // Bump to top of recent list.
+            app.recent.record_use(path);
+        }
+        Err(e) => {
+            app.set_status(format!("Probe error: {}", e));
         }
     }
 }

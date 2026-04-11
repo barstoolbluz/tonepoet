@@ -631,6 +631,9 @@ pub struct AppState {
     /// clicks don't trigger false double-clicks on different entries.
     pub last_browse_click: Option<(std::path::PathBuf, std::time::Instant)>,
 
+    /// Recent files list + overlay state (persisted to ~/.cache/tonepoet/recent.json).
+    pub recent: crate::tui::recent_files::RecentFilesState,
+
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
@@ -679,6 +682,7 @@ impl AppState {
             processing_active: false,
             should_quit: false,
             last_browse_click: None,
+            recent: crate::tui::recent_files::RecentFilesState::load(),
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }

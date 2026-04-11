@@ -41,6 +41,8 @@ pub enum Command {
     /// Switch to the browse screen. On the convert screen, sets
     /// the return target so a selected file loads back into the source pane.
     Browse,
+    /// Open the recent-files overlay.
+    Recent,
     Unknown(String),
 }
 
@@ -97,6 +99,7 @@ pub fn parse_command(input: &str) -> Command {
         }
         "rename" | "mv" => Command::Rename(args.to_string()),
         "browse" | "b" => Command::Browse,
+        "recent" | "recents" => Command::Recent,
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -171,6 +174,7 @@ pub fn execute_command(
                 app.convert.source.metadata = meta;
             }
             app.current_screen = AppScreen::Convert;
+            app.recent.record_use(&p);
         }
         Command::Output(path) => {
             if path.is_empty() {
@@ -283,7 +287,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :convert :preset :saveas :set :sort :filter :help");
+            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :recent :convert :preset :saveas :set :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
@@ -316,6 +320,9 @@ pub fn execute_command(
             }
             app.current_screen = AppScreen::Browse;
             app.browse.probe_current();
+        }
+        Command::Recent => {
+            app.recent.open_overlay();
         }
         Command::Unknown(input) => {
             app.set_status(format!("Unknown command: {}", input));

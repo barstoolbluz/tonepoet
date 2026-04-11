@@ -47,6 +47,11 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     if app.preset.overlay_open {
         super::presets_overlay::draw_presets_overlay(f, &app.preset);
     }
+
+    // Recent files overlay (independent of ActiveOverlay — uses its own flag)
+    if app.recent.overlay_open {
+        super::recent_overlay::draw_recent_overlay(f, &app.recent);
+    }
 }
 
 /// Center a rect within a parent area

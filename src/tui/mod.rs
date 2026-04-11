@@ -25,5 +25,7 @@ pub mod pill;
 pub mod presets;
 pub mod presets_overlay;
 pub mod probe;
+pub mod recent_files;
+pub mod recent_overlay;
 pub mod text_input;
 pub mod theme;

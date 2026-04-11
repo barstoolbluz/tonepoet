@@ -165,6 +165,7 @@ fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
             ],
             vec![
                 h(":browse", "", theme::CYAN, 2),
+                h(":recent", "", theme::CYAN, 2),
                 h("p", "presets", theme::CYAN, 1),
                 h("s", "save", theme::CYAN, 1),
                 h("f", "effects", theme::AMBER, 2),
@@ -188,6 +189,7 @@ fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
                 h(":filter", "", theme::CYAN, 2),
                 h(":cd", "", theme::CYAN, 2),
                 h(":rename", "", theme::AMBER, 2),
+                h(":recent", "", theme::CYAN, 2),
                 h(".", "hidden", theme::PURPLE, 2),
             ],
             vec![
