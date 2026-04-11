@@ -117,9 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let log_level = if cli.verbose { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
-        .format_timestamp_secs()
-        .init();
+    init_logging(log_level, matches!(cli.command, Commands::Tui));
 
     let config = TonepoetConfig::load().unwrap_or_default();
 
@@ -152,6 +150,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Initialize env_logger. In TUI mode, logs are redirected to a file at
+/// `~/.cache/tonepoet/tonepoet.log` so they don't corrupt the ratatui display.
+/// In CLI mode, logs go to stderr as usual.
+fn init_logging(level: &str, is_tui: bool) {
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(level),
+    );
+    builder.format_timestamp_secs();
+
+    if is_tui {
+        let log_path = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("tonepoet")
+            .join("tonepoet.log");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+        // If the file can't be opened, fall back to stderr (still ugly in TUI
+        // but no worse than before). try_init prevents a panic if init was
+        // already called somehow; we ignore the result.
+    }
+
+    let _ = builder.try_init();
 }
 
 fn parse_format(s: &str) -> anyhow::Result<AudioFormat> {
