@@ -591,7 +591,8 @@ fn entry_info_lines(
                 Span::styled("   kind    ", theme::muted()),
                 Span::styled("directory", theme::text()),
             ]);
-            // Show directory stats if cached
+            // Show directory stats if cached, or "computing…" if a stats
+            // task is currently in flight for this directory.
             if let Some(stats) = browse.current_dir_stats() {
                 lines.push(vec![
                     Span::styled("   files   ", theme::muted()),
@@ -606,6 +607,11 @@ fn entry_info_lines(
                 lines.push(vec![
                     Span::styled("   size    ", theme::muted()),
                     Span::styled(size_str(stats.total_size), theme::text()),
+                ]);
+            } else if browse.dir_stats_pending.contains(&entry.path) {
+                lines.push(vec![
+                    Span::styled("   files   ", theme::muted()),
+                    Span::styled("computing…", Style::default().fg(theme::TEXT_DIM)),
                 ]);
             }
         }

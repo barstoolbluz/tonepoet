@@ -167,5 +167,11 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
                 }
             }
         }
+        AppMessage::DirStatsComplete { path, stats } => {
+            app.browse.dir_stats_pending.remove(&path);
+            app.browse
+                .dir_stats_cache
+                .insert(path, std::sync::Arc::new(stats));
+        }
     }
 }

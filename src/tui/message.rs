@@ -33,4 +33,11 @@ pub enum AppMessage {
         /// Owned cached-info on success; error string on failure.
         result: Box<Result<crate::tui::browse::CachedInfo, String>>,
     },
+    /// Result of an asynchronous directory-stats computation launched by
+    /// `BrowseState::probe_current` for a directory entry. The main loop
+    /// updates `dir_stats_cache` and removes the path from `dir_stats_pending`.
+    DirStatsComplete {
+        path: std::path::PathBuf,
+        stats: crate::tui::browse::DirStats,
+    },
 }

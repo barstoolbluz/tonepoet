@@ -315,6 +315,10 @@ pub struct BrowseState {
     /// Directory stats cache: path → (file_count, audio_count, total_size)
     pub dir_stats_cache: HashMap<PathBuf, Arc<DirStats>>,
 
+    /// Set of directory paths whose stats are currently being computed on
+    /// a background task. Prevents duplicate spawns.
+    pub dir_stats_pending: std::collections::HashSet<PathBuf>,
+
     /// Where to send selected files
     pub return_target: BrowseReturnTarget,
 
@@ -349,6 +353,7 @@ impl BrowseState {
             probe_cache: HashMap::new(),
             probe_pending: std::collections::HashSet::new(),
             dir_stats_cache: HashMap::new(),
+            dir_stats_pending: std::collections::HashSet::new(),
             return_target: BrowseReturnTarget::None,
             error: None,
         };
@@ -795,45 +800,37 @@ impl BrowseState {
         self.selected_index
     }
 
-    /// Probe the currently selected entry (audio files only) on a background
-    /// tokio task. The result arrives via `AppMessage::AudioProbeComplete`,
-    /// which the event loop handles by inserting into `probe_cache`.
+    /// Kick off background lookup for the currently-selected entry:
+    /// - Audio files → `spawn_audio_probe` (lofty + ffmpeg metadata read)
+    /// - Subdirectories (not ParentDir) → `spawn_dir_stats` (file count + total size)
+    /// - Other kinds → no-op
     ///
-    /// No-op if the entry is already in the cache OR if a probe for the same
-    /// path is already in flight.
-    ///
-    /// Directory stats are NOT computed here — see `compute_dir_stats_current`
-    /// for an explicit, deferred-execution entry point.
+    /// Results arrive via `AppMessage::AudioProbeComplete` or
+    /// `AppMessage::DirStatsComplete` and the event loop populates the
+    /// respective caches. Pending sets prevent duplicate spawns when the
+    /// cursor moves rapidly back and forth.
     pub fn probe_current(&mut self, tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>) {
-        let path = match self.entries.get(self.selected_index) {
-            Some(entry) if entry.is_audio() => entry.path.clone(),
-            _ => return,
+        let entry = match self.entries.get(self.selected_index) {
+            Some(e) => e,
+            None => return,
         };
 
-        if self.probe_cache.contains_key(&path) {
-            return; // already probed (successfully or not)
-        }
-        if self.probe_pending.contains(&path) {
-            return; // probe already in flight
-        }
-
-        self.probe_pending.insert(path.clone());
-        spawn_audio_probe(path, tx.clone());
-    }
-
-    /// Compute directory stats for the currently-selected entry, if it's a
-    /// directory. SLOW on large directories — never call from an interactive
-    /// event handler; reserved for deferred/background execution.
-    #[allow(dead_code)]
-    pub fn compute_dir_stats_current(&mut self) {
-        if let Some(entry) = self.entries.get(self.selected_index) {
-            if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) {
-                if !self.dir_stats_cache.contains_key(&entry.path) {
-                    let path = entry.path.clone();
-                    let stats = compute_dir_stats(&path);
-                    self.dir_stats_cache.insert(path, Arc::new(stats));
-                }
+        if entry.is_audio() {
+            let path = entry.path.clone();
+            if self.probe_cache.contains_key(&path) || self.probe_pending.contains(&path) {
+                return;
             }
+            self.probe_pending.insert(path.clone());
+            spawn_audio_probe(path, tx.clone());
+        } else if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) {
+            let path = entry.path.clone();
+            if self.dir_stats_cache.contains_key(&path)
+                || self.dir_stats_pending.contains(&path)
+            {
+                return;
+            }
+            self.dir_stats_pending.insert(path.clone());
+            spawn_dir_stats(path, tx.clone());
         }
     }
 
@@ -880,6 +877,28 @@ pub fn spawn_audio_probe(
                 path,
                 result: Box::new(result),
             })
+            .await;
+    });
+}
+
+/// Spawn a background tokio task that computes directory stats for `path`
+/// (file count, audio file count, total size) and sends the result back via
+/// `DirStatsComplete`. The blocking `fs::read_dir` + per-entry stat loop
+/// runs on `spawn_blocking` so it doesn't tie up an async worker thread —
+/// the original sync version was the source of the Phase 4d UI freeze on
+/// large directories like ~/Downloads.
+pub fn spawn_dir_stats(
+    path: PathBuf,
+    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let path_for_task = path.clone();
+        let stats = tokio::task::spawn_blocking(move || compute_dir_stats(&path_for_task))
+            .await
+            .unwrap_or_default();
+
+        let _ = tx
+            .send(super::message::AppMessage::DirStatsComplete { path, stats })
             .await;
     });
 }
