@@ -720,17 +720,17 @@ impl BrowseState {
 
     /// Probe the currently selected entry (audio files only).
     /// Caches the result; cached entries are not re-probed.
+    ///
+    /// Directory stats are NOT computed here — they're a synchronous
+    /// `fs::read_dir` loop that blocks the event loop for several seconds
+    /// on very large directories (e.g. ~/Downloads), which breaks click
+    /// timing (two clicks end up separated by the full probe duration
+    /// from the event loop's perspective). Directory stats can be computed
+    /// on demand via `compute_dir_stats_current` from a deferred context
+    /// when that's built out.
     pub fn probe_current(&mut self) {
         let path = match self.entries.get(self.selected_index) {
             Some(entry) if entry.is_audio() => entry.path.clone(),
-            Some(entry) if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) => {
-                // Compute directory stats lazily
-                if !self.dir_stats_cache.contains_key(&entry.path) {
-                    let stats = compute_dir_stats(&entry.path);
-                    self.dir_stats_cache.insert(entry.path.clone(), Arc::new(stats));
-                }
-                return;
-            }
             _ => return,
         };
 
@@ -748,6 +748,22 @@ impl BrowseState {
             }
             Err(_) => {
                 self.probe_cache.insert(path, None);
+            }
+        }
+    }
+
+    /// Compute directory stats for the currently-selected entry, if it's a
+    /// directory. SLOW on large directories — never call from an interactive
+    /// event handler; reserved for deferred/background execution.
+    #[allow(dead_code)]
+    pub fn compute_dir_stats_current(&mut self) {
+        if let Some(entry) = self.entries.get(self.selected_index) {
+            if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) {
+                if !self.dir_stats_cache.contains_key(&entry.path) {
+                    let path = entry.path.clone();
+                    let stats = compute_dir_stats(&path);
+                    self.dir_stats_cache.insert(path, Arc::new(stats));
+                }
             }
         }
     }
