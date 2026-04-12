@@ -366,6 +366,111 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
     Ok(meta)
 }
 
+// ── Metadata writing ────────────────────────────────────────────────
+
+/// Which metadata field to edit. Used by TextEditTarget::BrowseMetadata
+/// and the context menu's "Edit metadata" submenu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MetadataField {
+    Title,
+    Artist,
+    Album,
+    Genre,
+    Year,
+}
+
+impl MetadataField {
+    /// Human-readable label for the field.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Artist => "artist",
+            Self::Album => "album",
+            Self::Genre => "genre",
+            Self::Year => "year",
+        }
+    }
+
+    /// All fields in display order.
+    pub fn all() -> &'static [MetadataField] {
+        &[Self::Title, Self::Artist, Self::Album, Self::Genre, Self::Year]
+    }
+}
+
+/// Write a single metadata field to an audio file's tags via lofty.
+///
+/// Re-reads the file, modifies the primary tag (creating one if needed),
+/// and saves with default `WriteOptions` (preserves padding and other tags).
+///
+/// Year values must be valid u32; non-numeric input returns an error.
+/// Empty strings clear the field (set to None).
+pub fn write_metadata_field(
+    path: &Path,
+    field: MetadataField,
+    value: &str,
+) -> Result<(), String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::Accessor;
+
+    let mut tagged = lofty::read_from_path(path)
+        .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+
+    // Get or create the primary tag for this format.
+    let tag = tagged
+        .primary_tag_mut()
+        .ok_or_else(|| format!("no writable tag for '{}'", path.display()))?;
+
+    let trimmed = value.trim();
+
+    match field {
+        MetadataField::Title => {
+            if trimmed.is_empty() {
+                tag.remove_title();
+            } else {
+                tag.set_title(trimmed.to_string());
+            }
+        }
+        MetadataField::Artist => {
+            if trimmed.is_empty() {
+                tag.remove_artist();
+            } else {
+                tag.set_artist(trimmed.to_string());
+            }
+        }
+        MetadataField::Album => {
+            if trimmed.is_empty() {
+                tag.remove_album();
+            } else {
+                tag.set_album(trimmed.to_string());
+            }
+        }
+        MetadataField::Genre => {
+            if trimmed.is_empty() {
+                tag.remove_genre();
+            } else {
+                tag.set_genre(trimmed.to_string());
+            }
+        }
+        MetadataField::Year => {
+            if trimmed.is_empty() {
+                tag.remove_year();
+            } else {
+                let y: u32 = trimmed
+                    .parse()
+                    .map_err(|_| format!("year must be a number, got '{}'", trimmed))?;
+                tag.set_year(y);
+            }
+        }
+    }
+
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| format!("failed to save tags to '{}': {}", path.display(), e))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -820,6 +820,12 @@ pub enum TextEditTarget {
     /// Rename a browse entry. Carries the original path (not index) so a
     /// directory refresh between open and commit can't corrupt the target.
     BrowseRename(std::path::PathBuf),
+    /// Edit a metadata tag on an audio file in the Browse info pane.
+    /// Carries the file path + which field to write via lofty.
+    BrowseMetadata {
+        path: std::path::PathBuf,
+        field: crate::tui::probe::MetadataField,
+    },
 }
 
 /// What action a confirmation dialog will perform

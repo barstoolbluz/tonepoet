@@ -1450,6 +1450,43 @@ fn apply_text_edit(
         TextEditTarget::BrowseRename(original_path) => {
             commit_browse_rename(app, original_path, trimmed, tx);
         }
+        TextEditTarget::BrowseMetadata { path, field } => {
+            // Race check: refuse if the file is currently being converted.
+            let is_processing = app.items_snapshot.iter().any(|item| {
+                item.input_path == path
+                    && matches!(
+                        item.status,
+                        crate::convert::ConversionStatus::Processing { .. }
+                    )
+            });
+            if is_processing {
+                app.set_status(format!(
+                    "cannot edit: {} is currently being converted",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                return;
+            }
+
+            // Write the tag via lofty.
+            match crate::tui::probe::write_metadata_field(&path, field, trimmed) {
+                Ok(()) => {
+                    // Invalidate probe cache so the info pane re-probes
+                    // with fresh tags on next cursor visit.
+                    app.browse.probe_cache.remove(&path);
+                    app.browse.probe_pending.remove(&path);
+                    // Re-trigger probe for immediate refresh.
+                    app.browse.probe_current(tx);
+                    app.set_status(format!(
+                        "{}: {} updated",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        field.label(),
+                    ));
+                }
+                Err(e) => {
+                    app.set_status(e);
+                }
+            }
+        }
     }
 }
 

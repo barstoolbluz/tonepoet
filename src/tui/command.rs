@@ -316,9 +316,29 @@ pub fn execute_command(
         }
         Command::Edit(path) => {
             if path.is_empty() {
-                app.set_status("Usage: :e <path>");
+                app.set_status("Usage: :e <path>  or  :e title|artist|album|genre|year");
                 return;
             }
+
+            // Context-sensitive: on Browse with an audio file selected,
+            // if the arg is a known metadata field name, open the tag
+            // editor for that field instead of loading a source path.
+            if app.current_screen == AppScreen::Browse {
+                use crate::tui::probe::MetadataField;
+                let field = match path.to_lowercase().as_str() {
+                    "title" => Some(MetadataField::Title),
+                    "artist" => Some(MetadataField::Artist),
+                    "album" => Some(MetadataField::Album),
+                    "genre" => Some(MetadataField::Genre),
+                    "year" => Some(MetadataField::Year),
+                    _ => None,
+                };
+                if let Some(field) = field {
+                    execute_edit_metadata(app, field);
+                    return;
+                }
+            }
+
             let expanded = expand_path(&path);
             let p = PathBuf::from(&expanded);
             if !p.exists() {
@@ -937,6 +957,69 @@ fn execute_go(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     }
     // start_processing handles the zero-ready-items case itself.
     super::convert_actions::start_processing(app, tx);
+}
+
+/// Public entry point for metadata editing from context_menu.rs.
+pub fn execute_edit_metadata_pub(app: &mut AppState, field: crate::tui::probe::MetadataField) {
+    execute_edit_metadata(app, field);
+}
+
+/// Execute `:e title` / `:edit artist` etc. — open a TextEdit overlay
+/// for the selected audio file's metadata tag on the Browse screen.
+fn execute_edit_metadata(app: &mut AppState, field: crate::tui::probe::MetadataField) {
+    // Validate: must be on Browse with a selected audio file.
+    let entry = match app.browse.selected_entry() {
+        Some(e) => e,
+        None => {
+            app.set_status("edit: no file selected");
+            return;
+        }
+    };
+    if !entry.is_audio() {
+        app.set_status("edit: selected entry is not an audio file");
+        return;
+    }
+    let path = entry.path.clone();
+
+    // Race check: refuse if the file is currently being converted.
+    let is_processing = app.items_snapshot.iter().any(|item| {
+        item.input_path == path
+            && matches!(
+                item.status,
+                crate::convert::ConversionStatus::Processing { .. }
+            )
+    });
+    if is_processing {
+        app.set_status(format!(
+            "cannot edit: {} is currently being converted",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        return;
+    }
+
+    // Pre-fill with the current value from probe cache (if available).
+    let current_value = app
+        .browse
+        .probe_cache
+        .get(&path)
+        .and_then(|opt| opt.as_ref())
+        .map(|cached| {
+            let m = &cached.metadata;
+            match field {
+                crate::tui::probe::MetadataField::Title => m.title.clone().unwrap_or_default(),
+                crate::tui::probe::MetadataField::Artist => m.artist.clone().unwrap_or_default(),
+                crate::tui::probe::MetadataField::Album => m.album.clone().unwrap_or_default(),
+                crate::tui::probe::MetadataField::Genre => m.genre.clone().unwrap_or_default(),
+                crate::tui::probe::MetadataField::Year => m.year.clone().unwrap_or_default(),
+            }
+        })
+        .unwrap_or_default();
+
+    app.active_overlay = ActiveOverlay::TextEdit {
+        input: super::text_input::TextInputState::new(current_value),
+        target: TextEditTarget::BrowseMetadata { path, field },
+        label: format!("edit {}", field.label()),
+    };
 }
 
 /// Execute `:expand` / `:x` — open the BatchList expand overlay.

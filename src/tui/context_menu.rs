@@ -58,6 +58,8 @@ pub enum ContextAction {
     RenameEntry,
     /// Copy the full path of the selected entry to the clipboard.
     CopyPath(PathBuf),
+    /// Edit a metadata field on the selected audio file.
+    EditMetadata(crate::tui::probe::MetadataField),
     /// Refresh the browse listing.
     Refresh,
     /// Toggle hidden-file visibility.
@@ -202,6 +204,28 @@ fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
     }
 }
 
+/// Build the "Edit metadata" submenu for audio files. Shows each
+/// editable field as a submenu item (Title, Artist, Album, Genre, Year).
+fn build_edit_metadata_submenu() -> ContextMenuEntry {
+    use crate::tui::probe::MetadataField;
+
+    let children: Vec<ContextMenuEntry> = MetadataField::all()
+        .iter()
+        .map(|&field| {
+            item_with_shortcut(
+                &format!("Edit {}", field.label()),
+                ContextAction::EditMetadata(field),
+                &format!(":e {}", field.label()),
+            )
+        })
+        .collect();
+
+    ContextMenuEntry::Submenu {
+        label: "Edit metadata".to_string(),
+        children,
+    }
+}
+
 /// Build the context menu for a right-click on a browse entry.
 pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let entry = match app.browse.selected_entry() {
@@ -212,7 +236,16 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let mut items = Vec::new();
 
     match &entry.kind {
-        EntryKind::AudioFile(_) | EntryKind::Archive | EntryKind::Directory => {
+        EntryKind::AudioFile(_) => {
+            items.push(build_convert_submenu(app));
+            items.push(build_edit_metadata_submenu());
+            items.push(separator());
+            items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
+            items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
+            items.push(separator());
+            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+        }
+        EntryKind::Archive | EntryKind::Directory => {
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
@@ -405,6 +438,10 @@ pub fn execute_context_action(
             // Best-effort clipboard copy. If clipboard isn't available,
             // set the path as a status message so the user can see it.
             app.set_status(format!("path: {}", path.display()));
+        }
+        ContextAction::EditMetadata(field) => {
+            // Delegate to the same function that handles `:e title` etc.
+            super::command::execute_edit_metadata_pub(app, field);
         }
         ContextAction::Refresh => {
             if app.current_screen == AppScreen::Browse {
