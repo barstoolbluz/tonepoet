@@ -210,20 +210,29 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
             app.preset.mark_modified();
         }
 
-        // Edit source file path
+        // Source pane default action: in Batch mode open the BatchList
+        // expand overlay (view/manage the file list); in Single/Empty
+        // mode open FileInput to edit the source path.
+        // Previously `e`/Enter in batch mode opened FileInput with the
+        // cursor path pre-filled, which would silently replace the
+        // whole batch with a single file if the user committed.
         (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source =>
         {
-            let initial = app
-                .convert
-                .source
-                .mode
-                .current_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            app.active_overlay = ActiveOverlay::FileInput {
-                input: super::text_input::TextInputState::new(initial),
-            };
+            if app.convert.source.mode.is_batch() {
+                app.active_overlay = ActiveOverlay::BatchList;
+            } else {
+                let initial = app
+                    .convert
+                    .source
+                    .mode
+                    .current_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                app.active_overlay = ActiveOverlay::FileInput {
+                    input: super::text_input::TextInputState::new(initial),
+                };
+            }
         }
 
         // Advanced toggle (stub)
