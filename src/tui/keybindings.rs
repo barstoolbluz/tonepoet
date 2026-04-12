@@ -124,11 +124,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 // Overlays have already been dispatched earlier in handle_key,
                 // so at this point Convert has the key exclusively.
                 if app.previous_screen.is_some() {
-                    app.convert.source.file_path = None;
-                    app.convert.source.info = None;
-                    app.convert.source.metadata =
-                        crate::tui::probe::SourceMetadata::default();
-                    app.convert.source.batch_queue = None;
+                    app.convert.source.mode = SourceMode::Empty;
                     app.convert.metadata = MetadataState::default();
                     let origin = app
                         .previous_screen
@@ -221,8 +217,8 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
             let initial = app
                 .convert
                 .source
-                .file_path
-                .as_ref()
+                .mode
+                .current_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
             app.active_overlay = ActiveOverlay::FileInput {
@@ -584,19 +580,20 @@ fn load_browse_selection(
             // Probe and load into source pane
             match crate::tui::probe::probe_audio(&path) {
                 Ok(info) => {
-                    app.convert.source.file_path = Some(path.clone());
-                    app.convert.source.info = Some(info);
+                    let metadata = crate::tui::probe::read_metadata(&path)
+                        .unwrap_or_default();
+                    app.convert.metadata.title = metadata.title.clone();
+                    app.convert.metadata.artist = metadata.artist.clone();
+                    app.convert.metadata.album = metadata.album.clone();
+                    app.convert.metadata.genre = metadata.genre.clone();
+                    app.convert.metadata.year = metadata.year.clone();
                     // Browse Enter loads a single file — abandon any
                     // pending batch from a previous :queue.
-                    app.convert.source.batch_queue = None;
-                    if let Ok(meta) = crate::tui::probe::read_metadata(&path) {
-                        app.convert.metadata.title = meta.title.clone();
-                        app.convert.metadata.artist = meta.artist.clone();
-                        app.convert.metadata.album = meta.album.clone();
-                        app.convert.metadata.genre = meta.genre.clone();
-                        app.convert.metadata.year = meta.year.clone();
-                        app.convert.source.metadata = meta;
-                    }
+                    app.convert.source.mode = SourceMode::Single {
+                        path: path.clone(),
+                        info: Some(info),
+                        metadata,
+                    };
                     app.set_status(format!(
                         "Loaded: {}",
                         path.file_name().unwrap_or_default().to_string_lossy()
@@ -928,8 +925,138 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
+        ActiveOverlay::BatchList => {
+            handle_batch_list_key(app, key);
+        }
         ActiveOverlay::None => {}
     }
+}
+
+/// Handle key events for the BatchList expand overlay. Moves the Batch
+/// cursor with ↑/↓/j/k, jumps with Home/End, removes the hovered file
+/// with `d`, closes with Enter/Esc. Scroll is computed in the renderer
+/// from cursor + list height.
+fn handle_batch_list_key(app: &mut AppState, key: KeyEvent) {
+    // Grab batch size for navigation bounds.
+    let (n, cursor) = match &app.convert.source.mode {
+        SourceMode::Batch { paths, cursor, .. } => (paths.len(), *cursor),
+        _ => {
+            // Batch vanished — close overlay defensively.
+            app.active_overlay = ActiveOverlay::None;
+            return;
+        }
+    };
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {
+            app.active_overlay = ActiveOverlay::None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if cursor > 0 {
+                move_batch_cursor(app, cursor - 1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if cursor + 1 < n {
+                move_batch_cursor(app, cursor + 1);
+            }
+        }
+        KeyCode::Home => {
+            if cursor > 0 {
+                move_batch_cursor(app, 0);
+            }
+        }
+        KeyCode::End => {
+            if n > 0 && cursor + 1 != n {
+                move_batch_cursor(app, n - 1);
+            }
+        }
+        KeyCode::Char('d') => {
+            remove_batch_at_cursor(app);
+            // If the batch collapsed (either to Single when only one
+            // file remains, or to Empty when all were removed), close
+            // the overlay — it's no longer meaningful.
+            if !app.convert.source.mode.is_batch() {
+                app.active_overlay = ActiveOverlay::None;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Move the Batch cursor to `new_cursor` and synchronously probe/read
+/// metadata for the new file. Sync is fine because cursor moves are
+/// keyboard-driven and a single probe takes ~50ms.
+fn move_batch_cursor(app: &mut AppState, new_cursor: usize) {
+    let new_path = match &app.convert.source.mode {
+        SourceMode::Batch { paths, .. } => paths.get(new_cursor).cloned(),
+        _ => None,
+    };
+    let Some(path) = new_path else { return; };
+
+    // Probe synchronously. On failure, clear cursor_info so the UI shows
+    // "probing…" / error state rather than stale data.
+    let info = crate::tui::probe::probe_audio(&path).ok();
+    let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
+
+    if let SourceMode::Batch {
+        cursor,
+        cursor_info,
+        cursor_metadata,
+        ..
+    } = &mut app.convert.source.mode
+    {
+        *cursor = new_cursor;
+        *cursor_info = info;
+        *cursor_metadata = metadata;
+    }
+}
+
+/// Remove the file at the batch cursor from the batch. If the batch
+/// drops to 0 files, transitions to `SourceMode::Empty`. If it drops
+/// to 1 file, promotes to `SourceMode::Single`.
+fn remove_batch_at_cursor(app: &mut AppState) {
+    let (remaining_paths, new_cursor) = match &mut app.convert.source.mode {
+        SourceMode::Batch { paths, cursor, .. } if !paths.is_empty() => {
+            let idx = (*cursor).min(paths.len() - 1);
+            paths.remove(idx);
+            let new_cursor = idx.min(paths.len().saturating_sub(1));
+            (paths.clone(), new_cursor)
+        }
+        _ => return,
+    };
+
+    if remaining_paths.is_empty() {
+        app.convert.source.mode = SourceMode::Empty;
+        return;
+    }
+
+    if remaining_paths.len() == 1 {
+        // Promote to Single — probe the remaining file.
+        let path = remaining_paths.into_iter().next().unwrap();
+        let info = crate::tui::probe::probe_audio(&path).ok();
+        let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
+        app.convert.source.mode = SourceMode::Single { path, info, metadata };
+        return;
+    }
+
+    // Stay in Batch — recompute summary and move cursor.
+    let mut new_mode = SourceMode::from_paths(remaining_paths);
+    if let SourceMode::Batch {
+        cursor,
+        cursor_info,
+        cursor_metadata,
+        paths,
+        ..
+    } = &mut new_mode
+    {
+        *cursor = new_cursor;
+        if let Some(p) = paths.get(new_cursor).cloned() {
+            *cursor_info = crate::tui::probe::probe_audio(&p).ok();
+            *cursor_metadata = crate::tui::probe::read_metadata(&p).unwrap_or_default();
+        }
+    }
+    app.convert.source.mode = new_mode;
 }
 
 /// Apply a text edit to the target field, setting modified flag as needed
@@ -1207,19 +1334,19 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Se
 fn load_recent_as_source(app: &mut AppState, path: &std::path::Path) {
     match crate::tui::probe::probe_audio(path) {
         Ok(info) => {
-            app.convert.source.file_path = Some(path.to_path_buf());
-            app.convert.source.info = Some(info);
+            let metadata = crate::tui::probe::read_metadata(path).unwrap_or_default();
+            app.convert.metadata.title = metadata.title.clone();
+            app.convert.metadata.artist = metadata.artist.clone();
+            app.convert.metadata.album = metadata.album.clone();
+            app.convert.metadata.genre = metadata.genre.clone();
+            app.convert.metadata.year = metadata.year.clone();
             // Loading from recent replaces the source — abandon any
             // pending batch from a previous :queue.
-            app.convert.source.batch_queue = None;
-            if let Ok(meta) = crate::tui::probe::read_metadata(path) {
-                app.convert.metadata.title = meta.title.clone();
-                app.convert.metadata.artist = meta.artist.clone();
-                app.convert.metadata.album = meta.album.clone();
-                app.convert.metadata.genre = meta.genre.clone();
-                app.convert.metadata.year = meta.year.clone();
-                app.convert.source.metadata = meta;
-            }
+            app.convert.source.mode = SourceMode::Single {
+                path: path.to_path_buf(),
+                info: Some(info),
+                metadata,
+            };
             app.set_status(format!(
                 "Loaded: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -1244,36 +1371,32 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
     match app.current_screen {
         AppScreen::Convert => {
             // Probe the file first
-            match crate::tui::probe::probe_audio(path) {
-                Ok(info) => {
-                    app.convert.source.file_path = Some(path.to_path_buf());
-                    app.convert.source.info = Some(info);
-                    // FileInput replaces the source — abandon any pending
-                    // batch from a previous :queue.
-                    app.convert.source.batch_queue = None;
-                    app.set_status(format!(
-                        "Loaded: {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                }
+            let info = match crate::tui::probe::probe_audio(path) {
+                Ok(i) => i,
                 Err(e) => {
-                    app.convert.source.file_path = None;
-                    app.convert.source.info = None;
-                    app.convert.source.batch_queue = None;
+                    // Reset to Empty on probe failure.
+                    app.convert.source.mode = SourceMode::Empty;
                     app.set_status(format!("Probe error: {}", e));
                     return;
                 }
-            }
-
-            // Read metadata (best-effort, don't fail the load)
-            if let Ok(meta) = crate::tui::probe::read_metadata(path) {
-                app.convert.metadata.title = meta.title.clone();
-                app.convert.metadata.artist = meta.artist.clone();
-                app.convert.metadata.album = meta.album.clone();
-                app.convert.metadata.genre = meta.genre.clone();
-                app.convert.metadata.year = meta.year.clone();
-                app.convert.source.metadata = meta;
-            }
+            };
+            // Read metadata (best-effort).
+            let metadata = crate::tui::probe::read_metadata(path).unwrap_or_default();
+            app.convert.metadata.title = metadata.title.clone();
+            app.convert.metadata.artist = metadata.artist.clone();
+            app.convert.metadata.album = metadata.album.clone();
+            app.convert.metadata.genre = metadata.genre.clone();
+            app.convert.metadata.year = metadata.year.clone();
+            // FileInput replaces the source — abandon any pending batch.
+            app.convert.source.mode = SourceMode::Single {
+                path: path.to_path_buf(),
+                info: Some(info),
+                metadata,
+            };
+            app.set_status(format!(
+                "Loaded: {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
             // Record in the recent-files history.
             app.recent.record_use(path);
         }
@@ -1541,6 +1664,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
                 app.current_screen = AppScreen::Browse;
                 app.browse.probe_current(tx);
+            }
+            TuiButton::SourceExpandButton => {
+                // Open the BatchList overlay if a batch is loaded.
+                if app.convert.source.mode.is_batch() {
+                    app.active_overlay = ActiveOverlay::BatchList;
+                }
             }
             TuiButton::MetadataField(field) => {
                 use super::button_map::MetadataFieldKind::*;

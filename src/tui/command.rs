@@ -29,6 +29,9 @@ pub enum Command {
     /// Start processing whatever's already in the queue. No new batch.
     /// Triggered by `:go` / `:start`.
     Go,
+    /// Open the BatchList expand overlay. Only valid when the Convert
+    /// source is a multi-file `Batch`. Triggered by `:expand` / `:x`.
+    Expand,
     Batch(String),
     Preset(String),
     SaveAs(String),
@@ -90,6 +93,7 @@ pub fn parse_command(input: &str) -> Command {
         "commit" => Command::Commit { start: false },
         "Commit" => Command::Commit { start: true },
         "go" | "start" => Command::Go,
+        "expand" | "x" => Command::Expand,
         "batch" => Command::Batch(args.to_string()),
         "preset" => Command::Preset(args.to_string()),
         "saveas" => Command::SaveAs(args.to_string()),
@@ -173,31 +177,34 @@ pub fn execute_command(
                 return;
             }
             // Probe the file first
-            match crate::tui::probe::probe_audio(&p) {
-                Ok(info) => {
-                    app.convert.source.file_path = Some(p.clone());
-                    app.convert.source.info = Some(info);
-                    // :e replaces the source — any pending batch is abandoned.
-                    app.convert.source.batch_queue = None;
-                    app.set_status(format!("Loaded: {}", p.file_name().unwrap_or_default().to_string_lossy()));
-                }
+            let info = match crate::tui::probe::probe_audio(&p) {
+                Ok(i) => i,
                 Err(e) => {
-                    app.convert.source.file_path = None;
-                    app.convert.source.info = None;
-                    app.convert.source.batch_queue = None;
+                    // Reset to Empty on probe failure — :e abandons any
+                    // existing source (single or batch) regardless.
+                    app.convert.source.mode = SourceMode::Empty;
                     app.set_status(format!("Probe error: {}", e));
                     return;
                 }
-            }
-            // Read metadata (best-effort)
-            if let Ok(meta) = crate::tui::probe::read_metadata(&p) {
-                app.convert.metadata.title = meta.title.clone();
-                app.convert.metadata.artist = meta.artist.clone();
-                app.convert.metadata.album = meta.album.clone();
-                app.convert.metadata.genre = meta.genre.clone();
-                app.convert.metadata.year = meta.year.clone();
-                app.convert.source.metadata = meta;
-            }
+            };
+            // Read metadata (best-effort).
+            let metadata = crate::tui::probe::read_metadata(&p).unwrap_or_default();
+            // Populate the editable metadata pane from the source tags.
+            app.convert.metadata.title = metadata.title.clone();
+            app.convert.metadata.artist = metadata.artist.clone();
+            app.convert.metadata.album = metadata.album.clone();
+            app.convert.metadata.genre = metadata.genre.clone();
+            app.convert.metadata.year = metadata.year.clone();
+
+            app.convert.source.mode = SourceMode::Single {
+                path: p.clone(),
+                info: Some(info),
+                metadata,
+            };
+            app.set_status(format!(
+                "Loaded: {}",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            ));
             app.current_screen = AppScreen::Convert;
             app.recent.record_use(&p);
         }
@@ -236,6 +243,9 @@ pub fn execute_command(
         }
         Command::Go => {
             execute_go(app, tx);
+        }
+        Command::Expand => {
+            execute_expand(app);
         }
         Command::Batch(dir) => {
             if dir.is_empty() {
@@ -298,7 +308,7 @@ pub fn execute_command(
             }
         }
         Command::Info => {
-            if let Some(info) = &app.convert.source.info {
+            if let Some(info) = app.convert.source.mode.current_info() {
                 app.set_status(format!(
                     "{} | {} | {} | {}",
                     info.format_name,
@@ -315,7 +325,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :convert :commit :Commit :go :start :recent :bookmarks :bm :preset :saveas :set :sort :filter :help");
+            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :convert :commit :Commit :go :start :expand :recent :bookmarks :bm :preset :saveas :set :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
@@ -554,6 +564,7 @@ fn execute_queue(
             }
 
             let first = paths[0].clone();
+            let path_count = paths.len();
 
             // Probe the first file before touching any state so preset
             // application stays atomic with a successful load.
@@ -564,6 +575,7 @@ fn execute_queue(
                     return;
                 }
             };
+            let metadata = crate::tui::probe::read_metadata(&first).unwrap_or_default();
 
             // Load preset (if any) after a successful probe.
             if let Some(name) = &preset {
@@ -573,40 +585,46 @@ fn execute_queue(
                 }
             }
 
-            // Populate the source pane with the first file's info and
-            // metadata (Phase 6c: still renders as single-file preview
-            // — proper batch summary + expand overlay lands in 6d).
-            app.convert.source.file_path = Some(first.clone());
-            app.convert.source.info = Some(info);
-            if let Ok(meta) = crate::tui::probe::read_metadata(&first) {
-                app.convert.metadata.title = meta.title.clone();
-                app.convert.metadata.artist = meta.artist.clone();
-                app.convert.metadata.album = meta.album.clone();
-                app.convert.metadata.genre = meta.genre.clone();
-                app.convert.metadata.year = meta.year.clone();
-                app.convert.source.metadata = meta;
-            }
-            app.recent.record_use(&first);
+            // Populate the editable metadata pane from the first file's
+            // tags (same for single-file and batch modes — batch edits
+            // only affect the cursor file when the user drills in).
+            app.convert.metadata.title = metadata.title.clone();
+            app.convert.metadata.artist = metadata.artist.clone();
+            app.convert.metadata.album = metadata.album.clone();
+            app.convert.metadata.genre = metadata.genre.clone();
+            app.convert.metadata.year = metadata.year.clone();
 
-            // Phase 6c: stash the full batch so `:commit` can iterate.
-            // None for single-file — the commit path falls back to
-            // source.file_path in that case.
-            app.convert.source.batch_queue = if paths.len() > 1 {
-                Some(paths.clone())
-            } else {
-                None
-            };
+            // Build the SourceMode (computes batch summary synchronously
+            // for multi-file batches).
+            let mut mode = SourceMode::from_paths(paths);
+            // Populate the first-file probe result into the appropriate
+            // variant so the user sees immediate info on landing.
+            match &mut mode {
+                SourceMode::Single { info: slot, metadata: meta_slot, .. } => {
+                    *slot = Some(info);
+                    *meta_slot = metadata;
+                }
+                SourceMode::Batch { cursor_info, cursor_metadata, .. } => {
+                    *cursor_info = Some(info);
+                    *cursor_metadata = metadata;
+                }
+                SourceMode::Empty => {
+                    // Unreachable given paths.is_empty() check above.
+                }
+            }
+            app.convert.source.mode = mode;
+            app.recent.record_use(&first);
 
             // Remember where we came from, switch to Convert for review.
             app.previous_screen = Some(AppScreen::Browse);
             app.current_screen = AppScreen::Convert;
 
-            if paths.len() == 1 {
+            if path_count == 1 {
                 app.set_status("review settings, then :commit or :Commit");
             } else {
                 app.set_status(format!(
-                    "batch of {} files — review settings, then :commit or :Commit (showing first file; full list in 6d)",
-                    paths.len()
+                    "batch of {} files — review settings, then :commit or :Commit",
+                    path_count
                 ));
             }
         }
@@ -655,10 +673,10 @@ fn execute_queue(
 /// - `:commit` (start=false): enqueue, return to origin (previous_screen)
 /// - `:Commit` (start=true): enqueue, start processing, jump to Queue
 ///
-/// Phase 6c: iterates `source.batch_queue` when present (multi-file
-/// batch), else commits the single file in `source.file_path`. Either
-/// way the pill state (options) is applied uniformly to all files in
-/// the commit — the whole point of reviewing once per batch.
+/// Phase 6d: reads `source.mode.all_paths()` which yields 1 path for
+/// Single, N for Batch. The pill state (options) is applied uniformly
+/// to all files in the commit — the whole point of reviewing once per
+/// batch.
 fn execute_commit(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
@@ -669,19 +687,10 @@ fn execute_commit(
         return;
     }
 
-    // Determine what to commit: prefer the multi-file batch, fall back
-    // to the single file in file_path.
-    let batch: Vec<PathBuf> = if let Some(ref b) = app.convert.source.batch_queue {
-        b.clone()
-    } else if let Some(ref p) = app.convert.source.file_path {
-        vec![p.clone()]
-    } else {
-        app.set_status("nothing to commit — no source file loaded");
-        return;
-    };
-
+    // Determine what to commit from the current source mode.
+    let batch = app.convert.source.mode.all_paths();
     if batch.is_empty() {
-        app.set_status("nothing to commit — empty batch");
+        app.set_status("nothing to commit — no source file loaded");
         return;
     }
 
@@ -731,11 +740,8 @@ fn execute_commit(
         parts.join(", ")
     };
 
-    // Clear source pane + batch so a subsequent `:queue` arrives fresh.
-    app.convert.source.file_path = None;
-    app.convert.source.info = None;
-    app.convert.source.metadata = crate::tui::probe::SourceMetadata::default();
-    app.convert.source.batch_queue = None;
+    // Clear source pane so a subsequent `:queue` arrives fresh.
+    app.convert.source.mode = SourceMode::Empty;
     app.convert.metadata = MetadataState::default();
 
     // Remove only the committed paths from browse.multi_selected so the
@@ -782,6 +788,20 @@ fn execute_go(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     }
     // start_processing handles the zero-ready-items case itself.
     super::convert_actions::start_processing(app, tx);
+}
+
+/// Execute `:expand` / `:x` — open the BatchList expand overlay.
+/// Only valid when the Convert source is a multi-file Batch.
+fn execute_expand(app: &mut AppState) {
+    if app.current_screen != AppScreen::Convert {
+        app.set_status(":expand only works on the Convert screen");
+        return;
+    }
+    if !app.convert.source.mode.is_batch() {
+        app.set_status(":expand: no batch loaded (use :queue from Browse)");
+        return;
+    }
+    app.active_overlay = ActiveOverlay::BatchList;
 }
 
 /// Execute a `:rename` command for the browse screen.

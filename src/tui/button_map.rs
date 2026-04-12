@@ -52,6 +52,9 @@ pub enum TuiButton {
 
     // Convert screen: "browse files..." pill on source pane → opens browse screen
     SourceBrowseButton,
+    // Convert screen: "expand" pill on source pane in Batch mode → opens
+    // the BatchList overlay to view/manage the full file list.
+    SourceExpandButton,
 
     // Queue action bar
     AddFiles,

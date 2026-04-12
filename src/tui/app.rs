@@ -160,30 +160,184 @@ pub enum MergeMode {
     SingleImage,
 }
 
-/// State for the source pane
+/// Source state: empty, a single reviewed file, or a multi-file batch.
+/// Phase 6d: replaces the flat `file_path / info / metadata / batch_queue`
+/// fields with a proper type-safe enum so callers must explicitly handle
+/// each mode.
+#[derive(Debug, Clone)]
+pub enum SourceMode {
+    /// No source loaded yet.
+    Empty,
+    /// A single file loaded for review.
+    Single {
+        path: PathBuf,
+        info: Option<SourceInfo>,
+        metadata: SourceMetadata,
+    },
+    /// A multi-file batch loaded for review. The cursor indexes into
+    /// `paths` for the "currently previewed" file, whose probe result
+    /// lives in `cursor_info` / `cursor_metadata` (lazily filled in by
+    /// `AudioProbeComplete` when the cursor moves).
+    Batch {
+        paths: Vec<PathBuf>,
+        cursor: usize,
+        cursor_info: Option<SourceInfo>,
+        cursor_metadata: SourceMetadata,
+        /// Sum of file sizes (cheap: `fs::metadata` per path).
+        total_size: u64,
+        /// Distinct parent-directory count — a rough "album" heuristic.
+        album_count: usize,
+        /// Format distribution based on file extension. Sorted descending
+        /// by count. Cheap: no ffmpeg probe needed.
+        format_histogram: Vec<(AudioFormat, usize)>,
+    },
+}
+
+impl SourceMode {
+    /// Construct from a vec of paths. Precomputes the batch summary
+    /// (total size, album count, format histogram) synchronously — all
+    /// from `fs::metadata` and file extensions, no ffmpeg probes.
+    ///
+    /// - `paths.len() == 0` → `Empty`
+    /// - `paths.len() == 1` → `Single` with info/metadata empty (caller
+    ///   populates via probe + read_metadata)
+    /// - `paths.len() > 1` → `Batch` with precomputed summary
+    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
+        match paths.len() {
+            0 => Self::Empty,
+            1 => Self::Single {
+                path: paths
+                    .into_iter()
+                    .next()
+                    .expect("len == 1 means one element"),
+                info: None,
+                metadata: SourceMetadata::default(),
+            },
+            _ => {
+                let total_size: u64 = paths
+                    .iter()
+                    .filter_map(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len())
+                    .sum();
+                let album_count = paths
+                    .iter()
+                    .filter_map(|p| p.parent())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                let format_histogram = compute_format_histogram(&paths);
+                Self::Batch {
+                    paths,
+                    cursor: 0,
+                    cursor_info: None,
+                    cursor_metadata: SourceMetadata::default(),
+                    total_size,
+                    album_count,
+                    format_histogram,
+                }
+            }
+        }
+    }
+
+    /// True if no source is loaded.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    /// True if this is a multi-file batch.
+    pub fn is_batch(&self) -> bool {
+        matches!(self, Self::Batch { .. })
+    }
+
+    /// All paths in this source (0 for Empty, 1 for Single, N for Batch).
+    pub fn all_paths(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Single { path, .. } => vec![path.clone()],
+            Self::Batch { paths, .. } => paths.clone(),
+        }
+    }
+
+    /// The currently previewed path (Single's path, or Batch's cursor).
+    pub fn current_path(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Empty => None,
+            Self::Single { path, .. } => Some(path),
+            Self::Batch { paths, cursor, .. } => paths.get(*cursor),
+        }
+    }
+
+    /// The currently previewed `SourceInfo` (None if not yet probed).
+    pub fn current_info(&self) -> Option<&SourceInfo> {
+        match self {
+            Self::Empty => None,
+            Self::Single { info, .. } => info.as_ref(),
+            Self::Batch { cursor_info, .. } => cursor_info.as_ref(),
+        }
+    }
+
+    /// The currently previewed `SourceMetadata`. Returns an owned default
+    /// for the Empty variant so the caller can always have something to
+    /// display without extra matching.
+    pub fn current_metadata(&self) -> SourceMetadata {
+        match self {
+            Self::Empty => SourceMetadata::default(),
+            Self::Single { metadata, .. } => metadata.clone(),
+            Self::Batch { cursor_metadata, .. } => cursor_metadata.clone(),
+        }
+    }
+
+    /// Number of files (0/1/N for Empty/Single/Batch).
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single { .. } => 1,
+            Self::Batch { paths, .. } => paths.len(),
+        }
+    }
+}
+
+/// Cheap format detection from file extension — used for batch histograms
+/// where probing each file with ffmpeg would be wasteful.
+fn compute_format_histogram(paths: &[PathBuf]) -> Vec<(AudioFormat, usize)> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<AudioFormat, usize> = HashMap::new();
+    for p in paths {
+        if let Some(fmt) = detect_format_from_extension(p) {
+            *counts.entry(fmt).or_insert(0) += 1;
+        }
+    }
+    let mut vec: Vec<(AudioFormat, usize)> = counts.into_iter().collect();
+    vec.sort_by(|a, b| b.1.cmp(&a.1));
+    vec
+}
+
+/// Map a file extension to an `AudioFormat`, if recognised.
+fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    match ext.to_lowercase().as_str() {
+        "flac" => Some(AudioFormat::Flac),
+        "wav" => Some(AudioFormat::Wav),
+        "aiff" | "aif" => Some(AudioFormat::Aiff),
+        "wv" => Some(AudioFormat::WavPack),
+        "mp3" => Some(AudioFormat::Mp3),
+        "m4a" | "aac" => Some(AudioFormat::Aac),
+        "opus" => Some(AudioFormat::Opus),
+        _ => None,
+    }
+}
+
+/// State for the source pane.
 #[derive(Debug, Clone)]
 pub struct SourceState {
-    pub file_path: Option<PathBuf>,
-    pub info: Option<SourceInfo>,
-    pub metadata: SourceMetadata,
+    pub mode: SourceMode,
     pub advanced_open: bool,
-    /// Phase 6c bridge: when `:queue` from Browse inherits a multi-file
-    /// selection, the full path list is stashed here. The source pane
-    /// renders the first file's info (proper batch summary + expand
-    /// overlay arrives in 6d via `SourceMode::Batch`), but `:commit`
-    /// iterates this list to enqueue all of them.
-    /// `None` for single-file mode.
-    pub batch_queue: Option<Vec<PathBuf>>,
 }
 
 impl Default for SourceState {
     fn default() -> Self {
         Self {
-            file_path: None,
-            info: None,
-            metadata: SourceMetadata::default(),
+            mode: SourceMode::Empty,
             advanced_open: false,
-            batch_queue: None,
         }
     }
 }
@@ -584,6 +738,12 @@ pub enum ActiveOverlay {
         target: TextEditTarget,
         label: String,
     },
+    /// Expand overlay for a multi-file batch: full path list with
+    /// keyboard navigation (↑/↓ move cursor, `d` removes, Enter/Esc
+    /// closes). Mirrors `source.mode.Batch.cursor` while open. Scroll
+    /// is derived from the cursor and list height in the renderer so
+    /// no persistent scroll state is needed here.
+    BatchList,
 }
 
 /// Which field a TextEdit overlay is editing

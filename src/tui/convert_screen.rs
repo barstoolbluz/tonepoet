@@ -147,16 +147,30 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         );
     }
 
-    // Source pane "browse files" pill (row 4 of the pane, right-aligned with 3-space margin)
+    // Source pane pill (row 4 of the pane, right-aligned with 3-space
+    // margin). In Single/Empty mode it's "browse files" → SourceBrowseButton;
+    // in Batch mode it's "expand" → SourceExpandButton.
     {
         let buttons = &mut app.button_map;
         let inner_w = source_area.width.saturating_sub(2);
-        let pill_label_w = super::draw_source::BROWSE_PILL_LABEL.chars().count() as u16;
+        let in_batch = app.convert.source.mode.is_batch();
+        let (button, label) = if in_batch {
+            (
+                TuiButton::SourceExpandButton,
+                super::draw_source::EXPAND_PILL_LABEL,
+            )
+        } else {
+            (
+                TuiButton::SourceBrowseButton,
+                super::draw_source::BROWSE_PILL_LABEL,
+            )
+        };
+        let pill_label_w = label.chars().count() as u16;
         let right_margin = 3u16;
         if inner_w as u16 >= pill_label_w + right_margin {
             let pill_x = source_area.x + 1 + (inner_w as u16 - pill_label_w - right_margin);
             buttons.record_button(
-                TuiButton::SourceBrowseButton,
+                button,
                 Rect::new(pill_x, source_area.y + 4, pill_label_w, 1),
             );
         }

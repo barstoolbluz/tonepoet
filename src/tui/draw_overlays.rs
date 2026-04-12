@@ -9,8 +9,9 @@ use ratatui::{
 };
 
 use crate::convert::ConversionStatus;
-use super::app::{ActiveOverlay, AppState};
+use super::app::{ActiveOverlay, AppState, SourceMode};
 use super::button_map::TuiButton;
+use super::theme;
 
 /// Draw any active overlay on top of the main content
 pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
@@ -41,6 +42,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             let label = label.clone();
             draw_text_edit(f, &label, &input);
         }
+        ActiveOverlay::BatchList => {
+            draw_batch_list(f, app);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -64,6 +68,108 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+/// Draw the BatchList expand overlay: full list of paths in the current
+/// batch with the cursor highlighted. Shows a hint line at the bottom
+/// with available actions. Scroll is computed from cursor + list height
+/// (cursor sticks to the bottom row when advancing past the visible range).
+fn draw_batch_list(f: &mut Frame, app: &AppState) {
+    let (paths, cursor) = match &app.convert.source.mode {
+        // Defensive: an empty Batch shouldn't exist (from_paths returns
+        // Empty for 0 paths, remove collapses to Empty/Single), but if
+        // somehow it did we'd panic on paths[scroll..end] below. Bail.
+        SourceMode::Batch { paths, cursor, .. } if !paths.is_empty() => {
+            (paths.clone(), *cursor)
+        }
+        _ => return,
+    };
+    // Additional cursor clamp in case source.mode was mutated with an
+    // out-of-bounds cursor somehow (shouldn't happen via our APIs).
+    let cursor = cursor.min(paths.len() - 1);
+
+    let area = f.size();
+    let popup_w = area.width.saturating_sub(8).min(100).max(40);
+    let popup_h = area.height.saturating_sub(6).min(30).max(10);
+    let popup = centered_rect(popup_w, popup_h, area);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::AMBER))
+        .title(Span::styled(
+            format!(" batch · {} files ", paths.len()),
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // Split into list area and hint bar at the bottom
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Compute scroll on the fly so the cursor is always in view. Stick
+    // the cursor to the bottom row once it passes `list_h - 1`.
+    let list_h = chunks[0].height as usize;
+    let scroll = if list_h == 0 || cursor < list_h {
+        0
+    } else {
+        cursor + 1 - list_h
+    };
+    let end = (scroll + list_h).min(paths.len());
+    let visible = &paths[scroll..end];
+
+    let list_lines: Vec<Line> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let idx = scroll + i;
+            let is_cursor = idx == cursor;
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            let parent = p
+                .parent()
+                .and_then(|pp| pp.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let text = if parent.is_empty() {
+                format!(" {:>4}  {}", idx + 1, name)
+            } else {
+                format!(" {:>4}  {} · {}", idx + 1, parent, name)
+            };
+            if is_cursor {
+                Line::from(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(theme::BG)
+                        .bg(theme::AMBER)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(Span::styled(text, Style::default().fg(theme::TEXT_BRIGHT)))
+            }
+        })
+        .collect();
+
+    let list = Paragraph::new(list_lines);
+    f.render_widget(list, chunks[0]);
+
+    // Hint bar
+    let hint = Paragraph::new(Line::from(vec![
+        Span::styled(" ↑/↓ ", Style::default().fg(theme::BLUE)),
+        Span::styled("move", Style::default().fg(theme::TEXT_MUTED)),
+        Span::raw("  "),
+        Span::styled(" d ", Style::default().fg(theme::RED)),
+        Span::styled("remove", Style::default().fg(theme::TEXT_MUTED)),
+        Span::raw("  "),
+        Span::styled(" enter/esc ", Style::default().fg(theme::GREEN)),
+        Span::styled("close", Style::default().fg(theme::TEXT_MUTED)),
+    ]));
+    f.render_widget(hint, chunks[1]);
 }
 
 /// Draw a confirmation dialog
