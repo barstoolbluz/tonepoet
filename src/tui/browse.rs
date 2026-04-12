@@ -726,6 +726,23 @@ impl BrowseState {
         self.multi_selected.clear();
     }
 
+    /// Collect paths for an enqueue operation (`:queue` / `:convert` etc).
+    /// - If `multi_selected` is non-empty, returns those paths.
+    /// - Otherwise returns the currently highlighted entry if it's an audio
+    ///   file or archive.
+    /// - Returns an empty vec if nothing valid is selected.
+    pub fn collect_selection_for_queue(&self) -> Vec<PathBuf> {
+        if !self.multi_selected.is_empty() {
+            return self.multi_selected.clone();
+        }
+        if let Some(entry) = self.selected_entry() {
+            if matches!(entry.kind, EntryKind::AudioFile(_) | EntryKind::Archive) {
+                return vec![entry.path.clone()];
+            }
+        }
+        Vec::new()
+    }
+
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         // Hidden files were captured by scan(); just re-apply the view layer.

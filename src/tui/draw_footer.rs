@@ -171,8 +171,9 @@ fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
                 h("f", "effects", theme::AMBER, 2),
             ],
             vec![
-                h("enter", "convert", theme::GREEN, 0),
-                h(":queue", "", theme::AMBER, 2),
+                h(":commit", "", theme::GREEN, 0),
+                h(":Commit", "+start", theme::GREEN, 1),
+                h("esc", "cancel", theme::AMBER, 2),
             ],
             vec![h(":q", "quit", theme::RED, 0)],
         ],
@@ -195,7 +196,7 @@ fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
             ],
             vec![
                 h(":queue", "", theme::AMBER, 1),
-                h(":queue!", "→queue", theme::AMBER, 2),
+                h(":convert", "", theme::AMBER, 2),
             ],
             vec![
                 h("⇧click", "toggle", theme::PURPLE, 2),

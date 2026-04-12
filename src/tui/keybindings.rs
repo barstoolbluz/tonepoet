@@ -118,7 +118,30 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 }
                 return;
             }
-            AppScreen::Convert => {}
+            AppScreen::Convert => {
+                // If we arrived via :queue from another screen (previous_screen
+                // is set), Esc cancels the batch review and returns to origin.
+                // Overlays have already been dispatched earlier in handle_key,
+                // so at this point Convert has the key exclusively.
+                if app.previous_screen.is_some() {
+                    app.convert.source.file_path = None;
+                    app.convert.source.info = None;
+                    app.convert.source.metadata =
+                        crate::tui::probe::SourceMetadata::default();
+                    app.convert.metadata = MetadataState::default();
+                    let origin = app
+                        .previous_screen
+                        .take()
+                        .unwrap_or(AppScreen::Browse);
+                    app.current_screen = origin;
+                    if origin == AppScreen::Browse {
+                        app.browse.probe_current(tx);
+                    }
+                    app.set_status("cancelled");
+                    return;
+                }
+                // No pending batch — fall through to handle_convert_key.
+            }
         }
     }
 
@@ -134,7 +157,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
 
 // ── Convert screen keybindings ───────────────────────────────────────
 
-fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
     match (key.code, key.modifiers) {
         // Tab between panes
         (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -224,15 +247,10 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
         }
 
-        // Start conversion (Enter when not editing source)
-        (KeyCode::Enter, KeyModifiers::NONE) => {
-            super::convert_actions::convert_or_queue(app, tx, true);
-        }
-
-        // Add to queue without starting (+ key)
-        (KeyCode::Char('+'), _) => {
-            super::convert_actions::convert_or_queue(app, tx, false);
-        }
+        // Commit is now command-mode only: `:commit` (enqueue) or
+        // `:Commit` (enqueue + start). No keyboard shortcuts — consistent
+        // with the vi-style philosophy and the "no back door" invariant.
+        // Esc cancels batch review (handled in handle_key top-level).
 
         // Open presets overlay
         (KeyCode::Char('p'), KeyModifiers::NONE) => {

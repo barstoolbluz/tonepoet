@@ -17,9 +17,18 @@ pub enum Command {
     Edit(String),
     Output(String),
     Cd(String),
-    Convert,
-    /// Add to queue. The bool is "switch after" — true for `:queue!` variant.
-    Queue(bool),
+    /// Open the Convert screen for batch review, inheriting the current
+    /// browse selection if any. Triggered by `:queue`, `:queue!`, `:qa`,
+    /// `:qa!`, `:convert`, `:c`. Optional preset name is loaded into the
+    /// format pills before review.
+    Queue { preset: Option<String> },
+    /// Commit the currently-reviewed file/batch from the Convert screen to
+    /// the queue. `:commit` (lowercase) enqueues only; `:Commit` (capital)
+    /// enqueues AND starts processing, jumping to the Queue screen.
+    Commit { start: bool },
+    /// Start processing whatever's already in the queue. No new batch.
+    /// Triggered by `:go` / `:start`.
+    Go,
     Batch(String),
     Preset(String),
     SaveAs(String),
@@ -70,9 +79,17 @@ pub fn parse_command(input: &str) -> Command {
         "e" | "edit" => Command::Edit(args.to_string()),
         "o" | "output" => Command::Output(args.to_string()),
         "cd" => Command::Cd(args.to_string()),
-        "c" | "convert" => Command::Convert,
-        "qa" | "queue" => Command::Queue(false),
-        "qa!" | "queue!" => Command::Queue(true),
+        "c" | "convert" | "qa" | "queue" | "qa!" | "queue!" => {
+            let preset = if args.is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            };
+            Command::Queue { preset }
+        }
+        "commit" => Command::Commit { start: false },
+        "Commit" => Command::Commit { start: true },
+        "go" | "start" => Command::Go,
         "batch" => Command::Batch(args.to_string()),
         "preset" => Command::Preset(args.to_string()),
         "saveas" => Command::SaveAs(args.to_string()),
@@ -208,11 +225,14 @@ pub fn execute_command(
                 Err(e) => app.set_status(format!("cd: {}", e)),
             }
         }
-        Command::Convert => {
-            super::convert_actions::convert_or_queue(app, tx, true);
+        Command::Queue { preset } => {
+            execute_queue(app, tx, preset);
         }
-        Command::Queue(switch_after) => {
-            execute_queue(app, tx, switch_after);
+        Command::Commit { start } => {
+            execute_commit(app, tx, start);
+        }
+        Command::Go => {
+            execute_go(app, tx);
         }
         Command::Batch(dir) => {
             if dir.is_empty() {
@@ -292,7 +312,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :recent :bookmarks :bm :convert :preset :saveas :set :sort :filter :help");
+            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :convert :commit :Commit :go :start :recent :bookmarks :bm :preset :saveas :set :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
@@ -479,62 +499,204 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
     }
 }
 
-/// Execute a `:queue` / `:queue!` command. Context-sensitive:
-/// - On the browse screen: adds the multi-selected files (or the current
-///   entry, if nothing is multi-selected) to the conversion queue with
-///   default options. Stays on browse unless `switch_after` is true.
-/// - On the convert screen: adds the currently loaded source file to the
-///   queue (via the existing convert_or_queue path). Stays on convert
-///   unless `switch_after` is true.
-/// - Anywhere else: status error.
-fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, switch_after: bool) {
+/// Execute a `:queue` / `:queue!` / `:convert` / `:c` command.
+///
+/// Opens the Convert screen for batch review with the current Browse
+/// selection inherited. Every enqueue operation must pass through this
+/// review step — there is no back door to the queue.
+///
+/// Context-sensitive behavior:
+/// - From Browse: collects selection (multi-selected or cursor entry),
+///   probes the first file, optionally loads a preset, populates the
+///   source pane, and switches to Convert. `previous_screen` is set so
+///   the user returns to Browse on `:commit` / Esc.
+/// - From Convert: with a preset arg, loads that preset in place; without,
+///   reminds the user to pick files in Browse first.
+/// - From Library: placeholder — selection inheritance arrives in Phase 6c.
+/// - From Queue / elsewhere: with a preset arg, loads the preset without
+///   switching; without, shows an error.
+///
+/// Phase 6b limitation: multi-file selections are rejected with a message
+/// directing the user to deselect extras. Real batch support (summary +
+/// expand overlay + bulk commit) arrives in Phase 6c/6d.
+fn execute_queue(
+    app: &mut AppState,
+    _tx: &mpsc::Sender<AppMessage>,
+    preset: Option<String>,
+) {
+    // Helper: load a named preset into the format/output-options pills.
+    // Returns Ok(()) on success, Err(status_message) on failure.
+    let load_preset_into_pills = |app: &mut AppState, name: &str| -> Result<(), String> {
+        match super::presets::load_preset(name) {
+            Ok(p) => {
+                p.apply_to_pills(
+                    &mut app.convert.format,
+                    &mut app.convert.output_options,
+                );
+                app.preset.active_preset = Some(name.to_string());
+                app.preset.modified = false;
+                Ok(())
+            }
+            Err(e) => Err(format!("preset '{}' failed: {}", name, e)),
+        }
+    };
+
     match app.current_screen {
         AppScreen::Browse => {
-            // Collect paths: multi-selected if any, else the current entry
-            // (provided it's an audio file or archive).
-            let mut paths: Vec<PathBuf> = app.browse.multi_selected.clone();
+            let paths = app.browse.collect_selection_for_queue();
+
             if paths.is_empty() {
-                if let Some(entry) = app.browse.selected_entry() {
-                    use super::browse::EntryKind;
-                    match &entry.kind {
-                        EntryKind::AudioFile(_) | EntryKind::Archive => {
-                            paths.push(entry.path.clone());
-                        }
-                        _ => {
-                            app.set_status("queue: selection is not an audio file");
-                            return;
-                        }
-                    }
-                } else {
-                    app.set_status("queue: no selection");
+                app.set_status("queue: no selection");
+                return;
+            }
+
+            // Phase 6b limitation: the Convert screen can only review a
+            // single file at a time (no SourceMode::Batch yet — that lands
+            // in 6d). Silently picking paths[0] creates a confusing loop
+            // where `:queue` → `:commit` → `:queue` hits "already in queue"
+            // on the second call because the committed file is still in
+            // multi_selected. Reject multi-file explicitly with guidance.
+            if paths.len() > 1 {
+                app.set_status(format!(
+                    "queue: {} files multi-selected — multi-file batch arrives in Phase 6c. Deselect extras (space/esc) and retry.",
+                    paths.len()
+                ));
+                return;
+            }
+
+            let first = paths[0].clone();
+
+            // Probe the first file before touching any state.
+            let info = match crate::tui::probe::probe_audio(&first) {
+                Ok(i) => i,
+                Err(e) => {
+                    app.set_status(format!("probe error: {}", e));
+                    return;
+                }
+            };
+
+            // Load preset (if any) after a successful probe.
+            if let Some(name) = &preset {
+                if let Err(msg) = load_preset_into_pills(app, name) {
+                    app.set_status(msg);
                     return;
                 }
             }
 
-            let options = crate::convert::ConversionOptions::default();
-            let mut count = 0;
-            for p in paths {
-                if app.manager.add_file_ready_for_processing(p, options.clone()).is_ok() {
-                    count += 1;
-                }
+            // Populate the source pane and read metadata.
+            app.convert.source.file_path = Some(first.clone());
+            app.convert.source.info = Some(info);
+            if let Ok(meta) = crate::tui::probe::read_metadata(&first) {
+                app.convert.metadata.title = meta.title.clone();
+                app.convert.metadata.artist = meta.artist.clone();
+                app.convert.metadata.album = meta.album.clone();
+                app.convert.metadata.genre = meta.genre.clone();
+                app.convert.metadata.year = meta.year.clone();
+                app.convert.source.metadata = meta;
             }
-            app.browse.clear_multi_selection();
-            app.set_status(format!("Queued {} files", count));
-            if switch_after {
-                app.current_screen = AppScreen::Queue;
+            app.recent.record_use(&first);
+
+            // Remember where we came from, switch to Convert for review.
+            app.previous_screen = Some(AppScreen::Browse);
+            app.current_screen = AppScreen::Convert;
+            app.set_status("review settings, then :commit or :Commit");
+        }
+        AppScreen::Library => {
+            // Placeholder screen. Selection inheritance arrives in 6c.
+            if let Some(name) = &preset {
+                match load_preset_into_pills(app, name) {
+                    Ok(()) => app.set_status(format!("preset loaded: {}", name)),
+                    Err(msg) => app.set_status(msg),
+                }
+            } else {
+                app.set_status("library → Convert inheritance arrives in Phase 6c");
             }
         }
         AppScreen::Convert => {
-            // Use the existing convert-to-queue path (`false` = queue, don't start).
-            let ok = super::convert_actions::convert_or_queue(app, tx, false);
-            if ok && switch_after {
-                app.current_screen = AppScreen::Queue;
+            // Already on Convert. A preset arg loads in place; without an
+            // arg, remind the user to pick files in Browse first.
+            if let Some(name) = &preset {
+                match load_preset_into_pills(app, name) {
+                    Ok(()) => app.set_status(format!("preset loaded: {}", name)),
+                    Err(msg) => app.set_status(msg),
+                }
+            } else {
+                app.set_status("switch to Browse to pick files, then :queue");
+            }
+        }
+        AppScreen::Queue => {
+            if let Some(name) = &preset {
+                match load_preset_into_pills(app, name) {
+                    Ok(()) => app.set_status(format!("preset loaded: {}", name)),
+                    Err(msg) => app.set_status(msg),
+                }
+            } else {
+                app.set_status(":queue: switch to Browse to pick files first");
             }
         }
         _ => {
-            app.set_status(":queue only works on the browse or convert screen");
+            app.set_status(":queue not supported on this screen");
         }
     }
+}
+
+/// Execute a `:commit` / `:Commit` command. Only valid on the Convert
+/// screen with a source file loaded. Enqueues the current source (and
+/// optionally starts processing), then navigates away:
+/// - `:commit` (start=false): enqueue, return to origin (previous_screen)
+/// - `:Commit` (start=true): enqueue, start processing, jump to Queue
+fn execute_commit(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    start: bool,
+) {
+    if app.current_screen != AppScreen::Convert {
+        app.set_status(":commit only works on the Convert screen");
+        return;
+    }
+
+    if app.convert.source.file_path.is_none() {
+        app.set_status("nothing to commit — no source file loaded");
+        return;
+    }
+
+    // Delegate the actual enqueue + optional start to the existing helper.
+    // On failure it already set a status message; just bail.
+    let ok = super::convert_actions::convert_or_queue(app, tx, start);
+    if !ok {
+        return;
+    }
+
+    // Clear the source pane so a subsequent `:queue` arrives fresh.
+    app.convert.source.file_path = None;
+    app.convert.source.info = None;
+    app.convert.source.metadata = crate::tui::probe::SourceMetadata::default();
+    app.convert.metadata = MetadataState::default();
+
+    if start {
+        // :Commit — land on Queue to watch processing.
+        app.previous_screen = None;
+        app.current_screen = AppScreen::Queue;
+    } else {
+        // :commit — return to origin, defaulting to Browse.
+        let origin = app.previous_screen.take().unwrap_or(AppScreen::Browse);
+        app.current_screen = origin;
+        if origin == AppScreen::Browse {
+            app.browse.probe_current(tx);
+        }
+    }
+}
+
+/// Execute a `:go` / `:start` command — begin processing whatever's in
+/// the queue. No new batch involved. No-op if already processing or if
+/// nothing is ready. Works from any screen.
+fn execute_go(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    if app.processing_active {
+        app.set_status("already processing");
+        return;
+    }
+    // start_processing handles the zero-ready-items case itself.
+    super::convert_actions::start_processing(app, tx);
 }
 
 /// Execute a `:rename` command for the browse screen.
