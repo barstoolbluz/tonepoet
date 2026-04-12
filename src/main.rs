@@ -88,7 +88,18 @@ enum Commands {
     },
 
     /// Launch full interactive TUI
-    Tui,
+    Tui {
+        /// Optional audio files to load into the Convert screen on launch.
+        /// A single file opens in Single mode; multiple files open as a
+        /// Batch for review. If no files are given, the TUI starts on the
+        /// configured default screen (Browse by default).
+        ///
+        /// Directory arguments are not supported in TUI mode; use
+        /// `tonepoet convert <DIR>` for batch directory conversion, or
+        /// launch the TUI and navigate via `:cd` on the Browse screen.
+        #[arg(required = false)]
+        paths: Vec<PathBuf>,
+    },
 
     /// Launch interactive TUI wizard
     Wizard,
@@ -117,13 +128,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let log_level = if cli.verbose { "debug" } else { "info" };
-    init_logging(log_level, matches!(cli.command, Commands::Tui));
+    init_logging(log_level, matches!(cli.command, Commands::Tui { .. }));
 
     let config = TonepoetConfig::load().unwrap_or_default();
 
     match cli.command {
-        Commands::Tui => {
-            run_tui(config).await?;
+        Commands::Tui { paths } => {
+            run_tui(config, paths).await?;
         }
         Commands::Convert {
             paths, format, output, workers, replaygain,
@@ -632,7 +643,7 @@ fn run_config(show: bool, reset: bool, path: bool, config: &TonepoetConfig) -> a
     Ok(())
 }
 
-async fn run_tui(config: TonepoetConfig) -> anyhow::Result<()> {
+async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Result<()> {
     use crossterm::{
         event::{EnableMouseCapture, DisableMouseCapture},
         execute,
@@ -651,6 +662,15 @@ async fn run_tui(config: TonepoetConfig) -> anyhow::Result<()> {
 
     // Create app state
     let mut app = AppState::new(config);
+
+    // Phase 6f: if the user launched with file args (`tonepoet tui foo.flac
+    // bar.flac`), seed the Convert screen with those files and land on
+    // Convert instead of the configured default screen. Invalid paths
+    // (missing, directories) are logged and skipped. Routes through
+    // Convert like any other enqueue source — no back door to the queue.
+    if !cli_paths.is_empty() {
+        app.seed_from_cli_paths(cli_paths);
+    }
 
     // Create message channel
     let (tx, rx) = tokio::sync::mpsc::channel(256);

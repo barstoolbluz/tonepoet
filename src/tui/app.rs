@@ -952,4 +952,113 @@ impl AppState {
             }
         }
     }
+
+    /// Phase 6f: seed the Convert screen from CLI `tonepoet tui <paths>`
+    /// invocation. Probes the first file, builds `SourceMode::Single` or
+    /// `SourceMode::Batch` from the paths, populates the editable metadata
+    /// pane from the first file's tags, and lands on the Convert screen
+    /// instead of the configured default screen. Routes through Convert
+    /// for review — no back door to the queue.
+    ///
+    /// Invalid paths (missing, directories, unreadable) are logged via
+    /// `log::warn` and skipped. If all paths are invalid the method is
+    /// a no-op beyond setting a status message.
+    pub fn seed_from_cli_paths(&mut self, paths: Vec<PathBuf>) {
+        let original_count = paths.len();
+        let valid: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| {
+                if !p.exists() {
+                    log::warn!("cli: path does not exist: {}", p.display());
+                    return false;
+                }
+                if p.is_dir() {
+                    log::warn!(
+                        "cli: directories not supported in TUI mode — use `tonepoet convert <dir>` or navigate via `:cd` on the Browse screen: {}",
+                        p.display()
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        let valid_count = valid.len();
+        if valid.is_empty() {
+            if original_count > 0 {
+                self.set_status(format!(
+                    "cli: {} invalid path(s) skipped; see log",
+                    original_count
+                ));
+            }
+            return;
+        }
+
+        let first = valid[0].clone();
+        let info = match crate::tui::probe::probe_audio(&first) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                log::warn!("cli: probe failed for {}: {}", first.display(), e);
+                None
+            }
+        };
+        let metadata = crate::tui::probe::read_metadata(&first).unwrap_or_default();
+
+        // Populate the editable metadata pane from the first file's tags.
+        self.convert.metadata.title = metadata.title.clone();
+        self.convert.metadata.artist = metadata.artist.clone();
+        self.convert.metadata.album = metadata.album.clone();
+        self.convert.metadata.genre = metadata.genre.clone();
+        self.convert.metadata.year = metadata.year.clone();
+
+        // Build the mode (Single for 1 file, Batch for N) and populate
+        // first-file probe/metadata in the appropriate variant.
+        let mut mode = SourceMode::from_paths(valid);
+        match &mut mode {
+            SourceMode::Single { info: slot, metadata: meta_slot, .. } => {
+                *slot = info;
+                *meta_slot = metadata;
+            }
+            SourceMode::Batch { cursor_info, cursor_metadata, .. } => {
+                *cursor_info = info;
+                *cursor_metadata = metadata;
+            }
+            SourceMode::Empty => {
+                // Unreachable — valid.is_empty() check guards against 0 paths.
+            }
+        }
+        self.convert.source.mode = mode;
+
+        // Record the first file in the recent-files history.
+        self.recent.record_use(&first);
+
+        // Override the configured default screen — CLI file args always
+        // land on Convert. Esc is a no-op (previous_screen stays None)
+        // since this is a "permanent load" intent, not a cancelable
+        // review. Consistent with `:e`, Browse Enter, and recent-files
+        // load paths.
+        self.current_screen = AppScreen::Convert;
+
+        // Surface how many paths were filtered out so the user knows
+        // something was skipped without having to tail the log file.
+        let skipped = original_count.saturating_sub(valid_count);
+        let skipped_suffix = if skipped > 0 {
+            format!(" ({} skipped, see log)", skipped)
+        } else {
+            String::new()
+        };
+        let status = if valid_count == 1 {
+            format!(
+                "loaded {}{} from cli — review, then :commit or :Commit",
+                first.file_name().unwrap_or_default().to_string_lossy(),
+                skipped_suffix,
+            )
+        } else {
+            format!(
+                "loaded batch of {} files{} from cli — review, then :commit or :Commit",
+                valid_count, skipped_suffix,
+            )
+        };
+        self.set_status(status);
+    }
 }
