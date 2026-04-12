@@ -221,7 +221,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
             if app.convert.focus == ConvertFocus::Source =>
         {
             if app.convert.source.mode.is_batch() {
-                app.active_overlay = ActiveOverlay::BatchList;
+                app.active_overlay = ActiveOverlay::BatchList { scroll: 0 };
             } else {
                 let initial = app
                     .convert
@@ -944,8 +944,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
-        ActiveOverlay::BatchList => {
-            handle_batch_list_key(app, key);
+        ActiveOverlay::BatchList { scroll } => {
+            handle_batch_list_key(app, key, scroll, tx);
         }
         ActiveOverlay::None => {}
     }
@@ -1000,9 +1000,25 @@ fn handle_command_tab(
 
 /// Handle key events for the BatchList expand overlay. Moves the Batch
 /// cursor with ↑/↓/j/k, jumps with Home/End, removes the hovered file
-/// with `d`, closes with Enter/Esc. Scroll is computed in the renderer
-/// from cursor + list height.
-fn handle_batch_list_key(app: &mut AppState, key: KeyEvent) {
+/// with `d`, closes with Enter/Esc.
+///
+/// Scroll is vim-smooth: it only updates when the cursor exits the
+/// visible range. The handler uses a conservative visible-row estimate
+/// (`APPROX_VISIBLE`) since it doesn't know the actual rendered height;
+/// the renderer clamps defensively so the cursor is always in view.
+fn handle_batch_list_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    mut scroll: usize,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    /// Conservative estimate of visible list rows. The real value
+    /// depends on terminal height; the renderer clamps to the actual
+    /// list area, so a too-small estimate just means the cursor
+    /// scrolls early (visible) rather than never (broken). 15 fits a
+    /// typical 30-row terminal with a ~25-row popup after chrome.
+    const APPROX_VISIBLE: usize = 15;
+
     // Grab batch size for navigation bounds.
     let (n, cursor) = match &app.convert.source.mode {
         SourceMode::Batch { paths, cursor, .. } => (paths.len(), *cursor),
@@ -1016,54 +1032,76 @@ fn handle_batch_list_key(app: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Enter => {
             app.active_overlay = ActiveOverlay::None;
+            return;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if cursor > 0 {
-                move_batch_cursor(app, cursor - 1);
+                move_batch_cursor(app, cursor - 1, tx);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if cursor + 1 < n {
-                move_batch_cursor(app, cursor + 1);
+                move_batch_cursor(app, cursor + 1, tx);
             }
         }
         KeyCode::Home => {
             if cursor > 0 {
-                move_batch_cursor(app, 0);
+                move_batch_cursor(app, 0, tx);
             }
         }
         KeyCode::End => {
             if n > 0 && cursor + 1 != n {
-                move_batch_cursor(app, n - 1);
+                move_batch_cursor(app, n - 1, tx);
             }
         }
         KeyCode::Char('d') => {
-            remove_batch_at_cursor(app);
+            remove_batch_at_cursor(app, tx);
             // If the batch collapsed (either to Single when only one
             // file remains, or to Empty when all were removed), close
             // the overlay — it's no longer meaningful.
             if !app.convert.source.mode.is_batch() {
                 app.active_overlay = ActiveOverlay::None;
+                return;
             }
         }
         _ => {}
     }
+
+    // Re-read the cursor after any mutating operations above.
+    let new_cursor = match &app.convert.source.mode {
+        SourceMode::Batch { cursor, .. } => *cursor,
+        _ => {
+            app.active_overlay = ActiveOverlay::None;
+            return;
+        }
+    };
+
+    // Vim-smooth scroll: only shift the visible range when the cursor
+    // has moved outside it. `APPROX_VISIBLE` is a conservative guess;
+    // the renderer clamps to the actual list area.
+    if new_cursor < scroll {
+        scroll = new_cursor;
+    } else if new_cursor >= scroll + APPROX_VISIBLE {
+        scroll = new_cursor + 1 - APPROX_VISIBLE;
+    }
+
+    app.active_overlay = ActiveOverlay::BatchList { scroll };
 }
 
-/// Move the Batch cursor to `new_cursor` and synchronously probe/read
-/// metadata for the new file. Sync is fine because cursor moves are
-/// keyboard-driven and a single probe takes ~50ms.
-fn move_batch_cursor(app: &mut AppState, new_cursor: usize) {
+/// Move the Batch cursor to `new_cursor` and spawn a background probe
+/// for the new file. The `cursor_info`/`cursor_metadata` fields are
+/// cleared immediately so the pane preview shows "probing…" until the
+/// `AudioProbeComplete` message arrives and refreshes them.
+fn move_batch_cursor(
+    app: &mut AppState,
+    new_cursor: usize,
+    tx: &mpsc::Sender<AppMessage>,
+) {
     let new_path = match &app.convert.source.mode {
         SourceMode::Batch { paths, .. } => paths.get(new_cursor).cloned(),
         _ => None,
     };
     let Some(path) = new_path else { return; };
-
-    // Probe synchronously. On failure, clear cursor_info so the UI shows
-    // "probing…" / error state rather than stale data.
-    let info = crate::tui::probe::probe_audio(&path).ok();
-    let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
 
     if let SourceMode::Batch {
         cursor,
@@ -1073,15 +1111,21 @@ fn move_batch_cursor(app: &mut AppState, new_cursor: usize) {
     } = &mut app.convert.source.mode
     {
         *cursor = new_cursor;
-        *cursor_info = info;
-        *cursor_metadata = metadata;
+        // Clear stale info; AudioProbeComplete will repopulate.
+        *cursor_info = None;
+        *cursor_metadata = crate::tui::probe::SourceMetadata::default();
     }
+
+    // Spawn the background probe. Result is routed to cursor_info in
+    // event_loop's AudioProbeComplete handler when it arrives.
+    super::browse::spawn_audio_probe(path, tx.clone());
 }
 
 /// Remove the file at the batch cursor from the batch. If the batch
 /// drops to 0 files, transitions to `SourceMode::Empty`. If it drops
-/// to 1 file, promotes to `SourceMode::Single`.
-fn remove_batch_at_cursor(app: &mut AppState) {
+/// to 1 file, promotes to `SourceMode::Single` and spawns a background
+/// probe for the remaining file.
+fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     let (remaining_paths, new_cursor) = match &mut app.convert.source.mode {
         SourceMode::Batch { paths, cursor, .. } if !paths.is_empty() => {
             let idx = (*cursor).min(paths.len() - 1);
@@ -1098,31 +1142,31 @@ fn remove_batch_at_cursor(app: &mut AppState) {
     }
 
     if remaining_paths.len() == 1 {
-        // Promote to Single — probe the remaining file.
+        // Promote to Single with empty info/metadata; AudioProbeComplete
+        // will populate it when the background probe finishes.
         let path = remaining_paths.into_iter().next().unwrap();
-        let info = crate::tui::probe::probe_audio(&path).ok();
-        let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
-        app.convert.source.mode = SourceMode::Single { path, info, metadata };
+        app.convert.source.mode = SourceMode::Single {
+            path: path.clone(),
+            info: None,
+            metadata: crate::tui::probe::SourceMetadata::default(),
+        };
+        super::browse::spawn_audio_probe(path, tx.clone());
         return;
     }
 
     // Stay in Batch — recompute summary and move cursor.
     let mut new_mode = SourceMode::from_paths(remaining_paths);
-    if let SourceMode::Batch {
-        cursor,
-        cursor_info,
-        cursor_metadata,
-        paths,
-        ..
-    } = &mut new_mode
-    {
+    let spawned_path = if let SourceMode::Batch { cursor, paths, .. } = &mut new_mode {
         *cursor = new_cursor;
-        if let Some(p) = paths.get(new_cursor).cloned() {
-            *cursor_info = crate::tui::probe::probe_audio(&p).ok();
-            *cursor_metadata = crate::tui::probe::read_metadata(&p).unwrap_or_default();
-        }
-    }
+        paths.get(new_cursor).cloned()
+    } else {
+        None
+    };
     app.convert.source.mode = new_mode;
+
+    if let Some(p) = spawned_path {
+        super::browse::spawn_audio_probe(p, tx.clone());
+    }
 }
 
 /// Apply a text edit to the target field, setting modified flag as needed
@@ -1734,7 +1778,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::SourceExpandButton => {
                 // Open the BatchList overlay if a batch is loaded.
                 if app.convert.source.mode.is_batch() {
-                    app.active_overlay = ActiveOverlay::BatchList;
+                    app.active_overlay = ActiveOverlay::BatchList { scroll: 0 };
                 }
             }
             TuiButton::MetadataField(field) => {

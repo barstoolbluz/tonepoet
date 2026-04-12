@@ -43,8 +43,8 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             let label = label.clone();
             draw_text_edit(f, &label, &input);
         }
-        ActiveOverlay::BatchList => {
-            draw_batch_list(f, app);
+        ActiveOverlay::BatchList { scroll } => {
+            draw_batch_list(f, app, scroll);
         }
     }
 
@@ -73,9 +73,15 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 /// Draw the BatchList expand overlay: full list of paths in the current
 /// batch with the cursor highlighted. Shows a hint line at the bottom
-/// with available actions. Scroll is computed from cursor + list height
-/// (cursor sticks to the bottom row when advancing past the visible range).
-fn draw_batch_list(f: &mut Frame, app: &AppState) {
+/// with available actions.
+///
+/// `stored_scroll` is the persistent scroll offset from `ActiveOverlay::
+/// BatchList { scroll }`. The renderer clamps it to keep the cursor
+/// visible even if the handler's conservative `APPROX_VISIBLE` estimate
+/// doesn't match the actual list height — the clamp here is defensive
+/// (only fires when list height differs from the estimate) and doesn't
+/// feed back into persistent state.
+fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
     let (paths, cursor) = match &app.convert.source.mode {
         // Defensive: an empty Batch shouldn't exist (from_paths returns
         // Empty for 0 paths, remove collapses to Empty/Single), but if
@@ -114,13 +120,18 @@ fn draw_batch_list(f: &mut Frame, app: &AppState) {
         ])
         .split(inner);
 
-    // Compute scroll on the fly so the cursor is always in view. Stick
-    // the cursor to the bottom row once it passes `list_h - 1`.
+    // Clamp `stored_scroll` to the range that keeps the cursor in
+    // view given the actual list height. The handler maintains
+    // smooth-scroll semantics using a conservative estimate; this
+    // clamp corrects for any difference between the estimate and
+    // reality without persisting back into state.
     let list_h = chunks[0].height as usize;
-    let scroll = if list_h == 0 || cursor < list_h {
+    let scroll = if list_h == 0 {
         0
     } else {
-        cursor + 1 - list_h
+        let min_scroll = cursor.saturating_sub(list_h.saturating_sub(1));
+        let max_scroll = cursor.min(paths.len().saturating_sub(list_h));
+        stored_scroll.clamp(min_scroll, max_scroll.max(min_scroll))
     };
     let end = (scroll + list_h).min(paths.len());
     let visible = &paths[scroll..end];

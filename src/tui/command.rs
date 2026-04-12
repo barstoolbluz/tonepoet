@@ -950,7 +950,7 @@ fn execute_expand(app: &mut AppState) {
         app.set_status(":expand: no batch loaded (use :queue from Browse)");
         return;
     }
-    app.active_overlay = ActiveOverlay::BatchList;
+    app.active_overlay = ActiveOverlay::BatchList { scroll: 0 };
 }
 
 /// Execute a `:rename` command for the browse screen.

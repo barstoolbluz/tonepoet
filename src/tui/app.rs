@@ -311,17 +311,37 @@ fn compute_format_histogram(paths: &[PathBuf]) -> Vec<(AudioFormat, usize)> {
     vec
 }
 
-/// Map a file extension to an `AudioFormat`, if recognised.
+/// Map a file extension to an `AudioFormat`, if recognised. Used only
+/// by the cheap batch format histogram — the real conversion pipeline
+/// uses `FormatDetector::detect` which does magic-byte sniffing and
+/// supports a wider range of formats.
+///
+/// Mappings pick the closest existing `AudioFormat` variant; some are
+/// best-effort (e.g. `.ogg` is typically Vorbis but could also be Opus
+/// or FLAC — we map to Opus as the most common modern case). Extensions
+/// without a reasonable variant (dsf/dff for DSD, ape/wma/shn/tta/amr
+/// for formats we don't represent) return `None` and fall through to
+/// "(no recognised audio extensions)" if the whole batch is unrecognised.
 fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
     let ext = path.extension().and_then(|e| e.to_str())?;
     match ext.to_lowercase().as_str() {
+        // FLAC — lossless
         "flac" => Some(AudioFormat::Flac),
-        "wav" => Some(AudioFormat::Wav),
-        "aiff" | "aif" => Some(AudioFormat::Aiff),
+        // WAV family (includes Wave64 and RF64 >4GB variants)
+        "wav" | "w64" | "rf64" | "bwf" => Some(AudioFormat::Wav),
+        // AIFF / AIFF-C
+        "aiff" | "aif" | "aifc" => Some(AudioFormat::Aiff),
+        // WavPack
         "wv" => Some(AudioFormat::WavPack),
+        // MP3
         "mp3" => Some(AudioFormat::Mp3),
-        "m4a" | "aac" => Some(AudioFormat::Aac),
-        "opus" => Some(AudioFormat::Opus),
+        // AAC family (m4a, adts .aac, .mp4 audio)
+        "m4a" | "aac" | "mp4" | "m4b" | "m4r" => Some(AudioFormat::Aac),
+        // ALAC — typically carried in m4a but sometimes standalone
+        "alac" | "caf" => Some(AudioFormat::Alac),
+        // Opus (.opus is unambiguous; .oga is Ogg Opus; .ogg is
+        // ambiguous but maps here as best-effort)
+        "opus" | "oga" | "ogg" => Some(AudioFormat::Opus),
         _ => None,
     }
 }
@@ -744,10 +764,16 @@ pub enum ActiveOverlay {
     },
     /// Expand overlay for a multi-file batch: full path list with
     /// keyboard navigation (↑/↓ move cursor, `d` removes, Enter/Esc
-    /// closes). Mirrors `source.mode.Batch.cursor` while open. Scroll
-    /// is derived from the cursor and list height in the renderer so
-    /// no persistent scroll state is needed here.
-    BatchList,
+    /// closes). Mirrors `source.mode.Batch.cursor` while open.
+    ///
+    /// `scroll` is the top row of the visible slice — persisted so
+    /// that the cursor only scrolls the list when it exits the
+    /// visible range (vim-smooth behaviour), rather than snapping to
+    /// the bottom on every keystroke. The renderer clamps defensively
+    /// so the cursor is always in view even if this value is stale.
+    BatchList {
+        scroll: usize,
+    },
 }
 
 /// Tab-completion state for the command input overlay.

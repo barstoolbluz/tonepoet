@@ -156,9 +156,46 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
             app.browse.probe_pending.remove(&path);
             match *result {
                 Ok(info) => {
+                    // Clone for the browse cache (shared via Arc).
                     app.browse
                         .probe_cache
-                        .insert(path, Some(std::sync::Arc::new(info)));
+                        .insert(path.clone(), Some(std::sync::Arc::new(info.clone())));
+
+                    // Phase 6g: route to the Convert source pane if
+                    // we're in Batch mode and this path matches the
+                    // current cursor, or in Single mode and this path
+                    // matches the loaded file. This completes the
+                    // async-probe pipeline for `move_batch_cursor` and
+                    // `remove_batch_at_cursor`.
+                    let super::browse::CachedInfo {
+                        source: probed_info,
+                        metadata: probed_metadata,
+                    } = info;
+                    match &mut app.convert.source.mode {
+                        super::app::SourceMode::Batch {
+                            paths,
+                            cursor,
+                            cursor_info,
+                            cursor_metadata,
+                            ..
+                        } => {
+                            if paths.get(*cursor).map(|p| p == &path).unwrap_or(false) {
+                                *cursor_info = Some(probed_info);
+                                *cursor_metadata = probed_metadata;
+                            }
+                        }
+                        super::app::SourceMode::Single {
+                            path: single_path,
+                            info: info_slot,
+                            metadata: metadata_slot,
+                        } => {
+                            if single_path == &path {
+                                *info_slot = Some(probed_info);
+                                *metadata_slot = probed_metadata;
+                            }
+                        }
+                        super::app::SourceMode::Empty => {}
+                    }
                 }
                 Err(_) => {
                     // Cache the failure so we don't retry; renderer falls back
