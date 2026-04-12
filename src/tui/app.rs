@@ -774,16 +774,24 @@ pub enum ActiveOverlay {
     BatchList {
         scroll: usize,
     },
-    /// Context menu triggered by right-click or `m` keybinding. Shows
-    /// a floating popup at `origin` with a list of actions filtered
-    /// for the current screen and click target. Flat menus for v1 —
-    /// nested submenus deferred.
+    /// Context menu triggered by right-click or `m` keybinding.
+    /// Two-level side-by-side model (hexload-tui pattern): the parent
+    /// menu is always visible; when the cursor is on a `Submenu` entry,
+    /// its children appear as a second panel to the right. Both are
+    /// visible simultaneously.
     ContextMenu {
         entries: Vec<crate::tui::context_menu::ContextMenuEntry>,
-        /// Index of the currently highlighted **item** (skips separators).
         selected: usize,
-        /// Screen position where the menu was triggered (for rendering).
         origin: (u16, u16),
+        /// Child submenu (populated when the selected parent entry is
+        /// a `Submenu` variant). Cleared when cursor moves to a
+        /// non-Submenu item.
+        submenu_entries: Vec<crate::tui::context_menu::ContextMenuEntry>,
+        submenu_selected: usize,
+        show_submenu: bool,
+        /// True when keyboard focus is in the submenu (Right opened it).
+        /// False when focus is in the parent menu.
+        focus_submenu: bool,
     },
 }
 

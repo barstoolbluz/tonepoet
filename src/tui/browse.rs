@@ -707,7 +707,10 @@ impl BrowseState {
     /// Toggle multi-select on the current entry
     pub fn toggle_selection(&mut self) {
         if let Some(entry) = self.entries.get(self.selected_index) {
-            if !entry.is_dir() {
+            // Allow selecting audio files, archives, directories, and
+            // other files. Only ParentDir (..) is excluded — it's a
+            // navigation pseudo-entry, not a real target.
+            if !matches!(entry.kind, EntryKind::ParentDir) {
                 let path = entry.path.clone();
                 if let Some(pos) = self.multi_selected.iter().position(|p| p == &path) {
                     self.multi_selected.remove(pos);
@@ -727,17 +730,28 @@ impl BrowseState {
     }
 
     /// Collect paths for an enqueue operation (`:queue` / `:convert` etc).
-    /// - If `multi_selected` is non-empty, returns those paths.
-    /// - Otherwise returns the currently highlighted entry if it's an audio
-    ///   file or archive.
+    ///
+    /// - If `multi_selected` is non-empty, expands any directories into
+    ///   their audio file contents (recursively) and returns the result.
+    /// - Otherwise, if the cursor is on an audio file, archive, or
+    ///   directory, returns it (directories expanded).
     /// - Returns an empty vec if nothing valid is selected.
+    ///
+    /// The expansion helper (`expand_paths_to_audio`) is screen-agnostic
+    /// so Library and future screens can reuse the same logic.
     pub fn collect_selection_for_queue(&self) -> Vec<PathBuf> {
         if !self.multi_selected.is_empty() {
-            return self.multi_selected.clone();
+            return expand_paths_to_audio(&self.multi_selected);
         }
         if let Some(entry) = self.selected_entry() {
-            if matches!(entry.kind, EntryKind::AudioFile(_) | EntryKind::Archive) {
-                return vec![entry.path.clone()];
+            match &entry.kind {
+                EntryKind::AudioFile(_) | EntryKind::Archive => {
+                    return vec![entry.path.clone()];
+                }
+                EntryKind::Directory => {
+                    return expand_paths_to_audio(&[entry.path.clone()]);
+                }
+                _ => {}
             }
         }
         Vec::new()
@@ -1069,6 +1083,57 @@ impl Default for BrowseState {
 }
 
 /// Classify a file by its extension
+/// Expand a list of paths into audio files suitable for queuing.
+/// - Audio files and archives are kept as-is.
+/// - Directories are walked recursively; audio files within are collected.
+/// - Non-audio files and unreadable entries are silently skipped.
+///
+/// Public and screen-agnostic — usable by Browse, Library, or any
+/// future screen that needs to queue directories or mixed selections.
+pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            collect_audio_recursive(path, &mut result);
+        } else {
+            let kind = classify_file(path);
+            if matches!(kind, EntryKind::AudioFile(_) | EntryKind::Archive) {
+                result.push(path.clone());
+            }
+        }
+    }
+    result
+}
+
+/// Recursively walk a directory, pushing audio files and archives into
+/// `out`. Follows the same extension classification as `classify_file`
+/// to stay consistent with the browse listing. Symlinks are skipped to
+/// avoid loops (same policy as `walk_dir_for_stats`).
+fn collect_audio_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_audio_recursive(&path, out);
+        } else {
+            let kind = classify_file(&path);
+            if matches!(kind, EntryKind::AudioFile(_) | EntryKind::Archive) {
+                out.push(path);
+            }
+        }
+    }
+}
+
 fn classify_file(path: &Path) -> EntryKind {
     let ext = path
         .extension()

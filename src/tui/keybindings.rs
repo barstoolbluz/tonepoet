@@ -969,72 +969,173 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::BatchList { scroll } => {
             handle_batch_list_key(app, key, scroll, tx);
         }
-        ActiveOverlay::ContextMenu { entries, selected, origin } => {
-            handle_context_menu_key(app, key, entries, selected, origin, tx);
+        ActiveOverlay::ContextMenu {
+            entries, selected, origin,
+            submenu_entries, submenu_selected,
+            show_submenu, focus_submenu,
+        } => {
+            handle_context_menu_key(
+                app, key, entries, selected, origin,
+                submenu_entries, submenu_selected,
+                show_submenu, focus_submenu, tx,
+            );
         }
         ActiveOverlay::None => {}
     }
 }
 
-/// Handle key events for the context menu overlay.
+/// Handle key events for the context menu overlay. Two-level side-by-side
+/// model: parent menu stays visible; submenu appears to the right when
+/// the cursor is on a Submenu entry. `focus_submenu` tracks which panel
+/// has keyboard focus.
+#[allow(clippy::too_many_arguments)]
 fn handle_context_menu_key(
     app: &mut AppState,
     key: KeyEvent,
     entries: Vec<super::context_menu::ContextMenuEntry>,
     mut selected: usize,
     origin: (u16, u16),
+    mut submenu_entries: Vec<super::context_menu::ContextMenuEntry>,
+    mut submenu_selected: usize,
+    mut show_submenu: bool,
+    mut focus_submenu: bool,
     tx: &mpsc::Sender<AppMessage>,
 ) {
     use super::context_menu::{ContextMenuEntry, execute_context_action};
 
-    // Count selectable items (not separators).
-    let selectable: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| match e {
-            ContextMenuEntry::Item(item) if item.enabled => Some(i),
-            _ => None,
-        })
-        .collect();
-
-    if selectable.is_empty() {
-        app.active_overlay = ActiveOverlay::None;
-        return;
+    /// Build selectable-index list for a set of entries.
+    fn selectable_indices(entries: &[ContextMenuEntry]) -> Vec<usize> {
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                ContextMenuEntry::Item(item) if item.enabled => Some(i),
+                ContextMenuEntry::Submenu { .. } => Some(i),
+                _ => None,
+            })
+            .collect()
     }
+
+    let parent_selectable = selectable_indices(&entries);
 
     match key.code {
         KeyCode::Esc => {
-            app.active_overlay = ActiveOverlay::None;
+            if focus_submenu {
+                // Esc in submenu → return focus to parent.
+                focus_submenu = false;
+            } else {
+                // Esc in parent → close entirely.
+                app.active_overlay = ActiveOverlay::None;
+                return;
+            }
+        }
+        KeyCode::Left => {
+            if focus_submenu {
+                focus_submenu = false;
+            } else {
+                app.active_overlay = ActiveOverlay::None;
+                return;
+            }
+        }
+        KeyCode::Right => {
+            if !focus_submenu && show_submenu {
+                // Move focus into the submenu.
+                focus_submenu = true;
+                submenu_selected = 0;
+            } else if focus_submenu {
+                // In submenu, Right on a Submenu item could open a 3rd
+                // level — for v1 we don't support 3 levels, so Enter
+                // is needed for leaf items.
+            }
         }
         KeyCode::Enter => {
-            // Execute the selected action and close.
-            if let Some(&idx) = selectable.get(selected) {
-                if let ContextMenuEntry::Item(item) = &entries[idx] {
-                    let action = item.action.clone();
-                    app.active_overlay = ActiveOverlay::None;
-                    execute_context_action(app, action, tx);
-                    return;
+            if focus_submenu {
+                // Execute the selected submenu item (or no-op if Submenu).
+                let sub_selectable = selectable_indices(&submenu_entries);
+                if let Some(&idx) = sub_selectable.get(submenu_selected) {
+                    if let ContextMenuEntry::Item(item) = &submenu_entries[idx] {
+                        let action = item.action.clone();
+                        app.active_overlay = ActiveOverlay::None;
+                        execute_context_action(app, action, tx);
+                        return;
+                    }
+                }
+            } else {
+                // In parent: Enter on Item executes; on Submenu moves focus in.
+                if let Some(&idx) = parent_selectable.get(selected) {
+                    match &entries[idx] {
+                        ContextMenuEntry::Submenu { .. } if show_submenu => {
+                            focus_submenu = true;
+                            submenu_selected = 0;
+                        }
+                        ContextMenuEntry::Item(item) => {
+                            let action = item.action.clone();
+                            app.active_overlay = ActiveOverlay::None;
+                            execute_context_action(app, action, tx);
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
             }
-            app.active_overlay = ActiveOverlay::None;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if selected > 0 {
-                selected -= 1;
+            if focus_submenu {
+                if submenu_selected > 0 {
+                    submenu_selected -= 1;
+                }
+            } else {
+                if selected > 0 {
+                    selected -= 1;
+                }
             }
-            app.active_overlay = ActiveOverlay::ContextMenu { entries, selected, origin };
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if selected + 1 < selectable.len() {
-                selected += 1;
+            if focus_submenu {
+                let sub_selectable = selectable_indices(&submenu_entries);
+                if submenu_selected + 1 < sub_selectable.len() {
+                    submenu_selected += 1;
+                }
+            } else {
+                if selected + 1 < parent_selectable.len() {
+                    selected += 1;
+                }
             }
-            app.active_overlay = ActiveOverlay::ContextMenu { entries, selected, origin };
         }
         _ => {
-            // Unrecognized key — close the menu.
             app.active_overlay = ActiveOverlay::None;
+            return;
         }
     }
+
+    // After cursor movement in the parent, update the submenu to match
+    // the newly selected entry (if it's a Submenu).
+    if !focus_submenu {
+        if let Some(&idx) = parent_selectable.get(selected) {
+            match &entries[idx] {
+                ContextMenuEntry::Submenu { children, .. } => {
+                    submenu_entries = children.clone();
+                    submenu_selected = 0;
+                    show_submenu = true;
+                }
+                _ => {
+                    show_submenu = false;
+                    submenu_entries.clear();
+                    submenu_selected = 0;
+                }
+            }
+        }
+    }
+
+    app.active_overlay = ActiveOverlay::ContextMenu {
+        entries,
+        selected,
+        origin,
+        submenu_entries,
+        submenu_selected,
+        show_submenu,
+        focus_submenu,
+    };
 }
 
 /// Build and open the context menu for the current screen. `x, y` is
@@ -1070,10 +1171,22 @@ fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
+    // Check if the first entry is a Submenu — if so, auto-show its children.
+    let (submenu_entries, show_submenu) = match entries.first() {
+        Some(super::context_menu::ContextMenuEntry::Submenu { children, .. }) => {
+            (children.clone(), true)
+        }
+        _ => (Vec::new(), false),
+    };
+
     app.active_overlay = ActiveOverlay::ContextMenu {
         entries,
         selected: 0,
         origin: (x, y),
+        submenu_entries,
+        submenu_selected: 0,
+        show_submenu,
+        focus_submenu: false,
     };
 }
 

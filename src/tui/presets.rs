@@ -195,6 +195,51 @@ pub fn list_presets() -> Vec<String> {
     names
 }
 
+/// List presets grouped by their output audio format (codec). Each group
+/// is `(AudioFormat, Vec<preset_name>)`, sorted by format name. Groups
+/// with zero presets are omitted. Presets whose format can't be parsed
+/// are collected under a final "unknown" group (returned as `None`).
+///
+/// Loads each preset to peek at the format field — fine for typical
+/// counts (5–20 files, ~1ms each).
+pub fn list_presets_by_format() -> Vec<(Option<AudioFormat>, Vec<String>)> {
+    use std::collections::HashMap;
+
+    let names = list_presets();
+    let mut groups: HashMap<Option<AudioFormat>, Vec<String>> = HashMap::new();
+
+    for name in names {
+        let fmt = load_preset(&name)
+            .ok()
+            .and_then(|p| parse_format(&p.format));
+        groups.entry(fmt).or_default().push(name);
+    }
+
+    // Produce groups in a stable display order. Known formats first,
+    // unknown ("Other") last. Codecs with no presets are omitted.
+    let mut result: Vec<(Option<AudioFormat>, Vec<String>)> = Vec::new();
+    let display_order = [
+        AudioFormat::Flac,
+        AudioFormat::Wav,
+        AudioFormat::WavPack,
+        AudioFormat::Aiff,
+        AudioFormat::Alac,
+        AudioFormat::Opus,
+        AudioFormat::Aac,
+        AudioFormat::Mp3,
+    ];
+    for fmt in &display_order {
+        if let Some(names) = groups.remove(&Some(*fmt)) {
+            result.push((Some(*fmt), names));
+        }
+    }
+    // Unknown at the end (presets whose format field didn't parse).
+    if let Some(names) = groups.remove(&None) {
+        result.push((None, names));
+    }
+    result
+}
+
 /// Load a preset by name
 pub fn load_preset(name: &str) -> Result<TuiPreset, String> {
     let dir = presets_dir();

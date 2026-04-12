@@ -24,12 +24,19 @@ pub struct ContextMenuItem {
     pub enabled: bool,
 }
 
-/// An entry in the context menu -- either a clickable item or a visual
-/// separator between groups.
+/// An entry in the context menu -- either a clickable item, a visual
+/// separator, or a submenu that expands on selection.
 #[derive(Debug, Clone)]
 pub enum ContextMenuEntry {
     Item(ContextMenuItem),
     Separator,
+    /// A submenu parent. Selecting it pushes the current menu onto the
+    /// stack and replaces it with `children`. The label is shown with
+    /// a "►" indicator.
+    Submenu {
+        label: String,
+        children: Vec<ContextMenuEntry>,
+    },
 }
 
 /// Actions that can be triggered from the context menu. Each variant
@@ -39,8 +46,12 @@ pub enum ContextAction {
     // ── Browse screen ───────────────────────────────────────────────
     /// Queue the selected file(s) for review on the Convert screen.
     QueueSelection,
+    /// Queue with a specific preset loaded.
+    QueueWithPreset(String),
     /// Queue and start processing (`:Commit` equivalent).
     QueueAndStart,
+    /// Queue with a preset and auto-start.
+    QueueAndStartWithPreset(String),
     /// Open the selected file/directory (same as Enter on browse).
     OpenEntry,
     /// Rename the selected file (F2 / `:rename`).
@@ -113,6 +124,84 @@ fn separator() -> ContextMenuEntry {
     ContextMenuEntry::Separator
 }
 
+/// Build the "Convert" submenu tree. The top level always shows the
+/// quick-action items (Custom and Last Used for both queue and start
+/// modes). Codec-grouped preset submenus appear below the separator
+/// only when presets exist.
+///
+/// ```text
+/// Convert ►
+/// ├── Custom (queue)                 — current pill state, review
+/// ├── Custom + start                 — current pill state, auto-start
+/// ├── Last used (queue)  [FLAC]      — same as Custom, labelled with format
+/// ├── Last used + start  [FLAC]
+/// ├── ─────────────────────          (only if presets exist)
+/// ├── FLAC ►
+/// │   ├── foobar2k (queue)
+/// │   ├── foobar2k + start
+/// │   └── ...
+/// ├── Opus ►
+/// │   └── ...
+/// ```
+///
+/// Reused by audio files, archives, and directories — the queue flow
+/// expands directories into their audio file contents automatically.
+fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
+    let groups = super::presets::list_presets_by_format();
+
+    // Label "Last Used" with the current output format so the user
+    // knows what they're getting without drilling in.
+    let current_format = app.convert.format.format.selected_value().name();
+
+    let mut children = vec![
+        item("Custom (queue)", ContextAction::QueueSelection),
+        item("Custom + start", ContextAction::QueueAndStart),
+        item(
+            &format!("Last used (queue)  [{}]", current_format),
+            ContextAction::QueueSelection,
+        ),
+        item(
+            &format!("Last used + start  [{}]", current_format),
+            ContextAction::QueueAndStart,
+        ),
+    ];
+
+    // Per-codec preset submenus: each codec that has presets gets a
+    // submenu with queue/start pairs for each preset.
+    if !groups.is_empty() {
+        children.push(separator());
+
+        for (fmt, names) in &groups {
+            let codec_label = match fmt {
+                Some(f) => f.name().to_string(),
+                None => "Other".to_string(),
+            };
+
+            let mut preset_items: Vec<ContextMenuEntry> = Vec::new();
+            for name in names {
+                preset_items.push(item(
+                    &format!("{} (queue)", name),
+                    ContextAction::QueueWithPreset(name.clone()),
+                ));
+                preset_items.push(item(
+                    &format!("{} + start", name),
+                    ContextAction::QueueAndStartWithPreset(name.clone()),
+                ));
+            }
+
+            children.push(ContextMenuEntry::Submenu {
+                label: codec_label,
+                children: preset_items,
+            });
+        }
+    }
+
+    ContextMenuEntry::Submenu {
+        label: "Convert".to_string(),
+        children,
+    }
+}
+
 /// Build the context menu for a right-click on a browse entry.
 pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let entry = match app.browse.selected_entry() {
@@ -123,20 +212,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let mut items = Vec::new();
 
     match &entry.kind {
-        EntryKind::AudioFile(_) | EntryKind::Archive => {
-            items.push(item_with_shortcut("Queue", ContextAction::QueueSelection, ":queue"));
-            items.push(item_with_shortcut(
-                "Queue + start",
-                ContextAction::QueueAndStart,
-                ":queue!",
-            ));
+        EntryKind::AudioFile(_) | EntryKind::Archive | EntryKind::Directory => {
+            items.push(build_convert_submenu(app));
             items.push(separator());
-            items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
-            items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
-            items.push(separator());
-            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
-        }
-        EntryKind::Directory => {
             items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
             items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
             items.push(separator());
@@ -191,21 +269,24 @@ pub fn build_convert_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         ":browse",
     ));
 
-    // Preset submenu (flat for v1 — just list available presets)
-    let presets = super::presets::list_presets();
-    if !presets.is_empty() {
+    // Presets grouped by codec — same tree structure as the browse
+    // entry's Convert submenu, but here just for loading (not queuing).
+    let groups = super::presets::list_presets_by_format();
+    if !groups.is_empty() {
         items.push(separator());
-        for name in presets.iter().take(10) {
-            items.push(item(
-                &format!("Preset: {}", name),
-                ContextAction::LoadPreset(name.clone()),
-            ));
-        }
-        if presets.len() > 10 {
-            items.push(item(
-                &format!("... +{} more (use :preset)", presets.len() - 10),
-                ContextAction::GoToScreen(AppScreen::Convert), // no-op, just informational
-            ));
+        for (fmt, names) in &groups {
+            let codec_label = match fmt {
+                Some(f) => format!("Presets: {}", f.name()),
+                None => "Presets: Other".to_string(),
+            };
+            let preset_items: Vec<ContextMenuEntry> = names
+                .iter()
+                .map(|name| item(name, ContextAction::LoadPreset(name.clone())))
+                .collect();
+            items.push(ContextMenuEntry::Submenu {
+                label: codec_label,
+                children: preset_items,
+            });
         }
     }
 
@@ -276,12 +357,23 @@ pub fn execute_context_action(
             let cmd = super::command::Command::Queue { preset: None };
             super::command::execute_command(app, cmd, tx);
         }
+        ContextAction::QueueWithPreset(name) => {
+            let cmd = super::command::Command::Queue { preset: Some(name) };
+            super::command::execute_command(app, cmd, tx);
+        }
         ContextAction::QueueAndStart => {
             // Queue then immediately start: :queue, switch to Convert, :Commit.
-            // For single-file quick path, just queue + start inline.
             let cmd = super::command::Command::Queue { preset: None };
             super::command::execute_command(app, cmd, tx);
             // If we landed on Convert (from :queue), auto-commit+start.
+            if app.current_screen == AppScreen::Convert {
+                let cmd = super::command::Command::Commit { start: true };
+                super::command::execute_command(app, cmd, tx);
+            }
+        }
+        ContextAction::QueueAndStartWithPreset(name) => {
+            let cmd = super::command::Command::Queue { preset: Some(name) };
+            super::command::execute_command(app, cmd, tx);
             if app.current_screen == AppScreen::Convert {
                 let cmd = super::command::Command::Commit { start: true };
                 super::command::execute_command(app, cmd, tx);

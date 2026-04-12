@@ -46,8 +46,16 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::BatchList { scroll } => {
             draw_batch_list(f, app, scroll);
         }
-        ActiveOverlay::ContextMenu { ref entries, selected, origin } => {
-            draw_context_menu(f, entries, selected, origin);
+        ActiveOverlay::ContextMenu {
+            ref entries, selected, origin,
+            ref submenu_entries, submenu_selected,
+            show_submenu, focus_submenu,
+        } => {
+            draw_context_menu_side_by_side(
+                f, entries, selected, origin,
+                submenu_entries, submenu_selected,
+                show_submenu, focus_submenu,
+            );
         }
     }
 
@@ -67,22 +75,82 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     }
 }
 
-/// Draw a floating context menu at the given screen origin.
-fn draw_context_menu(
+/// Draw a context menu with optional side-by-side submenu (hexload-tui
+/// pattern). Parent menu at `origin`; when `show_submenu` is true, the
+/// child appears to the right of the selected parent item.
+#[allow(clippy::too_many_arguments)]
+fn draw_context_menu_side_by_side(
     f: &mut Frame,
     entries: &[super::context_menu::ContextMenuEntry],
     selected: usize,
     origin: (u16, u16),
+    submenu_entries: &[super::context_menu::ContextMenuEntry],
+    submenu_selected: usize,
+    show_submenu: bool,
+    focus_submenu: bool,
 ) {
+    let area = f.size();
+
+    // Draw parent menu.
+    let parent_rect = render_menu_panel(
+        f, entries, selected, origin, area,
+        !focus_submenu, // highlighted border when focused
+    );
+
+    // Draw submenu to the right if active.
+    if show_submenu && !submenu_entries.is_empty() {
+        let sub_x = parent_rect.x + parent_rect.width - 1;
+        let sub_y = parent_rect.y + selected_entry_row(entries, selected) + 1;
+        render_menu_panel(
+            f,
+            submenu_entries,
+            submenu_selected,
+            (sub_x, sub_y),
+            area,
+            focus_submenu,
+        );
+    }
+}
+
+/// Find the row offset (within the menu body, 0-indexed) of the
+/// `selected`-th selectable entry.
+fn selected_entry_row(
+    entries: &[super::context_menu::ContextMenuEntry],
+    selected: usize,
+) -> u16 {
+    use super::context_menu::ContextMenuEntry;
+    let mut count = 0usize;
+    for (i, e) in entries.iter().enumerate() {
+        let is_selectable = matches!(
+            e,
+            ContextMenuEntry::Item(item) if item.enabled
+        ) || matches!(e, ContextMenuEntry::Submenu { .. });
+        if is_selectable {
+            if count == selected {
+                return i as u16;
+            }
+            count += 1;
+        }
+    }
+    0
+}
+
+/// Render a single menu panel at the given origin, clipped to `area`.
+/// Returns the actual Rect used (for positioning child menus).
+fn render_menu_panel(
+    f: &mut Frame,
+    entries: &[super::context_menu::ContextMenuEntry],
+    selected: usize,
+    origin: (u16, u16),
+    area: Rect,
+    has_focus: bool,
+) -> Rect {
     use super::context_menu::ContextMenuEntry;
 
     if entries.is_empty() {
-        return;
+        return Rect::default();
     }
 
-    let area = f.size();
-
-    // Compute menu dimensions from content.
     let max_label_w: usize = entries
         .iter()
         .filter_map(|e| match e {
@@ -90,95 +158,115 @@ fn draw_context_menu(
                 let shortcut_w = item
                     .shortcut
                     .as_ref()
-                    .map(|s| s.chars().count() + 3) // "  {shortcut}"
+                    .map(|s| s.chars().count() + 3)
                     .unwrap_or(0);
                 Some(item.label.chars().count() + shortcut_w)
             }
+            ContextMenuEntry::Submenu { label, .. } => Some(label.chars().count() + 2),
             ContextMenuEntry::Separator => None,
         })
         .max()
         .unwrap_or(10);
 
-    let menu_w = (max_label_w + 4).min(area.width as usize) as u16; // 2 border + 2 pad
-    let menu_h = (entries.len() + 2).min(area.height as usize) as u16; // + 2 for border
+    let menu_w = (max_label_w + 4).min(area.width as usize) as u16;
+    let menu_h = (entries.len() + 2).min(area.height as usize) as u16;
 
-    // Position: try to place at origin, but clip to screen bounds.
     let x = origin.0.min(area.width.saturating_sub(menu_w));
     let y = origin.1.min(area.height.saturating_sub(menu_h));
     let popup = Rect::new(x, y, menu_w, menu_h);
 
     f.render_widget(Clear, popup);
+    let border_color = if has_focus { theme::AMBER } else { theme::BORDER_DIM };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BORDER_DIM));
+        .border_style(Style::default().fg(border_color));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    // Build the selectable-index lookup (skip separators).
     let selectable_indices: Vec<usize> = entries
         .iter()
         .enumerate()
         .filter_map(|(i, e)| match e {
             ContextMenuEntry::Item(item) if item.enabled => Some(i),
+            ContextMenuEntry::Submenu { .. } => Some(i),
             _ => None,
         })
         .collect();
 
-    // Render each entry.
     let inner_w = inner.width as usize;
     let lines: Vec<Line> = entries
         .iter()
         .enumerate()
-        .map(|(i, entry)| {
-            match entry {
-                ContextMenuEntry::Separator => {
-                    Line::from(Span::styled(
-                        "─".repeat(inner_w),
-                        Style::default().fg(theme::BORDER_DIM),
-                    ))
-                }
-                ContextMenuEntry::Item(item) => {
-                    let is_selected = selectable_indices
+        .map(|(i, entry)| match entry {
+            ContextMenuEntry::Separator => Line::from(Span::styled(
+                "─".repeat(inner_w),
+                Style::default().fg(theme::BORDER_DIM),
+            )),
+            ContextMenuEntry::Item(item) => {
+                let is_selected = has_focus
+                    && selectable_indices
                         .get(selected)
                         .map(|&idx| idx == i)
                         .unwrap_or(false);
-
-                    let style = if !item.enabled {
-                        Style::default().fg(theme::TEXT_DIM)
-                    } else if is_selected {
-                        Style::default()
-                            .fg(theme::BG)
-                            .bg(theme::BLUE)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme::TEXT_BRIGHT)
-                    };
-
-                    let shortcut_str = item
-                        .shortcut
-                        .as_ref()
-                        .map(|s| format!("  {}", s))
-                        .unwrap_or_default();
-
-                    let label_w = item.label.chars().count();
-                    let shortcut_w = shortcut_str.chars().count();
-                    let pad = inner_w.saturating_sub(1 + label_w + shortcut_w);
-
-                    let text = format!(
-                        " {}{}{}",
-                        item.label,
-                        " ".repeat(pad),
-                        shortcut_str,
-                    );
-
-                    Line::from(Span::styled(text, style))
-                }
+                let style = if !item.enabled {
+                    Style::default().fg(theme::TEXT_DIM)
+                } else if is_selected {
+                    Style::default()
+                        .fg(theme::BG)
+                        .bg(theme::BLUE)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::TEXT_BRIGHT)
+                };
+                let shortcut_str = item
+                    .shortcut
+                    .as_ref()
+                    .map(|s| format!("  {}", s))
+                    .unwrap_or_default();
+                let label_w = item.label.chars().count();
+                let shortcut_w = shortcut_str.chars().count();
+                let pad = inner_w.saturating_sub(1 + label_w + shortcut_w);
+                Line::from(Span::styled(
+                    format!(" {}{}{}", item.label, " ".repeat(pad), shortcut_str),
+                    style,
+                ))
+            }
+            ContextMenuEntry::Submenu { label, .. } => {
+                let is_selected = has_focus
+                    && selectable_indices
+                        .get(selected)
+                        .map(|&idx| idx == i)
+                        .unwrap_or(false);
+                // Highlight parent submenu entry even when focus is in
+                // the child (so the user sees which parent is expanded).
+                let is_expanded = !has_focus
+                    && selectable_indices
+                        .get(selected)
+                        .map(|&idx| idx == i)
+                        .unwrap_or(false);
+                let style = if is_selected || is_expanded {
+                    Style::default()
+                        .fg(theme::BG)
+                        .bg(theme::BLUE)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::TEXT_BRIGHT)
+                };
+                let indicator = " ►";
+                let label_w = label.chars().count();
+                let indicator_w = indicator.chars().count();
+                let pad = inner_w.saturating_sub(1 + label_w + indicator_w);
+                Line::from(Span::styled(
+                    format!(" {}{}{}", label, " ".repeat(pad), indicator),
+                    style,
+                ))
             }
         })
         .collect();
 
-    let paragraph = Paragraph::new(lines);
-    f.render_widget(paragraph, inner);
+    f.render_widget(Paragraph::new(lines), inner);
+
+    popup
 }
 
 /// Center a rect within a parent area
