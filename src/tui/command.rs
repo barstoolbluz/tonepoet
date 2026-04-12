@@ -199,6 +199,12 @@ pub enum Command {
     /// Rename the current browse selection to the given name.
     /// Empty arg opens the rename overlay seeded with the current name.
     Rename(String),
+    /// Copy selected file(s) to a destination. Empty arg opens a TextEdit
+    /// picker. `:cp!` variant replaces existing files.
+    Copy { dest: String, force: bool },
+    /// Move selected file(s) to a destination. Empty arg opens picker.
+    /// `:mv!` replaces existing. Falls back to copy+delete across filesystems.
+    Move { dest: String, force: bool },
     /// Switch to the browse screen. On the convert screen, sets
     /// the return target so a selected file loads back into the source pane.
     Browse,
@@ -271,7 +277,11 @@ pub fn parse_command(input: &str) -> Command {
             let arg = if args.is_empty() { None } else { Some(args.to_string()) };
             Command::Filter(arg)
         }
-        "rename" | "mv" => Command::Rename(args.to_string()),
+        "rename" => Command::Rename(args.to_string()),
+        "cp" | "copy" => Command::Copy { dest: args.to_string(), force: false },
+        "cp!" | "copy!" => Command::Copy { dest: args.to_string(), force: true },
+        "mv" | "move" => Command::Move { dest: args.to_string(), force: false },
+        "mv!" | "move!" => Command::Move { dest: args.to_string(), force: true },
         "browse" | "b" => Command::Browse,
         "recent" | "recents" => Command::Recent,
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
@@ -494,7 +504,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e :o :cd :browse :rename :queue :queue! :convert :commit :Commit :go :start :expand :recent :bookmarks :bm :preset :saveas :set :sort :filter :help");
+            app.set_status(":q :e :o :cd :browse :rename :cp :mv :queue :convert :commit :Commit :go :start :expand :recent :bm :preset :saveas :set :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
@@ -517,6 +527,12 @@ pub fn execute_command(
         }
         Command::Rename(new_name) => {
             execute_rename(app, &new_name, tx);
+        }
+        Command::Copy { dest, force } => {
+            execute_file_op(app, &dest, force, false);
+        }
+        Command::Move { dest, force } => {
+            execute_file_op(app, &dest, force, true);
         }
         Command::Browse => {
             // If invoked from the convert screen, set return_target so the
@@ -957,6 +973,65 @@ fn execute_go(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     }
     // start_processing handles the zero-ready-items case itself.
     super::convert_actions::start_processing(app, tx);
+}
+
+/// Execute a `:cp` / `:mv` command. Collects selected files on Browse,
+/// then either opens a TextEdit picker for the destination (if no arg)
+/// or performs the operation directly (if arg provided).
+fn execute_file_op(app: &mut AppState, dest: &str, force: bool, is_move: bool) {
+    if app.current_screen != AppScreen::Browse {
+        let cmd = if is_move { ":mv" } else { ":cp" };
+        app.set_status(format!("{} only works on the Browse screen", cmd));
+        return;
+    }
+
+    // Collect sources: multi-selected or cursor entry. Unlike
+    // collect_selection_for_queue, we DON'T expand directories — copy/move
+    // operates on the entry itself, not its contents.
+    let sources = collect_selection_for_file_ops(app);
+    if sources.is_empty() {
+        app.set_status("no files selected for copy/move");
+        return;
+    }
+
+    let target = if is_move {
+        TextEditTarget::BrowseMove { sources, force }
+    } else {
+        TextEditTarget::BrowseCopy { sources, force }
+    };
+    let label = if is_move { "move to" } else { "copy to" };
+
+    if dest.trim().is_empty() {
+        // No destination arg — open picker pre-filled with current dir.
+        let initial = app.browse.current_dir.display().to_string();
+        app.active_overlay = ActiveOverlay::TextEdit {
+            input: super::text_input::TextInputState::new(
+                if initial.ends_with('/') { initial } else { format!("{}/", initial) },
+            ),
+            target,
+            label: label.to_string(),
+        };
+    } else {
+        // Destination provided — perform directly via the apply handler.
+        let dest_expanded = expand_path(dest.trim());
+        super::keybindings::apply_file_op_pub(app, target, &dest_expanded);
+    }
+}
+
+/// Collect selected entries for file ops (copy/move). Unlike
+/// `collect_selection_for_queue`, directories are NOT expanded — the
+/// op targets the directory itself.
+fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
+    use super::browse::EntryKind;
+    if !app.browse.multi_selected.is_empty() {
+        return app.browse.multi_selected.clone();
+    }
+    if let Some(entry) = app.browse.selected_entry() {
+        if !matches!(entry.kind, EntryKind::ParentDir) {
+            return vec![entry.path.clone()];
+        }
+    }
+    Vec::new()
 }
 
 /// Public entry point for metadata editing from context_menu.rs.

@@ -60,6 +60,10 @@ pub enum ContextAction {
     CopyPath(PathBuf),
     /// Edit a metadata field on the selected audio file.
     EditMetadata(crate::tui::probe::MetadataField),
+    /// Copy the selected file(s) to a destination (opens TextEdit picker).
+    CopyTo,
+    /// Move the selected file(s) to a destination (opens TextEdit picker).
+    MoveTo,
     /// Refresh the browse listing.
     Refresh,
     /// Toggle hidden-file visibility.
@@ -242,6 +246,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
             items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
+            items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
+            items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
@@ -250,6 +256,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
             items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
+            items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
+            items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
@@ -440,8 +448,15 @@ pub fn execute_context_action(
             app.set_status(format!("path: {}", path.display()));
         }
         ContextAction::EditMetadata(field) => {
-            // Delegate to the same function that handles `:e title` etc.
             super::command::execute_edit_metadata_pub(app, field);
+        }
+        ContextAction::CopyTo => {
+            let cmd = super::command::Command::Copy { dest: String::new(), force: false };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::MoveTo => {
+            let cmd = super::command::Command::Move { dest: String::new(), force: false };
+            super::command::execute_command(app, cmd, tx);
         }
         ContextAction::Refresh => {
             if app.current_screen == AppScreen::Browse {

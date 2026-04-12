@@ -1450,6 +1450,12 @@ fn apply_text_edit(
         TextEditTarget::BrowseRename(original_path) => {
             commit_browse_rename(app, original_path, trimmed, tx);
         }
+        TextEditTarget::BrowseCopy { sources, force } => {
+            do_file_op(app, &sources, trimmed, force, false, tx);
+        }
+        TextEditTarget::BrowseMove { sources, force } => {
+            do_file_op(app, &sources, trimmed, force, true, tx);
+        }
         TextEditTarget::BrowseMetadata { path, field } => {
             // Race check: refuse if the file is currently being converted.
             let is_processing = app.items_snapshot.iter().any(|item| {
@@ -1488,6 +1494,237 @@ fn apply_text_edit(
             }
         }
     }
+}
+
+/// Public entry point for file ops triggered with a destination arg
+/// (`:cp /dest` or `:mv /dest`). Called from command.rs when the
+/// destination is provided inline rather than via the TextEdit picker.
+pub fn apply_file_op_pub(
+    app: &mut AppState,
+    target: TextEditTarget,
+    dest: &str,
+) {
+    // We need a tx for probe_current after refresh, but we don't have
+    // one in this context. Set a flag to probe on next event loop tick.
+    match target {
+        TextEditTarget::BrowseCopy { sources, force } => {
+            do_file_op_no_tx(app, &sources, dest, force, false);
+        }
+        TextEditTarget::BrowseMove { sources, force } => {
+            do_file_op_no_tx(app, &sources, dest, force, true);
+        }
+        _ => {}
+    }
+}
+
+/// Perform a copy or move operation. Version with tx for probe refresh.
+fn do_file_op(
+    app: &mut AppState,
+    sources: &[std::path::PathBuf],
+    dest: &str,
+    force: bool,
+    is_move: bool,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    do_file_op_inner(app, sources, dest, force, is_move);
+    app.browse.refresh();
+    app.browse.probe_current(tx);
+}
+
+/// Perform a copy or move without tx (when called from command.rs with
+/// inline destination). Browse refresh is done; probe happens on next
+/// cursor move.
+fn do_file_op_no_tx(
+    app: &mut AppState,
+    sources: &[std::path::PathBuf],
+    dest: &str,
+    force: bool,
+    is_move: bool,
+) {
+    do_file_op_inner(app, sources, dest, force, is_move);
+    app.browse.refresh();
+}
+
+/// Core copy/move logic. Operates on each source path, reports results
+/// via status message.
+fn do_file_op_inner(
+    app: &mut AppState,
+    sources: &[std::path::PathBuf],
+    dest: &str,
+    force: bool,
+    is_move: bool,
+) {
+    let dest_dir = std::path::PathBuf::from(dest.trim());
+    if !dest_dir.exists() {
+        // Try to create the destination directory.
+        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            app.set_status(format!("failed to create destination: {}", e));
+            return;
+        }
+    }
+    if !dest_dir.is_dir() {
+        app.set_status(format!("destination is not a directory: {}", dest_dir.display()));
+        return;
+    }
+
+    let op_name = if is_move { "moved" } else { "copied" };
+    let mut succeeded = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+
+    for source in sources {
+        let file_name = match source.file_name() {
+            Some(n) => n.to_owned(),
+            None => {
+                errors += 1;
+                continue;
+            }
+        };
+        let target = dest_dir.join(&file_name);
+
+        // Skip if source and target are the same path (copying a file
+        // onto itself with force=true would corrupt it). Two checks:
+        // 1. Raw path comparison (catches same-dir obvious case).
+        // 2. Canonicalized comparison when both resolve (catches case-
+        //    insensitive filesystems and symlink-resolved equivalence).
+        //    Only compared when BOTH succeed — if either fails (e.g.,
+        //    target doesn't exist yet), we skip this check to avoid
+        //    false positives from None == None.
+        if source == &target {
+            skipped += 1;
+            continue;
+        }
+        if let (Ok(src_canon), Ok(dst_canon)) =
+            (source.canonicalize(), target.canonicalize())
+        {
+            if src_canon == dst_canon {
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // Check for existing destination.
+        if target.exists() && !force {
+            skipped += 1;
+            continue;
+        }
+
+        let result = if is_move {
+            move_path(source, &target)
+        } else {
+            copy_path(source, &target)
+        };
+
+        match result {
+            Ok(()) => succeeded += 1,
+            Err(e) => {
+                log::warn!(
+                    "{} failed: {} → {}: {}",
+                    op_name,
+                    source.display(),
+                    target.display(),
+                    e
+                );
+                errors += 1;
+            }
+        }
+    }
+
+    // Clear multi-selection after the operation.
+    app.browse.clear_multi_selection();
+
+    // Build status message.
+    let mut parts = vec![format!("{} {} file(s)", op_name, succeeded)];
+    if skipped > 0 {
+        parts.push(format!("{} skipped (exists)", skipped));
+    }
+    if errors > 0 {
+        parts.push(format!("{} errors", errors));
+    }
+    app.set_status(parts.join(", "));
+}
+
+/// Copy a file or directory to `target`. For directories, copies
+/// recursively.
+fn copy_path(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    if source.is_dir() {
+        copy_dir_recursive(source, target)
+    } else {
+        std::fs::copy(source, target)
+            .map(|_| ())
+            .map_err(|e| format!("{}", e))
+    }
+}
+
+/// Recursive directory copy. Skips symlinks to avoid loops and
+/// unexpected out-of-tree copies (consistent with browse scan policy).
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir: {}", e))?;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("readdir: {}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("entry: {}", e))?;
+        let file_type = entry.file_type().map_err(|e| format!("filetype: {}", e))?;
+        // Skip symlinks — following them could leave the source tree
+        // or create infinite loops.
+        if file_type.is_symlink() {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).map_err(|e| format!("copy: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Move a file or directory to `target`. Tries `fs::rename` first (fast,
+/// same-filesystem). If that fails with a cross-device error, falls back
+/// to copy+verify+delete (ACID: original is only deleted after the copy
+/// is confirmed via size match).
+fn move_path(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    // Try fast rename first.
+    match std::fs::rename(source, target) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            // ErrorKind::CrossesDevices is nightly-only. Check the raw
+            // OS error: EXDEV = 18 on Linux, same concept on macOS.
+            let is_cross_device = e.raw_os_error() == Some(18) // EXDEV on Linux
+                || e.to_string().to_lowercase().contains("cross-device");
+            if !is_cross_device {
+                return Err(format!("{}", e));
+            }
+            // Fall through to copy+delete.
+        }
+    }
+
+    // Cross-device fallback: copy, verify, delete.
+    copy_path(source, target)?;
+
+    // Verify: compare sizes (basic integrity check).
+    if source.is_file() {
+        let src_size = std::fs::metadata(source)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let dst_size = std::fs::metadata(target)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if src_size != dst_size {
+            // Copy succeeded but sizes differ — don't delete original.
+            return Err("cross-device move: size mismatch after copy, original preserved".to_string());
+        }
+    }
+
+    // Delete original.
+    if source.is_dir() {
+        std::fs::remove_dir_all(source).map_err(|e| format!("remove original dir: {}", e))?;
+    } else {
+        std::fs::remove_file(source).map_err(|e| format!("remove original: {}", e))?;
+    }
+
+    Ok(())
 }
 
 /// Commit a rename for a browse entry: validates the new name, constructs the

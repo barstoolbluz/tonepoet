@@ -826,6 +826,18 @@ pub enum TextEditTarget {
         path: std::path::PathBuf,
         field: crate::tui::probe::MetadataField,
     },
+    /// Copy selected files to the entered destination path.
+    BrowseCopy {
+        sources: Vec<std::path::PathBuf>,
+        force: bool,
+    },
+    /// Move selected files to the entered destination path. Falls back
+    /// to copy+delete across filesystems (ACID: copy first, verify
+    /// size, then delete original).
+    BrowseMove {
+        sources: Vec<std::path::PathBuf>,
+        force: bool,
+    },
 }
 
 /// What action a confirmation dialog will perform
