@@ -167,6 +167,13 @@ pub struct SourceState {
     pub info: Option<SourceInfo>,
     pub metadata: SourceMetadata,
     pub advanced_open: bool,
+    /// Phase 6c bridge: when `:queue` from Browse inherits a multi-file
+    /// selection, the full path list is stashed here. The source pane
+    /// renders the first file's info (proper batch summary + expand
+    /// overlay arrives in 6d via `SourceMode::Batch`), but `:commit`
+    /// iterates this list to enqueue all of them.
+    /// `None` for single-file mode.
+    pub batch_queue: Option<Vec<PathBuf>>,
 }
 
 impl Default for SourceState {
@@ -176,6 +183,7 @@ impl Default for SourceState {
             info: None,
             metadata: SourceMetadata::default(),
             advanced_open: false,
+            batch_queue: None,
         }
     }
 }

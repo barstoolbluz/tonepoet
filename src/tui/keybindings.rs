@@ -128,6 +128,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                     app.convert.source.info = None;
                     app.convert.source.metadata =
                         crate::tui::probe::SourceMetadata::default();
+                    app.convert.source.batch_queue = None;
                     app.convert.metadata = MetadataState::default();
                     let origin = app
                         .previous_screen
@@ -585,6 +586,9 @@ fn load_browse_selection(
                 Ok(info) => {
                     app.convert.source.file_path = Some(path.clone());
                     app.convert.source.info = Some(info);
+                    // Browse Enter loads a single file — abandon any
+                    // pending batch from a previous :queue.
+                    app.convert.source.batch_queue = None;
                     if let Ok(meta) = crate::tui::probe::read_metadata(&path) {
                         app.convert.metadata.title = meta.title.clone();
                         app.convert.metadata.artist = meta.artist.clone();
@@ -1205,6 +1209,9 @@ fn load_recent_as_source(app: &mut AppState, path: &std::path::Path) {
         Ok(info) => {
             app.convert.source.file_path = Some(path.to_path_buf());
             app.convert.source.info = Some(info);
+            // Loading from recent replaces the source — abandon any
+            // pending batch from a previous :queue.
+            app.convert.source.batch_queue = None;
             if let Ok(meta) = crate::tui::probe::read_metadata(path) {
                 app.convert.metadata.title = meta.title.clone();
                 app.convert.metadata.artist = meta.artist.clone();
@@ -1241,6 +1248,9 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
                 Ok(info) => {
                     app.convert.source.file_path = Some(path.to_path_buf());
                     app.convert.source.info = Some(info);
+                    // FileInput replaces the source — abandon any pending
+                    // batch from a previous :queue.
+                    app.convert.source.batch_queue = None;
                     app.set_status(format!(
                         "Loaded: {}",
                         path.file_name().unwrap_or_default().to_string_lossy()
@@ -1249,6 +1259,7 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
                 Err(e) => {
                     app.convert.source.file_path = None;
                     app.convert.source.info = None;
+                    app.convert.source.batch_queue = None;
                     app.set_status(format!("Probe error: {}", e));
                     return;
                 }

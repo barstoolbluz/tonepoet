@@ -61,13 +61,25 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
             })
             .unwrap_or_else(|| "—".to_string());
 
+        // Phase 6c: if we're in a multi-file batch, prefix the path with
+        // `[1/N]` so the user sees at a glance that more files are staged.
+        // (Proper batch summary + expand overlay arrives in 6d.)
+        let batch_prefix = source
+            .batch_queue
+            .as_ref()
+            .filter(|b| b.len() > 1)
+            .map(|b| format!("[1/{}] ", b.len()))
+            .unwrap_or_default();
+
+        let prefixed_path = format!("{}{}", batch_prefix, path_display);
+
         let max_path = w.saturating_sub(16);
-        let path_truncated = if path_display.chars().count() > max_path && max_path > 3 {
-            let skip = path_display.chars().count() - (max_path - 3);
-            let truncated: String = path_display.chars().skip(skip).collect();
+        let path_truncated = if prefixed_path.chars().count() > max_path && max_path > 3 {
+            let skip = prefixed_path.chars().count() - (max_path - 3);
+            let truncated: String = prefixed_path.chars().skip(skip).collect();
             format!("...{}", truncated)
         } else {
-            path_display
+            prefixed_path
         };
 
         // Format info line: WAV │ PCM 24-bit │ 96.0 kHz │ stereo │ 847.3 MB

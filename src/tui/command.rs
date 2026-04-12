@@ -177,11 +177,14 @@ pub fn execute_command(
                 Ok(info) => {
                     app.convert.source.file_path = Some(p.clone());
                     app.convert.source.info = Some(info);
+                    // :e replaces the source — any pending batch is abandoned.
+                    app.convert.source.batch_queue = None;
                     app.set_status(format!("Loaded: {}", p.file_name().unwrap_or_default().to_string_lossy()));
                 }
                 Err(e) => {
                     app.convert.source.file_path = None;
                     app.convert.source.info = None;
+                    app.convert.source.batch_queue = None;
                     app.set_status(format!("Probe error: {}", e));
                     return;
                 }
@@ -550,23 +553,10 @@ fn execute_queue(
                 return;
             }
 
-            // Phase 6b limitation: the Convert screen can only review a
-            // single file at a time (no SourceMode::Batch yet — that lands
-            // in 6d). Silently picking paths[0] creates a confusing loop
-            // where `:queue` → `:commit` → `:queue` hits "already in queue"
-            // on the second call because the committed file is still in
-            // multi_selected. Reject multi-file explicitly with guidance.
-            if paths.len() > 1 {
-                app.set_status(format!(
-                    "queue: {} files multi-selected — multi-file batch arrives in Phase 6c. Deselect extras (space/esc) and retry.",
-                    paths.len()
-                ));
-                return;
-            }
-
             let first = paths[0].clone();
 
-            // Probe the first file before touching any state.
+            // Probe the first file before touching any state so preset
+            // application stays atomic with a successful load.
             let info = match crate::tui::probe::probe_audio(&first) {
                 Ok(i) => i,
                 Err(e) => {
@@ -583,7 +573,9 @@ fn execute_queue(
                 }
             }
 
-            // Populate the source pane and read metadata.
+            // Populate the source pane with the first file's info and
+            // metadata (Phase 6c: still renders as single-file preview
+            // — proper batch summary + expand overlay lands in 6d).
             app.convert.source.file_path = Some(first.clone());
             app.convert.source.info = Some(info);
             if let Ok(meta) = crate::tui::probe::read_metadata(&first) {
@@ -596,10 +588,27 @@ fn execute_queue(
             }
             app.recent.record_use(&first);
 
+            // Phase 6c: stash the full batch so `:commit` can iterate.
+            // None for single-file — the commit path falls back to
+            // source.file_path in that case.
+            app.convert.source.batch_queue = if paths.len() > 1 {
+                Some(paths.clone())
+            } else {
+                None
+            };
+
             // Remember where we came from, switch to Convert for review.
             app.previous_screen = Some(AppScreen::Browse);
             app.current_screen = AppScreen::Convert;
-            app.set_status("review settings, then :commit or :Commit");
+
+            if paths.len() == 1 {
+                app.set_status("review settings, then :commit or :Commit");
+            } else {
+                app.set_status(format!(
+                    "batch of {} files — review settings, then :commit or :Commit (showing first file; full list in 6d)",
+                    paths.len()
+                ));
+            }
         }
         AppScreen::Library => {
             // Placeholder screen. Selection inheritance arrives in 6c.
@@ -641,10 +650,15 @@ fn execute_queue(
 }
 
 /// Execute a `:commit` / `:Commit` command. Only valid on the Convert
-/// screen with a source file loaded. Enqueues the current source (and
+/// screen with a source file or batch loaded. Enqueues the batch (and
 /// optionally starts processing), then navigates away:
 /// - `:commit` (start=false): enqueue, return to origin (previous_screen)
 /// - `:Commit` (start=true): enqueue, start processing, jump to Queue
+///
+/// Phase 6c: iterates `source.batch_queue` when present (multi-file
+/// batch), else commits the single file in `source.file_path`. Either
+/// way the pill state (options) is applied uniformly to all files in
+/// the commit — the whole point of reviewing once per batch.
 fn execute_commit(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
@@ -655,30 +669,101 @@ fn execute_commit(
         return;
     }
 
-    if app.convert.source.file_path.is_none() {
+    // Determine what to commit: prefer the multi-file batch, fall back
+    // to the single file in file_path.
+    let batch: Vec<PathBuf> = if let Some(ref b) = app.convert.source.batch_queue {
+        b.clone()
+    } else if let Some(ref p) = app.convert.source.file_path {
+        vec![p.clone()]
+    } else {
         app.set_status("nothing to commit — no source file loaded");
         return;
-    }
+    };
 
-    // Delegate the actual enqueue + optional start to the existing helper.
-    // On failure it already set a status message; just bail.
-    let ok = super::convert_actions::convert_or_queue(app, tx, start);
-    if !ok {
+    if batch.is_empty() {
+        app.set_status("nothing to commit — empty batch");
         return;
     }
 
-    // Clear the source pane so a subsequent `:queue` arrives fresh.
+    // Build options from the current pill state.
+    let options = super::convert_actions::pills_to_options(
+        &app.convert.format,
+        &app.convert.output_options,
+        &app.config,
+    );
+    let format_name = options.output_format.name();
+
+    // Enqueue the whole batch via the shared helper.
+    let outcome = super::convert_actions::commit_batch(app, &batch, &options);
+
+    // Nothing enqueued → don't clear state or navigate; user sees error.
+    if outcome.enqueued == 0 {
+        if outcome.skipped > 0 && outcome.errors == 0 {
+            app.set_status(format!(
+                "commit: all {} file(s) already queued",
+                outcome.skipped
+            ));
+        } else {
+            app.set_status(format!(
+                "commit failed: {} errors, {} skipped",
+                outcome.errors, outcome.skipped
+            ));
+        }
+        return;
+    }
+
+    // Build the success status message.
+    let success_status = if batch.len() == 1 {
+        let filename = batch[0]
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        format!("Queued: {} → {}", filename, format_name)
+    } else {
+        let mut parts = vec![format!("Queued {} → {}", outcome.enqueued, format_name)];
+        if outcome.skipped > 0 {
+            parts.push(format!("{} skipped", outcome.skipped));
+        }
+        if outcome.errors > 0 {
+            parts.push(format!("{} errors", outcome.errors));
+        }
+        parts.join(", ")
+    };
+
+    // Clear source pane + batch so a subsequent `:queue` arrives fresh.
     app.convert.source.file_path = None;
     app.convert.source.info = None;
     app.convert.source.metadata = crate::tui::probe::SourceMetadata::default();
+    app.convert.source.batch_queue = None;
     app.convert.metadata = MetadataState::default();
 
+    // Remove only the committed paths from browse.multi_selected so the
+    // user's unrelated selection state is preserved. This handles:
+    // - Multi-file batches sourced from multi_selected (all committed
+    //   paths get removed)
+    // - Single-file commits where the file happened to be the only
+    //   entry in multi_selected (that entry gets removed)
+    // - Single-file commits from `:e` / recent-files / Browse Enter for
+    //   a file that is NOT in multi_selected (nothing removed)
+    app.browse.multi_selected.retain(|p| !batch.contains(p));
+
     if start {
-        // :Commit — land on Queue to watch processing.
+        // :Commit — start processing if not already active, land on Queue.
+        if !app.processing_active {
+            super::convert_actions::start_processing(app, tx);
+            app.set_status(format!(
+                "Processing {} file(s) → {}",
+                outcome.enqueued, format_name
+            ));
+        } else {
+            app.set_status(format!("{} (processing active)", success_status));
+        }
         app.previous_screen = None;
         app.current_screen = AppScreen::Queue;
     } else {
         // :commit — return to origin, defaulting to Browse.
+        app.set_status(success_status);
         let origin = app.previous_screen.take().unwrap_or(AppScreen::Browse);
         app.current_screen = origin;
         if origin == AppScreen::Browse {

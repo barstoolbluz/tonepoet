@@ -93,89 +93,67 @@ pub fn pills_to_options(
     }
 }
 
-/// Add current source to queue with pill-derived options, optionally start conversion.
-/// Returns true if the action succeeded.
-pub fn convert_or_queue(
+/// Outcome of a batch commit: counts for the caller to report.
+#[derive(Debug, Default)]
+pub struct CommitOutcome {
+    /// Files successfully added to the queue (new items).
+    pub enqueued: usize,
+    /// Files skipped because they were already in the queue.
+    pub skipped: usize,
+    /// Files that failed to enqueue (e.g. add_file errored).
+    pub errors: usize,
+}
+
+/// Commit a batch of paths to the queue with the given conversion options.
+///
+/// Checks each path against the current queue to avoid duplicates (skips
+/// items already queued, processing, or paused). Persists the queue to
+/// disk on completion (if `persist_queue` is enabled).
+///
+/// Returns a `CommitOutcome` with counts; does NOT set any status message
+/// or touch navigation state — that's the caller's job. Also does NOT
+/// start processing; use `start_processing` separately for that.
+///
+/// Works for single-file and multi-file batches uniformly. A single-file
+/// caller can pass `&[path]`.
+pub fn commit_batch(
     app: &mut AppState,
-    tx: &mpsc::Sender<AppMessage>,
-    start: bool,
-) -> bool {
-    // Validate source file
-    let source_path = match &app.convert.source.file_path {
-        Some(p) => p.clone(),
-        None => {
-            app.set_status("No source file loaded. Press 'e' or :e <path>");
-            return false;
+    paths: &[std::path::PathBuf],
+    options: &ConversionOptions,
+) -> CommitOutcome {
+    let existing = app.manager.get_items_clone();
+    let mut outcome = CommitOutcome::default();
+
+    for path in paths {
+        let already_queued = existing.iter().any(|item| {
+            item.input_path == *path
+                && !matches!(
+                    item.status,
+                    ConversionStatus::Completed { .. }
+                        | ConversionStatus::Failed { .. }
+                        | ConversionStatus::Cancelled
+                )
+        });
+
+        if already_queued {
+            outcome.skipped += 1;
+            continue;
         }
-    };
 
-    if app.convert.source.info.is_none() {
-        app.set_status("Source file not probed. Try reloading with :e");
-        return false;
-    }
-
-    // Check for duplicate: is this file already in the queue?
-    let already_queued = app.manager.get_items_clone().iter().any(|item| {
-        item.input_path == source_path
-            && !matches!(
-                item.status,
-                ConversionStatus::Completed { .. }
-                    | ConversionStatus::Failed { .. }
-                    | ConversionStatus::Cancelled
-            )
-    });
-
-    if already_queued {
-        app.set_status("File already in queue. Switch to queue tab (4) to manage.");
-        return false;
-    }
-
-    // Build options from pills
-    let options = pills_to_options(
-        &app.convert.format,
-        &app.convert.output_options,
-        &app.config,
-    );
-
-    let format_name = options.output_format.name();
-
-    // Add to queue as ready-for-processing (status = Queued)
-    match app.manager.add_file_ready_for_processing(source_path.clone(), options) {
-        Ok(_) => {}
-        Err(e) => {
-            app.set_status(format!("Failed to queue: {}", e));
-            return false;
+        match app
+            .manager
+            .add_file_ready_for_processing(path.clone(), options.clone())
+        {
+            Ok(_) => outcome.enqueued += 1,
+            Err(_) => outcome.errors += 1,
         }
     }
 
-    // Save queue if persistence is enabled
     app.manager
         .save_queue(app.config.conversion.persist_queue)
         .ok();
 
-    let filename = source_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-
-    if start {
-        if app.processing_active {
-            // Already processing — file was added to queue, it'll be picked up
-            app.set_status(format!(
-                "Queued: {} → {} (conversion active)",
-                filename, format_name
-            ));
-        } else {
-            app.set_status(format!("Converting: {} → {}", filename, format_name));
-            start_processing(app, tx);
-            // Note: start_processing may overwrite status if 0 items ready,
-            // but that shouldn't happen since we just added one as Queued.
-        }
-    } else {
-        app.set_status(format!("Queued: {} → {}", filename, format_name));
-    }
-
-    true
+    outcome
 }
 
 /// Start processing all queued items. Shared between convert screen and queue screen.
