@@ -78,6 +78,17 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 };
                 return;
             }
+            // Context menu (keyboard alternative to right-click)
+            (KeyCode::Char('m'), KeyModifiers::NONE) => {
+                // Build context menu for the current screen and cursor.
+                // Origin is roughly the center of the screen (since there's
+                // no mouse position available for keyboard invocation).
+                let area = crossterm::terminal::size()
+                    .map(|(w, h)| (w / 3, h / 3))
+                    .unwrap_or((20, 10));
+                open_context_menu(app, area.0, area.1);
+                return;
+            }
             _ => {}
         }
     }
@@ -578,6 +589,17 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
 }
 
 /// Load the selected browse entry based on the return target
+/// Load the selected browse entry into the Convert source pane based on
+/// `target`. Public because it's called by `context_menu::execute_context_action`
+/// for the `OpenEntry` action as well.
+pub fn load_browse_selection_pub(
+    app: &mut AppState,
+    path: std::path::PathBuf,
+    target: super::browse::BrowseReturnTarget,
+) {
+    load_browse_selection(app, path, target);
+}
+
 fn load_browse_selection(
     app: &mut AppState,
     path: std::path::PathBuf,
@@ -947,8 +969,112 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::BatchList { scroll } => {
             handle_batch_list_key(app, key, scroll, tx);
         }
+        ActiveOverlay::ContextMenu { entries, selected, origin } => {
+            handle_context_menu_key(app, key, entries, selected, origin, tx);
+        }
         ActiveOverlay::None => {}
     }
+}
+
+/// Handle key events for the context menu overlay.
+fn handle_context_menu_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    entries: Vec<super::context_menu::ContextMenuEntry>,
+    mut selected: usize,
+    origin: (u16, u16),
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    use super::context_menu::{ContextMenuEntry, execute_context_action};
+
+    // Count selectable items (not separators).
+    let selectable: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            ContextMenuEntry::Item(item) if item.enabled => Some(i),
+            _ => None,
+        })
+        .collect();
+
+    if selectable.is_empty() {
+        app.active_overlay = ActiveOverlay::None;
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.active_overlay = ActiveOverlay::None;
+        }
+        KeyCode::Enter => {
+            // Execute the selected action and close.
+            if let Some(&idx) = selectable.get(selected) {
+                if let ContextMenuEntry::Item(item) = &entries[idx] {
+                    let action = item.action.clone();
+                    app.active_overlay = ActiveOverlay::None;
+                    execute_context_action(app, action, tx);
+                    return;
+                }
+            }
+            app.active_overlay = ActiveOverlay::None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if selected > 0 {
+                selected -= 1;
+            }
+            app.active_overlay = ActiveOverlay::ContextMenu { entries, selected, origin };
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if selected + 1 < selectable.len() {
+                selected += 1;
+            }
+            app.active_overlay = ActiveOverlay::ContextMenu { entries, selected, origin };
+        }
+        _ => {
+            // Unrecognized key — close the menu.
+            app.active_overlay = ActiveOverlay::None;
+        }
+    }
+}
+
+/// Build and open the context menu for the current screen. `x, y` is
+/// the screen position where the menu should be anchored (right-click
+/// position, or a computed position for keyboard `m`).
+fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
+    use super::context_menu::*;
+
+    let entries = match app.current_screen {
+        AppScreen::Browse => {
+            // If there's a selected entry, build entry menu; else empty-space menu.
+            if app.browse.selected_entry().is_some() {
+                build_browse_entry_menu(app)
+            } else {
+                build_browse_empty_menu(app)
+            }
+        }
+        AppScreen::Convert => build_convert_menu(app),
+        AppScreen::Queue => {
+            if app.items_snapshot.is_empty() {
+                build_queue_empty_menu(app)
+            } else {
+                build_queue_item_menu(app)
+            }
+        }
+        _ => {
+            // Library, Config, Wizard — no context menu yet.
+            return;
+        }
+    };
+
+    if entries.is_empty() {
+        return;
+    }
+
+    app.active_overlay = ActiveOverlay::ContextMenu {
+        entries,
+        selected: 0,
+        origin: (x, y),
+    };
 }
 
 /// Handle a Tab or Shift+Tab press inside the CommandInput overlay.
@@ -1634,6 +1760,87 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     _ => {}
                 }
             }
+        }
+        return;
+    }
+
+    // Desktop-standard: any click while a context menu is open closes
+    // it. Additionally:
+    // - Right-click: close old menu, fall through to open new menu at
+    //   the new position (with cursor moved to the clicked item).
+    // - Left-click on a selectable item (browse entry, queue item):
+    //   close menu AND select the clicked item (move cursor). Does NOT
+    //   activate/open — just selects. Matches Windows/macOS behavior.
+    // - Left-click on empty space or non-selectable area: close only.
+    if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            app.active_overlay = ActiveOverlay::None;
+
+            if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+                // Fall through to the right-click handler below, which
+                // moves the cursor and opens a new menu.
+            } else {
+                // Left/middle-click: close + select the clicked item
+                // (if it's a selectable entry), but don't trigger any
+                // action. Clicking empty space just closes.
+                let x = mouse.column;
+                let y = mouse.row;
+                match app.current_screen {
+                    AppScreen::Browse => {
+                        if let Some(super::button_map::TuiButton::BrowseEntry(idx)) =
+                            app.button_map.find_button_at(x, y)
+                        {
+                            app.browse.selected_index = idx;
+                            app.browse.ensure_visible();
+                        }
+                    }
+                    AppScreen::Queue => {
+                        if let Some(super::button_map::TuiButton::QueueItem(idx)) =
+                            app.button_map.find_button_at(x, y)
+                        {
+                            app.selected_index = idx;
+                            app.ensure_visible();
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
+    }
+
+    // Right-click → select the clicked target, then open its context
+    // menu. Desktop-standard: right-click on a file selects it AND
+    // shows the menu, just like Windows Explorer / macOS Finder.
+    // Skip if another (non-context-menu) overlay is already active.
+    if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+        if matches!(app.active_overlay, ActiveOverlay::None) {
+            let x = mouse.column;
+            let y = mouse.row;
+
+            // Move the cursor to the right-clicked target so the menu
+            // is built for THAT item, not whatever was selected before.
+            match app.current_screen {
+                AppScreen::Browse => {
+                    if let Some(super::button_map::TuiButton::BrowseEntry(idx)) =
+                        app.button_map.find_button_at(x, y)
+                    {
+                        app.browse.selected_index = idx;
+                        app.browse.ensure_visible();
+                    }
+                }
+                AppScreen::Queue => {
+                    if let Some(super::button_map::TuiButton::QueueItem(idx)) =
+                        app.button_map.find_button_at(x, y)
+                    {
+                        app.selected_index = idx;
+                        app.ensure_visible();
+                    }
+                }
+                _ => {}
+            }
+
+            open_context_menu(app, x, y);
         }
         return;
     }

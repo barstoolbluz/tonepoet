@@ -46,6 +46,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::BatchList { scroll } => {
             draw_batch_list(f, app, scroll);
         }
+        ActiveOverlay::ContextMenu { ref entries, selected, origin } => {
+            draw_context_menu(f, entries, selected, origin);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -62,6 +65,120 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     if app.bookmarks.overlay_open {
         super::bookmarks_overlay::draw_bookmarks_overlay(f, &mut app.bookmarks);
     }
+}
+
+/// Draw a floating context menu at the given screen origin.
+fn draw_context_menu(
+    f: &mut Frame,
+    entries: &[super::context_menu::ContextMenuEntry],
+    selected: usize,
+    origin: (u16, u16),
+) {
+    use super::context_menu::ContextMenuEntry;
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let area = f.size();
+
+    // Compute menu dimensions from content.
+    let max_label_w: usize = entries
+        .iter()
+        .filter_map(|e| match e {
+            ContextMenuEntry::Item(item) => {
+                let shortcut_w = item
+                    .shortcut
+                    .as_ref()
+                    .map(|s| s.chars().count() + 3) // "  {shortcut}"
+                    .unwrap_or(0);
+                Some(item.label.chars().count() + shortcut_w)
+            }
+            ContextMenuEntry::Separator => None,
+        })
+        .max()
+        .unwrap_or(10);
+
+    let menu_w = (max_label_w + 4).min(area.width as usize) as u16; // 2 border + 2 pad
+    let menu_h = (entries.len() + 2).min(area.height as usize) as u16; // + 2 for border
+
+    // Position: try to place at origin, but clip to screen bounds.
+    let x = origin.0.min(area.width.saturating_sub(menu_w));
+    let y = origin.1.min(area.height.saturating_sub(menu_h));
+    let popup = Rect::new(x, y, menu_w, menu_h);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER_DIM));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // Build the selectable-index lookup (skip separators).
+    let selectable_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            ContextMenuEntry::Item(item) if item.enabled => Some(i),
+            _ => None,
+        })
+        .collect();
+
+    // Render each entry.
+    let inner_w = inner.width as usize;
+    let lines: Vec<Line> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            match entry {
+                ContextMenuEntry::Separator => {
+                    Line::from(Span::styled(
+                        "─".repeat(inner_w),
+                        Style::default().fg(theme::BORDER_DIM),
+                    ))
+                }
+                ContextMenuEntry::Item(item) => {
+                    let is_selected = selectable_indices
+                        .get(selected)
+                        .map(|&idx| idx == i)
+                        .unwrap_or(false);
+
+                    let style = if !item.enabled {
+                        Style::default().fg(theme::TEXT_DIM)
+                    } else if is_selected {
+                        Style::default()
+                            .fg(theme::BG)
+                            .bg(theme::BLUE)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::TEXT_BRIGHT)
+                    };
+
+                    let shortcut_str = item
+                        .shortcut
+                        .as_ref()
+                        .map(|s| format!("  {}", s))
+                        .unwrap_or_default();
+
+                    let label_w = item.label.chars().count();
+                    let shortcut_w = shortcut_str.chars().count();
+                    let pad = inner_w.saturating_sub(1 + label_w + shortcut_w);
+
+                    let text = format!(
+                        " {}{}{}",
+                        item.label,
+                        " ".repeat(pad),
+                        shortcut_str,
+                    );
+
+                    Line::from(Span::styled(text, style))
+                }
+            }
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, inner);
 }
 
 /// Center a rect within a parent area

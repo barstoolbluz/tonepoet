@@ -774,6 +774,17 @@ pub enum ActiveOverlay {
     BatchList {
         scroll: usize,
     },
+    /// Context menu triggered by right-click or `m` keybinding. Shows
+    /// a floating popup at `origin` with a list of actions filtered
+    /// for the current screen and click target. Flat menus for v1 —
+    /// nested submenus deferred.
+    ContextMenu {
+        entries: Vec<crate::tui::context_menu::ContextMenuEntry>,
+        /// Index of the currently highlighted **item** (skips separators).
+        selected: usize,
+        /// Screen position where the menu was triggered (for rendering).
+        origin: (u16, u16),
+    },
 }
 
 /// Tab-completion state for the command input overlay.
