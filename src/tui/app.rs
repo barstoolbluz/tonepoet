@@ -732,6 +732,10 @@ pub enum ActiveOverlay {
     },
     CommandInput {
         input: crate::tui::text_input::TextInputState,
+        /// Active tab-completion state. `None` on initial open and after
+        /// any non-Tab keypress (so the next Tab re-parses). `Some` while
+        /// cycling through candidates.
+        completion: Option<CompletionState>,
     },
     TextEdit {
         input: crate::tui::text_input::TextInputState,
@@ -744,6 +748,17 @@ pub enum ActiveOverlay {
     /// is derived from the cursor and list height in the renderer so
     /// no persistent scroll state is needed here.
     BatchList,
+}
+
+/// Tab-completion state for the command input overlay.
+/// Stores the candidate list, the current cycle index, and the byte
+/// offset in the input text where the completed word begins (so cycles
+/// replace only the prefix, not the whole input).
+#[derive(Debug, Clone)]
+pub struct CompletionState {
+    pub candidates: Vec<String>,
+    pub cursor: usize,
+    pub prefix_start: usize,
 }
 
 /// Which field a TextEdit overlay is editing

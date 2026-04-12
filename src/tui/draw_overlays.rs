@@ -33,9 +33,10 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             let input = input.clone();
             draw_file_input(f, &input);
         }
-        ActiveOverlay::CommandInput { ref input } => {
+        ActiveOverlay::CommandInput { ref input, ref completion } => {
             let input = input.clone();
-            draw_command_input(f, &input);
+            let completion = completion.clone();
+            draw_command_input(f, &input, completion.as_ref());
         }
         ActiveOverlay::TextEdit { ref input, ref label, .. } => {
             let input = input.clone();
@@ -416,12 +417,23 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
 }
 
 /// Draw the vim-style command line at the bottom of the screen
-fn draw_command_input(f: &mut Frame, input: &super::text_input::TextInputState) {
+fn draw_command_input(
+    f: &mut Frame,
+    input: &super::text_input::TextInputState,
+    completion: Option<&super::app::CompletionState>,
+) {
     let area = f.size();
-    // Command line occupies the very last row
-    let cmd_area = Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1);
+    // Command line occupies the very last row; when completion is
+    // active with multiple candidates, the row above shows match count
+    // and a preview of the next few candidates.
+    let has_multi_matches = completion
+        .map(|c| c.candidates.len() > 1)
+        .unwrap_or(false);
 
-    // Clear the line
+    let cmd_row = area.y + area.height.saturating_sub(1);
+    let cmd_area = Rect::new(area.x, cmd_row, area.width, 1);
+
+    // Clear the command line
     f.render_widget(Clear, cmd_area);
 
     // Leave 1 col for ":" prefix
@@ -437,6 +449,37 @@ fn draw_command_input(f: &mut Frame, input: &super::text_input::TextInputState) 
     let cmd = Paragraph::new(line)
         .style(Style::default().bg(Color::Rgb(26, 27, 38))); // BG color
     f.render_widget(cmd, cmd_area);
+
+    // Optional hint row above the command line when cycling matches.
+    if has_multi_matches && area.height >= 2 {
+        let state = completion.expect("has_multi_matches implies Some");
+        let hint_row = cmd_row.saturating_sub(1);
+        let hint_area = Rect::new(area.x, hint_row, area.width, 1);
+        f.render_widget(Clear, hint_area);
+
+        // Format: "[2/5] foo bar baz qux ..."
+        let count = format!("[{}/{}] ", state.cursor + 1, state.candidates.len());
+        // Show up to 6 candidates starting from the current one for a
+        // compact preview; cursor candidate appears first.
+        let n = state.candidates.len();
+        let preview_n = 6.min(n);
+        let mut preview_items = Vec::with_capacity(preview_n);
+        for i in 0..preview_n {
+            let idx = (state.cursor + i) % n;
+            preview_items.push(state.candidates[idx].clone());
+        }
+        let preview = preview_items.join("  ");
+        let elided = if n > preview_n { " …" } else { "" };
+
+        let hint_line = Line::from(vec![
+            Span::styled(count, Style::default().fg(Color::Rgb(187, 154, 247))), // purple
+            Span::styled(preview, Style::default().fg(Color::Rgb(169, 177, 214))), // muted bright
+            Span::styled(elided.to_string(), Style::default().fg(Color::Rgb(86, 95, 137))), // dim
+        ]);
+        let hint = Paragraph::new(hint_line)
+            .style(Style::default().bg(Color::Rgb(26, 27, 38)));
+        f.render_widget(hint, hint_area);
+    }
 
     // Position cursor after the ':'
     f.set_cursor(cmd_area.x + 1 + cursor_col, cmd_area.y);

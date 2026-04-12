@@ -8,6 +8,155 @@ use crate::convert::simple_wizard::DitherType;
 use super::app::*;
 use super::message::AppMessage;
 
+/// Full list of command-mode tokens (including aliases) recognised by
+/// `parse_command`. Used by the tab-completion machinery.
+///
+/// Ordered so more-typed commands come first — matters for UX because
+/// the first match is what Tab shows initially before the user cycles.
+pub const COMMAND_NAMES: &[&str] = &[
+    "q", "quit", "exit",
+    "w", "write", "save",
+    "wq",
+    "e", "edit",
+    "o", "output",
+    "cd",
+    "queue", "queue!", "qa", "qa!",
+    "c", "convert",
+    "commit", "Commit",
+    "go", "start",
+    "expand", "x",
+    "batch",
+    "preset", "presets", "saveas",
+    "set",
+    "fx", "effects",
+    "info",
+    "tools",
+    "h", "help",
+    "sort", "sortdir",
+    "filter",
+    "rename", "mv",
+    "browse", "b",
+    "recent", "recents",
+    "bookmarks", "bm",
+];
+
+/// Commands that take a preset name as their argument. Used by the
+/// completion machinery to decide whether the word after the command
+/// should be completed against preset file names.
+pub const PRESET_TAKING_COMMANDS: &[&str] = &[
+    "queue", "queue!", "qa", "qa!", "c", "convert", "preset",
+];
+
+/// Compute tab-completion candidates from a CommandInput's current text
+/// and cursor position. Returns `None` if no completion is applicable
+/// (no matching candidates, or we're in a context that doesn't complete).
+///
+/// Completion kinds:
+/// - **Command name** — prefix is the first word of the input and the
+///   cursor is within it. Candidates come from `COMMAND_NAMES`.
+/// - **Preset name** — first word is in `PRESET_TAKING_COMMANDS` and the
+///   cursor is in the second word. Candidates come from the user's
+///   preset directory via `presets::list_presets()`. Case-insensitive
+///   prefix match.
+///
+/// Returns a `CompletionState` with `cursor = 0` (first candidate).
+pub fn compute_completion(
+    text: &str,
+    cursor: usize,
+) -> Option<CompletionState> {
+    let before_cursor = &text[..cursor.min(text.len())];
+
+    // Start of the word being completed: just after the last whitespace,
+    // or 0 if there is none. Uses char_indices for multibyte safety.
+    let prefix_start = before_cursor
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let prefix = &before_cursor[prefix_start..];
+
+    // Command name completion: nothing before the prefix (prefix_start == 0).
+    if prefix_start == 0 {
+        let candidates: Vec<String> = COMMAND_NAMES
+            .iter()
+            .filter(|n| n.starts_with(prefix))
+            .map(|n| n.to_string())
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        return Some(CompletionState {
+            candidates,
+            cursor: 0,
+            prefix_start,
+        });
+    }
+
+    // Preset-argument completion: first word is a preset-taking command.
+    let first_word_end = before_cursor
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| i)
+        .unwrap_or(before_cursor.len());
+    let first_word = &before_cursor[..first_word_end];
+
+    if !PRESET_TAKING_COMMANDS.contains(&first_word) {
+        return None;
+    }
+
+    // Case-insensitive prefix match against preset names on disk.
+    let presets = super::presets::list_presets();
+    let prefix_lower = prefix.to_lowercase();
+    let candidates: Vec<String> = presets
+        .into_iter()
+        .filter(|p| p.to_lowercase().starts_with(&prefix_lower))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    Some(CompletionState {
+        candidates,
+        cursor: 0,
+        prefix_start,
+    })
+}
+
+/// Advance the completion cycle by `direction` (+1 forward, -1 backward)
+/// and apply the new selection to the input. Called on every Tab /
+/// Shift+Tab press while a completion is active.
+pub fn cycle_completion(
+    input: &mut super::text_input::TextInputState,
+    state: &mut CompletionState,
+    direction: i32,
+) {
+    let len = state.candidates.len();
+    if len == 0 {
+        return;
+    }
+    state.cursor = if direction >= 0 {
+        (state.cursor + 1) % len
+    } else {
+        (state.cursor + len - 1) % len
+    };
+    apply_completion_to_input(input, state);
+}
+
+/// Replace the active completion range (`prefix_start..input.cursor`)
+/// with the currently-selected candidate, moving the cursor to the end
+/// of the inserted text.
+pub fn apply_completion_to_input(
+    input: &mut super::text_input::TextInputState,
+    state: &CompletionState,
+) {
+    let candidate = &state.candidates[state.cursor];
+    let prefix_end = input.cursor.min(input.text.len());
+    input.text.replace_range(state.prefix_start..prefix_end, candidate);
+    input.cursor = state.prefix_start + candidate.len();
+}
+
 /// Parsed command from the command line
 #[derive(Debug)]
 pub enum Command {
@@ -981,4 +1130,167 @@ fn expand_path(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::tui::text_input::TextInputState;
+
+    // ── compute_completion: command-name completion ──
+
+    #[test]
+    fn command_completion_prefix_q() {
+        // Typing "q" should match multiple q-prefixed commands.
+        let got = compute_completion("q", 1).expect("should have candidates");
+        assert_eq!(got.prefix_start, 0);
+        assert!(got.candidates.contains(&"q".to_string()));
+        assert!(got.candidates.contains(&"quit".to_string()));
+        assert!(got.candidates.contains(&"queue".to_string()));
+        assert!(got.candidates.contains(&"queue!".to_string()));
+    }
+
+    #[test]
+    fn command_completion_prefix_commit_uppercase() {
+        // Case-sensitive: "Comm" matches "Commit" but not "commit".
+        let got = compute_completion("Comm", 4).expect("should have candidates");
+        assert_eq!(got.candidates, vec!["Commit".to_string()]);
+    }
+
+    #[test]
+    fn command_completion_prefix_com_lowercase() {
+        // "com" matches "commit" but not "Commit" (case-sensitive).
+        let got = compute_completion("com", 3).expect("should have candidates");
+        assert!(got.candidates.contains(&"commit".to_string()));
+        assert!(!got.candidates.contains(&"Commit".to_string()));
+    }
+
+    #[test]
+    fn command_completion_prefix_con_matches_convert() {
+        // "con" matches "convert" (the "c" alias doesn't match since it's shorter).
+        let got = compute_completion("con", 3).expect("should have candidates");
+        assert_eq!(got.candidates, vec!["convert".to_string()]);
+    }
+
+    #[test]
+    fn command_completion_empty_prefix() {
+        // Empty input matches all commands.
+        let got = compute_completion("", 0).expect("should have candidates");
+        assert_eq!(got.candidates.len(), COMMAND_NAMES.len());
+    }
+
+    #[test]
+    fn command_completion_no_match() {
+        // Gibberish matches nothing.
+        let got = compute_completion("xyzzy", 5);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn command_completion_uppercase_q_no_match() {
+        // Case-sensitive: "Q" doesn't match "quit" (lowercase).
+        let got = compute_completion("Q", 1);
+        assert!(got.is_none());
+    }
+
+    // ── compute_completion: preset-arg completion ──
+
+    #[test]
+    fn preset_completion_only_for_preset_taking_commands() {
+        // "set foo" is NOT a preset-taking command, so no completion
+        // after the space.
+        let got = compute_completion("set foo", 7);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn preset_completion_for_non_preset_command() {
+        // "presets foo" (plural, which lists presets) is NOT in
+        // PRESET_TAKING_COMMANDS, so no arg completion.
+        let got = compute_completion("presets foo", 11);
+        assert!(got.is_none());
+    }
+
+    // Note: preset completion positive tests can't be unit-tested here
+    // without setting up a temp preset directory. The parsing/dispatch
+    // logic is covered by the structural tests above.
+
+    // ── apply_completion_to_input ──
+
+    #[test]
+    fn apply_replaces_prefix_and_updates_cursor() {
+        let mut input = TextInputState::new("q".to_string());
+        input.cursor = 1;
+        let state = CompletionState {
+            candidates: vec!["quit".to_string()],
+            cursor: 0,
+            prefix_start: 0,
+        };
+        apply_completion_to_input(&mut input, &state);
+        assert_eq!(input.text, "quit");
+        assert_eq!(input.cursor, 4);
+    }
+
+    #[test]
+    fn apply_preserves_text_before_prefix() {
+        let mut input = TextInputState::new("queue fo".to_string());
+        input.cursor = 8;
+        let state = CompletionState {
+            candidates: vec!["foobar2k".to_string()],
+            cursor: 0,
+            prefix_start: 6,
+        };
+        apply_completion_to_input(&mut input, &state);
+        assert_eq!(input.text, "queue foobar2k");
+        assert_eq!(input.cursor, 14);
+    }
+
+    #[test]
+    fn apply_then_cycle_replaces_previous_candidate() {
+        // Simulate: type "q" → Tab → first candidate → Tab → second candidate.
+        // After first apply, input.cursor is at the end of the first candidate;
+        // the second apply should replace the previous candidate entirely.
+        let mut input = TextInputState::new("q".to_string());
+        input.cursor = 1;
+        let mut state = CompletionState {
+            candidates: vec!["quit".to_string(), "queue".to_string()],
+            cursor: 0,
+            prefix_start: 0,
+        };
+        apply_completion_to_input(&mut input, &state);
+        assert_eq!(input.text, "quit");
+        assert_eq!(input.cursor, 4);
+
+        // Cycle forward
+        cycle_completion(&mut input, &mut state, 1);
+        assert_eq!(input.text, "queue");
+        assert_eq!(input.cursor, 5);
+
+        // Cycle forward again — wraps back to "quit"
+        cycle_completion(&mut input, &mut state, 1);
+        assert_eq!(input.text, "quit");
+        assert_eq!(input.cursor, 4);
+    }
+
+    #[test]
+    fn cycle_backward_wraps() {
+        let mut input = TextInputState::new("".to_string());
+        input.cursor = 0;
+        let mut state = CompletionState {
+            candidates: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            cursor: 0,
+            prefix_start: 0,
+        };
+        apply_completion_to_input(&mut input, &state);
+        assert_eq!(input.text, "a");
+
+        cycle_completion(&mut input, &mut state, -1);
+        assert_eq!(input.text, "c");
+
+        cycle_completion(&mut input, &mut state, -1);
+        assert_eq!(input.text, "b");
+
+        cycle_completion(&mut input, &mut state, -1);
+        assert_eq!(input.text, "a");
+    }
 }

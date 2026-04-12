@@ -74,6 +74,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             (KeyCode::Char(':'), KeyModifiers::SHIFT) | (KeyCode::Char(':'), KeyModifiers::NONE) => {
                 app.active_overlay = ActiveOverlay::CommandInput {
                     input: super::text_input::TextInputState::empty(),
+                    completion: None,
                 };
                 return;
             }
@@ -897,7 +898,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
             app.active_overlay = ActiveOverlay::FileInput { input };
         }
-        ActiveOverlay::CommandInput { mut input } => {
+        ActiveOverlay::CommandInput { mut input, mut completion } => {
             match key.code {
                 KeyCode::Enter => {
                     app.active_overlay = ActiveOverlay::None;
@@ -911,11 +912,20 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.active_overlay = ActiveOverlay::None;
                     return;
                 }
+                KeyCode::Tab => {
+                    handle_command_tab(&mut input, &mut completion, 1);
+                }
+                KeyCode::BackTab => {
+                    handle_command_tab(&mut input, &mut completion, -1);
+                }
                 _ => {
+                    // Any other key clears completion state so the next
+                    // Tab re-parses against the updated input.
+                    completion = None;
                     super::text_input::handle_text_input_key(&mut input, &key);
                 }
             }
-            app.active_overlay = ActiveOverlay::CommandInput { input };
+            app.active_overlay = ActiveOverlay::CommandInput { input, completion };
         }
         ActiveOverlay::TextEdit { mut input, target, label } => {
             match key.code {
@@ -939,6 +949,53 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         }
         ActiveOverlay::None => {}
     }
+}
+
+/// Handle a Tab or Shift+Tab press inside the CommandInput overlay.
+/// On first press (no active completion), parses the input at the
+/// cursor and gathers candidates. On subsequent presses, cycles
+/// through the candidates. Direction: +1 for Tab, -1 for Shift+Tab.
+///
+/// First-press starting index is the first candidate that is NOT
+/// identical to the typed prefix — so typing `queue` + Tab advances
+/// to `queue!` rather than no-op-applying `queue` onto itself.
+fn handle_command_tab(
+    input: &mut super::text_input::TextInputState,
+    completion: &mut Option<CompletionState>,
+    direction: i32,
+) {
+    if let Some(state) = completion.as_mut() {
+        // Already cycling — advance to next/previous candidate.
+        super::command::cycle_completion(input, state, direction);
+        return;
+    }
+
+    // First Tab: compute candidates, pick an initial index that produces
+    // a visible change (skipping any candidate identical to typed prefix).
+    let Some(mut state) = super::command::compute_completion(&input.text, input.cursor)
+    else {
+        return;
+    };
+    let typed: String = input.text[state.prefix_start..input.cursor.min(input.text.len())]
+        .to_string();
+    let len = state.candidates.len();
+    state.cursor = if direction >= 0 {
+        // Forward: first candidate that isn't the typed prefix, else 0.
+        state
+            .candidates
+            .iter()
+            .position(|c| c != &typed)
+            .unwrap_or(0)
+    } else {
+        // Backward: last candidate that isn't the typed prefix, else last.
+        state
+            .candidates
+            .iter()
+            .rposition(|c| c != &typed)
+            .unwrap_or(len - 1)
+    };
+    super::command::apply_completion_to_input(input, &state);
+    *completion = Some(state);
 }
 
 /// Handle key events for the BatchList expand overlay. Moves the Batch
