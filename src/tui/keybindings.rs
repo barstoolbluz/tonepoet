@@ -717,7 +717,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     }
 
     if selection_may_have_changed {
-        app.browse.probe_current(tx);
+        app.browse.probe_current_with_db(tx, Some(&app.db));
     }
 }
 

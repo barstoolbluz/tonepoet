@@ -978,6 +978,17 @@ impl BrowseState {
     /// respective caches. Pending sets prevent duplicate spawns when the
     /// cursor moves rapidly back and forth.
     pub fn probe_current(&mut self, tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>) {
+        self.probe_current_with_db(tx, None);
+    }
+
+    /// Probe the current selection, checking the SQLite cache first.
+    /// If the DB has a valid cached probe (matching mtime + size), populates
+    /// the in-memory cache directly and skips the async probe.
+    pub fn probe_current_with_db(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
+        db: Option<&crate::db::Database>,
+    ) {
         let entry = match self.entries.get(self.selected_index) {
             Some(e) => e,
             None => return,
@@ -988,6 +999,25 @@ impl BrowseState {
             if self.probe_cache.contains_key(&path) || self.probe_pending.contains(&path) {
                 return;
             }
+
+            // Check SQLite probe cache before spawning an async probe.
+            if let Some(db) = db {
+                if let Some(mtime) = entry.modified {
+                    let mtime_unix = crate::db::systemtime_to_unix(mtime);
+                    if let Some(row) = db.get_cached_probe(
+                        &path.display().to_string(),
+                        mtime_unix,
+                        entry.size,
+                    ) {
+                        if let Some(info) = row.to_cached_info(entry.size) {
+                            self.probe_cache
+                                .insert(path, Some(std::sync::Arc::new(info)));
+                            return;
+                        }
+                    }
+                }
+            }
+
             self.probe_pending.insert(path.clone());
             spawn_audio_probe(path, tx.clone());
         } else if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) {

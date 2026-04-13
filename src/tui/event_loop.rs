@@ -162,6 +162,20 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
                         .probe_cache
                         .insert(path.clone(), Some(std::sync::Arc::new(info.clone())));
 
+                    // Persist to SQLite probe cache for cross-session reuse.
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        let mtime = meta.modified()
+                            .map(crate::db::systemtime_to_unix)
+                            .unwrap_or(0);
+                        let row = crate::db::CachedProbeRow::from_cached_info(&info);
+                        let _ = app.db.store_probe(
+                            &path.display().to_string(),
+                            mtime,
+                            meta.len(),
+                            &row,
+                        );
+                    }
+
                     // Phase 6g: route to the Convert source pane if
                     // we're in Batch mode and this path matches the
                     // current cursor, or in Single mode and this path

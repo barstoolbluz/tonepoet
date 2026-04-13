@@ -480,6 +480,76 @@ pub struct CachedProbeRow {
     pub r128_album_gain: Option<String>,
 }
 
+// ── Conversion helpers ──────────────────────────────────────────
+
+impl CachedProbeRow {
+    /// Convert a CachedProbeRow to a CachedInfo (SourceInfo + SourceMetadata).
+    /// Returns None if essential fields (format_name, sample_rate, channels) are missing.
+    pub fn to_cached_info(&self, file_size: u64) -> Option<crate::tui::browse::CachedInfo> {
+        use crate::tui::probe::{SourceInfo, SourceMetadata};
+        Some(crate::tui::browse::CachedInfo {
+            source: SourceInfo {
+                format_name: self.format_name.clone()?,
+                codec: self.codec.clone().unwrap_or_default(),
+                bit_depth: self.bit_depth,
+                sample_rate: self.sample_rate?,
+                channels: self.channels?,
+                channel_layout: self.channel_layout.clone().unwrap_or_default(),
+                duration_secs: self.duration_secs.unwrap_or(0.0),
+                file_size,
+            },
+            metadata: SourceMetadata {
+                title: self.title.clone(),
+                artist: self.artist.clone(),
+                album: self.album.clone(),
+                genre: self.genre.clone(),
+                year: self.year.clone(),
+                track_number: self.track_number,
+                catalog_number: self.catalog_number.clone(),
+                rg_track_gain: self.rg_track_gain.clone(),
+                rg_track_peak: self.rg_track_peak.clone(),
+                rg_album_gain: self.rg_album_gain.clone(),
+                rg_album_peak: self.rg_album_peak.clone(),
+                r128_track_gain: self.r128_track_gain.clone(),
+                r128_album_gain: self.r128_album_gain.clone(),
+            },
+        })
+    }
+
+    /// Build a CachedProbeRow from SourceInfo + SourceMetadata.
+    pub fn from_cached_info(info: &crate::tui::browse::CachedInfo) -> Self {
+        Self {
+            format_name: Some(info.source.format_name.clone()),
+            codec: Some(info.source.codec.clone()),
+            bit_depth: info.source.bit_depth,
+            sample_rate: Some(info.source.sample_rate),
+            channels: Some(info.source.channels),
+            channel_layout: Some(info.source.channel_layout.clone()),
+            duration_secs: Some(info.source.duration_secs),
+            title: info.metadata.title.clone(),
+            artist: info.metadata.artist.clone(),
+            album: info.metadata.album.clone(),
+            genre: info.metadata.genre.clone(),
+            year: info.metadata.year.clone(),
+            track_number: info.metadata.track_number,
+            catalog_number: info.metadata.catalog_number.clone(),
+            rg_track_gain: info.metadata.rg_track_gain.clone(),
+            rg_track_peak: info.metadata.rg_track_peak.clone(),
+            rg_album_gain: info.metadata.rg_album_gain.clone(),
+            rg_album_peak: info.metadata.rg_album_peak.clone(),
+            r128_track_gain: info.metadata.r128_track_gain.clone(),
+            r128_album_gain: info.metadata.r128_album_gain.clone(),
+        }
+    }
+}
+
+/// Convert a SystemTime to a unix timestamp (seconds since epoch) as i64.
+pub fn systemtime_to_unix(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
