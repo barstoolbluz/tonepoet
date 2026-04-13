@@ -958,6 +958,11 @@ pub enum TextEditTarget {
         sources: Vec<std::path::PathBuf>,
         force: bool,
     },
+    /// Edit a single line in the bulk rename preview. The full
+    /// BulkRenameState is parked in `AppState::pending_bulk_rename`
+    /// while the TextEdit is open; the index identifies which op to
+    /// update on commit.
+    BulkRenameLine(usize),
 }
 
 /// What action a confirmation dialog will perform
@@ -1004,6 +1009,11 @@ pub struct AppState {
 
     // Overlays
     pub active_overlay: ActiveOverlay,
+
+    /// Parked BulkRenameState while a per-line TextEdit is open.
+    /// Set when `e` is pressed on a BulkRename row; consumed when
+    /// the TextEdit commits or is cancelled.
+    pub pending_bulk_rename: Option<Box<BulkRenameState>>,
 
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
@@ -1075,6 +1085,7 @@ impl AppState {
             wizard_mouse_areas: None,
             wizard_target: WizardTarget::ConfigureAll,
             active_overlay: ActiveOverlay::None,
+            pending_bulk_rename: None,
             status_message: None,
             processing_active: false,
             should_quit: false,

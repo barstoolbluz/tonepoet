@@ -973,9 +973,20 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 KeyCode::Enter => {
                     let text = input.text.clone();
                     apply_text_edit(app, target, &text, tx);
-                    app.active_overlay = ActiveOverlay::None;
+                    // apply_text_edit may set its own overlay (e.g. BulkRenameLine
+                    // restores BulkRename). Only clear if it didn't.
+                    if matches!(app.active_overlay, ActiveOverlay::TextEdit { .. }) {
+                        app.active_overlay = ActiveOverlay::None;
+                    }
                 }
                 KeyCode::Esc => {
+                    // If a BulkRename edit was in progress, restore the overlay.
+                    if matches!(target, TextEditTarget::BulkRenameLine(_)) {
+                        if let Some(rename_state) = app.pending_bulk_rename.take() {
+                            app.active_overlay = ActiveOverlay::BulkRename(rename_state);
+                            return;
+                        }
+                    }
                     app.active_overlay = ActiveOverlay::None;
                 }
                 _ => {
@@ -1330,8 +1341,18 @@ fn handle_bulk_rename_key(
                     }
                 }
                 KeyCode::Char('e') => {
-                    // Per-line editing will be wired in Phase 8b-5.
-                    app.set_status("Per-line editing: coming soon");
+                    if state.selected < total {
+                        let current = state.plan.ops[state.selected].target_relative.clone();
+                        let idx = state.selected;
+                        // Park the BulkRenameState while TextEdit is open.
+                        app.pending_bulk_rename = Some(Box::new(state));
+                        app.active_overlay = ActiveOverlay::TextEdit {
+                            input: super::text_input::TextInputState::new(current),
+                            target: TextEditTarget::BulkRenameLine(idx),
+                            label: "edit name".to_string(),
+                        };
+                        return;
+                    }
                 }
                 _ => {}
             }
@@ -1640,6 +1661,28 @@ fn apply_text_edit(
                 Err(e) => {
                     app.set_status(e);
                 }
+            }
+        }
+        TextEditTarget::BulkRenameLine(line_idx) => {
+            // Restore the parked BulkRenameState, update the edited line,
+            // revalidate, and reopen the overlay.
+            if let Some(mut rename_state) = app.pending_bulk_rename.take() {
+                if line_idx < rename_state.plan.ops.len() {
+                    // Sanitize the user's edited name.
+                    let edited = match crate::tui::rename_plan::sanitize_path(trimmed) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            // Bad path — keep original target, show error.
+                            app.set_status("Invalid path (contains unsafe characters)");
+                            app.active_overlay =
+                                ActiveOverlay::BulkRename(rename_state);
+                            return;
+                        }
+                    };
+                    rename_state.plan.ops[line_idx].target_relative = edited;
+                    crate::tui::rename_plan::validate_plan(&mut rename_state.plan);
+                }
+                app.active_overlay = ActiveOverlay::BulkRename(rename_state);
             }
         }
     }
