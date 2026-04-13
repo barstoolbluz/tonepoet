@@ -220,33 +220,41 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
 fn handle_paste(app: &mut AppState, text: &str) {
     match &app.active_overlay {
         ActiveOverlay::BulkRename(_) => {
-            // Take the state out of the overlay so we can mutate it.
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             if let ActiveOverlay::BulkRename(mut state) = overlay {
-                let lines: Vec<&str> = text.lines().collect();
-                let op_count = state.plan.ops.len();
-                let mut applied = 0usize;
-                for (i, line) in lines.iter().take(op_count).enumerate() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
+                if state.focus == super::app::BulkRenameFocus::Template {
+                    // Template focus: insert the first line into the template
+                    // input (single-line field), then rebuild the plan.
+                    let first_line = text.lines().next().unwrap_or("");
+                    for c in first_line.chars() {
+                        state.template_input.insert_char(c);
                     }
-                    match crate::tui::rename_plan::sanitize_path(trimmed) {
-                        Ok(sanitized) => {
-                            state.plan.ops[i].target_relative = sanitized;
-                            applied += 1;
+                    state.rebuild_plan();
+                } else {
+                    // List focus: replace ops line-by-line with pasted names.
+                    let lines: Vec<&str> = text.lines().collect();
+                    let op_count = state.plan.ops.len();
+                    let mut applied = 0usize;
+                    for (i, line) in lines.iter().take(op_count).enumerate() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
                         }
-                        Err(_) => {
-                            // Skip invalid lines; keep the template-derived name.
+                        match crate::tui::rename_plan::sanitize_path(trimmed) {
+                            Ok(sanitized) => {
+                                state.plan.ops[i].target_relative = sanitized;
+                                applied += 1;
+                            }
+                            Err(_) => {
+                                // Skip invalid lines; keep the template-derived name.
+                            }
                         }
                     }
+                    crate::tui::rename_plan::validate_plan(&mut state.plan);
+                    app.set_status(&format!(
+                        "Pasted {} name{}", applied, if applied == 1 { "" } else { "s" }
+                    ));
                 }
-                crate::tui::rename_plan::validate_plan(&mut state.plan);
-                app.set_status(&format!(
-                    "Pasted {} name{}", applied, if applied == 1 { "" } else { "s" }
-                ));
-                // Switch focus to list so the user can review.
-                state.focus = super::app::BulkRenameFocus::List;
                 app.active_overlay = ActiveOverlay::BulkRename(state);
             }
         }
