@@ -963,6 +963,10 @@ pub enum TextEditTarget {
     /// while the TextEdit is open; the index identifies which op to
     /// update on commit.
     BulkRenameLine(usize),
+    /// Save the current rename template. Carries the template string;
+    /// the TextEdit input is the user-chosen name for the template.
+    /// BulkRenameState parked in `pending_bulk_rename`.
+    SaveRenameTemplate(String),
 }
 
 /// What action a confirmation dialog will perform

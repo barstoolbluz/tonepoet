@@ -980,8 +980,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     }
                 }
                 KeyCode::Esc => {
-                    // If a BulkRename edit was in progress, restore the overlay.
-                    if matches!(target, TextEditTarget::BulkRenameLine(_)) {
+                    // If a BulkRename sub-edit was in progress, restore the overlay.
+                    if matches!(
+                        target,
+                        TextEditTarget::BulkRenameLine(_)
+                            | TextEditTarget::SaveRenameTemplate(_)
+                    ) {
                         if let Some(rename_state) = app.pending_bulk_rename.take() {
                             app.active_overlay = ActiveOverlay::BulkRename(rename_state);
                             return;
@@ -1356,6 +1360,41 @@ fn handle_bulk_rename_key(
                 }
                 KeyCode::Char('c') => {
                     apply_cue_to_rename(app, &mut state);
+                }
+                KeyCode::Char('t') => {
+                    // Cycle through saved rename templates.
+                    let templates = super::rename_presets::list_templates();
+                    if templates.is_empty() {
+                        app.set_status("No saved rename templates");
+                    } else {
+                        let current = &state.template_input.text;
+                        // Find the current template in the list, advance to next.
+                        let idx = templates
+                            .iter()
+                            .position(|(_, tmpl)| tmpl == current)
+                            .map(|i| (i + 1) % templates.len())
+                            .unwrap_or(0);
+                        let (name, tmpl) = &templates[idx];
+                        state.template_input =
+                            super::text_input::TextInputState::new(tmpl.clone());
+                        state.rebuild_plan();
+                        app.set_status(&format!("Template: {}", name));
+                    }
+                }
+                KeyCode::Char('S') => {
+                    // Save current template. Prompt for name via TextEdit.
+                    let template_text = state.template_input.text.clone();
+                    if template_text.trim().is_empty() {
+                        app.set_status("Template is empty");
+                    } else {
+                        app.pending_bulk_rename = Some(Box::new(state));
+                        app.active_overlay = ActiveOverlay::TextEdit {
+                            input: super::text_input::TextInputState::empty(),
+                            target: TextEditTarget::SaveRenameTemplate(template_text),
+                            label: "template name".to_string(),
+                        };
+                        return;
+                    }
                 }
                 _ => {}
             }
@@ -1749,6 +1788,18 @@ fn apply_text_edit(
                 Err(e) => {
                     app.set_status(e);
                 }
+            }
+        }
+        TextEditTarget::SaveRenameTemplate(template_str) => {
+            if !trimmed.is_empty() {
+                match super::rename_presets::save_template(trimmed, &template_str) {
+                    Ok(()) => app.set_status(&format!("Saved template: {}", trimmed)),
+                    Err(e) => app.set_status(&format!("Save failed: {}", e)),
+                }
+            }
+            // Restore the BulkRename overlay.
+            if let Some(rename_state) = app.pending_bulk_rename.take() {
+                app.active_overlay = ActiveOverlay::BulkRename(rename_state);
             }
         }
         TextEditTarget::BulkRenameLine(line_idx) => {

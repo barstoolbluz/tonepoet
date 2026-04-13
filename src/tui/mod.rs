@@ -31,6 +31,7 @@ pub mod presets_overlay;
 pub mod probe;
 pub mod recent_files;
 pub mod rename_plan;
+pub mod rename_presets;
 pub mod rename_template;
 pub mod recent_overlay;
 pub mod text_input;
