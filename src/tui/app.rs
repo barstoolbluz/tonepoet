@@ -1039,6 +1039,7 @@ pub enum ConfirmAction {
 pub struct AppState {
     pub config: TonepoetConfig,
     pub manager: ConversionManager,
+    pub db: crate::db::Database,
 
     // Navigation
     pub current_screen: AppScreen,
@@ -1126,9 +1127,21 @@ impl AppState {
 
         let initial_screen = AppScreen::from_config_name(&config.ui.default_screen);
 
+        // Open the SQLite database. If it fails, log and use a fallback
+        // in-memory DB so the TUI can still launch.
+        let db = match crate::db::Database::open() {
+            Ok(db) => db,
+            Err(e) => {
+                log::error!("Failed to open database: {}. Using in-memory fallback.", e);
+                crate::db::Database::open_memory()
+                    .expect("in-memory DB should never fail")
+            }
+        };
+
         Self {
             config,
             manager,
+            db,
             current_screen: initial_screen,
             previous_screen: None,
             convert: ConvertState {

@@ -1,5 +1,6 @@
 pub mod convert;
 pub mod config;
+pub mod db;
 pub mod tui;
 
 /// Check whether a file path has an archive extension that may be
