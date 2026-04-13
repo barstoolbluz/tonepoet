@@ -25,6 +25,15 @@ pub struct SourceMetadata {
     pub genre: Option<String>,
     pub year: Option<String>,
 
+    /// Track number from the tag (e.g. 3 for the third track).
+    /// Used by the bulk rename wizard for `%N%` / `%NN%` placeholders.
+    pub track_number: Option<u32>,
+
+    /// Catalog number (label/pressing identifier). Read from the
+    /// CATALOGNUMBER tag (Vorbis comment) or similar format-specific
+    /// field. Used by the bulk rename wizard for `%CATALOG%`.
+    pub catalog_number: Option<String>,
+
     /// Gain/peak values from REPLAYGAIN_* tags. Raw strings as stored in the
     /// file (e.g. `"-6.57 dB"` for gain, `"0.988281"` for peak).
     pub rg_track_gain: Option<String>,
@@ -326,6 +335,21 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
         }
         if meta.year.is_none() {
             meta.year = tag.year().map(|y| y.to_string());
+        }
+        if meta.track_number.is_none() {
+            meta.track_number = tag.track();
+        }
+        if meta.catalog_number.is_none() {
+            // CATALOGNUMBER is a Vorbis comment convention; also used in
+            // some ID3v2 TXXX frames. Try the standard ItemKey first,
+            // then fall back to a freeform lookup.
+            meta.catalog_number = tag
+                .get_string(&ItemKey::CatalogNumber)
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    tag.get_string(&ItemKey::Unknown("CATALOGNUMBER".to_string()))
+                        .map(|s| s.to_string())
+                });
         }
 
         // ReplayGain (raw strings, format-preserving)
