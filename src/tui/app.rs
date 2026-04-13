@@ -970,6 +970,10 @@ pub enum TextEditTarget {
     /// Add a new password to the keychain. The TextEdit input is the
     /// password itself.
     KeychainAdd,
+    /// Set an archive password for the currently selected archive in Browse.
+    /// The TextEdit input is the password. On commit, it's stored as a
+    /// session override and added to the keychain.
+    ArchivePassword(std::path::PathBuf),
 }
 
 /// State for the password keychain section on the Config screen.
@@ -1095,6 +1099,11 @@ pub struct AppState {
     /// Password keychain state for the Config screen.
     pub keychain: KeychainState,
 
+    /// Session-level archive password overrides (archive path → password).
+    /// Set via the `:password` command or interactive prompt. Takes
+    /// priority over keychain MRU when committing archives.
+    pub archive_passwords: std::collections::HashMap<std::path::PathBuf, String>,
+
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
@@ -1150,6 +1159,7 @@ impl AppState {
             recent: crate::tui::recent_files::RecentFilesState::load(),
             bookmarks: crate::tui::bookmarks::BookmarksState::load(),
             keychain: KeychainState::default(),
+            archive_passwords: std::collections::HashMap::new(),
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }

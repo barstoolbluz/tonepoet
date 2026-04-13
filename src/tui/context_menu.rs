@@ -70,6 +70,8 @@ pub enum ContextAction {
     Refresh,
     /// Open the bulk rename wizard for selected audio files.
     BulkRename,
+    /// Set a password for the selected archive (opens TextEdit prompt).
+    SetArchivePassword,
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -257,7 +259,19 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
-        EntryKind::Archive | EntryKind::Directory => {
+        EntryKind::Archive => {
+            items.push(build_convert_submenu(app));
+            items.push(separator());
+            items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
+            items.push(item_with_shortcut("Set Password...", ContextAction::SetArchivePassword, ":pw"));
+            items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
+            items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
+            items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
+            items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
+            items.push(separator());
+            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+        }
+        EntryKind::Directory => {
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
@@ -464,6 +478,10 @@ pub fn execute_context_action(
         }
         ContextAction::MoveToTrash => {
             let cmd = super::command::Command::Delete;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::SetArchivePassword => {
+            let cmd = super::command::Command::Password;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::BulkRename => {

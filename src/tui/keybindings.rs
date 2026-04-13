@@ -1938,6 +1938,21 @@ fn apply_text_edit(
                 }
             }
         }
+        TextEditTarget::ArchivePassword(archive_path) => {
+            if !trimmed.is_empty() {
+                // Store as session override for this archive.
+                app.archive_passwords
+                    .insert(archive_path.clone(), trimmed.to_string());
+                // Also add to keychain for future use.
+                let _ = super::keychain::add_password(trimmed);
+                app.keychain.reload();
+                let name = archive_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                app.set_status(&format!("Password set for {} (saved to keychain)", name));
+            }
+        }
     }
 }
 

@@ -140,13 +140,16 @@ pub fn commit_batch(
             continue;
         }
 
-        // For encrypted archives, resolve password: keychain MRU → config → None.
+        // For encrypted archives, resolve password:
+        // session override → keychain MRU → config → None.
         let archive_pw = if crate::is_encrypted_archive_ext(path) {
-            app.keychain.ensure_loaded();
-            app.keychain
-                .passwords
-                .first()
+            app.archive_passwords
+                .get(path)
                 .cloned()
+                .or_else(|| {
+                    app.keychain.ensure_loaded();
+                    app.keychain.passwords.first().cloned()
+                })
                 .or_else(|| app.config.conversion.archive_password.clone())
         } else {
             None

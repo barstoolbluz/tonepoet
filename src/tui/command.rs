@@ -42,6 +42,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "recent", "recents",
     "bookmarks", "bm",
     "rename-all", "renameall", "bulk-rename",
+    "password", "pw",
 ];
 
 /// Commands that take a preset name as their argument. Used by the
@@ -223,6 +224,8 @@ pub enum Command {
     Bookmarks(String),
     /// Open the bulk rename wizard for the current selection.
     BulkRename,
+    /// Set an archive password for the selected archive in Browse.
+    Password,
     Unknown(String),
 }
 
@@ -296,6 +299,7 @@ pub fn parse_command(input: &str) -> Command {
         "recent" | "recents" => Command::Recent,
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
         "rename-all" | "renameall" | "bulk-rename" => Command::BulkRename,
+        "password" | "pw" => Command::Password,
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -563,6 +567,24 @@ pub fn execute_command(
         }
         Command::Bookmarks(args) => {
             execute_bookmarks(app, &args);
+        }
+        Command::Password => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":password only works on the browse screen");
+            } else if let Some(entry) = app.browse.selected_entry() {
+                if matches!(entry.kind, super::browse::EntryKind::Archive) {
+                    let path = entry.path.clone();
+                    app.active_overlay = ActiveOverlay::TextEdit {
+                        input: super::text_input::TextInputState::empty(),
+                        target: TextEditTarget::ArchivePassword(path),
+                        label: "archive password".to_string(),
+                    };
+                } else {
+                    app.set_status("Selected file is not an archive");
+                }
+            } else {
+                app.set_status("No file selected");
+            }
         }
         Command::BulkRename => {
             if app.current_screen != AppScreen::Browse {
