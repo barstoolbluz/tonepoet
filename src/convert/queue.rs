@@ -171,11 +171,7 @@ impl ConversionItem {
             .map(|m| m.len())
             .unwrap_or(0);
         
-        // Set default archive password for 7z files
-        let archive_password = match &input_format {
-            FileFormat::SevenZip => Some("b0nn13mCmurr@y".to_string()),
-            _ => None,
-        };
+        let archive_password = None;
         
         Self {
             id,

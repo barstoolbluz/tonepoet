@@ -221,7 +221,12 @@ impl ConversionManager {
 
     /// Add a file that's already configured and ready for processing
     /// Used for download+convert workflows and presets where settings are pre-configured
-    pub fn add_file_ready_for_processing(&mut self, file: std::path::PathBuf, options: ConversionOptions) -> ConversionResult<String> {
+    pub fn add_file_ready_for_processing(
+        &mut self,
+        file: std::path::PathBuf,
+        options: ConversionOptions,
+        archive_password: Option<String>,
+    ) -> ConversionResult<String> {
         let format = FormatDetector::detect(&file)?;
         // Use try_write() instead of blocking_write() to avoid panic in async context
         let mut queue = self.queue.try_write()
@@ -229,6 +234,7 @@ impl ConversionManager {
 
         // Create item and mark as Queued (ready for processing)
         let mut item = ConversionItem::new(file.clone(), format, options);
+        item.archive_password = archive_password;
         item.status = ConversionStatus::Queued;
         let id = item.id.clone();
         queue.items_mut().push_back(item);

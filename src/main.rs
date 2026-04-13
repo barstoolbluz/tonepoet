@@ -450,8 +450,14 @@ fn add_item_to_queue(
 ) {
     let mut item = ConversionItem::new(path, format, options.clone());
     if matches!(format, FileFormat::SevenZip) {
+        // Password priority: CLI flag → config → keychain MRU → None.
         item.archive_password = archive_password.clone()
-            .or_else(|| config.conversion.archive_password.clone());
+            .or_else(|| config.conversion.archive_password.clone())
+            .or_else(|| {
+                tonepoet::tui::keychain::load_keychain()
+                    .into_iter()
+                    .next()
+            });
     }
     item.status = ConversionStatus::Queued;
     queue.add_item_direct(item);

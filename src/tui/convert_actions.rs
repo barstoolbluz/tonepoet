@@ -140,9 +140,21 @@ pub fn commit_batch(
             continue;
         }
 
+        // For archives, resolve password: keychain MRU → config → None.
+        let archive_pw = if path.extension().map(|e| e == "7z").unwrap_or(false) {
+            app.keychain.ensure_loaded();
+            app.keychain
+                .passwords
+                .first()
+                .cloned()
+                .or_else(|| app.config.conversion.archive_password.clone())
+        } else {
+            None
+        };
+
         match app
             .manager
-            .add_file_ready_for_processing(path.clone(), options.clone())
+            .add_file_ready_for_processing(path.clone(), options.clone(), archive_pw)
         {
             Ok(_) => outcome.enqueued += 1,
             Err(_) => outcome.errors += 1,

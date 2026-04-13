@@ -729,7 +729,7 @@ fn load_browse_selection(
             for p in paths_to_add {
                 if app
                     .manager
-                    .add_file_ready_for_processing(p, options.clone())
+                    .add_file_ready_for_processing(p, options.clone(), None)
                     .is_ok()
                 {
                     count += 1;
