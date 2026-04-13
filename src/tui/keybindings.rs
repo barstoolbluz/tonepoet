@@ -867,7 +867,7 @@ fn load_browse_selection(
                     // auto-load into the source pane.
                     app.browse.return_target = BrowseReturnTarget::None;
                     // Record this file in the recent-files history.
-                    app.recent.record_use(&path);
+                    app.recent.record_use_with_db(&path, &app.db);
                 }
                 Err(e) => {
                     app.set_status(format!("Probe error: {}", e));
@@ -2600,7 +2600,7 @@ fn load_recent_as_source(app: &mut AppState, path: &std::path::Path) {
             ));
             app.current_screen = AppScreen::Convert;
             // Bump to top of recent list.
-            app.recent.record_use(path);
+            app.recent.record_use_with_db(path, &app.db);
         }
         Err(e) => {
             app.set_status(format!("Probe error: {}", e));
@@ -2645,7 +2645,7 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
                 path.file_name().unwrap_or_default().to_string_lossy()
             ));
             // Record in the recent-files history.
-            app.recent.record_use(path);
+            app.recent.record_use_with_db(path, &app.db);
         }
         _ => {
             // Add to queue (existing behavior)

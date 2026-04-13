@@ -400,7 +400,7 @@ pub fn execute_command(
                 p.file_name().unwrap_or_default().to_string_lossy()
             ));
             app.current_screen = AppScreen::Convert;
-            app.recent.record_use(&p);
+            app.recent.record_use_with_db(&p, &app.db);
         }
         Command::Output(path) => {
             if path.is_empty() {
@@ -851,7 +851,7 @@ fn execute_queue(
                 }
             }
             app.convert.source.mode = mode;
-            app.recent.record_use(&first);
+            app.recent.record_use_with_db(&first, &app.db);
 
             // Remember where we came from, switch to Convert for review.
             app.previous_screen = Some(AppScreen::Browse);

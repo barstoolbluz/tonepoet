@@ -1138,6 +1138,10 @@ impl AppState {
             }
         };
 
+        // Load recent files + bookmarks from DB before moving `db` into struct.
+        let recent = crate::tui::recent_files::RecentFilesState::load_from_db(&db);
+        let bookmarks = crate::tui::bookmarks::BookmarksState::load_from_db(&db);
+
         Self {
             config,
             manager,
@@ -1169,8 +1173,8 @@ impl AppState {
             should_quit: false,
             last_browse_click: None,
             pending_browse_rename: None,
-            recent: crate::tui::recent_files::RecentFilesState::load(),
-            bookmarks: crate::tui::bookmarks::BookmarksState::load(),
+            recent,
+            bookmarks,
             keychain: KeychainState::default(),
             archive_passwords: std::collections::HashMap::new(),
             tool_check_cache: once_cell::sync::OnceCell::new(),
@@ -1306,7 +1310,7 @@ impl AppState {
         self.convert.source.mode = mode;
 
         // Record the first file in the recent-files history.
-        self.recent.record_use(&first);
+        self.recent.record_use_with_db(&first, &self.db);
 
         // Override the configured default screen — CLI file args always
         // land on Convert. Esc is a no-op (previous_screen stays None)

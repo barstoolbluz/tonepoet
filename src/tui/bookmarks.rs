@@ -56,6 +56,38 @@ impl BookmarksState {
         state
     }
 
+    /// Load from SQLite DB (preferred) with TOML import fallback.
+    pub fn load_from_db(db: &crate::db::Database) -> Self {
+        let mut state = Self::default();
+
+        // Try loading from DB first.
+        if let Ok(rows) = db.list_bookmarks() {
+            if !rows.is_empty() {
+                state.entries = rows
+                    .into_iter()
+                    .map(|(_id, name, path)| Bookmark {
+                        name,
+                        path: PathBuf::from(path),
+                    })
+                    .collect();
+                return state;
+            }
+        }
+
+        // DB empty — try importing from TOML.
+        let toml_path = Self::storage_path();
+        if let Ok(text) = fs::read_to_string(&toml_path) {
+            if let Ok(file) = toml::from_str::<BookmarksFile>(&text) {
+                for bm in &file.entries {
+                    let _ = db.add_bookmark(&bm.name, &bm.path.display().to_string());
+                }
+                state.entries = file.entries;
+            }
+        }
+
+        state
+    }
+
     /// Persist entries to disk. Best-effort: returns Err on IO failure but
     /// callers can ignore it (non-critical feature).
     pub fn save(&self) -> std::io::Result<()> {
@@ -83,6 +115,14 @@ impl BookmarksState {
     pub fn add(&mut self, name: String, path: PathBuf) {
         self.add_in_memory(name, path);
         let _ = self.save();
+    }
+
+    /// Add a bookmark, persisting to both TOML and SQLite.
+    pub fn add_with_db(&mut self, name: String, path: PathBuf, db: &crate::db::Database) {
+        let path_str = path.display().to_string();
+        self.add_in_memory(name.clone(), path);
+        let _ = self.save();
+        let _ = db.add_bookmark(&name, &path_str);
     }
 
     fn add_in_memory(&mut self, name: String, path: PathBuf) {

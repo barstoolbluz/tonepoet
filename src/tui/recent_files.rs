@@ -87,6 +87,47 @@ impl RecentFilesState {
         let _ = self.save();
     }
 
+    /// Record a file as recently used, persisting to both JSON and SQLite.
+    pub fn record_use_with_db(&mut self, path: &Path, db: &crate::db::Database) {
+        self.record_use_in_memory(path);
+        let _ = self.save();
+        let _ = db.record_recent(&path.display().to_string());
+    }
+
+    /// Load entries from SQLite DB (preferred) with JSON import fallback.
+    /// On first run: if DB is empty and JSON exists, imports JSON → DB.
+    pub fn load_from_db(db: &crate::db::Database) -> Self {
+        let mut state = Self::default();
+
+        // Try loading from DB first.
+        if let Ok(rows) = db.list_recent(MAX_ENTRIES) {
+            if !rows.is_empty() {
+                state.entries = rows
+                    .into_iter()
+                    .map(|(path, ts)| RecentEntry {
+                        path: PathBuf::from(path),
+                        timestamp: ts as u64,
+                    })
+                    .collect();
+                return state;
+            }
+        }
+
+        // DB empty — try importing from JSON.
+        let json_path = Self::storage_path();
+        if let Ok(text) = std::fs::read_to_string(&json_path) {
+            if let Ok(entries) = serde_json::from_str::<Vec<RecentEntry>>(&text) {
+                // Import into DB.
+                for entry in &entries {
+                    let _ = db.record_recent(&entry.path.display().to_string());
+                }
+                state.entries = entries;
+            }
+        }
+
+        state
+    }
+
     /// In-memory half of `record_use`: state mutation only, no disk IO.
     /// Extracted so unit tests can exercise the logic without touching the
     /// filesystem.
