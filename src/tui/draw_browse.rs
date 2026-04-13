@@ -253,10 +253,15 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
             lines.push(bordered_line(border_color, w, vec![]));
         }
     } else if browse.entries.is_empty() {
+        let msg = if browse.scan_pending.is_some() {
+            "   Loading..."
+        } else {
+            "   (empty)"
+        };
         lines.push(bordered_line(
             border_color,
             w,
-            vec![Span::styled("   (empty)", theme::muted())],
+            vec![Span::styled(msg, theme::muted())],
         ));
         for _ in 1..content_height {
             lines.push(bordered_line(border_color, w, vec![]));

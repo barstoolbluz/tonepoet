@@ -21,6 +21,10 @@ pub async fn run_app(
     tx: mpsc::Sender<AppMessage>,
     mut rx: mpsc::Receiver<AppMessage>,
 ) -> io::Result<()> {
+    // Set the message channel on BrowseState so navigation methods can
+    // spawn async scans. Must happen before the event loop starts.
+    app.browse.set_tx(tx.clone());
+
     loop {
         // 1. Refresh items from the manager
         app.refresh_items();
@@ -261,6 +265,40 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.browse
                 .dir_stats_cache
                 .insert(path, std::sync::Arc::new(stats));
+        }
+        AppMessage::DirScanComplete { path, parent_entry, dirs, files, error } => {
+            // Race protection: discard if user has navigated elsewhere.
+            if app.browse.current_dir != path {
+                return;
+            }
+            // Clear the scan handle.
+            app.browse.scan_pending = None;
+
+            if let Some(err) = error {
+                if err != "cancelled" {
+                    app.browse.error = Some(err);
+                }
+                return;
+            }
+
+            // Populate raw scan results.
+            app.browse.parent_entry = parent_entry;
+            app.browse.all_dirs = dirs;
+            app.browse.all_files = files;
+
+            // Apply current filter/sort.
+            app.browse.apply_view();
+
+            // Cursor restoration (e.g., after go_parent).
+            if let Some(target) = app.browse.cursor_restore_target.take() {
+                if let Some(idx) = app.browse.entries.iter().position(|e| e.name == target) {
+                    app.browse.selected_index = idx;
+                    app.browse.ensure_visible();
+                }
+            }
+
+            // Probe the newly selected entry.
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
         AppMessage::MetadataWriteComplete { path, field, result } => {
             // Step 3 (main thread): cleanup journal + backup, invalidate caches.

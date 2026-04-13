@@ -40,6 +40,14 @@ pub enum AppMessage {
         path: std::path::PathBuf,
         stats: crate::tui::browse::DirStats,
     },
+    /// Result of an async directory scan (readdir + lstat per entry).
+    DirScanComplete {
+        path: std::path::PathBuf,
+        parent_entry: Option<crate::tui::browse::BrowseEntry>,
+        dirs: Vec<crate::tui::browse::BrowseEntry>,
+        files: Vec<crate::tui::browse::BrowseEntry>,
+        error: Option<String>,
+    },
     /// Result of an async metadata tag write.
     MetadataWriteComplete {
         path: std::path::PathBuf,

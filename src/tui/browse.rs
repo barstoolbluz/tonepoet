@@ -271,11 +271,11 @@ pub struct BrowseState {
     // ── Scan results (refreshed only by scan(), i.e. on cd) ─────────
     /// ParentDir entry, if `current_dir` has a parent. Always passed
     /// through view filtering unchanged.
-    parent_entry: Option<BrowseEntry>,
+    pub(super) parent_entry: Option<BrowseEntry>,
     /// All directory entries from current_dir, unfiltered.
-    all_dirs: Vec<BrowseEntry>,
+    pub(super) all_dirs: Vec<BrowseEntry>,
     /// All file entries from current_dir, unfiltered (including hidden).
-    all_files: Vec<BrowseEntry>,
+    pub(super) all_files: Vec<BrowseEntry>,
 
     // ── View result (refilled by apply_view from scan results) ───────
     pub entries: Vec<BrowseEntry>,
@@ -327,6 +327,35 @@ pub struct BrowseState {
 
     /// When set, we're browsing inside an archive rather than the filesystem.
     pub archive: Option<ArchiveBrowseState>,
+
+    /// Handle to the in-flight async directory scan. `Some` while a background
+    /// scan is running. Used for cancellation and loading indicator.
+    pub scan_pending: Option<ScanHandle>,
+
+    /// After `go_parent`, the name of the directory we came from — so the
+    /// DirScanComplete handler can position the cursor on it.
+    pub cursor_restore_target: Option<String>,
+
+    /// Channel sender for async messages. Set after construction by the
+    /// event loop. `None` during the initial synchronous scan.
+    scan_tx: Option<tokio::sync::mpsc::Sender<super::message::AppMessage>>,
+}
+
+/// Handle to a cancellable background directory scan.
+#[derive(Debug, Clone)]
+pub struct ScanHandle {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ScanHandle {
+    pub fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (Self { cancel: flag.clone() }, flag)
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// State for browsing inside an archive.
@@ -371,19 +400,61 @@ impl BrowseState {
             return_target: BrowseReturnTarget::None,
             error: None,
             archive: None,
+            scan_pending: None,
+            cursor_restore_target: None,
+            scan_tx: None,
         };
-        state.refresh();
+        state.refresh(); // Initial scan is synchronous (no tx yet).
         state
     }
 
+    /// Set the message channel sender (called once from the event loop).
+    pub fn set_tx(&mut self, tx: tokio::sync::mpsc::Sender<super::message::AppMessage>) {
+        self.scan_tx = Some(tx);
+    }
+
     /// Full refresh: re-scan disk, then re-apply the view filters/sort.
+    /// Uses async scan if tx is available, otherwise falls back to synchronous.
     pub fn refresh(&mut self) {
         if self.archive.is_some() {
             self.refresh_archive_view();
             return;
         }
-        self.scan();
-        self.apply_view();
+        if self.scan_tx.is_some() {
+            self.begin_async_scan();
+        } else {
+            // Synchronous fallback (initial scan before tx is set).
+            self.scan();
+            self.apply_view();
+        }
+    }
+
+    /// Start an async directory scan. Cancels any in-flight scan first.
+    /// Clears entries immediately (renderer shows "Loading...").
+    fn begin_async_scan(&mut self) {
+        // Cancel previous scan if still running.
+        if let Some(handle) = self.scan_pending.take() {
+            handle.cancel();
+        }
+
+        // Clear display state.
+        self.parent_entry = None;
+        self.all_dirs.clear();
+        self.all_files.clear();
+        self.entries.clear();
+        self.error = None;
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+
+        let tx = match &self.scan_tx {
+            Some(tx) => tx.clone(),
+            None => return, // No channel — shouldn't happen after set_tx.
+        };
+
+        let (handle, cancel_flag) = ScanHandle::new();
+        self.scan_pending = Some(handle);
+
+        spawn_dir_scan(self.current_dir.clone(), cancel_flag, tx);
     }
 
     /// Whether we're currently browsing inside an archive.
@@ -594,7 +665,7 @@ impl BrowseState {
     /// - text filter (`filter_text`, case-insensitive substring on `name_lower`)
     /// Then sorting dirs and files independently (dirs-first invariant).
     /// ParentDir is always first and never filtered.
-    fn apply_view(&mut self) {
+    pub(super) fn apply_view(&mut self) {
         self.entries.clear();
 
         // Lowercase the filter text once per view application.
@@ -703,21 +774,15 @@ impl BrowseState {
     /// Navigate to the parent directory
     pub fn go_parent(&mut self) -> bool {
         if let Some(parent) = self.current_dir.parent() {
-            let prev_name = self
+            // Remember the directory we came from for cursor restoration
+            // after the async scan completes.
+            self.cursor_restore_target = self
                 .current_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string());
             self.current_dir = parent.to_path_buf();
             self.reset_nav_state();
             self.refresh();
-
-            // Try to position cursor on the directory we came from
-            if let Some(name) = prev_name {
-                if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
-                    self.selected_index = idx;
-                    self.ensure_visible();
-                }
-            }
             return true;
         }
         false
@@ -1099,6 +1164,125 @@ pub fn spawn_dir_stats(
             .send(super::message::AppMessage::DirStatsComplete { path, stats })
             .await;
     });
+}
+
+/// Spawn a background directory scan. The blocking I/O (readdir + lstat per
+/// entry) runs on `spawn_blocking`. Respects the cancel flag — checks every
+/// 50 entries and aborts early if set. Sends `DirScanComplete` when done.
+/// Wrapped in a 30-second timeout.
+pub fn spawn_dir_scan(
+    path: PathBuf,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let scan_path = path.clone();
+        let cancel_flag = cancel.clone();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                scan_directory_blocking(&scan_path, &cancel_flag)
+            }),
+        )
+        .await;
+
+        let (parent_entry, dirs, files, error) = match result {
+            Ok(Ok(Ok((parent, dirs, files)))) => (parent, dirs, files, None),
+            Ok(Ok(Err(e))) => (None, Vec::new(), Vec::new(), Some(e)),
+            Ok(Err(join_err)) => {
+                (None, Vec::new(), Vec::new(), Some(format!("scan task panicked: {}", join_err)))
+            }
+            Err(_timeout) => {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                (None, Vec::new(), Vec::new(), Some("scan timed out (30s)".into()))
+            }
+        };
+
+        let _ = tx
+            .send(super::message::AppMessage::DirScanComplete {
+                path,
+                parent_entry,
+                dirs,
+                files,
+                error,
+            })
+            .await;
+    });
+}
+
+/// Blocking directory scan — runs on a `spawn_blocking` thread.
+/// Returns (parent_entry, dirs, files) or an error string.
+fn scan_directory_blocking(
+    dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(Option<BrowseEntry>, Vec<BrowseEntry>, Vec<BrowseEntry>), String> {
+    use std::sync::atomic::Ordering;
+
+    let parent_entry = dir.parent().map(|parent| {
+        BrowseEntry::new(
+            parent.to_path_buf(),
+            "..".to_string(),
+            EntryKind::ParentDir,
+            0,
+            None,
+        )
+    });
+
+    let read = fs::read_dir(dir)
+        .map_err(|e| format!("Cannot read directory: {}", e))?;
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+
+    for (i, entry) in read.flatten().enumerate() {
+        // Check cancellation every 50 entries.
+        if i % 50 == 0 && cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        let symlink_meta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let is_symlink = symlink_meta.file_type().is_symlink();
+
+        let (metadata, is_broken_symlink) = if is_symlink {
+            match fs::metadata(&path) {
+                Ok(m) => (Some(m), false),
+                Err(_) => (None, true),
+            }
+        } else {
+            (Some(symlink_meta.clone()), false)
+        };
+
+        let effective = metadata.as_ref().unwrap_or(&symlink_meta);
+        let size = effective.len();
+        let modified = effective.modified().ok();
+
+        let kind = if is_broken_symlink {
+            EntryKind::OtherFile
+        } else if effective.is_dir() {
+            EntryKind::Directory
+        } else {
+            classify_file(&path)
+        };
+
+        let browse_entry = BrowseEntry::new_with_symlink(
+            path, name, kind.clone(), size, modified, is_symlink, is_broken_symlink,
+        );
+
+        if matches!(kind, EntryKind::Directory) {
+            dirs.push(browse_entry);
+        } else {
+            files.push(browse_entry);
+        }
+    }
+
+    Ok((parent_entry, dirs, files))
 }
 
 /// View-layer filter check: returns true if the entry passes the hidden,
