@@ -1140,7 +1140,9 @@ impl AppState {
 
         // Load recent files + bookmarks from DB before moving `db` into struct.
         let recent = crate::tui::recent_files::RecentFilesState::load_from_db(&db);
-        let bookmarks = crate::tui::bookmarks::BookmarksState::load_from_db(&db);
+        // Bookmarks: load from TOML for now. DB-backed bookmarks deferred
+        // until all mutation paths (add/remove/rename/commit_naming) are wired.
+        let bookmarks = crate::tui::bookmarks::BookmarksState::load();
 
         Self {
             config,

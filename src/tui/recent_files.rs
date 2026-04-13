@@ -117,9 +117,12 @@ impl RecentFilesState {
         let json_path = Self::storage_path();
         if let Ok(text) = std::fs::read_to_string(&json_path) {
             if let Ok(entries) = serde_json::from_str::<Vec<RecentEntry>>(&text) {
-                // Import into DB.
+                // Import into DB with original timestamps.
                 for entry in &entries {
-                    let _ = db.record_recent(&entry.path.display().to_string());
+                    let _ = db.record_recent_at(
+                        &entry.path.display().to_string(),
+                        entry.timestamp as i64,
+                    );
                 }
                 state.entries = entries;
             }

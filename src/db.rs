@@ -381,10 +381,15 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        self.record_recent_at(file_path, now)
+    }
+
+    /// Record a file access with a specific timestamp (for imports).
+    pub fn record_recent_at(&self, file_path: &str, timestamp: i64) -> Result<(), String> {
         self.conn.execute(
             "INSERT OR REPLACE INTO recent_files (file_path, accessed_at)
              VALUES (?1, ?2)",
-            params![file_path, now],
+            params![file_path, timestamp],
         ).map_err(|e| format!("recent insert: {}", e))?;
         Ok(())
     }
