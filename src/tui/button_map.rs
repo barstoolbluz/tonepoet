@@ -82,6 +82,46 @@ pub enum TuiButton {
     BrowseInfoMeta(crate::tui::probe::MetadataField),
 }
 
+impl TuiButton {
+    /// Which screen this button belongs to. Returns None for global
+    /// buttons (Tab, Overlay) that work on any screen.
+    pub fn screen(&self) -> Option<super::app::AppScreen> {
+        use super::app::AppScreen;
+        match self {
+            Self::Tab(_) | Self::OverlayConfirm | Self::OverlayCancel => None,
+            Self::Pane(_)
+            | Self::FormatPill(_)
+            | Self::RatePill(_)
+            | Self::DepthPill(_)
+            | Self::DitherPill(_)
+            | Self::ReplayGainPill(_)
+            | Self::MergePill(_)
+            | Self::PresetsButton
+            | Self::SaveButton
+            | Self::AdvancedToggle(_)
+            | Self::DestPathField
+            | Self::FolderTemplateField
+            | Self::FilenameTemplateField
+            | Self::MetadataField(_)
+            | Self::SourceBrowseButton
+            | Self::SourceExpandButton => Some(AppScreen::Convert),
+            Self::AddFiles
+            | Self::AddFolder
+            | Self::Configure
+            | Self::Convert
+            | Self::Pause
+            | Self::Stop
+            | Self::ClearCompleted
+            | Self::RetryFailed
+            | Self::QueueItem(_) => Some(AppScreen::Queue),
+            Self::BrowseEntry(_)
+            | Self::BrowseColumn(_)
+            | Self::BrowseList
+            | Self::BrowseInfoMeta(_) => Some(AppScreen::Browse),
+        }
+    }
+}
+
 /// Maps rendered button positions to their identities for mouse click detection
 #[derive(Debug, Clone)]
 pub struct ButtonRenderMap {

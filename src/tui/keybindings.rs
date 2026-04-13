@@ -2075,30 +2075,42 @@ fn apply_text_edit(
                 return;
             }
 
-            // Write the tag via lofty with atomic backup protection.
+            // Step 1 (main thread, fast): create backup + journal entry.
+            let backup = crate::db::Database::backup_path_for(&path);
+            if let Err(e) = crate::db::Database::create_backup_for(&path, &backup) {
+                app.set_status(format!("backup failed: {}", e));
+                return;
+            }
+            if let Err(e) = app.db.begin_metadata_write(
+                &path.display().to_string(),
+                &backup.display().to_string(),
+            ) {
+                let _ = std::fs::remove_file(&backup);
+                app.set_status(format!("journal error: {}", e));
+                return;
+            }
+
+            app.set_status(format!(
+                "Writing {}...",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+
+            // Step 2 (background): lofty write (potentially slow for large files).
             let write_path = path.clone();
             let write_field = field;
             let write_value = trimmed.to_string();
-            match app.db.atomic_metadata_write(&path, || {
-                crate::tui::probe::write_metadata_field(&write_path, write_field, &write_value)
-            }) {
-                Ok(()) => {
-                    // Invalidate probe caches (in-memory + DB).
-                    app.browse.probe_cache.remove(&path);
-                    app.browse.probe_pending.remove(&path);
-                    let _ = app.db.invalidate_probe(&path.display().to_string());
-                    // Re-trigger probe for immediate refresh.
-                    app.browse.probe_current(tx);
-                    app.set_status(format!(
-                        "{}: {} updated",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
-                        field.label(),
-                    ));
-                }
-                Err(e) => {
-                    app.set_status(e);
-                }
-            }
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::tui::probe::write_metadata_field(&write_path, write_field, &write_value)
+                }).await.unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+
+                let _ = tx.send(AppMessage::MetadataWriteComplete {
+                    path,
+                    field: write_field,
+                    result,
+                }).await;
+            });
         }
         TextEditTarget::SaveRenameTemplate(template_str) => {
             if !trimmed.is_empty() {
@@ -2984,8 +2996,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
-    // Check button map
+    // Check button map — skip screen-specific buttons if they belong
+    // to a different screen (stale button_map from the previous frame).
     if let Some(button) = app.button_map.find_button_at(x, y) {
+        if let Some(btn_screen) = button.screen() {
+            if btn_screen != app.current_screen {
+                return; // Stale button from a previous screen's render.
+            }
+        }
         match button {
             // ── Convert screen: pane focus ──
             TuiButton::Pane(focus) => {

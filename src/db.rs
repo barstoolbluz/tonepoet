@@ -350,6 +350,18 @@ impl Database {
     }
 
     /// Backup path: same directory, `.tonepoet-bak` suffix.
+    pub fn backup_path_for(original: &std::path::Path) -> std::path::PathBuf {
+        Self::backup_path(original)
+    }
+
+    /// Create a backup (public entry point for async writes).
+    pub fn create_backup_for(
+        original: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<(), String> {
+        Self::create_backup(original, backup)
+    }
+
     fn backup_path(original: &std::path::Path) -> std::path::PathBuf {
         let mut name = original
             .file_name()

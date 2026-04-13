@@ -40,6 +40,12 @@ pub enum AppMessage {
         path: std::path::PathBuf,
         stats: crate::tui::browse::DirStats,
     },
+    /// Result of an async metadata tag write.
+    MetadataWriteComplete {
+        path: std::path::PathBuf,
+        field: crate::tui::probe::MetadataField,
+        result: Result<(), String>,
+    },
     /// Result of an async archive listing (`7zz l -slt`).
     ArchiveListingComplete {
         archive_path: std::path::PathBuf,

@@ -44,7 +44,7 @@ pub async fn run_app(
 
         // 4. Drain async messages
         while let Ok(msg) = rx.try_recv() {
-            handle_message(app, msg);
+            handle_message(app, msg, &tx);
         }
 
         // 5. Poll for crossterm events (100ms timeout for responsive UI updates)
@@ -111,7 +111,7 @@ fn check_pending_browse_rename(app: &mut AppState) {
 }
 
 /// Handle async messages from background tasks
-fn handle_message(app: &mut AppState, msg: AppMessage) {
+fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::ConversionProgress { item_id, status } => {
             app.manager.update_item_status(&item_id, status, 0.0);
@@ -229,6 +229,34 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
             app.browse
                 .dir_stats_cache
                 .insert(path, std::sync::Arc::new(stats));
+        }
+        AppMessage::MetadataWriteComplete { path, field, result } => {
+            // Step 3 (main thread): cleanup journal + backup, invalidate caches.
+            let path_str = path.display().to_string();
+            let backup = crate::db::Database::backup_path_for(&path);
+            match result {
+                Ok(()) => {
+                    let _ = app.db.complete_metadata_write(&path_str);
+                    let _ = std::fs::remove_file(&backup);
+                    app.browse.probe_cache.remove(&path);
+                    app.browse.probe_pending.remove(&path);
+                    let _ = app.db.invalidate_probe(&path_str);
+                    app.browse.probe_current(tx);
+                    app.set_status(format!(
+                        "{}: {} updated",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        field.label(),
+                    ));
+                }
+                Err(e) => {
+                    // Rollback: restore from backup.
+                    if backup.exists() {
+                        let _ = std::fs::rename(&backup, &path);
+                    }
+                    let _ = app.db.complete_metadata_write(&path_str);
+                    app.set_status(format!("write failed (rolled back): {}", e));
+                }
+            }
         }
         AppMessage::ArchiveListingComplete { archive_path, result, password } => {
             match *result {
