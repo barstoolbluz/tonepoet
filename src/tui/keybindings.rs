@@ -1382,21 +1382,36 @@ fn handle_bulk_rename_key(
                     }
                 }
                 KeyCode::Char('C') => {
-                    // Apply Chicago-style title capitalization to all target stems.
+                    // Apply Chicago-style title capitalization to all targets.
+                    // Split by `/` to handle subdirectory paths independently,
+                    // and separate the extension from the final component.
                     for op in &mut state.plan.ops {
-                        // Extract the stem (before last dot) and extension.
-                        if let Some(dot_pos) = op.target_relative.rfind('.') {
-                            let stem = &op.target_relative[..dot_pos];
-                            let ext = &op.target_relative[dot_pos..];
-                            op.target_relative = format!(
-                                "{}{}",
-                                crate::convert::renaming::capitalize_title(stem),
-                                ext,
-                            );
-                        } else {
-                            op.target_relative =
-                                crate::convert::renaming::capitalize_title(&op.target_relative);
-                        }
+                        let parts: Vec<&str> = op.target_relative.split('/').collect();
+                        let capitalized: Vec<String> = parts
+                            .iter()
+                            .enumerate()
+                            .map(|(i, part)| {
+                                let is_last = i == parts.len() - 1;
+                                if is_last {
+                                    // Last component: separate stem from extension.
+                                    if let Some(dot_pos) = part.rfind('.') {
+                                        let stem = &part[..dot_pos];
+                                        let ext = &part[dot_pos..];
+                                        format!(
+                                            "{}{}",
+                                            crate::convert::renaming::capitalize_title(stem),
+                                            ext,
+                                        )
+                                    } else {
+                                        crate::convert::renaming::capitalize_title(part)
+                                    }
+                                } else {
+                                    // Directory component: capitalize as title.
+                                    crate::convert::renaming::capitalize_title(part)
+                                }
+                            })
+                            .collect();
+                        op.target_relative = capitalized.join("/");
                     }
                     crate::tui::rename_plan::validate_plan(&mut state.plan);
                     app.set_status("Applied title capitalization");
