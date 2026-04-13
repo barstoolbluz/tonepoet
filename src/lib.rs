@@ -2,6 +2,16 @@ pub mod convert;
 pub mod config;
 pub mod tui;
 
+/// Check whether a file path has an archive extension that may be
+/// password-encrypted (7z, rar, zip). Tar-based archives and ISO images
+/// don't support encryption and are excluded.
+pub fn is_encrypted_archive_ext(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_lowercase().as_str(), "7z" | "rar" | "zip"))
+        .unwrap_or(false)
+}
+
 /// Detect the best available 7-Zip binary. Prefers the official `7zz`
 /// (native Linux 7-Zip with SIMD optimizations, ~2-3x faster than p7zip)
 /// over the legacy `7z` (p7zip). Returns the binary name or None.

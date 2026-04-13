@@ -140,8 +140,8 @@ pub fn commit_batch(
             continue;
         }
 
-        // For archives, resolve password: keychain MRU → config → None.
-        let archive_pw = if path.extension().map(|e| e == "7z").unwrap_or(false) {
+        // For encrypted archives, resolve password: keychain MRU → config → None.
+        let archive_pw = if crate::is_encrypted_archive_ext(path) {
             app.keychain.ensure_loaded();
             app.keychain
                 .passwords

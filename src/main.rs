@@ -448,8 +448,8 @@ fn add_item_to_queue(
     archive_password: &Option<String>,
     config: &TonepoetConfig,
 ) {
-    let mut item = ConversionItem::new(path, format, options.clone());
-    if matches!(format, FileFormat::SevenZip) {
+    let mut item = ConversionItem::new(path.clone(), format, options.clone());
+    if tonepoet::is_encrypted_archive_ext(&path) {
         // Password priority: CLI flag → config → keychain MRU → None.
         item.archive_password = archive_password.clone()
             .or_else(|| config.conversion.archive_password.clone())

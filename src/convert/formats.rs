@@ -303,6 +303,22 @@ pub struct FormatDetector;
 impl FormatDetector {
     /// Detect file format from file path (archive or audio)
     pub fn detect(path: &Path) -> Result<FileFormat, super::ConversionError> {
+        // Check for compound tar extensions first (.tar.gz, .tar.bz2, etc.)
+        // because Path::extension() only returns the last component.
+        let name_lower = path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_lowercase())
+            .unwrap_or_default();
+        if name_lower.ends_with(".tar.gz")
+            || name_lower.ends_with(".tar.bz2")
+            || name_lower.ends_with(".tar.xz")
+            || name_lower.ends_with(".tar.zst")
+            || name_lower.ends_with(".tar.lz")
+            || name_lower.ends_with(".tar.lzma")
+        {
+            return Ok(FileFormat::SevenZip);
+        }
+
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -312,9 +328,12 @@ impl FormatDetector {
                     format!("No file extension found for: {}", path.display())
                 )
             })?;
-        
+
         match extension.as_str() {
-            "7z" => Ok(FileFormat::SevenZip),
+            // Archives — all handled by 7zz/7z extraction pipeline.
+            "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "dmg"
+            | "tgz" | "tbz2" | "txz" => Ok(FileFormat::SevenZip),
+            // Audio formats.
             "flac" => Ok(FileFormat::Audio(AudioFormat::Flac)),
             "wav" | "wave" => Ok(FileFormat::Audio(AudioFormat::Wav)),
             "aiff" | "aif" | "aifc" => Ok(FileFormat::Audio(AudioFormat::Aiff)),

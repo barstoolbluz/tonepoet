@@ -228,15 +228,15 @@ impl BrowseEntry {
     }
 
     /// Short type/format label for display in the type column.
-    /// Audio files show their format (FLAC/MP3/etc), archives show "7z",
-    /// directories show "dir", other files show their lowercase extension.
-    /// Symlinks are prefixed with `↪`.
+    /// Audio files show their format (FLAC/MP3/etc), archives show their
+    /// format (7z/zip/rar/tar.gz/etc), directories show "dir", other
+    /// files show their lowercase extension. Symlinks are prefixed with `↪`.
     pub fn type_label(&self) -> String {
         let base = match &self.kind {
             EntryKind::ParentDir => String::new(),
             EntryKind::Directory => "dir".to_string(),
             EntryKind::AudioFile(fmt) => fmt.name().to_string(),
-            EntryKind::Archive => "7z".to_string(),
+            EntryKind::Archive => archive_label(&self.path),
             EntryKind::OtherFile => self
                 .path
                 .extension()
@@ -1135,6 +1135,11 @@ fn collect_audio_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn classify_file(path: &Path) -> EntryKind {
+    // Check for double-extension archives first (e.g., .tar.gz).
+    if is_tar_compound(path) {
+        return EntryKind::Archive;
+    }
+
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -1148,7 +1153,48 @@ fn classify_file(path: &Path) -> EntryKind {
         Some("mp3") => EntryKind::AudioFile(AudioFormat::Mp3),
         Some("m4a") | Some("mp4") | Some("aac") => EntryKind::AudioFile(AudioFormat::Aac),
         Some("opus") => EntryKind::AudioFile(AudioFormat::Opus),
-        Some("7z") => EntryKind::Archive,
+        Some("7z") | Some("zip") | Some("rar") | Some("tar") | Some("iso")
+        | Some("cab") | Some("dmg") | Some("tgz") | Some("tbz2") | Some("txz") => {
+            EntryKind::Archive
+        }
         _ => EntryKind::OtherFile,
     }
+}
+
+/// Derive a short display label for an archive from its extension.
+fn archive_label(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_lowercase())
+        .unwrap_or_default();
+    // Check compound extensions first.
+    if name.ends_with(".tar.gz") { return "tar.gz".into(); }
+    if name.ends_with(".tar.bz2") { return "tar.bz2".into(); }
+    if name.ends_with(".tar.xz") { return "tar.xz".into(); }
+    if name.ends_with(".tar.zst") { return "tar.zst".into(); }
+    if name.ends_with(".tar.lz") { return "tar.lz".into(); }
+    if name.ends_with(".tar.lzma") { return "tar.lzma".into(); }
+    // Single extension.
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_else(|| "archive".into())
+}
+
+/// Check for compound tar extensions (.tar.gz, .tar.bz2, .tar.xz, .tar.zst).
+/// `Path::extension()` only returns the last component, so "file.tar.gz"
+/// gives "gz" which would be classified as OtherFile without this check.
+fn is_tar_compound(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_lowercase())
+        .unwrap_or_default();
+    name.ends_with(".tar.gz")
+        || name.ends_with(".tar.bz2")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".tar.zst")
+        || name.ends_with(".tar.lz")
+        || name.ends_with(".tar.lzma")
 }

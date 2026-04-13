@@ -728,7 +728,7 @@ fn load_browse_selection(
             let options = crate::convert::ConversionOptions::default();
             for p in paths_to_add {
                 // Resolve archive password: keychain MRU → config → None.
-                let archive_pw = if p.extension().map(|e| e == "7z").unwrap_or(false) {
+                let archive_pw = if crate::is_encrypted_archive_ext(&p) {
                     app.keychain.ensure_loaded();
                     app.keychain
                         .passwords
@@ -2549,7 +2549,8 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
                 if let Some(ext) = file_path.extension() {
                     let ext_str = ext.to_string_lossy().to_lowercase();
                     if matches!(ext_str.as_str(),
-                        "7z" | "flac" | "wav" | "aiff" | "aif" | "wv" | "mp3" | "m4a" | "aac" | "opus" | "ogg"
+                        "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "tgz" | "tbz2" | "txz"
+                        | "flac" | "wav" | "aiff" | "aif" | "wv" | "mp3" | "m4a" | "aac" | "opus" | "ogg"
                     ) {
                         match app.manager.add_file_blocking(file_path.to_path_buf(), options.clone()) {
                             Ok(_) => count += 1,
