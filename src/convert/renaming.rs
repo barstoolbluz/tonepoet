@@ -183,7 +183,7 @@ pub fn apply_folder_renaming(
     }
 }
 
-fn sanitize_for_filesystem(name: &str) -> String {
+pub fn sanitize_for_filesystem(name: &str) -> String {
     // Special case for AC/DC - remove the slash
     if name == "AC/DC" {
         return "ACDC".to_string();
