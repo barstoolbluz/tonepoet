@@ -727,13 +727,16 @@ fn load_browse_selection(
             let mut count = 0;
             let options = crate::convert::ConversionOptions::default();
             for p in paths_to_add {
-                // Resolve archive password: keychain MRU → config → None.
+                // Resolve archive password:
+                // session override → keychain MRU → config → None.
                 let archive_pw = if crate::is_encrypted_archive_ext(&p) {
-                    app.keychain.ensure_loaded();
-                    app.keychain
-                        .passwords
-                        .first()
+                    app.archive_passwords
+                        .get(&p)
                         .cloned()
+                        .or_else(|| {
+                            app.keychain.ensure_loaded();
+                            app.keychain.passwords.first().cloned()
+                        })
                         .or_else(|| app.config.conversion.archive_password.clone())
                 } else {
                     None
@@ -2561,16 +2564,19 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
         {
             let file_path = entry.path();
             if file_path.is_file() {
-                if let Some(ext) = file_path.extension() {
-                    let ext_str = ext.to_string_lossy().to_lowercase();
-                    if matches!(ext_str.as_str(),
+                // Check compound tar extensions first, then single extensions.
+                let is_compound_tar = super::browse::is_tar_compound_pub(file_path);
+                let is_known = is_compound_tar || file_path.extension().map(|ext| {
+                    let e = ext.to_string_lossy().to_lowercase();
+                    matches!(e.as_str(),
                         "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "tgz" | "tbz2" | "txz"
                         | "flac" | "wav" | "aiff" | "aif" | "wv" | "mp3" | "m4a" | "aac" | "opus" | "ogg"
-                    ) {
-                        match app.manager.add_file_blocking(file_path.to_path_buf(), options.clone()) {
-                            Ok(_) => count += 1,
-                            Err(_) => errors += 1,
-                        }
+                    )
+                }).unwrap_or(false);
+                if is_known {
+                    match app.manager.add_file_blocking(file_path.to_path_buf(), options.clone()) {
+                        Ok(_) => count += 1,
+                        Err(_) => errors += 1,
                     }
                 }
             }

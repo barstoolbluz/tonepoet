@@ -1182,6 +1182,11 @@ fn archive_label(path: &Path) -> String {
         .unwrap_or_else(|| "archive".into())
 }
 
+/// Public accessor for compound tar check (used by keybindings file-routing).
+pub fn is_tar_compound_pub(path: &Path) -> bool {
+    is_tar_compound(path)
+}
+
 /// Check for compound tar extensions (.tar.gz, .tar.bz2, .tar.xz, .tar.zst).
 /// `Path::extension()` only returns the last component, so "file.tar.gz"
 /// gives "gz" which would be classified as OtherFile without this check.
