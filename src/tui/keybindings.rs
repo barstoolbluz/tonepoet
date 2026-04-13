@@ -1914,8 +1914,11 @@ fn move_batch_cursor(
         *cursor_metadata = crate::tui::probe::SourceMetadata::default();
     }
 
-    // Spawn the background probe. Result is routed to cursor_info in
-    // event_loop's AudioProbeComplete handler when it arrives.
+    // Skip if a probe for this exact path is already in flight.
+    if app.convert.source.batch_probe_pending.as_ref() == Some(&path) {
+        return;
+    }
+    app.convert.source.batch_probe_pending = Some(path.clone());
     super::browse::spawn_audio_probe(path, tx.clone());
 }
 
@@ -1924,6 +1927,18 @@ fn move_batch_cursor(
 /// to 1 file, promotes to `SourceMode::Single` and spawns a background
 /// probe for the remaining file.
 fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    // Capture the current cursor file + its cached info BEFORE removing.
+    let old_cursor_path = match &app.convert.source.mode {
+        SourceMode::Batch { paths, cursor, .. } => paths.get(*cursor).cloned(),
+        _ => None,
+    };
+    let old_cursor_info = match &app.convert.source.mode {
+        SourceMode::Batch { cursor_info, cursor_metadata, .. } => {
+            cursor_info.as_ref().map(|info| (info.clone(), cursor_metadata.clone()))
+        }
+        _ => None,
+    };
+
     let (remaining_paths, new_cursor) = match &mut app.convert.source.mode {
         SourceMode::Batch { paths, cursor, .. } if !paths.is_empty() => {
             let idx = (*cursor).min(paths.len() - 1);
@@ -1940,9 +1955,18 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     }
 
     if remaining_paths.len() == 1 {
-        // Promote to Single with empty info/metadata; AudioProbeComplete
-        // will populate it when the background probe finishes.
         let path = remaining_paths.into_iter().next().unwrap();
+        // If this is the same file we already had info for, carry it over.
+        if old_cursor_path.as_ref() == Some(&path) {
+            if let Some((info, metadata)) = old_cursor_info {
+                app.convert.source.mode = SourceMode::Single {
+                    path,
+                    info: Some(info),
+                    metadata,
+                };
+                return;
+            }
+        }
         app.convert.source.mode = SourceMode::Single {
             path: path.clone(),
             info: None,
@@ -1953,17 +1977,36 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     }
 
     // Stay in Batch — recompute summary and move cursor.
+    let new_cursor_path = remaining_paths.get(new_cursor).cloned();
     let mut new_mode = SourceMode::from_paths(remaining_paths);
-    let spawned_path = if let SourceMode::Batch { cursor, paths, .. } = &mut new_mode {
+
+    // If the cursor landed on the same file, carry over cached info.
+    let need_probe = if let SourceMode::Batch {
+        cursor, cursor_info, cursor_metadata, ..
+    } = &mut new_mode
+    {
         *cursor = new_cursor;
-        paths.get(new_cursor).cloned()
+        if new_cursor_path == old_cursor_path {
+            if let Some((info, meta)) = old_cursor_info {
+                *cursor_info = Some(info);
+                *cursor_metadata = meta;
+                false // No probe needed.
+            } else {
+                true
+            }
+        } else {
+            true
+        }
     } else {
-        None
+        false
     };
+
     app.convert.source.mode = new_mode;
 
-    if let Some(p) = spawned_path {
-        super::browse::spawn_audio_probe(p, tx.clone());
+    if need_probe {
+        if let Some(p) = new_cursor_path {
+            super::browse::spawn_audio_probe(p, tx.clone());
+        }
     }
 }
 

@@ -351,6 +351,9 @@ fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
 pub struct SourceState {
     pub mode: SourceMode,
     pub advanced_open: bool,
+    /// Path of the batch cursor probe currently in flight. Prevents
+    /// duplicate spawns when the user holds an arrow key.
+    pub batch_probe_pending: Option<PathBuf>,
 }
 
 impl Default for SourceState {
@@ -358,6 +361,7 @@ impl Default for SourceState {
         Self {
             mode: SourceMode::Empty,
             advanced_open: false,
+            batch_probe_pending: None,
         }
     }
 }

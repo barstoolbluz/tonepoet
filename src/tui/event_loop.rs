@@ -186,6 +186,11 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
                         source: probed_info,
                         metadata: probed_metadata,
                     } = info;
+                    // Clear the batch probe pending flag if this result matches.
+                    if app.convert.source.batch_probe_pending.as_ref() == Some(&path) {
+                        app.convert.source.batch_probe_pending = None;
+                    }
+
                     match &mut app.convert.source.mode {
                         super::app::SourceMode::Batch {
                             paths,
