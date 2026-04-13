@@ -603,7 +603,8 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                             .or_else(|| {
                                 app.keychain.ensure_loaded();
                                 app.keychain.passwords.first().cloned()
-                            });
+                            })
+                            .or_else(|| app.config.conversion.archive_password.clone());
                         let tx = tx.clone();
                         app.set_status("Loading archive...");
                         tokio::spawn(async move {
