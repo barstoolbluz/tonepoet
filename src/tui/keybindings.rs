@@ -536,6 +536,25 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             // Browse is home — Esc with nothing to clear is a no-op.
         }
 
+        // Bulk rename: R opens the rename wizard for selected audio files.
+        (KeyCode::Char('R'), KeyModifiers::SHIFT) => {
+            let paths = super::command::collect_selection_for_file_ops(app);
+            // Filter to audio files only (directories/other files can't be renamed via template).
+            let audio_paths: Vec<std::path::PathBuf> = paths
+                .into_iter()
+                .filter(|p| {
+                    app.browse.entries.iter().any(|e| {
+                        e.path == *p
+                            && matches!(
+                                e.kind,
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                    })
+                })
+                .collect();
+            open_bulk_rename(app, audio_paths);
+        }
+
         _ => {}
     }
 
@@ -980,6 +999,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 show_submenu, focus_submenu, tx,
             );
         }
+        ActiveOverlay::BulkRename(state) => {
+            handle_bulk_rename_key(app, key, *state, tx);
+        }
         ActiveOverlay::None => {}
     }
 }
@@ -1237,8 +1259,135 @@ fn handle_command_tab(
     *completion = Some(state);
 }
 
+/// Handle key events for the bulk rename wizard overlay.
+fn handle_bulk_rename_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    mut state: BulkRenameState,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match state.focus {
+        BulkRenameFocus::Template => {
+            match key.code {
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                    return;
+                }
+                KeyCode::Tab => {
+                    state.focus = BulkRenameFocus::List;
+                }
+                KeyCode::Enter => {
+                    // Commit the plan if no conflicts.
+                    if state.plan.conflict_count() > 0 {
+                        app.set_status("Resolve conflicts before committing");
+                    } else if state.plan.pending_count() == 0 {
+                        app.set_status("Nothing to rename");
+                    } else {
+                        execute_bulk_rename(app, &mut state, tx);
+                        return;
+                    }
+                }
+                _ => {
+                    super::text_input::handle_text_input_key(&mut state.template_input, &key);
+                    state.rebuild_plan();
+                }
+            }
+        }
+        BulkRenameFocus::List => {
+            let total = state.plan.ops.len();
+            match key.code {
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                    return;
+                }
+                KeyCode::Tab => {
+                    state.focus = BulkRenameFocus::Template;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if state.selected > 0 {
+                        state.selected -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if state.selected + 1 < total {
+                        state.selected += 1;
+                    }
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    state.selected = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    state.selected = total.saturating_sub(1);
+                }
+                KeyCode::Enter => {
+                    if state.plan.conflict_count() > 0 {
+                        app.set_status("Resolve conflicts before committing");
+                    } else if state.plan.pending_count() == 0 {
+                        app.set_status("Nothing to rename");
+                    } else {
+                        execute_bulk_rename(app, &mut state, tx);
+                        return;
+                    }
+                }
+                KeyCode::Char('e') => {
+                    // Per-line editing will be wired in Phase 8b-5.
+                    app.set_status("Per-line editing: coming soon");
+                }
+                _ => {}
+            }
+        }
+    }
+    app.active_overlay = ActiveOverlay::BulkRename(Box::new(state));
+}
+
+/// Execute the bulk rename plan: move files, refresh browse, close overlay.
+fn execute_bulk_rename(
+    app: &mut AppState,
+    state: &mut BulkRenameState,
+    _tx: &mpsc::Sender<AppMessage>,
+) {
+    match crate::tui::rename_plan::execute_plan(&mut state.plan) {
+        Ok(count) => {
+            app.set_status(&format!("Renamed {} file{}", count, if count == 1 { "" } else { "s" }));
+            app.active_overlay = ActiveOverlay::None;
+            // Refresh browse to reflect the renames.
+            app.browse.refresh();
+        }
+        Err(e) => {
+            app.set_status(&format!("Rename failed: {}", e));
+            // Keep overlay open so user can see what happened.
+            app.active_overlay = ActiveOverlay::BulkRename(Box::new(state.clone()));
+        }
+    }
+}
+
+/// Open the bulk rename overlay with the given file paths. Pulls metadata
+/// from the browse probe cache where available, falling back to defaults.
+pub fn open_bulk_rename(app: &mut AppState, paths: Vec<std::path::PathBuf>) {
+    if paths.is_empty() {
+        app.set_status("No files selected for rename");
+        return;
+    }
+
+    let base_dir = app.browse.current_dir.clone();
+    let metadata: Vec<super::probe::SourceMetadata> = paths
+        .iter()
+        .map(|p| {
+            app.browse
+                .probe_cache
+                .get(p)
+                .and_then(|opt| opt.as_ref())
+                .map(|cached| cached.metadata.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let state = BulkRenameState::new(base_dir, paths, metadata);
+    app.active_overlay = ActiveOverlay::BulkRename(Box::new(state));
+}
+
 /// Handle key events for the BatchList expand overlay. Moves the Batch
-/// cursor with ↑/↓/j/k, jumps with Home/End, removes the hovered file
+/// cursor with up/down/j/k, jumps with Home/End, removes the hovered file
 /// with `d`, closes with Enter/Esc.
 ///
 /// Scroll is vim-smooth: it only updates when the cursor exits the

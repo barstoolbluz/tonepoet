@@ -1052,7 +1052,7 @@ fn execute_file_op(app: &mut AppState, dest: &str, force: bool, is_move: bool) {
 /// Collect selected entries for file ops (copy/move). Unlike
 /// `collect_selection_for_queue`, directories are NOT expanded — the
 /// op targets the directory itself.
-fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
+pub(super) fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
     use super::browse::EntryKind;
     if !app.browse.multi_selected.is_empty() {
         return app.browse.multi_selected.clone();

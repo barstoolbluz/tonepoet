@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::convert::ConversionStatus;
-use super::app::{ActiveOverlay, AppState, SourceMode};
+use super::app::{ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, SourceMode};
 use super::button_map::TuiButton;
 use super::theme;
 
@@ -56,6 +56,10 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
                 submenu_entries, submenu_selected,
                 show_submenu, focus_submenu,
             );
+        }
+        ActiveOverlay::BulkRename(ref state) => {
+            let state = state.clone();
+            draw_bulk_rename(f, &state);
         }
     }
 
@@ -699,4 +703,240 @@ fn draw_command_input(
 
     // Position cursor after the ':'
     f.set_cursor(cmd_area.x + 1 + cursor_col, cmd_area.y);
+}
+
+/// Draw the bulk rename wizard overlay.
+fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
+    use super::rename_plan::OpStatus;
+
+    let area = f.size();
+    // Use ~85% of screen, bounded to reasonable limits.
+    let w = (area.width * 85 / 100).max(60).min(area.width.saturating_sub(2));
+    let h = (area.height * 85 / 100).max(16).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::AMBER))
+        .title(Span::styled(
+            " Bulk Rename -- Template ",
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 6 || inner.width < 20 {
+        return;
+    }
+
+    // Layout: template(1) + hint(1) + blank(1) + summary(1) + separator(1) + list(rest) + footer(1)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // template input
+            Constraint::Length(1), // placeholder hints
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // summary
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // preview list
+            Constraint::Length(1), // footer
+        ])
+        .split(inner);
+
+    // ── Template input ───────────────────────────────────────────
+    let template_focused = state.focus == BulkRenameFocus::Template;
+    let label_style = if template_focused {
+        Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::TEXT_MUTED)
+    };
+    let input_w = chunks[0].width.saturating_sub(11) as usize; // "Template: " = 10 chars + 1
+    let (visible, cursor_col) = state.template_input.view(input_w);
+    let input_style = if template_focused {
+        Style::default().fg(theme::TEXT_BRIGHT)
+    } else {
+        Style::default().fg(theme::TEXT_MUTED)
+    };
+    let template_line = Line::from(vec![
+        Span::styled("Template: ", label_style),
+        Span::styled(visible, input_style),
+    ]);
+    f.render_widget(Paragraph::new(template_line), chunks[0]);
+
+    if template_focused {
+        f.set_cursor(chunks[0].x + 10 + cursor_col, chunks[0].y);
+    }
+
+    // ── Placeholder hints ────────────────────────────────────────
+    let hint = Line::from(Span::styled(
+        "%N% %NN% %NNN% %TITLE% %ARTIST% %ALBUM% %YEAR% %GENRE% %CATALOG% %EXT%",
+        Style::default().fg(theme::TEXT_MUTED),
+    ));
+    f.render_widget(Paragraph::new(hint), chunks[1]);
+
+    // ── Summary ──────────────────────────────────────────────────
+    let total = state.plan.ops.len();
+    let pending = state.plan.pending_count();
+    let conflicts = state.plan.conflict_count();
+    let skipped = total - pending - conflicts;
+    let summary = Line::from(vec![
+        Span::styled(format!("{} files", total), Style::default().fg(theme::TEXT_BRIGHT)),
+        Span::styled(" · ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(
+            format!("{} pending", pending),
+            Style::default().fg(theme::GREEN),
+        ),
+        if skipped > 0 {
+            Span::styled(
+                format!(" · {} skipped", skipped),
+                Style::default().fg(theme::TEXT_MUTED),
+            )
+        } else {
+            Span::raw("")
+        },
+        if conflicts > 0 {
+            Span::styled(
+                format!(" · {} conflict{}", conflicts, if conflicts == 1 { "" } else { "s" }),
+                Style::default().fg(theme::RED),
+            )
+        } else {
+            Span::raw("")
+        },
+    ]);
+    f.render_widget(Paragraph::new(summary), chunks[3]);
+
+    // ── Separator ────────────────────────────────────────────────
+    let sep = "─".repeat(chunks[4].width as usize);
+    f.render_widget(
+        Paragraph::new(Span::styled(sep, Style::default().fg(theme::TEXT_MUTED))),
+        chunks[4],
+    );
+
+    // ── Preview list ─────────────────────────────────────────────
+    let list_area = chunks[5];
+    let visible_rows = list_area.height as usize;
+
+    if total > 0 && visible_rows > 0 {
+        // Clamp scroll so the selected row is always visible.
+        let selected = state.selected.min(total.saturating_sub(1));
+        let scroll = {
+            let mut s = state.scroll;
+            if selected < s {
+                s = selected;
+            }
+            if selected >= s + visible_rows {
+                s = selected + 1 - visible_rows;
+            }
+            s
+        };
+
+        // Determine column widths: status(3) + target(half) + arrow(4) + source(rest)
+        let full_w = list_area.width as usize;
+        let status_w = 3;
+        let arrow_w = 4; // " <- "
+        let remaining = full_w.saturating_sub(status_w + arrow_w);
+        let target_w = remaining * 3 / 5;
+        let source_w = remaining.saturating_sub(target_w);
+
+        for row in 0..visible_rows {
+            let idx = scroll + row;
+            if idx >= total {
+                break;
+            }
+            let op = &state.plan.ops[idx];
+            let is_selected = idx == selected && state.focus == BulkRenameFocus::List;
+
+            let (icon, icon_color) = match &op.status {
+                OpStatus::Pending => (">>", theme::GREEN),
+                OpStatus::Skipped(_) => ("..", theme::TEXT_MUTED),
+                OpStatus::Conflict => ("!!", theme::RED),
+                OpStatus::Succeeded => ("ok", theme::GREEN),
+                OpStatus::Failed(_) => ("!!", theme::RED),
+            };
+
+            let target_name = &op.target_relative;
+            let source_name = state.sources[idx]
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // Truncate names to fit columns (char-safe).
+            let target_chars: usize = target_name.chars().count();
+            let target_display: String = if target_chars > target_w {
+                let truncated: String = target_name.chars().take(target_w.saturating_sub(1)).collect();
+                format!("{}~", truncated)
+            } else {
+                format!("{:<width$}", target_name, width = target_w)
+            };
+            let source_chars: usize = source_name.chars().count();
+            let source_display: String = if source_chars > source_w {
+                let truncated: String = source_name.chars().take(source_w.saturating_sub(1)).collect();
+                format!("{}~", truncated)
+            } else {
+                format!("{:<width$}", source_name, width = source_w)
+            };
+
+            let target_style = match &op.status {
+                OpStatus::Pending => Style::default().fg(theme::TEXT_BRIGHT),
+                OpStatus::Skipped(_) => Style::default().fg(theme::TEXT_MUTED),
+                OpStatus::Conflict => Style::default().fg(theme::RED),
+                OpStatus::Succeeded => Style::default().fg(theme::GREEN),
+                OpStatus::Failed(_) => Style::default().fg(theme::RED),
+            };
+
+            let line = Line::from(vec![
+                Span::styled(format!("{:<3}", icon), Style::default().fg(icon_color)),
+                Span::styled(target_display, target_style),
+                Span::styled(" <- ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(source_display, Style::default().fg(theme::TEXT_MUTED)),
+            ]);
+
+            let row_area = Rect::new(
+                list_area.x,
+                list_area.y + row as u16,
+                list_area.width,
+                1,
+            );
+
+            if is_selected {
+                let sel_style = Style::default()
+                    .bg(Color::Rgb(52, 56, 80))
+                    .add_modifier(Modifier::BOLD);
+                f.render_widget(Paragraph::new(line).style(sel_style), row_area);
+            } else {
+                f.render_widget(Paragraph::new(line), row_area);
+            }
+        }
+    }
+
+    // ── Footer keybindings ───────────────────────────────────────
+    let footer_parts = if state.focus == BulkRenameFocus::Template {
+        vec![
+            Span::styled("Tab", Style::default().fg(theme::AMBER)),
+            Span::styled(": list  ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled("Enter", Style::default().fg(theme::AMBER)),
+            Span::styled(": commit  ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled("Esc", Style::default().fg(theme::AMBER)),
+            Span::styled(": cancel", Style::default().fg(theme::TEXT_MUTED)),
+        ]
+    } else {
+        vec![
+            Span::styled("Tab", Style::default().fg(theme::AMBER)),
+            Span::styled(": template  ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled("e", Style::default().fg(theme::AMBER)),
+            Span::styled(": edit line  ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled("Enter", Style::default().fg(theme::AMBER)),
+            Span::styled(": commit  ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled("Esc", Style::default().fg(theme::AMBER)),
+            Span::styled(": cancel", Style::default().fg(theme::TEXT_MUTED)),
+        ]
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(footer_parts)).alignment(Alignment::Center),
+        chunks[6],
+    );
 }

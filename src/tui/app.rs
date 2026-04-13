@@ -793,6 +793,115 @@ pub enum ActiveOverlay {
         /// False when focus is in the parent menu.
         focus_submenu: bool,
     },
+    /// Bulk rename wizard overlay. Boxed because the state is large.
+    BulkRename(Box<BulkRenameState>),
+}
+
+/// Focus area within the bulk rename overlay.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BulkRenameFocus {
+    /// Editing the template input field.
+    Template,
+    /// Navigating the preview list.
+    List,
+}
+
+/// State for the bulk rename wizard overlay.
+#[derive(Debug, Clone)]
+pub struct BulkRenameState {
+    /// Source file paths (absolute), index-aligned with metadata/stems/extensions.
+    pub sources: Vec<std::path::PathBuf>,
+    /// Cached metadata per source.
+    pub metadata: Vec<SourceMetadata>,
+    /// Original filename stems (no extension).
+    pub original_stems: Vec<String>,
+    /// File extensions (without dot).
+    pub extensions: Vec<String>,
+    /// Template input field.
+    pub template_input: crate::tui::text_input::TextInputState,
+    /// The current rename plan (rebuilt on every template change).
+    pub plan: crate::tui::rename_plan::RenamePlan,
+    /// Currently selected row in the preview list.
+    pub selected: usize,
+    /// Scroll offset.
+    pub scroll: usize,
+    /// Which part has focus.
+    pub focus: BulkRenameFocus,
+}
+
+impl BulkRenameState {
+    /// Create a new bulk rename state from source files + their metadata.
+    pub fn new(
+        base_dir: std::path::PathBuf,
+        sources: Vec<std::path::PathBuf>,
+        metadata: Vec<SourceMetadata>,
+    ) -> Self {
+        let original_stems: Vec<String> = sources
+            .iter()
+            .map(|p| {
+                p.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let extensions: Vec<String> = sources
+            .iter()
+            .map(|p| {
+                p.extension()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let default_template = "%NN% - %TITLE%".to_string();
+        let plan = crate::tui::rename_plan::RenamePlan::new(
+            base_dir,
+            Vec::new(),
+        );
+        let mut state = Self {
+            sources,
+            metadata,
+            original_stems,
+            extensions,
+            template_input: crate::tui::text_input::TextInputState::new(default_template),
+            plan,
+            selected: 0,
+            scroll: 0,
+            focus: BulkRenameFocus::Template,
+        };
+        state.rebuild_plan();
+        state
+    }
+
+    /// Rebuild the rename plan from the current template + metadata.
+    pub fn rebuild_plan(&mut self) {
+        let template = &self.template_input.text;
+        let has_ext_placeholder = template.contains("%EXT%");
+        let base_dir = self.plan.base_dir.clone();
+        let items: Vec<(std::path::PathBuf, String)> = self
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(i, src)| {
+                let resolved = crate::tui::rename_template::resolve_template(
+                    template,
+                    &self.metadata[i],
+                    &self.original_stems[i],
+                    &self.extensions[i],
+                );
+                // Append extension if the template doesn't include %EXT%.
+                let with_ext = if !has_ext_placeholder && !self.extensions[i].is_empty() {
+                    format!("{}.{}", resolved, self.extensions[i])
+                } else {
+                    resolved
+                };
+                let sanitized = crate::tui::rename_plan::sanitize_path(&with_ext)
+                    .unwrap_or(with_ext);
+                (src.clone(), sanitized)
+            })
+            .collect();
+        self.plan = crate::tui::rename_plan::RenamePlan::new(base_dir, items);
+        crate::tui::rename_plan::validate_plan(&mut self.plan);
+    }
 }
 
 /// Tab-completion state for the command input overlay.
