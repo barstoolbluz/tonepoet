@@ -645,7 +645,7 @@ fn run_config(show: bool, reset: bool, path: bool, config: &TonepoetConfig) -> a
 
 async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Result<()> {
     use crossterm::{
-        event::{EnableMouseCapture, DisableMouseCapture},
+        event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -656,7 +656,7 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -680,7 +680,7 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
     result.map_err(|e| anyhow::anyhow!("{}", e))

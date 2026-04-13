@@ -52,6 +52,7 @@ pub async fn run_app(
             match event::read()? {
                 Event::Key(key) => handle_key(app, key, &tx),
                 Event::Mouse(mouse) => handle_mouse(app, mouse, &tx),
+                Event::Paste(text) => handle_paste(app, &text),
                 Event::Resize(_, _) => {} // redraw handled by loop
                 _ => {}
             }
@@ -209,6 +210,78 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
             app.browse
                 .dir_stats_cache
                 .insert(path, std::sync::Arc::new(stats));
+        }
+    }
+}
+
+/// Handle a bracketed paste event. When the BulkRename overlay is active,
+/// multi-line paste replaces the template-derived targets line-by-line.
+/// In text input overlays, the pasted text is inserted at the cursor.
+fn handle_paste(app: &mut AppState, text: &str) {
+    match &app.active_overlay {
+        ActiveOverlay::BulkRename(_) => {
+            // Take the state out of the overlay so we can mutate it.
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            if let ActiveOverlay::BulkRename(mut state) = overlay {
+                let lines: Vec<&str> = text.lines().collect();
+                let op_count = state.plan.ops.len();
+                let applied = lines.len().min(op_count);
+                for (i, line) in lines.iter().take(op_count).enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match crate::tui::rename_plan::sanitize_path(trimmed) {
+                        Ok(sanitized) => {
+                            state.plan.ops[i].target_relative = sanitized;
+                        }
+                        Err(_) => {
+                            // Skip invalid lines; keep the template-derived name.
+                        }
+                    }
+                }
+                crate::tui::rename_plan::validate_plan(&mut state.plan);
+                app.set_status(&format!(
+                    "Pasted {} name{}", applied, if applied == 1 { "" } else { "s" }
+                ));
+                // Switch focus to list so the user can review.
+                state.focus = super::app::BulkRenameFocus::List;
+                app.active_overlay = ActiveOverlay::BulkRename(state);
+            }
+        }
+        // For text input overlays, insert the first line at the cursor.
+        ActiveOverlay::TextEdit { .. }
+        | ActiveOverlay::CommandInput { .. }
+        | ActiveOverlay::FileInput { .. } => {
+            let first_line = text.lines().next().unwrap_or("");
+            // Insert each character at the cursor via the text input's insert_char.
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            match overlay {
+                ActiveOverlay::TextEdit { mut input, target, label } => {
+                    for c in first_line.chars() {
+                        input.insert_char(c);
+                    }
+                    app.active_overlay = ActiveOverlay::TextEdit { input, target, label };
+                }
+                ActiveOverlay::CommandInput { mut input, completion } => {
+                    for c in first_line.chars() {
+                        input.insert_char(c);
+                    }
+                    app.active_overlay = ActiveOverlay::CommandInput { input, completion };
+                }
+                ActiveOverlay::FileInput { mut input } => {
+                    for c in first_line.chars() {
+                        input.insert_char(c);
+                    }
+                    app.active_overlay = ActiveOverlay::FileInput { input };
+                }
+                other => {
+                    app.active_overlay = other;
+                }
+            }
+        }
+        _ => {
+            // Paste ignored outside text-entry contexts.
         }
     }
 }
