@@ -225,7 +225,7 @@ fn handle_paste(app: &mut AppState, text: &str) {
             if let ActiveOverlay::BulkRename(mut state) = overlay {
                 let lines: Vec<&str> = text.lines().collect();
                 let op_count = state.plan.ops.len();
-                let applied = lines.len().min(op_count);
+                let mut applied = 0usize;
                 for (i, line) in lines.iter().take(op_count).enumerate() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -234,6 +234,7 @@ fn handle_paste(app: &mut AppState, text: &str) {
                     match crate::tui::rename_plan::sanitize_path(trimmed) {
                         Ok(sanitized) => {
                             state.plan.ops[i].target_relative = sanitized;
+                            applied += 1;
                         }
                         Err(_) => {
                             // Skip invalid lines; keep the template-derived name.
@@ -263,11 +264,12 @@ fn handle_paste(app: &mut AppState, text: &str) {
                     }
                     app.active_overlay = ActiveOverlay::TextEdit { input, target, label };
                 }
-                ActiveOverlay::CommandInput { mut input, completion } => {
+                ActiveOverlay::CommandInput { mut input, .. } => {
                     for c in first_line.chars() {
                         input.insert_char(c);
                     }
-                    app.active_overlay = ActiveOverlay::CommandInput { input, completion };
+                    // Clear completion — pasted text invalidates candidates.
+                    app.active_overlay = ActiveOverlay::CommandInput { input, completion: None };
                 }
                 ActiveOverlay::FileInput { mut input } => {
                     for c in first_line.chars() {

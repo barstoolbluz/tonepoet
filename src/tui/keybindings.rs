@@ -1423,7 +1423,11 @@ fn apply_cue_to_rename(app: &mut AppState, state: &mut BulkRenameState) {
             entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.extension().map(|e| e == "cue").unwrap_or(false))
+                .filter(|p| {
+                    p.extension()
+                        .map(|e| e.to_ascii_lowercase() == "cue")
+                        .unwrap_or(false)
+                })
                 .collect()
         })
         .unwrap_or_default();
