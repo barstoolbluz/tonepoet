@@ -324,6 +324,20 @@ pub struct BrowseState {
 
     /// Error message from last directory read, if any
     pub error: Option<String>,
+
+    /// When set, we're browsing inside an archive rather than the filesystem.
+    pub archive: Option<ArchiveBrowseState>,
+}
+
+/// State for browsing inside an archive.
+#[derive(Debug, Clone)]
+pub struct ArchiveBrowseState {
+    /// The parsed archive listing.
+    pub listing: super::archive_listing::ArchiveListing,
+    /// Current directory path inside the archive ("" = root).
+    pub inner_path: String,
+    /// Password used to open this archive (for re-listing / extraction).
+    pub password: Option<String>,
 }
 
 impl BrowseState {
@@ -356,6 +370,7 @@ impl BrowseState {
             dir_stats_pending: std::collections::HashSet::new(),
             return_target: BrowseReturnTarget::None,
             error: None,
+            archive: None,
         };
         state.refresh();
         state
@@ -363,8 +378,130 @@ impl BrowseState {
 
     /// Full refresh: re-scan disk, then re-apply the view filters/sort.
     pub fn refresh(&mut self) {
+        if self.archive.is_some() {
+            self.refresh_archive_view();
+            return;
+        }
         self.scan();
         self.apply_view();
+    }
+
+    /// Whether we're currently browsing inside an archive.
+    pub fn is_in_archive(&self) -> bool {
+        self.archive.is_some()
+    }
+
+    /// Enter an archive: set archive state and populate entries from listing.
+    pub fn enter_archive(
+        &mut self,
+        listing: super::archive_listing::ArchiveListing,
+        password: Option<String>,
+    ) {
+        self.archive = Some(ArchiveBrowseState {
+            listing,
+            inner_path: String::new(),
+            password,
+        });
+        self.multi_selected.clear();
+        self.refresh_archive_view();
+    }
+
+    /// Exit the archive and return to filesystem browsing.
+    pub fn exit_archive(&mut self) {
+        self.archive = None;
+        self.multi_selected.clear();
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+        self.refresh();
+    }
+
+    /// Navigate into a subdirectory inside the archive.
+    pub fn enter_archive_dir(&mut self, dir_path: &str) {
+        if let Some(ref mut arc) = self.archive {
+            arc.inner_path = dir_path.to_string();
+        }
+        self.multi_selected.clear();
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+        self.refresh_archive_view();
+    }
+
+    /// Navigate up one level inside the archive. Returns false if already
+    /// at archive root (caller should exit the archive entirely).
+    pub fn go_up_in_archive(&mut self) -> bool {
+        if let Some(ref mut arc) = self.archive {
+            if arc.inner_path.is_empty() {
+                return false; // At root — caller should exit archive.
+            }
+            // Go to parent directory inside archive.
+            arc.inner_path = match arc.inner_path.rfind('/') {
+                Some(pos) => arc.inner_path[..pos].to_string(),
+                None => String::new(),
+            };
+            self.multi_selected.clear();
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            self.refresh_archive_view();
+            return true;
+        }
+        false
+    }
+
+    /// Repopulate `entries` from the archive listing at the current inner path.
+    fn refresh_archive_view(&mut self) {
+        self.entries.clear();
+        self.parent_entry = None;
+
+        let arc = match &self.archive {
+            Some(a) => a,
+            None => return,
+        };
+
+        // Add parent-dir entry.
+        self.parent_entry = Some(BrowseEntry::new(
+            PathBuf::from(".."),
+            "..".to_string(),
+            EntryKind::ParentDir,
+            0,
+            None,
+        ));
+
+        let items = arc.listing.entries_at(&arc.inner_path);
+
+        // Convert ArchiveListItems to BrowseEntries.
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for item in &items {
+            let kind = if item.is_dir {
+                EntryKind::Directory
+            } else {
+                classify_file(Path::new(&item.name))
+            };
+            let entry = BrowseEntry::new(
+                arc.listing.archive_path.join(&item.full_path),
+                item.name.clone(),
+                kind,
+                item.size,
+                None,
+            );
+            if item.is_dir {
+                dirs.push(entry);
+            } else {
+                files.push(entry);
+            }
+        }
+
+        // Build entries: parent + dirs + files (same order as filesystem browse).
+        if let Some(ref parent) = self.parent_entry {
+            self.entries.push(parent.clone());
+        }
+        self.entries.extend(dirs);
+        self.entries.extend(files);
+
+        // Clamp selection.
+        if self.selected_index >= self.entries.len() && !self.entries.is_empty() {
+            self.selected_index = self.entries.len() - 1;
+        }
     }
 
     /// Read the directory from disk into `parent_entry` / `all_dirs` / `all_files`.

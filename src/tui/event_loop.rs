@@ -211,6 +211,24 @@ fn handle_message(app: &mut AppState, msg: AppMessage) {
                 .dir_stats_cache
                 .insert(path, std::sync::Arc::new(stats));
         }
+        AppMessage::ArchiveListingComplete { archive_path, result, password } => {
+            match *result {
+                Ok(listing) => {
+                    let count = listing.entries.len();
+                    app.browse.enter_archive(listing, password);
+                    app.set_status(&format!(
+                        "Opened {} ({} entries)",
+                        archive_path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        count,
+                    ));
+                }
+                Err(e) => {
+                    app.set_status(&format!("Archive error: {}", e));
+                }
+            }
+        }
     }
 }
 

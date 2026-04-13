@@ -529,17 +529,40 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             selection_may_have_changed = true;
         }
 
-        // Go up (parent directory)
+        // Go up (parent directory / archive level)
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Backspace, _) => {
-            app.browse.go_parent();
+            if app.browse.is_in_archive() {
+                if !app.browse.go_up_in_archive() {
+                    app.browse.exit_archive();
+                }
+            } else {
+                app.browse.go_parent();
+            }
             selection_may_have_changed = true;
         }
 
-        // Enter directory or select file
+        // Enter directory/archive or select file
         (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => {
             if let Some(entry) = app.browse.selected_entry() {
                 if entry.is_dir() {
-                    app.browse.enter_selected();
+                    if app.browse.is_in_archive() {
+                        // Navigate into subdirectory inside archive.
+                        let item_name = entry.path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let inner = if let Some(ref arc) = app.browse.archive {
+                            if arc.inner_path.is_empty() {
+                                item_name
+                            } else {
+                                format!("{}/{}", arc.inner_path, item_name)
+                            }
+                        } else {
+                            item_name
+                        };
+                        app.browse.enter_archive_dir(&inner);
+                    } else {
+                        app.browse.enter_selected();
+                    }
                     selection_may_have_changed = true;
                 }
             }
@@ -547,9 +570,52 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         (KeyCode::Enter, KeyModifiers::NONE) => {
             if let Some(entry) = app.browse.selected_entry() {
                 match &entry.kind {
+                    EntryKind::Directory | EntryKind::ParentDir if app.browse.is_in_archive() => {
+                        if matches!(entry.kind, EntryKind::ParentDir) {
+                            if !app.browse.go_up_in_archive() {
+                                app.browse.exit_archive();
+                            }
+                        } else {
+                            let item_name = entry.path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let inner = if let Some(ref arc) = app.browse.archive {
+                                if arc.inner_path.is_empty() {
+                                    item_name
+                                } else {
+                                    format!("{}/{}", arc.inner_path, item_name)
+                                }
+                            } else {
+                                item_name
+                            };
+                            app.browse.enter_archive_dir(&inner);
+                        }
+                        selection_may_have_changed = true;
+                    }
                     EntryKind::Directory | EntryKind::ParentDir => {
                         app.browse.enter_selected();
                         selection_may_have_changed = true;
+                    }
+                    EntryKind::Archive if !app.browse.is_in_archive() => {
+                        // Open archive for browsing: async list contents.
+                        let path = entry.path.clone();
+                        let password = app.archive_passwords.get(&path).cloned()
+                            .or_else(|| {
+                                app.keychain.ensure_loaded();
+                                app.keychain.passwords.first().cloned()
+                            });
+                        let tx = tx.clone();
+                        app.set_status("Loading archive...");
+                        tokio::spawn(async move {
+                            let result = super::archive_listing::list_archive(
+                                &path, password.as_deref(),
+                            ).await;
+                            let _ = tx.send(AppMessage::ArchiveListingComplete {
+                                archive_path: path,
+                                result: Box::new(result),
+                                password,
+                            }).await;
+                        });
                     }
                     EntryKind::AudioFile(_) | EntryKind::Archive => {
                         let path = entry.path.clone();

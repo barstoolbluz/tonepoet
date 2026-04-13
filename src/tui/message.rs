@@ -40,4 +40,10 @@ pub enum AppMessage {
         path: std::path::PathBuf,
         stats: crate::tui::browse::DirStats,
     },
+    /// Result of an async archive listing (`7zz l -slt`).
+    ArchiveListingComplete {
+        archive_path: std::path::PathBuf,
+        result: Box<Result<crate::tui::archive_listing::ArchiveListing, String>>,
+        password: Option<String>,
+    },
 }
