@@ -727,9 +727,20 @@ fn load_browse_selection(
             let mut count = 0;
             let options = crate::convert::ConversionOptions::default();
             for p in paths_to_add {
+                // Resolve archive password: keychain MRU → config → None.
+                let archive_pw = if p.extension().map(|e| e == "7z").unwrap_or(false) {
+                    app.keychain.ensure_loaded();
+                    app.keychain
+                        .passwords
+                        .first()
+                        .cloned()
+                        .or_else(|| app.config.conversion.archive_password.clone())
+                } else {
+                    None
+                };
                 if app
                     .manager
-                    .add_file_ready_for_processing(p, options.clone(), None)
+                    .add_file_ready_for_processing(p, options.clone(), archive_pw)
                     .is_ok()
                 {
                     count += 1;
