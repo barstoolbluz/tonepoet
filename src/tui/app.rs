@@ -967,6 +967,55 @@ pub enum TextEditTarget {
     /// the TextEdit input is the user-chosen name for the template.
     /// BulkRenameState parked in `pending_bulk_rename`.
     SaveRenameTemplate(String),
+    /// Add a new password to the keychain. The TextEdit input is the
+    /// password itself.
+    KeychainAdd,
+}
+
+/// State for the password keychain section on the Config screen.
+#[derive(Debug, Clone)]
+pub struct KeychainState {
+    /// Cached password list (loaded on first visit to Config screen).
+    pub passwords: Vec<String>,
+    /// Selected index in the password list.
+    pub selected: usize,
+    /// Whether passwords are shown in cleartext or masked.
+    pub reveal: bool,
+    /// Whether the keychain section is focused (vs the settings section).
+    pub focused: bool,
+    /// Whether passwords have been loaded from disk.
+    pub loaded: bool,
+}
+
+impl Default for KeychainState {
+    fn default() -> Self {
+        Self {
+            passwords: Vec::new(),
+            selected: 0,
+            reveal: false,
+            focused: false,
+            loaded: false,
+        }
+    }
+}
+
+impl KeychainState {
+    /// Load passwords from disk if not already loaded.
+    pub fn ensure_loaded(&mut self) {
+        if !self.loaded {
+            self.passwords = crate::tui::keychain::load_keychain();
+            self.loaded = true;
+        }
+    }
+
+    /// Reload from disk (e.g., after add/remove).
+    pub fn reload(&mut self) {
+        self.passwords = crate::tui::keychain::load_keychain();
+        self.loaded = true;
+        if self.selected >= self.passwords.len() && !self.passwords.is_empty() {
+            self.selected = self.passwords.len() - 1;
+        }
+    }
 }
 
 /// What action a confirmation dialog will perform
@@ -1043,6 +1092,9 @@ pub struct AppState {
     /// Bookmarks list + overlay state (persisted to ~/.config/tonepoet/bookmarks.toml).
     pub bookmarks: crate::tui::bookmarks::BookmarksState,
 
+    /// Password keychain state for the Config screen.
+    pub keychain: KeychainState,
+
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
@@ -1097,6 +1149,7 @@ impl AppState {
             pending_browse_rename: None,
             recent: crate::tui::recent_files::RecentFilesState::load(),
             bookmarks: crate::tui::bookmarks::BookmarksState::load(),
+            keychain: KeychainState::default(),
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }

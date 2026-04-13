@@ -74,30 +74,40 @@ fn draw_wizard_screen(f: &mut Frame, app: &mut AppState) {
     }
 }
 
-/// Draw settings screen showing conversion configuration
+/// Draw settings screen showing conversion configuration + password keychain
 fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut AppState) {
     use ratatui::widgets::{Block, Borders};
     use ratatui::style::Modifier;
     use super::theme;
 
-    // Use convert screen layout with just footer for tab navigation
+    // Ensure keychain is loaded on first visit.
+    app.keychain.ensure_loaded();
+
+    // Top-level: settings pane + keychain pane + footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),
-            Constraint::Length(2),
+            Constraint::Length(12), // conversion settings
+            Constraint::Min(6),    // keychain
+            Constraint::Length(2), // footer
         ])
         .split(area);
 
-    let block = Block::default()
+    // ── Conversion settings pane ─────────────────────────────────
+    let settings_border = if !app.keychain.focused {
+        theme::CYAN
+    } else {
+        theme::TEXT_DIM
+    };
+    let settings_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::TEXT_DIM))
+        .border_style(Style::default().fg(settings_border))
         .title(Span::styled(
             " Conversion Settings ",
             Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
         ));
-    let inner = block.inner(chunks[0]);
-    f.render_widget(block, chunks[0]);
+    let settings_inner = settings_block.inner(chunks[0]);
+    f.render_widget(settings_block, chunks[0]);
 
     let cfg = &app.config.conversion;
 
@@ -108,7 +118,7 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(system default)".to_string());
 
-    let lines = vec![
+    let settings_lines = vec![
         Line::from(vec![
             Span::styled("  Backend:              ", theme::muted()),
             Span::styled(&cfg.preferred_backend, theme::bright()),
@@ -153,19 +163,88 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
             Span::styled("  Scratch directory:    ", theme::muted()),
             Span::styled(scratch_str, theme::bright()),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Edit ~/.config/tonepoet/config.toml to change settings",
-            theme::muted(),
-        )),
     ];
 
-    let p = Paragraph::new(lines);
-    f.render_widget(p, inner);
+    f.render_widget(Paragraph::new(settings_lines), settings_inner);
+
+    // ── Password keychain pane ───────────────────────────────────
+    let kc_border = if app.keychain.focused {
+        theme::AMBER
+    } else {
+        theme::TEXT_DIM
+    };
+    let kc_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(kc_border))
+        .title(Span::styled(
+            " Archive Passwords ",
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        ));
+    let kc_inner = kc_block.inner(chunks[1]);
+    f.render_widget(kc_block, chunks[1]);
+
+    if kc_inner.height < 2 {
+        // Too small to render anything.
+    } else if app.keychain.passwords.is_empty() {
+        let empty_lines = vec![
+            Line::from(Span::styled(
+                "  No saved passwords",
+                theme::muted(),
+            )),
+            Line::from(Span::styled(
+                "  Press 'a' to add a password",
+                theme::muted(),
+            )),
+        ];
+        f.render_widget(Paragraph::new(empty_lines), kc_inner);
+    } else {
+        let visible_rows = kc_inner.height as usize;
+        let total = app.keychain.passwords.len();
+        let selected = app.keychain.selected.min(total.saturating_sub(1));
+
+        // Simple scroll to keep selected in view.
+        let scroll = if selected >= visible_rows {
+            selected + 1 - visible_rows
+        } else {
+            0
+        };
+
+        for row in 0..visible_rows {
+            let idx = scroll + row;
+            if idx >= total {
+                break;
+            }
+            let pw = &app.keychain.passwords[idx];
+            let is_sel = idx == selected && app.keychain.focused;
+
+            let display = if app.keychain.reveal {
+                format!("  {} {}", idx + 1, pw)
+            } else {
+                let masked: String = std::iter::repeat('*').take(pw.len().min(20)).collect();
+                format!("  {} {}", idx + 1, masked)
+            };
+
+            let style = if is_sel {
+                Style::default()
+                    .bg(ratatui::style::Color::Rgb(52, 56, 80))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+
+            let row_area = ratatui::layout::Rect::new(
+                kc_inner.x,
+                kc_inner.y + row as u16,
+                kc_inner.width,
+                1,
+            );
+            f.render_widget(Paragraph::new(Span::styled(display, style)), row_area);
+        }
+    }
 
     // Footer
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
-    super::draw_footer::draw_footer(f, chunks[1], app.current_screen, &mut app.button_map, status_msg);
+    super::draw_footer::draw_footer(f, chunks[2], app.current_screen, &mut app.button_map, status_msg);
 }
 
 /// Draw a placeholder screen for unimplemented tabs

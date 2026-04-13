@@ -159,8 +159,65 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         AppScreen::Convert => handle_convert_key(app, key, tx),
         AppScreen::Browse => handle_browse_key(app, key, tx),
         AppScreen::Queue => handle_queue_key(app, key, tx),
+        AppScreen::Config => handle_config_key(app, key),
         AppScreen::Wizard => handle_wizard_key(app, key),
         _ => {} // placeholder screens
+    }
+}
+
+// ── Config screen keybindings ────────────────────────────────────────
+
+fn handle_config_key(app: &mut AppState, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        // Tab toggles focus between settings and keychain panes.
+        (KeyCode::Tab, KeyModifiers::NONE) | (KeyCode::BackTab, KeyModifiers::SHIFT) => {
+            app.keychain.focused = !app.keychain.focused;
+        }
+        _ => {}
+    }
+
+    if !app.keychain.focused {
+        return;
+    }
+
+    // Keychain-focused keys.
+    let total = app.keychain.passwords.len();
+    match (key.code, key.modifiers) {
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            if app.keychain.selected > 0 {
+                app.keychain.selected -= 1;
+            }
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            if app.keychain.selected + 1 < total {
+                app.keychain.selected += 1;
+            }
+        }
+        // Toggle password visibility.
+        (KeyCode::Char('v'), KeyModifiers::NONE) => {
+            app.keychain.reveal = !app.keychain.reveal;
+        }
+        // Add a new password.
+        (KeyCode::Char('a'), KeyModifiers::NONE) => {
+            app.active_overlay = ActiveOverlay::TextEdit {
+                input: super::text_input::TextInputState::empty(),
+                target: TextEditTarget::KeychainAdd,
+                label: "new password".to_string(),
+            };
+        }
+        // Delete selected password.
+        (KeyCode::Char('d'), KeyModifiers::NONE) => {
+            if total > 0 {
+                match super::keychain::remove_password(app.keychain.selected) {
+                    Ok(()) => {
+                        app.keychain.reload();
+                        app.set_status("Password removed");
+                    }
+                    Err(e) => app.set_status(&format!("Remove failed: {}", e)),
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1857,6 +1914,17 @@ fn apply_text_edit(
                     crate::tui::rename_plan::validate_plan(&mut rename_state.plan);
                 }
                 app.active_overlay = ActiveOverlay::BulkRename(rename_state);
+            }
+        }
+        TextEditTarget::KeychainAdd => {
+            if !trimmed.is_empty() {
+                match super::keychain::add_password(trimmed) {
+                    Ok(()) => {
+                        app.keychain.reload();
+                        app.set_status("Password added");
+                    }
+                    Err(e) => app.set_status(&format!("Add failed: {}", e)),
+                }
             }
         }
     }
