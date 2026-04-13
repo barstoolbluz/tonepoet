@@ -2854,6 +2854,13 @@ fn retry_failed(app: &mut AppState) {
 
 /// Handle mouse events
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
+    // Hover tracking: update hover_target on every mouse move.
+    if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
+        let new_hover = app.button_map.find_button_at(mouse.column, mouse.row);
+        app.hover_target = new_hover;
+        return; // Move events don't trigger actions.
+    }
+
     // Scroll wheel: route to the browse list if the cursor is over it.
     if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
         if app.current_screen == AppScreen::Browse {

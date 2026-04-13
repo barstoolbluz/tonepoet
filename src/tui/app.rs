@@ -1051,6 +1051,10 @@ pub struct AppState {
     pub manager: ConversionManager,
     pub db: crate::db::Database,
 
+    /// The button currently under the mouse cursor (updated on MouseEventKind::Moved).
+    /// Renderers check this to apply hover highlighting.
+    pub hover_target: Option<crate::tui::button_map::TuiButton>,
+
     // Navigation
     pub current_screen: AppScreen,
     pub previous_screen: Option<AppScreen>,
@@ -1187,6 +1191,7 @@ impl AppState {
             bookmarks,
             keychain: KeychainState::default(),
             archive_passwords: std::collections::HashMap::new(),
+            hover_target: None,
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }

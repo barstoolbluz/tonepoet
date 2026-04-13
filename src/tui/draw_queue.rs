@@ -62,7 +62,8 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         let y = inner.y + i as u16;
         let item_area = Rect::new(inner.x, y, inner.width, 1);
 
-        draw_queue_item(f, item_area, item, idx == app.selected_index, app);
+        let is_hovered = app.hover_target == Some(TuiButton::QueueItem(idx));
+        draw_queue_item(f, item_area, item, idx == app.selected_index, is_hovered, app);
         app.button_map.record_button(TuiButton::QueueItem(idx), item_area);
     }
 }
@@ -73,6 +74,7 @@ fn draw_queue_item(
     area: Rect,
     item: &ConversionItem,
     is_selected: bool,
+    is_hovered: bool,
     _app: &AppState,
 ) {
     if area.width < 10 {
@@ -122,9 +124,11 @@ fn draw_queue_item(
     ];
     spans.extend(status_spans);
 
-    // Apply row highlight for selected item
+    // Apply row highlight for selected/hovered item
     let row_style = if is_selected {
         Style::default().bg(Color::Rgb(30, 30, 50))
+    } else if is_hovered {
+        Style::default().bg(super::theme::HOVER_BG)
     } else {
         Style::default()
     };

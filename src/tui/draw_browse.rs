@@ -51,7 +51,8 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         .split(chunks[4]);
 
     let list_area = content_chunks[0];
-    draw_browse_list(f, list_area, &mut app.browse);
+    let hover = app.hover_target;
+    draw_browse_list(f, list_area, &mut app.browse, hover);
     draw_browse_info(f, content_chunks[1], &app.browse, &mut app.button_map);
 
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
@@ -190,7 +191,12 @@ fn truncate_left(s: &str, max: usize) -> String {
 
 /// Draw the directory listing (left pane) with a sortable column header row.
 /// Reserves an extra row for the live filter input when one is active.
-fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
+fn draw_browse_list(
+    f: &mut Frame,
+    area: Rect,
+    browse: &mut BrowseState,
+    hover: Option<super::button_map::TuiButton>,
+) {
     if area.height < 4 || area.width < 20 {
         return;
     }
@@ -274,6 +280,8 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
             let entry = &browse.entries[i];
             let is_selected = i == browse.selected_index;
             let is_checked = browse.is_multi_selected(&entry.path);
+            let is_hovered = !is_selected
+                && hover == Some(super::button_map::TuiButton::BrowseEntry(i));
             lines.push(render_entry_line(
                 border_color,
                 w,
@@ -281,6 +289,7 @@ fn draw_browse_list(f: &mut Frame, area: Rect, browse: &mut BrowseState) {
                 entry,
                 is_selected,
                 is_checked,
+                is_hovered,
             ));
         }
 
@@ -402,6 +411,7 @@ fn render_entry_line(
     entry: &BrowseEntry,
     is_selected: bool,
     is_checked: bool,
+    is_hovered: bool,
 ) -> Line<'static> {
     // Cursor indicator
     let cursor = if is_selected { "▸ " } else { "  " };
@@ -479,12 +489,18 @@ fn render_entry_line(
         spans.push(last);
     }
 
-    // Selected row gets a subtle bg highlight
-    if is_selected {
+    // Selected row gets a subtle bg highlight; hovered row gets a dimmer one.
+    let bg = if is_selected {
+        Some(theme::BORDER_DIM)
+    } else if is_hovered {
+        Some(theme::HOVER_BG)
+    } else {
+        None
+    };
+    if let Some(bg_color) = bg {
         for span in spans.iter_mut() {
             if !matches!(span.content.as_ref(), "│") {
-                let current = span.style;
-                span.style = current.bg(theme::BORDER_DIM);
+                span.style = span.style.bg(bg_color);
             }
         }
     }
