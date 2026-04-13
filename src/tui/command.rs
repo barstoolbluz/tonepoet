@@ -34,7 +34,10 @@ pub const COMMAND_NAMES: &[&str] = &[
     "h", "help",
     "sort", "sortdir",
     "filter",
-    "rename", "mv",
+    "rename",
+    "del", "delete", "trash",
+    "cp", "cp!", "copy", "copy!",
+    "mv", "mv!", "move", "move!",
     "browse", "b",
     "recent", "recents",
     "bookmarks", "bm",
@@ -199,6 +202,9 @@ pub enum Command {
     /// Rename the current browse selection to the given name.
     /// Empty arg opens the rename overlay seeded with the current name.
     Rename(String),
+    /// Move selected browse file(s) to the system trash (XDG Trash on
+    /// Linux, Finder Trash on macOS). Shows confirmation first.
+    Delete,
     /// Copy selected file(s) to a destination. Empty arg opens a TextEdit
     /// picker. `:cp!` variant replaces existing files.
     Copy { dest: String, force: bool },
@@ -277,6 +283,7 @@ pub fn parse_command(input: &str) -> Command {
             let arg = if args.is_empty() { None } else { Some(args.to_string()) };
             Command::Filter(arg)
         }
+        "del" | "delete" | "trash" => Command::Delete,
         "rename" => Command::Rename(args.to_string()),
         "cp" | "copy" => Command::Copy { dest: args.to_string(), force: false },
         "cp!" | "copy!" => Command::Copy { dest: args.to_string(), force: true },
@@ -504,7 +511,7 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e :o :cd :browse :rename :cp :mv :queue :convert :commit :Commit :go :start :expand :recent :bm :preset :saveas :set :sort :filter :help");
+            app.set_status(":q :e :o :cd :browse :rename :del :cp :mv :queue :convert :commit :Commit :go :start :expand :recent :bm :preset :saveas :set :sort :filter :help");
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
@@ -524,6 +531,9 @@ pub fn execute_command(
         }
         Command::Filter(arg) => {
             execute_filter(app, arg.as_deref());
+        }
+        Command::Delete => {
+            execute_delete(app);
         }
         Command::Rename(new_name) => {
             execute_rename(app, &new_name, tx);
@@ -973,6 +983,27 @@ fn execute_go(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     }
     // start_processing handles the zero-ready-items case itself.
     super::convert_actions::start_processing(app, tx);
+}
+
+/// Execute `:del` / `:delete` / `:trash` — show confirmation, then move
+/// selected browse entries to the system trash.
+fn execute_delete(app: &mut AppState) {
+    if app.current_screen != AppScreen::Browse {
+        app.set_status(":del only works on the Browse screen");
+        return;
+    }
+
+    let paths = collect_selection_for_file_ops(app);
+    if paths.is_empty() {
+        app.set_status("no files selected");
+        return;
+    }
+
+    let count = paths.len();
+    app.active_overlay = ActiveOverlay::Confirmation {
+        message: format!("Move {} item(s) to trash?", count),
+        action: ConfirmAction::TrashSelection(paths),
+    };
 }
 
 /// Execute a `:cp` / `:mv` command. Collects selected files on Browse,

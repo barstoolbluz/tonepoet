@@ -847,6 +847,8 @@ pub enum ConfirmAction {
     ClearCompleted,
     StopAll,
     ClearQueue,
+    /// Move the given paths to the system trash (XDG Trash / Finder Trash).
+    TrashSelection(Vec<PathBuf>),
 }
 
 // ── Main application state ───────────────────────────────────────────

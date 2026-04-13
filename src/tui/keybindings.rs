@@ -887,7 +887,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.active_overlay = ActiveOverlay::None;
-                    execute_confirm_action(app, &action);
+                    execute_confirm_action(app, &action, tx);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     app.active_overlay = ActiveOverlay::None;
@@ -2032,7 +2032,11 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
 
 // ── Helper functions ─────────────────────────────────────────────────
 
-fn execute_confirm_action(app: &mut AppState, action: &ConfirmAction) {
+fn execute_confirm_action(
+    app: &mut AppState,
+    action: &ConfirmAction,
+    tx: &mpsc::Sender<AppMessage>,
+) {
     match action {
         ConfirmAction::RemoveSelected => {
             let removed = app.manager.remove_selected();
@@ -2050,6 +2054,27 @@ fn execute_confirm_action(app: &mut AppState, action: &ConfirmAction) {
         ConfirmAction::ClearQueue => {
             app.manager.clear_queue();
             app.set_status("Cleared queue");
+        }
+        ConfirmAction::TrashSelection(paths) => {
+            let mut trashed = 0usize;
+            let mut errors = 0usize;
+            for path in paths {
+                match trash::delete(path) {
+                    Ok(()) => trashed += 1,
+                    Err(e) => {
+                        log::warn!("trash: {}: {}", path.display(), e);
+                        errors += 1;
+                    }
+                }
+            }
+            app.browse.clear_multi_selection();
+            app.browse.refresh();
+            app.browse.probe_current(tx);
+            let mut parts = vec![format!("trashed {} item(s)", trashed)];
+            if errors > 0 {
+                parts.push(format!("{} errors", errors));
+            }
+            app.set_status(parts.join(", "));
         }
     }
 }
@@ -2730,7 +2755,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 if let ActiveOverlay::Confirmation { action, .. } = &app.active_overlay {
                     let action = action.clone();
                     app.active_overlay = ActiveOverlay::None;
-                    execute_confirm_action(app, &action);
+                    execute_confirm_action(app, &action, tx);
                 }
             }
             TuiButton::OverlayCancel => {

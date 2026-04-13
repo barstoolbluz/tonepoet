@@ -56,6 +56,8 @@ pub enum ContextAction {
     OpenEntry,
     /// Rename the selected file (F2 / `:rename`).
     RenameEntry,
+    /// Move selected file(s) to the system trash.
+    MoveToTrash,
     /// Copy the full path of the selected entry to the clipboard.
     CopyPath(PathBuf),
     /// Edit a metadata field on the selected audio file.
@@ -248,6 +250,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
             items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
             items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
+            items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
@@ -258,6 +261,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
             items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
             items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
+            items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
@@ -265,6 +269,11 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item_with_shortcut("Go up", ContextAction::OpenEntry, "←"));
         }
         EntryKind::OtherFile => {
+            items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
+            items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
+            items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
+            items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
+            items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
     }
@@ -449,6 +458,10 @@ pub fn execute_context_action(
         }
         ContextAction::EditMetadata(field) => {
             super::command::execute_edit_metadata_pub(app, field);
+        }
+        ContextAction::MoveToTrash => {
+            let cmd = super::command::Command::Delete;
+            super::command::execute_command(app, cmd, tx);
         }
         ContextAction::CopyTo => {
             let cmd = super::command::Command::Copy { dest: String::new(), force: false };
