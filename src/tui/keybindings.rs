@@ -617,6 +617,34 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                             }).await;
                         });
                     }
+                    EntryKind::AudioFile(_) if app.browse.is_in_archive() => {
+                        // Inside an archive: extract selected files to temp before loading.
+                        // The synthetic path is archive_path/inner_path — extract the inner part.
+                        if let Some(ref arc) = app.browse.archive {
+                            let archive_path = arc.listing.archive_path.clone();
+                            let password = arc.password.clone();
+                            // Derive inner path from the synthetic path.
+                            let inner = entry.path.strip_prefix(&archive_path)
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            if !inner.is_empty() {
+                                let tx = tx.clone();
+                                let scratch = app.config.conversion.scratch_directory.clone();
+                                app.set_status("Extracting from archive...");
+                                tokio::spawn(async move {
+                                    let result = extract_from_archive(
+                                        &archive_path, &inner, password.as_deref(), scratch.as_deref(),
+                                    ).await;
+                                    let _ = tx.send(AppMessage::StatusMessage(
+                                        match &result {
+                                            Ok(p) => format!("Extracted: {}", p.display()),
+                                            Err(e) => format!("Extract failed: {}", e),
+                                        }
+                                    )).await;
+                                });
+                            }
+                        }
+                    }
                     EntryKind::AudioFile(_) | EntryKind::Archive => {
                         let path = entry.path.clone();
                         let target = app.browse.return_target;
@@ -746,6 +774,61 @@ pub fn load_browse_selection_pub(
     target: super::browse::BrowseReturnTarget,
 ) {
     load_browse_selection(app, path, target);
+}
+
+/// Extract a specific file from an archive to a scratch/temp directory.
+/// Returns the path to the extracted file on success.
+async fn extract_from_archive(
+    archive: &std::path::Path,
+    inner_path: &str,
+    password: Option<&str>,
+    scratch: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    use tokio::process::Command;
+
+    let bin = crate::detect_7z_binary()
+        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+
+    // Extract to a temp directory under scratch or system temp.
+    let base = scratch
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    let extract_dir = base.join(format!(
+        "tonepoet_extract_{}",
+        archive
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "archive".into())
+    ));
+    std::fs::create_dir_all(&extract_dir)
+        .map_err(|e| format!("mkdir: {}", e))?;
+
+    let mut cmd = Command::new(bin);
+    cmd.arg("x")
+        .arg(archive)
+        .arg(format!("-o{}", extract_dir.display()))
+        .arg("-y")
+        .arg(inner_path); // Extract only this specific file.
+    if let Some(pw) = password {
+        cmd.arg(format!("-p{}", pw));
+    }
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+
+    let output = cmd.output().await
+        .map_err(|e| format!("failed to run {}: {}", bin, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("extraction failed: {}", stderr.trim()));
+    }
+
+    let extracted = extract_dir.join(inner_path);
+    if extracted.exists() {
+        Ok(extracted)
+    } else {
+        Err("extracted file not found (path mismatch)".into())
+    }
 }
 
 fn load_browse_selection(
