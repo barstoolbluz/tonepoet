@@ -1354,6 +1354,9 @@ fn handle_bulk_rename_key(
                         return;
                     }
                 }
+                KeyCode::Char('c') => {
+                    apply_cue_to_rename(app, &mut state);
+                }
                 _ => {}
             }
         }
@@ -1405,6 +1408,87 @@ pub fn open_bulk_rename(app: &mut AppState, paths: Vec<std::path::PathBuf>) {
 
     let state = BulkRenameState::new(base_dir, paths, metadata);
     app.active_overlay = ActiveOverlay::BulkRename(Box::new(state));
+}
+
+/// Load a CUE sheet from the base directory and override the BulkRename
+/// metadata with CUE track data. Matches CUE tracks to source files by
+/// FILE reference, then by sequential order. Rebuilds the plan afterwards.
+fn apply_cue_to_rename(app: &mut AppState, state: &mut BulkRenameState) {
+    let base_dir = &state.plan.base_dir;
+
+    // Scan for .cue files in the base directory.
+    let cue_files: Vec<std::path::PathBuf> = std::fs::read_dir(base_dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|e| e == "cue").unwrap_or(false))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if cue_files.is_empty() {
+        app.set_status("No .cue files found in this directory");
+        return;
+    }
+
+    let cue_path = &cue_files[0];
+    let sheet = match super::cue_parser::parse_cue_file(cue_path) {
+        Ok(s) => s,
+        Err(e) => {
+            app.set_status(&format!("CUE parse error: {}", e));
+            return;
+        }
+    };
+
+    if sheet.tracks.is_empty() {
+        app.set_status("CUE file contains no tracks");
+        return;
+    }
+
+    // Map CUE tracks → source files.
+    // 1. Try FILE reference match (for track-by-track CUEs).
+    // 2. Fall back to sequential (CUE track index → source index).
+    let mut matched = 0usize;
+    for (i, source) in state.sources.iter().enumerate() {
+        let source_name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let cue_track = sheet
+            .tracks
+            .iter()
+            .find(|t| t.file.as_deref() == Some(source_name.as_str()))
+            .or_else(|| sheet.tracks.get(i));
+
+        if let Some(track) = cue_track {
+            state.metadata[i].track_number = Some(track.number);
+            if let Some(ref title) = track.title {
+                state.metadata[i].title = Some(title.clone());
+            }
+            if let Some(ref performer) = track.performer {
+                state.metadata[i].artist = Some(performer.clone());
+            }
+            if let Some(ref album) = sheet.title {
+                state.metadata[i].album = Some(album.clone());
+            }
+            matched += 1;
+        }
+    }
+
+    state.rebuild_plan();
+    let cue_name = cue_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    app.set_status(&format!(
+        "Loaded {} ({}/{} tracks matched)",
+        cue_name,
+        matched,
+        sheet.tracks.len()
+    ));
 }
 
 /// Handle key events for the BatchList expand overlay. Moves the Batch
