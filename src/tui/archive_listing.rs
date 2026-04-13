@@ -210,6 +210,22 @@ fn parse_slt_output(output: &str, archive: &Path) -> Result<ArchiveListing, Stri
 
         if let Some((key, value)) = parse_kv(trimmed) {
             if in_entries {
+                // 7zz v25+ doesn't always emit "----------" between entries.
+                // A new "Path = ..." while we already have a path signals
+                // the start of the next entry.
+                if key == "Path" {
+                    if let Some(builder) = current.take() {
+                        if builder.path.is_some() {
+                            if let Some(entry) = builder.build() {
+                                entries.push(entry);
+                            }
+                        }
+                    }
+                    let mut new_builder = EntryBuilder::default();
+                    new_builder.set(key, value);
+                    current = Some(new_builder);
+                    continue;
+                }
                 if let Some(ref mut builder) = current {
                     builder.set(key, value);
                 }
@@ -403,5 +419,57 @@ Encrypted = -
         let output = "----------\nPath = secret.flac\nSize = 100\nEncrypted = +\n";
         let listing = parse_slt_output(output, Path::new("test.7z")).unwrap();
         assert!(listing.entries[0].encrypted);
+    }
+
+    /// 7zz v25+ doesn't emit "----------" between entries — only before the
+    /// first one. Entries are delimited by the next "Path = ..." line.
+    #[test]
+    fn no_separator_between_entries() {
+        let output = r#"
+--
+Path = /tmp/test.7z
+Type = 7z
+Physical Size = 1000
+
+----------
+Path = Album
+Size = 0
+Packed Size = 0
+Attributes = D
+Encrypted = -
+
+Path = Album/01 - Song.flac
+Size = 30000000
+Packed Size = 25000000
+Attributes = A
+Encrypted = +
+
+Path = Album/02 - Track.flac
+Size = 28000000
+Packed Size = 23000000
+Attributes = A
+Encrypted = +
+
+Path = cover.jpg
+Size = 500000
+Packed Size = 490000
+Attributes = A
+Encrypted = -
+"#;
+        let listing = parse_slt_output(output, Path::new("/tmp/test.7z")).unwrap();
+        assert_eq!(listing.entries.len(), 4);
+        assert_eq!(listing.entries[0].path, "Album");
+        assert!(listing.entries[0].is_dir);
+        assert_eq!(listing.entries[1].path, "Album/01 - Song.flac");
+        assert!(!listing.entries[1].is_dir);
+        assert!(listing.entries[1].encrypted);
+        assert_eq!(listing.entries[2].path, "Album/02 - Track.flac");
+        assert_eq!(listing.entries[3].path, "cover.jpg");
+
+        // entries_at should work for subdirectory
+        let album = listing.entries_at("Album");
+        assert_eq!(album.len(), 2);
+        assert_eq!(album[0].name, "01 - Song.flac");
+        assert_eq!(album[1].name, "02 - Track.flac");
     }
 }
