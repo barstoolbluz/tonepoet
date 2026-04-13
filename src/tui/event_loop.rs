@@ -270,9 +270,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             match result {
                 Ok(path) => {
                     let display = path.display().to_string();
-                    app.browse.current_dir = path;
-                    app.browse.selected_index = 0;
-                    app.browse.refresh();
+                    app.browse.navigate_to(path);
                     app.set_status(&format!("cd: {}", display));
                 }
                 Err(e) => {
@@ -285,15 +283,19 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             if app.browse.current_dir != path {
                 return;
             }
-            // Clear the scan handle.
-            app.browse.scan_pending = None;
 
             if let Some(err) = error {
-                if err != "cancelled" {
-                    app.browse.error = Some(err);
+                if err == "cancelled" {
+                    // Don't clear scan_pending — a newer scan is in flight.
+                    return;
                 }
+                app.browse.scan_pending = None;
+                app.browse.error = Some(err);
                 return;
             }
+
+            // Success — clear the scan handle.
+            app.browse.scan_pending = None;
 
             // Populate raw scan results.
             app.browse.parent_entry = parent_entry;
