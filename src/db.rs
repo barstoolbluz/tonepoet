@@ -359,15 +359,15 @@ impl Database {
         original.with_file_name(name)
     }
 
-    /// Create a backup via hardlink (instant, same-fs) or copy (cross-fs fallback).
+    /// Create a backup by copying the file. We MUST copy, not hardlink:
+    /// hardlinks share the same inode, so in-place writes by lofty would
+    /// corrupt both the original AND the "backup". A copy has its own
+    /// inode and is immune to writes to the original.
     fn create_backup(
         original: &std::path::Path,
         backup: &std::path::Path,
     ) -> Result<(), String> {
         let _ = std::fs::remove_file(backup); // Remove stale backup.
-        if std::fs::hard_link(original, backup).is_ok() {
-            return Ok(());
-        }
         std::fs::copy(original, backup)
             .map_err(|e| format!("backup failed: {}", e))?;
         Ok(())
