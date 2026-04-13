@@ -588,7 +588,8 @@ fn run_check_tools() {
 
             let extra_tools: Vec<(&str, &str, Vec<&str>)> = vec![
                 ("ffprobe", "Audio stream analysis", vec!["-version"]),
-                ("7z", "Archive extraction", vec![]),
+                ("7zz", "Archive extraction (native 7-Zip)", vec!["--help"]),
+                ("7z", "Archive extraction (p7zip fallback)", vec![]),
                 ("opustags", "Opus metadata editing", vec!["--help"]),
                 ("wvtag", "WavPack metadata editing", vec!["--version"]),
                 ("AtomicParsley", "M4A/AAC metadata editing", vec!["--version"]),

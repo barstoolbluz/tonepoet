@@ -2045,21 +2045,25 @@ async fn extract_and_convert_7z(
         None,
     ).await;
     
-    // Extract 7z archive with progress tracking
+    // Extract archive with progress tracking.
+    // Prefer the official 7zz (native SIMD, 2-3x faster) over p7zip's 7z.
+    let sz_bin = crate::detect_7z_binary()
+        .unwrap_or("7z");
     let password = item.archive_password.as_deref();
-    let mut cmd = TokioCommand::new("7z");
+    let mut cmd = TokioCommand::new(sz_bin);
     cmd.arg("x")
-        .arg(&item.input_path);
+        .arg(&item.input_path)
+        .arg("-mmt=on"); // Multi-threaded decompression
     if let Some(pw) = password {
         cmd.arg(&format!("-p{}", pw));
     }
     let child = cmd
         .arg(&format!("-o{}", extract_path.display()))
         .arg("-y") // Yes to all prompts
-        .stdout(std::process::Stdio::piped())  // Capture stdout for error reporting
-        .stderr(std::process::Stdio::piped())  // Capture stderr for error reporting
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| ConversionError::ToolError(format!("Failed to spawn 7z: {}", e)))?;
+        .map_err(|e| ConversionError::ToolError(format!("Failed to spawn {}: {}", sz_bin, e)))?;
     
     // Get archive size for time estimation
     let archive_size = std::fs::metadata(&item.input_path)

@@ -78,7 +78,7 @@
           opusfile
           wavpack
           lame
-          p7zip
+          _7zz
           atomicparsley
         ]);
 

@@ -97,13 +97,17 @@ pub fn promote_password(password: &str) -> Result<(), String> {
     add_password(password)
 }
 
-/// Test an archive with a specific password using `7z t`.
+/// Test an archive with a specific password using the best available
+/// 7-Zip binary (`7zz` preferred over `7z`).
 /// Returns Ok(true) if the password works, Ok(false) if wrong password,
 /// Err on tool failure.
 pub async fn test_password(archive: &std::path::Path, password: &str) -> Result<bool, String> {
     use tokio::process::Command;
 
-    let mut cmd = Command::new("7z");
+    let bin = crate::detect_7z_binary()
+        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+
+    let mut cmd = Command::new(bin);
     cmd.arg("t")
         .arg(archive)
         .arg(format!("-p{}", password))
@@ -114,9 +118,9 @@ pub async fn test_password(archive: &std::path::Path, password: &str) -> Result<
     let output = cmd
         .output()
         .await
-        .map_err(|e| format!("failed to run 7z: {}", e))?;
+        .map_err(|e| format!("failed to run {}: {}", bin, e))?;
 
-    // 7z exit codes: 0 = ok, 2 = fatal error (includes wrong password)
+    // 7z/7zz exit codes: 0 = ok, 2 = fatal error (includes wrong password)
     Ok(output.status.success())
 }
 
