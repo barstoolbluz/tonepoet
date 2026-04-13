@@ -782,31 +782,37 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     let total = state.plan.ops.len();
     let pending = state.plan.pending_count();
     let conflicts = state.plan.conflict_count();
-    let skipped = total - pending - conflicts;
-    let summary = Line::from(vec![
+    let failed = state.plan.ops.iter()
+        .filter(|op| matches!(op.status, OpStatus::Failed(_)))
+        .count();
+    let skipped = total.saturating_sub(pending + conflicts + failed);
+    let mut summary_spans = vec![
         Span::styled(format!("{} files", total), Style::default().fg(theme::TEXT_BRIGHT)),
         Span::styled(" · ", Style::default().fg(theme::TEXT_MUTED)),
         Span::styled(
             format!("{} pending", pending),
             Style::default().fg(theme::GREEN),
         ),
-        if skipped > 0 {
-            Span::styled(
-                format!(" · {} skipped", skipped),
-                Style::default().fg(theme::TEXT_MUTED),
-            )
-        } else {
-            Span::raw("")
-        },
-        if conflicts > 0 {
-            Span::styled(
-                format!(" · {} conflict{}", conflicts, if conflicts == 1 { "" } else { "s" }),
-                Style::default().fg(theme::RED),
-            )
-        } else {
-            Span::raw("")
-        },
-    ]);
+    ];
+    if skipped > 0 {
+        summary_spans.push(Span::styled(
+            format!(" · {} skipped", skipped),
+            Style::default().fg(theme::TEXT_MUTED),
+        ));
+    }
+    if conflicts > 0 {
+        summary_spans.push(Span::styled(
+            format!(" · {} conflict{}", conflicts, if conflicts == 1 { "" } else { "s" }),
+            Style::default().fg(theme::RED),
+        ));
+    }
+    if failed > 0 {
+        summary_spans.push(Span::styled(
+            format!(" · {} failed", failed),
+            Style::default().fg(theme::RED),
+        ));
+    }
+    let summary = Line::from(summary_spans);
     f.render_widget(Paragraph::new(summary), chunks[3]);
 
     // ── Separator ────────────────────────────────────────────────

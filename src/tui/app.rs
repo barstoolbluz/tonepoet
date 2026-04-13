@@ -894,8 +894,19 @@ impl BulkRenameState {
                 } else {
                     resolved
                 };
-                let sanitized = crate::tui::rename_plan::sanitize_path(&with_ext)
-                    .unwrap_or(with_ext);
+                let sanitized = match crate::tui::rename_plan::sanitize_path(&with_ext) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // Sanitization rejected the path (traversal, empty, etc.).
+                        // Use the original filename so the op becomes a no-op
+                        // (source == target → Skipped by validate_plan). Never
+                        // fall back to the raw unsanitized string — it could
+                        // contain `..` traversal.
+                        src.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    }
+                };
                 (src.clone(), sanitized)
             })
             .collect();
