@@ -422,9 +422,16 @@ pub fn execute_command(
             }
             match app.browse.navigate_to_str(&path) {
                 Ok(()) => {
-                    let p = app.browse.current_dir.display().to_string();
-                    app.set_status(format!("cd: {}", p));
-                    app.browse.probe_current(tx);
+                    // If async, the status + probe happen in the
+                    // PathValidationComplete / DirScanComplete handlers.
+                    // If sync fallback, current_dir is already updated.
+                    if !app.browse.is_async_enabled() {
+                        let p = app.browse.current_dir.display().to_string();
+                        app.set_status(format!("cd: {}", p));
+                        app.browse.probe_current(tx);
+                    } else {
+                        app.set_status(format!("Resolving: {}", path));
+                    }
                 }
                 Err(e) => app.set_status(format!("cd: {}", e)),
             }

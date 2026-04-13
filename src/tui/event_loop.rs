@@ -266,6 +266,20 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 .dir_stats_cache
                 .insert(path, std::sync::Arc::new(stats));
         }
+        AppMessage::PathValidationComplete { input, result } => {
+            match result {
+                Ok(path) => {
+                    let display = path.display().to_string();
+                    app.browse.current_dir = path;
+                    app.browse.selected_index = 0;
+                    app.browse.refresh();
+                    app.set_status(&format!("cd: {}", display));
+                }
+                Err(e) => {
+                    app.set_status(&format!(":cd {}: {}", input, e));
+                }
+            }
+        }
         AppMessage::DirScanComplete { path, parent_entry, dirs, files, error } => {
             // Race protection: discard if user has navigated elsewhere.
             if app.browse.current_dir != path {

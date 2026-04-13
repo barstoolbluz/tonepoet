@@ -40,6 +40,11 @@ pub enum AppMessage {
         path: std::path::PathBuf,
         stats: crate::tui::browse::DirStats,
     },
+    /// Result of async path validation (canonicalize + is_dir) for :cd.
+    PathValidationComplete {
+        input: String,
+        result: Result<std::path::PathBuf, String>,
+    },
     /// Result of an async directory scan (readdir + lstat per entry).
     DirScanComplete {
         path: std::path::PathBuf,

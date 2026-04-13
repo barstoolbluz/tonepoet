@@ -413,6 +413,11 @@ impl BrowseState {
         self.scan_tx = Some(tx);
     }
 
+    /// Whether async scanning is enabled (tx has been set).
+    pub fn is_async_enabled(&self) -> bool {
+        self.scan_tx.is_some()
+    }
+
     /// Full refresh: re-scan disk, then re-apply the view filters/sort.
     /// Uses async scan if tx is available, otherwise falls back to synchronous.
     pub fn refresh(&mut self) {
@@ -805,7 +810,7 @@ impl BrowseState {
     /// home directory) is NOT supported and is rejected with a clear error
     /// rather than silently mangled into an invalid path.
     pub fn navigate_to_str(&mut self, input: &str) -> Result<(), String> {
-        // Tilde expansion: only `~` and `~/...` forms.
+        // Tilde expansion (no I/O — just env var lookup).
         let expanded = if input == "~" {
             std::env::var("HOME").map_err(|_| "HOME not set".to_string())?
         } else if let Some(rest) = input.strip_prefix("~/") {
@@ -817,7 +822,7 @@ impl BrowseState {
             input.to_string()
         };
 
-        // Relative paths resolve against current_dir
+        // Relative path resolution (no I/O — just path joining).
         let candidate = PathBuf::from(&expanded);
         let resolved = if candidate.is_absolute() {
             candidate
@@ -825,18 +830,43 @@ impl BrowseState {
             self.current_dir.join(candidate)
         };
 
-        // Canonicalize if possible; fall back to raw resolved on failure
-        let final_path = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+        // If we have a tx, do the blocking canonicalize + is_dir check
+        // asynchronously. Otherwise fall back to synchronous.
+        if let Some(tx) = &self.scan_tx {
+            let tx = tx.clone();
+            let input_str = input.to_string();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let final_path = resolved.canonicalize()
+                        .unwrap_or_else(|_| resolved.clone());
+                    if final_path.is_dir() {
+                        Ok(final_path)
+                    } else {
+                        Err(format!("not a directory: {}", final_path.display()))
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("path check failed: {}", e)));
 
-        if !final_path.is_dir() {
-            return Err(format!("not a directory: {}", final_path.display()));
+                let _ = tx.send(super::message::AppMessage::PathValidationComplete {
+                    input: input_str,
+                    result,
+                }).await;
+            });
+            Ok(()) // The actual navigation happens when the result arrives.
+        } else {
+            // Synchronous fallback.
+            let final_path = resolved.canonicalize()
+                .unwrap_or_else(|_| resolved.clone());
+            if !final_path.is_dir() {
+                return Err(format!("not a directory: {}", final_path.display()));
+            }
+            self.current_dir = final_path;
+            self.selected_index = 0;
+            self.reset_nav_state();
+            self.refresh();
+            Ok(())
         }
-
-        self.current_dir = final_path;
-        self.selected_index = 0;
-        self.reset_nav_state();
-        self.refresh();
-        Ok(())
     }
 
     pub fn selected_entry(&self) -> Option<&BrowseEntry> {
