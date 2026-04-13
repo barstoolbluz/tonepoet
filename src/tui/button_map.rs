@@ -77,6 +77,9 @@ pub enum TuiButton {
     BrowseEntry(usize),
     BrowseColumn(ColumnKind),
     BrowseList, // catch-all region for scroll wheel routing
+
+    // Browse info pane: clickable metadata field (click → edit tag).
+    BrowseInfoMeta(crate::tui::probe::MetadataField),
 }
 
 /// Maps rendered button positions to their identities for mouse click detection

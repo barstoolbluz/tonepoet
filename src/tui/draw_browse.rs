@@ -13,6 +13,7 @@ use super::browse::{BrowseEntry, BrowseState, EntryKind, SortBy, SortDir};
 use super::button_map::{ButtonRenderMap, ColumnKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
+use super::probe::MetadataField;
 use super::theme;
 
 /// Fixed column widths (inside the list border). Name is flexible.
@@ -51,7 +52,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
 
     let list_area = content_chunks[0];
     draw_browse_list(f, list_area, &mut app.browse);
-    draw_browse_info(f, content_chunks[1], &app.browse);
+    draw_browse_info(f, content_chunks[1], &app.browse, &mut app.button_map);
 
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(f, chunks[5], app.current_screen, &mut app.button_map, status_msg);
@@ -496,7 +497,23 @@ fn pad_or_truncate(s: &str, width: usize, right_align: bool) -> String {
 }
 
 /// Draw the info pane (right pane) showing details for the selected entry
-fn draw_browse_info(f: &mut Frame, area: Rect, browse: &BrowseState) {
+/// Content returned by `entry_info_lines`: the visual lines plus a
+/// mapping of which metadata fields appear at which line indices (for
+/// registering click targets).
+struct InfoContent {
+    lines: Vec<Vec<Span<'static>>>,
+    /// (field, line_index) for each clickable metadata row. Fields
+    /// that are absent but have a "(click to add)" placeholder also
+    /// appear here.
+    meta_field_rows: Vec<(MetadataField, usize)>,
+}
+
+fn draw_browse_info(
+    f: &mut Frame,
+    area: Rect,
+    browse: &BrowseState,
+    buttons: &mut ButtonRenderMap,
+) {
     if area.height < 4 || area.width < 15 {
         return;
     }
@@ -526,19 +543,22 @@ fn draw_browse_info(f: &mut Frame, area: Rect, browse: &BrowseState) {
 
     // Available width for content (inside borders, after the 3-space indent)
     let content_width = w.saturating_sub(2);
-    let content_lines = if let Some(entry) = browse.selected_entry() {
+    let info = if let Some(entry) = browse.selected_entry() {
         entry_info_lines(entry, browse, content_width)
     } else {
-        vec![vec![Span::styled("   (no selection)", theme::muted())]]
+        InfoContent {
+            lines: vec![vec![Span::styled("   (no selection)", theme::muted())]],
+            meta_field_rows: Vec::new(),
+        }
     };
 
     // Render content lines with border
-    for line_spans in content_lines.iter().take(content_height) {
+    for line_spans in info.lines.iter().take(content_height) {
         lines.push(bordered_line(border_color, w, line_spans.clone()));
     }
 
     // Fill remaining
-    let rendered = content_lines.len().min(content_height);
+    let rendered = info.lines.len().min(content_height);
     for _ in rendered..content_height {
         lines.push(bordered_line(border_color, w, vec![]));
     }
@@ -547,6 +567,18 @@ fn draw_browse_info(f: &mut Frame, area: Rect, browse: &BrowseState) {
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+
+    // Register clickable metadata fields in the info pane. Only for
+    // lines that fit within the visible content area.
+    let info_y_start = area.y + 1; // below top border
+    for (field, line_idx) in &info.meta_field_rows {
+        if *line_idx < content_height {
+            buttons.record_button(
+                TuiButton::BrowseInfoMeta(*field),
+                Rect::new(area.x + 1, info_y_start + *line_idx as u16, (w - 2) as u16, 1),
+            );
+        }
+    }
 }
 
 /// Truncate a string to fit within `max_chars` columns, adding ellipsis if needed.
@@ -561,15 +593,18 @@ fn truncate_to(s: &str, max_chars: usize) -> String {
 
 /// Build content lines for the info pane based on the entry kind.
 /// `content_width` is the width available inside the pane borders.
+/// Returns `InfoContent` with both the visual lines and a mapping of
+/// clickable metadata field positions.
 fn entry_info_lines(
     entry: &BrowseEntry,
     browse: &BrowseState,
     content_width: usize,
-) -> Vec<Vec<Span<'static>>> {
+) -> InfoContent {
     // Maximum width for free-form text values: subtract the 3-space indent
     let max_value_chars = content_width.saturating_sub(3);
 
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut meta_field_rows: Vec<(MetadataField, usize)> = Vec::new();
 
     // Blank
     lines.push(vec![]);
@@ -652,41 +687,88 @@ fn entry_info_lines(
                     Span::styled(info.size_display(), theme::text()),
                 ]);
 
-                // Metadata tags
+                // Metadata tags — always show the section (with placeholders
+                // for absent fields) so users can click to add new tags.
                 let meta = &cached.metadata;
-                let has_meta = meta.title.is_some()
-                    || meta.artist.is_some()
-                    || meta.album.is_some()
-                    || meta.year.is_some();
-                if has_meta {
-                    // Inline labels (artist/album/year) get less room because of the label prefix
-                    let inline_max = max_value_chars.saturating_sub(11); // " ARTIST  " = 11 chars
+                {
+                    let inline_max = max_value_chars.saturating_sub(11);
                     lines.push(vec![]);
+
+                    // Title: 2-line layout (label + value). Clickable on value row.
+                    lines.push(vec![Span::styled("   title", theme::muted())]);
+                    let title_value_row = lines.len();
                     if let Some(title) = &meta.title {
-                        lines.push(vec![Span::styled("   title", theme::muted())]);
                         lines.push(vec![
                             Span::raw("   "),
                             Span::styled(truncate_to(title, max_value_chars), theme::bright()),
                         ]);
+                    } else {
+                        lines.push(vec![Span::styled(
+                            "   (click to add)",
+                            Style::default().fg(theme::TEXT_DIM),
+                        )]);
                     }
+                    meta_field_rows.push((MetadataField::Title, title_value_row));
+
+                    // Artist: inline label + value. Clickable on the whole line.
+                    let artist_row = lines.len();
                     if let Some(artist) = &meta.artist {
                         lines.push(vec![
                             Span::styled("   artist  ", theme::muted()),
                             Span::styled(truncate_to(artist, inline_max), theme::text()),
                         ]);
+                    } else {
+                        lines.push(vec![
+                            Span::styled("   artist  ", theme::muted()),
+                            Span::styled("(click to add)", Style::default().fg(theme::TEXT_DIM)),
+                        ]);
                     }
+                    meta_field_rows.push((MetadataField::Artist, artist_row));
+
+                    // Album
+                    let album_row = lines.len();
                     if let Some(album) = &meta.album {
                         lines.push(vec![
                             Span::styled("   album   ", theme::muted()),
                             Span::styled(truncate_to(album, inline_max), theme::text()),
                         ]);
+                    } else {
+                        lines.push(vec![
+                            Span::styled("   album   ", theme::muted()),
+                            Span::styled("(click to add)", Style::default().fg(theme::TEXT_DIM)),
+                        ]);
                     }
+                    meta_field_rows.push((MetadataField::Album, album_row));
+
+                    // Genre
+                    let genre_row = lines.len();
+                    if let Some(genre) = &meta.genre {
+                        lines.push(vec![
+                            Span::styled("   genre   ", theme::muted()),
+                            Span::styled(truncate_to(genre, inline_max), theme::text()),
+                        ]);
+                    } else {
+                        lines.push(vec![
+                            Span::styled("   genre   ", theme::muted()),
+                            Span::styled("(click to add)", Style::default().fg(theme::TEXT_DIM)),
+                        ]);
+                    }
+                    meta_field_rows.push((MetadataField::Genre, genre_row));
+
+                    // Year
+                    let year_row = lines.len();
                     if let Some(year) = &meta.year {
                         lines.push(vec![
                             Span::styled("   year    ", theme::muted()),
                             Span::styled(truncate_to(year, inline_max), theme::text()),
                         ]);
+                    } else {
+                        lines.push(vec![
+                            Span::styled("   year    ", theme::muted()),
+                            Span::styled("(click to add)", Style::default().fg(theme::TEXT_DIM)),
+                        ]);
                     }
+                    meta_field_rows.push((MetadataField::Year, year_row));
                 }
 
                 // ReplayGain / R128 section. Only render if at least one
@@ -803,7 +885,10 @@ fn entry_info_lines(
         ]);
     }
 
-    lines
+    InfoContent {
+        lines,
+        meta_field_rows,
+    }
 }
 
 /// Create a bordered line

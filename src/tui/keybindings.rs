@@ -2279,6 +2279,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
+    // Don't dispatch button clicks while a modal overlay (TextEdit,
+    // FileInput, Confirmation, etc.) is open — the user must close it
+    // first. Without this guard, clicking a different field while
+    // editing silently replaces the overlay and loses the pending edit.
+    // Context menu dismissal is handled separately above.
+    if !matches!(app.active_overlay, ActiveOverlay::None) {
+        return;
+    }
+
     // Check button map
     if let Some(button) = app.button_map.find_button_at(x, y) {
         match button {
@@ -2707,6 +2716,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 } else {
                     app.browse.set_sort(target, SortDir::Asc);
                 }
+            }
+            TuiButton::BrowseInfoMeta(field) => {
+                // Click a metadata field in the info pane → open tag editor.
+                super::command::execute_edit_metadata_pub(app, field);
             }
             TuiButton::BrowseList => {
                 // Catch-all for scroll routing only; ignore on left click.
