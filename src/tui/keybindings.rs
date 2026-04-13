@@ -1381,6 +1381,26 @@ fn handle_bulk_rename_key(
                         app.set_status(&format!("Template: {}", name));
                     }
                 }
+                KeyCode::Char('C') => {
+                    // Apply Chicago-style title capitalization to all target stems.
+                    for op in &mut state.plan.ops {
+                        // Extract the stem (before last dot) and extension.
+                        if let Some(dot_pos) = op.target_relative.rfind('.') {
+                            let stem = &op.target_relative[..dot_pos];
+                            let ext = &op.target_relative[dot_pos..];
+                            op.target_relative = format!(
+                                "{}{}",
+                                crate::convert::renaming::capitalize_title(stem),
+                                ext,
+                            );
+                        } else {
+                            op.target_relative =
+                                crate::convert::renaming::capitalize_title(&op.target_relative);
+                        }
+                    }
+                    crate::tui::rename_plan::validate_plan(&mut state.plan);
+                    app.set_status("Applied title capitalization");
+                }
                 KeyCode::Char('S') => {
                     // Save current template. Prompt for name via TextEdit.
                     let template_text = state.template_input.text.clone();

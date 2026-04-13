@@ -68,6 +68,8 @@ pub enum ContextAction {
     MoveTo,
     /// Refresh the browse listing.
     Refresh,
+    /// Open the bulk rename wizard for selected audio files.
+    BulkRename,
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -248,6 +250,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
             items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
+            items.push(item_with_shortcut("Bulk Rename...", ContextAction::BulkRename, "R"));
             items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
             items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
             items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
@@ -462,6 +465,20 @@ pub fn execute_context_action(
         ContextAction::MoveToTrash => {
             let cmd = super::command::Command::Delete;
             super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::BulkRename => {
+            // Reuse the same path as the R keybinding.
+            let paths = super::command::collect_selection_for_file_ops(app);
+            let audio_paths: Vec<std::path::PathBuf> = paths
+                .into_iter()
+                .filter(|p| {
+                    app.browse.entries.iter().any(|e| {
+                        e.path == *p
+                            && matches!(e.kind, EntryKind::AudioFile(_))
+                    })
+                })
+                .collect();
+            super::keybindings::open_bulk_rename(app, audio_paths);
         }
         ContextAction::CopyTo => {
             let cmd = super::command::Command::Copy { dest: String::new(), force: false };

@@ -41,6 +41,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "browse", "b",
     "recent", "recents",
     "bookmarks", "bm",
+    "rename-all", "renameall", "bulk-rename",
 ];
 
 /// Commands that take a preset name as their argument. Used by the
@@ -220,6 +221,8 @@ pub enum Command {
     /// browsing mode. With "add [name]", quick-adds the current browse
     /// directory as a bookmark without opening the overlay.
     Bookmarks(String),
+    /// Open the bulk rename wizard for the current selection.
+    BulkRename,
     Unknown(String),
 }
 
@@ -292,6 +295,7 @@ pub fn parse_command(input: &str) -> Command {
         "browse" | "b" => Command::Browse,
         "recent" | "recents" => Command::Recent,
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
+        "rename-all" | "renameall" | "bulk-rename" => Command::BulkRename,
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -559,6 +563,23 @@ pub fn execute_command(
         }
         Command::Bookmarks(args) => {
             execute_bookmarks(app, &args);
+        }
+        Command::BulkRename => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":rename-all only works on the browse screen");
+            } else {
+                let paths = collect_selection_for_file_ops(app);
+                let audio_paths: Vec<PathBuf> = paths
+                    .into_iter()
+                    .filter(|p| {
+                        app.browse.entries.iter().any(|e| {
+                            e.path == *p
+                                && matches!(e.kind, super::browse::EntryKind::AudioFile(_))
+                        })
+                    })
+                    .collect();
+                super::keybindings::open_bulk_rename(app, audio_paths);
+            }
         }
         Command::Unknown(input) => {
             app.set_status(format!("Unknown command: {}", input));
