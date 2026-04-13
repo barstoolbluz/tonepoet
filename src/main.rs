@@ -670,6 +670,15 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     // Create app state
     let mut app = AppState::new(config);
 
+    // Crash recovery: check for interrupted metadata writes from a previous session.
+    let recovered = app.db.recover_stale_metadata_writes();
+    if !recovered.is_empty() {
+        for msg in &recovered {
+            log::warn!("Metadata recovery: {}", msg);
+        }
+        app.set_status(&format!("Recovered {} file(s) from interrupted metadata writes", recovered.len()));
+    }
+
     // Phase 6f: if the user launched with file args (`tonepoet tui foo.flac
     // bar.flac`), seed the Convert screen with those files and land on
     // Convert instead of the configured default screen. Invalid paths

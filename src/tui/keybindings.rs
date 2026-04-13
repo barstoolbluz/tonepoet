@@ -2032,13 +2032,18 @@ fn apply_text_edit(
                 return;
             }
 
-            // Write the tag via lofty.
-            match crate::tui::probe::write_metadata_field(&path, field, trimmed) {
+            // Write the tag via lofty with atomic backup protection.
+            let write_path = path.clone();
+            let write_field = field;
+            let write_value = trimmed.to_string();
+            match app.db.atomic_metadata_write(&path, || {
+                crate::tui::probe::write_metadata_field(&write_path, write_field, &write_value)
+            }) {
                 Ok(()) => {
-                    // Invalidate probe cache so the info pane re-probes
-                    // with fresh tags on next cursor visit.
+                    // Invalidate probe caches (in-memory + DB).
                     app.browse.probe_cache.remove(&path);
                     app.browse.probe_pending.remove(&path);
+                    let _ = app.db.invalidate_probe(&path.display().to_string());
                     // Re-trigger probe for immediate refresh.
                     app.browse.probe_current(tx);
                     app.set_status(format!(

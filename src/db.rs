@@ -258,6 +258,121 @@ impl Database {
         Ok(())
     }
 
+    // ── Atomic metadata write ──────────────────────────────────
+
+    /// Perform an atomic metadata write with hardlink backup + journal.
+    ///
+    /// 1. Creates a hardlink backup (copy fallback for cross-fs)
+    /// 2. Records the in-flight write in the journal table
+    /// 3. Calls the provided write function
+    /// 4. On success: removes journal entry + backup
+    /// 5. On failure: restores from backup (instant rollback)
+    pub fn atomic_metadata_write<F>(
+        &self,
+        file_path: &std::path::Path,
+        write_fn: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let path_str = file_path.display().to_string();
+        let backup = Self::backup_path(file_path);
+        let backup_str = backup.display().to_string();
+
+        // Step 1: create backup.
+        Self::create_backup(file_path, &backup)?;
+
+        // Step 2: record in journal.
+        if let Err(e) = self.begin_metadata_write(&path_str, &backup_str) {
+            let _ = std::fs::remove_file(&backup);
+            return Err(format!("journal error (write aborted): {}", e));
+        }
+
+        // Step 3: execute the write.
+        let result = write_fn();
+
+        // Step 4/5: cleanup.
+        match result {
+            Ok(()) => {
+                let _ = self.complete_metadata_write(&path_str);
+                let _ = std::fs::remove_file(&backup);
+                Ok(())
+            }
+            Err(e) => {
+                // Rollback: restore from backup.
+                if backup.exists() {
+                    if let Err(rollback_err) = std::fs::rename(&backup, file_path) {
+                        let _ = self.complete_metadata_write(&path_str);
+                        return Err(format!(
+                            "write failed AND rollback failed ({}: {}). Backup at: {}",
+                            e, rollback_err, backup_str
+                        ));
+                    }
+                }
+                let _ = self.complete_metadata_write(&path_str);
+                Err(format!("write failed (rolled back): {}", e))
+            }
+        }
+    }
+
+    /// Recover from any stale journal entries (crash recovery).
+    /// Returns descriptions of recovered files.
+    pub fn recover_stale_metadata_writes(&self) -> Vec<String> {
+        let entries = match self.stale_metadata_writes() {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut messages = Vec::new();
+        for (file_path, backup_path, started_at) in &entries {
+            let backup = std::path::PathBuf::from(backup_path);
+            let original = std::path::PathBuf::from(file_path);
+
+            if backup.exists() {
+                match std::fs::rename(&backup, &original) {
+                    Ok(()) => {
+                        messages.push(format!(
+                            "Recovered: {} (write started {})",
+                            file_path, started_at
+                        ));
+                    }
+                    Err(e) => {
+                        messages.push(format!(
+                            "RECOVERY FAILED for {}: {}. Backup at: {}",
+                            file_path, e, backup_path
+                        ));
+                    }
+                }
+            }
+            let _ = self.complete_metadata_write(file_path);
+        }
+        messages
+    }
+
+    /// Backup path: same directory, `.tonepoet-bak` suffix.
+    fn backup_path(original: &std::path::Path) -> std::path::PathBuf {
+        let mut name = original
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        name.push_str(".tonepoet-bak");
+        original.with_file_name(name)
+    }
+
+    /// Create a backup via hardlink (instant, same-fs) or copy (cross-fs fallback).
+    fn create_backup(
+        original: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<(), String> {
+        let _ = std::fs::remove_file(backup); // Remove stale backup.
+        if std::fs::hard_link(original, backup).is_ok() {
+            return Ok(());
+        }
+        std::fs::copy(original, backup)
+            .map_err(|e| format!("backup failed: {}", e))?;
+        Ok(())
+    }
+
     // ── Recent files ─────────────────────────────────────────────
 
     /// Record a file access (upsert with current timestamp).
