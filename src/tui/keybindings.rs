@@ -655,6 +655,12 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             } else if !app.browse.filter_text.is_empty() {
                 app.browse.clear_filter();
                 selection_may_have_changed = true;
+            } else if app.browse.is_in_archive() {
+                // Esc in archive: go up one level or exit.
+                if !app.browse.go_up_in_archive() {
+                    app.browse.exit_archive();
+                }
+                selection_may_have_changed = true;
             }
             // Browse is home — Esc with nothing to clear is a no-op.
         }

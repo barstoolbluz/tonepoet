@@ -122,12 +122,25 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
         return;
     }
 
-    let path_str = browse.current_dir.display().to_string();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let display = if !home.is_empty() && path_str.starts_with(&home) {
-        format!("~{}", &path_str[home.len()..])
+    let display = if let Some(ref arc) = browse.archive {
+        // Inside an archive: show "archive.7z:/inner/path"
+        let archive_name = arc.listing.archive_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if arc.inner_path.is_empty() {
+            format!("{}:/", archive_name)
+        } else {
+            format!("{}:/{}", archive_name, arc.inner_path)
+        }
     } else {
-        path_str
+        let path_str = browse.current_dir.display().to_string();
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() && path_str.starts_with(&home) {
+            format!("~{}", &path_str[home.len()..])
+        } else {
+            path_str
+        }
     };
 
     // Filter suffix appears only when a text filter is active.
