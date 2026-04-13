@@ -1893,7 +1893,7 @@ fn handle_batch_list_key(
 fn move_batch_cursor(
     app: &mut AppState,
     new_cursor: usize,
-    tx: &mpsc::Sender<AppMessage>,
+    _tx: &mpsc::Sender<AppMessage>,
 ) {
     let new_path = match &app.convert.source.mode {
         SourceMode::Batch { paths, .. } => paths.get(new_cursor).cloned(),
@@ -1914,12 +1914,13 @@ fn move_batch_cursor(
         *cursor_metadata = crate::tui::probe::SourceMetadata::default();
     }
 
-    // Skip if a probe for this exact path is already in flight.
-    if app.convert.source.batch_probe_pending.as_ref() == Some(&path) {
-        return;
-    }
-    app.convert.source.batch_probe_pending = Some(path.clone());
-    super::browse::spawn_audio_probe(path, tx.clone());
+    // Debounce: schedule the probe for 150ms from now instead of
+    // spawning immediately. The event loop tick fires it when the
+    // cursor has been still long enough.
+    app.convert.source.batch_probe_debounce = Some((
+        path,
+        std::time::Instant::now() + std::time::Duration::from_millis(150),
+    ));
 }
 
 /// Remove the file at the batch cursor from the batch. If the batch

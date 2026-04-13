@@ -27,6 +27,7 @@ pub async fn run_app(
         app.clamp_selection();
         app.clear_expired_status();
         check_pending_browse_rename(app);
+        check_batch_probe_debounce(app, &tx);
         // Close browse-only overlays if the user has left the browse screen.
         if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
             app.bookmarks.close_overlay();
@@ -66,6 +67,37 @@ pub async fn run_app(
 /// still on the browse screen with no overlay active, open the rename overlay
 /// for the pending path. If the user has navigated away or opened another
 /// overlay, silently drop the pending state.
+/// Fire a debounced batch cursor probe if the deadline has passed and
+/// the cursor is still on the target path.
+fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let (path, deadline) = match app.convert.source.batch_probe_debounce.take() {
+        Some(d) => d,
+        None => return,
+    };
+
+    if std::time::Instant::now() < deadline {
+        // Not ready yet — put it back.
+        app.convert.source.batch_probe_debounce = Some((path, deadline));
+        return;
+    }
+
+    // Verify cursor is still on this path.
+    let still_current = match &app.convert.source.mode {
+        super::app::SourceMode::Batch { paths, cursor, .. } => {
+            paths.get(*cursor) == Some(&path)
+        }
+        _ => false,
+    };
+
+    if still_current {
+        // Skip if already in flight (dedup guard).
+        if app.convert.source.batch_probe_pending.as_ref() != Some(&path) {
+            app.convert.source.batch_probe_pending = Some(path.clone());
+            super::browse::spawn_audio_probe(path, tx.clone());
+        }
+    }
+}
+
 fn check_pending_browse_rename(app: &mut AppState) {
     let (path, deadline) = match app.pending_browse_rename.as_ref() {
         Some(pr) => (pr.0.clone(), pr.1),

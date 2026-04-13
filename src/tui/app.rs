@@ -354,6 +354,11 @@ pub struct SourceState {
     /// Path of the batch cursor probe currently in flight. Prevents
     /// duplicate spawns when the user holds an arrow key.
     pub batch_probe_pending: Option<PathBuf>,
+    /// Debounce for batch cursor probes: (target_path, fire_at).
+    /// Set by move_batch_cursor, checked by the event loop tick.
+    /// Prevents N probes during rapid navigation — only fires once
+    /// the cursor has been still for 150ms.
+    pub batch_probe_debounce: Option<(PathBuf, std::time::Instant)>,
 }
 
 impl Default for SourceState {
@@ -362,6 +367,7 @@ impl Default for SourceState {
             mode: SourceMode::Empty,
             advanced_open: false,
             batch_probe_pending: None,
+            batch_probe_debounce: None,
         }
     }
 }
