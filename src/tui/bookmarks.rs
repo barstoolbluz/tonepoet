@@ -339,10 +339,11 @@ impl BookmarksState {
                 let name = input.text.trim().to_string();
                 if name.is_empty() {
                     false
-                } else {
-                    self.rename_at_in_memory(idx, name);
+                } else if self.rename_at_in_memory(idx, name) {
                     let _ = self.save();
                     true
+                } else {
+                    false
                 }
             }
         };
