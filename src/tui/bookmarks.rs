@@ -119,10 +119,31 @@ impl BookmarksState {
 
     /// Add a bookmark, persisting to both TOML and SQLite.
     pub fn add_with_db(&mut self, name: String, path: PathBuf, db: &crate::db::Database) {
-        let path_str = path.display().to_string();
-        self.add_in_memory(name.clone(), path);
+        self.add_in_memory(name, path);
         let _ = self.save();
-        let _ = db.add_bookmark(&name, &path_str);
+        self.sync_to_db(db);
+    }
+
+    /// Remove a bookmark, persisting to both TOML and SQLite.
+    pub fn remove_with_db(&mut self, index: usize, db: &crate::db::Database) -> bool {
+        if self.remove_in_memory(index) {
+            let _ = self.save();
+            self.sync_to_db(db);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sync the entire in-memory bookmark list to the DB (clear + rebuild).
+    /// Simple and correct for small lists (typically 5-20 bookmarks).
+    fn sync_to_db(&self, db: &crate::db::Database) {
+        // Clear existing DB bookmarks.
+        let _ = db.clear_bookmarks();
+        // Re-insert all.
+        for bm in &self.entries {
+            let _ = db.add_bookmark(&bm.name, &bm.path.display().to_string());
+        }
     }
 
     fn add_in_memory(&mut self, name: String, path: PathBuf) {
@@ -294,6 +315,40 @@ impl BookmarksState {
                 }
             }
         };
+        committed
+    }
+
+    /// Commit the naming operation, syncing to DB.
+    pub fn commit_naming_with_db(&mut self, db: &crate::db::Database) -> bool {
+        let naming = match self.naming.take() {
+            Some(n) => n,
+            None => return false,
+        };
+        let committed = match naming {
+            BookmarkNaming::Add { input, path } => {
+                let name = input.text.trim().to_string();
+                if name.is_empty() {
+                    false
+                } else {
+                    self.add_in_memory(name, path);
+                    let _ = self.save();
+                    true
+                }
+            }
+            BookmarkNaming::Rename { input, idx } => {
+                let name = input.text.trim().to_string();
+                if name.is_empty() {
+                    false
+                } else {
+                    self.rename_at_in_memory(idx, name);
+                    let _ = self.save();
+                    true
+                }
+            }
+        };
+        if committed {
+            self.sync_to_db(db);
+        }
         committed
     }
 

@@ -469,9 +469,14 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::CopyPath(path) => {
-            // Best-effort clipboard copy. If clipboard isn't available,
-            // set the path as a status message so the user can see it.
-            app.set_status(format!("path: {}", path.display()));
+            let path_str = path.display().to_string();
+            // OSC 52: copy to system clipboard via terminal escape sequence.
+            // Works in iTerm2, WezTerm, kitty, Alacritty, foot, xterm, etc.
+            let b64 = base64_encode(path_str.as_bytes());
+            let osc = format!("\x1b]52;c;{}\x07", b64);
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            app.set_status(format!("Copied: {}", path_str));
         }
         ContextAction::EditMetadata(field) => {
             super::command::execute_edit_metadata_pub(app, field);
@@ -536,7 +541,7 @@ pub fn execute_context_action(
         ContextAction::BookmarkCurrentDir => {
             let path = app.browse.current_dir.clone();
             let name = super::bookmarks::BookmarksState::default_name_for_path(&path);
-            app.bookmarks.add(name.clone(), path);
+            app.bookmarks.add_with_db(name.clone(), path, &app.db);
             app.set_status(format!("bookmark added: {}", name));
         }
 
@@ -633,4 +638,29 @@ pub fn execute_context_action(
             }
         }
     }
+}
+
+/// Minimal base64 encoder for OSC 52 clipboard (no crate dependency).
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((n >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(n & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }

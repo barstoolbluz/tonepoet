@@ -741,7 +741,7 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
             } else {
                 rest.to_string()
             };
-            app.bookmarks.add(name.clone(), path);
+            app.bookmarks.add_with_db(name.clone(), path, &app.db);
             app.set_status(format!("bookmark added: {}", name));
         }
         other => {

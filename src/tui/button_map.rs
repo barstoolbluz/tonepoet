@@ -145,6 +145,14 @@ impl ButtonRenderMap {
         self.button_bounds.push((button, screen_rect));
     }
 
+    /// Find the screen rect for a specific button (for cursor-relative menus).
+    pub fn find_button_rect(&self, target: &TuiButton) -> Option<Rect> {
+        self.button_bounds
+            .iter()
+            .find(|(btn, _)| btn == target)
+            .map(|(_, rect)| *rect)
+    }
+
     /// Find which button (if any) contains the given screen coordinates.
     /// Returns the LAST recorded button at that position (topmost in draw order).
     pub fn find_button_at(&self, x: u16, y: u16) -> Option<TuiButton> {

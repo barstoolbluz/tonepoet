@@ -80,13 +80,27 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             }
             // Context menu (keyboard alternative to right-click)
             (KeyCode::Char('m'), KeyModifiers::NONE) => {
-                // Build context menu for the current screen and cursor.
-                // Origin is roughly the center of the screen (since there's
-                // no mouse position available for keyboard invocation).
-                let area = crossterm::terminal::size()
-                    .map(|(w, h)| (w / 3, h / 3))
-                    .unwrap_or((20, 10));
-                open_context_menu(app, area.0, area.1);
+                // Position the context menu at the selected entry's screen
+                // location (from the button_map). Falls back to screen center
+                // if no entry is registered.
+                let origin = match app.current_screen {
+                    AppScreen::Browse => {
+                        app.button_map.find_button_rect(
+                            &TuiButton::BrowseEntry(app.browse.selected_index),
+                        ).map(|r| (r.x + 2, r.y))
+                    }
+                    AppScreen::Queue => {
+                        app.button_map.find_button_rect(
+                            &TuiButton::QueueItem(app.selected_index),
+                        ).map(|r| (r.x + 2, r.y))
+                    }
+                    _ => None,
+                }.unwrap_or_else(|| {
+                    crossterm::terminal::size()
+                        .map(|(w, h)| (w / 3, h / 3))
+                        .unwrap_or((20, 10))
+                });
+                open_context_menu(app, origin.0, origin.1);
                 return;
             }
             _ => {}
@@ -2548,7 +2562,7 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Se
     if app.bookmarks.naming.is_some() {
         match (key.code, key.modifiers) {
             (KeyCode::Enter, _) => {
-                if !app.bookmarks.commit_naming() {
+                if !app.bookmarks.commit_naming_with_db(&app.db) {
                     app.set_status("bookmark: name cannot be empty");
                 }
             }
@@ -2598,7 +2612,7 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Se
         }
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
             let idx = app.bookmarks.overlay_selected;
-            app.bookmarks.remove(idx);
+            app.bookmarks.remove_with_db(idx, &app.db);
             // Overlay stays open; if entries became empty, next render shows
             // the "(no bookmarks)" placeholder.
         }

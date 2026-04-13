@@ -462,6 +462,13 @@ impl Database {
         Ok(())
     }
 
+    /// Clear all bookmarks (for full sync from in-memory state).
+    pub fn clear_bookmarks(&self) -> Result<(), String> {
+        self.conn.execute("DELETE FROM bookmarks", [])
+            .map_err(|e| format!("bookmarks clear: {}", e))?;
+        Ok(())
+    }
+
     /// Remove a bookmark by id.
     pub fn remove_bookmark(&self, id: i64) -> Result<(), String> {
         self.conn.execute(
