@@ -227,8 +227,8 @@ impl Database {
         Ok(())
     }
 
-    /// Check if a file (by path + mtime + size) has been successfully
-    /// converted before. For dedup warnings.
+    /// Check if a file (by path) has been successfully converted before.
+    /// For dedup warnings.
     pub fn was_previously_converted(
         &self,
         input_path: &str,
