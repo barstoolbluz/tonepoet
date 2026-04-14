@@ -12,9 +12,25 @@ use super::app::AppScreen;
 use super::theme;
 
 /// A section in the help content (e.g., "Navigation", "Commands").
-struct HelpSection {
+pub struct HelpSection {
     title: &'static str,
     entries: Vec<(&'static str, &'static str)>, // (key, description)
+}
+
+/// Public accessor for keybindings handler scroll clamping.
+pub fn help_content_for(screen: AppScreen) -> Vec<HelpSection> {
+    help_content(screen)
+}
+
+/// Count the total rendered lines for a given set of sections.
+pub fn line_count(sections: &[HelpSection]) -> usize {
+    let mut count = 0;
+    for (i, section) in sections.iter().enumerate() {
+        if i > 0 { count += 1; } // Blank separator.
+        count += 1; // Title line.
+        count += section.entries.len();
+    }
+    count
 }
 
 /// Build the help content for a given screen.
@@ -105,6 +121,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     ("Up/k, Down/j", "Navigate queue items"),
                     ("Home/g, End/G", "Jump to top / bottom"),
                     ("PageUp, PageDown", "Page scroll"),
+                    ("Tab", "Switch focus: file list / action bar"),
                     ("Space", "Toggle selection"),
                     ("Ctrl+a", "Select all"),
                     ("Enter", "Show item info / error detail"),

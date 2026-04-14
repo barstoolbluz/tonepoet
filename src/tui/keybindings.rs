@@ -1268,27 +1268,36 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             handle_bulk_rename_key(app, key, *state, tx);
         }
         ActiveOverlay::Help { mut scroll, screen } => {
+            // Compute content length for scroll clamping.
+            let max_scroll = {
+                let sections = super::help::help_content_for(screen);
+                let total = super::help::line_count(&sections);
+                total.saturating_sub(15) // Approximate visible rows.
+            };
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
                     app.active_overlay = ActiveOverlay::None;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if scroll > 0 { scroll -= 1; }
+                    scroll = scroll.saturating_sub(1);
                     app.active_overlay = ActiveOverlay::Help { screen, scroll };
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    scroll += 1; // Clamped by renderer.
+                    scroll = (scroll + 1).min(max_scroll);
                     app.active_overlay = ActiveOverlay::Help { screen, scroll };
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
                     app.active_overlay = ActiveOverlay::Help { screen, scroll: 0 };
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    app.active_overlay = ActiveOverlay::Help { screen, scroll: max_scroll };
                 }
                 KeyCode::PageUp => {
                     scroll = scroll.saturating_sub(15);
                     app.active_overlay = ActiveOverlay::Help { screen, scroll };
                 }
                 KeyCode::PageDown => {
-                    scroll += 15; // Clamped by renderer.
+                    scroll = (scroll + 15).min(max_scroll);
                     app.active_overlay = ActiveOverlay::Help { screen, scroll };
                 }
                 _ => {}
