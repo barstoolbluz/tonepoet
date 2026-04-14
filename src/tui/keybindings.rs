@@ -2852,6 +2852,7 @@ fn retry_failed(app: &mut AppState) {
     if let Ok(mut queue) = app.manager.queue.try_write() {
         queue.retry_failed();
     }
+    app.save_queue();
     app.set_status("Re-queued failed items for retry");
 }
 
@@ -3290,6 +3291,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::ClearCompleted => {
                 app.manager.clear_completed();
+                app.save_queue();
                 app.set_status("Cleared completed items");
             }
             TuiButton::RetryFailed => {
