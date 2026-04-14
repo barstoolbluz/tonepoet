@@ -328,12 +328,15 @@ pub fn delete_preset_with_db(name: &str, db: &crate::db::Database) -> Result<(),
     Ok(())
 }
 
-/// Import all TOML presets into the SQLite database (first-run migration).
+/// Sync TOML presets into the SQLite database. Imports any TOML
+/// presets not already in the DB (handles first-run and externally-
+/// added presets like manual file copies or syncs from another machine).
 pub fn import_presets_to_db(db: &crate::db::Database) {
-    if db.has_presets() {
-        return; // DB already populated.
-    }
+    let db_names = db.list_preset_names();
     for name in list_presets() {
+        if db_names.iter().any(|n| n == &name) {
+            continue; // Already in DB.
+        }
         if let Ok(preset) = load_preset(&name) {
             let _ = db.store_preset(
                 &preset.name,
