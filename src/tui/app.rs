@@ -805,6 +805,13 @@ pub enum ActiveOverlay {
     },
     /// Bulk rename wizard overlay. Boxed because the state is large.
     BulkRename(Box<BulkRenameState>),
+    /// Help overlay showing keybindings for the current screen.
+    Help {
+        /// The screen that was active when help was opened.
+        screen: AppScreen,
+        /// Scroll offset in the help content.
+        scroll: usize,
+    },
 }
 
 /// Focus area within the bulk rename overlay.

@@ -24,6 +24,7 @@ pub mod draw_queue;
 pub mod draw_source;
 pub mod draw_status;
 pub mod event_loop;
+pub mod help;
 pub mod keychain;
 pub mod keybindings;
 pub mod message;

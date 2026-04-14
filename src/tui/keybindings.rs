@@ -103,6 +103,14 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 open_context_menu(app, origin.0, origin.1);
                 return;
             }
+            // Help overlay
+            (KeyCode::Char('?'), _) => {
+                app.active_overlay = ActiveOverlay::Help {
+                    screen: app.current_screen,
+                    scroll: 0,
+                };
+                return;
+            }
             _ => {}
         }
     }
@@ -1258,6 +1266,33 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         }
         ActiveOverlay::BulkRename(state) => {
             handle_bulk_rename_key(app, key, *state, tx);
+        }
+        ActiveOverlay::Help { mut scroll, screen } => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if scroll > 0 { scroll -= 1; }
+                    app.active_overlay = ActiveOverlay::Help { screen, scroll };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll += 1; // Clamped by renderer.
+                    app.active_overlay = ActiveOverlay::Help { screen, scroll };
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    app.active_overlay = ActiveOverlay::Help { screen, scroll: 0 };
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(15);
+                    app.active_overlay = ActiveOverlay::Help { screen, scroll };
+                }
+                KeyCode::PageDown => {
+                    scroll += 15; // Clamped by renderer.
+                    app.active_overlay = ActiveOverlay::Help { screen, scroll };
+                }
+                _ => {}
+            }
         }
         ActiveOverlay::None => {}
     }

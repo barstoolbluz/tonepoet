@@ -154,77 +154,38 @@ const fn h(key: &'static str, label: &'static str, color: ratatui::style::Color,
 
 /// Hint groups per screen. Groups are separated by ` │ ` dividers when rendered.
 fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
-    match current {
+    // Minimal hints: 3-5 essentials per screen + universal `: command │ ? help`.
+    // Full keybinding reference available via `?` help overlay.
+    let screen_hints = match current {
         AppScreen::Convert => vec![
-            vec![
-                h("↑↓", "navigate", theme::BLUE, 0),
-                h("tab", "pane", theme::BLUE, 0),
-                h("←→", "select", theme::BLUE, 1),
-                h("e", "edit", theme::BLUE, 1),
-                h("a", "advanced", theme::PURPLE, 2),
-            ],
-            vec![
-                h(":browse", "", theme::CYAN, 2),
-                h(":recent", "", theme::CYAN, 2),
-                h(":expand", "", theme::CYAN, 2),
-                h("p", "presets", theme::CYAN, 1),
-                h("s", "save", theme::CYAN, 1),
-                h("f", "effects", theme::AMBER, 2),
-            ],
-            vec![
-                h(":commit", "", theme::GREEN, 0),
-                h(":Commit", "+start", theme::GREEN, 1),
-                h("esc", "cancel", theme::AMBER, 2),
-            ],
-            vec![h(":q", "quit", theme::RED, 0)],
+            h("tab", "pane", theme::BLUE, 0),
+            h("←→", "select", theme::BLUE, 0),
+            h(":commit", "enqueue", theme::GREEN, 0),
         ],
         AppScreen::Browse => vec![
-            vec![
-                h("↑↓", "navigate", theme::BLUE, 0),
-                h("←→", "up/enter", theme::BLUE, 1),
-                h("space", "select", theme::BLUE, 1),
-                h("enter", "load", theme::GREEN, 0),
-            ],
-            vec![
-                h("/", "filter", theme::BLUE, 1),
-                h(":sort", "", theme::CYAN, 2),
-                h(":filter", "", theme::CYAN, 2),
-                h(":cd", "", theme::CYAN, 2),
-                h(":rename", "", theme::AMBER, 2),
-                h(":recent", "", theme::CYAN, 2),
-                h(":bm", "", theme::GREEN, 2),
-                h(".", "hidden", theme::PURPLE, 2),
-            ],
-            vec![
-                h(":queue", "", theme::AMBER, 1),
-                h(":convert", "", theme::AMBER, 2),
-            ],
-            vec![
-                h("⇧click", "toggle", theme::PURPLE, 2),
-                h("⌥click", "range", theme::PURPLE, 2),
-            ],
-            vec![h(":q", "quit", theme::RED, 0)],
+            h("↑↓", "navigate", theme::BLUE, 0),
+            h("enter", "open", theme::GREEN, 0),
+            h("space", "select", theme::BLUE, 0),
         ],
         AppScreen::Queue => vec![
-            vec![
-                h("↑↓", "navigate", theme::BLUE, 0),
-                h("space", "select", theme::BLUE, 1),
-                h("a", "add files", theme::BLUE, 1),
-                h("c", "configure", theme::PURPLE, 1),
-            ],
-            vec![
-                h("s", "start", theme::GREEN, 0),
-                h("p", "pause", theme::AMBER, 1),
-            ],
-            vec![h(":q", "quit", theme::RED, 0)],
+            h("↑↓", "navigate", theme::BLUE, 0),
+            h("s", "start", theme::GREEN, 0),
+            h("space", "select", theme::BLUE, 0),
         ],
-        _ => vec![
-            vec![
-                h(":q", "quit", theme::RED, 0),
-                h("1", "browse", theme::BLUE, 1),
-            ],
+        AppScreen::Config => vec![
+            h("tab", "focus", theme::BLUE, 0),
+            h("a", "add", theme::GREEN, 0),
+            h("d", "delete", theme::RED, 0),
         ],
-    }
+        _ => vec![],
+    };
+    vec![
+        screen_hints,
+        vec![
+            h(":", "command", theme::CYAN, 0),
+            h("?", "help", theme::AMBER, 0),
+        ],
+    ]
 }
 
 /// Width of one hint when rendered: key + (` ` + label + ` ` if label non-empty).

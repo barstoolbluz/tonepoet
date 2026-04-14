@@ -61,6 +61,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             let state = state.clone();
             draw_bulk_rename(f, &state);
         }
+        ActiveOverlay::Help { screen, scroll } => {
+            super::help::draw_help(f, screen, scroll);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)

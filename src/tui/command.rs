@@ -526,7 +526,10 @@ pub fn execute_command(
             app.set_status("Showing config/tools");
         }
         Command::Help => {
-            app.set_status(":q :e :o :cd :browse :rename :del :cp :mv :queue :convert :commit :Commit :go :start :expand :recent :bm :preset :saveas :set :sort :filter :help");
+            app.active_overlay = ActiveOverlay::Help {
+                screen: app.current_screen,
+                scroll: 0,
+            };
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref());
