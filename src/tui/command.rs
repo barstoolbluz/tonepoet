@@ -860,6 +860,12 @@ fn execute_queue(
             app.convert.source.mode = mode;
             app.recent.record_use_with_db(&first, &app.db);
 
+            // Persist batch state for crash recovery.
+            let batch_paths = app.convert.source.mode.all_paths();
+            let _ = app.db.save_batch_state(
+                &batch_paths, None, None, None, None, None,
+            );
+
             // Remember where we came from, switch to Convert for review.
             app.previous_screen = Some(AppScreen::Browse);
             app.current_screen = AppScreen::Convert;
@@ -988,6 +994,7 @@ fn execute_commit(
     // Clear source pane so a subsequent `:queue` arrives fresh.
     app.convert.source.mode = SourceMode::Empty;
     app.convert.metadata = MetadataState::default();
+    let _ = app.db.clear_batch_state();
 
     // Remove only the committed paths from browse.multi_selected so the
     // user's unrelated selection state is preserved. This handles:

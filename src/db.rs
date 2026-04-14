@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -73,6 +73,9 @@ impl Database {
         }
         if version < 3 {
             self.migrate_v3()?;
+        }
+        if version < 4 {
+            self.migrate_v4()?;
         }
 
         self.conn
@@ -181,6 +184,89 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_history_input
                 ON conversion_history(input_path);
         ").map_err(|e| format!("v3 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    /// v4: batch state table for Convert screen recovery.
+    fn migrate_v4(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS batch_state (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                paths_json  TEXT NOT NULL,
+                format      TEXT,
+                sample_rate INTEGER,
+                bit_depth   TEXT,
+                dither      TEXT,
+                replaygain  TEXT,
+                saved_at    TEXT NOT NULL
+            );
+        ").map_err(|e| format!("v4 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    // ── Batch state ──────────────────────────────────────────────
+
+    /// Save the current Convert screen batch state for recovery.
+    /// Uses id=1 (singleton row) — only one batch at a time.
+    pub fn save_batch_state(
+        &self,
+        paths: &[std::path::PathBuf],
+        format: Option<&str>,
+        sample_rate: Option<u32>,
+        bit_depth: Option<&str>,
+        dither: Option<&str>,
+        replaygain: Option<&str>,
+    ) -> Result<(), String> {
+        let paths_json = serde_json::to_string(
+            &paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+        ).map_err(|e| format!("paths serialize: {}", e))?;
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO batch_state (
+                id, paths_json, format, sample_rate, bit_depth,
+                dither, replaygain, saved_at
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                paths_json, format, sample_rate, bit_depth,
+                dither, replaygain, chrono::Utc::now().to_rfc3339(),
+            ],
+        ).map_err(|e| format!("batch state save: {}", e))?;
+        Ok(())
+    }
+
+    /// Load the saved batch state, if any. Returns (paths, format, sample_rate,
+    /// bit_depth, dither, replaygain).
+    pub fn load_batch_state(
+        &self,
+    ) -> Option<(Vec<std::path::PathBuf>, Option<String>, Option<u32>, Option<String>, Option<String>, Option<String>)> {
+        self.conn.query_row(
+            "SELECT paths_json, format, sample_rate, bit_depth, dither, replaygain
+             FROM batch_state WHERE id = 1",
+            [],
+            |row| {
+                let json: String = row.get(0)?;
+                let format: Option<String> = row.get(1)?;
+                let sample_rate: Option<u32> = row.get(2)?;
+                let bit_depth: Option<String> = row.get(3)?;
+                let dither: Option<String> = row.get(4)?;
+                let replaygain: Option<String> = row.get(5)?;
+                Ok((json, format, sample_rate, bit_depth, dither, replaygain))
+            },
+        ).ok().and_then(|(json, format, sr, bd, dither, rg)| {
+            let path_strs: Vec<String> = serde_json::from_str(&json).ok()?;
+            let paths: Vec<std::path::PathBuf> = path_strs.into_iter()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.exists()) // Only restore paths that still exist
+                .collect();
+            if paths.is_empty() { return None; }
+            Some((paths, format, sr, bd, dither, rg))
+        })
+    }
+
+    /// Clear the saved batch state (after commit or explicit cancel).
+    pub fn clear_batch_state(&self) -> Result<(), String> {
+        self.conn.execute("DELETE FROM batch_state WHERE id = 1", [])
+            .map_err(|e| format!("batch state clear: {}", e))?;
         Ok(())
     }
 
