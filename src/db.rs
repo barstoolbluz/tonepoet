@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -70,6 +70,9 @@ impl Database {
         }
         if version < 2 {
             self.migrate_v2()?;
+        }
+        if version < 3 {
+            self.migrate_v3()?;
         }
 
         self.conn
@@ -150,6 +153,92 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_presets_format ON presets(format);
         ").map_err(|e| format!("v2 migration failed: {}", e))?;
         Ok(())
+    }
+
+    /// v3: conversion history table.
+    fn migrate_v3(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS conversion_history (
+                id              INTEGER PRIMARY KEY,
+                input_path      TEXT NOT NULL,
+                output_path     TEXT,
+                input_format    TEXT,
+                output_format   TEXT NOT NULL,
+                sample_rate     INTEGER,
+                bit_depth       TEXT,
+                dither          TEXT,
+                replaygain_mode TEXT,
+                source_size     INTEGER,
+                output_size     INTEGER,
+                queued_at       TEXT,
+                started_at      TEXT,
+                completed_at    TEXT NOT NULL,
+                success         INTEGER NOT NULL,
+                error_message   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_history_completed
+                ON conversion_history(completed_at);
+            CREATE INDEX IF NOT EXISTS idx_history_input
+                ON conversion_history(input_path);
+        ").map_err(|e| format!("v3 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    // ── Conversion history ───────────────────────────────────────
+
+    /// Record a completed (or failed) conversion in the history table.
+    pub fn record_conversion(
+        &self,
+        input_path: &str,
+        output_path: Option<&str>,
+        input_format: Option<&str>,
+        output_format: &str,
+        sample_rate: Option<u32>,
+        bit_depth: Option<&str>,
+        dither: Option<&str>,
+        replaygain_mode: Option<&str>,
+        source_size: Option<u64>,
+        output_size: Option<u64>,
+        queued_at: Option<&str>,
+        started_at: Option<&str>,
+        completed_at: &str,
+        success: bool,
+        error_message: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT INTO conversion_history (
+                input_path, output_path, input_format, output_format,
+                sample_rate, bit_depth, dither, replaygain_mode,
+                source_size, output_size,
+                queued_at, started_at, completed_at,
+                success, error_message
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15
+            )",
+            params![
+                input_path, output_path, input_format, output_format,
+                sample_rate, bit_depth, dither, replaygain_mode,
+                source_size.map(|s| s as i64), output_size.map(|s| s as i64),
+                queued_at, started_at, completed_at,
+                success as i32, error_message,
+            ],
+        ).map_err(|e| format!("history insert: {}", e))?;
+        Ok(())
+    }
+
+    /// Check if a file (by path + mtime + size) has been successfully
+    /// converted before. For dedup warnings.
+    pub fn was_previously_converted(
+        &self,
+        input_path: &str,
+    ) -> bool {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM conversion_history
+             WHERE input_path = ?1 AND success = 1",
+            params![input_path],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) > 0
     }
 
     // ── Presets ───────────────────────────────────────────────────

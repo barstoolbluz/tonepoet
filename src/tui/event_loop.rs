@@ -150,17 +150,51 @@ fn check_pending_browse_rename(app: &mut AppState) {
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::ConversionProgress { item_id, status } => {
-            // Save queue whenever an item reaches a terminal state (Completed/Failed).
-            // Without this, a crash mid-batch loses all progress — completed items
-            // are still "Queued" in the saved JSON and get re-converted on restart.
-            let is_terminal = matches!(
-                status,
-                crate::convert::ConversionStatus::Completed { .. }
-                | crate::convert::ConversionStatus::Failed { .. }
-            );
+            // Capture terminal state info BEFORE the status is moved into the item.
+            let history_data = match &status {
+                crate::convert::ConversionStatus::Completed { output_path } => {
+                    Some((true, Some(output_path.display().to_string()), None::<String>))
+                }
+                crate::convert::ConversionStatus::Failed { error } => {
+                    Some((false, None, Some(error.clone())))
+                }
+                _ => None,
+            };
+
             app.manager.update_item_status(&item_id, status, 0.0);
-            if is_terminal {
+
+            // Save queue + record history on terminal states.
+            if let Some((success, output_path, error_msg)) = history_data {
                 app.manager.save_queue(app.config.conversion.persist_queue).ok();
+
+                // Record in conversion history (read item from snapshot for metadata).
+                if let Some(item) = app.items_snapshot.iter().find(|i| i.id == item_id) {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let rg_mode = if item.options.calculate_replaygain {
+                        item.options.replaygain_mode
+                            .as_ref()
+                            .map(|m| format!("{:?}", m))
+                    } else {
+                        None
+                    };
+                    let _ = app.db.record_conversion(
+                        &item.input_path.display().to_string(),
+                        output_path.as_deref(),
+                        Some(&format!("{:?}", item.input_format)),
+                        item.output_format.name(),
+                        item.options.target_sample_rate,
+                        item.options.target_bit_depth.map(|d| format!("{}", d)).as_deref(),
+                        item.options.dither_type.as_ref().map(|d| format!("{:?}", d)).as_deref(),
+                        rg_mode.as_deref(),
+                        Some(item.file_size),
+                        None, // output_size computed later by log writer if enabled
+                        Some(&item.queued_at.to_rfc3339()),
+                        item.started_at.as_ref().map(|t| t.to_rfc3339()).as_deref(),
+                        &now,
+                        success,
+                        error_msg.as_deref(),
+                    );
+                }
             }
         }
         AppMessage::ConversionComplete { completed, failed } => {
