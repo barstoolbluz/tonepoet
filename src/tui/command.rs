@@ -618,6 +618,7 @@ pub fn execute_command(
                 app.set_status("No audio files to analyze");
             } else {
                 let count = paths.len();
+                app.analysis_results.clear(); // Fresh analysis — discard old results.
                 app.set_status(format!("Analyzing {} file{}...", count, if count == 1 { "" } else { "s" }));
                 for path in paths {
                     let tx = tx.clone();

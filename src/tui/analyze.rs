@@ -91,41 +91,30 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 
     // ── Process a batch of samples (one channel) ─────────────────
 
-    let mut process_samples = |samples: &[f64], ch: usize, raw_i32: Option<&[i32]>| {
-        for (i, &s) in samples.iter().enumerate() {
-            let abs_val = s.abs();
-            if abs_val > peak_abs { peak_abs = abs_val; }
-            rms_sum += s * s;
-            dc_sum += s;
-            sample_count += 1;
-            if abs_val >= 0.9999695 { clipping_count += 1; } // ~-0.0003 dBFS
+    // Inline helper: accumulate samples for one channel. Does NOT
+    // touch block_sample_count — that's handled per-frame below.
+    macro_rules! accumulate_channel {
+        ($samples:expr, $ch:expr, $raw_i32:expr) => {{
+            let raw_opt: Option<&[i32]> = $raw_i32.map(|v| v as &[i32]);
+            for (i, &s) in $samples.iter().enumerate() {
+                let abs_val = s.abs();
+                if abs_val > peak_abs { peak_abs = abs_val; }
+                rms_sum += s * s;
+                dc_sum += s;
+                sample_count += 1;
+                if abs_val >= 0.9999695 { clipping_count += 1; }
 
-            if is_integer_fmt {
-                if let Some(raw) = raw_i32 {
-                    bit_or_mask |= (raw[i] as u32) | (raw[i].wrapping_neg() as u32);
+                if is_integer_fmt {
+                    if let Some(raw) = raw_opt {
+                        bit_or_mask |= (raw[i] as u32) | (raw[i].wrapping_neg() as u32);
+                    }
                 }
-            }
 
-            // DR block accumulation.
-            if abs_val > block_peaks[ch] { block_peaks[ch] = abs_val; }
-            block_rms_sums[ch] += s * s;
-        }
-        block_sample_count += samples.len();
-
-        // Flush completed blocks.
-        while block_sample_count >= block_size {
-            for c in 0..channels as usize {
-                let rms = (block_rms_sums[c] / block_size as f64).sqrt();
-                let rms_db = if rms > 0.0 { 20.0 * rms.log10() } else { -120.0 };
-                let peak_db = if block_peaks[c] > 0.0 { 20.0 * block_peaks[c].log10() } else { -120.0 };
-                dr_block_rms[c].push(rms_db);
-                dr_block_peak[c].push(peak_db);
-                block_rms_sums[c] = 0.0;
-                block_peaks[c] = 0.0;
+                if abs_val > block_peaks[$ch] { block_peaks[$ch] = abs_val; }
+                block_rms_sums[$ch] += s * s;
             }
-            block_sample_count -= block_size;
-        }
-    };
+        }};
+    }
 
     // ── Decode loop ──────────────────────────────────────────────
 
@@ -147,21 +136,21 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
                         let plane = decoded.plane::<i16>(ch);
                         let floats: Vec<f64> = plane.iter().map(|&s| s as f64 / 32768.0).collect();
                         let i32s: Vec<i32> = plane.iter().map(|&s| (s as i32) << 16).collect();
-                        process_samples(&floats, ch, Some(&i32s));
+                        accumulate_channel!(floats, ch, Some(&i32s));
                     }
                     Sample::I32(SampleType::Planar) => {
                         let plane = decoded.plane::<i32>(ch);
                         let floats: Vec<f64> = plane.iter().map(|&s| s as f64 / 2147483648.0).collect();
-                        process_samples(&floats, ch, Some(plane));
+                        accumulate_channel!(floats, ch, Some(plane));
                     }
                     Sample::F32(SampleType::Planar) => {
                         let plane = decoded.plane::<f32>(ch);
                         let floats: Vec<f64> = plane.iter().map(|&s| s as f64).collect();
-                        process_samples(&floats, ch, None);
+                        accumulate_channel!(floats, ch, None::<&[i32]>);
                     }
                     Sample::F64(SampleType::Planar) => {
                         let plane = decoded.plane::<f64>(ch);
-                        process_samples(plane, ch, None);
+                        { let sl: &[f64] = plane; accumulate_channel!(sl, ch, None::<&[i32]>); }
                     }
                     // Packed formats: samples are interleaved in plane 0.
                     Sample::I16(SampleType::Packed) => {
@@ -172,7 +161,7 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
                         let i32s: Vec<i32> = plane.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| (s as i32) << 16).collect();
-                        process_samples(&ch_samples, ch, Some(&i32s));
+                        accumulate_channel!(ch_samples, ch, Some(&i32s));
                     }
                     Sample::I32(SampleType::Packed) => {
                         let plane = decoded.plane::<i32>(0);
@@ -182,26 +171,40 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
                         let i32_ch: Vec<i32> = plane.iter()
                             .skip(ch).step_by(channels as usize)
                             .copied().collect();
-                        process_samples(&ch_samples, ch, Some(&i32_ch));
+                        accumulate_channel!(ch_samples, ch, Some(&i32_ch));
                     }
                     Sample::F32(SampleType::Packed) => {
                         let plane = decoded.plane::<f32>(0);
                         let ch_samples: Vec<f64> = plane.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| s as f64).collect();
-                        process_samples(&ch_samples, ch, None);
+                        accumulate_channel!(ch_samples, ch, None::<&[i32]>);
                     }
                     Sample::F64(SampleType::Packed) => {
                         let plane = decoded.plane::<f64>(0);
                         let ch_samples: Vec<f64> = plane.iter()
                             .skip(ch).step_by(channels as usize)
                             .copied().collect();
-                        process_samples(&ch_samples, ch, None);
+                        accumulate_channel!(ch_samples, ch, None::<&[i32]>);
                     }
                     _ => {
                         return Err(format!("unsupported sample format: {:?}", sample_fmt));
                     }
                 }
+            }
+            // Flush DR blocks once per frame (all channels processed).
+            block_sample_count += n;
+            while block_sample_count >= block_size {
+                for c in 0..channels as usize {
+                    let rms = (block_rms_sums[c] / block_size as f64).sqrt();
+                    let rms_db = if rms > 0.0 { 20.0 * rms.log10() } else { -120.0 };
+                    let peak_db = if block_peaks[c] > 0.0 { 20.0 * block_peaks[c].log10() } else { -120.0 };
+                    dr_block_rms[c].push(rms_db);
+                    dr_block_peak[c].push(peak_db);
+                    block_rms_sums[c] = 0.0;
+                    block_peaks[c] = 0.0;
+                }
+                block_sample_count -= block_size;
             }
         }
     }
