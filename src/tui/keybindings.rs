@@ -1272,7 +1272,11 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             let max_scroll = {
                 let sections = super::help::help_content_for(screen);
                 let total = super::help::line_count(&sections);
-                total.saturating_sub(15) // Approximate visible rows.
+                // Estimate visible rows from terminal height (same math as renderer).
+                let term_h = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(30) as usize;
+                let popup_h = (term_h * 85 / 100).max(15).min(term_h.saturating_sub(2));
+                let visible = popup_h.saturating_sub(4); // borders(2) + footer(1) + margin(1)
+                total.saturating_sub(visible)
             };
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
