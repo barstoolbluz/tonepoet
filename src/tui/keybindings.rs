@@ -1069,6 +1069,7 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
                 .count();
             if completed_count > 0 {
                 app.manager.clear_completed();
+                app.save_queue();
                 app.set_status(format!("Cleared {} completed items", completed_count));
             }
         }
@@ -2734,10 +2735,12 @@ fn execute_confirm_action(
     match action {
         ConfirmAction::RemoveSelected => {
             let removed = app.manager.remove_selected();
+            app.save_queue();
             app.set_status(format!("Removed {} items", removed));
         }
         ConfirmAction::ClearCompleted => {
             app.manager.clear_completed();
+            app.save_queue();
             app.set_status("Cleared completed items");
         }
         ConfirmAction::StopAll => {
@@ -2824,7 +2827,7 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
         }
     }
 
-    app.manager.save_queue(app.config.conversion.persist_queue).ok();
+    app.save_queue();
 }
 
 fn start_conversion(app: &mut AppState, tx: mpsc::Sender<AppMessage>) {

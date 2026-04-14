@@ -585,6 +585,7 @@ pub fn execute_context_action(
         }
         ContextAction::RemoveSelected => {
             let removed = app.manager.remove_selected();
+            app.save_queue();
             app.set_status(format!("Removed {} item(s)", removed));
         }
         ContextAction::RetryFailed => {

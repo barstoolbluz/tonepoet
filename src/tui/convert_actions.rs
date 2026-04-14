@@ -171,9 +171,7 @@ pub fn commit_batch(
         }
     }
 
-    app.manager
-        .save_queue(app.config.conversion.persist_queue)
-        .ok();
+    app.save_queue();
 
     outcome
 }

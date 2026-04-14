@@ -43,7 +43,7 @@ pub async fn run_app(
         // 3. Check quit
         if app.should_quit {
             // Save queue before exiting
-            app.manager.save_queue(app.config.conversion.persist_queue).ok();
+            app.save_queue();
             break;
         }
 
@@ -165,7 +165,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
 
             // Save queue + record history on terminal states.
             if let Some((success, output_path, error_msg)) = history_data {
-                app.manager.save_queue(app.config.conversion.persist_queue).ok();
+                app.save_queue();
 
                 // Record in conversion history (read item from snapshot for metadata).
                 if let Some(item) = app.items_snapshot.iter().find(|i| i.id == item_id) {
@@ -208,7 +208,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 app.set_status(format!("Conversion complete: {} files", completed));
             }
             // Save queue after completion
-            app.manager.save_queue(app.config.conversion.persist_queue).ok();
+            app.save_queue();
         }
         AppMessage::ConversionError { message } => {
             app.processing_active = false;
@@ -228,7 +228,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
             app.set_status(format!("Added {} files", count));
-            app.manager.save_queue(app.config.conversion.persist_queue).ok();
+            app.save_queue();
         }
         AppMessage::StatusMessage(msg) => {
             app.set_status(msg);

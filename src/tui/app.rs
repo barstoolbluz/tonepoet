@@ -1125,24 +1125,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: TonepoetConfig) -> Self {
-        let conv_config = ConversionConfig {
-            worker_count: config.conversion.worker_count,
-            ..ConversionConfig::default()
-        };
-        let mut manager = ConversionManager::new(conv_config);
-
-        // Load persisted queue if enabled
-        if config.conversion.persist_queue {
-            manager.load_persisted_queue();
-        }
-
-        let mut output_options = OutputOptionsState::new();
-        output_options.dest_path = config.conversion.default_destination.clone();
-
-        let initial_screen = AppScreen::from_config_name(&config.ui.default_screen);
-
-        // Open the SQLite database. If it fails, log and use a fallback
-        // in-memory DB so the TUI can still launch.
+        // Open the SQLite database FIRST — needed for queue load + other init.
         let db = match crate::db::Database::open() {
             Ok(db) => db,
             Err(e) => {
@@ -1152,7 +1135,38 @@ impl AppState {
             }
         };
 
-        // Load recent files + bookmarks from DB before moving `db` into struct.
+        let conv_config = ConversionConfig {
+            worker_count: config.conversion.worker_count,
+            ..ConversionConfig::default()
+        };
+        let mut manager = ConversionManager::new(conv_config);
+
+        // Load persisted queue: try SQLite first, fall back to JSON import.
+        if config.conversion.persist_queue {
+            let db_items = db.load_queue_items();
+            if !db_items.is_empty() {
+                if let Ok(mut q) = manager.queue.try_write() {
+                    for item in db_items {
+                        q.items_mut().push_back(item);
+                    }
+                }
+            } else {
+                // SQLite empty — try importing from JSON (first-run migration).
+                manager.load_persisted_queue();
+                // Sync the imported items to SQLite.
+                if let Ok(q) = manager.queue.try_read() {
+                    let items: Vec<&crate::convert::ConversionItem> = q.all_items();
+                    let _ = db.sync_queue(&items);
+                }
+            }
+        }
+
+        let mut output_options = OutputOptionsState::new();
+        output_options.dest_path = config.conversion.default_destination.clone();
+
+        let initial_screen = AppScreen::from_config_name(&config.ui.default_screen);
+
+        // Load recent files + bookmarks from DB.
         let recent = crate::tui::recent_files::RecentFilesState::load_from_db(&db);
         let bookmarks = crate::tui::bookmarks::BookmarksState::load_from_db(&db);
         // Import TOML presets into DB on first run.
@@ -1199,6 +1213,29 @@ impl AppState {
     }
 
     /// Set a status message that will auto-clear after 5 seconds
+    /// Save the conversion queue to both JSON (legacy) and SQLite.
+    pub fn save_queue(&mut self) {
+        if !self.config.conversion.persist_queue {
+            return;
+        }
+        // Legacy JSON save (kept for backward compat during migration).
+        self.manager.save_queue(true).ok();
+        // SQLite sync (ACID, transactional).
+        if let Ok(q) = self.manager.queue.try_read() {
+            let items: Vec<&crate::convert::ConversionItem> = q.all_items()
+                .into_iter()
+                .filter(|item| {
+                    !matches!(
+                        item.status,
+                        crate::convert::ConversionStatus::Processing { .. }
+                            | crate::convert::ConversionStatus::Cancelled
+                    )
+                })
+                .collect();
+            let _ = self.db.sync_queue(&items);
+        }
+    }
+
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), std::time::Instant::now()));
     }

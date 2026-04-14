@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 5;
+const CURRENT_VERSION: u32 = 6;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -79,6 +79,9 @@ impl Database {
         }
         if version < 5 {
             self.migrate_v5()?;
+        }
+        if version < 6 {
+            self.migrate_v6()?;
         }
 
         self.conn
@@ -279,6 +282,80 @@ impl Database {
             ALTER TABLE recent_files ADD COLUMN access_count INTEGER NOT NULL DEFAULT 1;
         ").map_err(|e| format!("v5 migration failed: {}", e))?;
         Ok(())
+    }
+
+    /// v6: conversion queue table.
+    fn migrate_v6(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS conversion_queue (
+                id              TEXT PRIMARY KEY,
+                item_json       TEXT NOT NULL
+            );
+        ").map_err(|e| format!("v6 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    // ── Conversion queue ─────────────────────────────────────────
+
+    /// Full sync: replace all queue rows with the current in-memory state.
+    /// Runs in a transaction for atomicity.
+    pub fn sync_queue(&self, items: &[&crate::convert::ConversionItem]) -> Result<(), String> {
+        let tx = self.conn.unchecked_transaction()
+            .map_err(|e| format!("queue tx begin: {}", e))?;
+
+        tx.execute("DELETE FROM conversion_queue", [])
+            .map_err(|e| format!("queue clear: {}", e))?;
+
+        for item in items {
+            let json = serde_json::to_string(item)
+                .map_err(|e| format!("queue item serialize: {}", e))?;
+            tx.execute(
+                "INSERT INTO conversion_queue (id, item_json) VALUES (?1, ?2)",
+                params![item.id, json],
+            ).map_err(|e| format!("queue item insert: {}", e))?;
+        }
+
+        tx.commit().map_err(|e| format!("queue tx commit: {}", e))?;
+        Ok(())
+    }
+
+    /// Load all queue items from SQLite. Returns deserialized items with
+    /// path validation (same as the JSON loader).
+    pub fn load_queue_items(&self) -> Vec<crate::convert::ConversionItem> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT item_json FROM conversion_queue"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        rows.flatten()
+            .filter_map(|json| serde_json::from_str::<crate::convert::ConversionItem>(&json).ok())
+            .filter(|item| {
+                let path_str = item.input_path.to_string_lossy();
+                if path_str.contains("..") {
+                    log::warn!("Filtered queue item with suspicious path: {:?}", item.input_path);
+                    return false;
+                }
+                if !item.input_path.exists() {
+                    log::info!("Filtered queue item - file gone: {:?}", item.input_path);
+                    return false;
+                }
+                true
+            })
+            .collect()
+    }
+
+    /// Check if the queue table has any rows.
+    pub fn has_queue_items(&self) -> bool {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM conversion_queue", [], |row| row.get::<_, i64>(0)
+        ).unwrap_or(0) > 0
     }
 
     // ── Conversion history ───────────────────────────────────────
