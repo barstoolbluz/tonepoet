@@ -311,6 +311,20 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 .dir_stats_cache
                 .insert(path, std::sync::Arc::new(stats));
         }
+        AppMessage::AnalysisComplete { result } => {
+            app.analysis_results.push(*result);
+            let count = app.analysis_results.len();
+            let last = &app.analysis_results[count - 1];
+            let name = last.path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            app.set_status(format!(
+                "Analyzed: {} — DR{} ({})",
+                name, last.dr_value, super::analyze::dr_label(last.dr_value),
+            ));
+            // Open the analysis overlay to show results.
+            app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+        }
         AppMessage::PathValidationComplete { input, result } => {
             match result {
                 Ok(path) => {

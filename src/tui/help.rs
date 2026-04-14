@@ -67,6 +67,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     (":mv <dest>", "Move selected to destination"),
                     (":del", "Move selected to trash"),
                     (":pw", "Set archive password"),
+                    (":analyze", "Audio analysis (DR, peak, clipping, etc.)"),
                 ],
             },
             HelpSection {

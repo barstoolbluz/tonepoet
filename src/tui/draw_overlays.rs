@@ -61,6 +61,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             let state = state.clone();
             draw_bulk_rename(f, &state);
         }
+        ActiveOverlay::Analysis { scroll } => {
+            draw_analysis(f, &app.analysis_results, scroll);
+        }
         ActiveOverlay::Help { screen, scroll } => {
             super::help::draw_help(f, screen, scroll);
         }
@@ -955,5 +958,130 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     f.render_widget(
         Paragraph::new(Line::from(footer_parts)).alignment(Alignment::Center),
         chunks[6],
+    );
+}
+
+/// Draw the analysis results overlay.
+fn draw_analysis(
+    f: &mut Frame,
+    results: &[super::analyze::AnalysisResult],
+    scroll: usize,
+) {
+    use super::analyze::dr_label;
+
+    let area = f.size();
+    let w = (area.width * 80 / 100).max(50).min(area.width.saturating_sub(2));
+    let h = (area.height * 80 / 100).max(12).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::PURPLE))
+        .title(Span::styled(
+            " Analysis Results ",
+            Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 || results.is_empty() {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    // Build content lines.
+    let mut lines: Vec<Line> = Vec::new();
+    let label_w = 22;
+
+    for (i, r) in results.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        let name = r.path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| r.path.display().to_string());
+        lines.push(Line::from(Span::styled(
+            format!("  {}", name),
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        )));
+
+        let dr_color = match r.dr_value {
+            0..=3 => theme::RED,
+            4..=7 => theme::AMBER,
+            8..=13 => theme::GREEN,
+            _ => theme::CYAN,
+        };
+
+        let entries: Vec<(&str, String, Color)> = vec![
+            ("Dynamic Range", format!("DR{} ({})", r.dr_value, dr_label(r.dr_value)), dr_color),
+            ("Sample Peak", format!("{:.1} dBFS", r.peak_db), theme::TEXT_BRIGHT),
+            ("RMS Level", format!("{:.1} dBFS", r.rms_db), theme::TEXT_BRIGHT),
+            ("Clipping", if r.clipping_count == 0 {
+                "None".into()
+            } else {
+                format!("{} samples", r.clipping_count)
+            }, if r.clipping_count == 0 { theme::GREEN } else { theme::RED }),
+            ("DC Bias", if r.dc_bias.abs() < 0.001 {
+                format!("{:.6} (negligible)", r.dc_bias)
+            } else {
+                format!("{:.6} (significant!)", r.dc_bias)
+            }, if r.dc_bias.abs() < 0.001 { theme::TEXT_MUTED } else { theme::AMBER }),
+            ("Bit Depth", format!(
+                "{}-bit{}",
+                r.actual_bit_depth,
+                r.declared_bit_depth.map(|d| if d != r.actual_bit_depth {
+                    format!(" ({} declared)", d)
+                } else {
+                    String::new()
+                }).unwrap_or_default()
+            ), if r.declared_bit_depth.map(|d| d != r.actual_bit_depth).unwrap_or(false) {
+                theme::AMBER
+            } else {
+                theme::TEXT_BRIGHT
+            }),
+        ];
+
+        // LUFS + true peak (if available).
+        let mut extra: Vec<(&str, String, Color)> = Vec::new();
+        if let Some(lufs) = r.lufs {
+            extra.push(("Loudness", format!("{:.1} LUFS", lufs), theme::TEXT_BRIGHT));
+        }
+        if let Some(tp) = r.true_peak_dbtp {
+            extra.push(("True Peak", format!("{:.1} dBTP", tp), theme::TEXT_BRIGHT));
+        }
+
+        for (label, value, color) in entries.iter().chain(extra.iter()) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {:<width$}", label, width = label_w), theme::muted()),
+                Span::styled(value.clone(), Style::default().fg(*color)),
+            ]));
+        }
+    }
+
+    let total = lines.len();
+    let visible = chunks[0].height as usize;
+    let scroll = scroll.min(total.saturating_sub(visible));
+
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    // Footer.
+    let footer = Line::from(vec![
+        Span::styled("↑↓", Style::default().fg(theme::BLUE)),
+        Span::styled(" scroll  ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled("Esc", Style::default().fg(theme::PURPLE)),
+        Span::styled(" close", Style::default().fg(theme::TEXT_MUTED)),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
     );
 }

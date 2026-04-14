@@ -43,6 +43,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "bookmarks", "bm",
     "rename-all", "renameall", "bulk-rename",
     "password", "pw",
+    "analyze", "analysis", "dr",
 ];
 
 /// Commands that take a preset name as their argument. Used by the
@@ -224,6 +225,8 @@ pub enum Command {
     Bookmarks(String),
     /// Open the bulk rename wizard for the current selection.
     BulkRename,
+    /// Analyze selected audio file(s) — DR, peak, clipping, etc.
+    Analyze,
     /// Set an archive password for the selected archive in Browse.
     Password,
     Unknown(String),
@@ -299,6 +302,7 @@ pub fn parse_command(input: &str) -> Command {
         "recent" | "recents" => Command::Recent,
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
         "rename-all" | "renameall" | "bulk-rename" => Command::BulkRename,
+        "analyze" | "analysis" | "dr" => Command::Analyze,
         "password" | "pw" => Command::Password,
         _ => Command::Unknown(input.to_string()),
     }
@@ -594,6 +598,45 @@ pub fn execute_command(
                 }
             } else {
                 app.set_status("No file selected");
+            }
+        }
+        Command::Analyze => {
+            // Collect paths to analyze from the current context.
+            let paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    sel.into_iter()
+                        .filter(|p| app.browse.entries.iter().any(|e| {
+                            e.path == *p && matches!(e.kind, super::browse::EntryKind::AudioFile(_))
+                        }))
+                        .collect()
+                }
+                AppScreen::Convert => app.convert.source.mode.all_paths(),
+                _ => Vec::new(),
+            };
+            if paths.is_empty() {
+                app.set_status("No audio files to analyze");
+            } else {
+                let count = paths.len();
+                app.set_status(format!("Analyzing {} file{}...", count, if count == 1 { "" } else { "s" }));
+                for path in paths {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            let res = super::analyze::analyze_file(&path)?;
+                            // Add LUFS via loudgain (blocking subprocess).
+                            // Run in a new tokio runtime block since we're in spawn_blocking.
+                            // Skip — LUFS will be added async after the PCM analysis.
+                            Ok::<_, String>(res)
+                        }).await.unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+
+                        if let Ok(result) = result {
+                            let _ = tx.send(AppMessage::AnalysisComplete {
+                                result: Box::new(result),
+                            }).await;
+                        }
+                    });
+                }
             }
         }
         Command::BulkRename => {

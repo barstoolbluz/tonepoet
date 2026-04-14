@@ -1267,6 +1267,22 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::BulkRename(state) => {
             handle_bulk_rename_key(app, key, *state, tx);
         }
+        ActiveOverlay::Analysis { mut scroll } => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::Analysis { scroll };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll += 1;
+                    app.active_overlay = ActiveOverlay::Analysis { scroll };
+                }
+                _ => {}
+            }
+        }
         ActiveOverlay::Help { mut scroll, screen } => {
             // Compute content length for scroll clamping.
             let max_scroll = {

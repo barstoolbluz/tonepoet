@@ -40,6 +40,10 @@ pub enum AppMessage {
         path: std::path::PathBuf,
         stats: crate::tui::browse::DirStats,
     },
+    /// Result of an async audio analysis (DR, peak, RMS, etc.).
+    AnalysisComplete {
+        result: Box<crate::tui::analyze::AnalysisResult>,
+    },
     /// Result of async path validation (canonicalize + is_dir) for :cd.
     PathValidationComplete {
         input: String,

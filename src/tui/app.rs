@@ -805,6 +805,10 @@ pub enum ActiveOverlay {
     },
     /// Bulk rename wizard overlay. Boxed because the state is large.
     BulkRename(Box<BulkRenameState>),
+    /// Analysis results overlay showing DR, peak, RMS, etc.
+    Analysis {
+        scroll: usize,
+    },
     /// Help overlay showing keybindings for the current screen.
     Help {
         /// The screen that was active when help was opened.
@@ -1062,6 +1066,10 @@ pub struct AppState {
     /// Renderers check this to apply hover highlighting.
     pub hover_target: Option<crate::tui::button_map::TuiButton>,
 
+    /// Analysis results from the last :analyze command. Displayed in an
+    /// overlay when the analysis completes.
+    pub analysis_results: Vec<crate::tui::analyze::AnalysisResult>,
+
     // Navigation
     pub current_screen: AppScreen,
     pub previous_screen: Option<AppScreen>,
@@ -1215,6 +1223,7 @@ impl AppState {
             keychain: KeychainState::default(),
             archive_passwords: std::collections::HashMap::new(),
             hover_target: None,
+            analysis_results: Vec::new(),
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }

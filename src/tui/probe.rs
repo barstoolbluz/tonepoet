@@ -65,6 +65,11 @@ fn ensure_ffmpeg_init() {
     });
 }
 
+/// Public accessor for the ffmpeg init guard (used by analyze.rs).
+pub fn ensure_ffmpeg_init_pub() {
+    ensure_ffmpeg_init();
+}
+
 impl SourceInfo {
     /// Format duration as HH:MM:SS
     pub fn duration_display(&self) -> String {
