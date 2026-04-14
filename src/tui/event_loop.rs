@@ -150,7 +150,18 @@ fn check_pending_browse_rename(app: &mut AppState) {
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::ConversionProgress { item_id, status } => {
+            // Save queue whenever an item reaches a terminal state (Completed/Failed).
+            // Without this, a crash mid-batch loses all progress — completed items
+            // are still "Queued" in the saved JSON and get re-converted on restart.
+            let is_terminal = matches!(
+                status,
+                crate::convert::ConversionStatus::Completed { .. }
+                | crate::convert::ConversionStatus::Failed { .. }
+            );
             app.manager.update_item_status(&item_id, status, 0.0);
+            if is_terminal {
+                app.manager.save_queue(app.config.conversion.persist_queue).ok();
+            }
         }
         AppMessage::ConversionComplete { completed, failed } => {
             app.processing_active = false;
@@ -327,7 +338,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     app.browse.probe_cache.remove(&path);
                     app.browse.probe_pending.remove(&path);
                     let _ = app.db.invalidate_probe(&path_str);
-                    app.browse.probe_current(tx);
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                     app.set_status(format!(
                         "{}: {} updated",
                         path.file_name().unwrap_or_default().to_string_lossy(),

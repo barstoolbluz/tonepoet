@@ -453,7 +453,7 @@ pub fn execute_context_action(
                     match &entry.kind {
                         EntryKind::Directory | EntryKind::ParentDir => {
                             app.browse.enter_selected();
-                            app.browse.probe_current(tx);
+                            app.browse.probe_current_with_db(tx, Some(&app.db));
                         }
                         _ => {
                             let path = entry.path.clone();
@@ -514,14 +514,14 @@ pub fn execute_context_action(
         ContextAction::Refresh => {
             if app.current_screen == AppScreen::Browse {
                 app.browse.refresh();
-                app.browse.probe_current(tx);
+                app.browse.probe_current_with_db(tx, Some(&app.db));
                 app.set_status("refreshed");
             }
         }
         ContextAction::ToggleHidden => {
             if app.current_screen == AppScreen::Browse {
                 app.browse.toggle_hidden();
-                app.browse.probe_current(tx);
+                app.browse.probe_current_with_db(tx, Some(&app.db));
             }
         }
         ContextAction::CycleSortBy => {
@@ -634,7 +634,7 @@ pub fn execute_context_action(
         ContextAction::GoToScreen(screen) => {
             app.current_screen = screen;
             if screen == AppScreen::Browse {
-                app.browse.probe_current(tx);
+                app.browse.probe_current_with_db(tx, Some(&app.db));
             }
         }
     }

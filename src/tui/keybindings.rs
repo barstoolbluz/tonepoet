@@ -51,7 +51,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             // quit key to prevent accidental exits.
             (KeyCode::Char('1'), KeyModifiers::NONE) => {
                 app.current_screen = AppScreen::Browse;
-                app.browse.probe_current(tx);
+                app.browse.probe_current_with_db(tx, Some(&app.db));
                 return;
             }
             (KeyCode::Char('2'), KeyModifiers::NONE) => {
@@ -127,7 +127,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 app.current_screen =
                     AppScreen::from_config_name(&app.config.ui.default_screen);
                 if app.current_screen == AppScreen::Browse {
-                    app.browse.probe_current(tx);
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                 }
                 return;
             }
@@ -140,7 +140,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 app.current_screen =
                     AppScreen::from_config_name(&app.config.ui.default_screen);
                 if app.current_screen == AppScreen::Browse {
-                    app.browse.probe_current(tx);
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                 }
                 return;
             }
@@ -158,7 +158,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                         .unwrap_or(AppScreen::Browse);
                     app.current_screen = origin;
                     if origin == AppScreen::Browse {
-                        app.browse.probe_current(tx);
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
                     }
                     app.set_status("cancelled");
                     return;
@@ -744,35 +744,35 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
     match (key.code, key.modifiers) {
         (KeyCode::Enter, _) => {
             app.browse.close_filter_input(true);
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
         (KeyCode::Esc, _) => {
             app.browse.close_filter_input(false);
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
         // List navigation while filter input is open
         (KeyCode::Up, _) => {
             app.browse.move_up();
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
         (KeyCode::Down, _) => {
             app.browse.move_down();
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
         (KeyCode::PageUp, _) => {
             app.browse.page_up();
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
         (KeyCode::PageDown, _) => {
             app.browse.page_down();
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
         // Everything else: feed to the text input, then re-apply view
         _ => {
             if let Some(input) = &mut app.browse.filter_input {
                 if handle_text_input_key(input, &key) {
                     app.browse.update_filter_from_input();
-                    app.browse.probe_current(tx);
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                 }
             }
         }
@@ -2222,7 +2222,7 @@ fn do_file_op(
 ) {
     do_file_op_inner(app, sources, dest, force, is_move);
     app.browse.refresh();
-    app.browse.probe_current(tx);
+    app.browse.probe_current_with_db(tx, Some(&app.db));
 }
 
 /// Perform a copy or move without tx (when called from command.rs with
@@ -2473,7 +2473,7 @@ pub(super) fn commit_browse_rename(
                 app.browse.selected_index = idx;
                 app.browse.ensure_visible();
             }
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
             app.set_status(format!("renamed: {} → {}", old_name, new_name));
         }
         Err(e) => {
@@ -2640,7 +2640,7 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Se
             }
             let display = path.display().to_string();
             app.browse.navigate_to(path);
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
             app.set_status(format!("cd: {}", display));
         }
         _ => {}
@@ -2763,7 +2763,7 @@ fn execute_confirm_action(
             }
             app.browse.clear_multi_selection();
             app.browse.refresh();
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
             let mut parts = vec![format!("trashed {} item(s)", trashed)];
             if errors > 0 {
                 parts.push(format!("{} errors", errors));
@@ -3038,7 +3038,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 match n {
                     1 => {
                         app.current_screen = AppScreen::Browse;
-                        app.browse.probe_current(tx);
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
                     }
                     2 => app.current_screen = AppScreen::Library,
                     3 => app.current_screen = AppScreen::Convert,
@@ -3112,7 +3112,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::SourceBrowseButton => {
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
                 app.current_screen = AppScreen::Browse;
-                app.browse.probe_current(tx);
+                app.browse.probe_current_with_db(tx, Some(&app.db));
             }
             TuiButton::SourceExpandButton => {
                 // Open the BatchList overlay if a batch is loaded.
@@ -3350,7 +3350,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     // contributes to rename/double-click timing.
                     app.last_browse_click = None;
                     app.pending_browse_rename = None;
-                    app.browse.probe_current(tx);
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                 } else if shift {
                     // ── Shift+click: toggle clicked entry in multi_selected ──
                     // toggle_selection operates on the current cursor (which we
@@ -3359,7 +3359,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     // Anchor unchanged. Clear click tracking.
                     app.last_browse_click = None;
                     app.pending_browse_rename = None;
-                    app.browse.probe_current(tx);
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                 } else {
                     // ── Plain click: open vs schedule-rename vs fresh ──
                     //
@@ -3394,7 +3394,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         match entry_kind {
                             EntryKind::Directory | EntryKind::ParentDir => {
                                 app.browse.enter_selected();
-                                app.browse.probe_current(tx);
+                                app.browse.probe_current_with_db(tx, Some(&app.db));
                             }
                             EntryKind::AudioFile(_) | EntryKind::Archive => {
                                 let target = app.browse.return_target;
@@ -3434,7 +3434,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         // Record this click and anchor.
                         app.last_browse_click = Some((clicked_path.clone(), now));
                         app.browse.multi_select_anchor = Some(clicked_path);
-                        app.browse.probe_current(tx);
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
                     }
                 }
             }

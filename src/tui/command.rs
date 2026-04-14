@@ -428,7 +428,7 @@ pub fn execute_command(
                     if !app.browse.is_async_enabled() {
                         let p = app.browse.current_dir.display().to_string();
                         app.set_status(format!("cd: {}", p));
-                        app.browse.probe_current(tx);
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
                     } else {
                         app.set_status(format!("Resolving: {}", path));
                     }
@@ -567,7 +567,7 @@ pub fn execute_command(
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
             }
             app.current_screen = AppScreen::Browse;
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
         Command::Recent => {
             app.recent.open_overlay();
@@ -1018,7 +1018,7 @@ fn execute_commit(
         let origin = app.previous_screen.take().unwrap_or(AppScreen::Browse);
         app.current_screen = origin;
         if origin == AppScreen::Browse {
-            app.browse.probe_current(tx);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
         }
     }
 }
