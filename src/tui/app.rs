@@ -1155,6 +1155,8 @@ impl AppState {
         // Load recent files + bookmarks from DB before moving `db` into struct.
         let recent = crate::tui::recent_files::RecentFilesState::load_from_db(&db);
         let bookmarks = crate::tui::bookmarks::BookmarksState::load_from_db(&db);
+        // Import TOML presets into DB on first run.
+        crate::tui::presets::import_presets_to_db(&db);
 
         Self {
             config,

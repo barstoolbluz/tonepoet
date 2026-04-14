@@ -159,7 +159,7 @@ fn separator() -> ContextMenuEntry {
 /// Reused by audio files, archives, and directories — the queue flow
 /// expands directories into their audio file contents automatically.
 fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
-    let groups = super::presets::list_presets_by_format();
+    let groups = super::presets::list_presets_by_format_db(&app.db);
 
     // Label "Last Used" with the current output format so the user
     // knows what they're getting without drilling in.
@@ -338,7 +338,7 @@ pub fn build_convert_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 
     // Presets grouped by codec — same tree structure as the browse
     // entry's Convert submenu, but here just for loading (not queuing).
-    let groups = super::presets::list_presets_by_format();
+    let groups = super::presets::list_presets_by_format_db(&app.db);
     if !groups.is_empty() {
         items.push(separator());
         for (fmt, names) in &groups {

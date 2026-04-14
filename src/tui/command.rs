@@ -319,7 +319,7 @@ pub fn execute_command(
                 let preset = super::presets::TuiPreset::from_pill_state(
                     name, &app.convert.format, &app.convert.output_options,
                 );
-                match super::presets::save_preset(&preset) {
+                match super::presets::save_preset_with_db(&preset, &app.db) {
                     Ok(_) => {
                         app.preset.modified = false;
                         app.set_status(format!("Saved preset: {}", name));
@@ -335,7 +335,7 @@ pub fn execute_command(
                 let preset = super::presets::TuiPreset::from_pill_state(
                     name, &app.convert.format, &app.convert.output_options,
                 );
-                super::presets::save_preset(&preset).ok();
+                super::presets::save_preset_with_db(&preset, &app.db).ok();
             }
             app.should_quit = true;
         }
@@ -480,7 +480,7 @@ pub fn execute_command(
                 let preset = super::presets::TuiPreset::from_pill_state(
                     &name, &app.convert.format, &app.convert.output_options,
                 );
-                match super::presets::save_preset(&preset) {
+                match super::presets::save_preset_with_db(&preset, &app.db) {
                     Ok(_) => {
                         app.preset.active_preset = Some(name.clone());
                         app.preset.modified = false;

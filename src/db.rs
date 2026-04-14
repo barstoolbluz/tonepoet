@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -68,8 +68,9 @@ impl Database {
         if version < 1 {
             self.migrate_v1()?;
         }
-
-        // Future: if version < 2 { self.migrate_v2()?; }
+        if version < 2 {
+            self.migrate_v2()?;
+        }
 
         self.conn
             .pragma_update(None, "user_version", CURRENT_VERSION)
@@ -128,6 +129,114 @@ impl Database {
         ").map_err(|e| format!("v1 migration failed: {}", e))?;
 
         Ok(())
+    }
+
+    /// v2: presets table.
+    fn migrate_v2(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS presets (
+                name            TEXT PRIMARY KEY,
+                description     TEXT,
+                format          TEXT NOT NULL,
+                sample_rate     INTEGER,
+                bit_depth       TEXT,
+                dither          TEXT,
+                replaygain      TEXT,
+                folder_template TEXT,
+                filename_template TEXT,
+                merge           TEXT,
+                version         INTEGER NOT NULL DEFAULT 2
+            );
+            CREATE INDEX IF NOT EXISTS idx_presets_format ON presets(format);
+        ").map_err(|e| format!("v2 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    // ── Presets ───────────────────────────────────────────────────
+
+    /// List all presets grouped by format. Returns (format, Vec<name>)
+    /// sorted by format then name. Instant via indexed query.
+    pub fn list_presets_by_format(&self) -> Vec<(String, Vec<String>)> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT name, format FROM presets ORDER BY format, name"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (name, format) = row;
+                if let Some(group) = groups.iter_mut().find(|(f, _)| f == &format) {
+                    group.1.push(name);
+                } else {
+                    groups.push((format, vec![name]));
+                }
+            }
+        }
+        groups
+    }
+
+    /// List all preset names (sorted).
+    pub fn list_preset_names(&self) -> Vec<String> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT name FROM presets ORDER BY name"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    /// Store a preset (upsert).
+    pub fn store_preset(
+        &self,
+        name: &str,
+        format: &str,
+        description: Option<&str>,
+        sample_rate: Option<u32>,
+        bit_depth: Option<&str>,
+        dither: Option<&str>,
+        replaygain: Option<&str>,
+        folder_template: Option<&str>,
+        filename_template: Option<&str>,
+        merge: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO presets (
+                name, format, description, sample_rate, bit_depth,
+                dither, replaygain, folder_template, filename_template, merge
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                name, format, description, sample_rate, bit_depth,
+                dither, replaygain, folder_template, filename_template, merge,
+            ],
+        ).map_err(|e| format!("preset store: {}", e))?;
+        Ok(())
+    }
+
+    /// Delete a preset by name.
+    pub fn delete_preset(&self, name: &str) -> Result<(), String> {
+        self.conn.execute(
+            "DELETE FROM presets WHERE name = ?1",
+            params![name],
+        ).map_err(|e| format!("preset delete: {}", e))?;
+        Ok(())
+    }
+
+    /// Check if the presets table has any entries.
+    pub fn has_presets(&self) -> bool {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM presets", [], |row| row.get::<_, i64>(0)
+        ).unwrap_or(0) > 0
     }
 
     // ── Metadata journal ─────────────────────────────────────────

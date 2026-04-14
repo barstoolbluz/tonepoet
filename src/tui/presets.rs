@@ -303,6 +303,91 @@ pub fn delete_preset(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Save a preset to both TOML and SQLite.
+pub fn save_preset_with_db(preset: &TuiPreset, db: &crate::db::Database) -> Result<(), String> {
+    save_preset(preset)?;
+    let _ = db.store_preset(
+        &preset.name,
+        &preset.format,
+        preset.description.as_deref(),
+        Some(preset.sample_rate),
+        Some(&preset.bit_depth),
+        Some(&preset.dither),
+        Some(&preset.replaygain),
+        Some(&preset.folder_template),
+        Some(&preset.filename_template),
+        Some(&preset.merge),
+    );
+    Ok(())
+}
+
+/// Delete a preset from both TOML and SQLite.
+pub fn delete_preset_with_db(name: &str, db: &crate::db::Database) -> Result<(), String> {
+    delete_preset(name)?;
+    let _ = db.delete_preset(name);
+    Ok(())
+}
+
+/// Import all TOML presets into the SQLite database (first-run migration).
+pub fn import_presets_to_db(db: &crate::db::Database) {
+    if db.has_presets() {
+        return; // DB already populated.
+    }
+    for name in list_presets() {
+        if let Ok(preset) = load_preset(&name) {
+            let _ = db.store_preset(
+                &preset.name,
+                &preset.format,
+                preset.description.as_deref(),
+                Some(preset.sample_rate),
+                Some(&preset.bit_depth),
+                Some(&preset.dither),
+                Some(&preset.replaygain),
+                Some(&preset.folder_template),
+                Some(&preset.filename_template),
+                Some(&preset.merge),
+            );
+        }
+    }
+}
+
+/// List presets grouped by format using the SQLite index.
+/// Falls back to the file-based scan if the DB is empty.
+pub fn list_presets_by_format_db(db: &crate::db::Database) -> Vec<(Option<AudioFormat>, Vec<String>)> {
+    let groups = db.list_presets_by_format();
+    if groups.is_empty() {
+        // Fall back to file-based scan (DB might not be populated yet).
+        return list_presets_by_format();
+    }
+
+    // Convert format strings to AudioFormat.
+    let display_order = [
+        AudioFormat::Flac,
+        AudioFormat::Wav,
+        AudioFormat::WavPack,
+        AudioFormat::Aiff,
+        AudioFormat::Alac,
+        AudioFormat::Opus,
+        AudioFormat::Aac,
+        AudioFormat::Mp3,
+    ];
+    let mut result = Vec::new();
+    for fmt in &display_order {
+        let fmt_str = fmt.name().to_lowercase();
+        if let Some((_, names)) = groups.iter().find(|(f, _)| f.to_lowercase() == fmt_str) {
+            result.push((Some(*fmt), names.clone()));
+        }
+    }
+    // Unknown formats at the end.
+    for (fmt_str, names) in &groups {
+        let is_known = display_order.iter().any(|f| f.name().to_lowercase() == fmt_str.to_lowercase());
+        if !is_known {
+            result.push((None, names.clone()));
+        }
+    }
+    result
+}
+
 // ── String → type parsers ────────────────────────────────────────────
 
 fn parse_format(s: &str) -> Option<AudioFormat> {

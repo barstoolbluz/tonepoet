@@ -357,7 +357,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
                     &app.convert.format,
                     &app.convert.output_options,
                 );
-                match super::presets::save_preset(&preset) {
+                match super::presets::save_preset_with_db(&preset, &app.db) {
                     Ok(_) => {
                         app.preset.modified = false;
                         app.set_status(format!("Saved preset: {}", name));
@@ -394,7 +394,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                     &app.convert.format,
                     &app.convert.output_options,
                 );
-                match super::presets::save_preset(&preset) {
+                match super::presets::save_preset_with_db(&preset, &app.db) {
                     Ok(_) => {
                         app.preset.active_preset = Some(name.clone());
                         app.preset.modified = false;
@@ -468,7 +468,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                             &app.preset.overlay_list,
                         );
                         preset.name = new_name;
-                        match super::presets::save_preset(&preset) {
+                        match super::presets::save_preset_with_db(&preset, &app.db) {
                             Ok(_) => {
                                 let saved_name = preset.name.clone();
                                 app.preset.overlay_list = super::presets::list_presets();
@@ -484,7 +484,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
         KeyCode::Char('x') => {
             // Delete selected preset
             if let Some(name) = app.preset.overlay_list.get(app.preset.overlay_selected).cloned() {
-                match super::presets::delete_preset(&name) {
+                match super::presets::delete_preset_with_db(&name, &app.db) {
                     Ok(_) => {
                         // If we deleted the active preset, clear it
                         if app.preset.active_preset.as_deref() == Some(&name) {
@@ -3062,7 +3062,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         &app.convert.format,
                         &app.convert.output_options,
                     );
-                    match super::presets::save_preset(&preset) {
+                    match super::presets::save_preset_with_db(&preset, &app.db) {
                         Ok(_) => {
                             app.preset.modified = false;
                             app.set_status(format!("Saved preset: {}", name));
