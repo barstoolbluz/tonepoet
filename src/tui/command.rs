@@ -988,6 +988,9 @@ fn execute_commit(
         if outcome.errors > 0 {
             parts.push(format!("{} errors", outcome.errors));
         }
+        if outcome.previously_converted > 0 {
+            parts.push(format!("{} re-converting", outcome.previously_converted));
+        }
         parts.join(", ")
     };
 

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 4;
+const CURRENT_VERSION: u32 = 5;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -76,6 +76,9 @@ impl Database {
         }
         if version < 4 {
             self.migrate_v4()?;
+        }
+        if version < 5 {
+            self.migrate_v5()?;
         }
 
         self.conn
@@ -267,6 +270,14 @@ impl Database {
     pub fn clear_batch_state(&self) -> Result<(), String> {
         self.conn.execute("DELETE FROM batch_state WHERE id = 1", [])
             .map_err(|e| format!("batch state clear: {}", e))?;
+        Ok(())
+    }
+
+    /// v5: add access_count to recent_files.
+    fn migrate_v5(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            ALTER TABLE recent_files ADD COLUMN access_count INTEGER NOT NULL DEFAULT 1;
+        ").map_err(|e| format!("v5 migration failed: {}", e))?;
         Ok(())
     }
 
@@ -683,8 +694,11 @@ impl Database {
     /// Record a file access with a specific timestamp (for imports).
     pub fn record_recent_at(&self, file_path: &str, timestamp: i64) -> Result<(), String> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO recent_files (file_path, accessed_at)
-             VALUES (?1, ?2)",
+            "INSERT INTO recent_files (file_path, accessed_at, access_count)
+             VALUES (?1, ?2, 1)
+             ON CONFLICT(file_path) DO UPDATE SET
+                accessed_at = ?2,
+                access_count = access_count + 1",
             params![file_path, timestamp],
         ).map_err(|e| format!("recent insert: {}", e))?;
         Ok(())

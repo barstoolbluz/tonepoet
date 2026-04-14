@@ -102,6 +102,8 @@ pub struct CommitOutcome {
     pub skipped: usize,
     /// Files that failed to enqueue (e.g. add_file errored).
     pub errors: usize,
+    /// Files that were previously converted (warning, not blocking).
+    pub previously_converted: usize,
 }
 
 /// Commit a batch of paths to the queue with the given conversion options.
@@ -138,6 +140,11 @@ pub fn commit_batch(
         if already_queued {
             outcome.skipped += 1;
             continue;
+        }
+
+        // Check if this file was previously converted (non-blocking warning).
+        if app.db.was_previously_converted(&path.display().to_string()) {
+            outcome.previously_converted += 1;
         }
 
         // For encrypted archives, resolve password:
