@@ -635,14 +635,29 @@ pub fn execute_command(
                         );
 
                         // Merge results and send.
-                        if let Ok(Ok(mut result)) = pcm_result {
-                            if let Some((lufs, tp)) = lufs_result {
-                                result.lufs = Some(lufs);
-                                result.true_peak_dbtp = Some(tp);
+                        match pcm_result {
+                            Ok(Ok(mut result)) => {
+                                if let Some((lufs, tp)) = lufs_result {
+                                    result.lufs = Some(lufs);
+                                    result.true_peak_dbtp = Some(tp);
+                                }
+                                let _ = tx.send(AppMessage::AnalysisComplete {
+                                    result: Box::new(result),
+                                }).await;
                             }
-                            let _ = tx.send(AppMessage::AnalysisComplete {
-                                result: Box::new(result),
-                            }).await;
+                            Ok(Err(e)) => {
+                                let name = lufs_path.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let _ = tx.send(AppMessage::StatusMessage(
+                                    format!("Analysis failed for {}: {}", name, e)
+                                )).await;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppMessage::StatusMessage(
+                                    format!("Analysis task panicked: {}", e)
+                                )).await;
+                            }
                         }
                     });
                 }
