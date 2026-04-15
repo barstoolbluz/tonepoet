@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 7;
+const CURRENT_VERSION: u32 = 8;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -85,6 +85,9 @@ impl Database {
         }
         if version < 7 {
             self.migrate_v7()?;
+        }
+        if version < 8 {
+            self.migrate_v8()?;
         }
 
         self.conn
@@ -323,9 +326,42 @@ impl Database {
         Ok(())
     }
 
+    /// v8: drop + recreate analysis_cache with algo_version column.
+    /// Invalidates all v7 cached results (algorithm was buggy).
+    fn migrate_v8(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            DROP TABLE IF EXISTS analysis_cache;
+            CREATE TABLE analysis_cache (
+                file_path       TEXT PRIMARY KEY,
+                file_mtime      INTEGER NOT NULL,
+                file_size       INTEGER NOT NULL,
+                algo_version    INTEGER NOT NULL,
+                dr_value        INTEGER,
+                peak_db         REAL,
+                rms_db          REAL,
+                clipping_count  INTEGER,
+                dc_bias         REAL,
+                actual_bit_depth INTEGER,
+                declared_bit_depth INTEGER,
+                sample_rate     INTEGER,
+                channels        INTEGER,
+                duration_secs   REAL,
+                lufs            REAL,
+                true_peak_dbtp  REAL,
+                analyzed_at     TEXT NOT NULL
+            );
+        ").map_err(|e| format!("v8 migration failed: {}", e))?;
+        Ok(())
+    }
+
     // ── Analysis cache ───────────────────────────────────────────
 
-    /// Look up cached analysis. Returns None if not cached or stale.
+    /// Bump this when the analysis algorithm changes to invalidate
+    /// cached results computed by an older version.
+    const ANALYSIS_ALGO_VERSION: i32 = 2;
+
+    /// Look up cached analysis. Returns None if not cached, stale,
+    /// or computed by an older algorithm version.
     pub fn get_cached_analysis(
         &self,
         file_path: &str,
@@ -337,8 +373,9 @@ impl Database {
                     actual_bit_depth, declared_bit_depth, sample_rate, channels,
                     duration_secs, lufs, true_peak_dbtp
              FROM analysis_cache
-             WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3",
-            params![file_path, mtime, size as i64],
+             WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3
+               AND algo_version = ?4",
+            params![file_path, mtime, size as i64, Self::ANALYSIS_ALGO_VERSION],
             |row| Ok(crate::tui::analyze::AnalysisResult {
                 path: std::path::PathBuf::from(file_path),
                 dr_value: row.get(0)?,
@@ -367,13 +404,13 @@ impl Database {
     ) -> Result<(), String> {
         self.conn.execute(
             "INSERT OR REPLACE INTO analysis_cache (
-                file_path, file_mtime, file_size,
+                file_path, file_mtime, file_size, algo_version,
                 dr_value, peak_db, rms_db, clipping_count, dc_bias,
                 actual_bit_depth, declared_bit_depth, sample_rate, channels,
                 duration_secs, lufs, true_peak_dbtp, analyzed_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
-                file_path, mtime, size as i64,
+                file_path, mtime, size as i64, Self::ANALYSIS_ALGO_VERSION,
                 r.dr_value, r.peak_db, r.rms_db, r.clipping_count as i64, r.dc_bias,
                 r.actual_bit_depth, r.declared_bit_depth, r.sample_rate, r.channels,
                 r.duration_secs, r.lufs, r.true_peak_dbtp,

@@ -83,10 +83,11 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
     let is_integer_fmt = matches!(sample_fmt, Sample::I16(_) | Sample::I32(_));
 
     // Per-block accumulators for DR (per-channel, then combined).
+    // Block arrays store LINEAR values (not dB) for correct aggregation.
     let mut block_rms_sums: Vec<f64> = vec![0.0; channels as usize];
     let mut block_peaks: Vec<f64> = vec![0.0; channels as usize];
     let mut block_sample_count: usize = 0;
-    let mut dr_block_rms: Vec<Vec<f64>> = vec![Vec::new(); channels as usize]; // per-channel
+    let mut dr_block_rms: Vec<Vec<f64>> = vec![Vec::new(); channels as usize];
     let mut dr_block_peak: Vec<Vec<f64>> = vec![Vec::new(); channels as usize];
 
     // ── Process a batch of samples (one channel) ─────────────────
@@ -120,13 +121,11 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 
     let mut decoded = ffmpeg::util::frame::Audio::empty();
 
-    for (stream, packet) in ictx.packets() {
-        if stream.index() != stream_idx {
-            continue;
-        }
-        decoder.send_packet(&packet).map_err(|e| format!("send_packet: {}", e))?;
-
-        while decoder.receive_frame(&mut decoded).is_ok() {
+    // Process a single decoded audio frame: accumulate all channels
+    // into the block and overall accumulators, then flush complete
+    // 3-second blocks.
+    macro_rules! process_frame {
+        () => {
             let n = decoded.samples();
             if n == 0 { continue; }
 
@@ -196,24 +195,42 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
             block_sample_count += n;
             while block_sample_count >= block_size {
                 for c in 0..channels as usize {
-                    let rms = (block_rms_sums[c] / block_size as f64).sqrt();
-                    let rms_db = if rms > 0.0 { 20.0 * rms.log10() } else { -120.0 };
-                    let peak_db = if block_peaks[c] > 0.0 { 20.0 * block_peaks[c].log10() } else { -120.0 };
-                    dr_block_rms[c].push(rms_db);
-                    dr_block_peak[c].push(peak_db);
+                    // AES-17 modified RMS: factor of 2 so full-scale sine = 0 dBFS.
+                    let rms_linear = (2.0 * block_rms_sums[c] / block_size as f64).sqrt();
+                    dr_block_rms[c].push(rms_linear);
+                    dr_block_peak[c].push(block_peaks[c]);
                     block_rms_sums[c] = 0.0;
                     block_peaks[c] = 0.0;
                 }
                 block_sample_count -= block_size;
             }
+        };
+    }
+
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != stream_idx {
+            continue;
+        }
+        decoder.send_packet(&packet).map_err(|e| format!("send_packet: {}", e))?;
+
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            process_frame!();
         }
     }
 
-    // Flush decoder.
+    // Flush decoder — process remaining buffered frames.
     decoder.send_eof().map_err(|e| format!("send_eof: {}", e))?;
     while decoder.receive_frame(&mut decoded).is_ok() {
-        // Process remaining frames (same logic as above, but for brevity
-        // we skip — the last partial block is negligible for DR accuracy).
+        process_frame!();
+    }
+
+    // Flush last partial block (reference: dr_rms divides by actual count).
+    if block_sample_count > 0 {
+        for c in 0..channels as usize {
+            let rms_linear = (2.0 * block_rms_sums[c] / block_sample_count as f64).sqrt();
+            dr_block_rms[c].push(rms_linear);
+            dr_block_peak[c].push(block_peaks[c]);
+        }
     }
 
     // ── Compute final metrics ────────────────────────────────────
@@ -240,7 +257,7 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 
     // ── DR calculation (TT algorithm) ────────────────────────────
 
-    let dr_value = compute_dr(&dr_block_rms, &dr_block_peak, peak_db, channels as usize);
+    let dr_value = compute_dr(&dr_block_rms, &dr_block_peak, channels as usize);
 
     Ok(AnalysisResult {
         path: path.to_path_buf(),
@@ -260,47 +277,57 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 }
 
 /// Compute the TT Dynamic Range value from per-channel block data.
+///
+/// Both `block_rms` and `block_peak` contain LINEAR amplitude values
+/// (not dB). The block RMS values already include the AES-17 factor
+/// of 2 (applied during accumulation).
 fn compute_dr(
-    block_rms: &[Vec<f64>],   // per-channel Vec of RMS values in dB
-    _block_peak: &[Vec<f64>], // per-channel Vec of peak values in dB (unused — we use overall peak)
-    overall_peak_db: f64,
+    block_rms: &[Vec<f64>],  // per-channel Vec of linear RMS values (with ×2)
+    block_peak: &[Vec<f64>], // per-channel Vec of linear peak values
     channels: usize,
 ) -> i32 {
     if channels == 0 || block_rms[0].is_empty() {
         return 0;
     }
 
-    // Per-channel DR.
     let mut channel_drs: Vec<f64> = Vec::new();
 
     for ch in 0..channels {
         let rms = &block_rms[ch];
+        let peaks = &block_peak[ch];
         if rms.is_empty() { continue; }
 
-        // Sort descending, take top 20%.
-        let mut sorted: Vec<f64> = rms.clone();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let top_count = (sorted.len() as f64 * 0.2).ceil() as usize;
-        let top_count = top_count.max(1);
-        let top_rms_mean: f64 = sorted[..top_count].iter().sum::<f64>() / top_count as f64;
+        // Sort RMS descending, take top 20% (floor, at least 1).
+        let mut sorted_rms: Vec<f64> = rms.clone();
+        sorted_rms.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let top_count = ((sorted_rms.len() as f64 * 0.2).floor() as usize).max(1);
 
-        let dr = overall_peak_db - top_rms_mean;
-        channel_drs.push(dr);
+        // Quadratic mean (RMS-of-RMS) of the top 20% in linear domain.
+        let rms_sq_sum: f64 = sorted_rms[..top_count].iter().map(|r| r * r).sum();
+        let rms_score = (rms_sq_sum / top_count as f64).sqrt();
+
+        // Second-highest per-channel block peak (robustness against spikes).
+        let mut sorted_peaks: Vec<f64> = peaks.clone();
+        sorted_peaks.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let peak_score = if sorted_peaks.len() >= 2 {
+            sorted_peaks[1]
+        } else {
+            sorted_peaks[0]
+        };
+
+        // Per-channel DR in dB.
+        if rms_score > 0.0 && peak_score > 0.0 {
+            let dr = 20.0 * (peak_score / rms_score).log10();
+            channel_drs.push(dr);
+        }
     }
 
     if channel_drs.is_empty() {
         return 0;
     }
 
-    // TT spec: for multi-channel, use second-highest DR.
-    // For mono, use the only channel.
-    channel_drs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let dr = if channel_drs.len() >= 2 {
-        channel_drs[1] // second-highest
-    } else {
-        channel_drs[0]
-    };
-
+    // TT spec: final DR is the arithmetic mean of per-channel DRs.
+    let dr = channel_drs.iter().sum::<f64>() / channel_drs.len() as f64;
     dr.round() as i32
 }
 
