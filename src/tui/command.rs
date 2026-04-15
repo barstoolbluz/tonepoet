@@ -623,15 +623,23 @@ pub fn execute_command(
                 for path in paths {
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            let res = super::analyze::analyze_file(&path)?;
-                            // Add LUFS via loudgain (blocking subprocess).
-                            // Run in a new tokio runtime block since we're in spawn_blocking.
-                            // Skip — LUFS will be added async after the PCM analysis.
-                            Ok::<_, String>(res)
-                        }).await.unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+                        let pcm_path = path.clone();
+                        let lufs_path = path;
 
-                        if let Ok(result) = result {
+                        // Run PCM analysis and loudgain in parallel.
+                        let (pcm_result, lufs_result) = tokio::join!(
+                            tokio::task::spawn_blocking(move || {
+                                super::analyze::analyze_file(&pcm_path)
+                            }),
+                            super::analyze::measure_loudness(&lufs_path),
+                        );
+
+                        // Merge results and send.
+                        if let Ok(Ok(mut result)) = pcm_result {
+                            if let Some((lufs, tp)) = lufs_result {
+                                result.lufs = Some(lufs);
+                                result.true_peak_dbtp = Some(tp);
+                            }
                             let _ = tx.send(AppMessage::AnalysisComplete {
                                 result: Box::new(result),
                             }).await;
