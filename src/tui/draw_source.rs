@@ -240,7 +240,7 @@ fn render_batch<'a>(
             Span::styled("   preview   ", theme::muted()),
             Span::styled(cursor_line_trunc, theme::bright()),
         ]),
-        expand_pill_row(border_color, w),
+        two_pill_row(border_color, w, EXPAND_PILL_LABEL),
     ]
 }
 
