@@ -20,6 +20,9 @@ pub const BROWSE_PILL_LABEL: &str = " browse files ";
 /// BatchList overlay to view / manage the full file list).
 pub const EXPAND_PILL_LABEL: &str = " expand ";
 
+/// Label shown on the clickable "analyze" pill on the source pane.
+pub const ANALYZE_PILL_LABEL: &str = " analyze ";
+
 /// Draw the source pane with amber border. Dispatches to the right
 /// renderer based on `source.mode`:
 /// - `Empty` → placeholder "press :browse..."
@@ -161,7 +164,7 @@ fn render_single<'a>(
             Span::styled("   duration  ", theme::muted()),
             Span::styled(info.duration_display(), theme::text()),
         ]),
-        browse_pill_row(border_color, w),
+        two_pill_row(border_color, w, BROWSE_PILL_LABEL),
     ]
 }
 
@@ -300,6 +303,41 @@ fn browse_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'s
 /// source pane. Clicking / activating opens the BatchList overlay.
 fn expand_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'static> {
     pill_row(border_color, width, EXPAND_PILL_LABEL)
+}
+
+/// Row with two pills: a primary pill (right-aligned) and an analyze pill
+/// to its left. Used when a file is loaded (Single/Batch).
+fn two_pill_row(
+    border_color: ratatui::style::Color,
+    width: usize,
+    primary_label: &'static str,
+) -> Line<'static> {
+    let pill_style = Style::default()
+        .fg(theme::PILL_ACTIVE_FG)
+        .bg(theme::PILL_ACTIVE_BG)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    let analyze_style = Style::default()
+        .fg(theme::PILL_ACTIVE_FG)
+        .bg(theme::PURPLE)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+
+    let primary_w = primary_label.chars().count();
+    let analyze_w = ANALYZE_PILL_LABEL.chars().count();
+    let gap = 2;
+    let right_margin = 3;
+    let total_pills = analyze_w + gap + primary_w;
+    let inner_w = width.saturating_sub(2);
+    let left_pad = inner_w.saturating_sub(total_pills + right_margin);
+
+    Line::from(vec![
+        Span::styled("│", theme::border(border_color)),
+        Span::raw(" ".repeat(left_pad)),
+        Span::styled(ANALYZE_PILL_LABEL, analyze_style),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(primary_label, pill_style),
+        Span::raw(" ".repeat(right_margin)),
+        Span::styled("│", theme::border(border_color)),
+    ])
 }
 
 /// Shared pill-row renderer: right-aligned pill with a small margin.

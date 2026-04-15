@@ -70,6 +70,8 @@ pub enum ContextAction {
     Refresh,
     /// Open the bulk rename wizard for selected audio files.
     BulkRename,
+    /// Analyze selected audio files (DR, peak, LUFS, etc.).
+    Analyze,
     /// Set a password for the selected archive (opens TextEdit prompt).
     SetArchivePassword,
     /// Toggle hidden-file visibility.
@@ -253,6 +255,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
             items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
             items.push(item_with_shortcut("Bulk Rename...", ContextAction::BulkRename, "R"));
+            items.push(item_with_shortcut("Analyze...", ContextAction::Analyze, ":analyze"));
             items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
             items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
             items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
@@ -487,6 +490,10 @@ pub fn execute_context_action(
         }
         ContextAction::SetArchivePassword => {
             let cmd = super::command::Command::Password;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::Analyze => {
+            let cmd = super::command::Command::Analyze;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::BulkRename => {

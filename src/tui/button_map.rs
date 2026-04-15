@@ -55,6 +55,8 @@ pub enum TuiButton {
     // Convert screen: "expand" pill on source pane in Batch mode → opens
     // the BatchList overlay to view/manage the full file list.
     SourceExpandButton,
+    // Convert screen: "analyze" pill on source pane → runs audio analysis.
+    SourceAnalyzeButton,
 
     // Queue action bar
     AddFiles,
@@ -104,7 +106,8 @@ impl TuiButton {
             | Self::FilenameTemplateField
             | Self::MetadataField(_)
             | Self::SourceBrowseButton
-            | Self::SourceExpandButton => Some(AppScreen::Convert),
+            | Self::SourceExpandButton
+            | Self::SourceAnalyzeButton => Some(AppScreen::Convert),
             Self::AddFiles
             | Self::AddFolder
             | Self::Configure

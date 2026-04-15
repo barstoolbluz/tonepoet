@@ -3240,6 +3240,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.active_overlay = ActiveOverlay::BatchList { scroll: 0 };
                 }
             }
+            TuiButton::SourceAnalyzeButton => {
+                let cmd = super::command::Command::Analyze;
+                super::command::execute_command(app, cmd, tx);
+            }
             TuiButton::MetadataField(field) => {
                 use super::button_map::MetadataFieldKind::*;
                 let (initial, target, label) = match field {

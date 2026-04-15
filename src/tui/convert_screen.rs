@@ -147,13 +147,13 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         );
     }
 
-    // Source pane pill (row 4 of the pane, right-aligned with 3-space
-    // margin). In Single/Empty mode it's "browse files" → SourceBrowseButton;
-    // in Batch mode it's "expand" → SourceExpandButton.
+    // Source pane pills (row 4 of the pane, right-aligned with 3-space
+    // margin). Primary pill: browse/expand. Secondary: analyze (when loaded).
     {
         let buttons = &mut app.button_map;
         let inner_w = source_area.width.saturating_sub(2);
         let in_batch = app.convert.source.mode.is_batch();
+        let has_source = !app.convert.source.mode.is_empty();
         let (button, label) = if in_batch {
             (
                 TuiButton::SourceExpandButton,
@@ -173,6 +173,19 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
                 button,
                 Rect::new(pill_x, source_area.y + 4, pill_label_w, 1),
             );
+
+            // Register analyze pill to the left of the primary pill.
+            if has_source {
+                let analyze_w = super::draw_source::ANALYZE_PILL_LABEL.chars().count() as u16;
+                let gap = 2u16;
+                let analyze_x = pill_x.saturating_sub(analyze_w + gap);
+                if analyze_x > source_area.x + 1 {
+                    buttons.record_button(
+                        TuiButton::SourceAnalyzeButton,
+                        Rect::new(analyze_x, source_area.y + 4, analyze_w, 1),
+                    );
+                }
+            }
         }
     }
 
