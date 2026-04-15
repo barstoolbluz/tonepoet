@@ -1281,11 +1281,11 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.active_overlay = ActiveOverlay::Analysis { scroll };
                 }
                 // Write ReplayGain tags: w = track only, W = album + track.
-                KeyCode::Char('w') => {
+                KeyCode::Char('w') | KeyCode::Char('W') => {
                     let paths: Vec<std::path::PathBuf> = app.analysis_results
                         .iter().map(|r| r.path.clone()).collect();
                     if !paths.is_empty() {
-                        let album = key.modifiers.contains(KeyModifiers::SHIFT);
+                        let album = key.code == KeyCode::Char('W');
                         let tx = tx.clone();
                         let db_paths: Vec<String> = paths.iter()
                             .map(|p| p.display().to_string()).collect();
