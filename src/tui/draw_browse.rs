@@ -53,7 +53,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
     let list_area = content_chunks[0];
     let hover = app.hover_target;
     draw_browse_list(f, list_area, &mut app.browse, hover);
-    draw_browse_info(f, content_chunks[1], &app.browse, &mut app.button_map);
+    draw_browse_info(f, content_chunks[1], &app.browse, &mut app.button_map, hover);
 
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(f, chunks[5], app.current_screen, &mut app.button_map, status_msg);
@@ -549,6 +549,7 @@ fn draw_browse_info(
     area: Rect,
     browse: &BrowseState,
     buttons: &mut ButtonRenderMap,
+    hover: Option<super::button_map::TuiButton>,
 ) {
     if area.height < 4 || area.width < 15 {
         return;
@@ -579,8 +580,9 @@ fn draw_browse_info(
 
     // Available width for content (inside borders, after the 3-space indent)
     let content_width = w.saturating_sub(2);
+    let analyze_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoAnalyze);
     let info = if let Some(entry) = browse.selected_entry() {
-        entry_info_lines(entry, browse, content_width)
+        entry_info_lines(entry, browse, content_width, analyze_hovered)
     } else {
         InfoContent {
             lines: vec![vec![Span::styled("   (no selection)", theme::muted())]],
@@ -646,6 +648,7 @@ fn entry_info_lines(
     entry: &BrowseEntry,
     browse: &BrowseState,
     content_width: usize,
+    analyze_hovered: bool,
 ) -> InfoContent {
     // Maximum width for free-form text values: subtract the 3-space indent
     let max_value_chars = content_width.saturating_sub(3);
@@ -896,19 +899,24 @@ fn entry_info_lines(
                 ]);
             }
 
-            // Analyze pill — right-aligned, purple.
+            // Analyze pill — right-aligned, purple (brighter on hover).
             lines.push(vec![]);
             let analyze_row = lines.len();
             let pill_label = " analyze ";
             let pill_w = pill_label.chars().count();
             let pad = content_width.saturating_sub(pill_w + 3);
+            let pill_bg = if analyze_hovered {
+                theme::BLUE // brighter on hover
+            } else {
+                theme::PURPLE
+            };
             lines.push(vec![
                 Span::raw(" ".repeat(pad)),
                 Span::styled(
                     pill_label,
                     Style::default()
                         .fg(theme::PILL_ACTIVE_FG)
-                        .bg(theme::PURPLE)
+                        .bg(pill_bg)
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
             ]);
