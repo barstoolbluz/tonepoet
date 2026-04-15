@@ -299,11 +299,6 @@ fn browse_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'s
     pill_row(border_color, width, BROWSE_PILL_LABEL)
 }
 
-/// Render the "expand" pill row for Batch mode, right-aligned inside the
-/// source pane. Clicking / activating opens the BatchList overlay.
-fn expand_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'static> {
-    pill_row(border_color, width, EXPAND_PILL_LABEL)
-}
 
 /// Row with two pills: a primary pill (right-aligned) and an analyze pill
 /// to its left. Used when a file is loaded (Single/Batch).
