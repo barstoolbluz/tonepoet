@@ -3582,6 +3582,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 // Click a metadata field in the info pane → open tag editor.
                 super::command::execute_edit_metadata_pub(app, field);
             }
+            TuiButton::BrowseInfoAnalyze => {
+                let cmd = super::command::Command::Analyze;
+                super::command::execute_command(app, cmd, tx);
+            }
             TuiButton::BrowseList => {
                 // Catch-all for scroll routing only; ignore on left click.
             }

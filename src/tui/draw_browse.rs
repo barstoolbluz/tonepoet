@@ -540,6 +540,8 @@ struct InfoContent {
     /// that are absent but have a "(click to add)" placeholder also
     /// appear here.
     meta_field_rows: Vec<(MetadataField, usize)>,
+    /// Line index of the analyze pill (if present).
+    analyze_pill_row: Option<usize>,
 }
 
 fn draw_browse_info(
@@ -583,6 +585,7 @@ fn draw_browse_info(
         InfoContent {
             lines: vec![vec![Span::styled("   (no selection)", theme::muted())]],
             meta_field_rows: Vec::new(),
+            analyze_pill_row: None,
         }
     };
 
@@ -610,6 +613,16 @@ fn draw_browse_info(
             buttons.record_button(
                 TuiButton::BrowseInfoMeta(*field),
                 Rect::new(area.x + 1, info_y_start + *line_idx as u16, (w - 2) as u16, 1),
+            );
+        }
+    }
+
+    // Register the analyze pill button if it fits.
+    if let Some(row) = info.analyze_pill_row {
+        if row < content_height {
+            buttons.record_button(
+                TuiButton::BrowseInfoAnalyze,
+                Rect::new(area.x + 1, info_y_start + row as u16, (w - 2) as u16, 1),
             );
         }
     }
@@ -882,6 +895,29 @@ fn entry_info_lines(
                     Span::styled(size_str(entry.size), theme::text()),
                 ]);
             }
+
+            // Analyze pill — right-aligned, purple.
+            lines.push(vec![]);
+            let analyze_row = lines.len();
+            let pill_label = " analyze ";
+            let pill_w = pill_label.chars().count();
+            let pad = content_width.saturating_sub(pill_w + 3);
+            lines.push(vec![
+                Span::raw(" ".repeat(pad)),
+                Span::styled(
+                    pill_label,
+                    Style::default()
+                        .fg(theme::PILL_ACTIVE_FG)
+                        .bg(theme::PURPLE)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            ]);
+            // Store the row index for button registration.
+            return InfoContent {
+                lines,
+                meta_field_rows,
+                analyze_pill_row: Some(analyze_row),
+            };
         }
         EntryKind::Archive => {
             lines.push(vec![
@@ -922,6 +958,7 @@ fn entry_info_lines(
     InfoContent {
         lines,
         meta_field_rows,
+        analyze_pill_row: None,
     }
 }
 
