@@ -1077,6 +1077,10 @@ fn draw_analysis(
     let footer = Line::from(vec![
         Span::styled("↑↓", Style::default().fg(theme::BLUE)),
         Span::styled(" scroll  ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled("w", Style::default().fg(theme::GREEN)),
+        Span::styled(" write RG  ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled("W", Style::default().fg(theme::GREEN)),
+        Span::styled(" album RG  ", Style::default().fg(theme::TEXT_MUTED)),
         Span::styled("Esc", Style::default().fg(theme::PURPLE)),
         Span::styled(" close", Style::default().fg(theme::TEXT_MUTED)),
     ]);

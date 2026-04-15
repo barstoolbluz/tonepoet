@@ -1280,6 +1280,58 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     scroll += 1;
                     app.active_overlay = ActiveOverlay::Analysis { scroll };
                 }
+                // Write ReplayGain tags: w = track only, W = album + track.
+                KeyCode::Char('w') => {
+                    let paths: Vec<std::path::PathBuf> = app.analysis_results
+                        .iter().map(|r| r.path.clone()).collect();
+                    if !paths.is_empty() {
+                        let album = key.modifiers.contains(KeyModifiers::SHIFT);
+                        let tx = tx.clone();
+                        let db_paths: Vec<String> = paths.iter()
+                            .map(|p| p.display().to_string()).collect();
+                        app.set_status(format!(
+                            "Writing {} ReplayGain tags...",
+                            if album { "album + track" } else { "track" },
+                        ));
+                        tokio::spawn(async move {
+                            let mut args = vec![
+                                "-s".to_string(), "i".to_string(),
+                                "-k".to_string(),
+                            ];
+                            if album {
+                                args.push("-a".to_string());
+                            } else {
+                                args.push("-r".to_string());
+                            }
+                            for p in &paths {
+                                args.push(p.to_string_lossy().to_string());
+                            }
+                            let output = tokio::process::Command::new("loudgain")
+                                .args(&args)
+                                .output()
+                                .await;
+                            let msg = match output {
+                                Ok(o) if o.status.success() => {
+                                    format!("ReplayGain tags written ({} file{})",
+                                        db_paths.len(),
+                                        if db_paths.len() == 1 { "" } else { "s" })
+                                }
+                                Ok(o) => {
+                                    let stderr = String::from_utf8_lossy(&o.stderr);
+                                    format!("loudgain failed: {}", stderr.lines().next().unwrap_or("unknown error"))
+                                }
+                                Err(e) => format!("loudgain not found: {}", e),
+                            };
+                            let _ = tx.send(AppMessage::StatusMessage(msg)).await;
+                        });
+                        app.active_overlay = ActiveOverlay::None;
+                        // Invalidate probe cache for the written files.
+                        for r in &app.analysis_results {
+                            app.browse.probe_cache.remove(&r.path);
+                            let _ = app.db.invalidate_probe(&r.path.display().to_string());
+                        }
+                    }
+                }
                 _ => {}
             }
         }
