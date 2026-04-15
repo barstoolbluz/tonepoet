@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 6;
+const CURRENT_VERSION: u32 = 7;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -82,6 +82,9 @@ impl Database {
         }
         if version < 6 {
             self.migrate_v6()?;
+        }
+        if version < 7 {
+            self.migrate_v7()?;
         }
 
         self.conn
@@ -292,6 +295,91 @@ impl Database {
                 item_json       TEXT NOT NULL
             );
         ").map_err(|e| format!("v6 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    /// v7: analysis cache table.
+    fn migrate_v7(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS analysis_cache (
+                file_path       TEXT PRIMARY KEY,
+                file_mtime      INTEGER NOT NULL,
+                file_size       INTEGER NOT NULL,
+                dr_value        INTEGER,
+                peak_db         REAL,
+                rms_db          REAL,
+                clipping_count  INTEGER,
+                dc_bias         REAL,
+                actual_bit_depth INTEGER,
+                declared_bit_depth INTEGER,
+                sample_rate     INTEGER,
+                channels        INTEGER,
+                duration_secs   REAL,
+                lufs            REAL,
+                true_peak_dbtp  REAL,
+                analyzed_at     TEXT NOT NULL
+            );
+        ").map_err(|e| format!("v7 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    // ── Analysis cache ───────────────────────────────────────────
+
+    /// Look up cached analysis. Returns None if not cached or stale.
+    pub fn get_cached_analysis(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: u64,
+    ) -> Option<crate::tui::analyze::AnalysisResult> {
+        self.conn.query_row(
+            "SELECT dr_value, peak_db, rms_db, clipping_count, dc_bias,
+                    actual_bit_depth, declared_bit_depth, sample_rate, channels,
+                    duration_secs, lufs, true_peak_dbtp
+             FROM analysis_cache
+             WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3",
+            params![file_path, mtime, size as i64],
+            |row| Ok(crate::tui::analyze::AnalysisResult {
+                path: std::path::PathBuf::from(file_path),
+                dr_value: row.get(0)?,
+                peak_db: row.get(1)?,
+                rms_db: row.get(2)?,
+                clipping_count: row.get::<_, i64>(3)? as u64,
+                dc_bias: row.get(4)?,
+                actual_bit_depth: row.get(5)?,
+                declared_bit_depth: row.get(6)?,
+                sample_rate: row.get(7)?,
+                channels: row.get(8)?,
+                duration_secs: row.get(9)?,
+                lufs: row.get(10)?,
+                true_peak_dbtp: row.get(11)?,
+            }),
+        ).ok()
+    }
+
+    /// Store an analysis result in the cache.
+    pub fn store_analysis(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: u64,
+        r: &crate::tui::analyze::AnalysisResult,
+    ) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO analysis_cache (
+                file_path, file_mtime, file_size,
+                dr_value, peak_db, rms_db, clipping_count, dc_bias,
+                actual_bit_depth, declared_bit_depth, sample_rate, channels,
+                duration_secs, lufs, true_peak_dbtp, analyzed_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                file_path, mtime, size as i64,
+                r.dr_value, r.peak_db, r.rms_db, r.clipping_count as i64, r.dc_bias,
+                r.actual_bit_depth, r.declared_bit_depth, r.sample_rate, r.channels,
+                r.duration_secs, r.lufs, r.true_peak_dbtp,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        ).map_err(|e| format!("analysis cache store: {}", e))?;
         Ok(())
     }
 

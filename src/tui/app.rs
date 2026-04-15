@@ -1070,6 +1070,10 @@ pub struct AppState {
     /// overlay when the analysis completes.
     pub analysis_results: Vec<crate::tui::analyze::AnalysisResult>,
 
+    /// Number of analysis tasks currently in flight. While > 0, the
+    /// status bar shows a persistent "Analyzing..." message.
+    pub analysis_pending: usize,
+
     // Navigation
     pub current_screen: AppScreen,
     pub previous_screen: Option<AppScreen>,
@@ -1224,6 +1228,7 @@ impl AppState {
             archive_passwords: std::collections::HashMap::new(),
             hover_target: None,
             analysis_results: Vec::new(),
+            analysis_pending: 0,
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }
@@ -1256,8 +1261,18 @@ impl AppState {
         self.status_message = Some((msg.into(), std::time::Instant::now()));
     }
 
-    /// Clear expired status messages
+    /// Clear expired status messages. While analysis is in flight,
+    /// shows a persistent "Analyzing..." message.
     pub fn clear_expired_status(&mut self) {
+        if self.analysis_pending > 0 {
+            let pending = self.analysis_pending;
+            let done = self.analysis_results.len();
+            self.status_message = Some((
+                format!("Analyzing... ({}/{})", done, done + pending),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
         if let Some((_, created)) = &self.status_message {
             if created.elapsed() > std::time::Duration::from_secs(5) {
                 self.status_message = None;

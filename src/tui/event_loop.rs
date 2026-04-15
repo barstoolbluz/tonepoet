@@ -312,18 +312,43 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 .insert(path, std::sync::Arc::new(stats));
         }
         AppMessage::AnalysisComplete { result } => {
-            app.analysis_results.push(*result);
-            let count = app.analysis_results.len();
-            let last = &app.analysis_results[count - 1];
-            let name = last.path.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            app.set_status(format!(
-                "Analyzed: {} — DR{} ({})",
-                name, last.dr_value, super::analyze::dr_label(last.dr_value),
-            ));
-            // Open the analysis overlay to show results.
-            app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+            app.analysis_pending = app.analysis_pending.saturating_sub(1);
+            match result {
+                Ok(result) => {
+                    // Persist to SQLite analysis cache for cross-session reuse.
+                    if let Ok(meta) = std::fs::metadata(&result.path) {
+                        let mtime = meta.modified()
+                            .map(crate::db::systemtime_to_unix)
+                            .unwrap_or(0);
+                        let _ = app.db.store_analysis(
+                            &result.path.display().to_string(),
+                            mtime,
+                            meta.len(),
+                            &result,
+                        );
+                    }
+
+                    app.analysis_results.push(*result);
+                    if app.analysis_pending == 0 {
+                        let count = app.analysis_results.len();
+                        let last = &app.analysis_results[count - 1];
+                        let name = last.path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        app.set_status(format!(
+                            "Analyzed: {} — DR{} ({})",
+                            name, last.dr_value, super::analyze::dr_label(last.dr_value),
+                        ));
+                        app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+                    }
+                }
+                Err(e) => {
+                    app.set_status(format!("Analysis failed: {}", e));
+                    if app.analysis_pending == 0 && !app.analysis_results.is_empty() {
+                        app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+                    }
+                }
+            }
         }
         AppMessage::PathValidationComplete { input, result } => {
             match result {

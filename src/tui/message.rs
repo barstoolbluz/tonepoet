@@ -41,8 +41,9 @@ pub enum AppMessage {
         stats: crate::tui::browse::DirStats,
     },
     /// Result of an async audio analysis (DR, peak, RMS, etc.).
+    /// `result` is Ok on success, Err(message) on failure.
     AnalysisComplete {
-        result: Box<crate::tui::analyze::AnalysisResult>,
+        result: Result<Box<crate::tui::analyze::AnalysisResult>, String>,
     },
     /// Result of async path validation (canonicalize + is_dir) for :cd.
     PathValidationComplete {

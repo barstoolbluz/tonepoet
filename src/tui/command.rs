@@ -617,49 +617,76 @@ pub fn execute_command(
             if paths.is_empty() {
                 app.set_status("No audio files to analyze");
             } else {
-                let count = paths.len();
-                app.analysis_results.clear(); // Fresh analysis — discard old results.
-                app.set_status(format!("Analyzing {} file{}...", count, if count == 1 { "" } else { "s" }));
-                for path in paths {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let pcm_path = path.clone();
-                        let lufs_path = path;
+                app.analysis_results.clear();
 
-                        // Run PCM analysis and loudgain in parallel.
-                        let (pcm_result, lufs_result) = tokio::join!(
-                            tokio::task::spawn_blocking(move || {
-                                super::analyze::analyze_file(&pcm_path)
-                            }),
-                            super::analyze::measure_loudness(&lufs_path),
-                        );
-
-                        // Merge results and send.
-                        match pcm_result {
-                            Ok(Ok(mut result)) => {
-                                if let Some((lufs, tp)) = lufs_result {
-                                    result.lufs = Some(lufs);
-                                    result.true_peak_dbtp = Some(tp);
-                                }
-                                let _ = tx.send(AppMessage::AnalysisComplete {
-                                    result: Box::new(result),
-                                }).await;
-                            }
-                            Ok(Err(e)) => {
-                                let name = lufs_path.file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                let _ = tx.send(AppMessage::StatusMessage(
-                                    format!("Analysis failed for {}: {}", name, e)
-                                )).await;
-                            }
-                            Err(e) => {
-                                let _ = tx.send(AppMessage::StatusMessage(
-                                    format!("Analysis task panicked: {}", e)
-                                )).await;
-                            }
-                        }
+                // Check DB cache for each path; only spawn analysis for misses.
+                let mut to_analyze = Vec::new();
+                for path in &paths {
+                    let cached = std::fs::metadata(path).ok().and_then(|meta| {
+                        let mtime = meta.modified()
+                            .map(crate::db::systemtime_to_unix)
+                            .unwrap_or(0);
+                        app.db.get_cached_analysis(
+                            &path.display().to_string(), mtime, meta.len(),
+                        )
                     });
+                    if let Some(result) = cached {
+                        app.analysis_results.push(result);
+                    } else {
+                        to_analyze.push(path.clone());
+                    }
+                }
+
+                if to_analyze.is_empty() {
+                    // All results served from cache — show overlay immediately.
+                    let count = app.analysis_results.len();
+                    let last = &app.analysis_results[count - 1];
+                    let name = last.path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    app.set_status(format!(
+                        "Analyzed: {} — DR{} ({}) [cached]",
+                        name, last.dr_value, super::analyze::dr_label(last.dr_value),
+                    ));
+                    app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+                } else {
+                    app.analysis_pending = to_analyze.len();
+                    for path in to_analyze {
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let pcm_path = path.clone();
+                            let lufs_path = path;
+
+                            // Run PCM analysis and loudgain in parallel.
+                            let (pcm_result, lufs_result) = tokio::join!(
+                                tokio::task::spawn_blocking(move || {
+                                    super::analyze::analyze_file(&pcm_path)
+                                }),
+                                super::analyze::measure_loudness(&lufs_path),
+                            );
+
+                            // Merge results and send (always send to decrement pending counter).
+                            let final_result = match pcm_result {
+                                Ok(Ok(mut result)) => {
+                                    if let Some((lufs, tp)) = lufs_result {
+                                        result.lufs = Some(lufs);
+                                        result.true_peak_dbtp = Some(tp);
+                                    }
+                                    Ok(Box::new(result))
+                                }
+                                Ok(Err(e)) => {
+                                    let name = lufs_path.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    Err(format!("{}: {}", name, e))
+                                }
+                                Err(e) => Err(format!("task panicked: {}", e)),
+                            };
+                            let _ = tx.send(AppMessage::AnalysisComplete {
+                                result: final_result,
+                            }).await;
+                        });
+                    }
                 }
             }
         }
