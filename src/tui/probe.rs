@@ -62,6 +62,9 @@ static FFMPEG_INIT: Once = Once::new();
 fn ensure_ffmpeg_init() {
     FFMPEG_INIT.call_once(|| {
         ffmpeg_next::init().expect("failed to initialize ffmpeg");
+        // Suppress ffmpeg's internal stderr logging (corrupt tags, invalid
+        // frames, etc.) which would bleed through and corrupt the TUI.
+        ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Quiet);
     });
 }
 

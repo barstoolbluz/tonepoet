@@ -73,7 +73,14 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 
     // ── Accumulator state ────────────────────────────────────────
 
-    let block_size = (sample_rate * 3) as usize; // 3-second blocks for DR.
+    // 3-second blocks for DR. At 44.1 kHz the original TT meter uses
+    // 3 × 44160 = 132480 instead of 132300 (compatibility quirk present
+    // in dr14_t.meter and foobar2000's foo_dr_meter).
+    let block_size = if sample_rate == 44100 {
+        3 * 44160 // 132480
+    } else {
+        (sample_rate * 3) as usize
+    };
     let mut peak_abs: f64 = 0.0;
     let mut rms_sum: f64 = 0.0;
     let mut sample_count: u64 = 0;
@@ -326,8 +333,16 @@ fn compute_dr(
         return 0;
     }
 
-    // TT spec: final DR is the arithmetic mean of per-channel DRs.
-    let dr = channel_drs.iter().sum::<f64>() / channel_drs.len() as f64;
+    // For stereo/multi-channel, use the second-highest (i.e. lower for
+    // stereo) per-channel DR — the channel with the least dynamic range
+    // determines the track rating. For mono, use the only value.
+    channel_drs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let dr = if channel_drs.len() >= 2 {
+        channel_drs[1]
+    } else {
+        channel_drs[0]
+    };
+
     dr.round() as i32
 }
 
