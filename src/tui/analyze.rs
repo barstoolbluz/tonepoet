@@ -155,6 +155,7 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
                         let plane = decoded.plane::<f64>(ch);
                         { let sl: &[f64] = plane; accumulate_channel!(sl, ch, None::<&[i32]>); }
                     }
+                    // Packed formats: samples are interleaved in plane 0.
                     Sample::I16(SampleType::Packed) => {
                         let plane = decoded.plane::<i16>(0);
                         let ch_samples: Vec<f64> = plane.iter()
@@ -198,7 +199,7 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
             block_sample_count += n;
             while block_sample_count >= block_size {
                 for c in 0..channels as usize {
-                    let rms_linear = (2.0 * block_rms_sums[c] / block_size as f64).sqrt();
+                    let rms_linear = (block_rms_sums[c] / block_size as f64).sqrt();
                     dr_block_rms[c].push(rms_linear);
                     dr_block_peak[c].push(block_peaks[c]);
                     block_rms_sums[c] = 0.0;
@@ -229,7 +230,7 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
     // Flush last partial block (reference: dr_rms divides by actual count).
     if block_sample_count > 0 {
         for c in 0..channels as usize {
-            let rms_linear = (2.0 * block_rms_sums[c] / block_sample_count as f64).sqrt();
+            let rms_linear = (block_rms_sums[c] / block_sample_count as f64).sqrt();
             dr_block_rms[c].push(rms_linear);
             dr_block_peak[c].push(block_peaks[c]);
         }

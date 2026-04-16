@@ -358,7 +358,7 @@ impl Database {
 
     /// Bump this when the analysis algorithm changes to invalidate
     /// cached results computed by an older version.
-    const ANALYSIS_ALGO_VERSION: i32 = 11;
+    const ANALYSIS_ALGO_VERSION: i32 = 13;
 
     /// Look up cached analysis. Returns None if not cached, stale,
     /// or computed by an older algorithm version.
