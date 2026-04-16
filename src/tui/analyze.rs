@@ -128,9 +128,6 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 
     let mut decoded = ffmpeg::util::frame::Audio::empty();
 
-    // Process a single decoded audio frame: accumulate all channels
-    // into the block and overall accumulators, then flush complete
-    // 3-second blocks.
     macro_rules! process_frame {
         () => {
             let n = decoded.samples();
@@ -158,7 +155,6 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
                         let plane = decoded.plane::<f64>(ch);
                         { let sl: &[f64] = plane; accumulate_channel!(sl, ch, None::<&[i32]>); }
                     }
-                    // Packed formats: samples are interleaved in plane 0.
                     Sample::I16(SampleType::Packed) => {
                         let plane = decoded.plane::<i16>(0);
                         let ch_samples: Vec<f64> = plane.iter()
@@ -202,7 +198,6 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
             block_sample_count += n;
             while block_sample_count >= block_size {
                 for c in 0..channels as usize {
-                    // AES-17 modified RMS: factor of 2 so full-scale sine = 0 dBFS.
                     let rms_linear = (2.0 * block_rms_sums[c] / block_size as f64).sqrt();
                     dr_block_rms[c].push(rms_linear);
                     dr_block_peak[c].push(block_peaks[c]);
