@@ -600,37 +600,57 @@ pub fn write_all_tags(
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{ItemValue, TagItem};
 
-    let mut tagged = lofty::read_from_path(path)
-        .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+    // Create a backup copy before modifying (crash safety).
+    let backup = crate::db::Database::backup_path_for(path);
+    std::fs::copy(path, &backup)
+        .map_err(|e| format!("backup failed for '{}': {}", path.display(), e))?;
 
-    // Get or create the primary tag.
-    if tagged.primary_tag().is_none() {
-        let tt = tagged.primary_tag_type();
-        tagged.insert_tag(lofty::tag::Tag::new(tt));
-    }
-    let tag = tagged.primary_tag_mut()
-        .ok_or_else(|| "failed to create primary tag".to_string())?;
+    let result = (|| -> Result<(), String> {
+        let mut tagged = lofty::read_from_path(path)
+            .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
 
-    for (key, new_value) in changes {
-        match new_value {
-            Some(val) if !val.trim().is_empty() => {
-                tag.remove_key(key);
-                tag.insert_unchecked(TagItem::new(
-                    key.clone(),
-                    ItemValue::Text(val.trim().to_string()),
-                ));
+        // Get or create the primary tag.
+        if tagged.primary_tag().is_none() {
+            let tt = tagged.primary_tag_type();
+            tagged.insert_tag(lofty::tag::Tag::new(tt));
+        }
+        let tag = tagged.primary_tag_mut()
+            .ok_or_else(|| "failed to create primary tag".to_string())?;
+
+        for (key, new_value) in changes {
+            match new_value {
+                Some(val) if !val.trim().is_empty() => {
+                    tag.remove_key(key);
+                    tag.insert_unchecked(TagItem::new(
+                        key.clone(),
+                        ItemValue::Text(val.trim().to_string()),
+                    ));
+                }
+                _ => {
+                    tag.remove_key(key);
+                }
             }
-            _ => {
-                tag.remove_key(key);
-            }
+        }
+
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .map_err(|e| format!("failed to save '{}': {}", path.display(), e))?;
+
+        Ok(())
+    })();
+
+    match &result {
+        Ok(()) => {
+            // Success — remove backup.
+            let _ = std::fs::remove_file(&backup);
+        }
+        Err(_) => {
+            // Failure — restore from backup.
+            let _ = std::fs::rename(&backup, path);
         }
     }
 
-    tagged
-        .save_to_path(path, WriteOptions::default())
-        .map_err(|e| format!("failed to save '{}': {}", path.display(), e))?;
-
-    Ok(())
+    result
 }
 
 #[cfg(test)]
