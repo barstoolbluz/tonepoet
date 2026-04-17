@@ -1870,13 +1870,13 @@ fn handle_metadata_editor_mouse(
         let total_rows = state.entries.len() + 1;
 
         match mouse.kind {
-            // Scroll wheel: navigate entries.
-            MouseEventKind::ScrollUp => {
+            // Scroll wheel: navigate entries. Blocked during inline edit.
+            MouseEventKind::ScrollUp if state.phase == MetadataEditorPhase::Editing => {
                 state.cursor = state.cursor.saturating_sub(1);
                 ensure_cursor_visible(&mut state);
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
-            MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::Editing => {
                 if state.cursor + 1 < total_rows {
                     state.cursor += 1;
                 }
@@ -1918,6 +1918,10 @@ fn handle_metadata_editor_mouse(
                         }
                     }
                     state.edit_input = None;
+                    state.phase = MetadataEditorPhase::Editing;
+                    recalc_dirty(&mut state);
+                } else if state.phase == MetadataEditorPhase::AddingKey {
+                    state.add_key_input = None;
                     state.phase = MetadataEditorPhase::Editing;
                     recalc_dirty(&mut state);
                 }
