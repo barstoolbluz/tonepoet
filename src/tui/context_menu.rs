@@ -44,14 +44,13 @@ pub enum ContextMenuEntry {
 #[derive(Debug, Clone)]
 pub enum ContextAction {
     // ── Browse screen ───────────────────────────────────────────────
-    /// Queue the selected file(s) for review on the Convert screen.
-    QueueSelection,
-    /// Queue with a specific preset loaded.
-    QueueWithPreset(String),
-    /// Queue and start processing (`:Commit` equivalent).
-    QueueAndStart,
-    /// Queue with a preset and auto-start.
-    QueueAndStartWithPreset(String),
+    /// Open the Convert screen for custom configuration.
+    ConvertCustom,
+    /// Queue with current pills ("last used") or a named preset.
+    /// `start` is resolved at dispatch time from config + Shift.
+    ConvertLastUsed,
+    /// Queue with a named preset.
+    ConvertWithPreset(String),
     /// Open the selected file/directory (same as Enter on browse).
     OpenEntry,
     /// Rename the selected file (F2 / `:rename`).
@@ -153,51 +152,24 @@ fn separator() -> ContextMenuEntry {
 /// expands directories into their audio file contents automatically.
 fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
     let groups = super::presets::list_presets_by_format_db(&app.db);
-
-    // Label "Last Used" with the current output format so the user
-    // knows what they're getting without drilling in.
     let current_format = app.convert.format.format.selected_value().name();
 
     let mut children = vec![
-        item("Custom (queue)", ContextAction::QueueSelection),
-        item("Custom + start", ContextAction::QueueAndStart),
+        item("Custom", ContextAction::ConvertCustom),
         item(
-            &format!("Last used (queue)  [{}]", current_format),
-            ContextAction::QueueSelection,
-        ),
-        item(
-            &format!("Last used + start  [{}]", current_format),
-            ContextAction::QueueAndStart,
+            &format!("Last used [{}]", current_format),
+            ContextAction::ConvertLastUsed,
         ),
     ];
 
-    // Per-codec preset submenus: each codec that has presets gets a
-    // submenu with queue/start pairs for each preset.
-    if !groups.is_empty() {
+    // Flat preset list (one item per preset, no queue/start pairs).
+    let all_presets: Vec<String> = groups.iter()
+        .flat_map(|(_, names)| names.clone())
+        .collect();
+    if !all_presets.is_empty() {
         children.push(separator());
-
-        for (fmt, names) in &groups {
-            let codec_label = match fmt {
-                Some(f) => f.name().to_string(),
-                None => "Other".to_string(),
-            };
-
-            let mut preset_items: Vec<ContextMenuEntry> = Vec::new();
-            for name in names {
-                preset_items.push(item(
-                    &format!("{} (queue)", name),
-                    ContextAction::QueueWithPreset(name.clone()),
-                ));
-                preset_items.push(item(
-                    &format!("{} + start", name),
-                    ContextAction::QueueAndStartWithPreset(name.clone()),
-                ));
-            }
-
-            children.push(ContextMenuEntry::Submenu {
-                label: codec_label,
-                children: preset_items,
-            });
+        for name in &all_presets {
+            children.push(item(name, ContextAction::ConvertWithPreset(name.clone())));
         }
     }
 
@@ -401,34 +373,33 @@ pub fn execute_context_action(
     app: &mut AppState,
     action: ContextAction,
     tx: &mpsc::Sender<AppMessage>,
+    shift_held: bool,
 ) {
     match action {
-        // ── Browse ──────────────────────────────────────────────────
-        ContextAction::QueueSelection => {
-            // Delegate to the existing :queue command path.
+        // ── Browse: Convert actions ─────────────────────────────────
+        ContextAction::ConvertCustom => {
+            // Open Convert screen for manual review — no auto-commit.
             let cmd = super::command::Command::Queue { preset: None };
             super::command::execute_command(app, cmd, tx);
         }
-        ContextAction::QueueWithPreset(name) => {
-            let cmd = super::command::Command::Queue { preset: Some(name) };
-            super::command::execute_command(app, cmd, tx);
-        }
-        ContextAction::QueueAndStart => {
-            // Queue then immediately start: :queue, switch to Convert, :Commit.
+        ContextAction::ConvertLastUsed => {
+            let start = resolve_convert_start(app, shift_held);
             let cmd = super::command::Command::Queue { preset: None };
             super::command::execute_command(app, cmd, tx);
-            // If we landed on Convert (from :queue), auto-commit+start.
             if app.current_screen == AppScreen::Convert {
-                let cmd = super::command::Command::Commit { start: true };
-                super::command::execute_command(app, cmd, tx);
+                super::command::execute_command(
+                    app, super::command::Command::Commit { start }, tx,
+                );
             }
         }
-        ContextAction::QueueAndStartWithPreset(name) => {
+        ContextAction::ConvertWithPreset(name) => {
+            let start = resolve_convert_start(app, shift_held);
             let cmd = super::command::Command::Queue { preset: Some(name) };
             super::command::execute_command(app, cmd, tx);
             if app.current_screen == AppScreen::Convert {
-                let cmd = super::command::Command::Commit { start: true };
-                super::command::execute_command(app, cmd, tx);
+                super::command::execute_command(
+                    app, super::command::Command::Commit { start }, tx,
+                );
             }
         }
         ContextAction::OpenEntry => {
@@ -653,4 +624,11 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Resolve whether a convert action should start processing.
+/// Default comes from config; Shift inverts it.
+fn resolve_convert_start(app: &AppState, shift_held: bool) -> bool {
+    let default_is_start = app.config.ui.convert_default_action != "enqueue";
+    default_is_start ^ shift_held
 }

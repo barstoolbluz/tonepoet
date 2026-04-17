@@ -185,6 +185,25 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
                         Rect::new(analyze_x, source_area.y + 4, analyze_w, 1),
                     );
                 }
+
+                // Enqueue pill row (row 5 of the pane).
+                let enq_start_w = super::draw_source::ENQUEUE_START_PILL_LABEL.chars().count() as u16;
+                let enq_w = super::draw_source::ENQUEUE_PILL_LABEL.chars().count() as u16;
+                let enq_start_x = source_area.x + 1 + (inner_w as u16).saturating_sub(enq_start_w + right_margin);
+                let enq_x = enq_start_x.saturating_sub(enq_w + gap);
+                let enq_row = source_area.y + 5;
+                if enq_row < source_area.y + source_area.height {
+                    buttons.record_button(
+                        TuiButton::SourceEnqueueStartButton,
+                        Rect::new(enq_start_x, enq_row, enq_start_w, 1),
+                    );
+                    if enq_x > source_area.x + 1 {
+                        buttons.record_button(
+                            TuiButton::SourceEnqueueButton,
+                            Rect::new(enq_x, enq_row, enq_w, 1),
+                        );
+                    }
+                }
             }
         }
     }

@@ -15,16 +15,26 @@ pub struct UiConfig {
     /// Case-insensitive; unknown values fall back to "browse".
     #[serde(default = "default_initial_screen")]
     pub default_screen: String,
+    /// Default action when clicking a preset or "Last used" in the context
+    /// menu. "start" = enqueue + start processing (default). "enqueue" =
+    /// enqueue only. Holding Shift inverts whichever is set.
+    #[serde(default = "default_convert_action")]
+    pub convert_default_action: String,
 }
 
 fn default_initial_screen() -> String {
     "browse".to_string()
 }
 
+fn default_convert_action() -> String {
+    "start".to_string()
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             default_screen: default_initial_screen(),
+            convert_default_action: default_convert_action(),
         }
     }
 }

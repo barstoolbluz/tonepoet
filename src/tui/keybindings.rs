@@ -1445,19 +1445,18 @@ fn handle_context_menu_key(
             }
         }
         KeyCode::Enter => {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             if focus_submenu {
-                // Execute the selected submenu item (or no-op if Submenu).
                 let sub_selectable = selectable_indices(&submenu_entries);
                 if let Some(&idx) = sub_selectable.get(submenu_selected) {
                     if let ContextMenuEntry::Item(item) = &submenu_entries[idx] {
                         let action = item.action.clone();
                         app.active_overlay = ActiveOverlay::None;
-                        execute_context_action(app, action, tx);
+                        execute_context_action(app, action, tx, shift);
                         return;
                     }
                 }
             } else {
-                // In parent: Enter on Item executes; on Submenu moves focus in.
                 if let Some(&idx) = parent_selectable.get(selected) {
                     match &entries[idx] {
                         ContextMenuEntry::Submenu { .. } if show_submenu => {
@@ -1467,7 +1466,7 @@ fn handle_context_menu_key(
                         ContextMenuEntry::Item(item) => {
                             let action = item.action.clone();
                             app.active_overlay = ActiveOverlay::None;
-                            execute_context_action(app, action, tx);
+                            execute_context_action(app, action, tx, shift);
                             return;
                         }
                         _ => {}
@@ -1712,6 +1711,7 @@ fn context_menu_mouse_click(
     mx: u16,
     my: u16,
     tx: &mpsc::Sender<AppMessage>,
+    shift_held: bool,
 ) -> bool {
     use super::context_menu::{ContextMenuEntry, execute_context_action};
     let area = crossterm::terminal::size().unwrap_or((80, 24));
@@ -1750,7 +1750,7 @@ fn context_menu_mouse_click(
                         if let ContextMenuEntry::Item(item) = e {
                             let action = item.action.clone();
                             app.active_overlay = ActiveOverlay::None;
-                            execute_context_action(app, action, tx);
+                            execute_context_action(app, action, tx, shift_held);
                             return true;
                         }
                     }
@@ -1774,7 +1774,7 @@ fn context_menu_mouse_click(
                 ContextMenuEntry::Item(item) => {
                     let action = item.action.clone();
                     app.active_overlay = ActiveOverlay::None;
-                    execute_context_action(app, action, tx);
+                    execute_context_action(app, action, tx, shift_held);
                     return true;
                 }
                 ContextMenuEntry::Submenu { .. } => {
@@ -3232,7 +3232,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.active_overlay = ActiveOverlay::None;
             } else {
                 // Left-click: try to activate the hovered item.
-                if !context_menu_mouse_click(app, mouse.column, mouse.row, tx) {
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                if !context_menu_mouse_click(app, mouse.column, mouse.row, tx, shift) {
                     // Click was outside the menu — close it and select
                     // the clicked browse/queue item if applicable.
                     app.active_overlay = ActiveOverlay::None;
@@ -3459,6 +3460,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::SourceAnalyzeButton => {
                 let cmd = super::command::Command::Analyze;
+                super::command::execute_command(app, cmd, tx);
+            }
+            TuiButton::SourceEnqueueButton => {
+                let cmd = super::command::Command::Commit { start: false };
+                super::command::execute_command(app, cmd, tx);
+            }
+            TuiButton::SourceEnqueueStartButton => {
+                let cmd = super::command::Command::Commit { start: true };
                 super::command::execute_command(app, cmd, tx);
             }
             TuiButton::MetadataField(field) => {

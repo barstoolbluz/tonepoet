@@ -57,6 +57,10 @@ pub enum TuiButton {
     SourceExpandButton,
     // Convert screen: "analyze" pill on source pane → runs audio analysis.
     SourceAnalyzeButton,
+    // Convert screen: "enqueue" pill → :commit (queue only).
+    SourceEnqueueButton,
+    // Convert screen: "enqueue + start" pill → :Commit (queue + start).
+    SourceEnqueueStartButton,
 
     // Queue action bar
     AddFiles,
@@ -109,7 +113,9 @@ impl TuiButton {
             | Self::MetadataField(_)
             | Self::SourceBrowseButton
             | Self::SourceExpandButton
-            | Self::SourceAnalyzeButton => Some(AppScreen::Convert),
+            | Self::SourceAnalyzeButton
+            | Self::SourceEnqueueButton
+            | Self::SourceEnqueueStartButton => Some(AppScreen::Convert),
             Self::AddFiles
             | Self::AddFolder
             | Self::Configure
