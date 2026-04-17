@@ -155,37 +155,51 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
                         let plane = decoded.plane::<f64>(ch);
                         { let sl: &[f64] = plane; accumulate_channel!(sl, ch, None::<&[i32]>); }
                     }
-                    // Packed formats: samples are interleaved in plane 0.
+                    // Packed formats: decoded.plane() only returns nb_samples
+                    // elements, but the interleaved buffer has nb_samples ×
+                    // channels values. Use data(0) for the full buffer.
                     Sample::I16(SampleType::Packed) => {
-                        let plane = decoded.plane::<i16>(0);
-                        let ch_samples: Vec<f64> = plane.iter()
+                        let raw = decoded.data(0);
+                        let full: &[i16] = unsafe {
+                            std::slice::from_raw_parts(raw.as_ptr() as *const i16, n * channels as usize)
+                        };
+                        let ch_samples: Vec<f64> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| s as f64 / 32768.0).collect();
-                        let i32s: Vec<i32> = plane.iter()
+                        let i32s: Vec<i32> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| (s as i32) << 16).collect();
                         accumulate_channel!(ch_samples, ch, Some(&i32s));
                     }
                     Sample::I32(SampleType::Packed) => {
-                        let plane = decoded.plane::<i32>(0);
-                        let ch_samples: Vec<f64> = plane.iter()
+                        let raw = decoded.data(0);
+                        let full: &[i32] = unsafe {
+                            std::slice::from_raw_parts(raw.as_ptr() as *const i32, n * channels as usize)
+                        };
+                        let ch_samples: Vec<f64> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| s as f64 / 2147483648.0).collect();
-                        let i32_ch: Vec<i32> = plane.iter()
+                        let i32_ch: Vec<i32> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .copied().collect();
                         accumulate_channel!(ch_samples, ch, Some(&i32_ch));
                     }
                     Sample::F32(SampleType::Packed) => {
-                        let plane = decoded.plane::<f32>(0);
-                        let ch_samples: Vec<f64> = plane.iter()
+                        let raw = decoded.data(0);
+                        let full: &[f32] = unsafe {
+                            std::slice::from_raw_parts(raw.as_ptr() as *const f32, n * channels as usize)
+                        };
+                        let ch_samples: Vec<f64> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| s as f64).collect();
                         accumulate_channel!(ch_samples, ch, None::<&[i32]>);
                     }
                     Sample::F64(SampleType::Packed) => {
-                        let plane = decoded.plane::<f64>(0);
-                        let ch_samples: Vec<f64> = plane.iter()
+                        let raw = decoded.data(0);
+                        let full: &[f64] = unsafe {
+                            std::slice::from_raw_parts(raw.as_ptr() as *const f64, n * channels as usize)
+                        };
+                        let ch_samples: Vec<f64> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .copied().collect();
                         accumulate_channel!(ch_samples, ch, None::<&[i32]>);
