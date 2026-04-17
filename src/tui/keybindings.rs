@@ -3194,8 +3194,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return; // Move events don't trigger actions.
     }
 
-    // Scroll wheel: route to the browse list if the cursor is over it.
+    // Scroll wheel: ignore while context menu is open.
     if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
+            return;
+        }
         if app.current_screen == AppScreen::Browse {
             let over_list = matches!(
                 app.button_map.find_button_at(mouse.column, mouse.row),
