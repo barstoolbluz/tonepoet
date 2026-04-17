@@ -4539,6 +4539,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         // Double-click: open/load immediately, cancel any pending rename.
                         app.last_browse_click = None;
                         app.pending_browse_rename = None;
+                        app.browse.multi_selected.clear();
                         let entry_kind = app.browse.entries[idx].kind.clone();
                         match entry_kind {
                             EntryKind::Directory | EntryKind::ParentDir => {
@@ -4554,8 +4555,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                             }
                         }
                     } else {
-                        // Not a double-click. Any click cancels any pending
-                        // rename (the user is acting, not waiting).
+                        // Not a double-click. Plain click clears multi-selection
+                        // (only Ctrl+click and Alt+click modify it).
+                        app.browse.multi_selected.clear();
+                        // Any click cancels any pending rename.
                         app.pending_browse_rename = None;
 
                         let same_path_as_last = app
