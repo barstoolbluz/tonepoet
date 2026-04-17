@@ -4536,22 +4536,20 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         .unwrap_or(false);
 
                     if is_double_click {
-                        // Double-click: open/load immediately, cancel any pending rename.
                         app.last_browse_click = None;
                         app.pending_browse_rename = None;
-                        app.browse.multi_selected.clear();
                         let entry_kind = app.browse.entries[idx].kind.clone();
                         match entry_kind {
+                            // Directories: double-click navigates into them.
                             EntryKind::Directory | EntryKind::ParentDir => {
+                                app.browse.multi_selected.clear();
                                 app.browse.enter_selected();
                                 app.browse.probe_current_with_db(tx, Some(&app.db));
                             }
-                            EntryKind::AudioFile(_) | EntryKind::Archive => {
-                                let target = app.browse.return_target;
-                                load_browse_selection(app, clicked_path, target);
-                            }
-                            EntryKind::OtherFile => {
-                                app.set_status("Not an audio file");
+                            // Files: double-click toggles selection (like Ctrl+click).
+                            _ => {
+                                app.browse.toggle_selection();
+                                app.browse.probe_current_with_db(tx, Some(&app.db));
                             }
                         }
                     } else {
