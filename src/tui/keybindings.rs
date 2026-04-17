@@ -526,29 +526,35 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     let mut selection_may_have_changed = false;
 
     match (key.code, key.modifiers) {
-        // Navigation
+        // Navigation (extends visual selection if V-mode is active)
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
             app.browse.move_up();
+            if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
             app.browse.move_down();
+            if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
         (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
             app.browse.move_top();
+            if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
         (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
             app.browse.move_bottom();
+            if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
         (KeyCode::PageUp, _) => {
             app.browse.page_up();
+            if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
         (KeyCode::PageDown, _) => {
             app.browse.page_down();
+            if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
 
@@ -681,11 +687,30 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Toggle multi-select (for audio files only)
+        // Toggle multi-select for individual items
         (KeyCode::Char(' '), KeyModifiers::NONE) => {
             app.browse.toggle_selection();
             app.browse.move_down();
             selection_may_have_changed = true;
+        }
+
+        // Visual (range) selection mode: V toggles. While active,
+        // cursor movement extends the selection from the anchor.
+        (KeyCode::Char('V'), KeyModifiers::SHIFT) => {
+            if app.browse.visual_mode {
+                // Exit visual mode, keep current selection.
+                app.browse.visual_mode = false;
+                app.set_status("Visual select off");
+            } else {
+                // Enter visual mode: anchor at current cursor.
+                app.browse.visual_mode = true;
+                if let Some(entry) = app.browse.entries.get(app.browse.selected_index) {
+                    app.browse.multi_select_anchor = Some(entry.path.clone());
+                }
+                // Select the current entry.
+                app.browse.update_visual_selection();
+                app.set_status("Visual select on — move cursor to extend range");
+            }
         }
 
         // Toggle hidden files
@@ -700,9 +725,12 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             app.browse.open_filter_input();
         }
 
-        // Esc escalation: multi-selection → text filter → return to convert
+        // Esc escalation: visual mode → multi-selection → text filter → archive
         (KeyCode::Esc, _) => {
-            if !app.browse.multi_selected.is_empty() {
+            if app.browse.visual_mode {
+                app.browse.visual_mode = false;
+                app.set_status("Visual select off");
+            } else if !app.browse.multi_selected.is_empty() {
                 app.browse.clear_multi_selection();
             } else if !app.browse.filter_text.is_empty() {
                 app.browse.clear_filter();
@@ -4451,62 +4479,45 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
 
                 let clicked_path = app.browse.entries[idx].path.clone();
-                let alt = mouse.modifiers.contains(KeyModifiers::ALT);
                 let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
 
-                // For alt-click, we need the anchor *before* moving the cursor.
-                // Otherwise resolve_anchor_index's fallback (which uses
-                // selected_index) would collapse to `idx` and give an empty range.
-                // Also persist the anchor if it's not yet set, so a sequence of
-                // alt-clicks behaves Finder-like (fixed origin until a plain click).
-                let prev_cursor = app.browse.selected_index;
-                let alt_anchor_idx = if alt {
-                    let idx_from_path = app.browse.multi_select_anchor.as_ref().and_then(
-                        |p| app.browse.entries.iter().position(|e| e.path == *p),
-                    );
-                    let resolved = idx_from_path.unwrap_or(prev_cursor);
-                    // Persist the anchor so subsequent alt-clicks keep this origin.
-                    if app.browse.multi_select_anchor.is_none() {
-                        if let Some(entry) = app.browse.entries.get(resolved) {
-                            app.browse.multi_select_anchor = Some(entry.path.clone());
-                        }
-                    }
-                    Some(resolved)
-                } else {
-                    None
-                };
-
-                // All three click modes move the cursor to the clicked entry.
+                // All click modes move the cursor to the clicked entry.
                 app.browse.selected_index = idx;
                 app.browse.ensure_visible();
 
-                if alt {
-                    // ── Alt+click: range-select from anchor to clicked entry ──
-                    let anchor_idx = alt_anchor_idx.unwrap();
-                    let lo = anchor_idx.min(idx);
-                    let hi = anchor_idx.max(idx);
-                    let to_add: Vec<std::path::PathBuf> = (lo..=hi)
-                        .filter_map(|i| app.browse.entries.get(i))
-                        .filter(|e| !e.is_dir())
-                        .map(|e| e.path.clone())
-                        .collect();
-                    for p in to_add {
-                        if !app.browse.multi_selected.iter().any(|sp| *sp == p) {
-                            app.browse.multi_selected.push(p);
+                if ctrl {
+                    // ── Ctrl+click / Ctrl+double-click ──
+                    // Detect double-click within the Ctrl path using last_browse_click.
+                    const DCLICK_MS: u64 = 500;
+                    let now = std::time::Instant::now();
+                    let is_ctrl_double = app.last_browse_click.as_ref()
+                        .filter(|(p, _)| *p == clicked_path)
+                        .map(|(_, t)| now.duration_since(*t).as_millis() < DCLICK_MS as u128)
+                        .unwrap_or(false);
+
+                    if is_ctrl_double {
+                        // ── Ctrl+double-click: range-select from anchor to here ──
+                        let anchor_idx = app.browse.multi_select_anchor.as_ref()
+                            .and_then(|p| app.browse.entries.iter().position(|e| e.path == *p))
+                            .unwrap_or(idx);
+                        let lo = anchor_idx.min(idx);
+                        let hi = anchor_idx.max(idx);
+                        let to_add: Vec<std::path::PathBuf> = (lo..=hi)
+                            .filter_map(|i| app.browse.entries.get(i))
+                            .filter(|e| !e.is_dir())
+                            .map(|e| e.path.clone())
+                            .collect();
+                        for p in to_add {
+                            if !app.browse.multi_selected.iter().any(|sp| *sp == p) {
+                                app.browse.multi_selected.push(p);
+                            }
                         }
+                        app.last_browse_click = None;
+                    } else {
+                        // ── Ctrl+single-click: toggle individual item ──
+                        app.browse.toggle_selection();
+                        app.last_browse_click = Some((clicked_path, now));
                     }
-                    // Anchor unchanged. Clear click tracking so alt+click never
-                    // contributes to rename/double-click timing.
-                    app.last_browse_click = None;
-                    app.pending_browse_rename = None;
-                    app.browse.probe_current_with_db(tx, Some(&app.db));
-                } else if ctrl {
-                    // ── Ctrl+click: toggle clicked entry in multi_selected ──
-                    // toggle_selection operates on the current cursor (which we
-                    // just moved to `idx`).
-                    app.browse.toggle_selection();
-                    // Anchor unchanged. Clear click tracking.
-                    app.last_browse_click = None;
                     app.pending_browse_rename = None;
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                 } else {

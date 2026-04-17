@@ -49,12 +49,28 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                 ],
             },
             HelpSection {
-                title: "Selection & Filtering",
+                title: "Selection",
                 entries: vec![
-                    ("Space", "Toggle multi-select"),
+                    ("Space", "Toggle select (moves cursor down)"),
+                    ("V", "Visual range select (move cursor to extend)"),
+                    ("Esc", "Exit visual mode / clear selection"),
+                    ("e", "Edit metadata for selected file(s)"),
+                ],
+            },
+            HelpSection {
+                title: "Mouse Selection",
+                entries: vec![
+                    ("Click", "Move cursor (clears multi-select)"),
+                    ("Double-click", "Toggle select (files) / enter (dirs)"),
+                    ("Ctrl+Click", "Toggle individual item"),
+                    ("Ctrl+Dbl-click", "Range select from anchor"),
+                ],
+            },
+            HelpSection {
+                title: "Filtering",
+                entries: vec![
                     (".", "Toggle hidden files"),
                     ("/", "Open text filter"),
-                    ("Esc", "Clear selection / filter / exit archive"),
                 ],
             },
             HelpSection {

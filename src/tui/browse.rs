@@ -286,9 +286,13 @@ pub struct BrowseState {
     /// Multi-selected file paths
     pub multi_selected: Vec<PathBuf>,
 
-    /// Anchor for range selection (Alt+click): the last plain-clicked entry.
+    /// Anchor for range selection: the last plain-clicked entry or V-mode start.
     /// Path-based so it survives refresh/sort/filter. `None` when no anchor is set.
     pub multi_select_anchor: Option<PathBuf>,
+
+    /// Visual (V) selection mode: when true, moving the cursor extends the
+    /// selection range from the anchor to the current cursor position.
+    pub visual_mode: bool,
 
     /// Filter input (when /-mode is active)
     pub filter_input: Option<TextInputState>,
@@ -386,6 +390,7 @@ impl BrowseState {
             visible_height: 0,
             multi_selected: Vec::new(),
             multi_select_anchor: None,
+            visual_mode: false,
             filter_input: None,
             filter_text: String::new(),
             filter_text_prior: None,
@@ -959,6 +964,27 @@ impl BrowseState {
 
     pub fn clear_multi_selection(&mut self) {
         self.multi_selected.clear();
+        self.visual_mode = false;
+    }
+
+    /// Update the visual selection range from anchor to current cursor.
+    /// Called after every cursor move while visual_mode is active.
+    pub fn update_visual_selection(&mut self) {
+        let anchor_idx = self.multi_select_anchor.as_ref()
+            .and_then(|p| self.entries.iter().position(|e| e.path == *p))
+            .unwrap_or(self.selected_index);
+        let lo = anchor_idx.min(self.selected_index);
+        let hi = anchor_idx.max(self.selected_index);
+
+        // Replace multi_selected with the contiguous range (non-ParentDir entries).
+        self.multi_selected.clear();
+        for i in lo..=hi {
+            if let Some(entry) = self.entries.get(i) {
+                if !matches!(entry.kind, EntryKind::ParentDir) {
+                    self.multi_selected.push(entry.path.clone());
+                }
+            }
+        }
     }
 
     /// Collect paths for an enqueue operation (`:queue` / `:convert` etc).
