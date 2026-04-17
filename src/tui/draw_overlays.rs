@@ -67,6 +67,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::Help { screen, scroll } => {
             super::help::draw_help(f, screen, scroll);
         }
+        ActiveOverlay::MetadataEditor(ref state) => {
+            draw_metadata_editor(f, state);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -1095,5 +1098,179 @@ fn draw_analysis(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
     );
+}
+
+/// Draw the full metadata editor overlay.
+fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) {
+    use super::app::MetadataEditorPhase;
+
+    let area = f.size();
+    let w = (area.width * 85 / 100).max(50).min(area.width.saturating_sub(2));
+    let h = (area.height * 85 / 100).max(14).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let title = if state.paths.len() == 1 {
+        let name = state.paths[0].file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        format!(" Metadata: {} ", name)
+    } else {
+        format!(" Metadata: {} files ", state.paths.len())
+    };
+    let border_color = if state.dirty { theme::AMBER } else { theme::CYAN };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(title, Style::default().fg(border_color).add_modifier(Modifier::BOLD)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 { return; }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let content_h = chunks[0].height as usize;
+    let inner_w = chunks[0].width as usize;
+    let key_col_w = 22;
+
+    // Build content lines.
+    let total_rows = state.entries.len() + 1; // +1 for "+ Add field..."
+    let scroll = state.scroll.min(total_rows.saturating_sub(content_h));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (i, entry) in state.entries.iter().enumerate() {
+        let is_cursor = i == state.cursor;
+        let is_deleted = state.deleted.contains(&i);
+        let is_dirty = entry.value != entry.original && !is_deleted;
+
+        // Key label.
+        let key_display = if entry.display_key.len() > key_col_w - 2 {
+            format!(" {:.width$}", entry.display_key, width = key_col_w - 2)
+        } else {
+            format!(" {:<width$}", entry.display_key, width = key_col_w - 2)
+        };
+
+        let key_style = if is_deleted {
+            Style::default().fg(theme::TEXT_DIM).add_modifier(Modifier::CROSSED_OUT)
+        } else if is_cursor {
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted()
+        };
+
+        // Value — show inline editor if this row is being edited.
+        let value_display = if is_cursor && state.phase == MetadataEditorPhase::InlineEdit {
+            if let Some(ref input) = state.edit_input {
+                let (visible, cursor_col) = input.view(inner_w.saturating_sub(key_col_w + 2));
+                let cp = cursor_col as usize;
+                let before = if cp <= visible.len() { &visible[..cp] } else { &visible[..] };
+                let cursor_ch = if cp < visible.len() { &visible[cp..cp + 1] } else { " " };
+                let after = if cp + 1 <= visible.len() { &visible[cp + 1..] } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(key_display, key_style),
+                    Span::styled(before.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(cursor_ch.to_string(), Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                    Span::styled(after.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                ]));
+                continue;
+            }
+            entry.value.clone()
+        } else if is_deleted {
+            format!("(deleted)")
+        } else if entry.is_binary {
+            entry.value.clone()
+        } else {
+            entry.value.clone()
+        };
+
+        let val_style = if is_deleted {
+            Style::default().fg(theme::RED).add_modifier(Modifier::CROSSED_OUT)
+        } else if is_dirty {
+            Style::default().fg(theme::GREEN)
+        } else if entry.is_binary {
+            Style::default().fg(theme::TEXT_DIM)
+        } else if is_cursor {
+            Style::default().fg(theme::TEXT_BRIGHT)
+        } else {
+            Style::default().fg(theme::TEXT_BRIGHT)
+        };
+
+        let val_truncated = if value_display.len() > inner_w.saturating_sub(key_col_w + 1) {
+            format!("{}...", &value_display[..inner_w.saturating_sub(key_col_w + 4)])
+        } else {
+            value_display
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(key_display, key_style),
+            Span::styled(val_truncated, val_style),
+        ]));
+    }
+
+    // "+ Add field..." row
+    let add_row = state.entries.len();
+    let is_cursor_add = state.cursor == add_row;
+    if state.phase == MetadataEditorPhase::AddingKey {
+        if let Some(ref input) = state.add_key_input {
+            let (visible, cursor_col) = input.view(inner_w.saturating_sub(4));
+            let cp = cursor_col as usize;
+            let before = if cp <= visible.len() { &visible[..cp] } else { &visible[..] };
+            let cursor_ch = if cp < visible.len() { &visible[cp..cp + 1] } else { " " };
+            let after = if cp + 1 <= visible.len() { &visible[cp + 1..] } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(" + ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+                Span::styled(before.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                Span::styled(cursor_ch.to_string(), Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                Span::styled(after.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+            ]));
+        }
+    } else {
+        let add_style = if is_cursor_add {
+            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT_DIM)
+        };
+        lines.push(Line::from(Span::styled(" + Add field...", add_style)));
+    }
+
+    // Apply scroll.
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    // Footer.
+    let footer = match state.phase {
+        MetadataEditorPhase::Editing => Line::from(vec![
+            Span::styled("↑↓", Style::default().fg(theme::BLUE)),
+            Span::styled(" navigate  ", theme::muted()),
+            Span::styled("Enter", Style::default().fg(theme::GREEN)),
+            Span::styled(" edit  ", theme::muted()),
+            Span::styled("a", Style::default().fg(theme::CYAN)),
+            Span::styled(" add  ", theme::muted()),
+            Span::styled("d", Style::default().fg(theme::RED)),
+            Span::styled(" delete  ", theme::muted()),
+            Span::styled("w", Style::default().fg(theme::GREEN)),
+            Span::styled(" save  ", theme::muted()),
+            Span::styled("Esc", Style::default().fg(theme::PURPLE)),
+            Span::styled(" close", theme::muted()),
+        ]),
+        MetadataEditorPhase::InlineEdit | MetadataEditorPhase::AddingKey => Line::from(vec![
+            Span::styled("Enter", Style::default().fg(theme::GREEN)),
+            Span::styled(" confirm  ", theme::muted()),
+            Span::styled("Esc", Style::default().fg(theme::PURPLE)),
+            Span::styled(" cancel", theme::muted()),
+        ]),
+        MetadataEditorPhase::Saving => Line::from(
+            Span::styled(" Saving... ", Style::default().fg(theme::AMBER)),
+        ),
+    };
+    f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), chunks[1]);
 }
 

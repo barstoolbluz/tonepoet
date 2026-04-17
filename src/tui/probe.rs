@@ -503,6 +503,136 @@ pub fn write_metadata_field(
     Ok(())
 }
 
+// ── Full tag enumeration + batch write (metadata editor) ────────────
+
+/// A single tag entry read from an audio file.
+#[derive(Debug, Clone)]
+pub struct TagEntry {
+    /// Display name (e.g. "ARTIST", "TRACKNUMBER", "CUSTOM_FIELD").
+    pub display_key: String,
+    /// Lofty item key for read/write mapping.
+    pub item_key: lofty::tag::ItemKey,
+    /// Current value (text or locator). Empty string if cleared.
+    pub value: String,
+    /// Value at read time, for dirty detection.
+    pub original: String,
+    /// True if the value is binary (non-editable).
+    pub is_binary: bool,
+}
+
+/// Priority order for standard fields (displayed first, in this order).
+const STANDARD_KEY_ORDER: &[&str] = &[
+    "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE", "DATE", "YEAR",
+    "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL",
+    "CATALOGNUMBER", "COMMENT", "COMPOSER", "CONDUCTOR", "LABEL",
+    "ISRC", "BARCODE",
+];
+
+/// Map an ItemKey to a human-readable display name using the tag's
+/// format-specific key string. Falls back to Debug format for unmapped keys.
+fn item_key_display(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) -> String {
+    // Try format-specific mapping first (gives "ARTIST" for VorbisComments, etc.)
+    if let Some(s) = key.map_key(tag_type, true) {
+        return s.to_string();
+    }
+    // Fallback: Debug format with cleanup
+    format!("{:?}", key)
+}
+
+/// Read all tags from an audio file's primary tag.
+/// Returns entries sorted: standard fields first, then alphabetical.
+pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::ItemValue;
+
+    let tagged = lofty::read_from_path(path)
+        .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+
+    let tag = tagged.primary_tag()
+        .or_else(|| tagged.first_tag())
+        .ok_or_else(|| format!("no tags in '{}'", path.display()))?;
+
+    let tag_type = tag.tag_type();
+    let mut entries: Vec<TagEntry> = Vec::new();
+
+    for item in tag.items() {
+        let key = item.key().clone();
+        let display_key = item_key_display(&key, tag_type);
+        let (value, is_binary) = match item.value() {
+            ItemValue::Text(t) => (t.clone(), false),
+            ItemValue::Locator(l) => (l.clone(), false),
+            ItemValue::Binary(b) => (format!("<binary, {} bytes>", b.len()), true),
+        };
+        entries.push(TagEntry {
+            display_key,
+            item_key: key,
+            value: value.clone(),
+            original: value,
+            is_binary,
+        });
+    }
+
+    // Sort: standard fields first (in STANDARD_KEY_ORDER), then rest alphabetically.
+    entries.sort_by(|a, b| {
+        let a_upper = a.display_key.to_ascii_uppercase();
+        let b_upper = b.display_key.to_ascii_uppercase();
+        let a_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
+        let b_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == b_upper);
+        match (a_idx, b_idx) {
+            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a_upper.cmp(&b_upper),
+        }
+    });
+
+    Ok(entries)
+}
+
+/// Write a batch of tag changes to an audio file.
+/// Each entry in `changes` is (ItemKey, Option<new_value>).
+/// `None` means delete the tag. Empty string also deletes.
+pub fn write_all_tags(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<(), String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::{ItemValue, TagItem};
+
+    let mut tagged = lofty::read_from_path(path)
+        .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+
+    // Get or create the primary tag.
+    if tagged.primary_tag().is_none() {
+        let tt = tagged.primary_tag_type();
+        tagged.insert_tag(lofty::tag::Tag::new(tt));
+    }
+    let tag = tagged.primary_tag_mut()
+        .ok_or_else(|| "failed to create primary tag".to_string())?;
+
+    for (key, new_value) in changes {
+        match new_value {
+            Some(val) if !val.trim().is_empty() => {
+                tag.remove_key(key);
+                tag.insert_unchecked(TagItem::new(
+                    key.clone(),
+                    ItemValue::Text(val.trim().to_string()),
+                ));
+            }
+            _ => {
+                tag.remove_key(key);
+            }
+        }
+    }
+
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| format!("failed to save '{}': {}", path.display(), e))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

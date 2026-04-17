@@ -64,6 +64,11 @@ pub enum AppMessage {
         field: crate::tui::probe::MetadataField,
         result: Result<(), String>,
     },
+    /// Result of a batch metadata write from the metadata editor.
+    MetadataEditorWriteComplete {
+        /// Per-file results: (path, Ok or Err).
+        results: Vec<(std::path::PathBuf, Result<(), String>)>,
+    },
     /// Result of an async archive listing (`7zz l -slt`).
     ArchiveListingComplete {
         archive_path: std::path::PathBuf,

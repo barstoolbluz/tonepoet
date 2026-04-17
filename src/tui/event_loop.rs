@@ -446,6 +446,31 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
+        AppMessage::MetadataEditorWriteComplete { results } => {
+            let total = results.len();
+            let failed: Vec<_> = results.iter()
+                .filter(|(_, r)| r.is_err())
+                .collect();
+            if failed.is_empty() {
+                app.set_status(format!(
+                    "Metadata saved ({} file{})",
+                    total, if total == 1 { "" } else { "s" },
+                ));
+            } else {
+                let first_err = failed[0].1.as_ref().unwrap_err();
+                app.set_status(format!(
+                    "Metadata: {} saved, {} failed — {}",
+                    total - failed.len(), failed.len(), first_err,
+                ));
+            }
+            // Invalidate caches for all written files.
+            for (path, _) in &results {
+                app.browse.probe_cache.remove(path);
+                let _ = app.db.invalidate_probe(&path.display().to_string());
+            }
+            app.active_overlay = ActiveOverlay::None;
+            app.browse.probe_current_with_db(tx, Some(&app.db));
+        }
     }
 }
 

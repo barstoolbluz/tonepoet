@@ -59,8 +59,10 @@ pub enum ContextAction {
     MoveToTrash,
     /// Copy the full path of the selected entry to the clipboard.
     CopyPath(PathBuf),
-    /// Edit a metadata field on the selected audio file.
+    /// Edit a metadata field on the selected audio file (legacy single-field).
     EditMetadata(crate::tui::probe::MetadataField),
+    /// Open the full metadata editor overlay.
+    EditMetadataFull,
     /// Copy the selected file(s) to a destination (opens TextEdit picker).
     CopyTo,
     /// Move the selected file(s) to a destination (opens TextEdit picker).
@@ -173,25 +175,6 @@ fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
 
 /// Build the "Edit metadata" submenu for audio files. Shows each
 /// editable field as a submenu item (Title, Artist, Album, Genre, Year).
-fn build_edit_metadata_submenu() -> ContextMenuEntry {
-    use crate::tui::probe::MetadataField;
-
-    let children: Vec<ContextMenuEntry> = MetadataField::all()
-        .iter()
-        .map(|&field| {
-            item(
-                &format!("Edit {}", field.label()),
-                ContextAction::EditMetadata(field),
-            )
-        })
-        .collect();
-
-    ContextMenuEntry::Submenu {
-        label: "Edit metadata".to_string(),
-        children,
-    }
-}
-
 /// Build the context menu for a right-click on a browse entry.
 pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let entry = match app.browse.selected_entry() {
@@ -204,9 +187,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     match &entry.kind {
         EntryKind::AudioFile(_) => {
             items.push(build_convert_submenu(app));
-            items.push(build_edit_metadata_submenu());
             items.push(separator());
             items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Edit metadata...", ContextAction::EditMetadataFull));
             items.push(item("Rename", ContextAction::RenameEntry));
             items.push(item("Bulk Rename...", ContextAction::BulkRename));
             items.push(item("Analyze...", ContextAction::Analyze));
@@ -428,6 +411,9 @@ pub fn execute_context_action(
         }
         ContextAction::EditMetadata(field) => {
             super::command::execute_edit_metadata_pub(app, field);
+        }
+        ContextAction::EditMetadataFull => {
+            super::keybindings::open_metadata_editor(app);
         }
         ContextAction::MoveToTrash => {
             let cmd = super::command::Command::Delete;

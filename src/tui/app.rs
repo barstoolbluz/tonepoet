@@ -816,6 +816,45 @@ pub enum ActiveOverlay {
         /// Scroll offset in the help content.
         scroll: usize,
     },
+    /// Full metadata tag editor overlay.
+    MetadataEditor(Box<MetadataEditorState>),
+}
+
+/// Phase of the metadata editor workflow.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataEditorPhase {
+    /// Browsing / editing fields.
+    Editing,
+    /// Currently editing a field's value inline.
+    InlineEdit,
+    /// Entering a new custom field name.
+    AddingKey,
+    /// Saving changes to disk.
+    Saving,
+}
+
+/// State for the metadata editor overlay.
+#[derive(Debug, Clone)]
+pub struct MetadataEditorState {
+    /// Files being edited.
+    pub paths: Vec<std::path::PathBuf>,
+    /// All tag entries (ordered for display).
+    pub entries: Vec<crate::tui::probe::TagEntry>,
+    /// Cursor position in the entries list.
+    pub cursor: usize,
+    /// Scroll offset for the visible window.
+    pub scroll: usize,
+    /// Text input for inline field editing.
+    pub edit_input: Option<crate::tui::text_input::TextInputState>,
+    /// Text input for adding a new field key.
+    pub add_key_input: Option<crate::tui::text_input::TextInputState>,
+    /// Current phase.
+    pub phase: MetadataEditorPhase,
+    /// Whether any entries have been modified.
+    pub dirty: bool,
+    /// Entries marked for deletion (by index). Tracked separately so
+    /// the user can see them struck through before saving.
+    pub deleted: Vec<usize>,
 }
 
 /// Focus area within the bulk rename overlay.

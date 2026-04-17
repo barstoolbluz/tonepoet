@@ -720,7 +720,6 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         // Bulk rename: R opens the rename wizard for selected audio files.
         (KeyCode::Char('R'), KeyModifiers::SHIFT) => {
             let paths = super::command::collect_selection_for_file_ops(app);
-            // Filter to audio files only (directories/other files can't be renamed via template).
             let audio_paths: Vec<std::path::PathBuf> = paths
                 .into_iter()
                 .filter(|p| {
@@ -734,6 +733,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                 })
                 .collect();
             open_bulk_rename(app, audio_paths);
+        }
+
+        // e = open metadata editor for selected audio file(s)
+        (KeyCode::Char('e'), KeyModifiers::NONE) => {
+            open_metadata_editor(app);
         }
 
         _ => {}
@@ -1336,6 +1340,13 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
+        ActiveOverlay::MetadataEditor(mut state) => {
+            handle_metadata_editor_key(app, key, &mut state, tx);
+            // If the handler didn't close the overlay, put state back.
+            if !matches!(app.active_overlay, ActiveOverlay::None) {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+        }
         ActiveOverlay::Help { mut scroll, screen } => {
             // Compute content length for scroll clamping.
             let max_scroll = {
@@ -1584,6 +1595,259 @@ fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
         show_submenu,
         focus_submenu: false,
     };
+}
+
+/// Handle key events inside the metadata editor overlay.
+fn handle_metadata_editor_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    use super::app::MetadataEditorPhase;
+
+    let total_rows = state.entries.len() + 1; // +1 for "Add field" row
+
+    match state.phase {
+        MetadataEditorPhase::Editing => {
+            match key.code {
+                KeyCode::Esc => {
+                    if state.dirty {
+                        // TODO: confirmation dialog for unsaved changes
+                        // For now, just close.
+                    }
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.cursor = state.cursor.saturating_sub(1);
+                    ensure_cursor_visible(state);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if state.cursor + 1 < total_rows {
+                        state.cursor += 1;
+                    }
+                    ensure_cursor_visible(state);
+                }
+                KeyCode::Enter => {
+                    if state.cursor < state.entries.len() {
+                        // Edit the focused field.
+                        let entry = &state.entries[state.cursor];
+                        if !entry.is_binary && !state.deleted.contains(&state.cursor) {
+                            state.edit_input = Some(
+                                super::text_input::TextInputState::new(entry.value.clone()),
+                            );
+                            state.phase = MetadataEditorPhase::InlineEdit;
+                        }
+                    } else {
+                        // "Add field" row — start adding a new key.
+                        state.add_key_input = Some(
+                            super::text_input::TextInputState::empty(),
+                        );
+                        state.phase = MetadataEditorPhase::AddingKey;
+                    }
+                }
+                KeyCode::Char('a') => {
+                    // Jump to "Add field" and start adding.
+                    state.cursor = state.entries.len();
+                    state.add_key_input = Some(
+                        super::text_input::TextInputState::empty(),
+                    );
+                    state.phase = MetadataEditorPhase::AddingKey;
+                    ensure_cursor_visible(state);
+                }
+                KeyCode::Char('d') => {
+                    if state.cursor < state.entries.len()
+                        && !state.deleted.contains(&state.cursor)
+                    {
+                        state.deleted.push(state.cursor);
+                        state.dirty = true;
+                    }
+                }
+                KeyCode::Char('u') => {
+                    // Undo delete for the focused entry.
+                    state.deleted.retain(|&i| i != state.cursor);
+                }
+                KeyCode::Char('w') => {
+                    if !state.dirty {
+                        app.set_status("No changes to save");
+                        return;
+                    }
+                    // Build change list and spawn async write.
+                    state.phase = MetadataEditorPhase::Saving;
+                    let paths = state.paths.clone();
+                    let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
+
+                    // Changed values.
+                    for (i, entry) in state.entries.iter().enumerate() {
+                        if state.deleted.contains(&i) {
+                            changes.push((entry.item_key.clone(), None));
+                        } else if entry.value != entry.original {
+                            changes.push((
+                                entry.item_key.clone(),
+                                Some(entry.value.clone()),
+                            ));
+                        }
+                    }
+
+                    // New entries (added by the user, have no original).
+                    // These are already in state.entries with original = "".
+                    // They'll be caught by the value != original check above
+                    // IF the user typed a value. If value is also "", skip.
+
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let mut results = Vec::new();
+                        for path in &paths {
+                            let r = tokio::task::spawn_blocking({
+                                let path = path.clone();
+                                let changes = changes.clone();
+                                move || crate::tui::probe::write_all_tags(&path, &changes)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+                            results.push((path.clone(), r));
+                        }
+                        let _ = tx.send(AppMessage::MetadataEditorWriteComplete { results }).await;
+                    });
+                }
+                _ => {}
+            }
+        }
+        MetadataEditorPhase::InlineEdit => {
+            let input = match state.edit_input.as_mut() {
+                Some(i) => i,
+                None => { state.phase = MetadataEditorPhase::Editing; return; }
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    state.edit_input = None;
+                    state.phase = MetadataEditorPhase::Editing;
+                }
+                KeyCode::Enter => {
+                    let new_val = input.text.clone();
+                    if state.cursor < state.entries.len() {
+                        state.entries[state.cursor].value = new_val;
+                        if state.entries[state.cursor].value != state.entries[state.cursor].original {
+                            state.dirty = true;
+                        }
+                    }
+                    state.edit_input = None;
+                    state.phase = MetadataEditorPhase::Editing;
+                }
+                _ => {
+                    super::text_input::handle_text_input_key(input, &key);
+                }
+            }
+        }
+        MetadataEditorPhase::AddingKey => {
+            let input = match state.add_key_input.as_mut() {
+                Some(i) => i,
+                None => { state.phase = MetadataEditorPhase::Editing; return; }
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    state.add_key_input = None;
+                    state.phase = MetadataEditorPhase::Editing;
+                }
+                KeyCode::Enter => {
+                    let key_name = input.text.trim().to_uppercase();
+                    if !key_name.is_empty() {
+                        state.entries.push(super::probe::TagEntry {
+                            display_key: key_name.clone(),
+                            item_key: lofty::tag::ItemKey::Unknown(key_name),
+                            value: String::new(),
+                            original: String::new(),
+                            is_binary: false,
+                        });
+                        state.dirty = true;
+                        state.cursor = state.entries.len() - 1;
+                        state.add_key_input = None;
+                        state.edit_input = Some(
+                            super::text_input::TextInputState::empty(),
+                        );
+                        state.phase = MetadataEditorPhase::InlineEdit;
+                        ensure_cursor_visible(state);
+                    } else {
+                        state.add_key_input = None;
+                        state.phase = MetadataEditorPhase::Editing;
+                    }
+                }
+                _ => {
+                    super::text_input::handle_text_input_key(input, &key);
+                }
+            }
+        }
+        MetadataEditorPhase::Saving => {
+            // Block input while saving, except Esc to force-close.
+            if key.code == KeyCode::Esc {
+                app.active_overlay = ActiveOverlay::None;
+            }
+        }
+    }
+}
+
+/// Open the metadata editor for the currently selected audio file(s).
+pub fn open_metadata_editor(app: &mut AppState) {
+    use super::browse::EntryKind;
+
+    let paths: Vec<std::path::PathBuf> = if app.browse.multi_selected.is_empty() {
+        // Single file.
+        match app.browse.selected_entry() {
+            Some(e) if matches!(e.kind, EntryKind::AudioFile(_)) => vec![e.path.clone()],
+            _ => {
+                app.set_status("No audio file selected");
+                return;
+            }
+        }
+    } else {
+        app.browse.multi_selected.iter()
+            .filter(|p| app.browse.entries.iter().any(|e| {
+                e.path == **p && matches!(e.kind, EntryKind::AudioFile(_))
+            }))
+            .cloned()
+            .collect()
+    };
+
+    if paths.is_empty() {
+        app.set_status("No audio files selected");
+        return;
+    }
+
+    // Read tags from the first file (for single-file or as the base for multi).
+    // For multi-file, a full merge would read all files — deferred to v2.
+    let entries = match super::probe::read_all_tags(&paths[0]) {
+        Ok(e) => e,
+        Err(e) => {
+            app.set_status(format!("Failed to read tags: {}", e));
+            return;
+        }
+    };
+
+    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
+        super::app::MetadataEditorState {
+            paths,
+            entries,
+            cursor: 0,
+            scroll: 0,
+            edit_input: None,
+            add_key_input: None,
+            phase: super::app::MetadataEditorPhase::Editing,
+            dirty: false,
+            deleted: Vec::new(),
+        },
+    ));
+}
+
+/// Ensure the cursor is visible in the metadata editor's scroll window.
+fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
+    // Approximate visible height — we don't know the exact terminal size here,
+    // but 20 is a safe default. The renderer clamps defensively.
+    let visible = 20usize;
+    if state.cursor < state.scroll {
+        state.scroll = state.cursor;
+    } else if state.cursor >= state.scroll + visible {
+        state.scroll = state.cursor.saturating_sub(visible - 1);
+    }
 }
 
 /// Compute the screen rect for a context menu panel, matching
