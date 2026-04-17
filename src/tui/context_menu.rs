@@ -188,7 +188,6 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         EntryKind::AudioFile(_) => {
             items.push(build_convert_submenu(app));
             items.push(separator());
-            items.push(item("Open", ContextAction::OpenEntry));
             items.push(item("Edit metadata...", ContextAction::EditMetadataFull));
             items.push(item("Rename", ContextAction::RenameEntry));
             items.push(item("Bulk Rename...", ContextAction::BulkRename));
@@ -202,7 +201,6 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         EntryKind::Archive => {
             items.push(build_convert_submenu(app));
             items.push(separator());
-            items.push(item("Open", ContextAction::OpenEntry));
             items.push(item("Set Password...", ContextAction::SetArchivePassword));
             items.push(item("Rename", ContextAction::RenameEntry));
             items.push(item("Copy to...", ContextAction::CopyTo));
