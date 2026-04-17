@@ -272,7 +272,7 @@ fn render_menu_panel(
                 } else {
                     Style::default().fg(theme::TEXT_BRIGHT)
                 };
-                let indicator = " ►";
+                let indicator = " >";
                 let label_w = label.chars().count();
                 let indicator_w = indicator.chars().count();
                 let pad = inner_w.saturating_sub(1 + label_w + indicator_w);
