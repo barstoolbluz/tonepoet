@@ -365,7 +365,7 @@ pub fn execute_context_action(
     app: &mut AppState,
     action: ContextAction,
     tx: &mpsc::Sender<AppMessage>,
-    shift_held: bool,
+    invert: bool,
 ) {
     match action {
         // ── Browse: Convert actions ─────────────────────────────────
@@ -375,7 +375,7 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::ConvertLastUsed => {
-            let start = resolve_convert_start(app, shift_held);
+            let start = resolve_convert_start(app, invert);
             let cmd = super::command::Command::Queue { preset: None };
             super::command::execute_command(app, cmd, tx);
             if app.current_screen == AppScreen::Convert {
@@ -385,7 +385,7 @@ pub fn execute_context_action(
             }
         }
         ContextAction::ConvertWithPreset(name) => {
-            let start = resolve_convert_start(app, shift_held);
+            let start = resolve_convert_start(app, invert);
             let cmd = super::command::Command::Queue { preset: Some(name) };
             super::command::execute_command(app, cmd, tx);
             if app.current_screen == AppScreen::Convert {
@@ -619,8 +619,8 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 /// Resolve whether a convert action should start processing.
-/// Default comes from config; Shift inverts it.
-fn resolve_convert_start(app: &AppState, shift_held: bool) -> bool {
+/// Default comes from config; `invert` flips it (keyboard `q`).
+fn resolve_convert_start(app: &AppState, invert: bool) -> bool {
     let default_is_start = app.config.ui.convert_default_action != "enqueue";
-    default_is_start ^ shift_held
+    default_is_start ^ invert
 }

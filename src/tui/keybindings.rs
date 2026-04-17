@@ -1444,15 +1444,16 @@ fn handle_context_menu_key(
                 // is needed for leaf items.
             }
         }
-        KeyCode::Enter => {
-            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // Enter = default action, q = inverted (enqueue-only ↔ start).
+        KeyCode::Enter | KeyCode::Char('q') => {
+            let invert = key.code == KeyCode::Char('q');
             if focus_submenu {
                 let sub_selectable = selectable_indices(&submenu_entries);
                 if let Some(&idx) = sub_selectable.get(submenu_selected) {
                     if let ContextMenuEntry::Item(item) = &submenu_entries[idx] {
                         let action = item.action.clone();
                         app.active_overlay = ActiveOverlay::None;
-                        execute_context_action(app, action, tx, shift);
+                        execute_context_action(app, action, tx, invert);
                         return;
                     }
                 }
@@ -1466,7 +1467,7 @@ fn handle_context_menu_key(
                         ContextMenuEntry::Item(item) => {
                             let action = item.action.clone();
                             app.active_overlay = ActiveOverlay::None;
-                            execute_context_action(app, action, tx, shift);
+                            execute_context_action(app, action, tx, invert);
                             return;
                         }
                         _ => {}
@@ -1711,7 +1712,7 @@ fn context_menu_mouse_click(
     mx: u16,
     my: u16,
     tx: &mpsc::Sender<AppMessage>,
-    shift_held: bool,
+    invert: bool,
 ) -> bool {
     use super::context_menu::{ContextMenuEntry, execute_context_action};
     let area = crossterm::terminal::size().unwrap_or((80, 24));
@@ -1750,7 +1751,7 @@ fn context_menu_mouse_click(
                         if let ContextMenuEntry::Item(item) = e {
                             let action = item.action.clone();
                             app.active_overlay = ActiveOverlay::None;
-                            execute_context_action(app, action, tx, shift_held);
+                            execute_context_action(app, action, tx, invert);
                             return true;
                         }
                     }
@@ -1774,7 +1775,7 @@ fn context_menu_mouse_click(
                 ContextMenuEntry::Item(item) => {
                     let action = item.action.clone();
                     app.active_overlay = ActiveOverlay::None;
-                    execute_context_action(app, action, tx, shift_held);
+                    execute_context_action(app, action, tx, invert);
                     return true;
                 }
                 ContextMenuEntry::Submenu { .. } => {
@@ -3232,8 +3233,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.active_overlay = ActiveOverlay::None;
             } else {
                 // Left-click: try to activate the hovered item.
-                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
-                if !context_menu_mouse_click(app, mouse.column, mouse.row, tx, shift) {
+                if !context_menu_mouse_click(app, mouse.column, mouse.row, tx, false) {
                     // Click was outside the menu — close it and select
                     // the clicked browse/queue item if applicable.
                     app.active_overlay = ActiveOverlay::None;
