@@ -122,20 +122,18 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
         }
     }
 
+    use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(theme::BLUE)),
-        Span::styled(" nav  ", theme::muted()),
-        Span::styled("enter", Style::default().fg(theme::GREEN)),
-        Span::styled(" cd  ", theme::muted()),
-        Span::styled("a", Style::default().fg(theme::BLUE)),
-        Span::styled(" add  ", theme::muted()),
-        Span::styled("d", Style::default().fg(theme::RED)),
-        Span::styled(" delete  ", theme::muted()),
-        Span::styled("e", Style::default().fg(theme::AMBER)),
-        Span::styled(" rename  ", theme::muted()),
-        Span::styled("esc", Style::default().fg(theme::RED)),
-        Span::styled(" close", theme::muted()),
+        pill("Enter cd", theme::GREEN),
+        gap(),
+        pill("a add", theme::CYAN),
+        gap(),
+        pill("d delete", theme::RED),
+        gap(),
+        pill("e rename", theme::AMBER),
+        gap(),
+        pill("Esc close", theme::PURPLE),
     ]));
 
     let paragraph = Paragraph::new(lines);
@@ -199,14 +197,13 @@ fn draw_naming_mode(f: &mut Frame, inner: Rect, naming: &BookmarkNaming) {
         ),
     ]));
 
-    // Spacer + help
+    // Spacer + help pills
+    use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("enter", Style::default().fg(theme::GREEN)),
-        Span::styled(" save  ", theme::muted()),
-        Span::styled("esc", Style::default().fg(theme::RED)),
-        Span::styled(" cancel", theme::muted()),
+        pill("Enter save", theme::GREEN),
+        gap(),
+        pill("Esc cancel", theme::PURPLE),
     ]));
 
     let paragraph = Paragraph::new(lines);

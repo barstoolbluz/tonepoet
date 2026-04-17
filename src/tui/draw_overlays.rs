@@ -13,6 +13,32 @@ use super::app::{ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, Sour
 use super::button_map::TuiButton;
 use super::theme;
 
+/// Render a pill-style footer button: ` label ` with colored background.
+/// Public alias for use from other modules (help.rs, etc.).
+pub fn footer_pill_pub(label: &str, bg: Color) -> Span<'static> {
+    footer_pill(label, bg)
+}
+
+fn footer_pill(label: &str, bg: Color) -> Span<'static> {
+    Span::styled(
+        format!(" {} ", label),
+        Style::default()
+            .fg(theme::PILL_ACTIVE_FG)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Public alias for pill_gap (for other modules).
+pub fn pill_gap_pub() -> Span<'static> {
+    pill_gap()
+}
+
+/// One-char gap between footer pills.
+fn pill_gap() -> Span<'static> {
+    Span::raw(" ")
+}
+
 /// Draw any active overlay on top of the main content
 pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     // Clone overlay data to avoid borrow issues
@@ -395,17 +421,12 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
     let list = Paragraph::new(list_lines);
     f.render_widget(list, chunks[0]);
 
-    // Hint bar
+    // Footer pills.
     let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" ↑/↓ ", Style::default().fg(theme::BLUE)),
-        Span::styled("move", Style::default().fg(theme::TEXT_MUTED)),
-        Span::raw("  "),
-        Span::styled(" d ", Style::default().fg(theme::RED)),
-        Span::styled("remove", Style::default().fg(theme::TEXT_MUTED)),
-        Span::raw("  "),
-        Span::styled(" enter/esc ", Style::default().fg(theme::GREEN)),
-        Span::styled("close", Style::default().fg(theme::TEXT_MUTED)),
-    ]));
+        footer_pill("d remove", theme::RED),
+        pill_gap(),
+        footer_pill("Esc close", theme::PURPLE),
+    ])).alignment(Alignment::Center);
     f.render_widget(hint, chunks[1]);
 }
 
@@ -477,7 +498,7 @@ fn draw_error_detail(f: &mut Frame, error: &str) {
     f.render_widget(error_text, chunks[0]);
 
     let hint = Paragraph::new(Line::from(vec![
-        Span::styled("Press Esc to close", Style::default().fg(Color::DarkGray)),
+        footer_pill("Esc close", theme::PURPLE),
     ]))
     .alignment(Alignment::Center);
     f.render_widget(hint, chunks[1]);
@@ -513,6 +534,11 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
         ConversionStatus::Cancelled => "Cancelled".to_string(),
     };
 
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
     let lines = vec![
         Line::from(vec![
             Span::styled("File: ", Style::default().fg(Color::Gray)),
@@ -541,15 +567,14 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
             Span::styled("Status: ", Style::default().fg(Color::Gray)),
             Span::styled(status_str, Style::default().fg(Color::Yellow)),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Press Esc to close",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
 
-    let info = Paragraph::new(lines).wrap(Wrap { trim: true });
-    f.render_widget(info, inner);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), chunks[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(footer_pill("Esc close", theme::PURPLE)))
+            .alignment(Alignment::Center),
+        chunks[1],
+    );
 }
 
 /// Draw file input overlay for adding files
@@ -592,8 +617,10 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
     f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
 
     let help = Paragraph::new(Line::from(vec![
-        Span::styled("Enter to confirm, Esc to cancel", Style::default().fg(Color::DarkGray)),
-    ]));
+        footer_pill("Enter confirm", theme::GREEN),
+        pill_gap(),
+        footer_pill("Esc cancel", theme::PURPLE),
+    ])).alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
 
@@ -645,10 +672,11 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
 
     f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
 
-    let help = Paragraph::new(Line::from(vec![Span::styled(
-        "Enter to save, Esc to cancel",
-        Style::default().fg(Color::DarkGray),
-    )]));
+    let help = Paragraph::new(Line::from(vec![
+        footer_pill("Enter save", theme::GREEN),
+        pill_gap(),
+        footer_pill("Esc cancel", theme::PURPLE),
+    ])).alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
 
@@ -935,34 +963,28 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
         }
     }
 
-    // ── Footer keybindings ───────────────────────────────────────
+    // ── Footer pills ────────────────────────────────────────────
     let footer_parts = if state.focus == BulkRenameFocus::Template {
         vec![
-            Span::styled("Tab", Style::default().fg(theme::AMBER)),
-            Span::styled(": list  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("Enter", Style::default().fg(theme::AMBER)),
-            Span::styled(": commit  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("Esc", Style::default().fg(theme::AMBER)),
-            Span::styled(": cancel", Style::default().fg(theme::TEXT_MUTED)),
+            footer_pill("Tab list", theme::AMBER),
+            pill_gap(),
+            footer_pill("Enter commit", theme::GREEN),
+            pill_gap(),
+            footer_pill("Esc cancel", theme::PURPLE),
         ]
     } else {
         vec![
-            Span::styled("Tab", Style::default().fg(theme::AMBER)),
-            Span::styled(": template  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("e", Style::default().fg(theme::AMBER)),
-            Span::styled(": edit  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("c", Style::default().fg(theme::AMBER)),
-            Span::styled(": cue  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("C", Style::default().fg(theme::AMBER)),
-            Span::styled(": caps  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("t", Style::default().fg(theme::AMBER)),
-            Span::styled("/", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("S", Style::default().fg(theme::AMBER)),
-            Span::styled(": tmpl  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("Enter", Style::default().fg(theme::AMBER)),
-            Span::styled(": commit  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("Esc", Style::default().fg(theme::AMBER)),
-            Span::styled(": cancel", Style::default().fg(theme::TEXT_MUTED)),
+            footer_pill("Tab tmpl", theme::AMBER),
+            pill_gap(),
+            footer_pill("e edit", theme::CYAN),
+            pill_gap(),
+            footer_pill("c cue", theme::CYAN),
+            pill_gap(),
+            footer_pill("C caps", theme::CYAN),
+            pill_gap(),
+            footer_pill("Enter commit", theme::GREEN),
+            pill_gap(),
+            footer_pill("Esc cancel", theme::PURPLE),
         ]
     };
     f.render_widget(
@@ -1083,16 +1105,13 @@ fn draw_analysis(
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
-    // Footer.
+    // Footer pills.
     let footer = Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(theme::BLUE)),
-        Span::styled(" scroll  ", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled("w", Style::default().fg(theme::GREEN)),
-        Span::styled(" track RG  ", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled("W", Style::default().fg(theme::GREEN)),
-        Span::styled(" album+track RG  ", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled("Esc", Style::default().fg(theme::PURPLE)),
-        Span::styled(" close", Style::default().fg(theme::TEXT_MUTED)),
+        footer_pill("w track RG", theme::GREEN),
+        pill_gap(),
+        footer_pill("W album+track RG", theme::GREEN),
+        pill_gap(),
+        footer_pill("Esc close", theme::PURPLE),
     ]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
@@ -1246,33 +1265,22 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer: clickable pill-style buttons with key hints.
-    let pill = |label: &str, bg: ratatui::style::Color| -> Span<'static> {
-        Span::styled(
-            format!(" {} ", label),
-            Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    let gap = || -> Span<'static> { Span::raw(" ") };
-
     let footer = match state.phase {
         MetadataEditorPhase::Editing => Line::from(vec![
-            pill("d delete", theme::RED),
-            gap(),
-            pill("u undo", theme::AMBER),
-            gap(),
-            pill("a add", theme::CYAN),
-            gap(),
-            pill("w save", theme::GREEN),
-            gap(),
-            pill("Esc close", theme::PURPLE),
+            footer_pill("d delete", theme::RED),
+            pill_gap(),
+            footer_pill("u undo", theme::AMBER),
+            pill_gap(),
+            footer_pill("a add", theme::CYAN),
+            pill_gap(),
+            footer_pill("w save", theme::GREEN),
+            pill_gap(),
+            footer_pill("Esc close", theme::PURPLE),
         ]),
         MetadataEditorPhase::InlineEdit | MetadataEditorPhase::AddingKey => Line::from(vec![
-            pill("Enter confirm", theme::GREEN),
-            gap(),
-            pill("Esc cancel", theme::PURPLE),
+            footer_pill("Enter confirm", theme::GREEN),
+            pill_gap(),
+            footer_pill("Esc cancel", theme::PURPLE),
         ]),
         MetadataEditorPhase::Saving => Line::from(
             Span::styled(" Saving... ", Style::default().fg(theme::AMBER)),

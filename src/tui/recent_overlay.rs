@@ -133,17 +133,15 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
         }
     }
 
-    // Blank + help line
+    // Blank + help pills
+    use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(theme::BLUE)),
-        Span::styled(" navigate  ", theme::muted()),
-        Span::styled("enter", Style::default().fg(theme::GREEN)),
-        Span::styled(" load  ", theme::muted()),
-        Span::styled("d", Style::default().fg(theme::RED)),
-        Span::styled(" delete  ", theme::muted()),
-        Span::styled("esc", Style::default().fg(theme::RED)),
-        Span::styled(" close", theme::muted()),
+        pill("Enter load", theme::GREEN),
+        gap(),
+        pill("d delete", theme::RED),
+        gap(),
+        pill("Esc close", theme::PURPLE),
     ]));
 
     let paragraph = Paragraph::new(lines);

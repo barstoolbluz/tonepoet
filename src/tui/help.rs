@@ -252,13 +252,8 @@ pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize) {
 
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
-    // Footer.
-    let footer = Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(theme::BLUE)),
-        Span::styled(" scroll  ", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled("Esc", Style::default().fg(theme::AMBER)),
-        Span::styled(" close", Style::default().fg(theme::TEXT_MUTED)),
-    ]);
+    // Footer pill.
+    let footer = Line::from(super::draw_overlays::footer_pill_pub("Esc close", theme::PURPLE));
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],

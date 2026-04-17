@@ -1839,6 +1839,248 @@ pub fn open_metadata_editor(app: &mut AppState) {
     ));
 }
 
+/// Handle mouse events for generic overlays: click-outside-to-close,
+/// footer pill clicks, and scroll. Returns true if the event was handled.
+fn handle_generic_overlay_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    _tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    let area = crossterm::terminal::size().unwrap_or((80, 24));
+    let mx = mouse.column;
+    let my = mouse.row;
+
+    // Determine which overlay is active and compute its popup rect.
+    // Returns (popup_rect, pill_labels_for_footer, close_action).
+    let (popup, pills): (Rect, Vec<(&str, &str)>) =
+        if app.bookmarks.overlay_open {
+            let w: u16 = 64.min(area.0.saturating_sub(4));
+            let list_h = app.bookmarks.entries.len() as u16;
+            let h = (list_h + 5).min(area.1.saturating_sub(4)).max(8);
+            let x = (area.0.saturating_sub(w)) / 2;
+            let y = (area.1.saturating_sub(h)) / 2;
+            if app.bookmarks.naming.is_some() {
+                (Rect::new(x, y, w, h), vec![
+                    ("Enter save", "enter"), ("Esc cancel", "esc"),
+                ])
+            } else {
+                (Rect::new(x, y, w, h), vec![
+                    ("Enter cd", "enter"), ("a add", "a"),
+                    ("d delete", "d"), ("e rename", "e"), ("Esc close", "esc"),
+                ])
+            }
+        } else if app.recent.overlay_open {
+            let w: u16 = 72.min(area.0.saturating_sub(4));
+            let list_h = app.recent.entries.len() as u16;
+            let h = (list_h + 5).min(area.1.saturating_sub(4)).max(8);
+            let x = (area.0.saturating_sub(w)) / 2;
+            let y = (area.1.saturating_sub(h)) / 2;
+            (Rect::new(x, y, w, h), vec![
+                ("Enter load", "enter"), ("d delete", "d"), ("Esc close", "esc"),
+            ])
+        } else if app.preset.overlay_open {
+            let w: u16 = 36;
+            let list_h = app.preset.overlay_list.len() as u16;
+            let h = (list_h + 10).min(area.1.saturating_sub(4));
+            let x = area.0.saturating_sub(w + 2);
+            let y = area.1.saturating_sub(h + 3);
+            if app.preset.naming_input.is_some() {
+                (Rect::new(x, y, w, h), vec![
+                    ("Enter save", "enter"), ("Esc cancel", "esc"),
+                ])
+            } else {
+                (Rect::new(x, y, w, h), vec![
+                    ("n new", "n"), ("d dup", "d"), ("x del", "x"), ("Esc close", "esc"),
+                ])
+            }
+        } else {
+            // ActiveOverlay-based overlays.
+            match &app.active_overlay {
+                ActiveOverlay::Analysis { .. } => {
+                    let w = ((area.0 as usize) * 80 / 100).max(50).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 80 / 100).max(12).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![
+                        ("w track RG", "w"), ("W album+track RG", "W"), ("Esc close", "esc"),
+                    ])
+                }
+                ActiveOverlay::BulkRename(ref state) => {
+                    let w = ((area.0 as usize) * 85 / 100).max(60).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 85 / 100).max(16).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    if state.focus == super::app::BulkRenameFocus::Template {
+                        (Rect::new(x, y, w, h), vec![
+                            ("Tab list", "tab"), ("Enter commit", "enter"), ("Esc cancel", "esc"),
+                        ])
+                    } else {
+                        (Rect::new(x, y, w, h), vec![
+                            ("Tab tmpl", "tab"), ("e edit", "e"), ("c cue", "c"),
+                            ("C caps", "C"), ("Enter commit", "enter"), ("Esc cancel", "esc"),
+                        ])
+                    }
+                }
+                ActiveOverlay::BatchList { .. } => {
+                    let w = area.0.saturating_sub(8).min(100).max(40);
+                    let h = area.1.saturating_sub(6).min(30).max(10);
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![
+                        ("d remove", "d"), ("Esc close", "esc"),
+                    ])
+                }
+                ActiveOverlay::Help { .. } => {
+                    let w = ((area.0 as usize) * 70 / 100).max(50).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 80 / 100).max(12).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![
+                        ("Esc close", "esc"),
+                    ])
+                }
+                ActiveOverlay::ErrorDetail { .. } => {
+                    let w: u16 = 60; let h: u16 = 12;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+                }
+                ActiveOverlay::ItemInfo { .. } => {
+                    let w: u16 = 70; let h: u16 = 16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+                }
+                ActiveOverlay::FileInput { .. } => {
+                    let w: u16 = 60; let h: u16 = 7;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![
+                        ("Enter confirm", "enter"), ("Esc cancel", "esc"),
+                    ])
+                }
+                ActiveOverlay::TextEdit { .. } => {
+                    let w = area.0.saturating_sub(4).min(80);
+                    let h: u16 = 7;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![
+                        ("Enter save", "enter"), ("Esc cancel", "esc"),
+                    ])
+                }
+                ActiveOverlay::Confirmation { .. } => {
+                    // Already has button_map support — skip.
+                    return false;
+                }
+                _ => return false,
+            }
+        };
+
+    let in_popup = mx >= popup.x && mx < popup.x + popup.width
+        && my >= popup.y && my < popup.y + popup.height;
+
+    // Footer row = last row inside the popup border.
+    let footer_y = popup.y + popup.height.saturating_sub(2);
+    let inner_x = popup.x + 1;
+    let inner_w = popup.width.saturating_sub(2);
+    let on_footer = my == footer_y && mx >= inner_x && mx < inner_x + inner_w;
+
+    match mouse.kind {
+        // Scroll: navigate for scrollable overlays.
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            // Simulate Up/Down key for scrollable overlays.
+            let code = if mouse.kind == MouseEventKind::ScrollUp {
+                KeyCode::Up
+            } else {
+                KeyCode::Down
+            };
+            let fake = KeyEvent::new(code, KeyModifiers::NONE);
+            // Route through the appropriate key handler.
+            if app.bookmarks.overlay_open {
+                handle_bookmarks_overlay_key(app, fake, _tx);
+            } else if app.recent.overlay_open {
+                handle_recent_overlay_key(app, fake);
+            } else if app.preset.overlay_open {
+                handle_preset_overlay_key(app, fake);
+            } else {
+                handle_overlay_key(app, fake, _tx);
+            }
+            return true;
+        }
+
+        // Left click outside popup: close.
+        MouseEventKind::Down(MouseButton::Left) if !in_popup => {
+            if app.bookmarks.overlay_open {
+                app.bookmarks.close_overlay();
+            } else if app.recent.overlay_open {
+                app.recent.overlay_open = false;
+            } else if app.preset.overlay_open {
+                app.preset.overlay_open = false;
+            } else {
+                app.active_overlay = ActiveOverlay::None;
+            }
+            return true;
+        }
+
+        // Left click on footer: pill hit-test.
+        MouseEventKind::Down(MouseButton::Left) if on_footer && !pills.is_empty() => {
+            if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
+                let fake = match action {
+                    "enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    "tab" => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                    other => {
+                        let ch = other.chars().next().unwrap_or('?');
+                        if ch.is_uppercase() {
+                            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT)
+                        } else {
+                            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+                        }
+                    }
+                };
+                if app.bookmarks.overlay_open {
+                    handle_bookmarks_overlay_key(app, fake, _tx);
+                } else if app.recent.overlay_open {
+                    handle_recent_overlay_key(app, fake);
+                } else if app.preset.overlay_open {
+                    handle_preset_overlay_key(app, fake);
+                } else {
+                    handle_overlay_key(app, fake, _tx);
+                }
+                return true;
+            }
+        }
+
+        // Right-click anywhere: close overlay.
+        MouseEventKind::Down(MouseButton::Right) => {
+            if app.bookmarks.overlay_open {
+                app.bookmarks.close_overlay();
+            } else if app.recent.overlay_open {
+                app.recent.overlay_open = false;
+            } else if app.preset.overlay_open {
+                app.preset.overlay_open = false;
+            } else {
+                app.active_overlay = ActiveOverlay::None;
+            }
+            return true;
+        }
+
+        // Move events: consume but don't act (prevents underlying UI from reacting).
+        MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+            return true;
+        }
+
+        // Other clicks inside popup: consume without action.
+        MouseEventKind::Down(_) if in_popup => {
+            return true;
+        }
+
+        _ => {}
+    }
+
+    false
+}
+
 /// Handle mouse events inside the metadata editor overlay.
 fn handle_metadata_editor_mouse(
     app: &mut AppState,
@@ -3720,6 +3962,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
         handle_metadata_editor_mouse(app, mouse, tx);
         return;
+    }
+
+    // Generic overlay mouse: click-outside-to-close + footer pill clicks
+    // for all overlays (except MetadataEditor which has its own handler,
+    // and ContextMenu which has its own hover/click system).
+    if !matches!(app.active_overlay, ActiveOverlay::None | ActiveOverlay::ContextMenu { .. })
+        || app.preset.overlay_open
+        || app.recent.overlay_open
+        || app.bookmarks.overlay_open
+    {
+        if handle_generic_overlay_mouse(app, mouse, tx) {
+            return;
+        }
     }
 
     // Context menu mouse interaction must be checked BEFORE the generic

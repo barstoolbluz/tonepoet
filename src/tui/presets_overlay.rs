@@ -53,12 +53,12 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
                 Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE),
             ),
         ]));
+        use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("enter", Style::default().fg(theme::GREEN)),
-            Span::styled(" save  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled("esc", Style::default().fg(theme::RED)),
-            Span::styled(" cancel", Style::default().fg(theme::TEXT_MUTED)),
+            pill("Enter save", theme::GREEN),
+            gap(),
+            pill("Esc cancel", theme::PURPLE),
         ]));
 
         let p = Paragraph::new(lines);
@@ -124,30 +124,16 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
         Style::default().fg(theme::BORDER_DIM),
     )));
 
-    // Actions
+    // Action pills
+    use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
     lines.push(Line::from(vec![
-        Span::styled(" n", Style::default().fg(theme::GREEN)),
-        Span::styled("  save as new preset", Style::default().fg(theme::TEXT)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" d", Style::default().fg(theme::AMBER)),
-        Span::styled("  duplicate", Style::default().fg(theme::TEXT)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" x", Style::default().fg(theme::RED)),
-        Span::styled("  delete", Style::default().fg(theme::TEXT)),
-    ]));
-
-    // Separator
-    lines.push(Line::from(Span::styled(
-        "─".repeat(inner.width as usize),
-        Style::default().fg(theme::BORDER_DIM),
-    )));
-
-    // Close hint
-    lines.push(Line::from(vec![
-        Span::styled(" esc", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled("  close", Style::default().fg(theme::TEXT_MUTED)),
+        pill("n new", theme::GREEN),
+        gap(),
+        pill("d dup", theme::AMBER),
+        gap(),
+        pill("x del", theme::RED),
+        gap(),
+        pill("Esc close", theme::PURPLE),
     ]));
 
     let p = Paragraph::new(lines);
