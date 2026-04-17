@@ -1829,6 +1829,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
             entries,
             cursor: 0,
             scroll: 0,
+            last_click: None,
             edit_input: None,
             add_key_input: None,
             phase: super::app::MetadataEditorPhase::Editing,
@@ -1836,6 +1837,140 @@ pub fn open_metadata_editor(app: &mut AppState) {
             deleted: Vec::new(),
         },
     ));
+}
+
+/// Handle mouse events inside the metadata editor overlay.
+fn handle_metadata_editor_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    _tx: &mpsc::Sender<AppMessage>,
+) {
+    use super::app::MetadataEditorPhase;
+
+    // Compute overlay geometry (must match draw_metadata_editor).
+    let area = crossterm::terminal::size().unwrap_or((80, 24));
+    let w = ((area.0 as usize) * 85 / 100).max(50).min(area.0 as usize - 2) as u16;
+    let h = ((area.1 as usize) * 85 / 100).max(14).min(area.1 as usize - 2) as u16;
+    let popup_x = (area.0.saturating_sub(w)) / 2;
+    let popup_y = (area.1.saturating_sub(h)) / 2;
+    // Inner content area (inside border + footer).
+    let content_x = popup_x + 1;
+    let content_y = popup_y + 1;
+    let content_h = h.saturating_sub(3) as usize; // -2 border -1 footer
+
+    let mx = mouse.column;
+    let my = mouse.row;
+
+    // Check if mouse is inside the overlay content area.
+    let in_content = mx >= content_x && mx < content_x + w.saturating_sub(2)
+        && my >= content_y && my < content_y + content_h as u16;
+
+    let overlay = app.active_overlay.clone();
+    if let ActiveOverlay::MetadataEditor(mut state) = overlay {
+        let total_rows = state.entries.len() + 1;
+
+        match mouse.kind {
+            // Scroll wheel: navigate entries.
+            MouseEventKind::ScrollUp => {
+                state.cursor = state.cursor.saturating_sub(1);
+                ensure_cursor_visible(&mut state);
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+            MouseEventKind::ScrollDown => {
+                if state.cursor + 1 < total_rows {
+                    state.cursor += 1;
+                }
+                ensure_cursor_visible(&mut state);
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+
+            // Right-click: cancel inline edit or close overlay.
+            MouseEventKind::Down(MouseButton::Right) => {
+                match state.phase {
+                    MetadataEditorPhase::InlineEdit => {
+                        state.edit_input = None;
+                        state.phase = MetadataEditorPhase::Editing;
+                        recalc_dirty(&mut state);
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    }
+                    MetadataEditorPhase::AddingKey => {
+                        state.add_key_input = None;
+                        state.phase = MetadataEditorPhase::Editing;
+                        recalc_dirty(&mut state);
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    }
+                    _ => {
+                        app.active_overlay = ActiveOverlay::None;
+                    }
+                }
+            }
+
+            // Left click in content: move cursor, double-click to edit.
+            MouseEventKind::Down(MouseButton::Left) if in_content => {
+                let row = (my - content_y) as usize + state.scroll;
+
+                // If currently in inline edit, confirm the edit first.
+                if state.phase == MetadataEditorPhase::InlineEdit {
+                    if let Some(ref input) = state.edit_input {
+                        let new_val = input.text.clone();
+                        if state.cursor < state.entries.len() {
+                            state.entries[state.cursor].value = new_val;
+                        }
+                    }
+                    state.edit_input = None;
+                    state.phase = MetadataEditorPhase::Editing;
+                    recalc_dirty(&mut state);
+                }
+
+                // Double-click detection: same row within 400ms.
+                let now = std::time::Instant::now();
+                let is_double = state.last_click
+                    .map(|(prev_row, prev_time)| {
+                        prev_row == row && now.duration_since(prev_time).as_millis() < 400
+                    })
+                    .unwrap_or(false);
+
+                if is_double && row < state.entries.len() {
+                    // Double-click: edit the field.
+                    state.cursor = row;
+                    let entry = &state.entries[row];
+                    if !entry.is_binary && !state.deleted.contains(&row) {
+                        state.edit_input = Some(
+                            super::text_input::TextInputState::new(entry.value.clone()),
+                        );
+                        state.phase = MetadataEditorPhase::InlineEdit;
+                    }
+                    state.last_click = None;
+                } else if is_double && row == state.entries.len() {
+                    // Double-click on "+ Add field..."
+                    state.cursor = state.entries.len();
+                    state.add_key_input = Some(
+                        super::text_input::TextInputState::empty(),
+                    );
+                    state.phase = MetadataEditorPhase::AddingKey;
+                    state.last_click = None;
+                } else {
+                    // Single click: move cursor.
+                    if row < total_rows {
+                        state.cursor = row;
+                    }
+                    state.last_click = Some((row, now));
+                }
+                ensure_cursor_visible(&mut state);
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+
+            // Left click outside content: ignore (don't close — prevents accidental loss).
+            MouseEventKind::Down(MouseButton::Left) => {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+
+            // Ignore other events.
+            _ => {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+        }
+    }
 }
 
 /// Ensure the cursor is visible in the metadata editor's scroll window.
@@ -3449,6 +3584,12 @@ fn retry_failed(app: &mut AppState) {
 
 /// Handle mouse events
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
+    // Metadata editor mouse: intercept all events when the editor is open.
+    if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
+        handle_metadata_editor_mouse(app, mouse, tx);
+        return;
+    }
+
     // Context menu mouse interaction must be checked BEFORE the generic
     // hover handler, since the menu is an overlay not tracked by button_map.
     if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {

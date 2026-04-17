@@ -844,6 +844,8 @@ pub struct MetadataEditorState {
     pub cursor: usize,
     /// Scroll offset for the visible window.
     pub scroll: usize,
+    /// Last left-click: (row_index, timestamp) for double-click detection.
+    pub last_click: Option<(usize, std::time::Instant)>,
     /// Text input for inline field editing.
     pub edit_input: Option<crate::tui::text_input::TextInputState>,
     /// Text input for adding a new field key.
