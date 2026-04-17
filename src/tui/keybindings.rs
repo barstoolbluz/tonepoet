@@ -3604,3 +3604,4 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         }
     }
 }
+

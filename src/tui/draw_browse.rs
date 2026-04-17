@@ -906,7 +906,7 @@ fn entry_info_lines(
             let pill_w = pill_label.chars().count();
             let pad = content_width.saturating_sub(pill_w + 3);
             let pill_bg = if analyze_hovered {
-                theme::BLUE // brighter on hover
+                theme::BLUE
             } else {
                 theme::PURPLE
             };
@@ -920,7 +920,6 @@ fn entry_info_lines(
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
             ]);
-            // Store the row index for button registration.
             return InfoContent {
                 lines,
                 meta_field_rows,

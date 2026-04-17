@@ -1078,9 +1078,9 @@ fn draw_analysis(
         Span::styled("↑↓", Style::default().fg(theme::BLUE)),
         Span::styled(" scroll  ", Style::default().fg(theme::TEXT_MUTED)),
         Span::styled("w", Style::default().fg(theme::GREEN)),
-        Span::styled(" write RG  ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(" track RG  ", Style::default().fg(theme::TEXT_MUTED)),
         Span::styled("W", Style::default().fg(theme::GREEN)),
-        Span::styled(" album RG  ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(" album+track RG  ", Style::default().fg(theme::TEXT_MUTED)),
         Span::styled("Esc", Style::default().fg(theme::PURPLE)),
         Span::styled(" close", Style::default().fg(theme::TEXT_MUTED)),
     ]);
@@ -1089,3 +1089,4 @@ fn draw_analysis(
         chunks[1],
     );
 }
+
