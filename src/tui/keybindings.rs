@@ -1666,6 +1666,7 @@ fn handle_metadata_editor_key(
                 KeyCode::Char('u') => {
                     // Undo delete for the focused entry.
                     state.deleted.retain(|&i| i != state.cursor);
+                    recalc_dirty(state);
                 }
                 KeyCode::Char('w') => {
                     if !state.dirty {
@@ -1727,12 +1728,10 @@ fn handle_metadata_editor_key(
                     let new_val = input.text.clone();
                     if state.cursor < state.entries.len() {
                         state.entries[state.cursor].value = new_val;
-                        if state.entries[state.cursor].value != state.entries[state.cursor].original {
-                            state.dirty = true;
-                        }
                     }
                     state.edit_input = None;
                     state.phase = MetadataEditorPhase::Editing;
+                    recalc_dirty(state);
                 }
                 _ => {
                     super::text_input::handle_text_input_key(input, &key);
@@ -1840,14 +1839,20 @@ pub fn open_metadata_editor(app: &mut AppState) {
 
 /// Ensure the cursor is visible in the metadata editor's scroll window.
 fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
-    // Approximate visible height — we don't know the exact terminal size here,
-    // but 20 is a safe default. The renderer clamps defensively.
-    let visible = 20usize;
+    let visible = crossterm::terminal::size()
+        .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
+        .unwrap_or(20);
     if state.cursor < state.scroll {
         state.scroll = state.cursor;
     } else if state.cursor >= state.scroll + visible {
         state.scroll = state.cursor.saturating_sub(visible - 1);
     }
+}
+
+/// Recalculate the dirty flag by checking all entries for changes.
+fn recalc_dirty(state: &mut super::app::MetadataEditorState) {
+    state.dirty = !state.deleted.is_empty()
+        || state.entries.iter().any(|e| e.value != e.original);
 }
 
 /// Compute the screen rect for a context menu panel, matching
