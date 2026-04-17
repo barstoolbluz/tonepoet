@@ -1881,7 +1881,7 @@ fn handle_generic_overlay_mouse(
         } else if app.preset.overlay_open {
             let w: u16 = 36;
             let list_h = app.preset.overlay_list.len() as u16;
-            let h = (list_h + 10).min(area.1.saturating_sub(4));
+            let h = (list_h + 6).min(area.1.saturating_sub(4));
             let x = area.0.saturating_sub(w + 2);
             let y = area.1.saturating_sub(h + 3);
             if app.preset.naming_input.is_some() {

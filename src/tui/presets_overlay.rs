@@ -16,8 +16,8 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
     let area = f.size();
     let width: u16 = 36;
     let list_height = preset.overlay_list.len() as u16;
-    // Header(1) + "saved presets" label(1) + list + separator(1) + actions(3) + separator(1) + esc(1) + borders(2)
-    let height = (list_height + 10).min(area.height.saturating_sub(4));
+    // Header(1) + "saved presets" label(1) + list + separator(1) + pill row(1) + borders(2)
+    let height = (list_height + 6).min(area.height.saturating_sub(4));
     let x = area.width.saturating_sub(width + 2);
     let y = area.height.saturating_sub(height + 3);
     let overlay_area = Rect::new(x, y, width, height);
