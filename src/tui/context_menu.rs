@@ -128,28 +128,20 @@ fn separator() -> ContextMenuEntry {
     ContextMenuEntry::Separator
 }
 
-/// Build the "Convert" submenu tree. The top level always shows the
-/// quick-action items (Custom and Last Used for both queue and start
-/// modes). Codec-grouped preset submenus appear below the separator
-/// only when presets exist.
+/// Build the "Convert" submenu. Custom opens the Convert screen for
+/// manual review; Last Used and presets auto-commit (enqueue + start by
+/// default, enqueue-only when Shift is held — configurable via
+/// `[ui] convert_default_action`).
 ///
 /// ```text
 /// Convert ►
-/// ├── Custom (queue)                 — current pill state, review
-/// ├── Custom + start                 — current pill state, auto-start
-/// ├── Last used (queue)  [FLAC]      — same as Custom, labelled with format
-/// ├── Last used + start  [FLAC]
+/// ├── Custom                         — open Convert screen
+/// ├── Last used [FLAC]               — auto-commit with current pills
 /// ├── ─────────────────────          (only if presets exist)
-/// ├── FLAC ►
-/// │   ├── foobar2k (queue)
-/// │   ├── foobar2k + start
-/// │   └── ...
-/// ├── Opus ►
-/// │   └── ...
+/// ├── preset-name-1
+/// ├── preset-name-2
+/// └── ...
 /// ```
-///
-/// Reused by audio files, archives, and directories — the queue flow
-/// expands directories into their audio file contents automatically.
 fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
     let groups = super::presets::list_presets_by_format_db(&app.db);
     let current_format = app.convert.format.format.selected_value().name();
