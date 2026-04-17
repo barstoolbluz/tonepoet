@@ -1660,7 +1660,7 @@ fn handle_metadata_editor_key(
                         && !state.deleted.contains(&state.cursor)
                     {
                         state.deleted.push(state.cursor);
-                        state.dirty = true;
+                        recalc_dirty(state);
                     }
                 }
                 KeyCode::Char('u') => {
@@ -1723,6 +1723,7 @@ fn handle_metadata_editor_key(
                 KeyCode::Esc => {
                     state.edit_input = None;
                     state.phase = MetadataEditorPhase::Editing;
+                    recalc_dirty(state);
                 }
                 KeyCode::Enter => {
                     let new_val = input.text.clone();
@@ -1747,6 +1748,7 @@ fn handle_metadata_editor_key(
                 KeyCode::Esc => {
                     state.add_key_input = None;
                     state.phase = MetadataEditorPhase::Editing;
+                    recalc_dirty(state);
                 }
                 KeyCode::Enter => {
                     let key_name = input.text.trim().to_uppercase();
@@ -1758,7 +1760,6 @@ fn handle_metadata_editor_key(
                             original: String::new(),
                             is_binary: false,
                         });
-                        state.dirty = true;
                         state.cursor = state.entries.len() - 1;
                         state.add_key_input = None;
                         state.edit_input = Some(
