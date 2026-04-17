@@ -123,7 +123,14 @@ fn draw_context_menu_side_by_side(
 }
 
 /// Find the row offset (within the menu body, 0-indexed) of the
-/// `selected`-th selectable entry.
+/// `selected`-th selectable entry. Public alias for keybindings.rs.
+pub fn selected_entry_row_pub(
+    entries: &[super::context_menu::ContextMenuEntry],
+    selected: usize,
+) -> u16 {
+    selected_entry_row(entries, selected)
+}
+
 fn selected_entry_row(
     entries: &[super::context_menu::ContextMenuEntry],
     selected: usize,

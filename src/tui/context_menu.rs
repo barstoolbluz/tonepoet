@@ -125,15 +125,6 @@ fn item(label: &str, action: ContextAction) -> ContextMenuEntry {
     })
 }
 
-fn item_with_shortcut(label: &str, action: ContextAction, shortcut: &str) -> ContextMenuEntry {
-    ContextMenuEntry::Item(ContextMenuItem {
-        label: label.to_string(),
-        action,
-        shortcut: Some(shortcut.to_string()),
-        enabled: true,
-    })
-}
-
 fn separator() -> ContextMenuEntry {
     ContextMenuEntry::Separator
 }
@@ -224,10 +215,9 @@ fn build_edit_metadata_submenu() -> ContextMenuEntry {
     let children: Vec<ContextMenuEntry> = MetadataField::all()
         .iter()
         .map(|&field| {
-            item_with_shortcut(
+            item(
                 &format!("Edit {}", field.label()),
                 ContextAction::EditMetadata(field),
-                &format!(":e {}", field.label()),
             )
         })
         .collect();
@@ -252,47 +242,47 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_convert_submenu(app));
             items.push(build_edit_metadata_submenu());
             items.push(separator());
-            items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
-            items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
-            items.push(item_with_shortcut("Bulk Rename...", ContextAction::BulkRename, "R"));
-            items.push(item_with_shortcut("Analyze...", ContextAction::Analyze, ":analyze"));
-            items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
-            items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
-            items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
+            items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Rename", ContextAction::RenameEntry));
+            items.push(item("Bulk Rename...", ContextAction::BulkRename));
+            items.push(item("Analyze...", ContextAction::Analyze));
+            items.push(item("Copy to...", ContextAction::CopyTo));
+            items.push(item("Move to...", ContextAction::MoveTo));
+            items.push(item("Move to Trash", ContextAction::MoveToTrash));
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::Archive => {
             items.push(build_convert_submenu(app));
             items.push(separator());
-            items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
-            items.push(item_with_shortcut("Set Password...", ContextAction::SetArchivePassword, ":pw"));
-            items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
-            items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
-            items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
-            items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
+            items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Set Password...", ContextAction::SetArchivePassword));
+            items.push(item("Rename", ContextAction::RenameEntry));
+            items.push(item("Copy to...", ContextAction::CopyTo));
+            items.push(item("Move to...", ContextAction::MoveTo));
+            items.push(item("Move to Trash", ContextAction::MoveToTrash));
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::Directory => {
             items.push(build_convert_submenu(app));
             items.push(separator());
-            items.push(item_with_shortcut("Open", ContextAction::OpenEntry, "Enter"));
-            items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
-            items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
-            items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
-            items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
+            items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Rename", ContextAction::RenameEntry));
+            items.push(item("Copy to...", ContextAction::CopyTo));
+            items.push(item("Move to...", ContextAction::MoveTo));
+            items.push(item("Move to Trash", ContextAction::MoveToTrash));
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::ParentDir => {
-            items.push(item_with_shortcut("Go up", ContextAction::OpenEntry, "←"));
+            items.push(item("Go up", ContextAction::OpenEntry));
         }
         EntryKind::OtherFile => {
-            items.push(item_with_shortcut("Rename", ContextAction::RenameEntry, "F2"));
-            items.push(item_with_shortcut("Copy to...", ContextAction::CopyTo, ":cp"));
-            items.push(item_with_shortcut("Move to...", ContextAction::MoveTo, ":mv"));
-            items.push(item_with_shortcut("Move to Trash", ContextAction::MoveToTrash, ":del"));
+            items.push(item("Rename", ContextAction::RenameEntry));
+            items.push(item("Copy to...", ContextAction::CopyTo));
+            items.push(item("Move to...", ContextAction::MoveTo));
+            items.push(item("Move to Trash", ContextAction::MoveToTrash));
             items.push(separator());
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
@@ -306,10 +296,10 @@ pub fn build_browse_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let _ = app; // used in future for conditional items
     vec![
         item("Refresh", ContextAction::Refresh),
-        item_with_shortcut("Toggle hidden", ContextAction::ToggleHidden, "."),
-        item_with_shortcut("Change sort", ContextAction::CycleSortBy, "s"),
+        item("Toggle hidden", ContextAction::ToggleHidden),
+        item("Change sort", ContextAction::CycleSortBy),
         separator(),
-        item_with_shortcut("Bookmarks", ContextAction::OpenBookmarks, "b"),
+        item("Bookmarks", ContextAction::OpenBookmarks),
         item("Bookmark this dir", ContextAction::BookmarkCurrentDir),
     ]
 }
@@ -319,25 +309,17 @@ pub fn build_convert_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let mut items = Vec::new();
 
     if !app.convert.source.mode.is_empty() {
-        items.push(item_with_shortcut("Commit", ContextAction::CommitQueue, ":commit"));
-        items.push(item_with_shortcut(
-            "Commit + start",
-            ContextAction::CommitAndStart,
-            ":Commit",
-        ));
+        items.push(item("Commit", ContextAction::CommitQueue));
+        items.push(item("Commit + start", ContextAction::CommitAndStart));
         items.push(separator());
     }
 
     if app.convert.source.mode.is_batch() {
-        items.push(item_with_shortcut("Expand batch", ContextAction::ExpandBatch, ":expand"));
+        items.push(item("Expand batch", ContextAction::ExpandBatch));
         items.push(separator());
     }
 
-    items.push(item_with_shortcut(
-        "Browse for source",
-        ContextAction::BrowseForSource,
-        ":browse",
-    ));
+    items.push(item("Browse for source", ContextAction::BrowseForSource));
 
     // Presets grouped by codec — same tree structure as the browse
     // entry's Convert submenu, but here just for loading (not queuing).
@@ -370,7 +352,7 @@ pub fn build_queue_item_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let mut items = Vec::new();
 
     if let Some(qi) = item_ref {
-        items.push(item_with_shortcut("Info", ContextAction::ShowItemInfo, "Enter"));
+        items.push(item("Info", ContextAction::ShowItemInfo));
 
         match &qi.status {
             ConversionStatus::Failed { .. } => {
@@ -386,9 +368,9 @@ pub fn build_queue_item_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     items.push(separator());
 
     if app.processing_active {
-        items.push(item_with_shortcut("Pause", ContextAction::TogglePause, "p"));
+        items.push(item("Pause", ContextAction::TogglePause));
     } else {
-        items.push(item_with_shortcut("Start", ContextAction::StartProcessing, "s"));
+        items.push(item("Start", ContextAction::StartProcessing));
     }
 
     items.push(item("Clear completed", ContextAction::ClearCompleted));
@@ -401,9 +383,9 @@ pub fn build_queue_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let mut items = Vec::new();
 
     if app.processing_active {
-        items.push(item_with_shortcut("Pause", ContextAction::TogglePause, "p"));
+        items.push(item("Pause", ContextAction::TogglePause));
     } else {
-        items.push(item_with_shortcut("Start all", ContextAction::StartProcessing, "s"));
+        items.push(item("Start all", ContextAction::StartProcessing));
     }
 
     items.push(item("Clear completed", ContextAction::ClearCompleted));

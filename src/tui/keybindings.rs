@@ -1,6 +1,7 @@
 //! Key event dispatch by screen/focus
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use crate::convert::{ConversionOptions, ConversionStatus};
@@ -1585,6 +1586,209 @@ fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
     };
 }
 
+/// Compute the screen rect for a context menu panel, matching
+/// `render_menu_panel` in draw_overlays.rs.
+fn context_menu_panel_rect(
+    entries: &[super::context_menu::ContextMenuEntry],
+    origin: (u16, u16),
+    area_w: u16,
+    area_h: u16,
+) -> Rect {
+    use super::context_menu::ContextMenuEntry;
+    let max_label_w: usize = entries
+        .iter()
+        .filter_map(|e| match e {
+            ContextMenuEntry::Item(item) => {
+                let shortcut_w = item.shortcut.as_ref()
+                    .map(|s| s.chars().count() + 3).unwrap_or(0);
+                Some(item.label.chars().count() + shortcut_w)
+            }
+            ContextMenuEntry::Submenu { label, .. } => Some(label.chars().count() + 2),
+            ContextMenuEntry::Separator => None,
+        })
+        .max()
+        .unwrap_or(10);
+    let menu_w = (max_label_w + 4).min(area_w as usize) as u16;
+    let menu_h = (entries.len() + 2).min(area_h as usize) as u16;
+    let x = origin.0.min(area_w.saturating_sub(menu_w));
+    let y = origin.1.min(area_h.saturating_sub(menu_h));
+    Rect::new(x, y, menu_w, menu_h)
+}
+
+/// Map a screen row to a selectable entry index within a menu panel.
+/// Returns None if the row is outside the menu body or on a separator/
+/// disabled item.
+fn context_menu_hit_test(
+    entries: &[super::context_menu::ContextMenuEntry],
+    panel: Rect,
+    mouse_x: u16,
+    mouse_y: u16,
+) -> Option<usize> {
+    use super::context_menu::ContextMenuEntry;
+    // Inner area: 1px border on each side.
+    let inner_x = panel.x + 1;
+    let inner_y = panel.y + 1;
+    let inner_w = panel.width.saturating_sub(2);
+    let inner_h = panel.height.saturating_sub(2);
+    if mouse_x < inner_x || mouse_x >= inner_x + inner_w
+        || mouse_y < inner_y || mouse_y >= inner_y + inner_h
+    {
+        return None;
+    }
+    let row = (mouse_y - inner_y) as usize;
+    if row >= entries.len() { return None; }
+    // Check if this row is a selectable entry.
+    let mut selectable_idx = 0usize;
+    for (i, e) in entries.iter().enumerate() {
+        let is_selectable = matches!(e, ContextMenuEntry::Item(item) if item.enabled)
+            || matches!(e, ContextMenuEntry::Submenu { .. });
+        if i == row {
+            return if is_selectable { Some(selectable_idx) } else { None };
+        }
+        if is_selectable {
+            selectable_idx += 1;
+        }
+    }
+    None
+}
+
+/// Handle mouse hover over the context menu — update selected item.
+fn context_menu_mouse_hover(app: &mut AppState, mx: u16, my: u16) {
+    use super::context_menu::ContextMenuEntry;
+    let area = crossterm::terminal::size().unwrap_or((80, 24));
+
+    if let ActiveOverlay::ContextMenu {
+        ref entries, ref mut selected, origin,
+        ref mut submenu_entries, ref mut submenu_selected,
+        ref mut show_submenu, ref mut focus_submenu, ..
+    } = app.active_overlay
+    {
+        let parent_rect = context_menu_panel_rect(entries, origin, area.0, area.1);
+
+        // Check submenu first (if visible and has focus or mouse is in it).
+        if *show_submenu && !submenu_entries.is_empty() {
+            let sel_row = super::draw_overlays::selected_entry_row_pub(entries, *selected);
+            let sub_x = parent_rect.x + parent_rect.width - 1;
+            let sub_y = parent_rect.y + sel_row + 1;
+            let sub_rect = context_menu_panel_rect(submenu_entries, (sub_x, sub_y), area.0, area.1);
+            if let Some(idx) = context_menu_hit_test(submenu_entries, sub_rect, mx, my) {
+                *submenu_selected = idx;
+                *focus_submenu = true;
+                return;
+            }
+        }
+
+        // Check parent menu.
+        if let Some(idx) = context_menu_hit_test(entries, parent_rect, mx, my) {
+            *selected = idx;
+            *focus_submenu = false;
+            // Update submenu if hovering a Submenu entry.
+            let selectable: Vec<usize> = entries.iter().enumerate()
+                .filter_map(|(i, e)| match e {
+                    ContextMenuEntry::Item(item) if item.enabled => Some(i),
+                    ContextMenuEntry::Submenu { .. } => Some(i),
+                    _ => None,
+                })
+                .collect();
+            if let Some(&entry_idx) = selectable.get(idx) {
+                if let ContextMenuEntry::Submenu { children, .. } = &entries[entry_idx] {
+                    *submenu_entries = children.clone();
+                    *submenu_selected = 0;
+                    *show_submenu = true;
+                } else {
+                    *show_submenu = false;
+                    *submenu_entries = Vec::new();
+                }
+            }
+        }
+    }
+}
+
+/// Handle left-click on a context menu item. Returns true if a menu item
+/// was clicked (action executed, menu closed). Returns false if click was
+/// outside the menu.
+fn context_menu_mouse_click(
+    app: &mut AppState,
+    mx: u16,
+    my: u16,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    use super::context_menu::{ContextMenuEntry, execute_context_action};
+    let area = crossterm::terminal::size().unwrap_or((80, 24));
+
+    // Extract state — we need to close the overlay before executing.
+    let (entries, selected, origin, submenu_entries, _submenu_selected,
+         show_submenu, _focus_submenu) = match &app.active_overlay {
+        ActiveOverlay::ContextMenu {
+            entries, selected, origin,
+            submenu_entries, submenu_selected,
+            show_submenu, focus_submenu,
+        } => (
+            entries.clone(), *selected, *origin,
+            submenu_entries.clone(), *submenu_selected,
+            *show_submenu, *focus_submenu,
+        ),
+        _ => return false,
+    };
+
+    let parent_rect = context_menu_panel_rect(&entries, origin, area.0, area.1);
+
+    // Check submenu first.
+    if show_submenu && !submenu_entries.is_empty() {
+        let sel_row = super::draw_overlays::selected_entry_row_pub(&entries, selected);
+        let sub_x = parent_rect.x + parent_rect.width - 1;
+        let sub_y = parent_rect.y + sel_row + 1;
+        let sub_rect = context_menu_panel_rect(&submenu_entries, (sub_x, sub_y), area.0, area.1);
+        if let Some(idx) = context_menu_hit_test(&submenu_entries, sub_rect, mx, my) {
+            // Find the actual entry at this selectable index.
+            let mut count = 0;
+            for e in &submenu_entries {
+                let is_sel = matches!(e, ContextMenuEntry::Item(item) if item.enabled)
+                    || matches!(e, ContextMenuEntry::Submenu { .. });
+                if is_sel {
+                    if count == idx {
+                        if let ContextMenuEntry::Item(item) = e {
+                            let action = item.action.clone();
+                            app.active_overlay = ActiveOverlay::None;
+                            execute_context_action(app, action, tx);
+                            return true;
+                        }
+                    }
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    // Check parent menu.
+    if let Some(idx) = context_menu_hit_test(&entries, parent_rect, mx, my) {
+        let selectable: Vec<usize> = entries.iter().enumerate()
+            .filter_map(|(i, e)| match e {
+                ContextMenuEntry::Item(item) if item.enabled => Some(i),
+                ContextMenuEntry::Submenu { .. } => Some(i),
+                _ => None,
+            })
+            .collect();
+        if let Some(&entry_idx) = selectable.get(idx) {
+            match &entries[entry_idx] {
+                ContextMenuEntry::Item(item) => {
+                    let action = item.action.clone();
+                    app.active_overlay = ActiveOverlay::None;
+                    execute_context_action(app, action, tx);
+                    return true;
+                }
+                ContextMenuEntry::Submenu { .. } => {
+                    // Clicking a submenu parent just focuses it (hover already opened it).
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    false
+}
+
 /// Handle a Tab or Shift+Tab press inside the CommandInput overlay.
 /// On first press (no active completion), parses the input at the
 /// cursor and gathers candidates. On subsequent presses, cycles
@@ -2974,6 +3178,15 @@ fn retry_failed(app: &mut AppState) {
 
 /// Handle mouse events
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
+    // Context menu mouse interaction must be checked BEFORE the generic
+    // hover handler, since the menu is an overlay not tracked by button_map.
+    if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
+        if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
+            context_menu_mouse_hover(app, mouse.column, mouse.row);
+            return;
+        }
+    }
+
     // Hover tracking: update hover_target on every mouse move.
     if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
         let new_hover = app.button_map.find_button_at(mouse.column, mouse.row);
@@ -3011,35 +3224,36 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // - Left-click on empty space or non-selectable area: close only.
     if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
         if matches!(mouse.kind, MouseEventKind::Down(_)) {
-            app.active_overlay = ActiveOverlay::None;
-
             if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
-                // Fall through to the right-click handler below, which
-                // moves the cursor and opens a new menu.
+                // Right-click: close old menu, fall through to open new one.
+                app.active_overlay = ActiveOverlay::None;
             } else {
-                // Left/middle-click: close + select the clicked item
-                // (if it's a selectable entry), but don't trigger any
-                // action. Clicking empty space just closes.
-                let x = mouse.column;
-                let y = mouse.row;
-                match app.current_screen {
-                    AppScreen::Browse => {
-                        if let Some(super::button_map::TuiButton::BrowseEntry(idx)) =
-                            app.button_map.find_button_at(x, y)
-                        {
-                            app.browse.selected_index = idx;
-                            app.browse.ensure_visible();
+                // Left-click: try to activate the hovered item.
+                if !context_menu_mouse_click(app, mouse.column, mouse.row, tx) {
+                    // Click was outside the menu — close it and select
+                    // the clicked browse/queue item if applicable.
+                    app.active_overlay = ActiveOverlay::None;
+                    let x = mouse.column;
+                    let y = mouse.row;
+                    match app.current_screen {
+                        AppScreen::Browse => {
+                            if let Some(super::button_map::TuiButton::BrowseEntry(idx)) =
+                                app.button_map.find_button_at(x, y)
+                            {
+                                app.browse.selected_index = idx;
+                                app.browse.ensure_visible();
+                            }
                         }
-                    }
-                    AppScreen::Queue => {
-                        if let Some(super::button_map::TuiButton::QueueItem(idx)) =
-                            app.button_map.find_button_at(x, y)
-                        {
-                            app.selected_index = idx;
-                            app.ensure_visible();
+                        AppScreen::Queue => {
+                            if let Some(super::button_map::TuiButton::QueueItem(idx)) =
+                                app.button_map.find_button_at(x, y)
+                            {
+                                app.selected_index = idx;
+                                app.ensure_visible();
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
                 return;
             }
