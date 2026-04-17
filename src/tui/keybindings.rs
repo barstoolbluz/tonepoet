@@ -4452,7 +4452,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
                 let clicked_path = app.browse.entries[idx].path.clone();
                 let alt = mouse.modifiers.contains(KeyModifiers::ALT);
-                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
 
                 // For alt-click, we need the anchor *before* moving the cursor.
                 // Otherwise resolve_anchor_index's fallback (which uses
@@ -4500,8 +4500,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.last_browse_click = None;
                     app.pending_browse_rename = None;
                     app.browse.probe_current_with_db(tx, Some(&app.db));
-                } else if shift {
-                    // ── Shift+click: toggle clicked entry in multi_selected ──
+                } else if ctrl {
+                    // ── Ctrl+click: toggle clicked entry in multi_selected ──
                     // toggle_selection operates on the current cursor (which we
                     // just moved to `idx`).
                     app.browse.toggle_selection();
