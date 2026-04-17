@@ -53,6 +53,14 @@ pub enum ContextAction {
     ConvertWithPreset(String),
     /// Open the selected file/directory (same as Enter on browse).
     OpenEntry,
+    /// Toggle the current entry's selection.
+    Select,
+    /// Select all non-ParentDir entries.
+    SelectAll,
+    /// Invert the selection (selected ↔ unselected).
+    SelectInverse,
+    /// Clear multi-selection.
+    Deselect,
     /// Rename the selected file (F2 / `:rename`).
     RenameEntry,
     /// Move selected file(s) to the system trash.
@@ -188,6 +196,11 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         EntryKind::AudioFile(_) => {
             items.push(build_convert_submenu(app));
             items.push(separator());
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(separator());
             items.push(item("Edit metadata...", ContextAction::EditMetadataFull));
             items.push(item("Rename", ContextAction::RenameEntry));
             items.push(item("Bulk Rename...", ContextAction::BulkRename));
@@ -201,6 +214,11 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         EntryKind::Archive => {
             items.push(build_convert_submenu(app));
             items.push(separator());
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(separator());
             items.push(item("Set Password...", ContextAction::SetArchivePassword));
             items.push(item("Rename", ContextAction::RenameEntry));
             items.push(item("Copy to...", ContextAction::CopyTo));
@@ -213,6 +231,11 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(separator());
             items.push(item("Rename", ContextAction::RenameEntry));
             items.push(item("Copy to...", ContextAction::CopyTo));
             items.push(item("Move to...", ContextAction::MoveTo));
@@ -222,8 +245,16 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         }
         EntryKind::ParentDir => {
             items.push(item("Go up", ContextAction::OpenEntry));
+            items.push(separator());
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Deselect", ContextAction::Deselect));
         }
         EntryKind::OtherFile => {
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(separator());
             items.push(item("Rename", ContextAction::RenameEntry));
             items.push(item("Copy to...", ContextAction::CopyTo));
             items.push(item("Move to...", ContextAction::MoveTo));
@@ -240,6 +271,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 pub fn build_browse_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let _ = app; // used in future for conditional items
     vec![
+        item("Select All", ContextAction::SelectAll),
+        item("Select Inverse", ContextAction::SelectInverse),
+        item("Deselect", ContextAction::Deselect),
+        separator(),
         item("Refresh", ContextAction::Refresh),
         item("Toggle hidden", ContextAction::ToggleHidden),
         item("Change sort", ContextAction::CycleSortBy),
@@ -373,6 +408,37 @@ pub fn execute_context_action(
                 super::command::execute_command(
                     app, super::command::Command::Commit { start }, tx,
                 );
+            }
+        }
+        ContextAction::Select => {
+            if app.current_screen == AppScreen::Browse {
+                app.browse.toggle_selection();
+            }
+        }
+        ContextAction::SelectAll => {
+            if app.current_screen == AppScreen::Browse {
+                use super::browse::EntryKind;
+                let paths: Vec<std::path::PathBuf> = app.browse.entries.iter()
+                    .filter(|e| !matches!(e.kind, EntryKind::ParentDir))
+                    .map(|e| e.path.clone())
+                    .collect();
+                app.browse.multi_selected = paths;
+            }
+        }
+        ContextAction::SelectInverse => {
+            if app.current_screen == AppScreen::Browse {
+                use super::browse::EntryKind;
+                let new_sel: Vec<std::path::PathBuf> = app.browse.entries.iter()
+                    .filter(|e| !matches!(e.kind, EntryKind::ParentDir))
+                    .filter(|e| !app.browse.multi_selected.iter().any(|p| *p == e.path))
+                    .map(|e| e.path.clone())
+                    .collect();
+                app.browse.multi_selected = new_sel;
+            }
+        }
+        ContextAction::Deselect => {
+            if app.current_screen == AppScreen::Browse {
+                app.browse.clear_multi_selection();
             }
         }
         ContextAction::OpenEntry => {
