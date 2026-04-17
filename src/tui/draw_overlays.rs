@@ -1245,27 +1245,34 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
-    // Footer.
+    // Footer: clickable pill-style buttons with key hints.
+    let pill = |label: &str, bg: ratatui::style::Color| -> Span<'static> {
+        Span::styled(
+            format!(" {} ", label),
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let gap = || -> Span<'static> { Span::raw(" ") };
+
     let footer = match state.phase {
         MetadataEditorPhase::Editing => Line::from(vec![
-            Span::styled("↑↓", Style::default().fg(theme::BLUE)),
-            Span::styled(" navigate  ", theme::muted()),
-            Span::styled("Enter", Style::default().fg(theme::GREEN)),
-            Span::styled(" edit  ", theme::muted()),
-            Span::styled("a", Style::default().fg(theme::CYAN)),
-            Span::styled(" add  ", theme::muted()),
-            Span::styled("d", Style::default().fg(theme::RED)),
-            Span::styled(" delete  ", theme::muted()),
-            Span::styled("w", Style::default().fg(theme::GREEN)),
-            Span::styled(" save  ", theme::muted()),
-            Span::styled("Esc", Style::default().fg(theme::PURPLE)),
-            Span::styled(" close", theme::muted()),
+            pill("d delete", theme::RED),
+            gap(),
+            pill("u undo", theme::AMBER),
+            gap(),
+            pill("a add", theme::CYAN),
+            gap(),
+            pill("w save", theme::GREEN),
+            gap(),
+            pill("Esc close", theme::PURPLE),
         ]),
         MetadataEditorPhase::InlineEdit | MetadataEditorPhase::AddingKey => Line::from(vec![
-            Span::styled("Enter", Style::default().fg(theme::GREEN)),
-            Span::styled(" confirm  ", theme::muted()),
-            Span::styled("Esc", Style::default().fg(theme::PURPLE)),
-            Span::styled(" cancel", theme::muted()),
+            pill("Enter confirm", theme::GREEN),
+            gap(),
+            pill("Esc cancel", theme::PURPLE),
         ]),
         MetadataEditorPhase::Saving => Line::from(
             Span::styled(" Saving... ", Style::default().fg(theme::AMBER)),

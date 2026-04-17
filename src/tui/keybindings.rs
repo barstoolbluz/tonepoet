@@ -1854,16 +1854,24 @@ fn handle_metadata_editor_mouse(
     let popup_x = (area.0.saturating_sub(w)) / 2;
     let popup_y = (area.1.saturating_sub(h)) / 2;
     // Inner content area (inside border + footer).
-    let content_x = popup_x + 1;
-    let content_y = popup_y + 1;
-    let content_h = h.saturating_sub(3) as usize; // -2 border -1 footer
+    let inner_x = popup_x + 1;
+    let inner_y = popup_y + 1;
+    let inner_w = w.saturating_sub(2);
+    let inner_h = h.saturating_sub(2);
+    let content_y = inner_y;
+    let content_h = inner_h.saturating_sub(1) as usize; // -1 for footer row
+    let footer_y = inner_y + inner_h.saturating_sub(1);
 
     let mx = mouse.column;
     let my = mouse.row;
 
-    // Check if mouse is inside the overlay content area.
-    let in_content = mx >= content_x && mx < content_x + w.saturating_sub(2)
+    // Region checks.
+    let in_popup = mx >= popup_x && mx < popup_x + w
+        && my >= popup_y && my < popup_y + h;
+    let in_content = mx >= inner_x && mx < inner_x + inner_w
         && my >= content_y && my < content_y + content_h as u16;
+    let in_footer = mx >= inner_x && mx < inner_x + inner_w
+        && my == footer_y;
 
     let overlay = app.active_overlay.clone();
     if let ActiveOverlay::MetadataEditor(mut state) = overlay {
@@ -1964,7 +1972,99 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
 
-            // Left click outside content: ignore (don't close — prevents accidental loss).
+            // Left click on footer: pill button hit-testing.
+            MouseEventKind::Down(MouseButton::Left) if in_footer => {
+                if state.phase == MetadataEditorPhase::Editing {
+                    // Pill layout (centered): [d delete] [u undo] [a add] [w save] [Esc close]
+                    // Each pill: " label " (label.len() + 2 for padding), 1-char gap between.
+                    let pills: &[(&str, &str)] = &[
+                        ("d delete", "d"),
+                        ("u undo", "u"),
+                        ("a add", "a"),
+                        ("w save", "w"),
+                        ("Esc close", "esc"),
+                    ];
+                    if let Some(action) = footer_pill_hit(pills, mx, inner_x, inner_w) {
+                        match action {
+                            "d" => {
+                                // Simulate 'd' key.
+                                let fake_key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                                if !matches!(app.active_overlay, ActiveOverlay::None) {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                }
+                                return;
+                            }
+                            "u" => {
+                                let fake_key = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                                if !matches!(app.active_overlay, ActiveOverlay::None) {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                }
+                                return;
+                            }
+                            "a" => {
+                                let fake_key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                                if !matches!(app.active_overlay, ActiveOverlay::None) {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                }
+                                return;
+                            }
+                            "w" => {
+                                let fake_key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
+                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                                if !matches!(app.active_overlay, ActiveOverlay::None) {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                }
+                                return;
+                            }
+                            "esc" => {
+                                app.active_overlay = ActiveOverlay::None;
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if state.phase == MetadataEditorPhase::InlineEdit
+                    || state.phase == MetadataEditorPhase::AddingKey
+                {
+                    // Pill layout: [Enter confirm] [Esc cancel]
+                    let pills: &[(&str, &str)] = &[
+                        ("Enter confirm", "enter"),
+                        ("Esc cancel", "esc"),
+                    ];
+                    if let Some(action) = footer_pill_hit(pills, mx, inner_x, inner_w) {
+                        match action {
+                            "enter" => {
+                                let fake_key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                                if !matches!(app.active_overlay, ActiveOverlay::None) {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                }
+                                return;
+                            }
+                            "esc" => {
+                                let fake_key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                                if !matches!(app.active_overlay, ActiveOverlay::None) {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                }
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+
+            // Left click outside the popup: close the overlay.
+            MouseEventKind::Down(MouseButton::Left) if !in_popup => {
+                app.active_overlay = ActiveOverlay::None;
+            }
+
+            // Left click inside popup but outside content/footer: ignore.
             MouseEventKind::Down(MouseButton::Left) => {
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
@@ -1975,6 +2075,34 @@ fn handle_metadata_editor_mouse(
             }
         }
     }
+}
+
+/// Hit-test a center-aligned row of pills. Returns the action string of
+/// the clicked pill, or None if the click missed all pills.
+/// Each pill is " label " (len+2 chars), with 1-char gaps between.
+fn footer_pill_hit<'a>(
+    pills: &'a [(&'a str, &'a str)],
+    mx: u16,
+    row_x: u16,
+    row_w: u16,
+) -> Option<&'a str> {
+    // Total width of all pills + gaps.
+    let total_w: usize = pills.iter()
+        .map(|(label, _)| label.len() + 2) // " label "
+        .sum::<usize>()
+        + pills.len().saturating_sub(1); // 1-char gaps
+    // Center offset.
+    let start_x = row_x as usize + (row_w as usize).saturating_sub(total_w) / 2;
+
+    let mut x = start_x;
+    for (label, action) in pills {
+        let pill_w = label.len() + 2;
+        if (mx as usize) >= x && (mx as usize) < x + pill_w {
+            return Some(action);
+        }
+        x += pill_w + 1; // +1 for gap
+    }
+    None
 }
 
 /// Ensure the cursor is visible in the metadata editor's scroll window.
