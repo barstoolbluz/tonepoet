@@ -4510,21 +4510,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.pending_browse_rename = None;
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                 } else {
-                    // ── Plain click: open vs schedule-rename vs fresh ──
+                    // ── Plain click: select vs schedule-rename vs fresh ──
                     //
-                    // Windows/macOS semantics:
                     // - Click within the double-click window of the prior click
-                    //   on the same path → open immediately (cancel any pending
-                    //   rename).
-                    // - Any click on the same path as the prior click OUTSIDE
-                    //   the double-click window SCHEDULES a rename, which
-                    //   commits after another double-click-window delay unless
-                    //   a subsequent click cancels it.
-                    // - Click on a different path → fresh click. Cancel pending.
-                    //
-                    // This preserves the "click, wait 5s, double-click = open"
-                    // flow: the wait-then-click schedules rename, but the
-                    // immediate follow-up click cancels it and fires open.
+                    //   on the same path → double-click: toggle selection (files)
+                    //   or navigate into directory.
+                    // - Same-path click OUTSIDE the double-click window schedules
+                    //   a rename (commits after another delay unless cancelled).
+                    // - Click on a different path → fresh click, cancel pending.
                     const OPEN_MS: u64 = 500;
 
                     let now = std::time::Instant::now();
