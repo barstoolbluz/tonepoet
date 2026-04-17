@@ -675,13 +675,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                             }
                         }
                     }
-                    EntryKind::AudioFile(_) | EntryKind::Archive => {
-                        let path = entry.path.clone();
-                        let target = app.browse.return_target;
-                        load_browse_selection(app, path, target);
-                    }
-                    EntryKind::OtherFile => {
-                        app.set_status("Not an audio file");
+                    EntryKind::AudioFile(_) | EntryKind::Archive | EntryKind::OtherFile => {
+                        // Toggle selection — converting is via context menu or :queue.
+                        app.browse.toggle_selection();
                     }
                 }
             }
