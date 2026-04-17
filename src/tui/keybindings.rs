@@ -3194,9 +3194,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return; // Move events don't trigger actions.
     }
 
-    // Scroll wheel: ignore while context menu is open.
+    // Scroll wheel: ignore while any overlay is open.
     if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
-        if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
+        if !matches!(app.active_overlay, ActiveOverlay::None) {
             return;
         }
         if app.current_screen == AppScreen::Browse {
