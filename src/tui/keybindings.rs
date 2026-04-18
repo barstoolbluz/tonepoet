@@ -2666,6 +2666,26 @@ fn handle_metadata_editor_mouse(
                             _ => {}
                         }
                     }
+                } else if state.phase == MetadataEditorPhase::DetailEdit {
+                    // Detail overlay pills: [Enter edit] [Esc back]
+                    // or [Enter confirm] [Esc cancel] during inline edit.
+                    let pills: &[(&str, &str)] = if state.detail_edit.is_some() {
+                        &[("Enter confirm", "enter"), ("Esc cancel", "esc")]
+                    } else {
+                        &[("Enter edit", "enter"), ("Esc back", "esc")]
+                    };
+                    if let Some(action) = footer_pill_hit(pills, mx, inner_x, inner_w) {
+                        let fake_key = match action {
+                            "enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            _ => { app.active_overlay = ActiveOverlay::MetadataEditor(state); return; }
+                        };
+                        handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                        if !matches!(app.active_overlay, ActiveOverlay::None) {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        }
+                        return;
+                    }
                 } else if state.phase == MetadataEditorPhase::InlineEdit
                     || state.phase == MetadataEditorPhase::AddingKey
                 {
