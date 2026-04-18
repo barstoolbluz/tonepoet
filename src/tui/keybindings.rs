@@ -1654,13 +1654,22 @@ fn handle_metadata_editor_key(
                 }
                 KeyCode::Enter => {
                     if state.cursor < state.entries.len() {
-                        // Edit the focused field.
                         let entry = &state.entries[state.cursor];
                         if !entry.is_binary && !state.deleted.contains(&state.cursor) {
-                            state.edit_input = Some(
-                                super::text_input::TextInputState::new(entry.value.clone()),
-                            );
-                            state.phase = MetadataEditorPhase::InlineEdit;
+                            if entry.is_mixed && state.paths.len() > 1 {
+                                // Mixed field: open per-file detail overlay.
+                                state.detail_field_idx = state.cursor;
+                                state.detail_cursor = 0;
+                                state.detail_scroll = 0;
+                                state.detail_edit = None;
+                                state.phase = MetadataEditorPhase::DetailEdit;
+                            } else {
+                                // Single value: inline edit.
+                                state.edit_input = Some(
+                                    super::text_input::TextInputState::new(entry.value.clone()),
+                                );
+                                state.phase = MetadataEditorPhase::InlineEdit;
+                            }
                         }
                     } else {
                         // "Add field" row — start adding a new key.
@@ -1697,40 +1706,43 @@ fn handle_metadata_editor_key(
                         app.set_status("No changes to save");
                         return;
                     }
-                    // Build change list and spawn async write.
+                    // Build per-file change lists and spawn async writes.
                     state.phase = MetadataEditorPhase::Saving;
                     let paths = state.paths.clone();
-                    let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
-
-                    // Changed values.
-                    for (i, entry) in state.entries.iter().enumerate() {
-                        if state.deleted.contains(&i) {
-                            changes.push((entry.item_key.clone(), None));
-                        } else if entry.value != entry.original {
-                            changes.push((
-                                entry.item_key.clone(),
-                                Some(entry.value.clone()),
-                            ));
-                        }
-                    }
-
-                    // New entries (added by the user, have no original).
-                    // These are already in state.entries with original = "".
-                    // They'll be caught by the value != original check above
-                    // IF the user typed a value. If value is also "", skip.
+                    let deleted = state.deleted.clone();
+                    let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> =
+                        state.entries.iter().map(|e| (
+                            e.item_key.clone(),
+                            e.per_file_values.clone(),
+                            e.per_file_originals.clone(),
+                        )).collect();
 
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         let mut results = Vec::new();
-                        for path in &paths {
-                            let r = tokio::task::spawn_blocking({
-                                let path = path.clone();
-                                let changes = changes.clone();
-                                move || crate::tui::probe::write_all_tags(&path, &changes)
-                            })
-                            .await
-                            .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
-                            results.push((path.clone(), r));
+                        for (file_idx, path) in paths.iter().enumerate() {
+                            let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
+                            for (entry_idx, (key, vals, origs)) in entries_snap.iter().enumerate() {
+                                if deleted.contains(&entry_idx) {
+                                    changes.push((key.clone(), None));
+                                } else if file_idx < vals.len() && file_idx < origs.len() {
+                                    if vals[file_idx] != origs[file_idx] {
+                                        changes.push((
+                                            key.clone(),
+                                            Some(vals[file_idx].clone()),
+                                        ));
+                                    }
+                                }
+                            }
+                            if !changes.is_empty() {
+                                let r = tokio::task::spawn_blocking({
+                                    let path = path.clone();
+                                    move || crate::tui::probe::write_all_tags(&path, &changes)
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+                                results.push((path.clone(), r));
+                            }
                         }
                         let _ = tx.send(AppMessage::MetadataEditorWriteComplete { results }).await;
                     });
@@ -1752,7 +1764,13 @@ fn handle_metadata_editor_key(
                 KeyCode::Enter => {
                     let new_val = input.text.clone();
                     if state.cursor < state.entries.len() {
-                        state.entries[state.cursor].value = new_val;
+                        let entry = &mut state.entries[state.cursor];
+                        entry.value = new_val.clone();
+                        // Set ALL per-file values to the new value.
+                        for v in &mut entry.per_file_values {
+                            *v = new_val.clone();
+                        }
+                        entry.is_mixed = false;
                     }
                     state.edit_input = None;
                     state.phase = MetadataEditorPhase::Editing;
@@ -1777,12 +1795,16 @@ fn handle_metadata_editor_key(
                 KeyCode::Enter => {
                     let key_name = input.text.trim().to_uppercase();
                     if !key_name.is_empty() {
+                        let n = state.paths.len();
                         state.entries.push(super::probe::TagEntry {
                             display_key: key_name.clone(),
                             item_key: lofty::tag::ItemKey::Unknown(key_name),
                             value: String::new(),
                             original: String::new(),
                             is_binary: false,
+                            is_mixed: false,
+                            per_file_values: vec![String::new(); n],
+                            per_file_originals: vec![String::new(); n],
                         });
                         state.cursor = state.entries.len() - 1;
                         state.add_key_input = None;
@@ -1799,6 +1821,67 @@ fn handle_metadata_editor_key(
                 _ => {
                     super::text_input::handle_text_input_key(input, &key);
                 }
+            }
+        }
+        MetadataEditorPhase::DetailEdit => {
+            let n_files = state.paths.len();
+            let field_idx = state.detail_field_idx;
+
+            // If an inline edit is active within the detail overlay:
+            if let Some(ref mut input) = state.detail_edit {
+                match key.code {
+                    KeyCode::Esc => {
+                        state.detail_edit = None;
+                    }
+                    KeyCode::Enter => {
+                        let new_val = input.text.clone();
+                        if field_idx < state.entries.len() && state.detail_cursor < n_files {
+                            state.entries[field_idx].per_file_values[state.detail_cursor] = new_val;
+                            // Recalculate mixed state.
+                            let all_same = state.entries[field_idx].per_file_values
+                                .windows(2).all(|w| w[0] == w[1]);
+                            state.entries[field_idx].is_mixed = !all_same;
+                            let new_display = if all_same {
+                                state.entries[field_idx].per_file_values[0].clone()
+                            } else {
+                                "<mixed>".to_string()
+                            };
+                            state.entries[field_idx].value = new_display;
+                        }
+                        state.detail_edit = None;
+                        recalc_dirty(state);
+                    }
+                    _ => {
+                        super::text_input::handle_text_input_key(input, &key);
+                    }
+                }
+                return;
+            }
+
+            // Detail overlay navigation.
+            match key.code {
+                KeyCode::Esc => {
+                    // Return to main field list.
+                    state.phase = MetadataEditorPhase::Editing;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.detail_cursor = state.detail_cursor.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if state.detail_cursor + 1 < n_files {
+                        state.detail_cursor += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    // Open inline edit for this file's value.
+                    if field_idx < state.entries.len() && state.detail_cursor < n_files {
+                        let val = state.entries[field_idx].per_file_values[state.detail_cursor].clone();
+                        state.detail_edit = Some(
+                            super::text_input::TextInputState::new(val),
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         MetadataEditorPhase::Saving => {
@@ -1828,14 +1911,34 @@ pub fn open_metadata_editor(app: &mut AppState) {
         return;
     }
 
-    // Read tags from the first file (for single-file or as the base for multi).
-    // For multi-file, a full merge would read all files — deferred to v2.
-    let entries = match super::probe::read_all_tags(&paths[0]) {
+    // Read and merge tags from all files.
+    let entries = match super::probe::read_all_tags_merged(&paths) {
         Ok(e) => e,
         Err(e) => {
             app.set_status(format!("Failed to read tags: {}", e));
             return;
         }
+    };
+
+    // Build per-file context labels: "NN filename" or just "filename".
+    let file_labels: Vec<String> = {
+        // Extract track numbers from the merged entries.
+        let track_key_upper = "TRACKNUMBER";
+        let track_entry = entries.iter().find(|e| {
+            e.display_key.to_ascii_uppercase() == track_key_upper
+        });
+        paths.iter().enumerate().map(|(i, p)| {
+            let stem = p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Some(te) = track_entry {
+                let tn = &te.per_file_values[i];
+                if !tn.is_empty() {
+                    return format!("{:>2}  {}", tn, stem);
+                }
+            }
+            stem
+        }).collect()
     };
 
     app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
@@ -1850,6 +1953,11 @@ pub fn open_metadata_editor(app: &mut AppState) {
             phase: super::app::MetadataEditorPhase::Editing,
             dirty: false,
             deleted: Vec::new(),
+            file_labels,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
         },
     ));
 }
@@ -2164,6 +2272,11 @@ fn handle_metadata_editor_mouse(
                         recalc_dirty(&mut state);
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     }
+                    MetadataEditorPhase::DetailEdit => {
+                        state.detail_edit = None;
+                        state.phase = MetadataEditorPhase::Editing;
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    }
                     _ => {
                         app.active_overlay = ActiveOverlay::None;
                     }
@@ -2374,10 +2487,13 @@ fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
     }
 }
 
-/// Recalculate the dirty flag by checking all entries for changes.
+/// Recalculate the dirty flag by checking per-file values for changes.
 fn recalc_dirty(state: &mut super::app::MetadataEditorState) {
     state.dirty = !state.deleted.is_empty()
-        || state.entries.iter().any(|e| e.value != e.original);
+        || state.entries.iter().any(|e|
+            e.per_file_values.iter().zip(e.per_file_originals.iter())
+                .any(|(v, o)| v != o)
+        );
 }
 
 /// Compute the screen rect for a context menu panel, matching

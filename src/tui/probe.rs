@@ -505,19 +505,26 @@ pub fn write_metadata_field(
 
 // ── Full tag enumeration + batch write (metadata editor) ────────────
 
-/// A single tag entry read from an audio file.
+/// A single tag entry read from an audio file (or merged across files).
 #[derive(Debug, Clone)]
 pub struct TagEntry {
     /// Display name (e.g. "ARTIST", "TRACKNUMBER", "CUSTOM_FIELD").
     pub display_key: String,
     /// Lofty item key for read/write mapping.
     pub item_key: lofty::tag::ItemKey,
-    /// Current value (text or locator). Empty string if cleared.
+    /// Displayed value: shared value or "<mixed>" when files disagree.
     pub value: String,
-    /// Value at read time, for dirty detection.
+    /// Original displayed value at read/merge time, for display-level dirty.
     pub original: String,
     /// True if the value is binary (non-editable).
     pub is_binary: bool,
+    /// True if files have different values for this key.
+    pub is_mixed: bool,
+    /// Per-file current values (indexed by paths order). Length = 1 for
+    /// single-file editing, N for multi-file.
+    pub per_file_values: Vec<String>,
+    /// Per-file original values at read time (for per-file write diff).
+    pub per_file_originals: Vec<String>,
 }
 
 /// Priority order for standard fields (displayed first, in this order).
@@ -567,12 +574,140 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
             display_key,
             item_key: key,
             value: value.clone(),
-            original: value,
+            original: value.clone(),
             is_binary,
+            is_mixed: false,
+            per_file_values: vec![value.clone()],
+            per_file_originals: vec![value],
         });
     }
 
     // Sort: standard fields first (in STANDARD_KEY_ORDER), then rest alphabetically.
+    entries.sort_by(|a, b| {
+        let a_upper = a.display_key.to_ascii_uppercase();
+        let b_upper = b.display_key.to_ascii_uppercase();
+        let a_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
+        let b_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == b_upper);
+        match (a_idx, b_idx) {
+            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a_upper.cmp(&b_upper),
+        }
+    });
+
+    Ok(entries)
+}
+
+/// Read and merge tags from multiple audio files.
+///
+/// For each `ItemKey` present in any file, collects per-file values.
+/// If all files agree → shared value. If they differ → `<mixed>`.
+/// Duplicate keys within a single file are joined with "; ".
+pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry>, String> {
+    use std::collections::HashMap;
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::{ItemValue, TagType};
+
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    if paths.len() == 1 {
+        return read_all_tags(&paths[0]);
+    }
+
+    // Read all files, collecting per-key values.
+    // Key: ItemKey → Vec of (file_index, value_string) for ordering.
+    // Also track the first tag_type for display name resolution.
+    let mut first_tag_type: Option<TagType> = None;
+    let n = paths.len();
+
+    // For each ItemKey, store: display_key, is_binary, per_file_value[file_idx]
+    struct KeyData {
+        display_key: String,
+        is_binary: bool,
+        values: Vec<String>, // one per file, "" if absent
+    }
+
+    // Use Vec<(ItemKey, KeyData)> to preserve insertion order (first-seen).
+    let mut key_order: Vec<lofty::tag::ItemKey> = Vec::new();
+    let mut key_map: HashMap<lofty::tag::ItemKey, KeyData> = HashMap::new();
+
+    for (file_idx, path) in paths.iter().enumerate() {
+        let tagged = lofty::read_from_path(path)
+            .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+
+        let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+            Some(t) => t,
+            None => continue, // file has no tags — all values stay ""
+        };
+
+        if first_tag_type.is_none() {
+            first_tag_type = Some(tag.tag_type());
+        }
+        let tag_type = first_tag_type.unwrap();
+
+        // Collect values per key. Join duplicates within this file with "; ".
+        let mut file_values: HashMap<lofty::tag::ItemKey, (String, bool)> = HashMap::new();
+        for item in tag.items() {
+            let key = item.key().clone();
+            let (val, is_bin) = match item.value() {
+                ItemValue::Text(t) => (t.clone(), false),
+                ItemValue::Locator(l) => (l.clone(), false),
+                ItemValue::Binary(b) => (format!("<binary, {} bytes>", b.len()), true),
+            };
+            let entry = file_values.entry(key.clone()).or_insert_with(|| (String::new(), is_bin));
+            if entry.0.is_empty() {
+                entry.0 = val;
+            } else {
+                entry.0 = format!("{}; {}", entry.0, val);
+            }
+            // Ensure this key is in the order list.
+            if !key_map.contains_key(&key) {
+                let display = item_key_display(&key, tag_type);
+                key_order.push(key.clone());
+                key_map.insert(key, KeyData {
+                    display_key: display,
+                    is_binary: is_bin,
+                    values: vec![String::new(); n],
+                });
+            }
+        }
+
+        // Write this file's values into the key_map.
+        for (key, (val, is_bin)) in &file_values {
+            if let Some(data) = key_map.get_mut(key) {
+                data.values[file_idx] = val.clone();
+                if *is_bin { data.is_binary = true; }
+            }
+        }
+    }
+
+    // Build merged TagEntry list.
+    let mut entries: Vec<TagEntry> = Vec::new();
+    for key in &key_order {
+        let data = &key_map[key];
+        let all_same = data.values.windows(2).all(|w| w[0] == w[1]);
+        let is_mixed = !all_same;
+        let display_value = if is_mixed {
+            "<mixed>".to_string()
+        } else {
+            data.values[0].clone()
+        };
+
+        entries.push(TagEntry {
+            display_key: data.display_key.clone(),
+            item_key: key.clone(),
+            value: display_value.clone(),
+            original: display_value,
+            is_binary: data.is_binary,
+            is_mixed,
+            per_file_values: data.values.clone(),
+            per_file_originals: data.values.clone(),
+        });
+    }
+
+    // Sort with standard key priority.
     entries.sort_by(|a, b| {
         let a_upper = a.display_key.to_ascii_uppercase();
         let b_upper = b.display_key.to_ascii_uppercase();

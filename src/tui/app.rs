@@ -829,6 +829,8 @@ pub enum MetadataEditorPhase {
     InlineEdit,
     /// Entering a new custom field name.
     AddingKey,
+    /// Per-file detail overlay for a mixed field.
+    DetailEdit,
     /// Saving changes to disk.
     Saving,
 }
@@ -857,6 +859,16 @@ pub struct MetadataEditorState {
     /// Entries marked for deletion (by index). Tracked separately so
     /// the user can see them struck through before saving.
     pub deleted: Vec<usize>,
+    /// Per-file context labels for the detail overlay (e.g., "01 filename").
+    pub file_labels: Vec<String>,
+    /// Which entry index is being detail-edited.
+    pub detail_field_idx: usize,
+    /// Cursor within the detail overlay.
+    pub detail_cursor: usize,
+    /// Scroll offset in the detail overlay.
+    pub detail_scroll: usize,
+    /// Inline edit within the detail overlay.
+    pub detail_edit: Option<crate::tui::text_input::TextInputState>,
 }
 
 /// Focus area within the bulk rename overlay.

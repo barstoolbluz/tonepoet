@@ -1157,6 +1157,13 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
 
     let content_h = chunks[0].height as usize;
     let inner_w = chunks[0].width as usize;
+
+    // Detail edit mode: show per-file values for one field.
+    if state.phase == MetadataEditorPhase::DetailEdit {
+        draw_metadata_detail(f, state, chunks[0], chunks[1], inner_w, content_h);
+        return;
+    }
+
     let key_col_w = 22;
 
     // Build content lines.
@@ -1168,7 +1175,9 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
     for (i, entry) in state.entries.iter().enumerate() {
         let is_cursor = i == state.cursor;
         let is_deleted = state.deleted.contains(&i);
-        let is_dirty = entry.value != entry.original && !is_deleted;
+        let is_dirty = !is_deleted && (entry.value != entry.original
+            || entry.per_file_values.iter().zip(entry.per_file_originals.iter())
+                .any(|(v, o)| v != o));
 
         // Key label.
         let key_display = if entry.display_key.len() > key_col_w - 2 {
@@ -1214,10 +1223,10 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
             Style::default().fg(theme::RED).add_modifier(Modifier::CROSSED_OUT)
         } else if is_dirty {
             Style::default().fg(theme::GREEN)
+        } else if entry.is_mixed {
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::ITALIC)
         } else if entry.is_binary {
             Style::default().fg(theme::TEXT_DIM)
-        } else if is_cursor {
-            Style::default().fg(theme::TEXT_BRIGHT)
         } else {
             Style::default().fg(theme::TEXT_BRIGHT)
         };
@@ -1285,7 +1294,117 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
         MetadataEditorPhase::Saving => Line::from(
             Span::styled(" Saving... ", Style::default().fg(theme::AMBER)),
         ),
+        MetadataEditorPhase::DetailEdit => {
+            // Unreachable — DetailEdit returns early above.
+            Line::from("")
+        }
     };
     f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), chunks[1]);
+}
+
+/// Render the per-file detail view within the metadata editor.
+fn draw_metadata_detail(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    content_area: Rect,
+    footer_area: Rect,
+    inner_w: usize,
+    content_h: usize,
+) {
+    let field_idx = state.detail_field_idx;
+    let entry = match state.entries.get(field_idx) {
+        Some(e) => e,
+        None => return,
+    };
+
+    // Header: field name.
+    let label_col_w = 30usize.min(inner_w / 2);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("  {}", entry.display_key),
+        Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // Per-file rows.
+    for (i, val) in entry.per_file_values.iter().enumerate() {
+        let is_cursor = i == state.detail_cursor;
+        let label = state.file_labels.get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("file {}", i + 1));
+        let label_truncated = if label.len() > label_col_w - 2 {
+            format!("  {:.width$}", label, width = label_col_w - 2)
+        } else {
+            format!("  {:<width$}", label, width = label_col_w - 2)
+        };
+
+        let label_style = if is_cursor {
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted()
+        };
+
+        // Inline edit within detail?
+        if is_cursor && state.detail_edit.is_some() {
+            if let Some(ref input) = state.detail_edit {
+                let (visible, cursor_col) = input.view(inner_w.saturating_sub(label_col_w + 2));
+                let cp = cursor_col as usize;
+                let before = if cp <= visible.len() { &visible[..cp] } else { &visible[..] };
+                let cursor_ch = if cp < visible.len() { &visible[cp..cp + 1] } else { " " };
+                let after = if cp + 1 <= visible.len() { &visible[cp + 1..] } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(label_truncated, label_style),
+                    Span::styled(before.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(cursor_ch.to_string(), Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                    Span::styled(after.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                ]));
+                continue;
+            }
+        }
+
+        let changed = entry.per_file_originals.get(i)
+            .map(|o| o != val)
+            .unwrap_or(false);
+        let val_style = if changed {
+            Style::default().fg(theme::GREEN)
+        } else if is_cursor {
+            Style::default().fg(theme::TEXT_BRIGHT)
+        } else {
+            Style::default().fg(theme::TEXT_BRIGHT)
+        };
+
+        let val_display = if val.len() > inner_w.saturating_sub(label_col_w + 1) {
+            format!("{}...", &val[..inner_w.saturating_sub(label_col_w + 4)])
+        } else {
+            val.clone()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(label_truncated, label_style),
+            Span::styled(val_display, val_style),
+        ]));
+    }
+
+    // Scroll.
+    let total = lines.len();
+    let scroll = state.detail_scroll.min(total.saturating_sub(content_h));
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
+    f.render_widget(Paragraph::new(visible_lines), content_area);
+
+    // Footer.
+    let footer = if state.detail_edit.is_some() {
+        Line::from(vec![
+            footer_pill("Enter confirm", theme::GREEN),
+            pill_gap(),
+            footer_pill("Esc cancel", theme::PURPLE),
+        ])
+    } else {
+        Line::from(vec![
+            footer_pill("Enter edit", theme::GREEN),
+            pill_gap(),
+            footer_pill("Esc back", theme::PURPLE),
+        ])
+    };
+    f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), footer_area);
 }
 
