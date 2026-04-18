@@ -1186,25 +1186,41 @@ impl BrowseState {
 
     /// Non-recursive search: filter current directory's entries.
     fn execute_search_local(&mut self, query: &str, show_hidden: bool, audio_only: bool) {
-        let mut results: Vec<BrowseEntry> = Vec::new();
+        use fuzzy_matcher::FuzzyMatcher;
+        use fuzzy_matcher::skim::SkimMatcherV2;
 
-        if let Some(ref parent) = self.parent_entry {
-            results.push(parent.clone());
-        }
+        let matcher = SkimMatcherV2::default();
+        let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
 
-        let check = |e: &BrowseEntry| -> bool {
-            if !show_hidden && e.name.starts_with('.') { return false; }
+        // Always include parent entry (no scoring).
+        let parent = self.parent_entry.clone();
+
+        let check_and_score = |e: &BrowseEntry| -> Option<i64> {
+            if !show_hidden && e.name.starts_with('.') { return None; }
             if audio_only && !matches!(e.kind, EntryKind::AudioFile(_))
-                && !matches!(e.kind, EntryKind::Directory) { return false; }
-            e.name_lower.contains(query)
+                && !matches!(e.kind, EntryKind::Directory) { return None; }
+            matcher.fuzzy_match(&e.name_lower, query)
         };
 
         for d in &self.all_dirs {
-            if check(d) { results.push(d.clone()); }
+            if let Some(score) = check_and_score(d) {
+                scored.push((d.clone(), score));
+            }
         }
         for f in &self.all_files {
-            if check(f) { results.push(f.clone()); }
+            if let Some(score) = check_and_score(f) {
+                scored.push((f.clone(), score));
+            }
         }
+
+        // Sort by score descending (best matches first).
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut results: Vec<BrowseEntry> = Vec::new();
+        if let Some(p) = parent {
+            results.push(p);
+        }
+        results.extend(scored.into_iter().map(|(e, _)| e));
 
         self.entries = results;
         self.selected_index = 0;
@@ -1214,21 +1230,20 @@ impl BrowseState {
     /// Recursive search: walk subdirectories, build entries with relative paths.
     fn execute_search_recursive(&mut self, query: &str, show_hidden: bool, audio_only: bool) {
         use walkdir::WalkDir;
+        use fuzzy_matcher::FuzzyMatcher;
+        use fuzzy_matcher::skim::SkimMatcherV2;
 
+        let matcher = SkimMatcherV2::default();
         let root = self.current_dir.clone();
-        let mut results: Vec<BrowseEntry> = Vec::new();
+        let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
 
-        // Always include parent entry for navigation.
-        if let Some(ref parent) = self.parent_entry {
-            results.push(parent.clone());
-        }
+        let parent = self.parent_entry.clone();
 
         for entry in WalkDir::new(&root)
             .min_depth(1)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
-                // Skip hidden directories unless show_hidden.
                 if !show_hidden {
                     if let Some(name) = e.file_name().to_str() {
                         if name.starts_with('.') { return false; }
@@ -1242,10 +1257,8 @@ impl BrowseState {
                 Err(_) => continue,
             };
 
-            // Skip directories in results (we only want files).
             if entry.file_type().is_dir() { continue; }
 
-            // Skip hidden files unless show_hidden.
             if !show_hidden {
                 if let Some(name) = entry.file_name().to_str() {
                     if name.starts_with('.') { continue; }
@@ -1255,30 +1268,36 @@ impl BrowseState {
             let path = entry.path().to_path_buf();
             let kind = classify_file(&path);
 
-            // Audio-only filter.
             if audio_only && !matches!(kind, EntryKind::AudioFile(_)) {
                 continue;
             }
 
-            // Show relative path from the search root as the display name.
             let rel = path.strip_prefix(&root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
             let rel_lower = rel.to_lowercase();
 
-            // Query match on the relative path.
-            if !rel_lower.contains(query) { continue; }
+            // Fuzzy match on the relative path.
+            if let Some(score) = matcher.fuzzy_match(&rel_lower, query) {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let modified = entry.metadata().ok()
+                    .and_then(|m| m.modified().ok());
+                scored.push((BrowseEntry::new(path, rel, kind, size, modified), score));
 
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            let modified = entry.metadata().ok()
-                .and_then(|m| m.modified().ok());
-
-            results.push(BrowseEntry::new(path, rel, kind, size, modified));
-
-            // Cap results to prevent excessive work on huge trees.
-            if results.len() >= 500 { break; }
+                // Cap collected matches.
+                if scored.len() >= 500 { break; }
+            }
         }
+
+        // Sort by score descending (best matches first).
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut results: Vec<BrowseEntry> = Vec::new();
+        if let Some(p) = parent {
+            results.push(p);
+        }
+        results.extend(scored.into_iter().map(|(e, _)| e));
 
         self.entries = results;
         self.selected_index = 0;
