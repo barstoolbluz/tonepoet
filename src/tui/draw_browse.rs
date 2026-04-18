@@ -105,7 +105,7 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
 
     // Search toggle in the top border (right-aligned "search" label).
     {
-        let search_label_w = if browse.search.active { 10u16 } else { 9u16 }; // " search ✓ " or " search "
+        let search_label_w = if browse.search.active { 10u16 } else { 8u16 }; // " search ✓ " or " search "
         let search_x = area.x + area.width - search_label_w - 1;
         buttons.record_button(TuiButton::BrowseSearchToggle, Rect::new(search_x, area.y, search_label_w, 1));
     }
@@ -113,29 +113,34 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
     // Search panel toggle pills (if search is active, rows 2-3 inside the border).
     if browse.search.active {
         let panel_y = area.y + 2; // row after column headers
-        // Recursive pill: right side of row 1
-        let rec_w = 13u16; // " recursive ✓ " max width
+        // Recursive pill: right side of row 1 (width varies with state)
+        let rec_w = if browse.search.recursive { 13u16 } else { 11u16 };
         let rec_x = area.x + area.width - rec_w - 1;
         buttons.record_button(TuiButton::BrowseSearchRecursive, Rect::new(rec_x, panel_y, rec_w, 1));
 
-        // Mode, Sort, and AudioOnly: row 2
+        // Mode, Sort, and AudioOnly: row 2 — widths must match draw code.
         let panel_y2 = panel_y + 1;
-        let mode_w = 16u16;
+        // mode: " mode: <label> " — all ASCII, .len() == display width
+        let mode_w = (7 + browse.search.mode.label().len() + 1) as u16;
         buttons.record_button(TuiButton::BrowseSearchMode, Rect::new(area.x + 1, panel_y2, mode_w, 1));
-        let sort_w = 18u16;
+        // sort: " sort: <label> ▲ " — arrow is 1 display col
+        let sort_w = (7 + browse.search.sort.label().len() + 1 + 1 + 1) as u16;
         let sort_x = area.x + 1 + mode_w + 1;
         buttons.record_button(TuiButton::BrowseSearchSort, Rect::new(sort_x, panel_y2, sort_w, 1));
-        let audio_w = 12u16;
+        // audio: " audio ✓ " (9) or " all files " (11)
+        let audio_w = if browse.search.audio_only { 9u16 } else { 11u16 };
         let audio_x = sort_x + sort_w + 1;
         buttons.record_button(TuiButton::BrowseSearchAudioOnly, Rect::new(audio_x, panel_y2, audio_w, 1));
     }
 
-    // Entry rows: lines below the header row, above the bottom border.
-    let content_height = (area.height as usize).saturating_sub(3); // top border + header + bottom border
+    // Entry rows: below header (and search panel if active), above bottom border.
+    let search_rows = if browse.search.active { 2u16 } else { 0 };
+    let entry_y_start = area.y + 2 + search_rows;
+    let content_height = (area.height as usize).saturating_sub(3 + search_rows as usize);
     let start = browse.scroll_offset;
     let end = (start + content_height).min(browse.entries.len());
     for (row, i) in (start..end).enumerate() {
-        let y = area.y + 2 + row as u16;
+        let y = entry_y_start + row as u16;
         buttons.record_button(
             TuiButton::BrowseEntry(i),
             Rect::new(area.x + 1, y, (inner_w) as u16, 1),
@@ -235,7 +240,9 @@ fn draw_browse_list(
     // Top border with title
     let title = " browse ";
     let search_label = if browse.search.active { " search ✓ " } else { " search " };
-    let dash_count = w.saturating_sub(2 + title.len() + search_label.len() + 2);
+    let search_display_w = search_label.chars().count();
+    // ┌ + title + dashes + search_label + ┐ = w
+    let dash_count = w.saturating_sub(1 + title.len() + search_display_w + 1);
 
     let search_style = if browse.search.active {
         Style::default().fg(theme::GREEN).add_modifier(ratatui::style::Modifier::BOLD)
@@ -287,10 +294,7 @@ fn draw_browse_list(
     // Search panel (2 rows when active).
     if browse.search.active {
         // Row 1: search input + [recursive] toggle
-        let input_w = inner_w.saturating_sub(14); // room for " / " + "[recursive]" + gaps
-        let (view, _cursor_col) = browse.search.input.view(input_w);
-        let display_input = if view.is_empty() { " ".to_string() } else { view };
-
+        // Layout: │ + " / "(3) + input(input_w) + gap(≥1) + rec_pill(pill_w) + │
         let rec_pill = if browse.search.recursive {
             Span::styled(" recursive ✓ ", Style::default()
                 .fg(theme::PILL_ACTIVE_FG).bg(theme::GREEN)
@@ -299,12 +303,22 @@ fn draw_browse_list(
             Span::styled(" recursive ", Style::default()
                 .fg(theme::TEXT_DIM).bg(theme::SURFACE))
         };
-
-        let search_pad = inner_w.saturating_sub(3 + input_w + 1 + rec_pill.width());
+        let pill_w = rec_pill.width();
+        let input_w = inner_w.saturating_sub(3 + 1 + pill_w); // " / " + gap + pill
+        let (view, _cursor_col) = browse.search.input.view(input_w);
+        // Pad view to input_w so the pill stays right-aligned.
+        let view_len = view.chars().count();
+        let padded = if view.is_empty() {
+            " ".repeat(input_w.max(1))
+        } else {
+            let pad = input_w.saturating_sub(view_len);
+            format!("{}{}", view, " ".repeat(pad))
+        };
+        let search_pad = inner_w.saturating_sub(3 + input_w + pill_w);
         lines.push(Line::from(vec![
             Span::styled("│", theme::border(border_color)),
             Span::styled(" / ", Style::default().fg(theme::AMBER)),
-            Span::styled(display_input, Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE)),
+            Span::styled(padded, Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE)),
             Span::raw(" ".repeat(search_pad.max(1))),
             rec_pill,
             Span::styled("│", theme::border(border_color)),
@@ -326,8 +340,10 @@ fn draw_browse_list(
                 .fg(theme::TEXT_DIM).bg(theme::SURFACE))
         };
 
-        let row2_used = 1 + mode_label.len() + 1 + sort_label.len() + 1 + audio_pill.width() + 1;
-        let row2_pad = inner_w.saturating_sub(row2_used);
+        let sort_display_w = sort_label.chars().count();
+        // Inner content: mode + gap + sort + gap + audio (no borders counted).
+        let row2_content = mode_label.len() + 1 + sort_display_w + 1 + audio_pill.width();
+        let row2_pad = inner_w.saturating_sub(row2_content);
         lines.push(Line::from(vec![
             Span::styled("│", theme::border(border_color)),
             Span::styled(mode_label, Style::default().fg(theme::CYAN)),
@@ -421,7 +437,8 @@ fn draw_browse_list(
 
     // Position the terminal cursor inside the search input or filter input.
     if browse.search.active && browse.search.focus == super::browse::SearchFocus::Input {
-        let input_w = inner_w.saturating_sub(14);
+        let pill_w = if browse.search.recursive { 13 } else { 11 };
+        let input_w = inner_w.saturating_sub(3 + 1 + pill_w);
         let (_, cursor_col) = browse.search.input.view(input_w);
         let cursor_x = area.x + 1 + 3 + cursor_col; // border + " / " prefix
         let cursor_y = area.y + 2; // top border + header + first search row
