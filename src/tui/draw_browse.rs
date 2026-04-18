@@ -118,12 +118,15 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
         let rec_x = area.x + area.width - rec_w - 1;
         buttons.record_button(TuiButton::BrowseSearchRecursive, Rect::new(rec_x, panel_y, rec_w, 1));
 
-        // Mode and AudioOnly pills: row 2
+        // Mode, Sort, and AudioOnly: row 2
         let panel_y2 = panel_y + 1;
-        let mode_w = 16u16; // " mode: filename " approx
+        let mode_w = 16u16;
         buttons.record_button(TuiButton::BrowseSearchMode, Rect::new(area.x + 1, panel_y2, mode_w, 1));
+        let sort_w = 18u16;
+        let sort_x = area.x + 1 + mode_w + 1;
+        buttons.record_button(TuiButton::BrowseSearchSort, Rect::new(sort_x, panel_y2, sort_w, 1));
         let audio_w = 12u16;
-        let audio_x = area.x + 1 + mode_w + 2;
+        let audio_x = sort_x + sort_w + 1;
         buttons.record_button(TuiButton::BrowseSearchAudioOnly, Rect::new(audio_x, panel_y2, audio_w, 1));
     }
 
@@ -307,8 +310,13 @@ fn draw_browse_list(
             Span::styled("│", theme::border(border_color)),
         ]));
 
-        // Row 2: mode cycle + [audio] toggle
+        // Row 2: mode cycle + sort cycle + [audio] toggle
         let mode_label = format!(" mode: {} ", browse.search.mode.label());
+        let sort_arrow = match browse.search.sort_dir {
+            super::browse::SortDir::Asc => "▲",
+            super::browse::SortDir::Desc => "▼",
+        };
+        let sort_label = format!(" sort: {} {} ", browse.search.sort.label(), sort_arrow);
         let audio_pill = if browse.search.audio_only {
             Span::styled(" audio ✓ ", Style::default()
                 .fg(theme::PILL_ACTIVE_FG).bg(theme::GREEN)
@@ -317,23 +325,17 @@ fn draw_browse_list(
             Span::styled(" all files ", Style::default()
                 .fg(theme::TEXT_DIM).bg(theme::SURFACE))
         };
-        let status = if browse.search.searching {
-            " searching..."
-        } else if !browse.search.input.text.is_empty() {
-            ""
-        } else {
-            ""
-        };
 
-        let row2_used = 1 + mode_label.len() + 2 + audio_pill.width() + status.len() + 1;
-        let row2_pad = inner_w.saturating_sub(row2_used).max(0);
+        let row2_used = 1 + mode_label.len() + 1 + sort_label.len() + 1 + audio_pill.width() + 1;
+        let row2_pad = inner_w.saturating_sub(row2_used);
         lines.push(Line::from(vec![
             Span::styled("│", theme::border(border_color)),
             Span::styled(mode_label, Style::default().fg(theme::CYAN)),
-            Span::raw("  "),
+            Span::raw(" "),
+            Span::styled(sort_label, Style::default().fg(theme::AMBER)),
+            Span::raw(" "),
             audio_pill,
             Span::raw(" ".repeat(row2_pad)),
-            Span::styled(status, Style::default().fg(theme::AMBER)),
             Span::styled("│", theme::border(border_color)),
         ]));
     }

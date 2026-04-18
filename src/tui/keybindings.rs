@@ -830,10 +830,32 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sende
         SearchFocus::Mode => {
             match key.code {
                 KeyCode::Esc => { app.browse.close_search(); }
-                KeyCode::Tab => { app.browse.search.focus = SearchFocus::AudioOnly; }
+                KeyCode::Tab => { app.browse.search.focus = SearchFocus::Sort; }
                 KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Recursive; }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     app.browse.search.mode = app.browse.search.mode.cycle();
+                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
+                }
+                _ => {}
+            }
+        }
+        SearchFocus::Sort => {
+            match key.code {
+                KeyCode::Esc => { app.browse.close_search(); }
+                KeyCode::Tab => { app.browse.search.focus = SearchFocus::AudioOnly; }
+                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Mode; }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    app.browse.search.sort = app.browse.search.sort.cycle();
+                    // Reset direction to the natural default for this sort.
+                    app.browse.search.sort_dir = match app.browse.search.sort {
+                        super::browse::SearchSort::Score => super::browse::SortDir::Desc,
+                        _ => super::browse::SortDir::Asc,
+                    };
+                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
+                }
+                // Shift+Enter or 'r' to reverse direction.
+                KeyCode::Char('r') => {
+                    app.browse.search.sort_dir = app.browse.search.sort_dir.toggle();
                     app.browse.search.last_keystroke = Some(std::time::Instant::now());
                 }
                 _ => {}
@@ -843,7 +865,7 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sende
             match key.code {
                 KeyCode::Esc => { app.browse.close_search(); }
                 KeyCode::Tab => { app.browse.search.focus = SearchFocus::Input; }
-                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Mode; }
+                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Sort; }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     app.browse.search.audio_only = !app.browse.search.audio_only;
                     app.browse.search.last_keystroke = Some(std::time::Instant::now());
@@ -5122,6 +5144,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseSearchMode => {
                 app.browse.search.mode = app.browse.search.mode.cycle();
+                app.browse.search.last_keystroke = Some(std::time::Instant::now());
+            }
+            TuiButton::BrowseSearchSort => {
+                app.browse.search.sort = app.browse.search.sort.cycle();
+                app.browse.search.sort_dir = match app.browse.search.sort {
+                    super::browse::SearchSort::Score => super::browse::SortDir::Desc,
+                    _ => super::browse::SortDir::Asc,
+                };
                 app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
             TuiButton::BrowseSearchAudioOnly => {

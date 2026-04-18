@@ -95,6 +95,7 @@ pub enum TuiButton {
     // Browse search panel: toggle pills.
     BrowseSearchRecursive,
     BrowseSearchMode,
+    BrowseSearchSort,
     BrowseSearchAudioOnly,
 }
 
@@ -142,6 +143,7 @@ impl TuiButton {
             | Self::BrowseSearchToggle
             | Self::BrowseSearchRecursive
             | Self::BrowseSearchMode
+            | Self::BrowseSearchSort
             | Self::BrowseSearchAudioOnly => Some(AppScreen::Browse),
         }
     }

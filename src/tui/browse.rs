@@ -178,12 +178,44 @@ impl SearchMode {
     }
 }
 
+/// Sort field for search results.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SearchSort {
+    Score,
+    Name,
+    Date,
+    Size,
+    Extension,
+}
+
+impl SearchSort {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Score => "relevance",
+            Self::Name => "name",
+            Self::Date => "date",
+            Self::Size => "size",
+            Self::Extension => "ext",
+        }
+    }
+    pub fn cycle(&self) -> Self {
+        match self {
+            Self::Score => Self::Name,
+            Self::Name => Self::Date,
+            Self::Date => Self::Size,
+            Self::Size => Self::Extension,
+            Self::Extension => Self::Score,
+        }
+    }
+}
+
 /// Which element of the search panel has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SearchFocus {
     Input,
     Recursive,
     Mode,
+    Sort,
     AudioOnly,
     /// Focus is on the results list — normal browse keys work.
     Results,
@@ -200,6 +232,10 @@ pub struct SearchState {
     pub audio_only: bool,
     /// What to match against.
     pub mode: SearchMode,
+    /// Sort field for results.
+    pub sort: SearchSort,
+    /// Sort direction for results.
+    pub sort_dir: SortDir,
     /// Whether the search panel is open.
     pub active: bool,
     /// Which element has keyboard focus.
@@ -217,6 +253,8 @@ impl SearchState {
             recursive: false,
             audio_only: true,
             mode: SearchMode::Filename,
+            sort: SearchSort::Score,
+            sort_dir: SortDir::Desc,
             active: false,
             focus: SearchFocus::Input,
             last_keystroke: None,
@@ -1213,8 +1251,8 @@ impl BrowseState {
             }
         }
 
-        // Sort by score descending (best matches first).
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort results.
+        sort_search_results(&mut scored, self.search.sort, self.search.sort_dir);
 
         let mut results: Vec<BrowseEntry> = Vec::new();
         if let Some(p) = parent {
@@ -1290,8 +1328,8 @@ impl BrowseState {
             }
         }
 
-        // Sort by score descending (best matches first).
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort results.
+        sort_search_results(&mut scored, self.search.sort, self.search.sort_dir);
 
         let mut results: Vec<BrowseEntry> = Vec::new();
         if let Some(p) = parent {
@@ -1733,6 +1771,35 @@ impl Default for BrowseState {
 ///
 /// Public and screen-agnostic — usable by Browse, Library, or any
 /// future screen that needs to queue directories or mixed selections.
+/// Sort scored search results by the given field and direction.
+fn sort_search_results(scored: &mut Vec<(BrowseEntry, i64)>, sort: SearchSort, dir: SortDir) {
+    scored.sort_by(|a, b| {
+        let ord = match sort {
+            SearchSort::Score => a.1.cmp(&b.1).reverse(), // higher score first by default
+            SearchSort::Name => a.0.name_lower.cmp(&b.0.name_lower),
+            SearchSort::Date => {
+                let a_time = a.0.modified.unwrap_or(std::time::UNIX_EPOCH);
+                let b_time = b.0.modified.unwrap_or(std::time::UNIX_EPOCH);
+                a_time.cmp(&b_time)
+            }
+            SearchSort::Size => a.0.size.cmp(&b.0.size),
+            SearchSort::Extension => {
+                let a_ext = a.0.path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let b_ext = b.0.path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                a_ext.to_ascii_lowercase().cmp(&b_ext.to_ascii_lowercase())
+            }
+        };
+        match dir {
+            SortDir::Asc => ord,
+            SortDir::Desc => ord.reverse(),
+        }
+    });
+}
+
 pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut result = Vec::new();
     for path in paths {
