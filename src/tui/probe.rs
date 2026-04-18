@@ -592,10 +592,14 @@ pub fn parse_track_disc_tag(s: &str) -> u32 {
 /// - "01" → (Some(1), None)
 pub fn parse_title_from_filename(stem: &str) -> (Option<u32>, Option<String>) {
     let mut s = stem.trim();
-    // Strip "Track " prefix (case-insensitive).
+    // Strip "Track " prefix (case-insensitive) only if followed by
+    // a non-letter (digit, space, separator) to avoid matching "Tracking".
     let lower = s.to_ascii_lowercase();
     if lower.starts_with("track") {
-        s = s[5..].trim_start();
+        let after = &s[5..];
+        if after.is_empty() || !after.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            s = after.trim_start();
+        }
     }
     // Extract leading digits.
     let digit_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -616,7 +620,7 @@ pub fn parse_title_from_filename(stem: &str) -> (Option<u32>, Option<String>) {
 }
 
 /// Priority order for standard fields (displayed first, in this order).
-const STANDARD_KEY_ORDER: &[&str] = &[
+pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE", "DATE", "YEAR",
     "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL",
     "CATALOGNUMBER", "COMMENT", "COMPOSER", "CONDUCTOR", "LABEL",

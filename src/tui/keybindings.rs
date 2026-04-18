@@ -2067,6 +2067,24 @@ pub fn open_metadata_editor(app: &mut AppState) {
             };
             entries[idx].value = new_val;
         }
+
+        // Re-sort entries so newly created TITLE/TRACKNUMBER appear in
+        // standard position (not appended at end).
+        if tn_idx >= entries.len() - 2 || title_idx >= entries.len() - 2 {
+            // Only needed if we actually pushed new entries.
+            entries.sort_by(|a, b| {
+                let a_upper = a.display_key.to_ascii_uppercase();
+                let b_upper = b.display_key.to_ascii_uppercase();
+                let a_pos = super::probe::STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
+                let b_pos = super::probe::STANDARD_KEY_ORDER.iter().position(|&k| k == b_upper);
+                match (a_pos, b_pos) {
+                    (Some(ai), Some(bi)) => ai.cmp(&bi),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a_upper.cmp(&b_upper),
+                }
+            });
+        }
     }
 
     // Build per-file context labels from sorted paths/entries.
