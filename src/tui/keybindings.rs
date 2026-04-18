@@ -1860,7 +1860,7 @@ fn handle_metadata_editor_key(
                             let new_display = if all_same {
                                 state.entries[field_idx].per_file_values[0].clone()
                             } else {
-                                "<mixed>".to_string()
+                                "<multiple values>".to_string()
                             };
                             state.entries[field_idx].value = new_display;
                         }
@@ -2061,7 +2061,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
             let all_same = entries[idx].per_file_values.windows(2).all(|w| w[0] == w[1]);
             entries[idx].is_mixed = !all_same;
             let new_val = if !all_same {
-                "<mixed>".to_string()
+                "<multiple values>".to_string()
             } else {
                 entries[idx].per_file_values[0].clone()
             };
@@ -2509,7 +2509,7 @@ fn handle_metadata_editor_mouse(
                                 let new_display = if all_same {
                                     state.entries[field_idx].per_file_values[0].clone()
                                 } else {
-                                    "<mixed>".to_string()
+                                    "<multiple values>".to_string()
                                 };
                                 state.entries[field_idx].value = new_display;
                             }

@@ -512,7 +512,7 @@ pub struct TagEntry {
     pub display_key: String,
     /// Lofty item key for read/write mapping.
     pub item_key: lofty::tag::ItemKey,
-    /// Displayed value: shared value or "<mixed>" when files disagree.
+    /// Displayed value: shared value or "<multiple values>" when files disagree.
     pub value: String,
     /// Original displayed value at read/merge time, for display-level dirty.
     pub original: String,
@@ -783,7 +783,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
         let all_same = data.values.windows(2).all(|w| w[0] == w[1]);
         let is_mixed = !all_same;
         let display_value = if is_mixed {
-            "<mixed>".to_string()
+            "<multiple values>".to_string()
         } else {
             data.values[0].clone()
         };
