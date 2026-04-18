@@ -2507,12 +2507,16 @@ fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
 /// Ensure the detail cursor is visible in the detail overlay.
 fn ensure_detail_visible(state: &mut super::app::MetadataEditorState) {
     let visible = crossterm::terminal::size()
-        .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(6)) // -border -footer -header -blank
+        .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(6))
         .unwrap_or(15);
-    if state.detail_cursor < state.detail_scroll {
-        state.detail_scroll = state.detail_cursor;
-    } else if state.detail_cursor >= state.detail_scroll + visible {
-        state.detail_scroll = state.detail_cursor.saturating_sub(visible - 1);
+    // The detail view has a 2-line header (field name + blank) before
+    // per-file rows. Cursor index i maps to line i+2 in the content.
+    let header_offset = 2usize;
+    let cursor_line = state.detail_cursor + header_offset;
+    if cursor_line < state.detail_scroll {
+        state.detail_scroll = cursor_line;
+    } else if cursor_line >= state.detail_scroll + visible {
+        state.detail_scroll = cursor_line.saturating_sub(visible - 1);
     }
 }
 
