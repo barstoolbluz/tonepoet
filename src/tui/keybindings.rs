@@ -1988,6 +1988,87 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     }
 
+    // Auto-populate TITLE and TRACKNUMBER from filenames where missing.
+    let mut did_auto_populate = false;
+    {
+        let n = paths.len();
+
+        // Find or create TRACKNUMBER entry.
+        let tn_idx = entries.iter().position(|e|
+            e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
+        let title_idx = entries.iter().position(|e|
+            e.display_key.to_ascii_uppercase() == "TITLE");
+
+        // Ensure TRACKNUMBER entry exists.
+        let tn_idx = match tn_idx {
+            Some(i) => i,
+            None => {
+                entries.push(super::probe::TagEntry {
+                    display_key: "TRACKNUMBER".to_string(),
+                    item_key: lofty::tag::ItemKey::TrackNumber,
+                    value: String::new(),
+                    original: String::new(),
+                    is_binary: false,
+                    is_mixed: false,
+                    per_file_values: vec![String::new(); n],
+                    per_file_originals: vec![String::new(); n],
+                });
+                entries.len() - 1
+            }
+        };
+
+        // Ensure TITLE entry exists.
+        let title_idx = match title_idx {
+            Some(i) => i,
+            None => {
+                entries.push(super::probe::TagEntry {
+                    display_key: "TITLE".to_string(),
+                    item_key: lofty::tag::ItemKey::TrackTitle,
+                    value: String::new(),
+                    original: String::new(),
+                    is_binary: false,
+                    is_mixed: false,
+                    per_file_values: vec![String::new(); n],
+                    per_file_originals: vec![String::new(); n],
+                });
+                entries.len() - 1
+            }
+        };
+
+        // Parse filenames and fill empty values.
+        for i in 0..n {
+            let stem = paths[i].file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let (parsed_track, parsed_title) = super::probe::parse_title_from_filename(stem);
+
+            if entries[tn_idx].per_file_values[i].is_empty() {
+                if let Some(t) = parsed_track {
+                    entries[tn_idx].per_file_values[i] = t.to_string();
+                    did_auto_populate = true;
+                }
+            }
+            if entries[title_idx].per_file_values[i].is_empty() {
+                if let Some(ref t) = parsed_title {
+                    entries[title_idx].per_file_values[i] = t.clone();
+                    did_auto_populate = true;
+                }
+            }
+        }
+
+        // Recalculate is_mixed and value for affected entries.
+        for idx in [tn_idx, title_idx] {
+            let all_same = entries[idx].per_file_values.windows(2).all(|w| w[0] == w[1]);
+            entries[idx].is_mixed = !all_same;
+            let new_val = if !all_same {
+                "<mixed>".to_string()
+            } else {
+                entries[idx].per_file_values[0].clone()
+            };
+            entries[idx].value = new_val;
+        }
+    }
+
     // Build per-file context labels from sorted paths/entries.
     // Short labels: "D1.01" or "01" or filename stem (fallback).
     let file_labels: Vec<String> = {
@@ -2038,7 +2119,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
             edit_input: None,
             add_key_input: None,
             phase: super::app::MetadataEditorPhase::Editing,
-            dirty: false,
+            dirty: did_auto_populate,
             deleted: Vec::new(),
             file_labels,
             detail_field_idx: 0,

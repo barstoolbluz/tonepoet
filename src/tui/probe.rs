@@ -581,6 +581,40 @@ pub fn parse_track_disc_tag(s: &str) -> u32 {
     part.parse().unwrap_or(0)
 }
 
+/// Parse a filename stem into (track_number, title).
+/// Strips leading "Track " prefix, extracts leading digits as track,
+/// strips separator, remainder is title.
+///
+/// Examples:
+/// - "01 - Statesboro Blues" → (Some(1), Some("Statesboro Blues"))
+/// - "Track 03 - Foo" → (Some(3), Some("Foo"))
+/// - "Statesboro Blues" → (None, Some("Statesboro Blues"))
+/// - "01" → (Some(1), None)
+pub fn parse_title_from_filename(stem: &str) -> (Option<u32>, Option<String>) {
+    let mut s = stem.trim();
+    // Strip "Track " prefix (case-insensitive).
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("track") {
+        s = s[5..].trim_start();
+    }
+    // Extract leading digits.
+    let digit_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if digit_end == 0 {
+        // No digits — entire stem is the title.
+        let title = s.trim();
+        return (None, if title.is_empty() { None } else { Some(title.to_string()) });
+    }
+    let track: u32 = s[..digit_end].parse().unwrap_or(0);
+    let track = if track > 0 { Some(track) } else { None };
+    // Strip separator after digits.
+    let rest = s[digit_end..].trim_start_matches(|c: char| {
+        c == ' ' || c == '-' || c == '.' || c == '_'
+    });
+    let title = rest.trim();
+    let title = if title.is_empty() { None } else { Some(title.to_string()) };
+    (track, title)
+}
+
 /// Priority order for standard fields (displayed first, in this order).
 const STANDARD_KEY_ORDER: &[&str] = &[
     "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE", "DATE", "YEAR",
@@ -609,9 +643,10 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
     let tagged = lofty::read_from_path(path)
         .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
 
-    let tag = tagged.primary_tag()
-        .or_else(|| tagged.first_tag())
-        .ok_or_else(|| format!("no tags in '{}'", path.display()))?;
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None => return Ok(Vec::new()), // tagless file — editor opens empty
+    };
 
     let tag_type = tag.tag_type();
     let mut entries: Vec<TagEntry> = Vec::new();
