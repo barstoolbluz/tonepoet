@@ -1866,11 +1866,13 @@ fn handle_metadata_editor_key(
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.detail_cursor = state.detail_cursor.saturating_sub(1);
+                    ensure_detail_visible(state);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if state.detail_cursor + 1 < n_files {
                         state.detail_cursor += 1;
                     }
+                    ensure_detail_visible(state);
                 }
                 KeyCode::Enter => {
                     // Open inline edit for this file's value.
@@ -2257,6 +2259,21 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
 
+            // Detail overlay: scroll navigates per-file entries.
+            MouseEventKind::ScrollUp if state.phase == MetadataEditorPhase::DetailEdit => {
+                state.detail_cursor = state.detail_cursor.saturating_sub(1);
+                ensure_detail_visible(&mut state);
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+            MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::DetailEdit => {
+                let n = state.paths.len();
+                if state.detail_cursor + 1 < n {
+                    state.detail_cursor += 1;
+                }
+                ensure_detail_visible(&mut state);
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+
             // Right-click: cancel inline edit or close overlay.
             MouseEventKind::Down(MouseButton::Right) => {
                 match state.phase {
@@ -2484,6 +2501,18 @@ fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
         state.scroll = state.cursor;
     } else if state.cursor >= state.scroll + visible {
         state.scroll = state.cursor.saturating_sub(visible - 1);
+    }
+}
+
+/// Ensure the detail cursor is visible in the detail overlay.
+fn ensure_detail_visible(state: &mut super::app::MetadataEditorState) {
+    let visible = crossterm::terminal::size()
+        .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(6)) // -border -footer -header -blank
+        .unwrap_or(15);
+    if state.detail_cursor < state.detail_scroll {
+        state.detail_scroll = state.detail_cursor;
+    } else if state.detail_cursor >= state.detail_scroll + visible {
+        state.detail_scroll = state.detail_cursor.saturating_sub(visible - 1);
     }
 }
 
