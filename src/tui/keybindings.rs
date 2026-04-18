@@ -1812,25 +1812,16 @@ fn handle_metadata_editor_key(
 
 /// Open the metadata editor for the currently selected audio file(s).
 pub fn open_metadata_editor(app: &mut AppState) {
-    use super::browse::EntryKind;
-
-    let paths: Vec<std::path::PathBuf> = if app.browse.multi_selected.is_empty() {
-        // Single file.
-        match app.browse.selected_entry() {
-            Some(e) if matches!(e.kind, EntryKind::AudioFile(_)) => vec![e.path.clone()],
-            _ => {
-                app.set_status("No audio file selected");
-                return;
-            }
-        }
-    } else {
-        app.browse.multi_selected.iter()
-            .filter(|p| app.browse.entries.iter().any(|e| {
-                e.path == **p && matches!(e.kind, EntryKind::AudioFile(_))
-            }))
-            .cloned()
-            .collect()
-    };
+    // Collect paths — expand directories recursively to find nested
+    // audio files (e.g., disc 01/disc 02 folders).
+    let sel = super::command::collect_selection_for_file_ops(app);
+    let paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
+        .into_iter()
+        .filter(|p| matches!(
+            super::browse::classify_file(p),
+            super::browse::EntryKind::AudioFile(_)
+        ))
+        .collect();
 
     if paths.is_empty() {
         app.set_status("No audio files selected");

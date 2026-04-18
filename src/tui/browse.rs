@@ -1541,7 +1541,7 @@ fn collect_audio_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn classify_file(path: &Path) -> EntryKind {
+pub(super) fn classify_file(path: &Path) -> EntryKind {
     // Check for double-extension archives first (e.g., .tar.gz).
     if is_tar_compound(path) {
         return EntryKind::Archive;

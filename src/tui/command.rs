@@ -602,13 +602,17 @@ pub fn execute_command(
         }
         Command::Analyze => {
             // Collect paths to analyze from the current context.
+            // On Browse, directories are expanded recursively to find
+            // nested audio files (e.g., disc 01/disc 02 folders).
             let paths: Vec<std::path::PathBuf> = match app.current_screen {
                 AppScreen::Browse => {
                     let sel = collect_selection_for_file_ops(app);
-                    sel.into_iter()
-                        .filter(|p| app.browse.entries.iter().any(|e| {
-                            e.path == *p && matches!(e.kind, super::browse::EntryKind::AudioFile(_))
-                        }))
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
                         .collect()
                 }
                 AppScreen::Convert => app.convert.source.mode.all_paths(),

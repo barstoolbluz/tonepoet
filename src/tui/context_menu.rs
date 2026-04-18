@@ -231,6 +231,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Edit metadata...", ContextAction::EditMetadataFull));
+            items.push(item("Analyze...", ContextAction::Analyze));
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
             items.push(item("Select Inverse", ContextAction::SelectInverse));
