@@ -378,6 +378,34 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
+        AppMessage::VerifyComplete { result } => {
+            app.verify_pending = app.verify_pending.saturating_sub(1);
+            app.verify_results.push(result);
+            if app.verify_pending == 0 {
+                // Sort by disc/track for logical display order.
+                {
+                    let mut result_paths: Vec<std::path::PathBuf> = app.verify_results
+                        .iter().map(|r| r.path.clone()).collect();
+                    crate::tui::probe::sort_paths_by_track(&mut result_paths);
+                    app.verify_results.sort_by(|a, b| {
+                        let ai = result_paths.iter().position(|p| *p == a.path).unwrap_or(usize::MAX);
+                        let bi = result_paths.iter().position(|p| *p == b.path).unwrap_or(usize::MAX);
+                        ai.cmp(&bi)
+                    });
+                }
+                let passed = app.verify_results.iter().filter(|r| r.passed).count();
+                let failed = app.verify_results.len() - passed;
+                if failed == 0 {
+                    app.set_status(format!("Verified {} file(s): all passed", passed));
+                } else {
+                    app.set_status(format!(
+                        "Verified {} file(s): {} passed, {} failed",
+                        passed + failed, passed, failed,
+                    ));
+                }
+                app.active_overlay = super::app::ActiveOverlay::Verify { scroll: 0 };
+            }
+        }
         AppMessage::PathValidationComplete { input, result } => {
             match result {
                 Ok(path) => {

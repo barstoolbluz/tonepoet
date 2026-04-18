@@ -818,6 +818,10 @@ pub enum ActiveOverlay {
     },
     /// Full metadata tag editor overlay.
     MetadataEditor(Box<MetadataEditorState>),
+    /// Verify results overlay showing pass/fail per file.
+    Verify {
+        scroll: usize,
+    },
 }
 
 /// Phase of the metadata editor workflow.
@@ -1127,6 +1131,12 @@ pub struct AppState {
     /// status bar shows a persistent "Analyzing..." message.
     pub analysis_pending: usize,
 
+    /// Verify results from the last :verify command.
+    pub verify_results: Vec<crate::tui::verify::VerifyResult>,
+
+    /// Number of verify tasks currently in flight.
+    pub verify_pending: usize,
+
     // Navigation
     pub current_screen: AppScreen,
     pub previous_screen: Option<AppScreen>,
@@ -1286,6 +1296,8 @@ impl AppState {
             hover_target: None,
             analysis_results: Vec::new(),
             analysis_pending: 0,
+            verify_results: Vec::new(),
+            verify_pending: 0,
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }
@@ -1326,6 +1338,15 @@ impl AppState {
             let done = self.analysis_results.len();
             self.status_message = Some((
                 format!("Analyzing... ({}/{})", done, done + pending),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        if self.verify_pending > 0 {
+            let pending = self.verify_pending;
+            let done = self.verify_results.len();
+            self.status_message = Some((
+                format!("Verifying... ({}/{})", done, done + pending),
                 std::time::Instant::now(),
             ));
             return;

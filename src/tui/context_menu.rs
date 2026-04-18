@@ -1,7 +1,6 @@
 //! Context menu: right-click / `m` keybinding opens a floating menu
 //! with context-sensitive actions. Per-screen `build_*_menu` functions
 //! produce filtered item lists; `execute_context_action` dispatches.
-//! Flat menus for v1 — nested submenus deferred.
 
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -83,6 +82,8 @@ pub enum ContextAction {
     Analyze,
     /// Set a password for the selected archive (opens TextEdit prompt).
     SetArchivePassword,
+    /// Verify integrity of selected audio file(s).
+    Verify,
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -181,8 +182,35 @@ fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
     }
 }
 
-/// Build the "Edit metadata" submenu for audio files. Shows each
-/// editable field as a submenu item (Title, Artist, Album, Genre, Year).
+/// Build the "File operations" submenu (Rename, Bulk Rename, Copy/Move,
+/// Trash). `include_bulk_rename` adds the Bulk Rename option for audio files.
+fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
+    let mut children = vec![
+        item("Rename", ContextAction::RenameEntry),
+    ];
+    if include_bulk_rename {
+        children.push(item("Bulk Rename", ContextAction::BulkRename));
+    }
+    children.push(item("Copy to...", ContextAction::CopyTo));
+    children.push(item("Move to...", ContextAction::MoveTo));
+    children.push(item("Move to Trash", ContextAction::MoveToTrash));
+    ContextMenuEntry::Submenu {
+        label: "File operations".to_string(),
+        children,
+    }
+}
+
+/// Build the "Utilities" submenu (Verify, and future items like freedb
+/// lookup, cover art extraction, etc.).
+fn build_utilities_submenu() -> ContextMenuEntry {
+    ContextMenuEntry::Submenu {
+        label: "Utilities".to_string(),
+        children: vec![
+            item("Verify", ContextAction::Verify),
+        ],
+    }
+}
+
 /// Build the context menu for a right-click on a browse entry.
 pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let entry = match app.browse.selected_entry() {
@@ -201,14 +229,11 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Select Inverse", ContextAction::SelectInverse));
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
-            items.push(item("Edit metadata...", ContextAction::EditMetadataFull));
-            items.push(item("Rename", ContextAction::RenameEntry));
-            items.push(item("Bulk Rename...", ContextAction::BulkRename));
-            items.push(item("Analyze...", ContextAction::Analyze));
-            items.push(item("Copy to...", ContextAction::CopyTo));
-            items.push(item("Move to...", ContextAction::MoveTo));
-            items.push(item("Move to Trash", ContextAction::MoveToTrash));
+            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
+            items.push(item("Analyze", ContextAction::Analyze));
+            items.push(build_utilities_submenu());
             items.push(separator());
+            items.push(build_file_ops_submenu(true));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::Archive => {
@@ -219,30 +244,23 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Select Inverse", ContextAction::SelectInverse));
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
-            items.push(item("Set Password...", ContextAction::SetArchivePassword));
-            items.push(item("Rename", ContextAction::RenameEntry));
-            items.push(item("Copy to...", ContextAction::CopyTo));
-            items.push(item("Move to...", ContextAction::MoveTo));
-            items.push(item("Move to Trash", ContextAction::MoveToTrash));
-            items.push(separator());
+            items.push(item("Set Password", ContextAction::SetArchivePassword));
+            items.push(build_file_ops_submenu(false));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::Directory => {
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(item("Open", ContextAction::OpenEntry));
-            items.push(item("Edit metadata...", ContextAction::EditMetadataFull));
-            items.push(item("Analyze...", ContextAction::Analyze));
+            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
+            items.push(item("Analyze", ContextAction::Analyze));
+            items.push(build_utilities_submenu());
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
             items.push(item("Select Inverse", ContextAction::SelectInverse));
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
-            items.push(item("Rename", ContextAction::RenameEntry));
-            items.push(item("Copy to...", ContextAction::CopyTo));
-            items.push(item("Move to...", ContextAction::MoveTo));
-            items.push(item("Move to Trash", ContextAction::MoveToTrash));
-            items.push(separator());
+            items.push(build_file_ops_submenu(false));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::ParentDir => {
@@ -257,11 +275,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Select Inverse", ContextAction::SelectInverse));
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
-            items.push(item("Rename", ContextAction::RenameEntry));
-            items.push(item("Copy to...", ContextAction::CopyTo));
-            items.push(item("Move to...", ContextAction::MoveTo));
-            items.push(item("Move to Trash", ContextAction::MoveToTrash));
-            items.push(separator());
+            items.push(build_file_ops_submenu(false));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
     }
@@ -491,6 +505,10 @@ pub fn execute_context_action(
         }
         ContextAction::Analyze => {
             let cmd = super::command::Command::Analyze;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::Verify => {
+            let cmd = super::command::Command::Verify;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::BulkRename => {

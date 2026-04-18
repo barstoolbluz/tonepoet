@@ -228,6 +228,8 @@ pub enum Command {
     BulkRename,
     /// Analyze selected audio file(s) — DR, peak, clipping, etc.
     Analyze,
+    /// Verify integrity of selected audio file(s).
+    Verify,
     /// Open the search panel.
     Search { recursive: bool },
     /// Set an archive password for the selected archive in Browse.
@@ -306,6 +308,7 @@ pub fn parse_command(input: &str) -> Command {
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
         "rename-all" | "renameall" | "bulk-rename" => Command::BulkRename,
         "analyze" | "analysis" | "dr" => Command::Analyze,
+        "verify" | "test" => Command::Verify,
         "search" | "s" => Command::Search { recursive: false },
         "rs" | "rsearch" => Command::Search { recursive: true },
         "password" | "pw" => Command::Password,
@@ -699,6 +702,36 @@ pub fn execute_command(
                         });
                     }
                 }
+            }
+        }
+        Command::Verify => {
+            let paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
+                        .collect()
+                }
+                AppScreen::Convert => app.convert.source.mode.all_paths(),
+                _ => Vec::new(),
+            };
+            if paths.is_empty() {
+                app.set_status("No audio files to verify");
+            } else {
+                app.verify_results.clear();
+                app.verify_pending = paths.len();
+                for path in paths {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = super::verify::verify_file(path).await;
+                        let _ = tx.send(AppMessage::VerifyComplete { result }).await;
+                    });
+                }
+                app.set_status(format!("Verifying {} file(s)...", app.verify_pending));
             }
         }
         Command::Search { recursive } => {

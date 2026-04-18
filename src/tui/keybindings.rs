@@ -1476,6 +1476,22 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
+        ActiveOverlay::Verify { mut scroll } => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::Verify { scroll };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll += 1;
+                    app.active_overlay = ActiveOverlay::Verify { scroll };
+                }
+                _ => {}
+            }
+        }
         ActiveOverlay::MetadataEditor(mut state) => {
             handle_metadata_editor_key(app, key, &mut state, tx);
             // If the handler didn't close the overlay, put state back.
@@ -2387,6 +2403,15 @@ fn handle_generic_overlay_mouse(
                     let y = (area.1.saturating_sub(h)) / 2;
                     (Rect::new(x, y, w, h), vec![
                         ("Enter save", "enter"), ("Esc cancel", "esc"),
+                    ])
+                }
+                ActiveOverlay::Verify { .. } => {
+                    let w = ((area.0 as usize) * 70 / 100).max(40).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![
+                        ("Esc close", "esc"),
                     ])
                 }
                 ActiveOverlay::Confirmation { .. } => {

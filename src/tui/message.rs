@@ -45,6 +45,10 @@ pub enum AppMessage {
     AnalysisComplete {
         result: Result<Box<crate::tui::analyze::AnalysisResult>, String>,
     },
+    /// Result of an async file integrity verification.
+    VerifyComplete {
+        result: crate::tui::verify::VerifyResult,
+    },
     /// Result of async path validation (canonicalize + is_dir) for :cd.
     PathValidationComplete {
         input: String,

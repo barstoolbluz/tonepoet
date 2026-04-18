@@ -96,6 +96,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::MetadataEditor(ref state) => {
             draw_metadata_editor(f, state);
         }
+        ActiveOverlay::Verify { scroll } => {
+            draw_verify(f, &app.verify_results, scroll);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -1407,5 +1410,108 @@ fn draw_metadata_detail(
         ])
     };
     f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), footer_area);
+}
+
+/// Draw the verify results overlay.
+fn draw_verify(
+    f: &mut Frame,
+    results: &[super::verify::VerifyResult],
+    scroll: usize,
+) {
+    let area = f.size();
+    let w = (area.width * 70 / 100).max(40).min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::GREEN))
+        .title(Span::styled(
+            " Verify Results ",
+            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 || results.is_empty() {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    // Summary line.
+    let passed = results.iter().filter(|r| r.passed).count();
+    let failed = results.len() - passed;
+    let mut lines: Vec<Line> = Vec::new();
+
+    let summary_spans = if failed == 0 {
+        vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{} passed", passed),
+                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+            ),
+        ]
+    } else {
+        vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{} passed", passed),
+                Style::default().fg(theme::GREEN),
+            ),
+            Span::styled(", ", theme::muted()),
+            Span::styled(
+                format!("{} failed", failed),
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            ),
+        ]
+    };
+    lines.push(Line::from(summary_spans));
+    lines.push(Line::from(""));
+
+    // Per-file results.
+    for r in results {
+        let name = r.path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| r.path.display().to_string());
+
+        let (icon, icon_color) = if r.passed {
+            (" ✓ ", theme::GREEN)
+        } else {
+            (" ✗ ", theme::RED)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(name, Style::default().fg(theme::TEXT_BRIGHT)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled(&r.detail, Style::default().fg(theme::TEXT_DIM)),
+        ]));
+    }
+
+    let total = lines.len();
+    let visible = chunks[0].height as usize;
+    let scroll = scroll.min(total.saturating_sub(visible));
+
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    // Footer pill.
+    let footer = Line::from(vec![
+        footer_pill("Esc close", theme::GREEN),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
 }
 

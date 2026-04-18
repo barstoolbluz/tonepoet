@@ -40,3 +40,4 @@ pub mod rename_template;
 pub mod recent_overlay;
 pub mod text_input;
 pub mod theme;
+pub mod verify;
