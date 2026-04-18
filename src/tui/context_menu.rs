@@ -84,6 +84,10 @@ pub enum ContextAction {
     SetArchivePassword,
     /// Verify integrity of selected audio file(s).
     Verify,
+    /// Generate a multi-file CUE sheet (one FILE per track).
+    GenerateCueMultiFile,
+    /// Generate a single-image CUE sheet (one FILE, cumulative timestamps).
+    GenerateCueSingleImage,
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -207,6 +211,8 @@ fn build_utilities_submenu() -> ContextMenuEntry {
         label: "Utilities".to_string(),
         children: vec![
             item("Verify", ContextAction::Verify),
+            item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
+            item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
         ],
     }
 }
@@ -509,6 +515,14 @@ pub fn execute_context_action(
         }
         ContextAction::Verify => {
             let cmd = super::command::Command::Verify;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::GenerateCueMultiFile => {
+            let cmd = super::command::Command::GenerateCue { single_image: false };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::GenerateCueSingleImage => {
+            let cmd = super::command::Command::GenerateCue { single_image: true };
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::BulkRename => {

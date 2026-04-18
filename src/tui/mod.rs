@@ -9,6 +9,7 @@ pub mod browse;
 pub mod button_map;
 pub mod command;
 pub mod context_menu;
+pub mod cue_generate;
 pub mod cue_parser;
 pub mod convert_actions;
 pub mod convert_screen;

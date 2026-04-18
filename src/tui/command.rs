@@ -230,6 +230,9 @@ pub enum Command {
     Analyze,
     /// Verify integrity of selected audio file(s).
     Verify,
+    /// Generate a CUE sheet from the selected audio files.
+    /// `single_image`: false = multi-file, true = single image with cumulative timestamps.
+    GenerateCue { single_image: bool },
     /// Open the search panel.
     Search { recursive: bool },
     /// Set an archive password for the selected archive in Browse.
@@ -309,6 +312,8 @@ pub fn parse_command(input: &str) -> Command {
         "rename-all" | "renameall" | "bulk-rename" => Command::BulkRename,
         "analyze" | "analysis" | "dr" => Command::Analyze,
         "verify" | "test" => Command::Verify,
+        "cue" => Command::GenerateCue { single_image: false },
+        "cue!" => Command::GenerateCue { single_image: true },
         "search" | "s" => Command::Search { recursive: false },
         "rs" | "rsearch" => Command::Search { recursive: true },
         "password" | "pw" => Command::Password,
@@ -732,6 +737,87 @@ pub fn execute_command(
                     });
                 }
                 app.set_status(format!("Verifying {} file(s)...", app.verify_pending));
+            }
+        }
+        Command::GenerateCue { single_image } => {
+            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            if paths.is_empty() {
+                app.set_status("No audio files for CUE generation");
+            } else {
+                super::probe::sort_paths_by_track(&mut paths);
+
+                // CUE file goes in the root of the selection. When a
+                // directory was selected, use that directory; when individual
+                // files were selected, use their parent.
+                let output_dir = if app.current_screen == AppScreen::Browse {
+                    let sel = collect_selection_for_file_ops(app);
+                    if sel.len() == 1 && sel[0].is_dir() {
+                        sel[0].clone()
+                    } else {
+                        paths[0].parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf()
+                    }
+                } else {
+                    paths[0].parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf()
+                };
+
+                match super::cue_generate::gather_cue_info(&paths, &output_dir) {
+                    Ok((album, tracks)) => {
+                        let cue_content = if single_image {
+                            let image_name =
+                                super::cue_generate::derive_image_filename(&album, &paths[0]);
+                            let ext = paths[0]
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("flac");
+                            let fmt = super::cue_generate::cue_format_tag(ext);
+                            super::cue_generate::generate_single_image_cue(
+                                &album, &tracks, &image_name, fmt,
+                            )
+                        } else {
+                            super::cue_generate::generate_multifile_cue(&album, &tracks)
+                        };
+
+                        let cue_filename = super::cue_generate::cue_output_filename(&album);
+                        let cue_path = output_dir.join(&cue_filename);
+
+                        match std::fs::write(&cue_path, &cue_content) {
+                            Ok(()) => {
+                                let mode = if single_image { "single image" } else { "multi-file" };
+                                app.set_status(format!(
+                                    "CUE sheet ({}) written: {}",
+                                    mode, cue_filename,
+                                ));
+                                // Refresh browse to show the new file.
+                                if app.current_screen == AppScreen::Browse {
+                                    app.browse.refresh();
+                                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                                }
+                            }
+                            Err(e) => {
+                                app.set_status(format!("CUE write failed: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.set_status(format!("CUE generation failed: {}", e));
+                    }
+                }
             }
         }
         Command::Search { recursive } => {
