@@ -1165,45 +1165,113 @@ impl BrowseState {
         self.apply_view_preserving_cursor();
     }
 
-    /// Execute a non-recursive filename search on the current directory's
-    /// entries. Filters `all_dirs` + `all_files` by substring match
-    /// (case-insensitive) and writes results into `entries`.
+    /// Execute a filename search. Non-recursive filters the current
+    /// directory listing. Recursive walks subdirectories via walkdir.
     pub fn execute_search(&mut self) {
         let query = self.search.input.text.trim().to_ascii_lowercase();
         if query.is_empty() {
-            // Empty query: show all entries (like no filter).
             self.apply_view_preserving_cursor();
             return;
         }
 
+        let show_hidden = self.show_hidden;
+        let audio_only = self.search.audio_only;
+
+        if self.search.recursive {
+            self.execute_search_recursive(&query, show_hidden, audio_only);
+        } else {
+            self.execute_search_local(&query, show_hidden, audio_only);
+        }
+    }
+
+    /// Non-recursive search: filter current directory's entries.
+    fn execute_search_local(&mut self, query: &str, show_hidden: bool, audio_only: bool) {
         let mut results: Vec<BrowseEntry> = Vec::new();
 
-        // Include parent entry if it passes.
         if let Some(ref parent) = self.parent_entry {
             results.push(parent.clone());
         }
 
-        // Filter dirs + files by query.
-        let check_entry = |e: &BrowseEntry| -> bool {
-            if !self.show_hidden && e.name.starts_with('.') {
-                return false;
-            }
-            if self.search.audio_only && !matches!(e.kind, EntryKind::AudioFile(_)) && !matches!(e.kind, EntryKind::Directory) {
-                return false;
-            }
-            e.name_lower.contains(&query)
+        let check = |e: &BrowseEntry| -> bool {
+            if !show_hidden && e.name.starts_with('.') { return false; }
+            if audio_only && !matches!(e.kind, EntryKind::AudioFile(_))
+                && !matches!(e.kind, EntryKind::Directory) { return false; }
+            e.name_lower.contains(query)
         };
 
         for d in &self.all_dirs {
-            if check_entry(d) {
-                results.push(d.clone());
-            }
+            if check(d) { results.push(d.clone()); }
         }
         for f in &self.all_files {
-            if check_entry(f) {
-                results.push(f.clone());
-            }
+            if check(f) { results.push(f.clone()); }
         }
+
+        self.entries = results;
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// Recursive search: walk subdirectories, build entries with relative paths.
+    fn execute_search_recursive(&mut self, query: &str, show_hidden: bool, audio_only: bool) {
+        use walkdir::WalkDir;
+
+        let root = self.current_dir.clone();
+        let mut results: Vec<BrowseEntry> = Vec::new();
+
+        // Always include parent entry for navigation.
+        if let Some(ref parent) = self.parent_entry {
+            results.push(parent.clone());
+        }
+
+        for entry in WalkDir::new(&root)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                // Skip hidden directories unless show_hidden.
+                if !show_hidden {
+                    if let Some(name) = e.file_name().to_str() {
+                        if name.starts_with('.') { return false; }
+                    }
+                }
+                true
+            })
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            // Skip directories in results (we only want files).
+            if entry.file_type().is_dir() { continue; }
+
+            let path = entry.path().to_path_buf();
+            let kind = classify_file(&path);
+
+            // Audio-only filter.
+            if audio_only && !matches!(kind, EntryKind::AudioFile(_)) {
+                continue;
+            }
+
+            // Show relative path from the search root as the display name.
+            let rel = path.strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let rel_lower = rel.to_lowercase();
+
+            // Query match on the relative path.
+            if !rel_lower.contains(query) { continue; }
+
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let modified = entry.metadata().ok()
+                .and_then(|m| m.modified().ok());
+
+            results.push(BrowseEntry::new(path, rel, kind, size, modified));
+        }
+
+        // Cap results to prevent OOM on huge trees.
+        results.truncate(500);
 
         self.entries = results;
         self.selected_index = 0;
