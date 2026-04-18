@@ -1318,7 +1318,12 @@ fn draw_metadata_detail(
     };
 
     // Header: field name.
-    let label_col_w = 30usize.min(inner_w / 2);
+    // Label column width: enough for "D99.99" (6) + padding, or filename fallback.
+    let max_label = state.file_labels.iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(6);
+    let label_col_w = (max_label + 4).min(inner_w / 3).max(10);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         format!("  {}", entry.display_key),
@@ -1330,13 +1335,9 @@ fn draw_metadata_detail(
     for (i, val) in entry.per_file_values.iter().enumerate() {
         let is_cursor = i == state.detail_cursor;
         let label = state.file_labels.get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("file {}", i + 1));
-        let label_truncated = if label.len() > label_col_w - 2 {
-            format!("  {:.width$}", label, width = label_col_w - 2)
-        } else {
-            format!("  {:<width$}", label, width = label_col_w - 2)
-        };
+            .map(|l| l.as_str())
+            .unwrap_or("?");
+        let label_display = format!("  {:<width$}  ", label, width = label_col_w - 4);
 
         let label_style = if is_cursor {
             Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
@@ -1353,7 +1354,7 @@ fn draw_metadata_detail(
                 let cursor_ch = if cp < visible.len() { &visible[cp..cp + 1] } else { " " };
                 let after = if cp + 1 <= visible.len() { &visible[cp + 1..] } else { "" };
                 lines.push(Line::from(vec![
-                    Span::styled(label_truncated, label_style),
+                    Span::styled(label_display.clone(), label_style),
                     Span::styled(before.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
                     Span::styled(cursor_ch.to_string(), Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
                     Span::styled(after.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
@@ -1380,7 +1381,7 @@ fn draw_metadata_detail(
         };
 
         lines.push(Line::from(vec![
-            Span::styled(label_truncated, label_style),
+            Span::styled(label_display, label_style),
             Span::styled(val_display, val_style),
         ]));
     }

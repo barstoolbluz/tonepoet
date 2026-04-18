@@ -1989,6 +1989,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
     }
 
     // Build per-file context labels from sorted paths/entries.
+    // Short labels: "D1.01" or "01" or filename stem (fallback).
     let file_labels: Vec<String> = {
         let track_entry = entries.iter().find(|e|
             e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
@@ -2004,9 +2005,6 @@ pub fn open_metadata_editor(app: &mut AppState) {
             .unwrap_or(false);
 
         paths.iter().enumerate().map(|(i, p)| {
-            let stem = p.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
             let tn = track_entry
                 .and_then(|e| e.per_file_values.get(i))
                 .filter(|v| !v.is_empty());
@@ -2017,9 +2015,15 @@ pub fn open_metadata_editor(app: &mut AppState) {
                 None
             };
             match (dn, tn) {
-                (Some(d), Some(t)) => format!("D{}.{:>2}  {}", d, t, stem),
-                (None, Some(t)) => format!("{:>2}  {}", t, stem),
-                _ => stem,
+                (Some(d), Some(t)) => format!("D{}.{:>02}", d, t),
+                (None, Some(t)) => format!("{:>02}", t),
+                _ => {
+                    // Fallback: filename stem, truncated.
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string()
+                }
             }
         }).collect()
     };
