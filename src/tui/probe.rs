@@ -619,6 +619,48 @@ pub fn parse_title_from_filename(stem: &str) -> (Option<u32>, Option<String>) {
     (track, title)
 }
 
+/// Sort paths by (disc, track, filename) for logical display order.
+/// Reads disc/track tags from each file via lofty (lightweight read),
+/// falls back to directory/filename patterns.
+pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::ItemKey;
+
+    if paths.len() <= 1 {
+        return;
+    }
+
+    let sort_keys: Vec<(u32, u32, String)> = paths.iter().map(|p| {
+        // Try reading disc/track from tags.
+        let (tag_disc, tag_track) = lofty::read_from_path(p).ok()
+            .and_then(|tagged| {
+                let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+                let disc = tag.get_string(&ItemKey::DiscNumber)
+                    .map(|s| parse_track_disc_tag(s));
+                let track = tag.get_string(&ItemKey::TrackNumber)
+                    .map(|s| parse_track_disc_tag(s));
+                Some((disc, track))
+            })
+            .unwrap_or((None, None));
+
+        let disc = tag_disc.unwrap_or_else(|| extract_disc_from_path(p));
+        let track = tag_track.unwrap_or_else(|| {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            extract_track_from_filename(stem)
+        });
+        let filename = p.file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        (disc, track, filename)
+    }).collect();
+
+    let mut perm: Vec<usize> = (0..paths.len()).collect();
+    perm.sort_by(|&a, &b| sort_keys[a].cmp(&sort_keys[b]));
+
+    let sorted: Vec<_> = perm.iter().map(|&i| paths[i].clone()).collect();
+    *paths = sorted;
+}
+
 /// Priority order for standard fields (displayed first, in this order).
 pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE", "DATE", "YEAR",

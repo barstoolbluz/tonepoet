@@ -604,7 +604,7 @@ pub fn execute_command(
             // Collect paths to analyze from the current context.
             // On Browse, directories are expanded recursively to find
             // nested audio files (e.g., disc 01/disc 02 folders).
-            let paths: Vec<std::path::PathBuf> = match app.current_screen {
+            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
                 AppScreen::Browse => {
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
@@ -618,6 +618,8 @@ pub fn execute_command(
                 AppScreen::Convert => app.convert.source.mode.all_paths(),
                 _ => Vec::new(),
             };
+            // Sort by disc/track for logical result order.
+            super::probe::sort_paths_by_track(&mut paths);
             if paths.is_empty() {
                 app.set_status("No audio files to analyze");
             } else {
