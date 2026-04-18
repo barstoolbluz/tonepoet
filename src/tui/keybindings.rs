@@ -2406,14 +2406,23 @@ fn handle_metadata_editor_mouse(
                     .unwrap_or(false);
 
                 if is_double && row < state.entries.len() {
-                    // Double-click: edit the field.
+                    // Double-click: open detail for mixed fields, inline edit otherwise.
                     state.cursor = row;
                     let entry = &state.entries[row];
                     if !entry.is_binary && !state.deleted.contains(&row) {
-                        state.edit_input = Some(
-                            super::text_input::TextInputState::new(entry.value.clone()),
-                        );
-                        state.phase = MetadataEditorPhase::InlineEdit;
+                        if entry.is_mixed && state.paths.len() > 1 {
+                            state.detail_field_idx = row;
+                            state.detail_cursor = 0;
+                            state.detail_scroll = 0;
+                            state.detail_edit = None;
+                            state.last_click = None;
+                            state.phase = MetadataEditorPhase::DetailEdit;
+                        } else {
+                            state.edit_input = Some(
+                                super::text_input::TextInputState::new(entry.value.clone()),
+                            );
+                            state.phase = MetadataEditorPhase::InlineEdit;
+                        }
                     }
                     state.last_click = None;
                 } else if is_double && row == state.entries.len() {
