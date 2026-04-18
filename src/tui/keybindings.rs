@@ -834,6 +834,13 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sende
                 KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Recursive; }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     app.browse.search.mode = app.browse.search.mode.cycle();
+                    // If switching away from tags and a tag sort is active, reset to Score.
+                    if app.browse.search.mode == super::browse::SearchMode::Filename
+                        && app.browse.search.sort.is_tag_sort()
+                    {
+                        app.browse.search.sort = super::browse::SearchSort::Score;
+                        app.browse.search.sort_dir = super::browse::SortDir::Desc;
+                    }
                     app.browse.search.last_keystroke = Some(std::time::Instant::now());
                 }
                 _ => {}
@@ -845,8 +852,9 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sende
                 KeyCode::Tab => { app.browse.search.focus = SearchFocus::AudioOnly; }
                 KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Mode; }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    app.browse.search.sort = app.browse.search.sort.cycle();
-                    // Reset direction to the natural default for this sort.
+                    let tag_mode = matches!(app.browse.search.mode,
+                        super::browse::SearchMode::Tags | super::browse::SearchMode::Both);
+                    app.browse.search.sort = app.browse.search.sort.cycle_with_mode(tag_mode);
                     app.browse.search.sort_dir = match app.browse.search.sort {
                         super::browse::SearchSort::Score => super::browse::SortDir::Desc,
                         _ => super::browse::SortDir::Asc,
@@ -5144,10 +5152,18 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseSearchMode => {
                 app.browse.search.mode = app.browse.search.mode.cycle();
+                if app.browse.search.mode == super::browse::SearchMode::Filename
+                    && app.browse.search.sort.is_tag_sort()
+                {
+                    app.browse.search.sort = super::browse::SearchSort::Score;
+                    app.browse.search.sort_dir = super::browse::SortDir::Desc;
+                }
                 app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
             TuiButton::BrowseSearchSort => {
-                app.browse.search.sort = app.browse.search.sort.cycle();
+                let tag_mode = matches!(app.browse.search.mode,
+                    super::browse::SearchMode::Tags | super::browse::SearchMode::Both);
+                app.browse.search.sort = app.browse.search.sort.cycle_with_mode(tag_mode);
                 app.browse.search.sort_dir = match app.browse.search.sort {
                     super::browse::SearchSort::Score => super::browse::SortDir::Desc,
                     _ => super::browse::SortDir::Asc,

@@ -186,6 +186,10 @@ pub enum SearchSort {
     Date,
     Size,
     Extension,
+    Artist,
+    Album,
+    Year,
+    Title,
 }
 
 impl SearchSort {
@@ -196,16 +200,34 @@ impl SearchSort {
             Self::Date => "date",
             Self::Size => "size",
             Self::Extension => "ext",
+            Self::Artist => "artist",
+            Self::Album => "album",
+            Self::Year => "year",
+            Self::Title => "title",
         }
     }
-    pub fn cycle(&self) -> Self {
+
+    /// Cycle to next sort. `tag_mode` controls whether tag-based sorts
+    /// are included (only when search mode is Tags or Both).
+    pub fn cycle_with_mode(&self, tag_mode: bool) -> Self {
         match self {
             Self::Score => Self::Name,
             Self::Name => Self::Date,
             Self::Date => Self::Size,
             Self::Size => Self::Extension,
-            Self::Extension => Self::Score,
+            Self::Extension => {
+                if tag_mode { Self::Artist } else { Self::Score }
+            }
+            Self::Artist => Self::Album,
+            Self::Album => Self::Year,
+            Self::Year => Self::Title,
+            Self::Title => Self::Score,
         }
+    }
+
+    /// True if this sort requires tag data.
+    pub fn is_tag_sort(&self) -> bool {
+        matches!(self, Self::Artist | Self::Album | Self::Year | Self::Title)
     }
 }
 
@@ -1203,8 +1225,7 @@ impl BrowseState {
         self.apply_view_preserving_cursor();
     }
 
-    /// Execute a filename search. Non-recursive filters the current
-    /// directory listing. Recursive walks subdirectories via walkdir.
+    /// Execute a search. Mode determines what to match against.
     pub fn execute_search(&mut self) {
         let query = self.search.input.text.trim().to_ascii_lowercase();
         if query.is_empty() {
@@ -1214,44 +1235,55 @@ impl BrowseState {
 
         let show_hidden = self.show_hidden;
         let audio_only = self.search.audio_only;
+        let mode = self.search.mode;
 
         if self.search.recursive {
-            self.execute_search_recursive(&query, show_hidden, audio_only);
+            self.execute_search_recursive(&query, show_hidden, audio_only, mode);
         } else {
-            self.execute_search_local(&query, show_hidden, audio_only);
+            self.execute_search_local(&query, show_hidden, audio_only, mode);
         }
     }
 
     /// Non-recursive search: filter current directory's entries.
-    fn execute_search_local(&mut self, query: &str, show_hidden: bool, audio_only: bool) {
+    fn execute_search_local(&mut self, query: &str, show_hidden: bool, audio_only: bool, mode: SearchMode) {
         use fuzzy_matcher::FuzzyMatcher;
         use fuzzy_matcher::skim::SkimMatcherV2;
 
         let matcher = SkimMatcherV2::default();
         let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
-
-        // Always include parent entry (no scoring).
         let parent = self.parent_entry.clone();
+        let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
+        let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
 
-        let check_and_score = |e: &BrowseEntry| -> Option<i64> {
-            if !show_hidden && e.name.starts_with('.') { return None; }
-            if audio_only && !matches!(e.kind, EntryKind::AudioFile(_))
-                && !matches!(e.kind, EntryKind::Directory) { return None; }
-            matcher.fuzzy_match(&e.name_lower, query)
-        };
+        for entries_list in [&self.all_dirs, &self.all_files] {
+            for e in entries_list {
+                if !show_hidden && e.name.starts_with('.') { continue; }
+                if audio_only && !matches!(e.kind, EntryKind::AudioFile(_))
+                    && !matches!(e.kind, EntryKind::Directory) { continue; }
 
-        for d in &self.all_dirs {
-            if let Some(score) = check_and_score(d) {
-                scored.push((d.clone(), score));
+                let mut best_score: Option<i64> = None;
+
+                if search_filename {
+                    if let Some(s) = matcher.fuzzy_match(&e.name_lower, query) {
+                        best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+                    }
+                }
+
+                if search_tags && matches!(e.kind, EntryKind::AudioFile(_)) {
+                    let tag_str = build_tag_search_string(&e.path);
+                    if !tag_str.is_empty() {
+                        if let Some(s) = matcher.fuzzy_match(&tag_str, query) {
+                            best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+                        }
+                    }
+                }
+
+                if let Some(score) = best_score {
+                    scored.push((e.clone(), score));
+                }
             }
         }
-        for f in &self.all_files {
-            if let Some(score) = check_and_score(f) {
-                scored.push((f.clone(), score));
-            }
-        }
 
-        // Sort results.
         sort_search_results(&mut scored, self.search.sort, self.search.sort_dir);
 
         let mut results: Vec<BrowseEntry> = Vec::new();
@@ -1266,7 +1298,7 @@ impl BrowseState {
     }
 
     /// Recursive search: walk subdirectories, build entries with relative paths.
-    fn execute_search_recursive(&mut self, query: &str, show_hidden: bool, audio_only: bool) {
+    fn execute_search_recursive(&mut self, query: &str, show_hidden: bool, audio_only: bool, mode: SearchMode) {
         use walkdir::WalkDir;
         use fuzzy_matcher::FuzzyMatcher;
         use fuzzy_matcher::skim::SkimMatcherV2;
@@ -1274,8 +1306,9 @@ impl BrowseState {
         let matcher = SkimMatcherV2::default();
         let root = self.current_dir.clone();
         let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
-
         let parent = self.parent_entry.clone();
+        let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
+        let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
 
         for entry in WalkDir::new(&root)
             .min_depth(1)
@@ -1316,19 +1349,33 @@ impl BrowseState {
                 .to_string();
             let rel_lower = rel.to_lowercase();
 
-            // Fuzzy match on the relative path.
-            if let Some(score) = matcher.fuzzy_match(&rel_lower, query) {
+            let mut best_score: Option<i64> = None;
+
+            if search_filename {
+                if let Some(s) = matcher.fuzzy_match(&rel_lower, query) {
+                    best_score = Some(s);
+                }
+            }
+
+            if search_tags && matches!(kind, EntryKind::AudioFile(_)) {
+                let tag_str = build_tag_search_string(&path);
+                if !tag_str.is_empty() {
+                    if let Some(s) = matcher.fuzzy_match(&tag_str, query) {
+                        best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+                    }
+                }
+            }
+
+            if let Some(score) = best_score {
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 let modified = entry.metadata().ok()
                     .and_then(|m| m.modified().ok());
                 scored.push((BrowseEntry::new(path, rel, kind, size, modified), score));
 
-                // Cap collected matches.
                 if scored.len() >= 500 { break; }
             }
         }
 
-        // Sort results.
         sort_search_results(&mut scored, self.search.sort, self.search.sort_dir);
 
         let mut results: Vec<BrowseEntry> = Vec::new();
@@ -1771,11 +1818,54 @@ impl Default for BrowseState {
 ///
 /// Public and screen-agnostic — usable by Browse, Library, or any
 /// future screen that needs to queue directories or mixed selections.
+/// Build a lowercase searchable string from an audio file's metadata tags.
+/// Concatenates title, artist, album, genre, year with spaces.
+/// Returns empty string if tags can't be read.
+fn build_tag_search_string(path: &Path) -> String {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::Accessor;
+
+    let tagged = match lofty::read_from_path(path) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None => return String::new(),
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = tag.title() { parts.push(v.to_string()); }
+    if let Some(v) = tag.artist() { parts.push(v.to_string()); }
+    if let Some(v) = tag.album() { parts.push(v.to_string()); }
+    if let Some(v) = tag.genre() { parts.push(v.to_string()); }
+    if let Some(y) = tag.year() { parts.push(y.to_string()); }
+
+    parts.join(" ").to_lowercase()
+}
+
 /// Sort scored search results by the given field and direction.
 fn sort_search_results(scored: &mut Vec<(BrowseEntry, i64)>, sort: SearchSort, dir: SortDir) {
+    // For tag-based sorts, pre-extract the sort key to avoid repeated lofty reads.
+    if sort.is_tag_sort() {
+        let mut keyed: Vec<(String, usize)> = scored.iter().enumerate().map(|(i, (entry, _))| {
+            let key = extract_tag_sort_key(&entry.path, sort);
+            (key, i)
+        }).collect();
+
+        keyed.sort_by(|a, b| {
+            let ord = a.0.cmp(&b.0);
+            match dir { SortDir::Asc => ord, SortDir::Desc => ord.reverse() }
+        });
+
+        let sorted: Vec<_> = keyed.iter().map(|(_, i)| scored[*i].clone()).collect();
+        *scored = sorted;
+        return;
+    }
+
     scored.sort_by(|a, b| {
         let ord = match sort {
-            SearchSort::Score => a.1.cmp(&b.1), // natural ascending; Desc default reverses to best-first
+            SearchSort::Score => a.1.cmp(&b.1),
             SearchSort::Name => a.0.name_lower.cmp(&b.0.name_lower),
             SearchSort::Date => {
                 let a_time = a.0.modified.unwrap_or(std::time::UNIX_EPOCH);
@@ -1792,12 +1882,38 @@ fn sort_search_results(scored: &mut Vec<(BrowseEntry, i64)>, sort: SearchSort, d
                     .unwrap_or("");
                 a_ext.to_ascii_lowercase().cmp(&b_ext.to_ascii_lowercase())
             }
+            _ => std::cmp::Ordering::Equal, // tag sorts handled above
         };
         match dir {
             SortDir::Asc => ord,
             SortDir::Desc => ord.reverse(),
         }
     });
+}
+
+/// Extract a single tag field value for sorting, lowercased.
+fn extract_tag_sort_key(path: &Path, sort: SearchSort) -> String {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::Accessor;
+
+    let tagged = match lofty::read_from_path(path) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None => return String::new(),
+    };
+
+    let val = match sort {
+        SearchSort::Artist => tag.artist().map(|s| s.to_string()),
+        SearchSort::Album => tag.album().map(|s| s.to_string()),
+        SearchSort::Year => tag.year().map(|y| format!("{:04}", y)),
+        SearchSort::Title => tag.title().map(|s| s.to_string()),
+        _ => None,
+    };
+
+    val.unwrap_or_default().to_lowercase()
 }
 
 pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
