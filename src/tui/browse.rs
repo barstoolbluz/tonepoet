@@ -266,6 +266,11 @@ pub struct SearchState {
     pub last_keystroke: Option<std::time::Instant>,
     /// True while an async search is in flight.
     pub searching: bool,
+    /// In-memory tag cache for non-recursive tag search (avoids repeated
+    /// lofty reads on each debounce). Cleared on search close / dir change.
+    pub tag_cache: std::collections::HashMap<PathBuf, String>,
+    /// Cancel flag for async recursive search tasks.
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SearchState {
@@ -281,6 +286,8 @@ impl SearchState {
             focus: SearchFocus::Input,
             last_keystroke: None,
             searching: false,
+            tag_cache: std::collections::HashMap::new(),
+            cancel: None,
         }
     }
 }
@@ -1217,16 +1224,23 @@ impl BrowseState {
 
     /// Close the search panel and restore the normal directory listing.
     pub fn close_search(&mut self) {
+        // Cancel any in-flight async search.
+        if let Some(ref flag) = self.search.cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.search.active = false;
         self.search.input = TextInputState::new(String::new());
         self.search.last_keystroke = None;
         self.search.searching = false;
+        self.search.tag_cache.clear();
+        self.search.cancel = None;
         // Restore normal listing.
         self.apply_view_preserving_cursor();
     }
 
-    /// Execute a search. Mode determines what to match against.
-    pub fn execute_search(&mut self) {
+    /// Execute a search. Non-recursive runs synchronously.
+    /// Recursive spawns an async task and sends results via tx.
+    pub fn execute_search(&mut self, tx: Option<&tokio::sync::mpsc::Sender<super::message::AppMessage>>) {
         let query = self.search.input.text.trim().to_ascii_lowercase();
         if query.is_empty() {
             self.apply_view_preserving_cursor();
@@ -1238,7 +1252,9 @@ impl BrowseState {
         let mode = self.search.mode;
 
         if self.search.recursive {
-            self.execute_search_recursive(&query, show_hidden, audio_only, mode);
+            if let Some(tx) = tx {
+                self.spawn_search_async(&query, show_hidden, audio_only, mode, tx.clone());
+            }
         } else {
             self.execute_search_local(&query, show_hidden, audio_only, mode);
         }
@@ -1272,7 +1288,7 @@ impl BrowseState {
                 }
 
                 if search_tags && matches!(e.kind, EntryKind::AudioFile(_)) {
-                    let tag_str = build_tag_search_string(&e.path);
+                    let tag_str = build_tag_search_string_cached(&e.path, &mut self.search.tag_cache);
                     if !tag_str.is_empty() {
                         if let Some(s) = matcher.fuzzy_match(&tag_str, query) {
                             best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
@@ -1299,96 +1315,140 @@ impl BrowseState {
         self.scroll_offset = 0;
     }
 
-    /// Recursive search: walk subdirectories, build entries with relative paths.
-    fn execute_search_recursive(&mut self, query: &str, show_hidden: bool, audio_only: bool, mode: SearchMode) {
-        use walkdir::WalkDir;
-        use fuzzy_matcher::FuzzyMatcher;
-        use fuzzy_matcher::skim::SkimMatcherV2;
+    /// Spawn an async recursive search task. Results arrive via SearchComplete.
+    fn spawn_search_async(
+        &mut self,
+        query: &str,
+        show_hidden: bool,
+        audio_only: bool,
+        mode: SearchMode,
+        tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+    ) {
+        // Cancel any previous search task.
+        if let Some(ref flag) = self.search.cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
-        let matcher = SkimMatcherV2::default();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.search.cancel = Some(cancel.clone());
+        self.search.searching = true;
+
         let root = self.current_dir.clone();
-        let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
-        let parent = self.parent_entry.clone();
+        let query = query.to_string();
         let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
         let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
 
-        for entry in WalkDir::new(&root)
-            .min_depth(1)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                if !show_hidden {
-                    if let Some(name) = e.file_name().to_str() {
-                        if name.starts_with('.') { return false; }
+        tokio::spawn(async move {
+            let results = tokio::task::spawn_blocking(move || {
+                use walkdir::WalkDir;
+                use fuzzy_matcher::FuzzyMatcher;
+                use fuzzy_matcher::skim::SkimMatcherV2;
+
+                let matcher = SkimMatcherV2::default();
+                let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
+
+                // Open own DB connection for tag cache.
+                let db = crate::db::Database::open().ok();
+
+                for entry in WalkDir::new(&root)
+                    .min_depth(1)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_entry(|e| {
+                        if !show_hidden {
+                            if let Some(name) = e.file_name().to_str() {
+                                if name.starts_with('.') { return false; }
+                            }
+                        }
+                        true
+                    })
+                {
+                    // Check cancel flag periodically.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Vec::new();
+                    }
+
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    if entry.file_type().is_dir() { continue; }
+
+                    if !show_hidden {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.starts_with('.') { continue; }
+                        }
+                    }
+
+                    let path = entry.path().to_path_buf();
+                    let kind = classify_file(&path);
+
+                    if audio_only && !matches!(kind, EntryKind::AudioFile(_)) {
+                        continue;
+                    }
+
+                    let rel = path.strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+                    let rel_lower = rel.to_lowercase();
+
+                    let mut best_score: Option<i64> = None;
+
+                    if search_filename {
+                        if let Some(s) = matcher.fuzzy_match(&rel_lower, &query) {
+                            best_score = Some(s);
+                        }
+                    }
+
+                    if search_tags && matches!(kind, EntryKind::AudioFile(_)) {
+                        // Try DB cache first, then lofty.
+                        let tag_str = if let Some(ref db) = db {
+                            let path_str = path.display().to_string();
+                            let meta = std::fs::metadata(&path).ok();
+                            let mtime = meta.as_ref()
+                                .and_then(|m| m.modified().ok())
+                                .map(crate::db::systemtime_to_unix)
+                                .unwrap_or(0);
+                            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+                            if let Some((cached, ..)) = db.get_cached_tags(&path_str, mtime, size) {
+                                cached
+                            } else {
+                                let s = read_tag_string_from_file(&path);
+                                let _ = db.store_cached_tags(
+                                    &path_str, mtime, size,
+                                    None, None, None, None, None, &s,
+                                );
+                                s
+                            }
+                        } else {
+                            read_tag_string_from_file(&path)
+                        };
+
+                        if !tag_str.is_empty() {
+                            if let Some(s) = matcher.fuzzy_match(&tag_str, &query) {
+                                best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+                            }
+                        }
+                    }
+
+                    if let Some(score) = best_score {
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let modified = entry.metadata().ok()
+                            .and_then(|m| m.modified().ok());
+                        scored.push((BrowseEntry::new(path, rel, kind, size, modified), score));
+
+                        if scored.len() >= 500 { break; }
                     }
                 }
-                true
-            })
-        {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
 
-            if entry.file_type().is_dir() { continue; }
+                scored
+            }).await.unwrap_or_default();
 
-            if !show_hidden {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with('.') { continue; }
-                }
-            }
-
-            let path = entry.path().to_path_buf();
-            let kind = classify_file(&path);
-
-            if audio_only && !matches!(kind, EntryKind::AudioFile(_)) {
-                continue;
-            }
-
-            let rel = path.strip_prefix(&root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            let rel_lower = rel.to_lowercase();
-
-            let mut best_score: Option<i64> = None;
-
-            if search_filename {
-                if let Some(s) = matcher.fuzzy_match(&rel_lower, query) {
-                    best_score = Some(s);
-                }
-            }
-
-            if search_tags && matches!(kind, EntryKind::AudioFile(_)) {
-                let tag_str = build_tag_search_string(&path);
-                if !tag_str.is_empty() {
-                    if let Some(s) = matcher.fuzzy_match(&tag_str, query) {
-                        best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
-                    }
-                }
-            }
-
-            if let Some(score) = best_score {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                let modified = entry.metadata().ok()
-                    .and_then(|m| m.modified().ok());
-                scored.push((BrowseEntry::new(path, rel, kind, size, modified), score));
-
-                if scored.len() >= 500 { break; }
-            }
-        }
-
-        sort_search_results(&mut scored, self.search.sort, self.search.sort_dir);
-
-        let mut results: Vec<BrowseEntry> = Vec::new();
-        if let Some(p) = parent {
-            results.push(p);
-        }
-        results.extend(scored.into_iter().map(|(e, _)| e));
-
-        self.entries = results;
-        self.selected_index = 0;
-        self.scroll_offset = 0;
+            let _ = tx.send(super::message::AppMessage::SearchComplete { results }).await;
+        });
     }
 
     /// Reset filter state AND clear the multi-select anchor, used by navigation
@@ -1821,9 +1881,20 @@ impl Default for BrowseState {
 /// Public and screen-agnostic — usable by Browse, Library, or any
 /// future screen that needs to queue directories or mixed selections.
 /// Build a lowercase searchable string from an audio file's metadata tags.
-/// Concatenates title, artist, album, genre, year with spaces.
-/// Returns empty string if tags can't be read.
-fn build_tag_search_string(path: &Path) -> String {
+/// Uses the in-memory `tag_cache` if available, otherwise reads via lofty
+/// and populates the cache.
+fn build_tag_search_string_cached(path: &Path, tag_cache: &mut std::collections::HashMap<PathBuf, String>) -> String {
+    if let Some(cached) = tag_cache.get(path) {
+        return cached.clone();
+    }
+    let result = read_tag_string_from_file(path);
+    tag_cache.insert(path.to_path_buf(), result.clone());
+    result
+}
+
+/// Read tag string directly from a file via lofty (no cache).
+/// Used by async tasks that manage their own DB cache.
+fn read_tag_string_from_file(path: &Path) -> String {
     use lofty::file::TaggedFileExt;
     use lofty::tag::Accessor;
 
@@ -1847,7 +1918,7 @@ fn build_tag_search_string(path: &Path) -> String {
 }
 
 /// Sort scored search results by the given field and direction.
-fn sort_search_results(scored: &mut Vec<(BrowseEntry, i64)>, sort: SearchSort, dir: SortDir) {
+pub(super) fn sort_search_results(scored: &mut Vec<(BrowseEntry, i64)>, sort: SearchSort, dir: SortDir) {
     // For tag-based sorts, pre-extract the sort key to avoid repeated lofty reads.
     if sort.is_tag_sort() {
         let mut keyed: Vec<(String, usize)> = scored.iter().enumerate().map(|(i, (entry, _))| {

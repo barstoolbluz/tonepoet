@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 8;
+const CURRENT_VERSION: u32 = 9;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -88,6 +88,9 @@ impl Database {
         }
         if version < 8 {
             self.migrate_v8()?;
+        }
+        if version < 9 {
+            self.migrate_v9()?;
         }
 
         self.conn
@@ -352,6 +355,97 @@ impl Database {
             );
         ").map_err(|e| format!("v8 migration failed: {}", e))?;
         Ok(())
+    }
+
+    /// v9: search tag cache table.
+    fn migrate_v9(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS search_tag_cache (
+                file_path       TEXT PRIMARY KEY,
+                file_mtime      INTEGER NOT NULL,
+                file_size       INTEGER NOT NULL,
+                title           TEXT,
+                artist          TEXT,
+                album           TEXT,
+                genre           TEXT,
+                year            TEXT,
+                tag_string      TEXT NOT NULL,
+                last_accessed   TEXT NOT NULL
+            );
+        ").map_err(|e| format!("v9 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    // ── Search tag cache ─────────────────────────────────────────
+
+    /// Look up cached tag string. Returns (tag_string, title, artist, album, genre, year)
+    /// on hit. Updates last_accessed. Returns None if not cached or stale.
+    pub fn get_cached_tags(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: u64,
+    ) -> Option<(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> {
+        let row = self.conn.query_row(
+            "SELECT tag_string, title, artist, album, genre, year
+             FROM search_tag_cache
+             WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3",
+            params![file_path, mtime, size as i64],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            )),
+        ).ok()?;
+
+        // Update last_accessed.
+        let _ = self.conn.execute(
+            "UPDATE search_tag_cache SET last_accessed = ?1 WHERE file_path = ?2",
+            params![chrono::Utc::now().to_rfc3339(), file_path],
+        );
+
+        Some(row)
+    }
+
+    /// Store a tag string in the search cache.
+    pub fn store_cached_tags(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: u64,
+        title: Option<&str>,
+        artist: Option<&str>,
+        album: Option<&str>,
+        genre: Option<&str>,
+        year: Option<&str>,
+        tag_string: &str,
+    ) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO search_tag_cache
+             (file_path, file_mtime, file_size, title, artist, album, genre, year, tag_string, last_accessed)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                file_path, mtime, size as i64,
+                title, artist, album, genre, year,
+                tag_string,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        ).map_err(|e| format!("search tag cache store: {}", e))?;
+        Ok(())
+    }
+
+    /// Prune search tag cache entries not accessed in the last `days` days.
+    pub fn prune_search_tag_cache(&self, days: u32) {
+        let _ = self.conn.execute(
+            &format!(
+                "DELETE FROM search_tag_cache WHERE last_accessed < datetime('now', '-{} days')",
+                days
+            ),
+            [],
+        );
     }
 
     // ── Analysis cache ───────────────────────────────────────────

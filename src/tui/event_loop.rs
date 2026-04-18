@@ -32,7 +32,7 @@ pub async fn run_app(
         app.clear_expired_status();
         check_pending_browse_rename(app);
         check_batch_probe_debounce(app, &tx);
-        check_search_debounce(app);
+        check_search_debounce(app, &tx);
         // Close browse-only overlays if the user has left the browse screen.
         if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
             app.bookmarks.close_overlay();
@@ -104,7 +104,7 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
 }
 
 /// Fire a debounced search if the user has stopped typing for 200ms.
-fn check_search_debounce(app: &mut AppState) {
+fn check_search_debounce(app: &mut AppState, tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>) {
     if !app.browse.search.active {
         return;
     }
@@ -116,7 +116,7 @@ fn check_search_debounce(app: &mut AppState) {
         return;
     }
     app.browse.search.last_keystroke = None;
-    app.browse.execute_search();
+    app.browse.execute_search(Some(tx));
 }
 
 fn check_pending_browse_rename(app: &mut AppState) {
@@ -473,6 +473,28 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     app.set_status(&format!("Archive error: {}", e));
                 }
             }
+        }
+        AppMessage::SearchComplete { results } => {
+            if !app.browse.search.active {
+                return; // Search was closed while task was running.
+            }
+            app.browse.search.searching = false;
+
+            let mut scored = results;
+            super::browse::sort_search_results(
+                &mut scored,
+                app.browse.search.sort,
+                app.browse.search.sort_dir,
+            );
+
+            let mut entries: Vec<super::browse::BrowseEntry> = Vec::new();
+            if let Some(ref parent) = app.browse.parent_entry {
+                entries.push(parent.clone());
+            }
+            entries.extend(scored.into_iter().map(|(e, _)| e));
+            app.browse.entries = entries;
+            app.browse.selected_index = 0;
+            app.browse.scroll_offset = 0;
         }
         AppMessage::MetadataEditorWriteComplete { results } => {
             let total = results.len();

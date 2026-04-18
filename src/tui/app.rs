@@ -1199,7 +1199,11 @@ impl AppState {
     pub fn new(config: TonepoetConfig) -> Self {
         // Open the SQLite database FIRST — needed for queue load + other init.
         let db = match crate::db::Database::open() {
-            Ok(db) => db,
+            Ok(db) => {
+                // Prune stale search tag cache entries (>30 days old).
+                db.prune_search_tag_cache(30);
+                db
+            }
             Err(e) => {
                 log::error!("Failed to open database: {}. Using in-memory fallback.", e);
                 crate::db::Database::open_memory()

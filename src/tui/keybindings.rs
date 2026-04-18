@@ -789,7 +789,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 /// Arrow keys / page keys navigate the filtered list; everything else is
 /// fed into the text input. Enter commits, Esc cancels (restores prior filter).
 /// Handle keys when the search panel is active.
-fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use super::browse::SearchFocus;
 
     match app.browse.search.focus {
@@ -799,14 +799,14 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sende
                     app.browse.close_search();
                 }
                 KeyCode::Enter => {
-                    app.browse.execute_search();
+                    app.browse.execute_search(Some(tx));
                 }
                 KeyCode::Tab => {
                     app.browse.search.focus = SearchFocus::Recursive;
                 }
                 KeyCode::Down => {
                     // Move focus to results list.
-                    app.browse.execute_search();
+                    app.browse.execute_search(Some(tx));
                     app.browse.search.focus = super::browse::SearchFocus::Results;
                 }
                 _ => {

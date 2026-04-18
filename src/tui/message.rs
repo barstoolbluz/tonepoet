@@ -64,6 +64,10 @@ pub enum AppMessage {
         field: crate::tui::probe::MetadataField,
         result: Result<(), String>,
     },
+    /// Results of an async recursive search.
+    SearchComplete {
+        results: Vec<(crate::tui::browse::BrowseEntry, i64)>,
+    },
     /// Result of a batch metadata write from the metadata editor.
     MetadataEditorWriteComplete {
         /// Per-file results: (path, Ok or Err).
