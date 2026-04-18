@@ -1339,7 +1339,7 @@ impl BrowseState {
         let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
 
         tokio::spawn(async move {
-            let results = tokio::task::spawn_blocking(move || {
+            let results = tokio::task::spawn_blocking(move || -> Option<Vec<(BrowseEntry, i64)>> {
                 use walkdir::WalkDir;
                 use fuzzy_matcher::FuzzyMatcher;
                 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -1365,7 +1365,7 @@ impl BrowseState {
                 {
                     // Check cancel flag periodically.
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Vec::new();
+                        return None; // Cancelled — don't send results.
                     }
 
                     let entry = match entry {
@@ -1446,10 +1446,13 @@ impl BrowseState {
                     }
                 }
 
-                scored
-            }).await.unwrap_or_default();
+                Some(scored)
+            }).await.unwrap_or(None);
 
-            let _ = tx.send(super::message::AppMessage::SearchComplete { results }).await;
+            // Only send results if not cancelled.
+            if let Some(results) = results {
+                let _ = tx.send(super::message::AppMessage::SearchComplete { results }).await;
+            }
         });
     }
 

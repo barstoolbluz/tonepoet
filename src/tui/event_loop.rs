@@ -478,11 +478,6 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             if !app.browse.search.active {
                 return; // Search was closed while task was running.
             }
-            // Discard empty results from a cancelled task if another
-            // search is still in flight (prevents brief empty flash).
-            if results.is_empty() && app.browse.search.searching {
-                return;
-            }
             app.browse.search.searching = false;
 
             let mut scored = results;
