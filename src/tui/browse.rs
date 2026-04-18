@@ -1775,7 +1775,7 @@ impl Default for BrowseState {
 fn sort_search_results(scored: &mut Vec<(BrowseEntry, i64)>, sort: SearchSort, dir: SortDir) {
     scored.sort_by(|a, b| {
         let ord = match sort {
-            SearchSort::Score => a.1.cmp(&b.1).reverse(), // higher score first by default
+            SearchSort::Score => a.1.cmp(&b.1), // natural ascending; Desc default reverses to best-first
             SearchSort::Name => a.0.name_lower.cmp(&b.0.name_lower),
             SearchSort::Date => {
                 let a_time = a.0.modified.unwrap_or(std::time::UNIX_EPOCH);
