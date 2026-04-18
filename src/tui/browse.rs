@@ -1245,6 +1245,13 @@ impl BrowseState {
             // Skip directories in results (we only want files).
             if entry.file_type().is_dir() { continue; }
 
+            // Skip hidden files unless show_hidden.
+            if !show_hidden {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with('.') { continue; }
+                }
+            }
+
             let path = entry.path().to_path_buf();
             let kind = classify_file(&path);
 
@@ -1268,10 +1275,10 @@ impl BrowseState {
                 .and_then(|m| m.modified().ok());
 
             results.push(BrowseEntry::new(path, rel, kind, size, modified));
-        }
 
-        // Cap results to prevent OOM on huge trees.
-        results.truncate(500);
+            // Cap results to prevent excessive work on huge trees.
+            if results.len() >= 500 { break; }
+        }
 
         self.entries = results;
         self.selected_index = 0;
