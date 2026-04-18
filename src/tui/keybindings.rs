@@ -1662,6 +1662,7 @@ fn handle_metadata_editor_key(
                                 state.detail_cursor = 0;
                                 state.detail_scroll = 0;
                                 state.detail_edit = None;
+                                state.last_click = None;
                                 state.phase = MetadataEditorPhase::DetailEdit;
                             } else {
                                 // Single value: inline edit.
@@ -1712,6 +1713,7 @@ fn handle_metadata_editor_key(
                         state.detail_cursor = 0;
                         state.detail_scroll = 0;
                         state.detail_edit = None;
+                        state.last_click = None;
                         state.phase = MetadataEditorPhase::DetailEdit;
                     }
                 }
@@ -2320,9 +2322,11 @@ fn handle_metadata_editor_mouse(
 
                 // Detail overlay: click moves detail_cursor, double-click edits.
                 if state.phase == MetadataEditorPhase::DetailEdit {
+                    // Recalculate row using detail_scroll (not main scroll).
+                    let detail_row = (my - content_y) as usize + state.detail_scroll;
                     let header_offset = 2usize;
-                    if row >= header_offset {
-                        let file_idx = row - header_offset;
+                    if detail_row >= header_offset {
+                        let file_idx = detail_row - header_offset;
                         let n_files = state.paths.len();
                         let field_idx = state.detail_field_idx;
 
