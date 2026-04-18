@@ -1416,15 +1416,17 @@ impl BrowseState {
                             if let Some((cached, ..)) = db.get_cached_tags(&path_str, mtime, size) {
                                 cached
                             } else {
-                                let s = read_tag_string_from_file(&path);
+                                let r = read_tags_from_file(&path);
                                 let _ = db.store_cached_tags(
                                     &path_str, mtime, size,
-                                    None, None, None, None, None, &s,
+                                    r.title.as_deref(), r.artist.as_deref(),
+                                    r.album.as_deref(), r.genre.as_deref(),
+                                    r.year.as_deref(), &r.tag_string,
                                 );
-                                s
+                                r.tag_string
                             }
                         } else {
-                            read_tag_string_from_file(&path)
+                            read_tags_from_file(&path).tag_string
                         };
 
                         if !tag_str.is_empty() {
@@ -1887,34 +1889,59 @@ fn build_tag_search_string_cached(path: &Path, tag_cache: &mut std::collections:
     if let Some(cached) = tag_cache.get(path) {
         return cached.clone();
     }
-    let result = read_tag_string_from_file(path);
-    tag_cache.insert(path.to_path_buf(), result.clone());
-    result
+    let result = read_tags_from_file(path);
+    tag_cache.insert(path.to_path_buf(), result.tag_string.clone());
+    result.tag_string
 }
 
-/// Read tag string directly from a file via lofty (no cache).
-/// Used by async tasks that manage their own DB cache.
-fn read_tag_string_from_file(path: &Path) -> String {
+/// Tag data read from a file for search and cache storage.
+struct TagReadResult {
+    tag_string: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    genre: Option<String>,
+    year: Option<String>,
+}
+
+/// Read tag fields from a file via lofty. Returns concatenated search
+/// string plus individual fields for caching and sorting.
+fn read_tags_from_file(path: &Path) -> TagReadResult {
     use lofty::file::TaggedFileExt;
     use lofty::tag::Accessor;
 
     let tagged = match lofty::read_from_path(path) {
         Ok(t) => t,
-        Err(_) => return String::new(),
+        Err(_) => return TagReadResult {
+            tag_string: String::new(),
+            title: None, artist: None, album: None, genre: None, year: None,
+        },
     };
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
         Some(t) => t,
-        None => return String::new(),
+        None => return TagReadResult {
+            tag_string: String::new(),
+            title: None, artist: None, album: None, genre: None, year: None,
+        },
     };
 
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(v) = tag.title() { parts.push(v.to_string()); }
-    if let Some(v) = tag.artist() { parts.push(v.to_string()); }
-    if let Some(v) = tag.album() { parts.push(v.to_string()); }
-    if let Some(v) = tag.genre() { parts.push(v.to_string()); }
-    if let Some(y) = tag.year() { parts.push(y.to_string()); }
+    let title = tag.title().map(|s| s.to_string());
+    let artist = tag.artist().map(|s| s.to_string());
+    let album = tag.album().map(|s| s.to_string());
+    let genre = tag.genre().map(|s| s.to_string());
+    let year = tag.year().map(|y| y.to_string());
 
-    parts.join(" ").to_lowercase()
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(ref v) = title { parts.push(v); }
+    if let Some(ref v) = artist { parts.push(v); }
+    if let Some(ref v) = album { parts.push(v); }
+    if let Some(ref v) = genre { parts.push(v); }
+    if let Some(ref v) = year { parts.push(v); }
+
+    TagReadResult {
+        tag_string: parts.join(" ").to_lowercase(),
+        title, artist, album, genre, year,
+    }
 }
 
 /// Sort scored search results by the given field and direction.
