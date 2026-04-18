@@ -1263,7 +1263,9 @@ impl BrowseState {
 
                 let mut best_score: Option<i64> = None;
 
-                if search_filename {
+                // Directories always match on filename (for navigation),
+                // even in tags-only mode.
+                if search_filename || matches!(e.kind, EntryKind::Directory) {
                     if let Some(s) = matcher.fuzzy_match(&e.name_lower, query) {
                         best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                     }
