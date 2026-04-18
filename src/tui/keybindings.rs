@@ -1701,6 +1701,20 @@ fn handle_metadata_editor_key(
                     state.deleted.retain(|&i| i != state.cursor);
                     recalc_dirty(state);
                 }
+                // D = force-open detail overlay (even for non-mixed fields).
+                KeyCode::Char('D') => {
+                    if state.paths.len() > 1
+                        && state.cursor < state.entries.len()
+                        && !state.entries[state.cursor].is_binary
+                        && !state.deleted.contains(&state.cursor)
+                    {
+                        state.detail_field_idx = state.cursor;
+                        state.detail_cursor = 0;
+                        state.detail_scroll = 0;
+                        state.detail_edit = None;
+                        state.phase = MetadataEditorPhase::DetailEdit;
+                    }
+                }
                 KeyCode::Char('w') => {
                     if !state.dirty {
                         app.set_status("No changes to save");
@@ -2304,12 +2318,70 @@ fn handle_metadata_editor_mouse(
             MouseEventKind::Down(MouseButton::Left) if in_content => {
                 let row = (my - content_y) as usize + state.scroll;
 
+                // Detail overlay: click moves detail_cursor, double-click edits.
+                if state.phase == MetadataEditorPhase::DetailEdit {
+                    let header_offset = 2usize;
+                    if row >= header_offset {
+                        let file_idx = row - header_offset;
+                        let n_files = state.paths.len();
+                        let field_idx = state.detail_field_idx;
+
+                        // Confirm inline edit if active.
+                        if let Some(ref input) = state.detail_edit {
+                            let new_val = input.text.clone();
+                            if field_idx < state.entries.len() && state.detail_cursor < n_files {
+                                state.entries[field_idx].per_file_values[state.detail_cursor] = new_val;
+                                let all_same = state.entries[field_idx].per_file_values
+                                    .windows(2).all(|w| w[0] == w[1]);
+                                state.entries[field_idx].is_mixed = !all_same;
+                                let new_display = if all_same {
+                                    state.entries[field_idx].per_file_values[0].clone()
+                                } else {
+                                    "<mixed>".to_string()
+                                };
+                                state.entries[field_idx].value = new_display;
+                            }
+                            state.detail_edit = None;
+                            recalc_dirty(&mut state);
+                        }
+
+                        if file_idx < n_files {
+                            // Double-click detection.
+                            let now = std::time::Instant::now();
+                            let is_double = state.last_click
+                                .map(|(prev, t)| prev == file_idx && now.duration_since(t).as_millis() < 400)
+                                .unwrap_or(false);
+
+                            if is_double && field_idx < state.entries.len() {
+                                // Open inline edit for this file's value.
+                                let val = state.entries[field_idx].per_file_values[file_idx].clone();
+                                state.detail_edit = Some(
+                                    super::text_input::TextInputState::new(val),
+                                );
+                                state.detail_cursor = file_idx;
+                                state.last_click = None;
+                            } else {
+                                state.detail_cursor = file_idx;
+                                state.last_click = Some((file_idx, now));
+                            }
+                            ensure_detail_visible(&mut state);
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+
                 // If currently in inline edit, confirm the edit first.
                 if state.phase == MetadataEditorPhase::InlineEdit {
                     if let Some(ref input) = state.edit_input {
                         let new_val = input.text.clone();
                         if state.cursor < state.entries.len() {
-                            state.entries[state.cursor].value = new_val;
+                            let entry = &mut state.entries[state.cursor];
+                            entry.value = new_val.clone();
+                            for v in &mut entry.per_file_values {
+                                *v = new_val.clone();
+                            }
+                            entry.is_mixed = false;
                         }
                     }
                     state.edit_input = None;

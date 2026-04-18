@@ -43,7 +43,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     ("Up/k, Down/j", "Navigate entries"),
                     ("Left/h, Backspace", "Go to parent directory"),
                     ("Right/l", "Enter directory"),
-                    ("Enter", "Open file / enter dir / browse archive"),
+                    ("Enter", "Toggle select / enter dir / browse archive"),
                     ("Home/g, End/G", "Jump to top / bottom"),
                     ("PageUp, PageDown", "Page scroll"),
                 ],
@@ -55,6 +55,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     ("V", "Visual range select (move cursor to extend)"),
                     ("Esc", "Exit visual mode / clear selection"),
                     ("e", "Edit metadata for selected file(s)"),
+                    ("D", "Per-file detail view (in metadata editor)"),
                 ],
             },
             HelpSection {
