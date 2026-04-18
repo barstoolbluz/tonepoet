@@ -1916,7 +1916,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
     // Collect paths — expand directories recursively to find nested
     // audio files (e.g., disc 01/disc 02 folders).
     let sel = super::command::collect_selection_for_file_ops(app);
-    let paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
+    let mut paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
         .into_iter()
         .filter(|p| matches!(
             super::browse::classify_file(p),
@@ -1930,7 +1930,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
     }
 
     // Read and merge tags from all files.
-    let entries = match super::probe::read_all_tags_merged(&paths) {
+    let mut entries = match super::probe::read_all_tags_merged(&paths) {
         Ok(e) => e,
         Err(e) => {
             app.set_status(format!("Failed to read tags: {}", e));
@@ -1938,24 +1938,89 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     };
 
-    // Build per-file context labels: "NN filename" or just "filename".
+    // Sort files by (disc, track, filename) for logical display order.
+    if paths.len() > 1 {
+        let n = paths.len();
+
+        // Extract disc/track from merged entries, falling back to path patterns.
+        let disc_entry = entries.iter().find(|e|
+            e.display_key.to_ascii_uppercase() == "DISCNUMBER");
+        let track_entry = entries.iter().find(|e|
+            e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
+
+        let sort_keys: Vec<(u32, u32, String)> = (0..n).map(|i| {
+            let tag_disc = disc_entry
+                .and_then(|e| e.per_file_values.get(i))
+                .filter(|v| !v.is_empty())
+                .map(|v| super::probe::parse_track_disc_tag(v));
+            let tag_track = track_entry
+                .and_then(|e| e.per_file_values.get(i))
+                .filter(|v| !v.is_empty())
+                .map(|v| super::probe::parse_track_disc_tag(v));
+
+            let disc = tag_disc.unwrap_or_else(||
+                super::probe::extract_disc_from_path(&paths[i]));
+            let track = tag_track.unwrap_or_else(|| {
+                let stem = paths[i].file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("");
+                super::probe::extract_track_from_filename(stem)
+            });
+            let filename = paths[i].file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            (disc, track, filename)
+        }).collect();
+
+        // Build sort permutation.
+        let mut perm: Vec<usize> = (0..n).collect();
+        perm.sort_by(|&a, &b| sort_keys[a].cmp(&sort_keys[b]));
+
+        // Apply permutation to paths.
+        let sorted_paths: Vec<_> = perm.iter().map(|&i| paths[i].clone()).collect();
+        paths = sorted_paths;
+
+        // Apply permutation to all per_file_values and per_file_originals.
+        for entry in &mut entries {
+            let sorted_vals: Vec<_> = perm.iter().map(|&i| entry.per_file_values[i].clone()).collect();
+            let sorted_origs: Vec<_> = perm.iter().map(|&i| entry.per_file_originals[i].clone()).collect();
+            entry.per_file_values = sorted_vals;
+            entry.per_file_originals = sorted_origs;
+        }
+    }
+
+    // Build per-file context labels from sorted paths/entries.
     let file_labels: Vec<String> = {
-        // Extract track numbers from the merged entries.
-        let track_key_upper = "TRACKNUMBER";
-        let track_entry = entries.iter().find(|e| {
-            e.display_key.to_ascii_uppercase() == track_key_upper
-        });
+        let track_entry = entries.iter().find(|e|
+            e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
+        let disc_entry = entries.iter().find(|e|
+            e.display_key.to_ascii_uppercase() == "DISCNUMBER");
+        let has_multi_disc = disc_entry
+            .map(|e| {
+                let unique: std::collections::HashSet<&str> = e.per_file_values.iter()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.as_str()).collect();
+                unique.len() > 1
+            })
+            .unwrap_or(false);
+
         paths.iter().enumerate().map(|(i, p)| {
             let stem = p.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if let Some(te) = track_entry {
-                let tn = &te.per_file_values[i];
-                if !tn.is_empty() {
-                    return format!("{:>2}  {}", tn, stem);
-                }
+            let tn = track_entry
+                .and_then(|e| e.per_file_values.get(i))
+                .filter(|v| !v.is_empty());
+            let dn = if has_multi_disc {
+                disc_entry.and_then(|e| e.per_file_values.get(i))
+                    .filter(|v| !v.is_empty())
+            } else {
+                None
+            };
+            match (dn, tn) {
+                (Some(d), Some(t)) => format!("D{}.{:>2}  {}", d, t, stem),
+                (None, Some(t)) => format!("{:>2}  {}", t, stem),
+                _ => stem,
             }
-            stem
         }).collect()
     };
 

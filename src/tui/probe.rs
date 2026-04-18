@@ -527,6 +527,60 @@ pub struct TagEntry {
     pub per_file_originals: Vec<String>,
 }
 
+/// Extract a track number from a filename stem by taking leading digits.
+/// Returns 0 if no leading digits found.
+/// Examples: "01 - Foo" → 1, "Track 03" → 3, "Foo" → 0.
+pub fn extract_track_from_filename(stem: &str) -> u32 {
+    let s = stem.trim();
+    // Try leading digits first.
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        return digits.parse().unwrap_or(0);
+    }
+    // Try "Track NN" pattern.
+    let lower = s.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("track") {
+        let rest = rest.trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return digits.parse().unwrap_or(0);
+    }
+    0
+}
+
+/// Extract a disc number from a path's parent directory name.
+/// Matches patterns like "Disc 01", "CD2", "Disk 1", "d01".
+/// Returns 1 if no disc pattern found (default single-disc).
+pub fn extract_disc_from_path(path: &std::path::Path) -> u32 {
+    let parent_name = path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let lower = parent_name.to_ascii_lowercase();
+
+    // Try prefixes: "disc", "disk", "cd", "d" (in order of specificity).
+    for prefix in &["disc", "disk", "cd", "d"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let rest = rest.trim_start_matches(|c: char| c == ' ' || c == '_' || c == '-');
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+    }
+    1 // default: single disc
+}
+
+/// Parse a tag value like "1", "01", or "1/12" into a u32.
+/// Returns 0 if unparseable.
+pub fn parse_track_disc_tag(s: &str) -> u32 {
+    let s = s.trim();
+    // Handle "N/M" format (track/total or disc/total).
+    let part = s.split('/').next().unwrap_or(s).trim();
+    part.parse().unwrap_or(0)
+}
+
 /// Priority order for standard fields (displayed first, in this order).
 const STANDARD_KEY_ORDER: &[&str] = &[
     "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE", "DATE", "YEAR",
