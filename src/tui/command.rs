@@ -44,6 +44,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "rename-all", "renameall", "bulk-rename",
     "password", "pw",
     "analyze", "analysis", "dr",
+    "search", "s", "rs", "rsearch",
 ];
 
 /// Commands that take a preset name as their argument. Used by the
@@ -227,6 +228,8 @@ pub enum Command {
     BulkRename,
     /// Analyze selected audio file(s) — DR, peak, clipping, etc.
     Analyze,
+    /// Open the search panel.
+    Search { recursive: bool },
     /// Set an archive password for the selected archive in Browse.
     Password,
     Unknown(String),
@@ -303,6 +306,8 @@ pub fn parse_command(input: &str) -> Command {
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
         "rename-all" | "renameall" | "bulk-rename" => Command::BulkRename,
         "analyze" | "analysis" | "dr" => Command::Analyze,
+        "search" | "s" => Command::Search { recursive: false },
+        "rs" | "rsearch" => Command::Search { recursive: true },
         "password" | "pw" => Command::Password,
         _ => Command::Unknown(input.to_string()),
     }
@@ -694,6 +699,14 @@ pub fn execute_command(
                         });
                     }
                 }
+            }
+        }
+        Command::Search { recursive } => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":search only works on the browse screen");
+            } else {
+                app.browse.open_search();
+                app.browse.search.recursive = recursive;
             }
         }
         Command::BulkRename => {

@@ -32,6 +32,7 @@ pub async fn run_app(
         app.clear_expired_status();
         check_pending_browse_rename(app);
         check_batch_probe_debounce(app, &tx);
+        check_search_debounce(app);
         // Close browse-only overlays if the user has left the browse screen.
         if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
             app.bookmarks.close_overlay();
@@ -100,6 +101,22 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
             super::browse::spawn_audio_probe(path, tx.clone());
         }
     }
+}
+
+/// Fire a debounced search if the user has stopped typing for 200ms.
+fn check_search_debounce(app: &mut AppState) {
+    if !app.browse.search.active {
+        return;
+    }
+    let deadline = match app.browse.search.last_keystroke {
+        Some(t) => t + std::time::Duration::from_millis(200),
+        None => return,
+    };
+    if std::time::Instant::now() < deadline {
+        return;
+    }
+    app.browse.search.last_keystroke = None;
+    app.browse.execute_search();
 }
 
 fn check_pending_browse_rename(app: &mut AppState) {

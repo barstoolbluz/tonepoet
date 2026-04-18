@@ -103,6 +103,30 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
         Rect::new(type_x0, header_y, COL_TYPE_W as u16, 1),
     );
 
+    // Search toggle in the top border (right-aligned "search" label).
+    {
+        let search_label_w = if browse.search.active { 10u16 } else { 9u16 }; // " search ✓ " or " search "
+        let search_x = area.x + area.width - search_label_w - 1;
+        buttons.record_button(TuiButton::BrowseSearchToggle, Rect::new(search_x, area.y, search_label_w, 1));
+    }
+
+    // Search panel toggle pills (if search is active, rows 2-3 inside the border).
+    if browse.search.active {
+        let panel_y = area.y + 2; // row after column headers
+        // Recursive pill: right side of row 1
+        let rec_w = 13u16; // " recursive ✓ " max width
+        let rec_x = area.x + area.width - rec_w - 1;
+        buttons.record_button(TuiButton::BrowseSearchRecursive, Rect::new(rec_x, panel_y, rec_w, 1));
+
+        // Mode and AudioOnly pills: row 2
+        let panel_y2 = panel_y + 1;
+        let mode_w = 16u16; // " mode: filename " approx
+        buttons.record_button(TuiButton::BrowseSearchMode, Rect::new(area.x + 1, panel_y2, mode_w, 1));
+        let audio_w = 12u16;
+        let audio_x = area.x + 1 + mode_w + 2;
+        buttons.record_button(TuiButton::BrowseSearchAudioOnly, Rect::new(audio_x, panel_y2, audio_w, 1));
+    }
+
     // Entry rows: lines below the header row, above the bottom border.
     let content_height = (area.height as usize).saturating_sub(3); // top border + header + bottom border
     let start = browse.scroll_offset;
@@ -207,17 +231,20 @@ fn draw_browse_list(
 
     // Top border with title
     let title = " browse ";
-    let adv_label = " advanced ";
-    let dash_count = w.saturating_sub(2 + title.len() + adv_label.len() + 2);
+    let search_label = if browse.search.active { " search ✓ " } else { " search " };
+    let dash_count = w.saturating_sub(2 + title.len() + search_label.len() + 2);
 
+    let search_style = if browse.search.active {
+        Style::default().fg(theme::GREEN).add_modifier(ratatui::style::Modifier::BOLD)
+    } else {
+        theme::border(border_color)
+    };
     let top_line = Line::from(vec![
         Span::styled("┌", theme::border(border_color)),
         Span::styled(title, theme::border(border_color)),
         Span::styled("─".repeat(dash_count), theme::border(border_color)),
-        Span::raw(" "),
-        Span::styled("a", theme::muted()),
-        Span::styled("dvanced", theme::border(border_color)),
-        Span::styled(" ┐", theme::border(border_color)),
+        Span::styled(search_label, search_style),
+        Span::styled("┐", theme::border(border_color)),
     ]);
 
     let bot_line = Line::from(Span::styled(
@@ -225,9 +252,17 @@ fn draw_browse_list(
         theme::border(border_color),
     ));
 
-    // Content rows = total - top border - header - bottom border (-1 if filter row).
+    // Content rows = total - top border - header - bottom border
+    // (-1 if filter row, -2 if search panel).
     let has_filter = browse.filter_input.is_some();
-    let reserved = if has_filter { 4 } else { 3 };
+    let has_search = browse.search.active;
+    let reserved = if has_search {
+        5 // top border + header + 2 search rows + bottom border
+    } else if has_filter {
+        4
+    } else {
+        3
+    };
     let content_height = (area.height as usize).saturating_sub(reserved);
     browse.visible_height = content_height;
 
@@ -245,6 +280,63 @@ fn draw_browse_list(
         browse.sort_by,
         browse.sort_dir,
     ));
+
+    // Search panel (2 rows when active).
+    if browse.search.active {
+        // Row 1: search input + [recursive] toggle
+        let input_w = inner_w.saturating_sub(14); // room for " / " + "[recursive]" + gaps
+        let (view, _cursor_col) = browse.search.input.view(input_w);
+        let display_input = if view.is_empty() { " ".to_string() } else { view };
+
+        let rec_pill = if browse.search.recursive {
+            Span::styled(" recursive ✓ ", Style::default()
+                .fg(theme::PILL_ACTIVE_FG).bg(theme::GREEN)
+                .add_modifier(ratatui::style::Modifier::BOLD))
+        } else {
+            Span::styled(" recursive ", Style::default()
+                .fg(theme::TEXT_DIM).bg(theme::SURFACE))
+        };
+
+        let search_pad = inner_w.saturating_sub(3 + input_w + 1 + rec_pill.width());
+        lines.push(Line::from(vec![
+            Span::styled("│", theme::border(border_color)),
+            Span::styled(" / ", Style::default().fg(theme::AMBER)),
+            Span::styled(display_input, Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE)),
+            Span::raw(" ".repeat(search_pad.max(1))),
+            rec_pill,
+            Span::styled("│", theme::border(border_color)),
+        ]));
+
+        // Row 2: mode cycle + [audio] toggle
+        let mode_label = format!(" mode: {} ", browse.search.mode.label());
+        let audio_pill = if browse.search.audio_only {
+            Span::styled(" audio ✓ ", Style::default()
+                .fg(theme::PILL_ACTIVE_FG).bg(theme::GREEN)
+                .add_modifier(ratatui::style::Modifier::BOLD))
+        } else {
+            Span::styled(" all files ", Style::default()
+                .fg(theme::TEXT_DIM).bg(theme::SURFACE))
+        };
+        let status = if browse.search.searching {
+            " searching..."
+        } else if !browse.search.input.text.is_empty() {
+            ""
+        } else {
+            ""
+        };
+
+        let row2_used = 1 + mode_label.len() + 2 + audio_pill.width() + status.len() + 1;
+        let row2_pad = inner_w.saturating_sub(row2_used).max(0);
+        lines.push(Line::from(vec![
+            Span::styled("│", theme::border(border_color)),
+            Span::styled(mode_label, Style::default().fg(theme::CYAN)),
+            Span::raw("  "),
+            audio_pill,
+            Span::raw(" ".repeat(row2_pad)),
+            Span::styled(status, Style::default().fg(theme::AMBER)),
+            Span::styled("│", theme::border(border_color)),
+        ]));
+    }
 
     if let Some(err) = &browse.error {
         lines.push(bordered_line(

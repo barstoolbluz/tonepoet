@@ -90,6 +90,12 @@ pub enum TuiButton {
     BrowseInfoAnalyze,
     // Browse info pane: edit tags pill (click → open metadata editor).
     BrowseInfoEditTags,
+    // Browse list: "search" label in border (click → toggle search panel).
+    BrowseSearchToggle,
+    // Browse search panel: toggle pills.
+    BrowseSearchRecursive,
+    BrowseSearchMode,
+    BrowseSearchAudioOnly,
 }
 
 impl TuiButton {
@@ -132,7 +138,11 @@ impl TuiButton {
             | Self::BrowseList
             | Self::BrowseInfoMeta(_)
             | Self::BrowseInfoAnalyze
-            | Self::BrowseInfoEditTags => Some(AppScreen::Browse),
+            | Self::BrowseInfoEditTags
+            | Self::BrowseSearchToggle
+            | Self::BrowseSearchRecursive
+            | Self::BrowseSearchMode
+            | Self::BrowseSearchAudioOnly => Some(AppScreen::Browse),
         }
     }
 }

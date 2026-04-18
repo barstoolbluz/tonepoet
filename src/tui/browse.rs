@@ -153,6 +153,76 @@ impl FormatFilter {
     }
 }
 
+/// Search mode: what to match the query against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SearchMode {
+    Filename,
+    Tags,
+    Both,
+}
+
+impl SearchMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Filename => "filename",
+            Self::Tags => "tags",
+            Self::Both => "both",
+        }
+    }
+    pub fn cycle(&self) -> Self {
+        match self {
+            Self::Filename => Self::Tags,
+            Self::Tags => Self::Both,
+            Self::Both => Self::Filename,
+        }
+    }
+}
+
+/// Which element of the search panel has keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SearchFocus {
+    Input,
+    Recursive,
+    Mode,
+    AudioOnly,
+}
+
+/// State for the inline search panel in the browse screen.
+#[derive(Debug, Clone)]
+pub struct SearchState {
+    /// Text input for the search query.
+    pub input: super::text_input::TextInputState,
+    /// Search subdirectories recursively.
+    pub recursive: bool,
+    /// Only show audio files (default true).
+    pub audio_only: bool,
+    /// What to match against.
+    pub mode: SearchMode,
+    /// Whether the search panel is open.
+    pub active: bool,
+    /// Which element has keyboard focus.
+    pub focus: SearchFocus,
+    /// Debounce: instant of last keystroke (search fires after 200ms idle).
+    pub last_keystroke: Option<std::time::Instant>,
+    /// True while an async search is in flight.
+    pub searching: bool,
+}
+
+impl SearchState {
+    pub fn new() -> Self {
+        Self {
+            input: super::text_input::TextInputState::empty(),
+            recursive: false,
+            audio_only: true,
+            mode: SearchMode::Filename,
+            active: false,
+            focus: SearchFocus::Input,
+            last_keystroke: None,
+            searching: false,
+        }
+    }
+}
+
 /// A single entry in the browse listing
 #[derive(Debug, Clone)]
 pub struct BrowseEntry {
@@ -294,6 +364,9 @@ pub struct BrowseState {
     /// selection range from the anchor to the current cursor position.
     pub visual_mode: bool,
 
+    /// Inline search panel state.
+    pub search: SearchState,
+
     /// Filter input (when /-mode is active)
     pub filter_input: Option<TextInputState>,
     /// Committed filter text (empty = no filter)
@@ -391,6 +464,7 @@ impl BrowseState {
             multi_selected: Vec::new(),
             multi_select_anchor: None,
             visual_mode: false,
+            search: SearchState::new(),
             filter_input: None,
             filter_text: String::new(),
             filter_text_prior: None,
@@ -1066,6 +1140,72 @@ impl BrowseState {
         self.filter_text.clear();
         self.filter_input = None;
         self.filter_text_prior = None;
+    }
+
+    /// Open the search panel. Clears any active old-style filter.
+    pub fn open_search(&mut self) {
+        self.search.active = true;
+        self.search.focus = SearchFocus::Input;
+        self.search.input = TextInputState::new(String::new());
+        self.search.last_keystroke = None;
+        self.search.searching = false;
+        // Clear old filter if active.
+        self.reset_filter_state();
+    }
+
+    /// Close the search panel and restore the normal directory listing.
+    pub fn close_search(&mut self) {
+        self.search.active = false;
+        self.search.input = TextInputState::new(String::new());
+        self.search.last_keystroke = None;
+        self.search.searching = false;
+        // Restore normal listing.
+        self.apply_view_preserving_cursor();
+    }
+
+    /// Execute a non-recursive filename search on the current directory's
+    /// entries. Filters `all_dirs` + `all_files` by substring match
+    /// (case-insensitive) and writes results into `entries`.
+    pub fn execute_search(&mut self) {
+        let query = self.search.input.text.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            // Empty query: show all entries (like no filter).
+            self.apply_view_preserving_cursor();
+            return;
+        }
+
+        let mut results: Vec<BrowseEntry> = Vec::new();
+
+        // Include parent entry if it passes.
+        if let Some(ref parent) = self.parent_entry {
+            results.push(parent.clone());
+        }
+
+        // Filter dirs + files by query.
+        let check_entry = |e: &BrowseEntry| -> bool {
+            if !self.show_hidden && e.name.starts_with('.') {
+                return false;
+            }
+            if self.search.audio_only && !matches!(e.kind, EntryKind::AudioFile(_)) && !matches!(e.kind, EntryKind::Directory) {
+                return false;
+            }
+            e.name_lower.contains(&query)
+        };
+
+        for d in &self.all_dirs {
+            if check_entry(d) {
+                results.push(d.clone());
+            }
+        }
+        for f in &self.all_files {
+            if check_entry(f) {
+                results.push(f.clone());
+            }
+        }
+
+        self.entries = results;
+        self.selected_index = 0;
+        self.scroll_offset = 0;
     }
 
     /// Reset filter state AND clear the multi-select anchor, used by navigation

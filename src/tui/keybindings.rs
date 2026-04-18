@@ -40,6 +40,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
 
     // Browse filter input preempts global keys: while typing in the filter,
     // characters like `q`, `1`-`5`, `:` go to the input, not to global handlers.
+    if app.current_screen == AppScreen::Browse && app.browse.search.active {
+        handle_browse_search_key(app, key, tx);
+        return;
+    }
+
     if app.current_screen == AppScreen::Browse && app.browse.filter_input.is_some() {
         handle_browse_filter_key(app, key, tx);
         return;
@@ -715,10 +720,13 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             selection_may_have_changed = true;
         }
 
-        // Open the live text-filter input. Match both NONE and SHIFT modifiers
-        // because some terminals/layouts report `/` as a shifted char.
+        // Open the search panel (replaces old `/` filter).
         (KeyCode::Char('/'), KeyModifiers::NONE) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
-            app.browse.open_filter_input();
+            if app.browse.search.active {
+                // Already open — focus stays on input.
+            } else {
+                app.browse.open_search();
+            }
         }
 
         // Esc escalation: visual mode → multi-selection → text filter → archive
@@ -775,6 +783,71 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 /// Hybrid dispatcher used while the live text filter input is open.
 /// Arrow keys / page keys navigate the filtered list; everything else is
 /// fed into the text input. Enter commits, Esc cancels (restores prior filter).
+/// Handle keys when the search panel is active.
+fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+    use super::browse::SearchFocus;
+
+    match app.browse.search.focus {
+        SearchFocus::Input => {
+            match key.code {
+                KeyCode::Esc => {
+                    app.browse.close_search();
+                }
+                KeyCode::Enter => {
+                    app.browse.execute_search();
+                }
+                KeyCode::Tab => {
+                    app.browse.search.focus = SearchFocus::Recursive;
+                }
+                KeyCode::Down => {
+                    // Execute search and move to results.
+                    app.browse.execute_search();
+                }
+                _ => {
+                    super::text_input::handle_text_input_key(&mut app.browse.search.input, &key);
+                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
+                }
+            }
+        }
+        SearchFocus::Recursive => {
+            match key.code {
+                KeyCode::Esc => { app.browse.close_search(); }
+                KeyCode::Tab => { app.browse.search.focus = SearchFocus::Mode; }
+                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Input; }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    app.browse.search.recursive = !app.browse.search.recursive;
+                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
+                }
+                _ => {}
+            }
+        }
+        SearchFocus::Mode => {
+            match key.code {
+                KeyCode::Esc => { app.browse.close_search(); }
+                KeyCode::Tab => { app.browse.search.focus = SearchFocus::AudioOnly; }
+                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Recursive; }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    app.browse.search.mode = app.browse.search.mode.cycle();
+                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
+                }
+                _ => {}
+            }
+        }
+        SearchFocus::AudioOnly => {
+            match key.code {
+                KeyCode::Esc => { app.browse.close_search(); }
+                KeyCode::Tab => { app.browse.search.focus = SearchFocus::Input; }
+                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Mode; }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    app.browse.search.audio_only = !app.browse.search.audio_only;
+                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use super::text_input::handle_text_input_key;
 
@@ -5026,6 +5099,25 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseInfoEditTags => {
                 open_metadata_editor(app);
+            }
+            TuiButton::BrowseSearchToggle => {
+                if app.browse.search.active {
+                    app.browse.close_search();
+                } else {
+                    app.browse.open_search();
+                }
+            }
+            TuiButton::BrowseSearchRecursive => {
+                app.browse.search.recursive = !app.browse.search.recursive;
+                app.browse.search.last_keystroke = Some(std::time::Instant::now());
+            }
+            TuiButton::BrowseSearchMode => {
+                app.browse.search.mode = app.browse.search.mode.cycle();
+                app.browse.search.last_keystroke = Some(std::time::Instant::now());
+            }
+            TuiButton::BrowseSearchAudioOnly => {
+                app.browse.search.audio_only = !app.browse.search.audio_only;
+                app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
             TuiButton::BrowseList => {
                 // Catch-all for scroll routing only; ignore on left click.
