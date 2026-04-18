@@ -330,6 +330,17 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
 
                     app.analysis_results.push(*result);
                     if app.analysis_pending == 0 {
+                        // Sort results by disc/track for logical display order.
+                        {
+                            let mut result_paths: Vec<std::path::PathBuf> = app.analysis_results
+                                .iter().map(|r| r.path.clone()).collect();
+                            crate::tui::probe::sort_paths_by_track(&mut result_paths);
+                            app.analysis_results.sort_by(|a, b| {
+                                let ai = result_paths.iter().position(|p| *p == a.path).unwrap_or(usize::MAX);
+                                let bi = result_paths.iter().position(|p| *p == b.path).unwrap_or(usize::MAX);
+                                ai.cmp(&bi)
+                            });
+                        }
                         let count = app.analysis_results.len();
                         let last = &app.analysis_results[count - 1];
                         let name = last.path.file_name()
