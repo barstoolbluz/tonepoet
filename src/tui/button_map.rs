@@ -88,6 +88,8 @@ pub enum TuiButton {
     BrowseInfoMeta(crate::tui::probe::MetadataField),
     // Browse info pane: analyze pill (click → run audio analysis).
     BrowseInfoAnalyze,
+    // Browse info pane: edit tags pill (click → open metadata editor).
+    BrowseInfoEditTags,
 }
 
 impl TuiButton {
@@ -129,7 +131,8 @@ impl TuiButton {
             | Self::BrowseColumn(_)
             | Self::BrowseList
             | Self::BrowseInfoMeta(_)
-            | Self::BrowseInfoAnalyze => Some(AppScreen::Browse),
+            | Self::BrowseInfoAnalyze
+            | Self::BrowseInfoEditTags => Some(AppScreen::Browse),
         }
     }
 }

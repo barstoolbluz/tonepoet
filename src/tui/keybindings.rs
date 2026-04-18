@@ -5024,6 +5024,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 let cmd = super::command::Command::Analyze;
                 super::command::execute_command(app, cmd, tx);
             }
+            TuiButton::BrowseInfoEditTags => {
+                open_metadata_editor(app);
+            }
             TuiButton::BrowseList => {
                 // Catch-all for scroll routing only; ignore on left click.
             }

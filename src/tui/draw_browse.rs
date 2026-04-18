@@ -542,6 +542,8 @@ struct InfoContent {
     meta_field_rows: Vec<(MetadataField, usize)>,
     /// Line index of the analyze pill (if present).
     analyze_pill_row: Option<usize>,
+    /// Line index of the edit tags pill (if present).
+    edit_tags_pill_row: Option<usize>,
 }
 
 fn draw_browse_info(
@@ -581,13 +583,15 @@ fn draw_browse_info(
     // Available width for content (inside borders, after the 3-space indent)
     let content_width = w.saturating_sub(2);
     let analyze_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoAnalyze);
+    let edit_tags_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoEditTags);
     let info = if let Some(entry) = browse.selected_entry() {
-        entry_info_lines(entry, browse, content_width, analyze_hovered)
+        entry_info_lines(entry, browse, content_width, analyze_hovered, edit_tags_hovered)
     } else {
         InfoContent {
             lines: vec![vec![Span::styled("   (no selection)", theme::muted())]],
             meta_field_rows: Vec::new(),
             analyze_pill_row: None,
+            edit_tags_pill_row: None,
         }
     };
 
@@ -619,11 +623,19 @@ fn draw_browse_info(
         }
     }
 
-    // Register the analyze pill button if it fits.
+    // Register pill buttons if they fit.
     if let Some(row) = info.analyze_pill_row {
         if row < content_height {
             buttons.record_button(
                 TuiButton::BrowseInfoAnalyze,
+                Rect::new(area.x + 1, info_y_start + row as u16, (w - 2) as u16, 1),
+            );
+        }
+    }
+    if let Some(row) = info.edit_tags_pill_row {
+        if row < content_height {
+            buttons.record_button(
+                TuiButton::BrowseInfoEditTags,
                 Rect::new(area.x + 1, info_y_start + row as u16, (w - 2) as u16, 1),
             );
         }
@@ -649,6 +661,7 @@ fn entry_info_lines(
     browse: &BrowseState,
     content_width: usize,
     analyze_hovered: bool,
+    edit_tags_hovered: bool,
 ) -> InfoContent {
     // Maximum width for free-form text values: subtract the 3-space indent
     let max_value_chars = content_width.saturating_sub(3);
@@ -701,6 +714,8 @@ fn entry_info_lines(
             }
         }
         EntryKind::AudioFile(fmt) => {
+            #[allow(unused_assignments)]
+            let mut analyze_row = 0usize;
             // Show cached probe info if available
             if let Some(cached) = browse.current_cached_info() {
                 let info = &cached.source;
@@ -735,6 +750,24 @@ fn entry_info_lines(
                 lines.push(vec![
                     Span::styled("   size    ", theme::muted()),
                     Span::styled(info.size_display(), theme::text()),
+                ]);
+
+                // Analyze pill — after technical info, before metadata.
+                lines.push(vec![]);
+                analyze_row = lines.len();
+                let analyze_label = " analyze ";
+                let analyze_w = analyze_label.chars().count();
+                let analyze_pad = content_width.saturating_sub(analyze_w + 3);
+                let analyze_bg = if analyze_hovered { theme::BLUE } else { theme::PURPLE };
+                lines.push(vec![
+                    Span::raw(" ".repeat(analyze_pad)),
+                    Span::styled(
+                        analyze_label,
+                        Style::default()
+                            .fg(theme::PILL_ACTIVE_FG)
+                            .bg(analyze_bg)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
                 ]);
 
                 // Metadata tags — always show the section (with placeholders
@@ -897,26 +930,63 @@ fn entry_info_lines(
                     Span::styled("   size    ", theme::muted()),
                     Span::styled(size_str(entry.size), theme::text()),
                 ]);
+
+                // Analyze pill after basic info.
+                lines.push(vec![]);
+                let analyze_row_unprobed = lines.len();
+                let a_label = " analyze ";
+                let a_w = a_label.chars().count();
+                let a_pad = content_width.saturating_sub(a_w + 3);
+                let a_bg = if analyze_hovered { theme::BLUE } else { theme::PURPLE };
+                lines.push(vec![
+                    Span::raw(" ".repeat(a_pad)),
+                    Span::styled(
+                        a_label,
+                        Style::default()
+                            .fg(theme::PILL_ACTIVE_FG)
+                            .bg(a_bg)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                ]);
+                // Return early — no metadata to show.
+                lines.push(vec![]);
+                let et_row = lines.len();
+                let et_label = " edit tags ";
+                let et_w2 = et_label.chars().count();
+                let et_pad2 = content_width.saturating_sub(et_w2 + 3);
+                let et_bg2 = if edit_tags_hovered { theme::BLUE } else { theme::PURPLE };
+                lines.push(vec![
+                    Span::raw(" ".repeat(et_pad2)),
+                    Span::styled(
+                        et_label,
+                        Style::default()
+                            .fg(theme::PILL_ACTIVE_FG)
+                            .bg(et_bg2)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                ]);
+                return InfoContent {
+                    lines,
+                    meta_field_rows,
+                    analyze_pill_row: Some(analyze_row_unprobed),
+                    edit_tags_pill_row: Some(et_row),
+                };
             }
 
-            // Analyze pill — right-aligned, purple (brighter on hover).
+            // Edit tags pill — after metadata/RG section.
             lines.push(vec![]);
-            let analyze_row = lines.len();
-            let pill_label = " analyze ";
-            let pill_w = pill_label.chars().count();
-            let pad = content_width.saturating_sub(pill_w + 3);
-            let pill_bg = if analyze_hovered {
-                theme::BLUE
-            } else {
-                theme::PURPLE
-            };
+            let edit_tags_row = lines.len();
+            let et_label = " edit tags ";
+            let et_w = et_label.chars().count();
+            let et_pad = content_width.saturating_sub(et_w + 3);
+            let et_bg = if edit_tags_hovered { theme::BLUE } else { theme::PURPLE };
             lines.push(vec![
-                Span::raw(" ".repeat(pad)),
+                Span::raw(" ".repeat(et_pad)),
                 Span::styled(
-                    pill_label,
+                    et_label,
                     Style::default()
                         .fg(theme::PILL_ACTIVE_FG)
-                        .bg(pill_bg)
+                        .bg(et_bg)
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
             ]);
@@ -924,6 +994,7 @@ fn entry_info_lines(
                 lines,
                 meta_field_rows,
                 analyze_pill_row: Some(analyze_row),
+                edit_tags_pill_row: Some(edit_tags_row),
             };
         }
         EntryKind::Archive => {
@@ -966,6 +1037,7 @@ fn entry_info_lines(
         lines,
         meta_field_rows,
         analyze_pill_row: None,
+        edit_tags_pill_row: None,
     }
 }
 
