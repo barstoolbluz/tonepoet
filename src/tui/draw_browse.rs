@@ -752,7 +752,74 @@ fn entry_info_lines(
                     Span::styled(info.size_display(), theme::text()),
                 ]);
 
-                // Analyze pill — after technical info, before metadata.
+                // ReplayGain / R128 — shown with technical info since
+                // these are measurement data, not user-editable metadata.
+                let meta = &cached.metadata;
+                let has_rg = meta.rg_track_gain.is_some()
+                    || meta.rg_album_gain.is_some()
+                    || meta.rg_track_peak.is_some()
+                    || meta.rg_album_peak.is_some();
+                let has_r128 = meta.r128_track_gain.is_some() || meta.r128_album_gain.is_some();
+                if has_rg || has_r128 {
+                    lines.push(vec![]);
+                    let label = match (has_rg, has_r128) {
+                        (true, true) => "replaygain + r128",
+                        (true, false) => match (
+                            meta.rg_track_gain.is_some(),
+                            meta.rg_album_gain.is_some(),
+                        ) {
+                            (true, true) => "replaygain (track + album)",
+                            (false, true) => "replaygain (album)",
+                            _ => "replaygain (track)",
+                        },
+                        (false, true) => "r128",
+                        _ => "loudness",
+                    };
+                    lines.push(vec![Span::styled(
+                        format!("   {}", label),
+                        theme::muted(),
+                    )]);
+
+                    let rg_inline_max = max_value_chars.saturating_sub(11);
+                    if let Some(g) = &meta.rg_track_gain {
+                        lines.push(vec![
+                            Span::styled("   tk gain ", theme::muted()),
+                            Span::styled(truncate_to(g, rg_inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(p) = &meta.rg_track_peak {
+                        lines.push(vec![
+                            Span::styled("   tk peak ", theme::muted()),
+                            Span::styled(truncate_to(p, rg_inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(g) = &meta.rg_album_gain {
+                        lines.push(vec![
+                            Span::styled("   al gain ", theme::muted()),
+                            Span::styled(truncate_to(g, rg_inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(p) = &meta.rg_album_peak {
+                        lines.push(vec![
+                            Span::styled("   al peak ", theme::muted()),
+                            Span::styled(truncate_to(p, rg_inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(g) = &meta.r128_track_gain {
+                        lines.push(vec![
+                            Span::styled("   r128 tk ", theme::muted()),
+                            Span::styled(truncate_to(g, rg_inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(g) = &meta.r128_album_gain {
+                        lines.push(vec![
+                            Span::styled("   r128 al ", theme::muted()),
+                            Span::styled(truncate_to(g, rg_inline_max), theme::text()),
+                        ]);
+                    }
+                }
+
+                // Analyze pill — after technical info + RG, before metadata.
                 lines.push(vec![]);
                 analyze_row = lines.len();
                 let analyze_label = " analyze ";
@@ -772,7 +839,6 @@ fn entry_info_lines(
 
                 // Metadata tags — always show the section (with placeholders
                 // for absent fields) so users can click to add new tags.
-                let meta = &cached.metadata;
                 {
                     let inline_max = max_value_chars.saturating_sub(11);
                     lines.push(vec![]);
@@ -854,72 +920,6 @@ fn entry_info_lines(
                     meta_field_rows.push((MetadataField::Year, year_row));
                 }
 
-                // ReplayGain / R128 section. Only render if at least one
-                // gain field is present. The label clarifies the type.
-                let has_rg = meta.rg_track_gain.is_some()
-                    || meta.rg_album_gain.is_some()
-                    || meta.rg_track_peak.is_some()
-                    || meta.rg_album_peak.is_some();
-                let has_r128 = meta.r128_track_gain.is_some() || meta.r128_album_gain.is_some();
-                if has_rg || has_r128 {
-                    lines.push(vec![]);
-                    let label = match (has_rg, has_r128) {
-                        (true, true) => "replaygain + r128",
-                        (true, false) => match (
-                            meta.rg_track_gain.is_some(),
-                            meta.rg_album_gain.is_some(),
-                        ) {
-                            (true, true) => "replaygain (track + album)",
-                            (false, true) => "replaygain (album)",
-                            _ => "replaygain (track)",
-                        },
-                        (false, true) => "r128",
-                        _ => "loudness",
-                    };
-                    lines.push(vec![Span::styled(
-                        format!("   {}", label),
-                        theme::muted(),
-                    )]);
-
-                    let inline_max = max_value_chars.saturating_sub(11);
-
-                    if let Some(g) = &meta.rg_track_gain {
-                        lines.push(vec![
-                            Span::styled("   tk gain ", theme::muted()),
-                            Span::styled(truncate_to(g, inline_max), theme::text()),
-                        ]);
-                    }
-                    if let Some(p) = &meta.rg_track_peak {
-                        lines.push(vec![
-                            Span::styled("   tk peak ", theme::muted()),
-                            Span::styled(truncate_to(p, inline_max), theme::text()),
-                        ]);
-                    }
-                    if let Some(g) = &meta.rg_album_gain {
-                        lines.push(vec![
-                            Span::styled("   al gain ", theme::muted()),
-                            Span::styled(truncate_to(g, inline_max), theme::text()),
-                        ]);
-                    }
-                    if let Some(p) = &meta.rg_album_peak {
-                        lines.push(vec![
-                            Span::styled("   al peak ", theme::muted()),
-                            Span::styled(truncate_to(p, inline_max), theme::text()),
-                        ]);
-                    }
-                    if let Some(g) = &meta.r128_track_gain {
-                        lines.push(vec![
-                            Span::styled("   r128 tk ", theme::muted()),
-                            Span::styled(truncate_to(g, inline_max), theme::text()),
-                        ]);
-                    }
-                    if let Some(g) = &meta.r128_album_gain {
-                        lines.push(vec![
-                            Span::styled("   r128 al ", theme::muted()),
-                            Span::styled(truncate_to(g, inline_max), theme::text()),
-                        ]);
-                    }
-                }
             } else {
                 // Not yet probed or probe failed — show basic info
                 lines.push(vec![
