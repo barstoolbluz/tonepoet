@@ -417,10 +417,16 @@ fn draw_browse_list(
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
 
-    // Position the terminal cursor inside the filter input row.
-    if let Some(col_in_view) = filter_cursor {
-        let cursor_x = area.x + 1 + 3 + col_in_view; // border + " / " prefix
-        let cursor_y = area.y + area.height - 2; // row above the bottom border
+    // Position the terminal cursor inside the search input or filter input.
+    if browse.search.active && browse.search.focus == super::browse::SearchFocus::Input {
+        let input_w = inner_w.saturating_sub(14);
+        let (_, cursor_col) = browse.search.input.view(input_w);
+        let cursor_x = area.x + 1 + 3 + cursor_col; // border + " / " prefix
+        let cursor_y = area.y + 2; // top border + header + first search row
+        f.set_cursor(cursor_x, cursor_y);
+    } else if let Some(col_in_view) = filter_cursor {
+        let cursor_x = area.x + 1 + 3 + col_in_view;
+        let cursor_y = area.y + area.height - 2;
         f.set_cursor(cursor_x, cursor_y);
     }
 }

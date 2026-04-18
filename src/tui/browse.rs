@@ -185,6 +185,8 @@ pub enum SearchFocus {
     Recursive,
     Mode,
     AudioOnly,
+    /// Focus is on the results list — normal browse keys work.
+    Results,
 }
 
 /// State for the inline search panel in the browse screen.

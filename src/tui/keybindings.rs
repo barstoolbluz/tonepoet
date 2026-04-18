@@ -40,7 +40,9 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
 
     // Browse filter input preempts global keys: while typing in the filter,
     // characters like `q`, `1`-`5`, `:` go to the input, not to global handlers.
-    if app.current_screen == AppScreen::Browse && app.browse.search.active {
+    if app.current_screen == AppScreen::Browse && app.browse.search.active
+        && app.browse.search.focus != super::browse::SearchFocus::Results
+    {
         handle_browse_search_key(app, key, tx);
         return;
     }
@@ -720,10 +722,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             selection_may_have_changed = true;
         }
 
-        // Open the search panel (replaces old `/` filter).
+        // Open the search panel or refocus the input.
         (KeyCode::Char('/'), KeyModifiers::NONE) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
             if app.browse.search.active {
-                // Already open — focus stays on input.
+                // Refocus on input (e.g., from Results focus).
+                app.browse.search.focus = super::browse::SearchFocus::Input;
             } else {
                 app.browse.open_search();
             }
@@ -731,7 +734,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 
         // Esc escalation: visual mode → multi-selection → text filter → archive
         (KeyCode::Esc, _) => {
-            if app.browse.visual_mode {
+            if app.browse.search.active {
+                app.browse.close_search();
+            } else if app.browse.visual_mode {
                 app.browse.visual_mode = false;
                 app.set_status("Visual select off");
             } else if !app.browse.multi_selected.is_empty() {
@@ -800,8 +805,9 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sende
                     app.browse.search.focus = SearchFocus::Recursive;
                 }
                 KeyCode::Down => {
-                    // Execute search and move to results.
+                    // Move focus to results list.
                     app.browse.execute_search();
+                    app.browse.search.focus = super::browse::SearchFocus::Results;
                 }
                 _ => {
                     super::text_input::handle_text_input_key(&mut app.browse.search.input, &key);
@@ -844,6 +850,9 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sende
                 }
                 _ => {}
             }
+        }
+        SearchFocus::Results => {
+            // Unreachable — Results focus skips this handler entirely.
         }
     }
 }
