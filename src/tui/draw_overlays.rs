@@ -102,6 +102,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::BitCompare { scroll } => {
             draw_bit_compare(f, &app.compare_results, scroll);
         }
+        ActiveOverlay::Preemphasis { scroll } => {
+            draw_preemphasis(f, &app.preemph_results, scroll);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -1095,7 +1098,6 @@ fn draw_analysis(
         if let Some(tp) = r.true_peak_dbtp {
             extra.push(("True Peak", format!("{:.1} dBTP", tp), theme::TEXT_BRIGHT));
         }
-
         for (label, value, color) in entries.iter().chain(extra.iter()) {
             lines.push(Line::from(vec![
                 Span::styled(format!("    {:<width$}", label, width = label_w), theme::muted()),
@@ -1622,6 +1624,116 @@ fn draw_bit_compare(
     // Footer pill.
     let footer = Line::from(vec![
         footer_pill("Esc close", theme::CYAN),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
+}
+
+/// Draw the pre-emphasis detection results overlay.
+fn draw_preemphasis(
+    f: &mut Frame,
+    results: &[super::preemphasis::PreemphasisResult],
+    scroll: usize,
+) {
+    use super::preemphasis::PreemphasisConfidence;
+
+    let area = f.size();
+    let w = (area.width * 75 / 100).max(50).min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::PURPLE))
+        .title(Span::styled(
+            " Pre-emphasis Detection ",
+            Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 || results.is_empty() {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let detected = results.iter().filter(|r| r.confidence == PreemphasisConfidence::Detected).count();
+    let possible = results.iter().filter(|r| r.confidence == PreemphasisConfidence::Possible).count();
+    let mut lines: Vec<Line> = Vec::new();
+
+    let summary = if detected > 0 || possible > 0 {
+        vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(format!("{} detected", detected),
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+            Span::styled(", ", theme::muted()),
+            Span::styled(format!("{} possible", possible),
+                Style::default().fg(theme::AMBER)),
+            Span::styled(format!("  ({} total)", results.len()), theme::muted()),
+        ]
+    } else {
+        vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("Not detected in {} file(s)", results.len()),
+                Style::default().fg(theme::GREEN),
+            ),
+        ]
+    };
+    lines.push(Line::from(summary));
+    lines.push(Line::from(""));
+
+    for r in results {
+        let name = r.path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| r.path.display().to_string());
+
+        let (icon, icon_color) = match r.confidence {
+            PreemphasisConfidence::Detected => (" ✓ ", theme::RED),
+            PreemphasisConfidence::Possible => (" ? ", theme::AMBER),
+            PreemphasisConfidence::NotDetected => (" · ", theme::TEXT_DIM),
+        };
+
+        let conf_label = match r.confidence {
+            PreemphasisConfidence::Detected => "DETECTED",
+            PreemphasisConfidence::Possible => "possible",
+            PreemphasisConfidence::NotDetected => "",
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(name, Style::default().fg(theme::TEXT_BRIGHT)),
+            if !conf_label.is_empty() {
+                Span::styled(format!("  {}", conf_label), Style::default().fg(icon_color))
+            } else {
+                Span::raw("")
+            },
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled(r.detail.clone(), Style::default().fg(theme::TEXT_DIM)),
+        ]));
+    }
+
+    let total = lines.len();
+    let visible = chunks[0].height as usize;
+    let scroll = scroll.min(total.saturating_sub(visible));
+
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    let footer = Line::from(vec![
+        footer_pill("Esc close", theme::PURPLE),
     ]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),

@@ -32,6 +32,7 @@ pub mod keychain;
 pub mod keybindings;
 pub mod message;
 pub mod pill;
+pub mod preemphasis;
 pub mod presets;
 pub mod presets_overlay;
 pub mod probe;

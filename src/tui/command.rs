@@ -241,6 +241,8 @@ pub enum Command {
     ClearCompareRef,
     /// Direct comparison of two explicit paths (`:compare path1 path2`).
     ComparePaths { path1: String, path2: String },
+    /// Detect CD pre-emphasis on selected audio file(s).
+    DetectPreemphasis,
     /// Open the search panel.
     Search { recursive: bool },
     /// Set an archive password for the selected archive in Browse.
@@ -322,6 +324,7 @@ pub fn parse_command(input: &str) -> Command {
         "verify" | "test" => Command::Verify,
         "cue" => Command::GenerateCue { single_image: false },
         "cue!" => Command::GenerateCue { single_image: true },
+        "preemphasis" | "preemph" | "pe" => Command::DetectPreemphasis,
         "mark" => Command::MarkCompareRef,
         "unmark" | "clearref" => Command::ClearCompareRef,
         "compare" | "cmp" => {
@@ -937,6 +940,38 @@ pub fn execute_command(
                     let _ = tx.send(AppMessage::CompareComplete { result }).await;
                 });
                 app.set_status("Comparing...");
+            }
+        }
+        Command::DetectPreemphasis => {
+            let paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            if paths.is_empty() {
+                app.set_status("No audio files for pre-emphasis detection");
+            } else {
+                app.preemph_results.clear();
+                app.preemph_pending = paths.len();
+                for path in paths {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = super::preemphasis::detect_preemphasis(path).await;
+                        let _ = tx.send(AppMessage::PreemphasisComplete { result }).await;
+                    });
+                }
+                app.set_status(format!(
+                    "Detecting pre-emphasis on {} file(s)...",
+                    app.preemph_pending,
+                ));
             }
         }
         Command::Search { recursive } => {

@@ -378,6 +378,33 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
+        AppMessage::PreemphasisComplete { result } => {
+            app.preemph_pending = app.preemph_pending.saturating_sub(1);
+            app.preemph_results.push(result);
+            if app.preemph_pending == 0 {
+                // Sort by path for consistent display.
+                app.preemph_results.sort_by(|a, b| a.path.cmp(&b.path));
+                let detected = app.preemph_results.iter()
+                    .filter(|r| r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Detected)
+                    .count();
+                let possible = app.preemph_results.iter()
+                    .filter(|r| r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Possible)
+                    .count();
+                let total = app.preemph_results.len();
+                if detected > 0 || possible > 0 {
+                    app.set_status(format!(
+                        "Pre-emphasis: {} detected, {} possible out of {} file(s)",
+                        detected, possible, total,
+                    ));
+                } else {
+                    app.set_status(format!(
+                        "Pre-emphasis: not detected in {} file(s)",
+                        total,
+                    ));
+                }
+                app.active_overlay = super::app::ActiveOverlay::Preemphasis { scroll: 0 };
+            }
+        }
         AppMessage::CompareComplete { result } => {
             app.compare_pending = app.compare_pending.saturating_sub(1);
             app.compare_results.push(result);

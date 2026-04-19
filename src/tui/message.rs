@@ -49,6 +49,10 @@ pub enum AppMessage {
     VerifyComplete {
         result: crate::tui::verify::VerifyResult,
     },
+    /// Result of an async pre-emphasis detection scan.
+    PreemphasisComplete {
+        result: crate::tui::preemphasis::PreemphasisResult,
+    },
     /// Result of an async bit-level comparison between two audio files.
     CompareComplete {
         result: crate::tui::bit_compare::CompareResult,

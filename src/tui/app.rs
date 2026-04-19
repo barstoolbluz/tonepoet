@@ -826,6 +826,10 @@ pub enum ActiveOverlay {
     BitCompare {
         scroll: usize,
     },
+    /// Pre-emphasis detection results overlay.
+    Preemphasis {
+        scroll: usize,
+    },
 }
 
 /// Phase of the metadata editor workflow.
@@ -1141,6 +1145,12 @@ pub struct AppState {
     /// Number of verify tasks currently in flight.
     pub verify_pending: usize,
 
+    /// Pre-emphasis detection results.
+    pub preemph_results: Vec<crate::tui::preemphasis::PreemphasisResult>,
+
+    /// Number of pre-emphasis detection tasks in flight.
+    pub preemph_pending: usize,
+
     /// Reference paths for bit-compare (marked by user, persists until cleared).
     pub compare_reference: Vec<std::path::PathBuf>,
 
@@ -1311,6 +1321,8 @@ impl AppState {
             analysis_pending: 0,
             verify_results: Vec::new(),
             verify_pending: 0,
+            preemph_results: Vec::new(),
+            preemph_pending: 0,
             compare_reference: Vec::new(),
             compare_results: Vec::new(),
             compare_pending: 0,
@@ -1372,6 +1384,15 @@ impl AppState {
             let done = self.compare_results.len();
             self.status_message = Some((
                 format!("Comparing... ({}/{})", done, done + pending),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        if self.preemph_pending > 0 {
+            let pending = self.preemph_pending;
+            let done = self.preemph_results.len();
+            self.status_message = Some((
+                format!("Detecting pre-emphasis... ({}/{})", done, done + pending),
                 std::time::Instant::now(),
             ));
             return;

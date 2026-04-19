@@ -31,6 +31,11 @@ pub struct AnalysisResult {
     pub lufs: Option<f64>,
     /// True peak in dBTP (from loudgain, None if unavailable).
     pub true_peak_dbtp: Option<f64>,
+    /// CD pre-emphasis detection result (legacy; now handled by dedicated
+    /// Detect Pre-emphasis action). Kept for DB cache compatibility.
+    pub preemphasis: Option<super::preemphasis::PreemphasisConfidence>,
+    /// Pre-emphasis diagnostic value (legacy). Kept for DB cache compatibility.
+    pub preemphasis_corr: Option<f64>,
 }
 
 /// Analyze an audio file: decode to PCM and compute all metrics in one pass.
@@ -290,6 +295,8 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
         duration_secs: duration_secs.abs(),
         lufs: None,
         true_peak_dbtp: None,
+        preemphasis: None,
+        preemphasis_corr: None,
     })
 }
 

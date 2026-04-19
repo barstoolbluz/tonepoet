@@ -94,6 +94,8 @@ pub enum ContextAction {
     BitCompareWithReference,
     /// Clear the stored bit-compare reference.
     ClearCompareReference,
+    /// Detect CD pre-emphasis on selected audio file(s).
+    DetectPreemphasis,
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -215,6 +217,7 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
         item("Verify", ContextAction::Verify),
+        item("Detect pre-emphasis", ContextAction::DetectPreemphasis),
         item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
         item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
         separator(),
@@ -551,6 +554,10 @@ pub fn execute_context_action(
         }
         ContextAction::ClearCompareReference => {
             let cmd = super::command::Command::ClearCompareRef;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::DetectPreemphasis => {
+            let cmd = super::command::Command::DetectPreemphasis;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::BulkRename => {
