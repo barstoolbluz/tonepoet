@@ -56,99 +56,123 @@ const PROBE_FREQS: &[f64] = &[
 const BLOCK_SIZE: usize = 8192;
 
 /// Thresholds for spectral RMS error (dB). Lower = closer match.
-/// Without CUE evidence, spectral analysis is a screening heuristic.
-/// These thresholds are set conservatively: "Possible" casts a wide net
-/// since false positives are less harmful than missed pre-emphasis.
-const SPECTRAL_DETECTED: f64 = 2.0; // unused without CUE; kept for future refinement
-const SPECTRAL_POSSIBLE: f64 = 4.0;
+/// Without metadata/CUE evidence, spectral analysis is a screening
+/// heuristic — kept tight to minimize false positives. Most real
+/// detection comes from tag/CUE evidence; spectral is supplementary.
+const SPECTRAL_DETECTED: f64 = 1.5;
+const SPECTRAL_POSSIBLE: f64 = 2.5;
 
-// ── CUE/log file evidence ───────────────────────────────────────────
+// ── Metadata & file evidence ────────────────────────────────────────
 
-/// Check whether any CUE file in the same directory as `audio_path`
-/// contains a `FLAGS PRE` line for a track that references this file
-/// (or for any track, if the CUE is a single-image layout).
-/// Also checks EAC `.log` files for "pre-emphasis" mentions.
-fn check_cue_evidence(audio_path: &Path) -> bool {
-    let dir = match audio_path.parent() {
-        Some(d) => d,
-        None => return false,
-    };
-    let audio_name = audio_path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+/// Evidence source for pre-emphasis detection.
+#[derive(Debug, Clone)]
+pub enum PreemphasisEvidence {
+    /// PRE_EMPHASIS or PRE-EMPHASIS tag found in the audio file.
+    Tag,
+    /// COMMENT tag mentions "pre-emphasis" or similar.
+    CommentTag,
+    /// FLAGS PRE found in a CUE file in the same directory.
+    CueFile,
+    /// Pre-emphasis mentioned in an EAC/XLD log file.
+    LogFile,
+}
 
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
+impl PreemphasisEvidence {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Tag => "tag",
+            Self::CommentTag => "comment tag",
+            Self::CueFile => "CUE file",
+            Self::LogFile => "log file",
+        }
+    }
+}
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ext = path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+/// Check audio file tags for pre-emphasis indicators via lofty.
+/// Returns the evidence type if found.
+fn check_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::ItemKey;
 
-        if ext == "cue" {
-            if check_cue_file_for_preemphasis(&path, audio_name) {
-                return true;
+    let tagged = lofty::read_from_path(audio_path).ok()?;
+    for tag in tagged.tags() {
+        // Check for explicit PRE_EMPHASIS or PRE-EMPHASIS tag.
+        let pe_keys = [
+            ItemKey::Unknown("PRE_EMPHASIS".to_string()),
+            ItemKey::Unknown("PRE-EMPHASIS".to_string()),
+            ItemKey::Unknown("PREEMPHASIS".to_string()),
+            ItemKey::Unknown("pre_emphasis".to_string()),
+            ItemKey::Unknown("pre-emphasis".to_string()),
+            ItemKey::Unknown("preemphasis".to_string()),
+        ];
+        for key in &pe_keys {
+            if let Some(val) = tag.get_string(key) {
+                let v = val.trim().to_ascii_lowercase();
+                if v == "1" || v == "yes" || v == "true" {
+                    return Some(PreemphasisEvidence::Tag);
+                }
             }
-        } else if ext == "log" {
-            if check_log_file_for_preemphasis(&path) {
-                return true;
+        }
+
+        // Check COMMENT tag for "pre-emphasis" / "pre emphasis" mentions.
+        if let Some(comment) = tag.get_string(&ItemKey::Comment) {
+            let lower = comment.to_ascii_lowercase();
+            if lower.contains("pre-emphasis") || lower.contains("pre emphasis")
+                || lower.contains("preemphasis")
+            {
+                return Some(PreemphasisEvidence::CommentTag);
             }
         }
     }
-    false
+    None
 }
 
-/// Parse a CUE file looking for FLAGS PRE. Returns true if the CUE
-/// has FLAGS PRE for a track that references `audio_name`, or for any
-/// track if this is a single-image CUE (which covers all tracks).
-fn check_cue_file_for_preemphasis(cue_path: &Path, audio_name: &str) -> bool {
+/// Check CUE and log files in the directory for pre-emphasis evidence.
+/// Also checks parent directory (for disc 01/disc 02 layouts).
+fn check_file_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
+    let dir = match audio_path.parent() {
+        Some(d) => d,
+        None => return None,
+    };
+
+    // Check this directory and the parent (for disc 01/02 layouts).
+    for search_dir in [Some(dir), dir.parent()].iter().flatten() {
+        let entries = match fs::read_dir(search_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            if ext == "cue" {
+                if check_cue_file_for_preemphasis(&path) {
+                    return Some(PreemphasisEvidence::CueFile);
+                }
+            } else if ext == "log" {
+                if check_log_file_for_preemphasis(&path) {
+                    return Some(PreemphasisEvidence::LogFile);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a CUE file looking for FLAGS PRE. Returns true if any track
+/// has the pre-emphasis flag set.
+fn check_cue_file_for_preemphasis(cue_path: &Path) -> bool {
     let content = match fs::read_to_string(cue_path) {
         Ok(c) => c,
         Err(_) => return false,
     };
-
-    // Simple state machine: track the most recent FILE reference and
-    // whether we've seen FLAGS PRE in the current TRACK block.
-    let mut current_file: Option<String> = None;
-    let mut has_flags_pre = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        let upper = trimmed.to_ascii_uppercase();
-
-        if upper.starts_with("FILE ") {
-            // Extract filename from FILE "name" FORMAT
-            if let Some(start) = trimmed.find('"') {
-                if let Some(end) = trimmed[start + 1..].find('"') {
-                    current_file = Some(trimmed[start + 1..start + 1 + end].to_string());
-                }
-            }
-        } else if upper.starts_with("TRACK ") {
-            // Reset flags for new track.
-            has_flags_pre = false;
-        } else if upper.contains("FLAGS") && upper.contains("PRE") {
-            has_flags_pre = true;
-            // Check if this track's FILE matches our audio file, or
-            // if this is a single-image CUE (one FILE for all tracks).
-            if let Some(ref file) = current_file {
-                // Direct match or the CUE references a different container
-                // file (single-image). Either way, FLAGS PRE means this
-                // disc has pre-emphasis.
-                if file == audio_name || !file.is_empty() {
-                    return true;
-                }
-            } else {
-                // No FILE line yet but FLAGS PRE found — pre-emphasis.
-                return true;
-            }
-        }
-    }
-
-    has_flags_pre
+    content.lines().any(|line| {
+        let upper = line.trim().to_ascii_uppercase();
+        upper.contains("FLAGS") && upper.contains("PRE")
+    })
 }
 
 /// Check an EAC/XLD log file for pre-emphasis mentions.
@@ -165,11 +189,13 @@ fn check_log_file_for_preemphasis(log_path: &Path) -> bool {
 
 // ── Public API ──────────────────────────────────────────────────────
 
-/// Detect pre-emphasis by checking CUE/log files first, then streaming
-/// the full audio through ffmpeg for spectral analysis.
+/// Detect pre-emphasis by checking metadata/CUE/log evidence first,
+/// then streaming the full audio through ffmpeg for spectral analysis.
 pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
-    // Phase 1: Check CUE/log file evidence (fast, definitive).
-    let cue_confirmed = check_cue_evidence(&path);
+    // Phase 1: Check tag and file evidence (fast, authoritative).
+    let evidence = check_tag_evidence(&path)
+        .or_else(|| check_file_evidence(&path));
+    let cue_confirmed = evidence.is_some();
 
     // Probe for sample rate and channels.
     let info = match tokio::task::spawn_blocking({
@@ -177,22 +203,22 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
         move || crate::tui::probe::probe_audio(&p)
     }).await {
         Ok(Ok(info)) => info,
-        Ok(Err(e)) => return error_result(&path, cue_confirmed, &format!("probe: {}", e)),
-        Err(e) => return error_result(&path, cue_confirmed, &format!("probe: {}", e)),
+        Ok(Err(e)) => return error_result(&path, evidence.as_ref(), &format!("probe: {}", e)),
+        Err(e) => return error_result(&path, evidence.as_ref(), &format!("probe: {}", e)),
     };
 
     if info.sample_rate > 48000 {
+        let detail = match &evidence {
+            Some(e) => format!("{} confirmed (spectral skipped: sample rate > 48 kHz)", e.label()),
+            None => "skipped (sample rate > 48 kHz)".into(),
+        };
         return PreemphasisResult {
             path,
             confidence: if cue_confirmed { PreemphasisConfidence::Detected } else { PreemphasisConfidence::NotDetected },
             cue_confirmed,
             spectral_rms_error: f64::NAN,
             crest_improvement: 0.0,
-            detail: if cue_confirmed {
-                "CUE confirmed (spectral skipped: sample rate > 48 kHz)".into()
-            } else {
-                "skipped (sample rate > 48 kHz)".into()
-            },
+            detail,
         };
     }
 
@@ -202,7 +228,7 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
     // Spawn ffmpeg decoder.
     let mut child = match spawn_decoder(&path) {
         Ok(c) => c,
-        Err(e) => return error_result(&path, cue_confirmed, &e),
+        Err(e) => return error_result(&path, evidence.as_ref(), &e),
     };
     let mut stdout = child.stdout.take().unwrap();
 
@@ -215,7 +241,7 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
 
     if usable_freqs.len() < 5 {
         let _ = child.kill().await;
-        return error_result(&path, cue_confirmed, "too few usable probe frequencies");
+        return error_result(&path, evidence.as_ref(), "too few usable probe frequencies");
     }
 
     // Precompute Hann window and theoretical detrended curve.
@@ -363,7 +389,7 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
     // ── Compute metrics ─────────────────────────────────────────────
 
     if block_count < 10 || total_samples == 0 {
-        return error_result(&path, cue_confirmed, "insufficient audio data");
+        return error_result(&path, evidence.as_ref(), "insufficient audio data");
     }
 
     // Primary: average detrended residual vs theoretical.
@@ -399,10 +425,13 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
         PreemphasisConfidence::NotDetected
     };
 
-    let cue_tag = if cue_confirmed { "CUE confirmed, " } else { "" };
+    let evidence_tag = match &evidence {
+        Some(e) => format!("{} confirmed, ", e.label()),
+        None => String::new(),
+    };
     let detail = format!(
         "{}spectral={:.2} dB, crest={:+.2} dB, blocks={}",
-        cue_tag, spectral_rms_error, crest_improvement, block_count,
+        evidence_tag, spectral_rms_error, crest_improvement, block_count,
     );
 
     // Diagnostic dump (temporary for threshold tuning).
@@ -554,17 +583,17 @@ fn spawn_decoder(path: &Path) -> Result<tokio::process::Child, String> {
         .map_err(|e| format!("ffmpeg: {}", e))
 }
 
-fn error_result(path: &Path, cue_confirmed: bool, detail: &str) -> PreemphasisResult {
+fn error_result(path: &Path, evidence: Option<&PreemphasisEvidence>, detail: &str) -> PreemphasisResult {
+    let has_evidence = evidence.is_some();
     PreemphasisResult {
         path: path.to_path_buf(),
-        confidence: if cue_confirmed { PreemphasisConfidence::Detected } else { PreemphasisConfidence::NotDetected },
-        cue_confirmed,
+        confidence: if has_evidence { PreemphasisConfidence::Detected } else { PreemphasisConfidence::NotDetected },
+        cue_confirmed: has_evidence,
         spectral_rms_error: f64::NAN,
         crest_improvement: 0.0,
-        detail: if cue_confirmed {
-            format!("CUE confirmed; {}", detail)
-        } else {
-            detail.to_string()
+        detail: match evidence {
+            Some(e) => format!("{} confirmed; {}", e.label(), detail),
+            None => detail.to_string(),
         },
     }
 }
