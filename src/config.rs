@@ -20,6 +20,10 @@ pub struct UiConfig {
     /// enqueue only. Holding Shift inverts whichever is set.
     #[serde(default = "default_convert_action")]
     pub convert_default_action: String,
+    /// Whether to keep the bit-compare reference after a comparison completes.
+    /// false (default) = auto-clear; true = persist until manually cleared.
+    #[serde(default)]
+    pub compare_keep_reference: bool,
 }
 
 fn default_initial_screen() -> String {
@@ -35,6 +39,7 @@ impl Default for UiConfig {
         Self {
             default_screen: default_initial_screen(),
             convert_default_action: default_convert_action(),
+            compare_keep_reference: false,
         }
     }
 }

@@ -396,6 +396,9 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     ));
                 }
                 app.active_overlay = super::app::ActiveOverlay::BitCompare { scroll: 0 };
+                if !app.config.ui.compare_keep_reference {
+                    app.compare_reference.clear();
+                }
             }
         }
         AppMessage::VerifyComplete { result } => {
