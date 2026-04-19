@@ -15,7 +15,7 @@ Your task is to **replace the spectral analysis** with a precision-first suspici
 CD pre-emphasis (IEC 60908) is a first-order high-shelf filter:
 - Time constants: τ₁ = 50 µs, τ₂ = 15 µs
 - Transfer function: `H(f) = (1 + jf/f₁) / (1 + jf/f₂)` where f₁ ≈ 3183 Hz, f₂ ≈ 10610 Hz
-- Gain: 0 dB at DC, +10 dB at 20 kHz
+- Gain: 0 dB at DC, +9.5 dB at 20 kHz (asymptotic max ~+10.5 dB)
 
 When a CD was mastered with pre-emphasis but ripped without applying de-emphasis, the audio has the pre-emphasis curve baked into the PCM. The subcode flag (read from the physical CD) is how all existing tools detect this — no known tool reliably detects pre-emphasis from PCM alone.
 
