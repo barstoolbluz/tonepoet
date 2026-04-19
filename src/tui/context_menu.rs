@@ -88,6 +88,12 @@ pub enum ContextAction {
     GenerateCueMultiFile,
     /// Generate a single-image CUE sheet (one FILE, cumulative timestamps).
     GenerateCueSingleImage,
+    /// Mark current selection as the bit-compare reference.
+    MarkCompareReference,
+    /// Run bit comparison against the stored reference.
+    BitCompareWithReference,
+    /// Clear the stored bit-compare reference.
+    ClearCompareReference,
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -204,16 +210,26 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
     }
 }
 
-/// Build the "Utilities" submenu (Verify, and future items like freedb
-/// lookup, cover art extraction, etc.).
-fn build_utilities_submenu() -> ContextMenuEntry {
+/// Build the "Utilities" submenu. Compare items change based on whether
+/// a reference is currently stored.
+fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
+    let mut children = vec![
+        item("Verify", ContextAction::Verify),
+        item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
+        item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
+        separator(),
+    ];
+
+    if app.compare_reference.is_empty() {
+        children.push(item("Bit compare (mark reference)", ContextAction::MarkCompareReference));
+    } else {
+        children.push(item("Bit compare with reference", ContextAction::BitCompareWithReference));
+        children.push(item("Clear reference", ContextAction::ClearCompareReference));
+    }
+
     ContextMenuEntry::Submenu {
         label: "Utilities".to_string(),
-        children: vec![
-            item("Verify", ContextAction::Verify),
-            item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
-            item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
-        ],
+        children,
     }
 }
 
@@ -237,7 +253,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
-            items.push(build_utilities_submenu());
+            items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(true));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
@@ -260,7 +276,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open", ContextAction::OpenEntry));
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
-            items.push(build_utilities_submenu());
+            items.push(build_utilities_submenu(app));
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
             items.push(item("Select Inverse", ContextAction::SelectInverse));
@@ -523,6 +539,18 @@ pub fn execute_context_action(
         }
         ContextAction::GenerateCueSingleImage => {
             let cmd = super::command::Command::GenerateCue { single_image: true };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::MarkCompareReference => {
+            let cmd = super::command::Command::MarkCompareRef;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::BitCompareWithReference => {
+            let cmd = super::command::Command::BitCompare;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::ClearCompareReference => {
+            let cmd = super::command::Command::ClearCompareRef;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::BulkRename => {

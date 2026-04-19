@@ -49,6 +49,10 @@ pub enum AppMessage {
     VerifyComplete {
         result: crate::tui::verify::VerifyResult,
     },
+    /// Result of an async bit-level comparison between two audio files.
+    CompareComplete {
+        result: crate::tui::bit_compare::CompareResult,
+    },
     /// Result of async path validation (canonicalize + is_dir) for :cd.
     PathValidationComplete {
         input: String,

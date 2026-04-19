@@ -99,6 +99,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::Verify { scroll } => {
             draw_verify(f, &app.verify_results, scroll);
         }
+        ActiveOverlay::BitCompare { scroll } => {
+            draw_bit_compare(f, &app.compare_results, scroll);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -1508,6 +1511,117 @@ fn draw_verify(
     // Footer pill.
     let footer = Line::from(vec![
         footer_pill("Esc close", theme::GREEN),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
+}
+
+/// Draw the bit-compare results overlay.
+fn draw_bit_compare(
+    f: &mut Frame,
+    results: &[super::bit_compare::CompareResult],
+    scroll: usize,
+) {
+    let area = f.size();
+    let w = (area.width * 75 / 100).max(50).min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::CYAN))
+        .title(Span::styled(
+            " Bit Compare Results ",
+            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 || results.is_empty() {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    // Summary line.
+    let identical = results.iter().filter(|r| r.identical).count();
+    let differ = results.len() - identical;
+    let mut lines: Vec<Line> = Vec::new();
+
+    let summary_spans = if differ == 0 {
+        vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{} pair(s): all bit-identical", identical),
+                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+            ),
+        ]
+    } else {
+        vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{} identical", identical),
+                Style::default().fg(theme::GREEN),
+            ),
+            Span::styled(", ", theme::muted()),
+            Span::styled(
+                format!("{} differ", differ),
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            ),
+        ]
+    };
+    lines.push(Line::from(summary_spans));
+    lines.push(Line::from(""));
+
+    // Per-pair results.
+    for r in results {
+        let ref_name = r.ref_path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| r.ref_path.display().to_string());
+        let target_name = r.target_path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| r.target_path.display().to_string());
+
+        let (icon, icon_color) = if r.identical {
+            (" ✓ ", theme::GREEN)
+        } else {
+            (" ✗ ", theme::RED)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(ref_name, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled("  vs  ", theme::muted()),
+            Span::styled(target_name, Style::default().fg(theme::TEXT_BRIGHT)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled(
+                r.detail.clone(),
+                Style::default().fg(if r.identical { theme::TEXT_DIM } else { theme::RED }),
+            ),
+        ]));
+    }
+
+    let total = lines.len();
+    let visible = chunks[0].height as usize;
+    let scroll = scroll.min(total.saturating_sub(visible));
+
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    // Footer pill.
+    let footer = Line::from(vec![
+        footer_pill("Esc close", theme::CYAN),
     ]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),

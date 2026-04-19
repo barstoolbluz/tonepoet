@@ -378,6 +378,26 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
+        AppMessage::CompareComplete { result } => {
+            app.compare_pending = app.compare_pending.saturating_sub(1);
+            app.compare_results.push(result);
+            if app.compare_pending == 0 {
+                let identical = app.compare_results.iter().filter(|r| r.identical).count();
+                let differ = app.compare_results.len() - identical;
+                if differ == 0 {
+                    app.set_status(format!(
+                        "Compared {} pair(s): all bit-identical",
+                        identical,
+                    ));
+                } else {
+                    app.set_status(format!(
+                        "Compared {} pair(s): {} identical, {} differ",
+                        identical + differ, identical, differ,
+                    ));
+                }
+                app.active_overlay = super::app::ActiveOverlay::BitCompare { scroll: 0 };
+            }
+        }
         AppMessage::VerifyComplete { result } => {
             app.verify_pending = app.verify_pending.saturating_sub(1);
             app.verify_results.push(result);

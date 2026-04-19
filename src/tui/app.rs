@@ -822,6 +822,10 @@ pub enum ActiveOverlay {
     Verify {
         scroll: usize,
     },
+    /// Bit-compare results overlay showing identical/differ per pair.
+    BitCompare {
+        scroll: usize,
+    },
 }
 
 /// Phase of the metadata editor workflow.
@@ -1137,6 +1141,15 @@ pub struct AppState {
     /// Number of verify tasks currently in flight.
     pub verify_pending: usize,
 
+    /// Reference paths for bit-compare (marked by user, persists until cleared).
+    pub compare_reference: Vec<std::path::PathBuf>,
+
+    /// Bit-compare results from the last comparison.
+    pub compare_results: Vec<crate::tui::bit_compare::CompareResult>,
+
+    /// Number of compare tasks currently in flight.
+    pub compare_pending: usize,
+
     // Navigation
     pub current_screen: AppScreen,
     pub previous_screen: Option<AppScreen>,
@@ -1298,6 +1311,9 @@ impl AppState {
             analysis_pending: 0,
             verify_results: Vec::new(),
             verify_pending: 0,
+            compare_reference: Vec::new(),
+            compare_results: Vec::new(),
+            compare_pending: 0,
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }
@@ -1347,6 +1363,15 @@ impl AppState {
             let done = self.verify_results.len();
             self.status_message = Some((
                 format!("Verifying... ({}/{})", done, done + pending),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        if self.compare_pending > 0 {
+            let pending = self.compare_pending;
+            let done = self.compare_results.len();
+            self.status_message = Some((
+                format!("Comparing... ({}/{})", done, done + pending),
                 std::time::Instant::now(),
             ));
             return;

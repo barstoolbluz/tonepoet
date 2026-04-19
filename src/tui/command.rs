@@ -233,6 +233,14 @@ pub enum Command {
     /// Generate a CUE sheet from the selected audio files.
     /// `single_image`: false = multi-file, true = single image with cumulative timestamps.
     GenerateCue { single_image: bool },
+    /// Mark the current browse selection as the bit-compare reference.
+    MarkCompareRef,
+    /// Run bit comparison: current selection vs stored reference.
+    BitCompare,
+    /// Clear the stored bit-compare reference.
+    ClearCompareRef,
+    /// Direct comparison of two explicit paths (`:compare path1 path2`).
+    ComparePaths { path1: String, path2: String },
     /// Open the search panel.
     Search { recursive: bool },
     /// Set an archive password for the selected archive in Browse.
@@ -314,6 +322,22 @@ pub fn parse_command(input: &str) -> Command {
         "verify" | "test" => Command::Verify,
         "cue" => Command::GenerateCue { single_image: false },
         "cue!" => Command::GenerateCue { single_image: true },
+        "mark" => Command::MarkCompareRef,
+        "unmark" | "clearref" => Command::ClearCompareRef,
+        "compare" | "cmp" => {
+            // :compare path1 path2
+            let mut parts = args.splitn(2, char::is_whitespace);
+            let p1 = parts.next().unwrap_or("").trim().to_string();
+            let p2 = parts.next().unwrap_or("").trim().to_string();
+            if p1.is_empty() {
+                // No args: compare selection vs reference.
+                Command::BitCompare
+            } else if p2.is_empty() {
+                Command::Unknown(format!("compare: need two paths (got one: {})", p1))
+            } else {
+                Command::ComparePaths { path1: p1, path2: p2 }
+            }
+        }
         "search" | "s" => Command::Search { recursive: false },
         "rs" | "rsearch" => Command::Search { recursive: true },
         "password" | "pw" => Command::Password,
@@ -818,6 +842,101 @@ pub fn execute_command(
                         app.set_status(format!("CUE generation failed: {}", e));
                     }
                 }
+            }
+        }
+        Command::MarkCompareRef => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":mark only works on the browse screen");
+            } else {
+                let sel = collect_selection_for_file_ops(app);
+                let mut paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
+                    .into_iter()
+                    .filter(|p| matches!(
+                        super::browse::classify_file(p),
+                        super::browse::EntryKind::AudioFile(_)
+                    ))
+                    .collect();
+                if paths.is_empty() {
+                    app.set_status("No audio files to mark as reference");
+                } else {
+                    super::probe::sort_paths_by_track(&mut paths);
+                    let count = paths.len();
+                    app.compare_reference = paths;
+                    app.set_status(format!(
+                        "Marked {} file(s) as compare reference",
+                        count,
+                    ));
+                }
+            }
+        }
+        Command::ClearCompareRef => {
+            if app.compare_reference.is_empty() {
+                app.set_status("No compare reference set");
+            } else {
+                app.compare_reference.clear();
+                app.set_status("Compare reference cleared");
+            }
+        }
+        Command::BitCompare => {
+            if app.compare_reference.is_empty() {
+                app.set_status("No compare reference set (use :mark first)");
+            } else if app.current_screen != AppScreen::Browse {
+                app.set_status(":compare only works on the browse screen");
+            } else {
+                let sel = collect_selection_for_file_ops(app);
+                let mut targets: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
+                    .into_iter()
+                    .filter(|p| matches!(
+                        super::browse::classify_file(p),
+                        super::browse::EntryKind::AudioFile(_)
+                    ))
+                    .collect();
+                if targets.is_empty() {
+                    app.set_status("No audio files selected for comparison");
+                } else {
+                    super::probe::sort_paths_by_track(&mut targets);
+                    let refs = &app.compare_reference;
+                    if refs.len() != targets.len() {
+                        app.set_status(format!(
+                            "Reference has {} file(s) but target has {} — counts must match",
+                            refs.len(), targets.len(),
+                        ));
+                    } else {
+                        app.compare_results.clear();
+                        app.compare_pending = refs.len();
+                        for (ref_path, target_path) in refs.iter().zip(targets.iter()) {
+                            let tx = tx.clone();
+                            let rp = ref_path.clone();
+                            let tp = target_path.clone();
+                            tokio::spawn(async move {
+                                let result = super::bit_compare::compare_files(rp, tp).await;
+                                let _ = tx.send(AppMessage::CompareComplete { result }).await;
+                            });
+                        }
+                        app.set_status(format!(
+                            "Comparing {} pair(s)...",
+                            app.compare_pending,
+                        ));
+                    }
+                }
+            }
+        }
+        Command::ComparePaths { path1, path2 } => {
+            let p1 = std::path::PathBuf::from(&path1);
+            let p2 = std::path::PathBuf::from(&path2);
+            if !p1.exists() {
+                app.set_status(format!("compare: not found: {}", path1));
+            } else if !p2.exists() {
+                app.set_status(format!("compare: not found: {}", path2));
+            } else {
+                app.compare_results.clear();
+                app.compare_pending = 1;
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let result = super::bit_compare::compare_files(p1, p2).await;
+                    let _ = tx.send(AppMessage::CompareComplete { result }).await;
+                });
+                app.set_status("Comparing...");
             }
         }
         Command::Search { recursive } => {
