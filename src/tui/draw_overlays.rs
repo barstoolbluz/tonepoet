@@ -1700,14 +1700,18 @@ fn draw_preemphasis(
 
         let (icon, icon_color) = match r.confidence {
             PreemphasisConfidence::Detected => (" ✓ ", theme::RED),
+            PreemphasisConfidence::StrongCandidate => (" ✓ ", theme::AMBER),
             PreemphasisConfidence::Possible => (" ? ", theme::AMBER),
             PreemphasisConfidence::NotDetected => (" · ", theme::TEXT_DIM),
+            PreemphasisConfidence::Indeterminate => (" - ", theme::TEXT_DIM),
         };
 
         let conf_label = match r.confidence {
             PreemphasisConfidence::Detected => "DETECTED",
+            PreemphasisConfidence::StrongCandidate => "STRONG",
             PreemphasisConfidence::Possible => "possible",
             PreemphasisConfidence::NotDetected => "",
+            PreemphasisConfidence::Indeterminate => "indeterminate",
         };
 
         lines.push(Line::from(vec![

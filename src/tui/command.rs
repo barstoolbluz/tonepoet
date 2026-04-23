@@ -243,6 +243,10 @@ pub enum Command {
     ComparePaths { path1: String, path2: String },
     /// Detect CD pre-emphasis on selected audio file(s).
     DetectPreemphasis,
+    /// Train the pre-emphasis corpus model from a directory of non-PE audio.
+    TrainPreemphCorpus { path: String },
+    /// Calibrate the pre-emphasis LDA classifier from labeled PE and non-PE directories.
+    CalibratePreemphasis { pe_dir: String, non_pe_dir: String },
     /// Open the search panel.
     Search { recursive: bool },
     /// Set an archive password for the selected archive in Browse.
@@ -325,6 +329,26 @@ pub fn parse_command(input: &str) -> Command {
         "cue" => Command::GenerateCue { single_image: false },
         "cue!" => Command::GenerateCue { single_image: true },
         "preemphasis" | "preemph" | "pe" => Command::DetectPreemphasis,
+        "preemph-calibrate" | "pe-calibrate" => {
+            let mut parts = args.splitn(2, char::is_whitespace);
+            let pe_dir = parts.next().unwrap_or("").trim().to_string();
+            let non_pe_dir = parts.next().unwrap_or("").trim().to_string();
+            if pe_dir.is_empty() || non_pe_dir.is_empty() {
+                Command::Unknown("usage: :preemph-calibrate <pe_dir> <non_pe_dir>".into())
+            } else {
+                Command::CalibratePreemphasis { pe_dir, non_pe_dir }
+            }
+        }
+        "preemph-train" | "pe-train" | "train-corpus" => {
+            let path = if args.is_empty() {
+                dirs::home_dir()
+                    .map(|h| h.join("preemph-dev").to_string_lossy().to_string())
+                    .unwrap_or_else(|| "~/preemph-dev".to_string())
+            } else {
+                args.to_string()
+            };
+            Command::TrainPreemphCorpus { path }
+        }
         "mark" => Command::MarkCompareRef,
         "unmark" | "clearref" => Command::ClearCompareRef,
         "compare" | "cmp" => {
@@ -972,6 +996,39 @@ pub fn execute_command(
                     "Detecting pre-emphasis on {} file(s)...",
                     app.preemph_pending,
                 ));
+            }
+        }
+        Command::TrainPreemphCorpus { path } => {
+            let scan_path = std::path::PathBuf::from(&path);
+            if !scan_path.is_dir() {
+                app.set_status(format!("Not a directory: {}", path));
+            } else {
+                let tx = tx.clone();
+                app.set_status(format!("Training corpus from {}...", path));
+                tokio::spawn(async move {
+                    let result = super::preemphasis::corpus::train_corpus_from_dir(&scan_path).await;
+                    let _ = tx.send(super::message::AppMessage::CorpusTrainComplete {
+                        result: result.map(|m| (m.n_tracks, m.n_frames)),
+                    }).await;
+                });
+            }
+        }
+        Command::CalibratePreemphasis { pe_dir, non_pe_dir } => {
+            let pe_path = std::path::PathBuf::from(&pe_dir);
+            let non_pe_path = std::path::PathBuf::from(&non_pe_dir);
+            if !pe_path.is_dir() {
+                app.set_status(format!("Not a directory: {}", pe_dir));
+            } else if !non_pe_path.is_dir() {
+                app.set_status(format!("Not a directory: {}", non_pe_dir));
+            } else {
+                let tx = tx.clone();
+                app.set_status(format!("Calibrating pre-emphasis detector..."));
+                tokio::spawn(async move {
+                    let result = super::preemphasis::corpus::calibrate(&pe_path, &non_pe_path).await;
+                    let _ = tx.send(super::message::AppMessage::CalibrationComplete {
+                        result: result.map(|r| (r.n_pe, r.n_non_pe, r.cv_accuracy, r.cv_fpr, r.threshold)),
+                    }).await;
+                });
             }
         }
         Command::Search { recursive } => {

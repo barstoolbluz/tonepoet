@@ -42,3 +42,4 @@ trash = "4"
 humansize = "2"
 ffmpeg-next = "7.1"
 rusqlite = { version = "0.39", features = ["bundled"] }
+rustfft = "6"

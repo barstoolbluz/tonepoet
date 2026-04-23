@@ -405,6 +405,32 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 app.active_overlay = super::app::ActiveOverlay::Preemphasis { scroll: 0 };
             }
         }
+        AppMessage::CorpusTrainComplete { result } => {
+            match result {
+                Ok((n_tracks, n_frames)) => {
+                    app.set_status(format!(
+                        "Corpus trained: {} tracks, {} frames",
+                        n_tracks, n_frames,
+                    ));
+                }
+                Err(e) => {
+                    app.set_status(format!("Corpus training failed: {}", e));
+                }
+            }
+        }
+        AppMessage::CalibrationComplete { result } => {
+            match result {
+                Ok((n_pe, n_non_pe, accuracy, fpr, threshold)) => {
+                    app.set_status(format!(
+                        "Calibrated: {:.1}% accuracy, {:.1}% FPR, threshold={:.3} ({} PE + {} non-PE)",
+                        accuracy * 100.0, fpr * 100.0, threshold, n_pe, n_non_pe,
+                    ));
+                }
+                Err(e) => {
+                    app.set_status(format!("Calibration failed: {}", e));
+                }
+            }
+        }
         AppMessage::CompareComplete { result } => {
             app.compare_pending = app.compare_pending.saturating_sub(1);
             app.compare_results.push(result);

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 10;
+const CURRENT_VERSION: u32 = 13;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -94,6 +94,15 @@ impl Database {
         }
         if version < 10 {
             self.migrate_v10()?;
+        }
+        if version < 11 {
+            self.migrate_v11()?;
+        }
+        if version < 12 {
+            self.migrate_v12()?;
+        }
+        if version < 13 {
+            self.migrate_v13()?;
         }
 
         self.conn
@@ -390,6 +399,50 @@ impl Database {
         Ok(())
     }
 
+    /// v11: add preemph_corpus table for spectral scorer model storage.
+    fn migrate_v11(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS preemph_corpus (
+                id          INTEGER PRIMARY KEY DEFAULT 1,
+                n_frames    INTEGER NOT NULL,
+                n_tracks    INTEGER NOT NULL,
+                mean        BLOB NOT NULL,
+                covariance  BLOB NOT NULL,
+                pca         BLOB NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+        ").map_err(|e| format!("v11 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    /// v12: add empirical PE template column to preemph_corpus.
+    fn migrate_v12(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            ALTER TABLE preemph_corpus ADD COLUMN pe_template BLOB;
+        ").map_err(|e| format!("v12 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    /// v13: add preemph_classifier table for trained LDA classifier storage.
+    fn migrate_v13(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS preemph_classifier (
+                id              INTEGER PRIMARY KEY DEFAULT 1,
+                weights         BLOB NOT NULL,
+                bias            REAL NOT NULL,
+                threshold       REAL NOT NULL,
+                feature_impute  BLOB NOT NULL,
+                feature_means   BLOB NOT NULL,
+                feature_stds    BLOB NOT NULL,
+                cv_accuracy     REAL,
+                cv_fpr          REAL,
+                cv_precision    REAL,
+                trained_at      TEXT NOT NULL
+            );
+        ").map_err(|e| format!("v13 migration failed: {}", e))?;
+        Ok(())
+    }
+
     // ── Search tag cache ─────────────────────────────────────────
 
     /// Look up cached tag string. Returns (tag_string, title, artist, album, genre, year)
@@ -487,6 +540,7 @@ impl Database {
             |row| {
                 let preemph_int: Option<i32> = row.get(12)?;
                 let preemphasis = match preemph_int {
+                    Some(3) => Some(crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate),
                     Some(2) => Some(crate::tui::preemphasis::PreemphasisConfidence::Detected),
                     Some(1) => Some(crate::tui::preemphasis::PreemphasisConfidence::Possible),
                     _ => None,
@@ -535,8 +589,10 @@ impl Database {
                 r.duration_secs, r.lufs, r.true_peak_dbtp,
                 r.preemphasis.as_ref().and_then(|p| match p {
                     crate::tui::preemphasis::PreemphasisConfidence::Detected => Some(2i32),
+                    crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate => Some(3i32),
                     crate::tui::preemphasis::PreemphasisConfidence::Possible => Some(1i32),
                     crate::tui::preemphasis::PreemphasisConfidence::NotDetected => None,
+                    crate::tui::preemphasis::PreemphasisConfidence::Indeterminate => None,
                 }),
                 r.preemphasis_corr,
                 chrono::Utc::now().to_rfc3339(),
@@ -1197,6 +1253,222 @@ pub fn systemtime_to_unix(t: std::time::SystemTime) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+// ── Pre-emphasis corpus model storage ──────────────────────────────
+
+impl Database {
+    /// Load the pre-emphasis corpus model from the database.
+    pub fn load_preemph_corpus(&self) -> Result<crate::tui::preemphasis::corpus::CorpusModel, String> {
+        use crate::tui::preemphasis::stft::NUM_BANDS;
+
+        let (n_frames, n_tracks, mean_blob, cov_blob, pca_blob, pe_tmpl_blob): (i64, i64, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>) =
+            self.conn.query_row(
+                "SELECT n_frames, n_tracks, mean, covariance, pca, pe_template FROM preemph_corpus WHERE id = 1",
+                [],
+                |row| Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                )),
+            ).map_err(|_| "no corpus model found (run :preemph-train)".to_string())?;
+
+        // Deserialize mean (31 x f64 LE).
+        if mean_blob.len() != NUM_BANDS * 8 {
+            return Err("corrupt corpus mean blob".into());
+        }
+        let mut mean = [0.0f64; NUM_BANDS];
+        for k in 0..NUM_BANDS {
+            mean[k] = f64::from_le_bytes(mean_blob[k*8..(k+1)*8].try_into().unwrap());
+        }
+
+        // Deserialize covariance (31x31 x f64 LE).
+        let cov_size = NUM_BANDS * NUM_BANDS;
+        if cov_blob.len() != cov_size * 8 {
+            return Err("corrupt corpus covariance blob".into());
+        }
+        let mut covariance = vec![0.0f64; cov_size];
+        for i in 0..cov_size {
+            covariance[i] = f64::from_le_bytes(cov_blob[i*8..(i+1)*8].try_into().unwrap());
+        }
+
+        // Deserialize PCA components (N x 31 x f64 LE).
+        let pca_component_bytes = NUM_BANDS * 8;
+        if pca_blob.len() % pca_component_bytes != 0 {
+            return Err("corrupt corpus PCA blob".into());
+        }
+        let num_components = pca_blob.len() / pca_component_bytes;
+        let mut pca_components = Vec::with_capacity(num_components);
+        for c in 0..num_components {
+            let mut pc = [0.0f64; NUM_BANDS];
+            let offset = c * pca_component_bytes;
+            for k in 0..NUM_BANDS {
+                pc[k] = f64::from_le_bytes(pca_blob[offset + k*8..offset + (k+1)*8].try_into().unwrap());
+            }
+            pca_components.push(pc);
+        }
+
+        // Deserialize empirical PE template if present.
+        let empirical_pe_template = pe_tmpl_blob.and_then(|blob| {
+            if blob.len() != NUM_BANDS * 8 { return None; }
+            let mut tmpl = [0.0f64; NUM_BANDS];
+            for k in 0..NUM_BANDS {
+                tmpl[k] = f64::from_le_bytes(blob[k*8..(k+1)*8].try_into().ok()?);
+            }
+            Some(tmpl)
+        });
+
+        Ok(crate::tui::preemphasis::corpus::CorpusModel {
+            mean,
+            covariance,
+            pca_components,
+            empirical_pe_template,
+            n_frames: n_frames as u64,
+            n_tracks: n_tracks as u64,
+        })
+    }
+
+    /// Store (or replace) the pre-emphasis corpus model.
+    pub fn store_preemph_corpus(&self, model: &crate::tui::preemphasis::corpus::CorpusModel) -> Result<(), String> {
+        use crate::tui::preemphasis::stft::NUM_BANDS;
+
+        // Serialize mean.
+        let mut mean_blob = Vec::with_capacity(NUM_BANDS * 8);
+        for &v in &model.mean {
+            mean_blob.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Serialize covariance.
+        let mut cov_blob = Vec::with_capacity(model.covariance.len() * 8);
+        for &v in &model.covariance {
+            cov_blob.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Serialize PCA components.
+        let mut pca_blob = Vec::with_capacity(model.pca_components.len() * NUM_BANDS * 8);
+        for pc in &model.pca_components {
+            for &v in pc {
+                pca_blob.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        // Serialize empirical PE template if present.
+        let pe_tmpl_blob: Option<Vec<u8>> = model.empirical_pe_template.map(|tmpl| {
+            let mut blob = Vec::with_capacity(NUM_BANDS * 8);
+            for &v in &tmpl {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob
+        });
+
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO preemph_corpus (id, n_frames, n_tracks, mean, covariance, pca, pe_template, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                model.n_frames as i64,
+                model.n_tracks as i64,
+                mean_blob,
+                cov_blob,
+                pca_blob,
+                pe_tmpl_blob,
+                now,
+            ],
+        ).map_err(|e| format!("store corpus: {}", e))?;
+        Ok(())
+    }
+
+    /// Load the trained pre-emphasis LDA classifier from the database.
+    pub fn load_preemph_classifier(&self) -> Result<crate::tui::preemphasis::scoring::LdaClassifier, String> {
+        use crate::tui::preemphasis::scoring::NUM_FEATURES;
+
+        let (weights_blob, bias, threshold, impute_blob, means_blob, stds_blob):
+            (Vec<u8>, f64, f64, Vec<u8>, Vec<u8>, Vec<u8>) =
+            self.conn.query_row(
+                "SELECT weights, bias, threshold, feature_impute, feature_means, feature_stds
+                 FROM preemph_classifier WHERE id = 1",
+                [],
+                |row| Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                )),
+            ).map_err(|_| "no trained classifier found (run :preemph-calibrate)".to_string())?;
+
+        let expected_len = NUM_FEATURES * 8;
+        if weights_blob.len() != expected_len
+            || impute_blob.len() != expected_len
+            || means_blob.len() != expected_len
+            || stds_blob.len() != expected_len
+        {
+            return Err("corrupt classifier blob".into());
+        }
+
+        let mut weights = [0.0f64; NUM_FEATURES];
+        let mut feature_impute = [0.0f64; NUM_FEATURES];
+        let mut feature_means = [0.0f64; NUM_FEATURES];
+        let mut feature_stds = [0.0f64; NUM_FEATURES];
+
+        for i in 0..NUM_FEATURES {
+            weights[i] = f64::from_le_bytes(weights_blob[i*8..(i+1)*8].try_into().unwrap());
+            feature_impute[i] = f64::from_le_bytes(impute_blob[i*8..(i+1)*8].try_into().unwrap());
+            feature_means[i] = f64::from_le_bytes(means_blob[i*8..(i+1)*8].try_into().unwrap());
+            feature_stds[i] = f64::from_le_bytes(stds_blob[i*8..(i+1)*8].try_into().unwrap());
+        }
+
+        Ok(crate::tui::preemphasis::scoring::LdaClassifier {
+            weights,
+            bias,
+            threshold,
+            feature_impute,
+            feature_means,
+            feature_stds,
+        })
+    }
+
+    /// Store (or replace) the trained pre-emphasis LDA classifier.
+    pub fn store_preemph_classifier(
+        &self,
+        classifier: &crate::tui::preemphasis::scoring::LdaClassifier,
+        cv_accuracy: f64,
+        cv_fpr: f64,
+        cv_precision: f64,
+    ) -> Result<(), String> {
+        use crate::tui::preemphasis::scoring::NUM_FEATURES;
+
+        let serialize = |arr: &[f64; NUM_FEATURES]| -> Vec<u8> {
+            let mut blob = Vec::with_capacity(NUM_FEATURES * 8);
+            for &v in arr { blob.extend_from_slice(&v.to_le_bytes()); }
+            blob
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO preemph_classifier
+             (id, weights, bias, threshold, feature_impute, feature_means, feature_stds,
+              cv_accuracy, cv_fpr, cv_precision, trained_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                serialize(&classifier.weights),
+                classifier.bias,
+                classifier.threshold,
+                serialize(&classifier.feature_impute),
+                serialize(&classifier.feature_means),
+                serialize(&classifier.feature_stds),
+                cv_accuracy,
+                cv_fpr,
+                cv_precision,
+                now,
+            ],
+        ).map_err(|e| format!("store classifier: {}", e))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

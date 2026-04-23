@@ -53,6 +53,14 @@ pub enum AppMessage {
     PreemphasisComplete {
         result: crate::tui::preemphasis::PreemphasisResult,
     },
+    /// Result of corpus training completion.
+    CorpusTrainComplete {
+        result: Result<(u64, u64), String>, // (n_tracks, n_frames)
+    },
+    /// Result of LDA classifier calibration.
+    CalibrationComplete {
+        result: Result<(usize, usize, f64, f64, f64), String>, // (n_pe, n_non_pe, accuracy, fpr, threshold)
+    },
     /// Result of an async bit-level comparison between two audio files.
     CompareComplete {
         result: crate::tui::bit_compare::CompareResult,
