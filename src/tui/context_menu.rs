@@ -217,7 +217,6 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
         item("Verify", ContextAction::Verify),
-        item("Detect pre-emphasis", ContextAction::DetectPreemphasis),
         item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
         item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
         separator(),
