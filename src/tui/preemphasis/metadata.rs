@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 
 /// Evidence source for pre-emphasis detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PreemphasisEvidence {
     /// PRE_EMPHASIS or PRE-EMPHASIS tag found in the audio file.
     Tag,
@@ -18,6 +18,10 @@ pub enum PreemphasisEvidence {
     CueFile,
     /// Pre-emphasis mentioned in an EAC/XLD log file.
     LogFile,
+    /// Catalog number exactly matches a known PE pressing.
+    CatalogExact,
+    /// Catalog number matches a known PE series (but not an exact title).
+    CatalogSeries,
 }
 
 impl PreemphasisEvidence {
@@ -27,6 +31,8 @@ impl PreemphasisEvidence {
             Self::CommentTag => "comment tag",
             Self::CueFile => "CUE file",
             Self::LogFile => "log file",
+            Self::CatalogExact => "catalog match",
+            Self::CatalogSeries => "catalog series",
         }
     }
 }

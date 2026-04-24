@@ -12,6 +12,7 @@
 //!    beats both M0 and M1 by a clear margin.
 
 pub mod metadata;
+pub mod catalog;
 pub mod iir;
 pub mod stft;
 pub mod frame_select;
@@ -92,7 +93,25 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
         };
     }
 
-    // Phase 2: Spectral model comparison.
+    // Phase 2: Catalog-number matching (fast, semi-authoritative).
+    if let Some(catalog_match) = catalog::check_catalog_evidence(&path) {
+        return PreemphasisResult {
+            path,
+            confidence: catalog_match.confidence,
+            cue_confirmed: catalog_match.confidence == PreemphasisConfidence::Detected,
+            llr_m2_vs_m0: f64::NAN,
+            llr_m2_vs_m1: f64::NAN,
+            fitted_alpha: f64::NAN,
+            frames_scored: 0,
+            deemph_distance_delta: 0.0,
+            gates_fired: vec![],
+            detail: catalog_match.detail,
+            spectral_rms_error: 0.0,
+            crest_improvement: 0.0,
+        };
+    }
+
+    // Phase 3: Spectral model comparison.
     match run_spectral_scorer(&path).await {
         Ok(result) => result,
         Err(e) => {
