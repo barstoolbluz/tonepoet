@@ -253,12 +253,21 @@ async fn run_spectral_scorer(path: &PathBuf) -> Result<PreemphasisResult, String
         &format!("{:?}", verdict.confidence),
     );
 
-    let detail = format!(
-        "z={:.2}, α={:.3}, r={:.3}, Δd={:.2}, frames={}, gates=[{}]",
+    // Log raw diagnostics for debugging (visible with RUST_LOG=debug).
+    log::debug!(
+        "spectral PE: z={:.2}, α={:.3}, r={:.3}, Δd={:.2}, frames={}, gates=[{}]",
         model_scores.z_score, model_scores.alpha, model_scores.pe_correlation,
         deemph_delta, selected.frames.len(),
         verdict.gates_fired.join(", "),
     );
+
+    // User-facing detail: concise verdict without raw numbers.
+    let detail = match verdict.confidence {
+        PreemphasisConfidence::Possible | PreemphasisConfidence::StrongCandidate =>
+            "spectral analysis suggests pre-emphasis boost may be present".to_string(),
+        _ =>
+            "spectral analysis did not find pre-emphasis evidence".to_string(),
+    };
 
     Ok(PreemphasisResult {
         path: path.clone(),

@@ -1749,30 +1749,6 @@ fn draw_preemphasis(
         ]));
     }
 
-    // Spectral analysis legend (only shown when any result has spectral data).
-    let has_spectral = results.iter().any(|r| r.fitted_alpha.is_finite());
-    if has_spectral {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Spectral analysis legend",
-            Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
-        )));
-        let legend = [
-            ("\u{03B1} (alpha)", "PE template projection. Positive = spectrum matches pre-emphasis curve."),
-            ("r", "Correlation with PE curve shape. Positive = PE-like spectral profile."),
-            ("\u{0394}d (delta-d)", "Virtual de-emphasis improvement. Positive = de-emphasis normalizes the spectrum."),
-            ("z", "Whitened matched-filter score combining the above with corpus statistics."),
-            ("frames", "Number of qualifying low-level frames used for scoring."),
-            ("gates", "Conditions that suppress a positive verdict (few frames, unstable signal, etc)."),
-        ];
-        for (key, desc) in &legend {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<12}", key), Style::default().fg(theme::AMBER)),
-                Span::styled(*desc, Style::default().fg(theme::TEXT_DIM)),
-            ]));
-        }
-    }
-
     let total = lines.len();
     let visible = chunks[0].height as usize;
     let scroll = scroll.min(total.saturating_sub(visible));
