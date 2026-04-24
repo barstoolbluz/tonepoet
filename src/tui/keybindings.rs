@@ -55,8 +55,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
     // Global keys (except in Wizard mode)
     if app.current_screen != AppScreen::Wizard {
         match (key.code, key.modifiers) {
-            // Quit is ONLY available via `:q` / `:quit` command mode — no bare-letter
-            // quit key to prevent accidental exits.
+            // Quit via Ctrl+Q (intentional modifier prevents accidental exits).
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+                app.should_quit = true;
+                return;
+            }
             (KeyCode::Char('1'), KeyModifiers::NONE) => {
                 app.current_screen = AppScreen::Browse;
                 app.browse.probe_current_with_db(tx, Some(&app.db));
