@@ -1,13 +1,15 @@
 //! Catalog-number-based pre-emphasis detection.
 //!
-//! Matches catalog numbers from audio tags or folder names against:
-//! 1. A database of exact known-PE catalog numbers (→ Detected)
-//! 2. Regex patterns for known PE series (→ Possible)
+//! Catalog numbers are gathered from audio tags and folder names, normalized,
+//! and matched against:
+//! 1. A database of exact known-PE catalog numbers (Detected)
+//! 2. Catalog-number families associated with possible PE pressings (Possible)
 //!
 //! Source: https://www.studio-nibble.com/cd/index.php?title=Pre-emphasis_(release_list)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
 use lazy_static::lazy_static;
 use regex::Regex;
 
@@ -24,113 +26,501 @@ pub struct CatalogMatch {
     pub detail: String,
 }
 
-// ── Catalog extraction ─────────────────────────────────────────────
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CatalogSource {
+    Tag,
+    Folder,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CatalogCandidate {
+    raw: String,
+    normalized: String,
+    source: CatalogSource,
+}
+
+impl CatalogSource {
+    fn label(self) -> &'static str {
+        match self {
+            CatalogSource::Tag => "audio tag",
+            CatalogSource::Folder => "folder name",
+        }
+    }
+}
+
+// -- Catalog extraction -------------------------------------------------------
 
 lazy_static! {
-    /// Regex to extract catalog numbers from folder names.
-    /// Matches Japanese and international catalog patterns.
-    static ref CATALOG_EXTRACT: Regex = Regex::new(concat!(
-        r"(?i)(",
-        r"35DP[-\s·]?\d{1,3}",          // CBS/Sony Japan 35DP
-        r"|50DP[-\s·]?\d{1,3}",          // CBS/Sony Japan 50DP (doubles)
-        r"|32DP[-\s·]?\d{1,3}",          // CBS/Sony Japan 32DP
-        r"|35DC[-\s·]?\d{1,3}",          // CBS/Sony Japan classical
-        r"|56DC[-\s·]?\d{1,3}",          // CBS/Sony Japan classical doubles
-        r"|35DH[-\s·]?\d{1,3}",          // CBS/Sony Japan 35DH
-        r"|35[·.]?8P[-\s·]?\d{1,3}",    // Epic-Sony Japan 35.8P
-        r"|CP35[-\s·]?\d{4}",            // Toshiba-EMI Japan
-        r"|CP32[-\s·]?\d{4}",            // Chrysalis/Toshiba Japan
-        r"|38XB[-\s·]?\d+",              // A&M Japan
-        r"|32PD[-\s·]?\d+",              // Philips Japan
-        r"|20VD[-\s·]?\d+",              // Victor Japan
-        r"|32JC[-\s·]?\d+",              // Japan Record
-        r"|CDV[-\s]?\d{4,5}",            // UK Virgin CDV
-        r"|CSCS[-\s·]?\d{4}",            // CBS/Sony Japan reissue
-        r"|SRCS[-\s·]?\d{4}",            // Sony Japan reissue
-        r"|ESCA[-\s·]?\d{4}",            // Epic/Sony Japan
-        r"|AGCD[-\s·]?\d{3,4}",          // American Gramaphone
-        r"|CK[-\s]?\d{5}",               // US Columbia CK
-        r"|EK[-\s]?\d{5}",               // US Epic EK
-        r"|ZK[-\s]?\d{5}",               // US Columbia ZK
-        r"|Facd[-\s]?\d+",               // Factory Records
-        r"|FIEND\s?CD[-\s]?\d+",         // Demon Records
+    /// Catalog-like tokens found in tag text or folder names.
+    ///
+    /// The regex finds candidates only. Every hit is checked for text
+    /// boundaries, normalized, deduplicated, and then matched against exact
+    /// catalog data or normalized series patterns.
+    static ref CATALOG_CANDIDATE: Regex = Regex::new(concat!(
+        r"(?ix)(",
+        // Long or more specific prefixes first.
+        r"35[\s·.]?8P[-\s·.]?[0-9](?:[-\s·.]?[0-9]){0,2}",
+        r"|CDEPC[-\s·.]?[0-9](?:[-\s·.]?[0-9]){4}",
+        r"|CDCBS[-\s·.]?[0-9](?:[-\s·.]?[0-9]){4}",
+        r"|FIEND[-\s·.]*CD[-\s·.]?[0-9]+",
+        r"|ROTA[-\s·.]*CD[-\s·.]?[0-9]+",
+        r"|DIX[-\s·.]*CD[-\s·.]?[0-9]+",
+        r"|LXHCD[-\s·.]?[0-9]+",
+        r"|CDID[-\s·.]?[0-9](?:[-\s·.]?[0-9]){0,2}",
+        r"|CDFA[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|CDP[-\s·.]?[0-9](?:[-\s·.]?[0-9]){5,6}",
+        r"|MCAD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|MCD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){4}[-\s·.]?MD",
+        r"|JRCD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|SNEG[-\s·.]?[0-9](?:[-\s·.]?[0-9]){2}",
+        r"|FACD[-\s·.]?[0-9]+",
+        r"|AGCD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){2,3}",
+        r"|CSCS[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|SRCS[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|ESCA[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|CP35[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|CP32[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|35DP[-\s·.]?[0-9](?:[-\s·.]?[0-9]){0,2}",
+        r"|50DP[-\s·.]?[0-9](?:[-\s·.]?[0-9]){0,2}",
+        r"|32DP[-\s·.]?[0-9](?:[-\s·.]?[0-9]){0,2}",
+        r"|35DC[-\s·.]?[0-9](?:[-\s·.]?[0-9]){0,2}",
+        r"|56DC[-\s·.]?[0-9](?:[-\s·.]?[0-9]){0,2}",
+        r"|35DH[-\s·.]?[0-9](?:[-\s·.]?[0-9]){0,2}",
+        r"|38XB[-\s·.]?[0-9]+",
+        r"|32PD[-\s·.]?[0-9]+",
+        r"|20VD[-\s·.]?[0-9]+",
+        r"|32JC[-\s·.]?[0-9]+",
+        r"|CDV[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3,4}",
+        r"|CCD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|BCD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|VJD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){4}",
+        r"|VSD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        r"|ND[-\s·.]?[0-9](?:[-\s·.]?[0-9]){4}",
+        r"|CK[-\s·.]?[0-9](?:[-\s·.]?[0-9]){4}",
+        r"|EK[-\s·.]?[0-9](?:[-\s·.]?[0-9]){4}",
+        r"|ZK[-\s·.]?[0-9](?:[-\s·.]?[0-9]){4}",
+        r"|CD[-\s·.]?[0-9](?:[-\s·.]?[0-9]){3}",
+        // Numeric-only catalog numbers are kept only when their normalized
+        // token exists in the exact catalog map. The optional suffix covers
+        // forms such as 8296632Y1 without creating partial matches.
+        r"|[0-9](?:[-\s.]?[0-9]){3,}(?:[-\s.]?[A-Z][0-9]?)?",
         r")"
-    )).unwrap();
+    ))
+    .unwrap();
 }
 
 /// Normalize a catalog number for database lookup.
-/// Strips spaces, dashes, dots, and converts to uppercase.
+/// Removes punctuation and spacing, then uppercases ASCII letters.
 fn normalize_catalog(raw: &str) -> String {
     raw.chars()
-        .filter(|c| c.is_alphanumeric())
+        .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
-        .to_uppercase()
+        .to_ascii_uppercase()
 }
 
-/// Extract a catalog number from the parent folder name.
-fn extract_catalog_from_folder(audio_path: &Path) -> Option<String> {
-    let parent = audio_path.parent()?;
-    let folder_name = parent.file_name()?.to_str()?;
-    CATALOG_EXTRACT.find(folder_name).map(|m| m.as_str().to_string())
+fn previous_char(text: &str, byte_index: usize) -> Option<char> {
+    text[..byte_index].chars().next_back()
 }
 
-/// Extract a catalog number from the audio file's tags.
-fn extract_catalog_from_tags(audio_path: &Path) -> Option<String> {
-    use lofty::file::TaggedFileExt;
-    use lofty::tag::ItemKey;
+fn next_char(text: &str, byte_index: usize) -> Option<char> {
+    text[byte_index..].chars().next()
+}
 
-    let tagged = lofty::read_from_path(audio_path).ok()?;
-    for tag in tagged.tags() {
-        // Try standard CatalogNumber key.
-        if let Some(val) = tag.get_string(&ItemKey::CatalogNumber) {
-            let v = val.trim();
-            if !v.is_empty() { return Some(v.to_string()); }
-        }
-        // Try freeform CATALOGNUMBER.
-        if let Some(val) = tag.get_string(&ItemKey::Unknown("CATALOGNUMBER".to_string())) {
-            let v = val.trim();
-            if !v.is_empty() { return Some(v.to_string()); }
+fn next_char_after_first(text: &str, byte_index: usize) -> Option<char> {
+    let mut chars = text[byte_index..].chars();
+    chars.next()?;
+    chars.next()
+}
+
+fn next_ascii_token(text: &str, byte_index: usize) -> Option<&str> {
+    let mut token_start = None;
+
+    for (offset, c) in text[byte_index..].char_indices() {
+        if !c.is_whitespace() {
+            token_start = Some(byte_index + offset);
+            break;
         }
     }
+
+    let start = token_start?;
+
+    if !text[start..].chars().next()?.is_ascii_alphanumeric() {
+        return None;
+    }
+
+    let mut end = text.len();
+    for (offset, c) in text[start..].char_indices() {
+        if !c.is_ascii_alphanumeric() {
+            end = start + offset;
+            break;
+        }
+    }
+
+    Some(&text[start..end])
+}
+
+fn is_probable_cd_year(token: &str) -> bool {
+    token.len() == 4
+        && token.as_bytes().iter().all(|b| b.is_ascii_digit())
+        && (&token[..2] == "19" || &token[..2] == "20")
+}
+
+fn starts_with_ascii_digit(token: &str) -> bool {
+    token.as_bytes().first().map_or(false, |b| b.is_ascii_digit())
+}
+
+fn is_probable_space_separated_suffix(token: &str) -> bool {
+    let bytes = token.as_bytes();
+
+    match bytes.len() {
+        // Common matrix/suffix notation after a catalog can be written as a
+        // separate single letter: "35DP-25 A". Treat that as continuation
+        // rather than ordinary prose.
+        1 => bytes[0].is_ascii_alphabetic(),
+        // Also reject compact letter-digit or digit-letter suffixes such as
+        // "A1" or "1A" without rejecting two-letter country/context tokens
+        // like "UK".
+        2 => {
+            bytes.iter().all(|b| b.is_ascii_alphanumeric())
+                && bytes.iter().any(|b| b.is_ascii_alphabetic())
+                && bytes.iter().any(|b| b.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+fn has_catalog_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let before_ok = previous_char(text, start).map_or(true, |c| !c.is_ascii_alphanumeric());
+    if !before_ok {
+        return false;
+    }
+
+    match next_char(text, end) {
+        None => true,
+        Some(c) if c.is_ascii_alphanumeric() => false,
+        // Reject immediate suffixes such as CDV-2192.1 and CDV-2192-A.
+        // Treat punctuation followed by whitespace as terminal punctuation.
+        Some('-' | '.' | '·') => match next_char_after_first(text, end) {
+            None => true,
+            Some(c) if c.is_whitespace() => true,
+            Some(c) => !c.is_ascii_alphanumeric(),
+        },
+        // Reject whitespace-separated numeric continuations such as 35DP 123 4
+        // and short suffix codes such as 35DP-25 A or 35DP-25 A1. Allow
+        // ordinary release-year context such as 35DP-25 1982 Japan.
+        Some(c) if c.is_whitespace() => match next_ascii_token(text, end) {
+            None => true,
+            Some(token) if is_probable_cd_year(token) => true,
+            Some(token) if is_probable_space_separated_suffix(token) => false,
+            Some(token) => !starts_with_ascii_digit(token),
+        },
+        Some(_) => true,
+    }
+}
+
+fn trimmed_match_end_before_probable_year(text: &str, start: usize, end: usize) -> Option<usize> {
+    for (offset, c) in text[start..end].char_indices().rev() {
+        if !c.is_whitespace() {
+            continue;
+        }
+
+        let candidate_end = start + offset;
+        let candidate_raw = text[start..candidate_end].trim_end();
+        if candidate_raw.is_empty() {
+            continue;
+        }
+
+        let Some(token) = next_ascii_token(text, candidate_end) else {
+            continue;
+        };
+        if !is_probable_cd_year(token) {
+            continue;
+        }
+
+        if candidate_is_usable(&normalize_catalog(candidate_raw)) {
+            return Some(candidate_end);
+        }
+    }
+
     None
 }
 
-// ── Public API ─────────────────────────────────────────────────────
+fn has_trailing_short_suffix_on_usable_base(raw: &str, normalized: &str) -> bool {
+    let raw = raw.trim();
+
+    for (offset, c) in raw.char_indices().rev() {
+        if !(c.is_whitespace() || matches!(c, '-' | '.' | '·')) {
+            continue;
+        }
+
+        let suffix_start = offset + c.len_utf8();
+        let suffix = raw[suffix_start..].trim();
+        if suffix.len() != 1 || !suffix.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+            return false;
+        }
+
+        let base = raw[..offset].trim_end();
+        if base.is_empty() {
+            return false;
+        }
+
+        let base_normalized = normalize_catalog(base);
+        if base_normalized == normalized || base_normalized.is_empty() {
+            return false;
+        }
+
+        return candidate_is_usable(&base_normalized);
+    }
+
+    false
+}
+
+fn candidate_is_usable(normalized: &str) -> bool {
+    if normalized.is_empty() {
+        return false;
+    }
+
+    KNOWN_PE_EXACT.contains_key(normalized)
+        || KNOWN_PE_SERIES
+            .iter()
+            .any(|(pattern, _)| pattern.is_match(normalized))
+}
+
+fn push_candidate(
+    candidates: &mut Vec<CatalogCandidate>,
+    seen: &mut HashSet<String>,
+    raw: &str,
+    source: CatalogSource,
+) {
+    let raw = raw.trim();
+    let normalized = normalize_catalog(raw);
+
+    if has_trailing_short_suffix_on_usable_base(raw, &normalized) {
+        return;
+    }
+
+    if !candidate_is_usable(&normalized) {
+        return;
+    }
+
+    if seen.insert(normalized.clone()) {
+        candidates.push(CatalogCandidate {
+            raw: raw.to_string(),
+            normalized,
+            source,
+        });
+    }
+}
+
+fn extract_catalog_candidates_from_text(text: &str, source: CatalogSource) -> Vec<CatalogCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    for hit in CATALOG_CANDIDATE.find_iter(text) {
+        if has_catalog_boundaries(text, hit.start(), hit.end()) {
+            push_candidate(&mut candidates, &mut seen, hit.as_str(), source);
+            continue;
+        }
+
+        // Some family patterns allow grouped digits. In a folder like
+        // "Asia 35DP-25 1982 Japan", a greedy match may consume the first
+        // digit of the year as "35DP-25 1". Recover the shorter candidate
+        // only when the skipped text is a plausible CD-era year and the
+        // shorter normalized catalog is known.
+        if let Some(trimmed_end) =
+            trimmed_match_end_before_probable_year(text, hit.start(), hit.end())
+        {
+            if has_catalog_boundaries(text, hit.start(), trimmed_end) {
+                push_candidate(
+                    &mut candidates,
+                    &mut seen,
+                    &text[hit.start()..trimmed_end],
+                    source,
+                );
+            }
+        }
+    }
+
+    candidates
+}
+
+fn tag_value_candidates(value: &str, source: CatalogSource) -> Vec<CatalogCandidate> {
+    let mut candidates = extract_catalog_candidates_from_text(value, source);
+
+    // Also check the full tag value after normalization. This covers catalog
+    // values whose punctuation is unusual but whose normalized value is known.
+    let mut seen = candidates
+        .iter()
+        .map(|candidate| candidate.normalized.clone())
+        .collect::<HashSet<_>>();
+    push_candidate(&mut candidates, &mut seen, value, source);
+
+    candidates
+}
+
+fn catalog_candidates_from_folder(audio_path: &Path) -> Vec<CatalogCandidate> {
+    let Some(parent) = audio_path.parent() else {
+        return Vec::new();
+    };
+    let Some(folder_name) = parent.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+
+    extract_catalog_candidates_from_text(folder_name, CatalogSource::Folder)
+}
+
+fn catalog_candidates_from_tags(audio_path: &Path) -> Vec<CatalogCandidate> {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::ItemKey;
+
+    let Ok(tagged) = lofty::read_from_path(audio_path) else {
+        return Vec::new();
+    };
+
+    // Unknown tag keys are matched by exact key string in lofty, so keep a
+    // broad set of common spelling and case variants.
+    let freeform_keys = [
+        "CATALOGNUMBER",
+        "CatalogNumber",
+        "catalognumber",
+        "CATALOG_NUMBER",
+        "Catalog_Number",
+        "catalog_number",
+        "CATALOG NO",
+        "Catalog No",
+        "catalog no",
+        "CATALOGNO",
+        "CatalogNo",
+        "catalogno",
+        "CATALOG #",
+        "Catalog #",
+        "catalog #",
+        "CATALOG",
+        "Catalog",
+        "catalog",
+        "CATNO",
+        "CatNo",
+        "catno",
+        "CAT NO",
+        "Cat No",
+        "cat no",
+        "CATALOGUE NUMBER",
+        "Catalogue Number",
+        "catalogue number",
+        "CATALOGUE NO",
+        "Catalogue No",
+        "catalogue no",
+        "CATALOGUE_NO",
+        "Catalogue_No",
+        "catalogue_no",
+        "CATALOGUE",
+        "Catalogue",
+        "catalogue",
+    ];
+
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    for tag in tagged.tags() {
+        let mut values = Vec::new();
+
+        if let Some(value) = tag.get_string(&ItemKey::CatalogNumber) {
+            values.push(value);
+        }
+
+        for key in freeform_keys {
+            if let Some(value) = tag.get_string(&ItemKey::Unknown(key.to_string())) {
+                values.push(value);
+            }
+        }
+
+        for value in values {
+            for candidate in tag_value_candidates(value, CatalogSource::Tag) {
+                if seen.insert(candidate.normalized.clone()) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn catalog_candidates(audio_path: &Path) -> Vec<CatalogCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    for candidate in catalog_candidates_from_tags(audio_path)
+        .into_iter()
+        .chain(catalog_candidates_from_folder(audio_path))
+    {
+        if seen.insert(candidate.normalized.clone()) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+}
+
+// -- Public API ---------------------------------------------------------------
 
 /// Check if the audio file's catalog number matches a known PE pressing.
 ///
 /// Returns:
-/// - `CatalogExact` + `Detected` for exact catalog+title matches
+/// - `CatalogExact` + `Detected` for exact catalog matches
 /// - `CatalogSeries` + `Possible` for catalog numbers in known PE series
 /// - `None` if no catalog match
 pub fn check_catalog_evidence(audio_path: &Path) -> Option<CatalogMatch> {
-    // Try tag first, then folder name.
-    let raw_catalog = extract_catalog_from_tags(audio_path)
-        .or_else(|| extract_catalog_from_folder(audio_path))?;
+    let candidates = catalog_candidates(audio_path);
+    best_catalog_match(&candidates)
+}
 
-    let normalized = normalize_catalog(&raw_catalog);
-    if normalized.is_empty() { return None; }
+fn best_catalog_match(candidates: &[CatalogCandidate]) -> Option<CatalogMatch> {
+    // Confidence wins over source order: any exact catalog match beats any
+    // series-family match, even when the series candidate appeared earlier.
+    // Within the same confidence tier, preserve candidate discovery order.
+    candidates
+        .iter()
+        .find_map(match_exact_catalog_candidate)
+        .or_else(|| candidates.iter().find_map(match_series_catalog_candidate))
+}
 
-    // Check exact match.
-    if let Some(&(artist, title)) = KNOWN_PE_EXACT.get(normalized.as_str()) {
-        let detail = format!("catalog {} matches known PE pressing: {} - {}", &raw_catalog, artist, title);
-        return Some(CatalogMatch {
-            evidence: PreemphasisEvidence::CatalogExact,
-            confidence: PreemphasisConfidence::Detected,
-            catalog_number: raw_catalog,
-            series_name: None,
-            detail,
-        });
-    }
+fn match_catalog_candidate(candidate: CatalogCandidate) -> Option<CatalogMatch> {
+    match_exact_catalog_candidate(&candidate).or_else(|| match_series_catalog_candidate(&candidate))
+}
 
-    // Check series match.
+fn match_exact_catalog_candidate(candidate: &CatalogCandidate) -> Option<CatalogMatch> {
+    let &(artist, title) = KNOWN_PE_EXACT.get(candidate.normalized.as_str())?;
+    let detail = format!(
+        "catalog {} from {} matches known PE pressing: {} - {}",
+        candidate.raw,
+        candidate.source.label(),
+        artist,
+        title
+    );
+
+    Some(CatalogMatch {
+        evidence: PreemphasisEvidence::CatalogExact,
+        confidence: PreemphasisConfidence::Detected,
+        catalog_number: candidate.raw.clone(),
+        series_name: None,
+        detail,
+    })
+}
+
+fn match_series_catalog_candidate(candidate: &CatalogCandidate) -> Option<CatalogMatch> {
     for (pattern, series_name) in KNOWN_PE_SERIES.iter() {
-        if pattern.is_match(&raw_catalog) {
-            let detail = format!("catalog {} matches PE series: {}", &raw_catalog, series_name);
+        if pattern.is_match(candidate.normalized.as_str()) {
+            let detail = format!(
+                "catalog {} from {} matches PE series: {}",
+                candidate.raw,
+                candidate.source.label(),
+                series_name
+            );
             return Some(CatalogMatch {
                 evidence: PreemphasisEvidence::CatalogSeries,
                 confidence: PreemphasisConfidence::Possible,
-                catalog_number: raw_catalog,
+                catalog_number: candidate.raw.clone(),
                 series_name: Some(series_name.to_string()),
                 detail,
             });
@@ -140,22 +530,52 @@ pub fn check_catalog_evidence(audio_path: &Path) -> Option<CatalogMatch> {
     None
 }
 
-// ── Known PE series (regex patterns → Possible) ────────────────────
+// -- Known PE series (normalized regex patterns -> Possible) -----------------
 
 lazy_static! {
     static ref KNOWN_PE_SERIES: Vec<(Regex, &'static str)> = vec![
-        (Regex::new(r"(?i)^35DP[-\s·]?\d{1,3}$").unwrap(), "Japan CBS/Sony 35DP"),
-        (Regex::new(r"(?i)^50DP[-\s·]?\d{1,3}$").unwrap(), "Japan CBS/Sony 50DP (doubles)"),
-        (Regex::new(r"(?i)^32DP[-\s·]?\d{1,3}$").unwrap(), "Japan CBS/Sony 32DP"),
-        (Regex::new(r"(?i)^35DC[-\s·]?\d{1,3}$").unwrap(), "Japan CBS/Sony 35DC (classical)"),
-        (Regex::new(r"(?i)^56DC[-\s·]?\d{1,3}$").unwrap(), "Japan CBS/Sony 56DC (classical doubles)"),
-        (Regex::new(r"(?i)^35DH[-\s·]?\d{1,3}$").unwrap(), "Japan CBS/Sony 35DH"),
-        (Regex::new(r"(?i)^35[·.]?8P[-\s·]?\d{1,3}$").unwrap(), "Japan Epic-Sony 35.8P"),
-        (Regex::new(r"(?i)^CP35[-\s·]?3\d{3}$").unwrap(), "Japan Toshiba-EMI CP35-3xxx"),
-        (Regex::new(r"(?i)^CP32[-\s·]?5\d{3}$").unwrap(), "Japan Chrysalis/Toshiba CP32-5xxx"),
-        (Regex::new(r"(?i)^38XB[-\s·]?\d+$").unwrap(), "Japan A&M 38XB"),
-        (Regex::new(r"(?i)^CDV[-\s]?\d{4,5}$").unwrap(), "UK Virgin CDV"),
-        (Regex::new(r"(?i)^AGCD[-\s·]?\d{3,4}$").unwrap(), "American Gramaphone AGCD"),
+        (
+            Regex::new(r"^35DP[0-9]{1,3}$").unwrap(),
+            "Japan CBS/Sony 35DP"
+        ),
+        (
+            Regex::new(r"^50DP[0-9]{1,3}$").unwrap(),
+            "Japan CBS/Sony 50DP (doubles)"
+        ),
+        (
+            Regex::new(r"^32DP[0-9]{1,3}$").unwrap(),
+            "Japan CBS/Sony 32DP"
+        ),
+        (
+            Regex::new(r"^35DC[0-9]{1,3}$").unwrap(),
+            "Japan CBS/Sony 35DC (classical)"
+        ),
+        (
+            Regex::new(r"^56DC[0-9]{1,3}$").unwrap(),
+            "Japan CBS/Sony 56DC (classical doubles)"
+        ),
+        (
+            Regex::new(r"^35DH[0-9]{1,3}$").unwrap(),
+            "Japan CBS/Sony 35DH"
+        ),
+        (
+            Regex::new(r"^358P[0-9]{1,3}$").unwrap(),
+            "Japan Epic-Sony 35.8P"
+        ),
+        (
+            Regex::new(r"^CP353[0-9]{3}$").unwrap(),
+            "Japan Toshiba-EMI CP35-3xxx"
+        ),
+        (
+            Regex::new(r"^CP325[0-9]{3}$").unwrap(),
+            "Japan Chrysalis/Toshiba CP32-5xxx"
+        ),
+        (Regex::new(r"^38XB[0-9]+$").unwrap(), "Japan A&M 38XB"),
+        (Regex::new(r"^CDV[0-9]{4,5}$").unwrap(), "UK Virgin CDV"),
+        (
+            Regex::new(r"^AGCD[0-9]{3,4}$").unwrap(),
+            "American Gramaphone AGCD"
+        ),
     ];
 }
 
@@ -402,12 +822,28 @@ lazy_static! {
 mod tests {
     use super::*;
 
+    fn candidate(raw: &str) -> CatalogCandidate {
+        CatalogCandidate {
+            raw: raw.to_string(),
+            normalized: normalize_catalog(raw),
+            source: CatalogSource::Tag,
+        }
+    }
+
+    fn normalized_candidates(input: &str) -> Vec<String> {
+        extract_catalog_candidates_from_text(input, CatalogSource::Folder)
+            .into_iter()
+            .map(|candidate| candidate.normalized)
+            .collect()
+    }
+
     #[test]
     fn test_normalize_catalog() {
         assert_eq!(normalize_catalog("35DP-25"), "35DP25");
         assert_eq!(normalize_catalog("35.8P-002"), "358P002");
         assert_eq!(normalize_catalog("CP32-5090"), "CP325090");
         assert_eq!(normalize_catalog("CDV 2192"), "CDV2192");
+        assert_eq!(normalize_catalog("  ck 08163  "), "CK08163");
     }
 
     #[test]
@@ -420,60 +856,245 @@ mod tests {
     }
 
     #[test]
-    fn test_series_match() {
-        // 35DP-999 is not in the exact database but matches the 35DP series.
-        let raw = "35DP-999";
-        let matched = KNOWN_PE_SERIES.iter().any(|(pat, _)| pat.is_match(raw));
-        assert!(matched, "35DP-999 should match 35DP series");
+    fn test_series_match_uses_normalized_catalogs() {
+        let cases = [
+            "35DP-999",
+            "35DP 999",
+            "35.8P-7",
+            "358P-7",
+            "CP35-3016",
+            "CDV 2192",
+            "AGCD-355",
+        ];
 
-        // 35.8P with unicode dot should match.
-        let raw = "35·8P-7";
-        let matched = KNOWN_PE_SERIES.iter().any(|(pat, _)| pat.is_match(raw));
-        assert!(matched, "35·8P-7 should match 35.8P series");
+        for raw in cases {
+            let normalized = normalize_catalog(raw);
+            let matched = KNOWN_PE_SERIES
+                .iter()
+                .any(|(pattern, _)| pattern.is_match(normalized.as_str()));
+            assert!(matched, "{raw} should match after normalization");
+        }
 
-        // 35.8P with ASCII dot should match.
-        let raw = "35.8P-7";
-        let matched = KNOWN_PE_SERIES.iter().any(|(pat, _)| pat.is_match(raw));
-        assert!(matched, "35.8P-7 should match 35.8P series");
-
-        // CP35-3016 should match (3xxx prefix).
-        let raw = "CP35-3016";
-        let matched = KNOWN_PE_SERIES.iter().any(|(pat, _)| pat.is_match(raw));
-        assert!(matched, "CP35-3016 should match CP35-3xxx series");
-
-        // CP35-2016 should NOT match (not 3xxx).
-        let raw = "CP35-2016";
-        let matched = KNOWN_PE_SERIES.iter().any(|(pat, _)| pat.is_match(raw));
-        assert!(!matched, "CP35-2016 should not match CP35-3xxx series");
-
-        // CDV2192 (no space) should match.
-        let raw = "CDV2192";
-        let matched = KNOWN_PE_SERIES.iter().any(|(pat, _)| pat.is_match(raw));
-        assert!(matched, "CDV2192 should match UK Virgin CDV series");
-
-        // MFSL should not match any series.
-        let raw = "MFSL";
-        let matched = KNOWN_PE_SERIES.iter().any(|(pat, _)| pat.is_match(raw));
-        assert!(!matched, "MFSL should not match any PE series");
-
-        // 35DP-1234 (4 digits) should NOT match (series allows 1-3 digits).
-        let raw = "35DP-1234";
-        let matched = KNOWN_PE_SERIES.iter().any(|(pat, _)| pat.is_match(raw));
-        assert!(!matched, "35DP-1234 should not match (too many digits)");
+        let rejected = ["CP35-2016", "MFSL", "35DP-1234"];
+        for raw in rejected {
+            let normalized = normalize_catalog(raw);
+            let matched = KNOWN_PE_SERIES
+                .iter()
+                .any(|(pattern, _)| pattern.is_match(normalized.as_str()));
+            assert!(!matched, "{raw} should not match");
+        }
     }
 
     #[test]
-    fn test_catalog_extract_regex() {
-        let cases = vec![
-            ("Japan  CBS-Sony 35DP-25", Some("35DP-25")),
-            ("Japan  Epic-Sony 35.8P-7", Some("35.8P-7")),
-            ("Japan  CP32-5090", Some("CP32-5090")),
-            ("MFSL UltraDisc UHR", None),
-            ("Japan  A&M Records 38XB-2", Some("38XB-2")),
+    fn test_catalog_extracts_expected_candidates() {
+        let cases = [
+            ("Japan CBS-Sony 35DP-25", vec!["35DP25"]),
+            ("Japan Epic-Sony 35.8P-7", vec!["358P7"]),
+            ("Japan CP32-5090", vec!["CP325090"]),
+            ("Japan A&M Records 38XB-2", vec!["38XB2"]),
+            ("UK Virgin CDV 2192", vec!["CDV2192"]),
+            ("Columbia CK 08163", vec!["CK08163"]),
+            ("Pet Shop Boys CDP 746271", vec!["CDP746271"]),
         ];
+
         for (input, expected) in cases {
-            let found = CATALOG_EXTRACT.find(input).map(|m| m.as_str());
-            assert_eq!(found, expected, "Failed for input: {}", input);
+            assert_eq!(normalized_candidates(input), expected, "failed for {input}");
         }
+    }
+
+    #[test]
+    fn test_catalog_extraction_rejects_embedded_or_extended_tokens() {
+        let rejected = [
+            "foo35DP-25",
+            "35DP-25bar",
+            "Japan CBS-Sony 35DP-1234",
+            "Japan CBS-Sony 35DP-123-4",
+            "Epic 35.8P-1234",
+            "Columbia CK081634",
+        ];
+
+        for input in rejected {
+            assert!(
+                normalized_candidates(input).is_empty(),
+                "{input} should not produce a candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tag_text_can_contain_extra_catalog_text() {
+        let candidates = tag_value_candidates("35DP-25 (DIDP 50001)", CatalogSource::Tag);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].normalized, "35DP25");
+
+        let matched = match_catalog_candidate(candidates.into_iter().next().unwrap());
+        assert!(matched.is_some());
+        assert!(matches!(
+            matched.unwrap().confidence,
+            PreemphasisConfidence::Detected
+        ));
+    }
+
+    #[test]
+    fn test_exact_match_precedes_series_match() {
+        let matched = match_catalog_candidate(candidate("CP35-3016")).unwrap();
+        assert!(matches!(
+            matched.confidence,
+            PreemphasisConfidence::Detected
+        ));
+        assert!(matches!(
+            matched.evidence,
+            PreemphasisEvidence::CatalogExact
+        ));
+    }
+
+    #[test]
+    fn test_series_fallback_still_works() {
+        let matched = match_catalog_candidate(candidate("35DP-999")).unwrap();
+        assert!(matches!(
+            matched.confidence,
+            PreemphasisConfidence::Possible
+        ));
+        assert!(matches!(
+            matched.evidence,
+            PreemphasisEvidence::CatalogSeries
+        ));
+    }
+
+    #[test]
+    fn test_numeric_catalogs_must_be_known_exact_values() {
+        assert_eq!(normalized_candidates("Dire Straits 9252642"), vec!["9252642"]);
+        assert!(normalized_candidates("random remaster 1234567").is_empty());
+    }
+
+    #[test]
+    fn test_multiple_candidates_are_preserved_in_order() {
+        let candidates = normalized_candidates("Miles Davis CK08163 and 35DP-61");
+        assert_eq!(candidates, vec!["CK08163", "35DP61"]);
+    }
+
+    #[test]
+    fn test_folder_extracts_numeric_letter_digit_exact_catalog() {
+        assert_eq!(
+            normalized_candidates("Vangelis 8296632Y1"),
+            vec!["8296632Y1"]
+        );
+    }
+
+    #[test]
+    fn test_whitespace_digit_continuation_is_rejected() {
+        assert!(normalized_candidates("Japan CBS-Sony 35DP 123 4").is_empty());
+    }
+
+    #[test]
+    fn test_punctuation_letter_suffix_is_rejected() {
+        assert!(normalized_candidates("UK Virgin CDV-2192-A").is_empty());
+        assert!(normalized_candidates("CBS 35DP-25-A").is_empty());
+    }
+
+    #[test]
+    fn test_grouped_folder_catalog_formats_are_normalized() {
+        assert_eq!(
+            normalized_candidates("Deep Purple CDP 7 46242 2"),
+            vec!["CDP7462422"]
+        );
+        assert_eq!(
+            normalized_candidates("Enya MCD 06059 MD"),
+            vec!["MCD06059MD"]
+        );
+        assert_eq!(normalized_candidates("35 8P-11"), vec!["358P11"]);
+        assert_eq!(normalized_candidates("FIEND-CD-99"), vec!["FIENDCD99"]);
+    }
+
+    #[test]
+    fn test_catalog_before_year_is_accepted() {
+        assert_eq!(
+            normalized_candidates("Asia 35DP-25 1982 Japan"),
+            vec!["35DP25"]
+        );
+        assert_eq!(
+            normalized_candidates("UK Virgin CDV 2192 1981"),
+            vec!["CDV2192"]
+        );
+        assert_eq!(
+            normalized_candidates("Miles Davis CK08163 1986 Columbia"),
+            vec!["CK08163"]
+        );
+        assert_eq!(
+            normalized_candidates("Pet Shop Boys CDP 746271 1986"),
+            vec!["CDP746271"]
+        );
+    }
+
+    #[test]
+    fn test_non_year_whitespace_digit_continuation_is_rejected() {
+        assert!(normalized_candidates("Japan CBS-Sony 35DP 123 4").is_empty());
+        assert!(normalized_candidates("UK Virgin CDV 2192 1").is_empty());
+        assert!(normalized_candidates("Pet Shop Boys CDP 746271 1234").is_empty());
+    }
+
+    #[test]
+    fn test_period_after_catalog_can_be_sentence_punctuation() {
+        assert_eq!(
+            normalized_candidates("UK Virgin CDV-2192. Japan first pressing"),
+            vec!["CDV2192"]
+        );
+        assert_eq!(
+            normalized_candidates("CBS 35DP-25. Japan for Europe"),
+            vec!["35DP25"]
+        );
+    }
+
+    #[test]
+    fn test_immediate_suffixes_after_catalog_are_rejected() {
+        assert!(normalized_candidates("UK Virgin CDV-2192.1").is_empty());
+        assert!(normalized_candidates("UK Virgin CDV-2192-A").is_empty());
+        assert!(normalized_candidates("CBS 35DP-25-A").is_empty());
+    }
+
+    #[test]
+    fn test_space_separated_short_suffixes_are_rejected() {
+        assert!(normalized_candidates("CBS 35DP-25 A").is_empty());
+        assert!(normalized_candidates("CBS 35DP-25 A1").is_empty());
+        assert!(normalized_candidates("CBS 35DP-25 1A").is_empty());
+    }
+
+    #[test]
+    fn test_parenthesized_context_after_catalog_is_accepted() {
+        assert_eq!(
+            normalized_candidates("CBS 35DP-25 (Japan first pressing)"),
+            vec!["35DP25"]
+        );
+        assert_eq!(
+            normalized_candidates("CBS 35DP-25 (1982 Japan first pressing)"),
+            vec!["35DP25"]
+        );
+    }
+
+    #[test]
+    fn test_best_match_prefers_exact_over_earlier_series_match() {
+        let candidates = vec![
+            CatalogCandidate {
+                raw: "35DP-999".to_string(),
+                normalized: "35DP999".to_string(),
+                source: CatalogSource::Tag,
+            },
+            CatalogCandidate {
+                raw: "CP35-3016".to_string(),
+                normalized: "CP353016".to_string(),
+                source: CatalogSource::Folder,
+            },
+        ];
+
+        let matched = best_catalog_match(&candidates).unwrap();
+        assert!(matches!(
+            matched.confidence,
+            PreemphasisConfidence::Detected
+        ));
+        assert!(matches!(
+            matched.evidence,
+            PreemphasisEvidence::CatalogExact
+        ));
+        assert_eq!(matched.catalog_number, "CP35-3016");
     }
 }
