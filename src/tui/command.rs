@@ -742,6 +742,27 @@ pub fn execute_command(
                                         result.lufs = Some(lufs);
                                         result.true_peak_dbtp = Some(tp);
                                     }
+
+                                    // Fast pre-emphasis detection (metadata + catalog only, no spectral).
+                                    let pe_path = result.path.clone();
+                                    let pe_evidence = super::preemphasis::metadata::check_tag_evidence(&pe_path)
+                                        .or_else(|| super::preemphasis::metadata::check_file_evidence(&pe_path));
+                                    let catalog_match = super::preemphasis::catalog::check_catalog_evidence(&pe_path);
+
+                                    if let Some(ev) = pe_evidence {
+                                        result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
+                                        result.preemphasis_detail = Some(format!(
+                                            "{} indicates source disc used pre-emphasis; verify de-emphasis was not applied during ripping",
+                                            ev.label()
+                                        ));
+                                    } else if let Some(cm) = catalog_match {
+                                        result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
+                                        result.preemphasis_detail = Some(format!(
+                                            "{}; verify de-emphasis was not applied during ripping",
+                                            cm.detail
+                                        ));
+                                    }
+
                                     Ok(Box::new(result))
                                 }
                                 Ok(Err(e)) => {

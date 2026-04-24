@@ -528,6 +528,7 @@ struct FoldStats {
     eligible_non_pe_count: usize,
 }
 
+#[allow(dead_code)]
 impl FoldStats {
     fn total(&self) -> usize {
         self.pe_count + self.non_pe_count

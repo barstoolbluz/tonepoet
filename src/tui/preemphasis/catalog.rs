@@ -485,6 +485,7 @@ fn best_catalog_match(candidates: &[CatalogCandidate]) -> Option<CatalogMatch> {
         .or_else(|| candidates.iter().find_map(match_series_catalog_candidate))
 }
 
+#[allow(dead_code)]
 fn match_catalog_candidate(candidate: CatalogCandidate) -> Option<CatalogMatch> {
     match_exact_catalog_candidate(&candidate).or_else(|| match_series_catalog_candidate(&candidate))
 }

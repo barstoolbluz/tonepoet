@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 13;
+const CURRENT_VERSION: u32 = 14;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -103,6 +103,9 @@ impl Database {
         }
         if version < 13 {
             self.migrate_v13()?;
+        }
+        if version < 14 {
+            self.migrate_v14()?;
         }
 
         self.conn
@@ -443,6 +446,14 @@ impl Database {
         Ok(())
     }
 
+    /// v14: add preemphasis_detail column to analysis_cache.
+    fn migrate_v14(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            ALTER TABLE analysis_cache ADD COLUMN preemphasis_detail TEXT;
+        ").map_err(|e| format!("v14 migration failed: {}", e))?;
+        Ok(())
+    }
+
     // ── Search tag cache ─────────────────────────────────────────
 
     /// Look up cached tag string. Returns (tag_string, title, artist, album, genre, year)
@@ -519,7 +530,7 @@ impl Database {
 
     /// Bump this when the analysis algorithm changes to invalidate
     /// cached results computed by an older version.
-    const ANALYSIS_ALGO_VERSION: i32 = 18;
+    const ANALYSIS_ALGO_VERSION: i32 = 19;
 
     /// Look up cached analysis. Returns None if not cached, stale,
     /// or computed by an older algorithm version.
@@ -532,7 +543,8 @@ impl Database {
         self.conn.query_row(
             "SELECT dr_value, peak_db, rms_db, clipping_count, dc_bias,
                     actual_bit_depth, declared_bit_depth, sample_rate, channels,
-                    duration_secs, lufs, true_peak_dbtp, preemphasis, preemphasis_corr
+                    duration_secs, lufs, true_peak_dbtp, preemphasis, preemphasis_corr,
+                    preemphasis_detail
              FROM analysis_cache
              WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3
                AND algo_version = ?4",
@@ -561,6 +573,7 @@ impl Database {
                     true_peak_dbtp: row.get(11)?,
                     preemphasis,
                     preemphasis_corr: row.get(13)?,
+                    preemphasis_detail: row.get(14)?,
                 })
             },
         ).ok()
@@ -580,8 +593,8 @@ impl Database {
                 dr_value, peak_db, rms_db, clipping_count, dc_bias,
                 actual_bit_depth, declared_bit_depth, sample_rate, channels,
                 duration_secs, lufs, true_peak_dbtp, preemphasis, preemphasis_corr,
-                analyzed_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                preemphasis_detail, analyzed_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 file_path, mtime, size as i64, Self::ANALYSIS_ALGO_VERSION,
                 r.dr_value, r.peak_db, r.rms_db, r.clipping_count as i64, r.dc_bias,
@@ -595,6 +608,7 @@ impl Database {
                     crate::tui::preemphasis::PreemphasisConfidence::Indeterminate => None,
                 }),
                 r.preemphasis_corr,
+                r.preemphasis_detail,
                 chrono::Utc::now().to_rfc3339(),
             ],
         ).map_err(|e| format!("analysis cache store: {}", e))?;

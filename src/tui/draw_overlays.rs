@@ -1098,6 +1098,26 @@ fn draw_analysis(
         if let Some(tp) = r.true_peak_dbtp {
             extra.push(("True Peak", format!("{:.1} dBTP", tp), theme::TEXT_BRIGHT));
         }
+        // Pre-emphasis line (only shown when PE evidence found).
+        if let Some(ref pe_conf) = r.preemphasis {
+            use super::preemphasis::PreemphasisConfidence;
+            let (pe_label, pe_color) = match pe_conf {
+                PreemphasisConfidence::Detected => ("Likely", theme::AMBER),
+                PreemphasisConfidence::StrongCandidate => ("Likely", theme::AMBER),
+                PreemphasisConfidence::Possible => ("Possible", theme::AMBER),
+                _ => ("", theme::TEXT_DIM),
+            };
+            if !pe_label.is_empty() {
+                let detail = r.preemphasis_detail.as_deref().unwrap_or("");
+                let value = if detail.is_empty() {
+                    pe_label.to_string()
+                } else {
+                    format!("{} — {}", pe_label, detail)
+                };
+                extra.push(("Pre-emphasis", value, pe_color));
+            }
+        }
+
         for (label, value, color) in entries.iter().chain(extra.iter()) {
             lines.push(Line::from(vec![
                 Span::styled(format!("    {:<width$}", label, width = label_w), theme::muted()),
@@ -1699,7 +1719,7 @@ fn draw_preemphasis(
             .unwrap_or_else(|| r.path.display().to_string());
 
         let (icon, icon_color) = match r.confidence {
-            PreemphasisConfidence::Detected => (" ✓ ", theme::RED),
+            PreemphasisConfidence::Detected => (" ✓ ", theme::AMBER),
             PreemphasisConfidence::StrongCandidate => (" ✓ ", theme::AMBER),
             PreemphasisConfidence::Possible => (" ? ", theme::AMBER),
             PreemphasisConfidence::NotDetected => (" · ", theme::TEXT_DIM),
@@ -1707,8 +1727,8 @@ fn draw_preemphasis(
         };
 
         let conf_label = match r.confidence {
-            PreemphasisConfidence::Detected => "DETECTED",
-            PreemphasisConfidence::StrongCandidate => "STRONG",
+            PreemphasisConfidence::Detected => "LIKELY",
+            PreemphasisConfidence::StrongCandidate => "LIKELY",
             PreemphasisConfidence::Possible => "possible",
             PreemphasisConfidence::NotDetected => "",
             PreemphasisConfidence::Indeterminate => "indeterminate",
@@ -1727,6 +1747,30 @@ fn draw_preemphasis(
             Span::styled("   ", Style::default()),
             Span::styled(r.detail.clone(), Style::default().fg(theme::TEXT_DIM)),
         ]));
+    }
+
+    // Spectral analysis legend (only shown when any result has spectral data).
+    let has_spectral = results.iter().any(|r| r.fitted_alpha.is_finite());
+    if has_spectral {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Spectral analysis legend",
+            Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+        )));
+        let legend = [
+            ("\u{03B1} (alpha)", "PE template projection. Positive = spectrum matches pre-emphasis curve."),
+            ("r", "Correlation with PE curve shape. Positive = PE-like spectral profile."),
+            ("\u{0394}d (delta-d)", "Virtual de-emphasis improvement. Positive = de-emphasis normalizes the spectrum."),
+            ("z", "Whitened matched-filter score combining the above with corpus statistics."),
+            ("frames", "Number of qualifying low-level frames used for scoring."),
+            ("gates", "Conditions that suppress a positive verdict (few frames, unstable signal, etc)."),
+        ];
+        for (key, desc) in &legend {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<12}", key), Style::default().fg(theme::AMBER)),
+                Span::styled(*desc, Style::default().fg(theme::TEXT_DIM)),
+            ]));
+        }
     }
 
     let total = lines.len();

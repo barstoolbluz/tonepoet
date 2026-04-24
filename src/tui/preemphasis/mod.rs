@@ -75,12 +75,13 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
     let evidence = metadata::check_tag_evidence(&path)
         .or_else(|| metadata::check_file_evidence(&path));
 
-    // If metadata confirms, return immediately with Detected.
+    // Metadata confirms the source disc had PE, but we can't verify
+    // whether de-emphasis was applied during ripping. Report as Likely.
     if let Some(ref ev) = evidence {
         return PreemphasisResult {
             path,
-            confidence: PreemphasisConfidence::Detected,
-            cue_confirmed: true,
+            confidence: PreemphasisConfidence::StrongCandidate,
+            cue_confirmed: false,
             llr_m2_vs_m0: f64::NAN,
             llr_m2_vs_m1: f64::NAN,
             fitted_alpha: f64::NAN,
@@ -93,12 +94,13 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
         };
     }
 
-    // Phase 2: Catalog-number matching (fast, semi-authoritative).
+    // Phase 2: Catalog-number matching. Catalog confirms the disc had PE
+    // but can't verify whether de-emphasis was applied. Report as Likely.
     if let Some(catalog_match) = catalog::check_catalog_evidence(&path) {
         return PreemphasisResult {
             path,
-            confidence: catalog_match.confidence,
-            cue_confirmed: catalog_match.confidence == PreemphasisConfidence::Detected,
+            confidence: PreemphasisConfidence::StrongCandidate,
+            cue_confirmed: false,
             llr_m2_vs_m0: f64::NAN,
             llr_m2_vs_m1: f64::NAN,
             fitted_alpha: f64::NAN,
