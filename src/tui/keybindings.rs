@@ -569,7 +569,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         }
 
         // Go up (parent directory / archive level)
-        (KeyCode::Left, KeyModifiers::NONE) | (KeyCode::Backspace, _) => {
+        (KeyCode::Left, KeyModifiers::NONE) => {
             if app.browse.is_in_archive() {
                 if !app.browse.go_up_in_archive() {
                     app.browse.exit_archive();
@@ -578,6 +578,24 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                 app.browse.go_parent();
             }
             selection_may_have_changed = true;
+        }
+
+        // Backspace: delete last char from type-ahead buffer when active,
+        // otherwise go to parent directory.
+        (KeyCode::Backspace, _) => {
+            if app.browse.type_ahead_active() {
+                app.browse.type_ahead_pop();
+                selection_may_have_changed = true;
+            } else {
+                if app.browse.is_in_archive() {
+                    if !app.browse.go_up_in_archive() {
+                        app.browse.exit_archive();
+                    }
+                } else {
+                    app.browse.go_parent();
+                }
+                selection_may_have_changed = true;
+            }
         }
 
         // Enter directory/archive or select file

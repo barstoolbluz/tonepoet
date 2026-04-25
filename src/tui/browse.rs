@@ -1084,6 +1084,22 @@ impl BrowseState {
         }
     }
 
+    /// Remove the last character from the type-ahead buffer and re-search.
+    /// If the buffer becomes empty, clears the type-ahead state entirely.
+    pub fn type_ahead_pop(&mut self) {
+        self.type_ahead_buffer.pop();
+        if self.type_ahead_buffer.is_empty() {
+            self.type_ahead_last_keystroke = None;
+        } else {
+            self.type_ahead_last_keystroke = Some(Instant::now());
+            let prefix = self.type_ahead_buffer.to_lowercase();
+            if let Some(idx) = self.entries.iter().position(|e| e.name_lower.starts_with(&prefix)) {
+                self.selected_index = idx;
+                self.ensure_visible();
+            }
+        }
+    }
+
     /// Whether the type-ahead buffer is currently active (non-empty and
     /// not timed out).
     pub fn type_ahead_active(&self) -> bool {
