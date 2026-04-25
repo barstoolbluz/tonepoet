@@ -1938,7 +1938,6 @@ fn handle_metadata_editor_key(
                     if state.cursor < state.entries.len() {
                         let entry = &mut state.entries[state.cursor];
                         entry.value = new_val.clone();
-                        // Set ALL per-file values to the new value.
                         for v in &mut entry.per_file_values {
                             *v = new_val.clone();
                         }
@@ -1947,6 +1946,136 @@ fn handle_metadata_editor_key(
                     state.edit_input = None;
                     state.phase = MetadataEditorPhase::Editing;
                     recalc_dirty(state);
+                }
+                // Up/Down: move cursor to the same column on the
+                // previous/next display row in multiline editing.
+                KeyCode::Up | KeyCode::Down => {
+                    let has_nl = input.text.contains('\n') || input.text.contains('\r');
+                    let char_count = input.text.chars().count();
+                    // Compute val_max (must match draw_metadata_editor).
+                    let area = crossterm::terminal::size().unwrap_or((80, 24));
+                    let w = ((area.0 as usize) * 85 / 100).max(50).min(area.0 as usize - 2);
+                    let inner_w = w.saturating_sub(2);
+                    let key_col_w = 22usize;
+                    let vm = inner_w.saturating_sub(key_col_w + 1);
+
+                    if (char_count > super::draw_overlays::MULTILINE_EDIT_THRESHOLD || has_nl)
+                        && vm > 0
+                    {
+                        let sanitized = input.text.replace("\r\n", "\n").replace('\r', "\n");
+
+                        // Compute sanitized cursor position.
+                        let mut sp = 0usize;
+                        {
+                            let mut pcr = false;
+                            for (bi, c) in input.text.char_indices() {
+                                if bi >= input.cursor { break; }
+                                if c == '\r' { pcr = true; continue; }
+                                if pcr {
+                                    sp += if c == '\n' { 1 } else { 2 };
+                                    pcr = false;
+                                    continue;
+                                }
+                                sp += 1;
+                            }
+                            if pcr { sp += 1; }
+                        }
+
+                        // Map sanitized position to (row, col).
+                        let mut cur_row = 0usize;
+                        let mut cur_col = 0usize;
+                        {
+                            let mut idx = 0usize;
+                            for c in sanitized.chars() {
+                                if idx == sp { break; }
+                                if c == '\n' { cur_row += 1; cur_col = 0; }
+                                else {
+                                    cur_col += 1;
+                                    if cur_col >= vm { cur_row += 1; cur_col = 0; }
+                                }
+                                idx += 1;
+                            }
+                        }
+
+                        // Compute target row.
+                        let target_row = if key.code == KeyCode::Up {
+                            if cur_row == 0 { 0 } else { cur_row - 1 }
+                        } else {
+                            cur_row + 1
+                        };
+                        let target_col = cur_col;
+
+                        // Walk sanitized text to find the byte offset for
+                        // (target_row, target_col), clamped to that row's length.
+                        let mut drow = 0usize;
+                        let mut dcol = 0usize;
+                        let mut best_byte = input.text.len();
+                        let mut orig_iter = input.text.char_indices().peekable();
+                        let mut found = false;
+                        for sc in sanitized.chars() {
+                            if drow == target_row && dcol == target_col {
+                                // Exact match.
+                                if let Some(&(bi, _)) = orig_iter.peek() {
+                                    best_byte = bi;
+                                }
+                                found = true;
+                                break;
+                            }
+                            // Track the last valid position on the target row
+                            // (in case target_col exceeds the row's length).
+                            if drow == target_row {
+                                if let Some(&(bi, _)) = orig_iter.peek() {
+                                    best_byte = bi;
+                                }
+                            }
+                            // Advance past target row → stop.
+                            if drow > target_row {
+                                // Went past — best_byte is the end of target_row.
+                                found = true;
+                                break;
+                            }
+
+                            // Advance orig_iter.
+                            if let Some((_, oc)) = orig_iter.next() {
+                                if oc == '\r' {
+                                    if let Some(&(_, '\n')) = orig_iter.peek() {
+                                        orig_iter.next();
+                                    }
+                                }
+                            }
+
+                            if sc == '\n' {
+                                // Before moving to next row, record end-of-line
+                                // position if we're on the target row.
+                                if drow == target_row {
+                                    if let Some(&(bi, _)) = orig_iter.peek() {
+                                        best_byte = bi;
+                                    }
+                                }
+                                drow += 1;
+                                dcol = 0;
+                            } else {
+                                dcol += 1;
+                                if dcol >= vm {
+                                    if drow == target_row {
+                                        if let Some(&(bi, _)) = orig_iter.peek() {
+                                            best_byte = bi;
+                                        }
+                                    }
+                                    drow += 1;
+                                    dcol = 0;
+                                }
+                            }
+                        }
+                        // If target_row is past the last row, go to end.
+                        if !found && drow == target_row {
+                            // We're on the target row at end of text.
+                            best_byte = input.text.len();
+                        }
+
+                        input.cursor = best_byte.min(input.text.len());
+                    }
+                    // For single-line values, Up/Down are no-ops.
                 }
                 _ => {
                     super::text_input::handle_text_input_key(input, &key);
@@ -2726,8 +2855,130 @@ fn handle_metadata_editor_mouse(
                     return;
                 }
 
-                // If currently in inline edit, confirm the edit first.
+                // If currently in inline edit: clicking within the multiline
+                // drop-down area repositions the cursor; clicking elsewhere
+                // commits the edit.
                 if state.phase == MetadataEditorPhase::InlineEdit {
+                    let key_col_w = 22usize;
+                    let iw = inner_w as usize;
+                    let vm = iw.saturating_sub(key_col_w + 1); // val_max
+
+                    // Calculate how many visual rows the currently-edited
+                    // field occupies (1 for short, N for multiline).
+                    let drop_rows = if let Some(ref input) = state.edit_input {
+                        let char_count = input.text.chars().count();
+                        let has_nl = input.text.contains('\n') || input.text.contains('\r');
+                        if (char_count > super::draw_overlays::MULTILINE_EDIT_THRESHOLD || has_nl)
+                            && vm > 0
+                        {
+                            let sanitized = input.text.replace("\r\n", "\n").replace('\r', "\n");
+                            let mut n = 0usize;
+                            for para in sanitized.split('\n') {
+                                let pc = para.chars().count();
+                                n += if pc == 0 { 1 } else { (pc + vm - 1) / vm };
+                            }
+                            n.min(8).max(1)
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    };
+
+                    // Visual row range of the edited field within the content area.
+                    let edit_visual_start = state.cursor.saturating_sub(state.scroll);
+                    let edit_visual_end = edit_visual_start + drop_rows;
+                    let click_visual_row = (my - content_y) as usize;
+
+                    if click_visual_row >= edit_visual_start && click_visual_row < edit_visual_end {
+                        // Click is within the drop-down area — reposition cursor.
+                        // Account for drop_scroll: the visible lines may be
+                        // offset within the total display rows.
+                        if let Some(ref mut input) = state.edit_input {
+                            // Compute drop_scroll (must match draw_metadata_editor).
+                            let sanitized_tmp = input.text.replace("\r\n", "\n").replace('\r', "\n");
+                            let mut cur_drow = 0usize;
+                            let mut cur_dcol = 0usize;
+                            // Map cursor to display row (simplified: walk sanitized).
+                            {
+                                let mut sp = 0usize;
+                                // Compute sanitized cursor pos.
+                                let mut pcr = false;
+                                for (bi, c) in input.text.char_indices() {
+                                    if bi >= input.cursor { break; }
+                                    if c == '\r' { pcr = true; continue; }
+                                    if pcr {
+                                        sp += if c == '\n' { 1 } else { 2 };
+                                        pcr = false;
+                                        continue;
+                                    }
+                                    sp += 1;
+                                }
+                                if pcr { sp += 1; }
+                                let mut idx = 0usize;
+                                for c in sanitized_tmp.chars() {
+                                    if idx == sp { break; }
+                                    if c == '\n' { cur_drow += 1; cur_dcol = 0; }
+                                    else {
+                                        cur_dcol += 1;
+                                        if cur_dcol >= vm { cur_drow += 1; cur_dcol = 0; }
+                                    }
+                                    idx += 1;
+                                }
+                            }
+                            let ds = if cur_drow < drop_rows { 0 } else { cur_drow - drop_rows + 1 };
+                            let click_line = (click_visual_row - edit_visual_start) + ds;
+                            let click_col = (mx as usize).saturating_sub(
+                                inner_x as usize + key_col_w
+                            );
+                            // Walk the sanitized text to find which char position
+                            // corresponds to (click_line, click_col).
+                            let sanitized = input.text.replace("\r\n", "\n").replace('\r', "\n");
+                            let mut target_byte = input.text.len(); // default: end
+                            let mut drow = 0usize;
+                            let mut dcol = 0usize;
+                            let mut orig_byte = 0usize;
+                            let mut orig_iter = input.text.char_indices().peekable();
+                            for sc in sanitized.chars() {
+                                if drow == click_line && dcol == click_col {
+                                    target_byte = orig_byte;
+                                    break;
+                                }
+                                // Advance orig_iter past the char(s) that
+                                // produced this sanitized char.
+                                if let Some((bi, oc)) = orig_iter.next() {
+                                    orig_byte = bi + oc.len_utf8();
+                                    // If original had \r\n → single \n in sanitized,
+                                    // skip the \n too.
+                                    if oc == '\r' {
+                                        if let Some(&(_, '\n')) = orig_iter.peek() {
+                                            let (bi2, oc2) = orig_iter.next().unwrap();
+                                            orig_byte = bi2 + oc2.len_utf8();
+                                        }
+                                    }
+                                }
+                                if sc == '\n' {
+                                    drow += 1;
+                                    dcol = 0;
+                                } else {
+                                    dcol += 1;
+                                    if dcol >= vm {
+                                        drow += 1;
+                                        dcol = 0;
+                                    }
+                                }
+                            }
+                            // If we landed past the target, clamp.
+                            if drow == click_line && dcol <= click_col {
+                                target_byte = orig_byte;
+                            }
+                            input.cursor = target_byte.min(input.text.len());
+                        }
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        return;
+                    }
+
+                    // Click is outside the drop-down — commit the edit.
                     if let Some(ref input) = state.edit_input {
                         let new_val = input.text.clone();
                         if state.cursor < state.entries.len() {

@@ -39,6 +39,21 @@ fn pill_gap() -> Span<'static> {
     Span::raw(" ")
 }
 
+/// Values longer than this (in chars) use multiline drop-down editing
+/// instead of single-line horizontal scrolling.
+pub const MULTILINE_EDIT_THRESHOLD: usize = 96;
+
+/// Truncate a string to at most `max` characters, appending "..." if cut.
+/// Uses char-based (not byte-based) slicing to avoid panics on multi-byte text.
+fn truncate_to_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
+    format!("{}...", truncated)
+}
+
 /// Draw any active overlay on top of the main content
 pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     // Clone overlay data to avoid borrow issues
@@ -1223,28 +1238,186 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
         };
 
         // Value — show inline editor if this row is being edited.
+        let key_chars = key_display.chars().count();
+        let val_max = inner_w.saturating_sub(key_chars + 1);
+
         let value_display = if is_cursor && state.phase == MetadataEditorPhase::InlineEdit {
             if let Some(ref input) = state.edit_input {
-                let (visible, cursor_col) = input.view(inner_w.saturating_sub(key_col_w + 2));
+                let char_count = input.text.chars().count();
+                let has_newlines = input.text.contains('\n') || input.text.contains('\r');
+
+                if (char_count > MULTILINE_EDIT_THRESHOLD || has_newlines) && val_max > 0 {
+                    // ── Multiline drop-down for long/multi-line values ──
+                    // Normalize line endings, split into paragraphs, then
+                    // hard-wrap each paragraph at val_max.
+                    let sanitized = input.text.replace("\r\n", "\n").replace('\r', "\n");
+                    let mut display_rows: Vec<Vec<char>> = Vec::new();
+                    for paragraph in sanitized.split('\n') {
+                        let pchars: Vec<char> = paragraph.chars().collect();
+                        if pchars.is_empty() {
+                            display_rows.push(Vec::new());
+                        } else {
+                            for chunk in pchars.chunks(val_max) {
+                                display_rows.push(chunk.to_vec());
+                            }
+                        }
+                    }
+
+                    // Map cursor position to (row, col) in display_rows.
+                    // Walk the sanitized text (which matches display_rows)
+                    // but count using sanitized char indices. We need to
+                    // convert cursor_display_col() (which counts chars in
+                    // the original text) to a position in the sanitized text.
+                    let cursor_byte = input.cursor;
+                    // Count chars in original text up to cursor_byte, but
+                    // also track the corresponding position in the sanitized
+                    // version by skipping \r chars (which were removed).
+                    let mut sanitized_pos = 0usize;
+                    {
+                        let mut prev_was_cr = false;
+                        for (byte_idx, c) in input.text.char_indices() {
+                            if byte_idx >= cursor_byte { break; }
+                            if c == '\r' {
+                                // Check if next char is \n (CRLF → single \n).
+                                prev_was_cr = true;
+                                continue;
+                            }
+                            if prev_was_cr {
+                                if c == '\n' {
+                                    // \r\n → \n, already counted by the \n
+                                    sanitized_pos += 1;
+                                } else {
+                                    // Standalone \r → \n + current char
+                                    sanitized_pos += 2;
+                                }
+                                prev_was_cr = false;
+                                continue;
+                            }
+                            sanitized_pos += 1;
+                            prev_was_cr = false;
+                        }
+                        if prev_was_cr {
+                            sanitized_pos += 1; // trailing \r → \n
+                        }
+                    }
+
+                    // Now map sanitized_pos to (row, col) in display_rows.
+                    let mut cursor_row = 0usize;
+                    let mut cursor_col_in_row = 0usize;
+                    {
+                        let mut idx = 0usize;
+                        let mut drow = 0usize;
+                        let mut dcol = 0usize;
+                        for c in sanitized.chars() {
+                            if idx == sanitized_pos {
+                                cursor_row = drow;
+                                cursor_col_in_row = dcol;
+                                break;
+                            }
+                            if c == '\n' {
+                                drow += 1;
+                                dcol = 0;
+                            } else {
+                                dcol += 1;
+                                if dcol >= val_max {
+                                    drow += 1;
+                                    dcol = 0;
+                                }
+                            }
+                            idx += 1;
+                        }
+                        if idx == sanitized_pos {
+                            cursor_row = drow;
+                            cursor_col_in_row = dcol;
+                        }
+                    }
+
+                    let total_rows = display_rows.len();
+                    let max_drop_rows = 8usize.min(total_rows).max(1);
+                    let drop_scroll = if cursor_row < max_drop_rows {
+                        0
+                    } else {
+                        cursor_row - max_drop_rows + 1
+                    };
+                    let visible_end = (drop_scroll + max_drop_rows).min(total_rows);
+
+                    let drop_bg = Style::default().bg(Color::Rgb(30, 30, 46));
+
+                    for row in drop_scroll..visible_end {
+                        let row_chars = &display_rows[row];
+
+                        let prefix = if row == drop_scroll {
+                            Span::styled(key_display.clone(), key_style)
+                        } else {
+                            Span::styled(" ".repeat(key_chars), Style::default().bg(Color::Rgb(30, 30, 46)))
+                        };
+
+                        if row == cursor_row {
+                            let col = cursor_col_in_row;
+                            let before: String = row_chars[..col.min(row_chars.len())].iter().collect();
+                            let cur_ch: String = if col < row_chars.len() {
+                                row_chars[col].to_string()
+                            } else {
+                                " ".to_string()
+                            };
+                            let after: String = if col + 1 < row_chars.len() {
+                                row_chars[col + 1..].iter().collect()
+                            } else {
+                                String::new()
+                            };
+                            let used = before.chars().count() + 1 + after.chars().count();
+                            let pad = val_max.saturating_sub(used);
+                            lines.push(Line::from(vec![
+                                prefix,
+                                Span::styled(before, drop_bg.fg(theme::TEXT_BRIGHT)),
+                                Span::styled(cur_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                                Span::styled(format!("{}{}", after, " ".repeat(pad)), drop_bg.fg(theme::TEXT_BRIGHT)),
+                            ]));
+                        } else {
+                            let text: String = row_chars.iter().collect();
+                            let pad = val_max.saturating_sub(row_chars.len());
+                            lines.push(Line::from(vec![
+                                prefix,
+                                Span::styled(format!("{}{}", text, " ".repeat(pad)), drop_bg.fg(theme::TEXT_BRIGHT)),
+                            ]));
+                        }
+                    }
+                    continue;
+                }
+
+                // ── Single-line inline edit for short values ─────
+                // Replace newlines with ↵ so they don't cause terminal line breaks.
+                let (visible, cursor_col) = input.view(val_max);
                 let cp = cursor_col as usize;
-                let before = if cp <= visible.len() { &visible[..cp] } else { &visible[..] };
-                let cursor_ch = if cp < visible.len() { &visible[cp..cp + 1] } else { " " };
-                let after = if cp + 1 <= visible.len() { &visible[cp + 1..] } else { "" };
+                let chars: Vec<char> = visible.chars()
+                    .map(|c| if c == '\n' || c == '\r' { '↵' } else { c })
+                    .collect();
+                let before: String = chars[..cp.min(chars.len())].iter().collect();
+                let cursor_ch: String = if cp < chars.len() {
+                    chars[cp].to_string()
+                } else {
+                    " ".to_string()
+                };
+                let after: String = if cp + 1 < chars.len() {
+                    chars[cp + 1..].iter().collect()
+                } else {
+                    String::new()
+                };
                 lines.push(Line::from(vec![
                     Span::styled(key_display, key_style),
-                    Span::styled(before.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
-                    Span::styled(cursor_ch.to_string(), Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
-                    Span::styled(after.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(cursor_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                    Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
                 ]));
                 continue;
             }
-            entry.value.clone()
+            entry.value.replace('\n', "↵").replace('\r', "")
         } else if is_deleted {
             format!("(deleted)")
         } else if entry.is_binary {
             entry.value.clone()
         } else {
-            entry.value.clone()
+            entry.value.replace('\n', "↵").replace('\r', "")
         };
 
         let val_style = if is_deleted {
@@ -1259,11 +1432,7 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
             Style::default().fg(theme::TEXT_BRIGHT)
         };
 
-        let val_truncated = if value_display.len() > inner_w.saturating_sub(key_col_w + 1) {
-            format!("{}...", &value_display[..inner_w.saturating_sub(key_col_w + 4)])
-        } else {
-            value_display
-        };
+        let val_truncated = truncate_to_chars(&value_display, val_max);
 
         lines.push(Line::from(vec![
             Span::styled(key_display, key_style),
@@ -1278,14 +1447,23 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
         if let Some(ref input) = state.add_key_input {
             let (visible, cursor_col) = input.view(inner_w.saturating_sub(4));
             let cp = cursor_col as usize;
-            let before = if cp <= visible.len() { &visible[..cp] } else { &visible[..] };
-            let cursor_ch = if cp < visible.len() { &visible[cp..cp + 1] } else { " " };
-            let after = if cp + 1 <= visible.len() { &visible[cp + 1..] } else { "" };
+            let chars: Vec<char> = visible.chars().collect();
+            let before: String = chars[..cp.min(chars.len())].iter().collect();
+            let cursor_ch: String = if cp < chars.len() {
+                chars[cp].to_string()
+            } else {
+                " ".to_string()
+            };
+            let after: String = if cp + 1 < chars.len() {
+                chars[cp + 1..].iter().collect()
+            } else {
+                String::new()
+            };
             lines.push(Line::from(vec![
                 Span::styled(" + ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
-                Span::styled(before.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
-                Span::styled(cursor_ch.to_string(), Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
-                Span::styled(after.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                Span::styled(cursor_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
             ]));
         }
     } else {
@@ -1374,18 +1552,33 @@ fn draw_metadata_detail(
         };
 
         // Inline edit within detail?
+        let label_chars = label_display.chars().count();
+        let detail_val_max = inner_w.saturating_sub(label_chars + 1);
+
         if is_cursor && state.detail_edit.is_some() {
             if let Some(ref input) = state.detail_edit {
-                let (visible, cursor_col) = input.view(inner_w.saturating_sub(label_col_w + 2));
+                let (visible, cursor_col) = input.view(detail_val_max);
                 let cp = cursor_col as usize;
-                let before = if cp <= visible.len() { &visible[..cp] } else { &visible[..] };
-                let cursor_ch = if cp < visible.len() { &visible[cp..cp + 1] } else { " " };
-                let after = if cp + 1 <= visible.len() { &visible[cp + 1..] } else { "" };
+                // Replace newlines with ↵ to prevent terminal line breaks.
+                let chars: Vec<char> = visible.chars()
+                    .map(|c| if c == '\n' || c == '\r' { '↵' } else { c })
+                    .collect();
+                let before: String = chars[..cp.min(chars.len())].iter().collect();
+                let cursor_ch: String = if cp < chars.len() {
+                    chars[cp].to_string()
+                } else {
+                    " ".to_string()
+                };
+                let after: String = if cp + 1 < chars.len() {
+                    chars[cp + 1..].iter().collect()
+                } else {
+                    String::new()
+                };
                 lines.push(Line::from(vec![
                     Span::styled(label_display.clone(), label_style),
-                    Span::styled(before.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
-                    Span::styled(cursor_ch.to_string(), Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
-                    Span::styled(after.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(cursor_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                    Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
                 ]));
                 continue;
             }
@@ -1402,11 +1595,8 @@ fn draw_metadata_detail(
             Style::default().fg(theme::TEXT_BRIGHT)
         };
 
-        let val_display = if val.len() > inner_w.saturating_sub(label_col_w + 1) {
-            format!("{}...", &val[..inner_w.saturating_sub(label_col_w + 4)])
-        } else {
-            val.clone()
-        };
+        let val_sanitized = val.replace('\n', "↵").replace('\r', "");
+        let val_display = truncate_to_chars(&val_sanitized, detail_val_max);
 
         lines.push(Line::from(vec![
             Span::styled(label_display, label_style),
