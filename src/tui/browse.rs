@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+
+/// Type-ahead buffer resets after this duration of inactivity.
+const TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(1500);
 
 use crate::convert::formats::AudioFormat;
 use crate::tui::probe::{SourceInfo, SourceMetadata};
@@ -482,6 +485,11 @@ pub struct BrowseState {
     /// DirScanComplete handler can position the cursor on it.
     pub cursor_restore_target: Option<String>,
 
+    /// Type-ahead navigation buffer: accumulated keystrokes for prefix jump.
+    pub type_ahead_buffer: String,
+    /// Instant of the last type-ahead keystroke, for timeout reset.
+    pub type_ahead_last_keystroke: Option<Instant>,
+
     /// Channel sender for async messages. Set after construction by the
     /// event loop. `None` during the initial synchronous scan.
     scan_tx: Option<tokio::sync::mpsc::Sender<super::message::AppMessage>>,
@@ -550,6 +558,8 @@ impl BrowseState {
             archive: None,
             scan_pending: None,
             cursor_restore_target: None,
+            type_ahead_buffer: String::new(),
+            type_ahead_last_keystroke: None,
             scan_tx: None,
         };
         state.refresh(); // Initial scan is synchronous (no tx yet).
@@ -1047,6 +1057,45 @@ impl BrowseState {
         }
     }
 
+    // ── Type-ahead navigation ──────────────────────────────────────────
+
+    /// Reset the type-ahead buffer and timestamp.
+    pub fn clear_type_ahead(&mut self) {
+        self.type_ahead_buffer.clear();
+        self.type_ahead_last_keystroke = None;
+    }
+
+    /// Append a character to the type-ahead buffer and jump to the first
+    /// matching entry. Resets the buffer first if the timeout has elapsed.
+    pub fn type_ahead_push(&mut self, c: char) {
+        if let Some(last) = self.type_ahead_last_keystroke {
+            if last.elapsed() >= TYPE_AHEAD_TIMEOUT {
+                self.type_ahead_buffer.clear();
+            }
+        }
+
+        self.type_ahead_buffer.push(c);
+        self.type_ahead_last_keystroke = Some(Instant::now());
+
+        let prefix = self.type_ahead_buffer.to_lowercase();
+        if let Some(idx) = self.entries.iter().position(|e| e.name_lower.starts_with(&prefix)) {
+            self.selected_index = idx;
+            self.ensure_visible();
+        }
+    }
+
+    /// Whether the type-ahead buffer is currently active (non-empty and
+    /// not timed out).
+    pub fn type_ahead_active(&self) -> bool {
+        if self.type_ahead_buffer.is_empty() {
+            return false;
+        }
+        match self.type_ahead_last_keystroke {
+            Some(last) => last.elapsed() < TYPE_AHEAD_TIMEOUT,
+            None => false,
+        }
+    }
+
     pub fn page_up(&mut self) {
         let jump = self.visible_height.max(1);
         self.selected_index = self.selected_index.saturating_sub(jump);
@@ -1462,6 +1511,7 @@ impl BrowseState {
     fn reset_nav_state(&mut self) {
         self.reset_filter_state();
         self.multi_select_anchor = None;
+        self.clear_type_ahead();
     }
 
     /// Resolve the range-select anchor to an index in the current `entries` vec.

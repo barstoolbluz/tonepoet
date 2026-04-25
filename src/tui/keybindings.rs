@@ -90,7 +90,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 return;
             }
             // Context menu (keyboard alternative to right-click)
-            (KeyCode::Char('m'), KeyModifiers::NONE) => {
+            (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
                 // Position the context menu at the selected entry's screen
                 // location (from the button_map). Falls back to screen center
                 // if no entry is registered.
@@ -537,22 +537,22 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 
     match (key.code, key.modifiers) {
         // Navigation (extends visual selection if V-mode is active)
-        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+        (KeyCode::Up, KeyModifiers::NONE) => {
             app.browse.move_up();
             if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
-        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+        (KeyCode::Down, KeyModifiers::NONE) => {
             app.browse.move_down();
             if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
-        (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
+        (KeyCode::Home, _) => {
             app.browse.move_top();
             if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
         }
-        (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
+        (KeyCode::End, _) => {
             app.browse.move_bottom();
             if app.browse.visual_mode { app.browse.update_visual_selection(); }
             selection_may_have_changed = true;
@@ -569,7 +569,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         }
 
         // Go up (parent directory / archive level)
-        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Backspace, _) => {
+        (KeyCode::Left, KeyModifiers::NONE) | (KeyCode::Backspace, _) => {
             if app.browse.is_in_archive() {
                 if !app.browse.go_up_in_archive() {
                     app.browse.exit_archive();
@@ -581,7 +581,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         }
 
         // Enter directory/archive or select file
-        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => {
+        (KeyCode::Right, KeyModifiers::NONE) => {
             if let Some(entry) = app.browse.selected_entry() {
                 if entry.is_dir() {
                     if app.browse.is_in_archive() {
@@ -693,16 +693,22 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Toggle multi-select for individual items
+        // Space: literal space in type-ahead when buffer is active,
+        // otherwise toggle multi-select for individual items.
         (KeyCode::Char(' '), KeyModifiers::NONE) => {
-            app.browse.toggle_selection();
-            app.browse.move_down();
-            selection_may_have_changed = true;
+            if app.browse.type_ahead_active() {
+                app.browse.type_ahead_push(' ');
+                selection_may_have_changed = true;
+            } else {
+                app.browse.toggle_selection();
+                app.browse.move_down();
+                selection_may_have_changed = true;
+            }
         }
 
-        // Visual (range) selection mode: V toggles. While active,
+        // Visual (range) selection mode: Ctrl+V toggles. While active,
         // cursor movement extends the selection from the anchor.
-        (KeyCode::Char('V'), KeyModifiers::SHIFT) => {
+        (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
             if app.browse.visual_mode {
                 // Exit visual mode, keep current selection.
                 app.browse.visual_mode = false;
@@ -735,9 +741,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Esc escalation: visual mode → multi-selection → text filter → archive
+        // Esc escalation: type-ahead → search → visual mode → multi-selection → text filter → archive
         (KeyCode::Esc, _) => {
-            if app.browse.search.active {
+            if app.browse.type_ahead_active() {
+                app.browse.clear_type_ahead();
+            } else if app.browse.search.active {
                 app.browse.close_search();
             } else if app.browse.visual_mode {
                 app.browse.visual_mode = false;
@@ -757,27 +765,19 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             // Browse is home — Esc with nothing to clear is a no-op.
         }
 
-        // Bulk rename: R opens the rename wizard for selected audio files.
-        (KeyCode::Char('R'), KeyModifiers::SHIFT) => {
-            let paths = super::command::collect_selection_for_file_ops(app);
-            let audio_paths: Vec<std::path::PathBuf> = paths
-                .into_iter()
-                .filter(|p| {
-                    app.browse.entries.iter().any(|e| {
-                        e.path == *p
-                            && matches!(
-                                e.kind,
-                                super::browse::EntryKind::AudioFile(_)
-                            )
-                    })
-                })
-                .collect();
-            open_bulk_rename(app, audio_paths);
+        // Ctrl+E = open metadata editor for selected audio file(s)
+        (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+            open_metadata_editor(app);
         }
 
-        // e = open metadata editor for selected audio file(s)
-        (KeyCode::Char('e'), KeyModifiers::NONE) => {
-            open_metadata_editor(app);
+        // Type-ahead navigation: bare letter/number keys jump to the
+        // first entry whose name starts with the accumulated prefix.
+        (KeyCode::Char(c), mods)
+            if mods.is_empty() || mods == KeyModifiers::SHIFT =>
+        {
+            app.browse.type_ahead_push(c);
+            if app.browse.visual_mode { app.browse.update_visual_selection(); }
+            selection_may_have_changed = true;
         }
 
         _ => {}

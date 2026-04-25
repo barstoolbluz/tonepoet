@@ -40,21 +40,22 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
             HelpSection {
                 title: "Navigation",
                 entries: vec![
-                    ("Up/k, Down/j", "Navigate entries"),
-                    ("Left/h, Backspace", "Go to parent directory"),
-                    ("Right/l", "Enter directory"),
+                    ("Up, Down", "Navigate entries"),
+                    ("Left, Backspace", "Go to parent directory"),
+                    ("Right", "Enter directory"),
                     ("Enter", "Toggle select / enter dir / browse archive"),
-                    ("Home/g, End/G", "Jump to top / bottom"),
+                    ("Home, End", "Jump to top / bottom"),
                     ("PageUp, PageDown", "Page scroll"),
+                    ("type letters", "Jump to first matching entry"),
                 ],
             },
             HelpSection {
                 title: "Selection",
                 entries: vec![
                     ("Space", "Toggle select (moves cursor down)"),
-                    ("V", "Visual range select (move cursor to extend)"),
-                    ("Esc", "Exit visual mode / clear selection"),
-                    ("e", "Edit metadata for selected file(s)"),
+                    ("Ctrl+V", "Visual range select (move cursor to extend)"),
+                    ("Esc", "Exit type-ahead / visual mode / clear selection"),
+                    ("Ctrl+E", "Edit metadata for selected file(s)"),
                     ("D", "Per-file detail view (in metadata editor)"),
                 ],
             },
@@ -77,9 +78,9 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
             HelpSection {
                 title: "File Operations",
                 entries: vec![
-                    ("R", "Bulk rename wizard"),
-                    ("m", "Context menu (right-click)"),
+                    ("Ctrl+M", "Context menu (right-click)"),
                     (":rename <name>", "Rename selected entry"),
+                    (":rename-all", "Bulk rename wizard"),
                     (":cp <dest>", "Copy selected to destination"),
                     (":mv <dest>", "Move selected to destination"),
                     (":del", "Move selected to trash"),
@@ -97,7 +98,6 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     (":recent", "Open recent files"),
                     (":bm", "Open bookmarks"),
                     (":bm add [name]", "Bookmark current directory"),
-                    (":rename-all", "Bulk rename (same as R)"),
                 ],
             },
         ],
@@ -188,7 +188,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
             (":q", "Quit tonepoet"),
             (":go / :start", "Start processing queued items"),
             ("?", "Toggle this help overlay"),
-            ("m", "Context menu"),
+            ("Ctrl+M", "Context menu"),
         ],
     });
 

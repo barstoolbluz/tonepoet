@@ -183,11 +183,18 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
         String::new()
     };
 
-    // Reserve space for prefix + filter suffix; truncate the path from the left
+    // Type-ahead suffix appears while the jump buffer is active.
+    let type_ahead_suffix = if browse.type_ahead_active() {
+        format!("   jump: {}", browse.type_ahead_buffer)
+    } else {
+        String::new()
+    };
+
+    // Reserve space for prefix + suffixes; truncate the path from the left
     // so the most contextual portion (current directory) stays visible.
     let prefix = "  path  ";
     let prefix_w = prefix.chars().count();
-    let suffix_w = filter_suffix.chars().count();
+    let suffix_w = filter_suffix.chars().count() + type_ahead_suffix.chars().count();
     let path_max = (area.width as usize)
         .saturating_sub(prefix_w)
         .saturating_sub(suffix_w)
@@ -200,6 +207,9 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
     ];
     if !filter_suffix.is_empty() {
         spans.push(Span::styled(filter_suffix, Style::default().fg(theme::AMBER)));
+    }
+    if !type_ahead_suffix.is_empty() {
+        spans.push(Span::styled(type_ahead_suffix, Style::default().fg(theme::CYAN)));
     }
 
     let line = Paragraph::new(Line::from(spans));

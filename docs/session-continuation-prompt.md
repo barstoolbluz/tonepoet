@@ -14,7 +14,7 @@ Read `CLAUDE.md` in the project root for build instructions, workspace structure
 - Vi command mode (`:` opens command input): `:q`, `:e`, `:set`, `:preset`, `:cd`, `:sort`, `:filter`, `:rename`, `:cp`, `:mv`, `:del`, etc.
 - PillState<T> generic pill selector widget for format options
 - All overlay footers are clickable pill buttons with mouse support
-- Context menus (right-click / `m` key) with side-by-side submenu rendering
+- Context menus (right-click / `Ctrl+M`) with side-by-side submenu rendering
 
 ### Browse screen (primary focus of recent work)
 - Full file browser with sortable columns (Name, Size, Date, Type)
@@ -22,7 +22,7 @@ Read `CLAUDE.md` in the project root for build instructions, workspace structure
 - Info pane showing technical details, ReplayGain/R128, metadata
 - Inline search panel with fuzzy matching, recursive search, tag search, multiple sort modes
 - SQLite tag cache with LRU eviction for search
-- Multi-select: click, Ctrl+click toggle, Ctrl+double-click range, V visual mode
+- Multi-select: click, Ctrl+click toggle, Ctrl+double-click range, Ctrl+V visual mode
 - Enter/double-click = select (not load into Convert)
 - Context menu with submenus:
   - **Convert >** (Custom, Last Used, presets)
@@ -31,9 +31,10 @@ Read `CLAUDE.md` in the project root for build instructions, workspace structure
   - **Utilities >** (Verify, CUE sheet multi-file, CUE sheet single-image, Bit compare mark/compare/clear)
   - **File operations >** (Rename, Bulk Rename, Copy to..., Move to..., Move to Trash)
   - Copy path
+- Type-to-navigate: bare letter keys accumulate into a prefix buffer and jump to the first matching entry; resets after 1.5s timeout; Esc clears
 - Bookmarks overlay
 - Recent files overlay
-- Bulk rename wizard with template engine and CUE import
+- Bulk rename wizard with template engine and CUE import (`:rename-all`)
 - Archive support: 7z listing, password keychain, multi-format
 
 ### Analysis features
