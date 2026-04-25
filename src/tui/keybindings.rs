@@ -89,31 +89,6 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 };
                 return;
             }
-            // Context menu (keyboard alternative to right-click)
-            (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
-                // Position the context menu at the selected entry's screen
-                // location (from the button_map). Falls back to screen center
-                // if no entry is registered.
-                let origin = match app.current_screen {
-                    AppScreen::Browse => {
-                        app.button_map.find_button_rect(
-                            &TuiButton::BrowseEntry(app.browse.selected_index),
-                        ).map(|r| (r.x + 2, r.y))
-                    }
-                    AppScreen::Queue => {
-                        app.button_map.find_button_rect(
-                            &TuiButton::QueueItem(app.selected_index),
-                        ).map(|r| (r.x + 2, r.y))
-                    }
-                    _ => None,
-                }.unwrap_or_else(|| {
-                    crossterm::terminal::size()
-                        .map(|(w, h)| (w / 3, h / 3))
-                        .unwrap_or((20, 10))
-                });
-                open_context_menu(app, origin.0, origin.1);
-                return;
-            }
             // Help overlay
             (KeyCode::Char('?'), _) => {
                 app.active_overlay = ActiveOverlay::Help {
@@ -1753,7 +1728,7 @@ fn handle_context_menu_key(
 /// Build and open the context menu for the current screen. `x, y` is
 /// the screen position where the menu should be anchored (right-click
 /// position, or a computed position for keyboard `m`).
-fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
+pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
     use super::context_menu::*;
 
     let entries = match app.current_screen {

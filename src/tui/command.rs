@@ -45,6 +45,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "password", "pw",
     "analyze", "analysis", "dr",
     "search", "s", "rs", "rsearch",
+    "context", "menu",
 ];
 
 /// Commands that take a preset name as their argument. Used by the
@@ -251,6 +252,8 @@ pub enum Command {
     Search { recursive: bool },
     /// Set an archive password for the selected archive in Browse.
     Password,
+    /// Open the context menu at the current selection.
+    ContextMenu,
     Unknown(String),
 }
 
@@ -368,6 +371,7 @@ pub fn parse_command(input: &str) -> Command {
         "search" | "s" => Command::Search { recursive: false },
         "rs" | "rsearch" => Command::Search { recursive: true },
         "password" | "pw" => Command::Password,
+        "context" | "menu" => Command::ContextMenu,
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -1076,6 +1080,26 @@ pub fn execute_command(
                     .collect();
                 super::keybindings::open_bulk_rename(app, audio_paths);
             }
+        }
+        Command::ContextMenu => {
+            let origin = match app.current_screen {
+                AppScreen::Browse => {
+                    app.button_map.find_button_rect(
+                        &super::button_map::TuiButton::BrowseEntry(app.browse.selected_index),
+                    ).map(|r| (r.x + 2, r.y))
+                }
+                AppScreen::Queue => {
+                    app.button_map.find_button_rect(
+                        &super::button_map::TuiButton::QueueItem(app.selected_index),
+                    ).map(|r| (r.x + 2, r.y))
+                }
+                _ => None,
+            }.unwrap_or_else(|| {
+                crossterm::terminal::size()
+                    .map(|(w, h)| (w / 3, h / 3))
+                    .unwrap_or((20, 10))
+            });
+            super::keybindings::open_context_menu(app, origin.0, origin.1);
         }
         Command::Unknown(input) => {
             app.set_status(format!("Unknown command: {}", input));

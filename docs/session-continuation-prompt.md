@@ -14,7 +14,7 @@ Read `CLAUDE.md` in the project root for build instructions, workspace structure
 - Vi command mode (`:` opens command input): `:q`, `:e`, `:set`, `:preset`, `:cd`, `:sort`, `:filter`, `:rename`, `:cp`, `:mv`, `:del`, etc.
 - PillState<T> generic pill selector widget for format options
 - All overlay footers are clickable pill buttons with mouse support
-- Context menus (right-click / `Ctrl+M`) with side-by-side submenu rendering
+- Context menus (right-click / `:context`) with side-by-side submenu rendering
 
 ### Browse screen (primary focus of recent work)
 - Full file browser with sortable columns (Name, Size, Date, Type)

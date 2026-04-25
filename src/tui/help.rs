@@ -78,7 +78,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
             HelpSection {
                 title: "File Operations",
                 entries: vec![
-                    ("Ctrl+M", "Context menu (right-click)"),
+                    (":context", "Context menu (right-click)"),
                     (":rename <name>", "Rename selected entry"),
                     (":rename-all", "Bulk rename wizard"),
                     (":cp <dest>", "Copy selected to destination"),
@@ -188,7 +188,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
             (":q", "Quit tonepoet"),
             (":go / :start", "Start processing queued items"),
             ("?", "Toggle this help overlay"),
-            ("Ctrl+M", "Context menu"),
+            (":context", "Context menu"),
         ],
     });
 
