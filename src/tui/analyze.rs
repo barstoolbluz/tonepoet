@@ -106,10 +106,11 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 
     // ── Process a batch of samples (one channel) ─────────────────
 
-    // Inline helper: accumulate samples for one channel. Does NOT
-    // touch block_sample_count — that's handled per-frame below.
-    macro_rules! accumulate_channel {
-        ($samples:expr, $ch:expr, $raw_i32:expr) => {{
+    // Global-stats accumulator: peak, RMS, DC, clipping, bit depth.
+    // Does NOT touch per-block DR accumulators — those are handled
+    // by the split-accumulate loop below.
+    macro_rules! accumulate_global {
+        ($samples:expr, $raw_i32:expr) => {{
             let raw_opt: Option<&[i32]> = $raw_i32.map(|v| v as &[i32]);
             for (i, &s) in $samples.iter().enumerate() {
                 let abs_val = s.abs();
@@ -124,12 +125,12 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
                         bit_or_mask |= (raw[i] as u32) | (raw[i].wrapping_neg() as u32);
                     }
                 }
-
-                if abs_val > block_peaks[$ch] { block_peaks[$ch] = abs_val; }
-                block_rms_sums[$ch] += s * s;
             }
         }};
     }
+
+    // Temporary per-channel float buffers, reused each frame.
+    let mut ch_floats: Vec<Vec<f64>> = vec![Vec::new(); channels as usize];
 
     // ── Decode loop ──────────────────────────────────────────────
 
@@ -140,27 +141,33 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
             let n = decoded.samples();
             if n == 0 { continue; }
 
+            // ── Extract per-channel samples + accumulate global stats ──
             for ch in 0..channels as usize {
                 match sample_fmt {
                     Sample::I16(SampleType::Planar) => {
                         let plane = decoded.plane::<i16>(ch);
                         let floats: Vec<f64> = plane.iter().map(|&s| s as f64 / 32768.0).collect();
                         let i32s: Vec<i32> = plane.iter().map(|&s| (s as i32) << 16).collect();
-                        accumulate_channel!(floats, ch, Some(&i32s));
+                        accumulate_global!(floats, Some(&i32s));
+                        ch_floats[ch] = floats;
                     }
                     Sample::I32(SampleType::Planar) => {
                         let plane = decoded.plane::<i32>(ch);
                         let floats: Vec<f64> = plane.iter().map(|&s| s as f64 / 2147483648.0).collect();
-                        accumulate_channel!(floats, ch, Some(plane));
+                        accumulate_global!(floats, Some(plane));
+                        ch_floats[ch] = floats;
                     }
                     Sample::F32(SampleType::Planar) => {
                         let plane = decoded.plane::<f32>(ch);
                         let floats: Vec<f64> = plane.iter().map(|&s| s as f64).collect();
-                        accumulate_channel!(floats, ch, None::<&[i32]>);
+                        accumulate_global!(floats, None::<&[i32]>);
+                        ch_floats[ch] = floats;
                     }
                     Sample::F64(SampleType::Planar) => {
                         let plane = decoded.plane::<f64>(ch);
-                        { let sl: &[f64] = plane; accumulate_channel!(sl, ch, None::<&[i32]>); }
+                        let floats: Vec<f64> = plane.to_vec();
+                        accumulate_global!(floats, None::<&[i32]>);
+                        ch_floats[ch] = floats;
                     }
                     // Packed formats: decoded.plane() only returns nb_samples
                     // elements, but the interleaved buffer has nb_samples ×
@@ -170,63 +177,86 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
                         let full: &[i16] = unsafe {
                             std::slice::from_raw_parts(raw.as_ptr() as *const i16, n * channels as usize)
                         };
-                        let ch_samples: Vec<f64> = full.iter()
+                        let floats: Vec<f64> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| s as f64 / 32768.0).collect();
                         let i32s: Vec<i32> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| (s as i32) << 16).collect();
-                        accumulate_channel!(ch_samples, ch, Some(&i32s));
+                        accumulate_global!(floats, Some(&i32s));
+                        ch_floats[ch] = floats;
                     }
                     Sample::I32(SampleType::Packed) => {
                         let raw = decoded.data(0);
                         let full: &[i32] = unsafe {
                             std::slice::from_raw_parts(raw.as_ptr() as *const i32, n * channels as usize)
                         };
-                        let ch_samples: Vec<f64> = full.iter()
+                        let floats: Vec<f64> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| s as f64 / 2147483648.0).collect();
                         let i32_ch: Vec<i32> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .copied().collect();
-                        accumulate_channel!(ch_samples, ch, Some(&i32_ch));
+                        accumulate_global!(floats, Some(&i32_ch));
+                        ch_floats[ch] = floats;
                     }
                     Sample::F32(SampleType::Packed) => {
                         let raw = decoded.data(0);
                         let full: &[f32] = unsafe {
                             std::slice::from_raw_parts(raw.as_ptr() as *const f32, n * channels as usize)
                         };
-                        let ch_samples: Vec<f64> = full.iter()
+                        let floats: Vec<f64> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .map(|&s| s as f64).collect();
-                        accumulate_channel!(ch_samples, ch, None::<&[i32]>);
+                        accumulate_global!(floats, None::<&[i32]>);
+                        ch_floats[ch] = floats;
                     }
                     Sample::F64(SampleType::Packed) => {
                         let raw = decoded.data(0);
                         let full: &[f64] = unsafe {
                             std::slice::from_raw_parts(raw.as_ptr() as *const f64, n * channels as usize)
                         };
-                        let ch_samples: Vec<f64> = full.iter()
+                        let floats: Vec<f64> = full.iter()
                             .skip(ch).step_by(channels as usize)
                             .copied().collect();
-                        accumulate_channel!(ch_samples, ch, None::<&[i32]>);
+                        accumulate_global!(floats, None::<&[i32]>);
+                        ch_floats[ch] = floats;
                     }
                     _ => {
                         return Err(format!("unsupported sample format: {:?}", sample_fmt));
                     }
                 }
             }
-            // Flush DR blocks once per frame (all channels processed).
-            block_sample_count += n;
-            while block_sample_count >= block_size {
+
+            // ── Split-accumulate: flush DR blocks at exact boundaries ──
+            // Each frame's per-channel samples are split into sub-slices
+            // at the block boundary so no energy leaks across blocks.
+            let mut offset = 0usize;
+            let mut remaining = n;
+            while remaining > 0 {
+                let space = block_size - block_sample_count;
+                let chunk = remaining.min(space);
                 for c in 0..channels as usize {
-                    let rms_linear = (block_rms_sums[c] / block_size as f64).sqrt();
-                    dr_block_rms[c].push(rms_linear);
-                    dr_block_peak[c].push(block_peaks[c]);
-                    block_rms_sums[c] = 0.0;
-                    block_peaks[c] = 0.0;
+                    for &s in &ch_floats[c][offset..offset + chunk] {
+                        let abs_val = s.abs();
+                        if abs_val > block_peaks[c] { block_peaks[c] = abs_val; }
+                        block_rms_sums[c] += s * s;
+                    }
                 }
-                block_sample_count -= block_size;
+                block_sample_count += chunk;
+                offset += chunk;
+                remaining -= chunk;
+                if block_sample_count >= block_size {
+                    for c in 0..channels as usize {
+                        // AES-17 ×2 factor: matches foobar2000's foo_dr_meter.
+                        let rms_linear = (2.0 * block_rms_sums[c] / block_size as f64).sqrt();
+                        dr_block_rms[c].push(rms_linear);
+                        dr_block_peak[c].push(block_peaks[c]);
+                        block_rms_sums[c] = 0.0;
+                        block_peaks[c] = 0.0;
+                    }
+                    block_sample_count = 0;
+                }
             }
         };
     }
@@ -251,7 +281,7 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
     // Flush last partial block (reference: dr_rms divides by actual count).
     if block_sample_count > 0 {
         for c in 0..channels as usize {
-            let rms_linear = (block_rms_sums[c] / block_sample_count as f64).sqrt();
+            let rms_linear = (2.0 * block_rms_sums[c] / block_sample_count as f64).sqrt();
             dr_block_rms[c].push(rms_linear);
             dr_block_peak[c].push(block_peaks[c]);
         }
@@ -265,7 +295,8 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 
     let peak_db = if peak_abs > 0.0 { 20.0 * peak_abs.log10() } else { -120.0 };
     let rms_db = if sample_count > 0 {
-        let rms = (rms_sum / sample_count as f64).sqrt();
+        // AES-17 ×2 factor, matching foobar2000's foo_dr_meter display.
+        let rms = (2.0 * rms_sum / sample_count as f64).sqrt();
         if rms > 0.0 { 20.0 * rms.log10() } else { -120.0 }
     } else {
         -120.0
@@ -306,10 +337,10 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 /// Compute the TT Dynamic Range value from per-channel block data.
 ///
 /// Both `block_rms` and `block_peak` contain LINEAR amplitude values
-/// (not dB). The block RMS values already include the AES-17 factor
-/// of 2 (applied during accumulation).
+/// (not dB). Block RMS includes the AES-17 ×2 factor (matching
+/// foobar2000's foo_dr_meter and dr14_t.meter).
 fn compute_dr(
-    block_rms: &[Vec<f64>],  // per-channel Vec of linear RMS values (with ×2)
+    block_rms: &[Vec<f64>],  // per-channel Vec of linear RMS values
     block_peak: &[Vec<f64>], // per-channel Vec of linear peak values
     channels: usize,
 ) -> i32 {

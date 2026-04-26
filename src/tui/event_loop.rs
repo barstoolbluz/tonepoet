@@ -337,12 +337,14 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         let mtime = meta.modified()
                             .map(crate::db::systemtime_to_unix)
                             .unwrap_or(0);
-                        let _ = app.db.store_analysis(
+                        if let Err(e) = app.db.store_analysis(
                             &result.path.display().to_string(),
                             mtime,
                             meta.len(),
                             &result,
-                        );
+                        ) {
+                            log::error!("analysis cache store failed: {}", e);
+                        }
                     }
 
                     app.analysis_results.push(*result);
