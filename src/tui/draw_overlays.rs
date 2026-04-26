@@ -120,6 +120,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::Preemphasis { scroll } => {
             draw_preemphasis(f, &app.preemph_results, scroll);
         }
+        ActiveOverlay::CueImportReview { ref changes, scroll } => {
+            draw_cue_import_review(f, changes, scroll);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -1484,6 +1487,10 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
     // Footer: clickable pill-style buttons with key hints.
     let footer = match state.phase {
         MetadataEditorPhase::Editing => Line::from(vec![
+            footer_pill(":import-cue", theme::BLUE),
+            pill_gap(),
+            footer_pill(":fix-caps", theme::BLUE),
+            pill_gap(),
             footer_pill("d delete", theme::RED),
             pill_gap(),
             footer_pill("u undo", theme::AMBER),
@@ -1957,3 +1964,88 @@ fn draw_preemphasis(
     );
 }
 
+/// Draw the CUE import review overlay showing proposed changes.
+fn draw_cue_import_review(
+    f: &mut Frame,
+    changes: &[super::app::CueImportChange],
+    scroll: usize,
+) {
+    let area = f.size();
+    let w = (area.width * 80 / 100).max(50).min(area.width.saturating_sub(2));
+    let h = (area.height * 80 / 100).max(12).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let title = format!(" CUE Import Review — {} change{} ",
+        changes.len(), if changes.len() == 1 { "" } else { "s" });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::CYAN))
+        .title(Span::styled(title, Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 { return; }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let content_h = chunks[0].height as usize;
+    let inner_w = chunks[0].width as usize;
+
+    // Build content lines grouped by filename.
+    let mut lines: Vec<Line> = Vec::new();
+    let mut current_file: Option<&str> = None;
+
+    for change in changes {
+        if current_file != Some(&change.filename) {
+            if current_file.is_some() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {}", change.filename),
+                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            )));
+            current_file = Some(&change.filename);
+        }
+
+        let label_w = 16;
+        let label = format!("    {:<width$}", change.field, width = label_w - 4);
+        let old_display = if change.old_value.is_empty() {
+            "(empty)".to_string()
+        } else {
+            truncate_to_chars(&change.old_value.replace('\n', "↵"), inner_w / 3)
+        };
+        let new_display = truncate_to_chars(
+            &change.new_value.replace('\n', "↵"),
+            inner_w.saturating_sub(label_w + old_display.chars().count() + 6),
+        );
+
+        lines.push(Line::from(vec![
+            Span::styled(label, theme::muted()),
+            Span::styled(old_display, Style::default().fg(theme::RED)),
+            Span::styled(" → ", theme::muted()),
+            Span::styled(new_display, Style::default().fg(theme::GREEN)),
+        ]));
+    }
+
+    let total = lines.len();
+    let scroll = scroll.min(total.saturating_sub(content_h));
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    let footer = Line::from(vec![
+        footer_pill("Enter accept", theme::GREEN),
+        pill_gap(),
+        footer_pill("Esc cancel", theme::PURPLE),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
+}

@@ -46,6 +46,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "analyze", "analysis", "dr",
     "write-dr", "writedr",
     "write-rg-track", "write-rg-album",
+    "import-cue",
+    "fix-caps", "fixcaps",
     "search", "s", "rs", "rsearch",
     "context", "menu",
 ];
@@ -237,6 +239,10 @@ pub enum Command {
     WriteRgTrack,
     /// Write ReplayGain album + track tags via loudgain.
     WriteRgAlbum,
+    /// Import metadata from a CUE sheet via external editor + review.
+    ImportCue,
+    /// Apply capitalization rules to TITLE, ARTIST, ALBUM fields.
+    FixCaps,
     /// Verify integrity of selected audio file(s).
     Verify,
     /// Generate a CUE sheet from the selected audio files.
@@ -381,6 +387,8 @@ pub fn parse_command(input: &str) -> Command {
         "write-dr" | "writedr" => Command::WriteDr,
         "write-rg-track" => Command::WriteRgTrack,
         "write-rg-album" => Command::WriteRgAlbum,
+        "import-cue" => Command::ImportCue,
+        "fix-caps" | "fixcaps" => Command::FixCaps,
         "password" | "pw" => Command::Password,
         "context" | "menu" => Command::ContextMenu,
         _ => Command::Unknown(input.to_string()),
@@ -1178,6 +1186,169 @@ pub fn execute_command(
                 }
             }
         }
+        Command::ImportCue => {
+            // Restore parked metadata editor so we can read its state.
+            if let Some(parked) = app.pending_metadata_editor.take() {
+                app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+            }
+            if let ActiveOverlay::MetadataEditor(ref state) = app.active_overlay {
+                let dir = match state.paths.first().and_then(|p| p.parent()) {
+                    Some(d) => d.to_path_buf(),
+                    None => {
+                        app.set_status("No file path to search for CUE");
+                        return;
+                    }
+                };
+
+                // Find .cue file in the directory.
+                let cue_path = match std::fs::read_dir(&dir) {
+                    Ok(entries) => {
+                        let mut cues: Vec<std::path::PathBuf> = entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| {
+                                p.extension()
+                                    .map(|e| e.to_ascii_lowercase() == "cue")
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        cues.sort();
+                        cues.into_iter().next()
+                    }
+                    Err(_) => None,
+                };
+
+                let cue_path = match cue_path {
+                    Some(p) => p,
+                    None => {
+                        app.set_status("No CUE file found in directory");
+                        return;
+                    }
+                };
+
+                // Copy CUE to temp file for editing.
+                let temp_dir = std::env::temp_dir();
+                let temp_name = format!("tonepoet-cue-{}.cue",
+                    std::process::id());
+                let temp_path = temp_dir.join(temp_name);
+                if let Err(e) = std::fs::copy(&cue_path, &temp_path) {
+                    app.set_status(format!("Failed to copy CUE: {}", e));
+                    return;
+                }
+
+                // Park the metadata editor state for later.
+                if let ActiveOverlay::MetadataEditor(state) =
+                    std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+                {
+                    app.pending_metadata_editor = Some(state);
+                }
+
+                // Open external editor (blocks, TUI suspended).
+                let editor_ok = super::external_editor::open_in_editor(&temp_path);
+
+                match editor_ok {
+                    Ok(true) => {
+                        // Parse the edited CUE.
+                        let sheet = match super::cue_parser::parse_cue_file(&temp_path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&temp_path);
+                                if let Some(parked) = app.pending_metadata_editor.take() {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                                }
+                                app.set_status(format!("CUE parse error: {}", e));
+                                return;
+                            }
+                        };
+
+                        // Build the diff against current tags.
+                        let changes = if let Some(ref state) = app.pending_metadata_editor {
+                            build_cue_diff(state, &sheet)
+                        } else {
+                            Vec::new()
+                        };
+
+                        if changes.is_empty() {
+                            // No differences — restore editor.
+                            if let Some(parked) = app.pending_metadata_editor.take() {
+                                app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                            }
+                            app.set_status("No changes from CUE import");
+                        } else {
+                            let n = changes.len();
+                            // Show review overlay (editor stays parked).
+                            app.active_overlay = ActiveOverlay::CueImportReview {
+                                changes,
+                                scroll: 0,
+                            };
+                            app.set_status(format!(
+                                "CUE import: {} change{} to review",
+                                n, if n == 1 { "" } else { "s" },
+                            ));
+                        }
+                    }
+                    Ok(false) => {
+                        // Editor exited with error — cancel.
+                        if let Some(parked) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                        }
+                        app.set_status("CUE import cancelled");
+                    }
+                    Err(e) => {
+                        if let Some(parked) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                        }
+                        app.set_status(format!("Editor error: {}", e));
+                    }
+                }
+
+                let _ = std::fs::remove_file(&temp_path);
+            } else {
+                app.set_status(":import-cue only works in the metadata editor");
+            }
+        }
+        Command::FixCaps => {
+            // Restore parked metadata editor if coming from command mode.
+            if let Some(parked) = app.pending_metadata_editor.take() {
+                app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+            }
+            if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
+                use crate::convert::renaming::{capitalize_title, capitalize_section};
+
+                let mut changed = 0usize;
+                for entry in &mut state.entries {
+                    let key_upper = entry.display_key.to_ascii_uppercase();
+                    let cap_fn: fn(&str) -> String = match key_upper.as_str() {
+                        "TITLE" => capitalize_title,
+                        "ARTIST" | "ALBUM" | "ALBUMARTIST" | "PERFORMER" => capitalize_section,
+                        _ => continue,
+                    };
+                    for v in &mut entry.per_file_values {
+                        if !v.is_empty() {
+                            let new_val = cap_fn(v);
+                            if new_val != *v {
+                                *v = new_val;
+                                changed += 1;
+                            }
+                        }
+                    }
+                    // Update merged display value and mixed state.
+                    let n = state.paths.len();
+                    let all_same = entry.per_file_values.windows(2)
+                        .all(|w| w[0] == w[1]);
+                    entry.is_mixed = !all_same && n > 1;
+                    entry.value = if entry.is_mixed {
+                        "<multiple values>".to_string()
+                    } else {
+                        entry.per_file_values.first().cloned().unwrap_or_default()
+                    };
+                }
+                state.dirty = true;
+                app.set_status(format!("Capitalization applied ({} values changed)", changed));
+            } else {
+                app.set_status(":fix-caps only works in the metadata editor");
+            }
+        }
         Command::ContextMenu => {
             let origin = match app.current_screen {
                 AppScreen::Browse => {
@@ -1967,6 +2138,121 @@ fn expand_path(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// Build a list of proposed changes by comparing CUE sheet metadata
+/// against the current tags in the metadata editor.
+fn build_cue_diff(
+    state: &super::app::MetadataEditorState,
+    sheet: &super::cue_parser::CueSheet,
+) -> Vec<super::app::CueImportChange> {
+    let mut changes = Vec::new();
+
+    for (i, path) in state.paths.iter().enumerate() {
+        let stem = path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let filename = path.file_stem()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| stem.clone());
+
+        // Match CUE track by filename, then by index.
+        let track = sheet.tracks.iter()
+            .find(|t| t.file.as_deref() == Some(stem.as_str()))
+            .or_else(|| sheet.tracks.get(i));
+
+        // Collect proposed values for this file.
+        let mut proposed: Vec<(&str, String)> = Vec::new();
+
+        if let Some(t) = track {
+            if let Some(ref title) = t.title {
+                proposed.push(("TITLE", title.clone()));
+            }
+            if let Some(ref performer) = t.performer {
+                proposed.push(("ARTIST", performer.clone()));
+            }
+            if t.number > 0 {
+                proposed.push(("TRACKNUMBER", t.number.to_string()));
+            }
+        }
+        if let Some(ref album) = sheet.title {
+            proposed.push(("ALBUM", album.clone()));
+        }
+
+        // Compare each proposed value against the current tag.
+        for (field, new_value) in proposed {
+            let old_value = state.entries.iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case(field))
+                .map(|e| e.per_file_values.get(i).cloned().unwrap_or_default())
+                .unwrap_or_default();
+
+            if old_value != new_value {
+                changes.push(super::app::CueImportChange {
+                    file_index: i,
+                    filename: filename.clone(),
+                    field: field.to_string(),
+                    old_value,
+                    new_value,
+                });
+            }
+        }
+    }
+
+    changes
+}
+
+/// Apply a set of CUE import changes to a metadata editor state.
+pub fn apply_cue_changes(
+    state: &mut super::app::MetadataEditorState,
+    changes: &[super::app::CueImportChange],
+) {
+    let n = state.paths.len();
+
+    for change in changes {
+        // Find or create the entry for this field.
+        let idx = match state.entries.iter().position(|e|
+            e.display_key.eq_ignore_ascii_case(&change.field))
+        {
+            Some(i) => i,
+            None => {
+                let item_key = match change.field.to_ascii_uppercase().as_str() {
+                    "TITLE" => lofty::tag::ItemKey::TrackTitle,
+                    "ARTIST" => lofty::tag::ItemKey::TrackArtist,
+                    "ALBUM" => lofty::tag::ItemKey::AlbumTitle,
+                    "TRACKNUMBER" => lofty::tag::ItemKey::TrackNumber,
+                    _ => lofty::tag::ItemKey::Unknown(change.field.to_ascii_uppercase()),
+                };
+                state.entries.push(super::probe::TagEntry {
+                    display_key: change.field.to_ascii_uppercase(),
+                    item_key,
+                    value: String::new(),
+                    original: String::new(),
+                    is_binary: false,
+                    is_mixed: false,
+                    per_file_values: vec![String::new(); n],
+                    per_file_originals: vec![String::new(); n],
+                });
+                state.entries.len() - 1
+            }
+        };
+
+        if change.file_index < n {
+            state.entries[idx].per_file_values[change.file_index] = change.new_value.clone();
+        }
+    }
+
+    // Update merged display values and mixed state.
+    for entry in &mut state.entries {
+        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+        entry.is_mixed = !all_same && n > 1;
+        entry.value = if entry.is_mixed {
+            "<multiple values>".to_string()
+        } else {
+            entry.per_file_values.first().cloned().unwrap_or_default()
+        };
+    }
+
+    state.dirty = true;
 }
 
 #[cfg(test)]

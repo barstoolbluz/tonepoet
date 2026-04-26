@@ -830,6 +830,28 @@ pub enum ActiveOverlay {
     Preemphasis {
         scroll: usize,
     },
+    /// CUE import review: shows proposed changes before merging into
+    /// the metadata editor. The editor state is parked in
+    /// `AppState::pending_metadata_editor` during review.
+    CueImportReview {
+        changes: Vec<CueImportChange>,
+        scroll: usize,
+    },
+}
+
+/// A single proposed change from a CUE import.
+#[derive(Debug, Clone)]
+pub struct CueImportChange {
+    /// Index into the metadata editor's file list.
+    pub file_index: usize,
+    /// Display filename for the change.
+    pub filename: String,
+    /// Tag field name (e.g. "TITLE", "ARTIST").
+    pub field: String,
+    /// Current tag value (empty string if absent).
+    pub old_value: String,
+    /// New value from the edited CUE sheet.
+    pub new_value: String,
 }
 
 /// Phase of the metadata editor workflow.
@@ -1192,6 +1214,11 @@ pub struct AppState {
     /// the TextEdit commits or is cancelled.
     pub pending_bulk_rename: Option<Box<BulkRenameState>>,
 
+    /// Parked MetadataEditorState while command mode or CUE import
+    /// review is open. Set when `:` is pressed in the metadata editor;
+    /// restored after the command executes or review completes.
+    pub pending_metadata_editor: Option<Box<MetadataEditorState>>,
+
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
     pub processing_active: bool,
@@ -1307,6 +1334,7 @@ impl AppState {
             wizard_target: WizardTarget::ConfigureAll,
             active_overlay: ActiveOverlay::None,
             pending_bulk_rename: None,
+            pending_metadata_editor: None,
             status_message: None,
             processing_active: false,
             should_quit: false,

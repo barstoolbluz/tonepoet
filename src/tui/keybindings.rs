@@ -1334,10 +1334,21 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         let cmd = super::command::parse_command(&input.text);
                         super::command::execute_command(app, cmd, tx);
                     }
+                    // If a parked metadata editor wasn't consumed by the
+                    // command, restore it now.
+                    if let Some(parked) = app.pending_metadata_editor.take() {
+                        if matches!(app.active_overlay, ActiveOverlay::None) {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                        }
+                    }
                     return;
                 }
                 KeyCode::Esc => {
                     app.active_overlay = ActiveOverlay::None;
+                    // Restore parked metadata editor on cancel.
+                    if let Some(parked) = app.pending_metadata_editor.take() {
+                        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                    }
                     return;
                 }
                 KeyCode::Tab => {
@@ -1423,6 +1434,43 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 KeyCode::Down => {
                     scroll += 1;
                     app.active_overlay = ActiveOverlay::Analysis { scroll };
+                }
+                _ => {}
+            }
+        }
+        ActiveOverlay::CueImportReview { mut scroll, ref changes } => {
+            let changes = changes.clone(); // clone for use after overlay replace
+            match key.code {
+                KeyCode::Enter => {
+                    // Accept: apply changes to parked metadata editor.
+                    if let Some(mut parked) = app.pending_metadata_editor.take() {
+                        super::command::apply_cue_changes(&mut parked, &changes);
+                        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                        app.set_status(format!(
+                            "Imported {} change{} from CUE",
+                            changes.len(),
+                            if changes.len() == 1 { "" } else { "s" },
+                        ));
+                    } else {
+                        app.active_overlay = ActiveOverlay::None;
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    // Cancel: restore editor without changes.
+                    if let Some(parked) = app.pending_metadata_editor.take() {
+                        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                    } else {
+                        app.active_overlay = ActiveOverlay::None;
+                    }
+                    app.set_status("CUE import cancelled");
+                }
+                KeyCode::Up => {
+                    scroll = scroll.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::CueImportReview { changes, scroll };
+                }
+                KeyCode::Down => {
+                    scroll += 1;
+                    app.active_overlay = ActiveOverlay::CueImportReview { changes, scroll };
                 }
                 _ => {}
             }
@@ -1746,6 +1794,16 @@ fn handle_metadata_editor_key(
     match state.phase {
         MetadataEditorPhase::Editing => {
             match key.code {
+                // Command mode: park editor state, open command input.
+                KeyCode::Char(':') => {
+                    let parked = state.clone();
+                    app.pending_metadata_editor = Some(parked);
+                    app.active_overlay = ActiveOverlay::CommandInput {
+                        input: super::text_input::TextInputState::empty(),
+                        completion: None,
+                    };
+                    return;
+                }
                 KeyCode::Esc => {
                     if state.dirty {
                         // TODO: confirmation dialog for unsaved changes
@@ -2547,6 +2605,16 @@ fn handle_generic_overlay_mouse(
                         ("Esc close", "esc"),
                     ])
                 }
+                ActiveOverlay::CueImportReview { .. } => {
+                    let w = ((area.0 as usize) * 80 / 100).max(50).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 80 / 100).max(12).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![
+                        ("Enter accept", "enter"),
+                        ("Esc cancel", "esc"),
+                    ])
+                }
                 ActiveOverlay::Confirmation { .. } => {
                     // Already has button_map support — skip.
                     return false;
@@ -3017,6 +3085,8 @@ fn handle_metadata_editor_mouse(
                     // Pill layout (centered): [d delete] [u undo] [a add] [w save] [Esc close]
                     // Each pill: " label " (label.len() + 2 for padding), 1-char gap between.
                     let pills: &[(&str, &str)] = &[
+                        (":import-cue", ":import-cue"),
+                        (":fix-caps", ":fix-caps"),
                         ("d delete", "d"),
                         ("u undo", "u"),
                         ("a add", "a"),
@@ -3024,9 +3094,14 @@ fn handle_metadata_editor_mouse(
                         ("Esc close", "esc"),
                     ];
                     if let Some(action) = footer_pill_hit(pills, mx, inner_x, inner_w) {
+                        if action.starts_with(':') {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                            let cmd = super::command::parse_command(&action[1..]);
+                            super::command::execute_command(app, cmd, _tx);
+                            return;
+                        }
                         match action {
                             "d" => {
-                                // Simulate 'd' key.
                                 let fake_key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
                                 handle_metadata_editor_key(app, fake_key, &mut state, _tx);
                                 if !matches!(app.active_overlay, ActiveOverlay::None) {

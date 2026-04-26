@@ -16,6 +16,7 @@ pub mod convert_actions;
 pub mod convert_screen;
 pub mod dr_report;
 pub mod draw;
+pub mod external_editor;
 pub mod draw_browse;
 pub mod draw_footer;
 pub mod draw_header;
