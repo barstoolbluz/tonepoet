@@ -1409,65 +1409,20 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 KeyCode::Esc | KeyCode::Char('q') => {
                     app.active_overlay = ActiveOverlay::None;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                // Command mode: allow :write-dr, :write-rg etc.
+                KeyCode::Char(':') => {
+                    app.active_overlay = ActiveOverlay::CommandInput {
+                        input: super::text_input::TextInputState::empty(),
+                        completion: None,
+                    };
+                }
+                KeyCode::Up => {
                     scroll = scroll.saturating_sub(1);
                     app.active_overlay = ActiveOverlay::Analysis { scroll };
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     scroll += 1;
                     app.active_overlay = ActiveOverlay::Analysis { scroll };
-                }
-                // Write ReplayGain tags: w = track only, W = album + track.
-                KeyCode::Char('w') | KeyCode::Char('W') => {
-                    let paths: Vec<std::path::PathBuf> = app.analysis_results
-                        .iter().map(|r| r.path.clone()).collect();
-                    if !paths.is_empty() {
-                        let album = key.code == KeyCode::Char('W');
-                        let tx = tx.clone();
-                        let db_paths: Vec<String> = paths.iter()
-                            .map(|p| p.display().to_string()).collect();
-                        app.set_status(format!(
-                            "Writing {} ReplayGain tags...",
-                            if album { "album + track" } else { "track" },
-                        ));
-                        tokio::spawn(async move {
-                            let mut args = vec![
-                                "-s".to_string(), "i".to_string(),
-                                "-k".to_string(),
-                            ];
-                            if album {
-                                args.push("-a".to_string());
-                            } else {
-                                args.push("-r".to_string());
-                            }
-                            for p in &paths {
-                                args.push(p.to_string_lossy().to_string());
-                            }
-                            let output = tokio::process::Command::new("loudgain")
-                                .args(&args)
-                                .output()
-                                .await;
-                            let msg = match output {
-                                Ok(o) if o.status.success() => {
-                                    format!("ReplayGain tags written ({} file{})",
-                                        db_paths.len(),
-                                        if db_paths.len() == 1 { "" } else { "s" })
-                                }
-                                Ok(o) => {
-                                    let stderr = String::from_utf8_lossy(&o.stderr);
-                                    format!("loudgain failed: {}", stderr.lines().next().unwrap_or("unknown error"))
-                                }
-                                Err(e) => format!("loudgain not found: {}", e),
-                            };
-                            let _ = tx.send(AppMessage::StatusMessage(msg)).await;
-                        });
-                        app.active_overlay = ActiveOverlay::None;
-                        // Invalidate probe cache for the written files.
-                        for r in &app.analysis_results {
-                            app.browse.probe_cache.remove(&r.path);
-                            let _ = app.db.invalidate_probe(&r.path.display().to_string());
-                        }
-                    }
                 }
                 _ => {}
             }
@@ -2496,7 +2451,10 @@ fn handle_generic_overlay_mouse(
                     let x = (area.0.saturating_sub(w)) / 2;
                     let y = (area.1.saturating_sub(h)) / 2;
                     (Rect::new(x, y, w, h), vec![
-                        ("w track RG", "w"), ("W album+track RG", "W"), ("Esc close", "esc"),
+                        (":write-dr", ":write-dr"),
+                        (":write-rg-track", ":write-rg-track"),
+                        (":write-rg-album", ":write-rg-album"),
+                        ("Esc close", "esc"),
                     ])
                 }
                 ActiveOverlay::BulkRename(ref state) => {
@@ -2646,27 +2604,34 @@ fn handle_generic_overlay_mouse(
         // Left click on footer: pill hit-test.
         MouseEventKind::Down(MouseButton::Left) if on_footer && !pills.is_empty() => {
             if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
-                let fake = match action {
-                    "enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                    "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                    "tab" => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-                    other => {
-                        let ch = other.chars().next().unwrap_or('?');
-                        if ch.is_uppercase() {
-                            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT)
-                        } else {
-                            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
-                        }
-                    }
-                };
-                if app.bookmarks.overlay_open {
-                    handle_bookmarks_overlay_key(app, fake, _tx);
-                } else if app.recent.overlay_open {
-                    handle_recent_overlay_key(app, fake);
-                } else if app.preset.overlay_open {
-                    handle_preset_overlay_key(app, fake);
+                // Actions starting with ":" are command-mode commands —
+                // execute them directly instead of synthesizing a keypress.
+                if action.starts_with(':') {
+                    let cmd = super::command::parse_command(&action[1..]);
+                    super::command::execute_command(app, cmd, _tx);
                 } else {
-                    handle_overlay_key(app, fake, _tx);
+                    let fake = match action {
+                        "enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        "tab" => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                        other => {
+                            let ch = other.chars().next().unwrap_or('?');
+                            if ch.is_uppercase() {
+                                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT)
+                            } else {
+                                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+                            }
+                        }
+                    };
+                    if app.bookmarks.overlay_open {
+                        handle_bookmarks_overlay_key(app, fake, _tx);
+                    } else if app.recent.overlay_open {
+                        handle_recent_overlay_key(app, fake);
+                    } else if app.preset.overlay_open {
+                        handle_preset_overlay_key(app, fake);
+                    } else {
+                        handle_overlay_key(app, fake, _tx);
+                    }
                 }
                 return true;
             }

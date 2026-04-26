@@ -1150,9 +1150,11 @@ fn draw_analysis(
 
     // Footer pills.
     let footer = Line::from(vec![
-        footer_pill("w track RG", theme::GREEN),
+        footer_pill(":write-dr", theme::BLUE),
         pill_gap(),
-        footer_pill("W album+track RG", theme::GREEN),
+        footer_pill(":write-rg-track", theme::GREEN),
+        pill_gap(),
+        footer_pill(":write-rg-album", theme::GREEN),
         pill_gap(),
         footer_pill("Esc close", theme::PURPLE),
     ]);

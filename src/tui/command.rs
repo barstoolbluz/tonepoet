@@ -44,6 +44,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "rename-all", "renameall", "bulk-rename",
     "password", "pw",
     "analyze", "analysis", "dr",
+    "write-dr", "writedr",
+    "write-rg-track", "write-rg-album",
     "search", "s", "rs", "rsearch",
     "context", "menu",
 ];
@@ -229,6 +231,12 @@ pub enum Command {
     BulkRename,
     /// Analyze selected audio file(s) — DR, peak, clipping, etc.
     Analyze,
+    /// Write DR analysis report to each album directory.
+    WriteDr,
+    /// Write ReplayGain track tags via loudgain.
+    WriteRgTrack,
+    /// Write ReplayGain album + track tags via loudgain.
+    WriteRgAlbum,
     /// Verify integrity of selected audio file(s).
     Verify,
     /// Generate a CUE sheet from the selected audio files.
@@ -370,6 +378,9 @@ pub fn parse_command(input: &str) -> Command {
         }
         "search" | "s" => Command::Search { recursive: false },
         "rs" | "rsearch" => Command::Search { recursive: true },
+        "write-dr" | "writedr" => Command::WriteDr,
+        "write-rg-track" => Command::WriteRgTrack,
+        "write-rg-album" => Command::WriteRgAlbum,
         "password" | "pw" => Command::Password,
         "context" | "menu" => Command::ContextMenu,
         _ => Command::Unknown(input.to_string()),
@@ -1079,6 +1090,92 @@ pub fn execute_command(
                     })
                     .collect();
                 super::keybindings::open_bulk_rename(app, audio_paths);
+            }
+        }
+        Command::WriteRgTrack | Command::WriteRgAlbum => {
+            let album = matches!(cmd, Command::WriteRgAlbum);
+            let paths: Vec<std::path::PathBuf> = app.analysis_results
+                .iter().map(|r| r.path.clone()).collect();
+            if paths.is_empty() {
+                app.set_status("No analysis results — run :analyze first");
+            } else {
+                let tx = tx.clone();
+                let db_paths: Vec<String> = paths.iter()
+                    .map(|p| p.display().to_string()).collect();
+                app.set_status(format!(
+                    "Writing {} ReplayGain tags...",
+                    if album { "album + track" } else { "track" },
+                ));
+                tokio::spawn(async move {
+                    let mut args = vec![
+                        "-s".to_string(), "i".to_string(),
+                        "-k".to_string(),
+                    ];
+                    if album {
+                        args.push("-a".to_string());
+                    } else {
+                        args.push("-r".to_string());
+                    }
+                    for p in &paths {
+                        args.push(p.to_string_lossy().to_string());
+                    }
+                    let output = tokio::process::Command::new("loudgain")
+                        .args(&args)
+                        .output()
+                        .await;
+                    let msg = match output {
+                        Ok(o) if o.status.success() => {
+                            format!("ReplayGain tags written ({} file{})",
+                                db_paths.len(),
+                                if db_paths.len() == 1 { "" } else { "s" })
+                        }
+                        Ok(o) => {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            format!("loudgain failed: {}", stderr.lines().next().unwrap_or("unknown error"))
+                        }
+                        Err(e) => format!("loudgain not found: {}", e),
+                    };
+                    let _ = tx.send(super::message::AppMessage::StatusMessage(msg)).await;
+                });
+                // Invalidate probe cache for the written files.
+                for r in &app.analysis_results {
+                    app.browse.probe_cache.remove(&r.path);
+                    let _ = app.db.invalidate_probe(&r.path.display().to_string());
+                }
+            }
+        }
+        Command::WriteDr => {
+            if app.analysis_results.is_empty() {
+                app.set_status("No analysis results — run :analyze first");
+            } else {
+                let reports = super::dr_report::format_dr_reports(&app.analysis_results);
+                let mut written = Vec::new();
+                let mut errors = Vec::new();
+                for (dir, text) in &reports {
+                    let path = dir.join("dr_analysis.txt");
+                    match std::fs::write(&path, text) {
+                        Ok(()) => written.push(path),
+                        Err(e) => errors.push(format!("{}: {}", dir.display(), e)),
+                    }
+                }
+                if errors.is_empty() {
+                    if written.len() == 1 {
+                        app.set_status(format!(
+                            "DR report written to {}",
+                            written[0].display(),
+                        ));
+                    } else {
+                        app.set_status(format!(
+                            "DR reports written to {} directories",
+                            written.len(),
+                        ));
+                    }
+                } else {
+                    app.set_status(format!(
+                        "DR report errors: {}",
+                        errors.join("; "),
+                    ));
+                }
             }
         }
         Command::ContextMenu => {
