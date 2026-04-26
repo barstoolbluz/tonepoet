@@ -384,15 +384,9 @@ fn compute_dr(
         return 0;
     }
 
-    // For stereo/multi-channel, use the second-highest (i.e. lower for
-    // stereo) per-channel DR — the channel with the least dynamic range
-    // determines the track rating. For mono, use the only value.
-    channel_drs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let dr = if channel_drs.len() >= 2 {
-        channel_drs[1]
-    } else {
-        channel_drs[0]
-    };
+    // Arithmetic mean of per-channel DRs (matching foobar2000's
+    // foo_dr_meter and MacinMeter). For mono, uses the only value.
+    let dr: f64 = channel_drs.iter().sum::<f64>() / channel_drs.len() as f64;
 
     dr.round() as i32
 }
