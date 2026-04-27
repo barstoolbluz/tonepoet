@@ -706,6 +706,64 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 }
             }
         }
+        ActiveOverlay::MetadataEditor(_) => {
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            if let ActiveOverlay::MetadataEditor(mut state) = overlay {
+                use super::app::MetadataEditorPhase;
+                if state.phase == MetadataEditorPhase::DetailEdit {
+                    let field_idx = state.detail_field_idx;
+                    if field_idx < state.entries.len() {
+                        let sanitized = text.replace("\r\n", "\n").replace('\r', "\n");
+                        let lines: Vec<&str> = sanitized.split('\n').collect();
+                        let n_files = state.paths.len();
+                        let entry = &mut state.entries[field_idx];
+                        let is_album = entry.display_key.eq_ignore_ascii_case("ALBUM");
+
+                        if is_album {
+                            let val = lines.first().map(|l| l.trim().to_string())
+                                .unwrap_or_default();
+                            for v in &mut entry.per_file_values {
+                                *v = val.clone();
+                            }
+                        } else {
+                            for (i, line) in lines.iter().enumerate() {
+                                if i >= n_files { break; }
+                                entry.per_file_values[i] = line.trim().to_string();
+                            }
+                        }
+
+                        // Cancel any active inline edit.
+                        state.detail_edit = None;
+
+                        // Update merged display value + mixed state.
+                        let all_same = entry.per_file_values.windows(2)
+                            .all(|w| w[0] == w[1]);
+                        entry.is_mixed = !all_same && n_files > 1;
+                        entry.value = if entry.is_mixed {
+                            "<multiple values>".to_string()
+                        } else {
+                            entry.per_file_values.first().cloned().unwrap_or_default()
+                        };
+
+                        state.dirty = true;
+                        let applied = lines.len().min(n_files);
+                        app.set_status(format!(
+                            "Pasted {} value{}", applied,
+                            if applied == 1 { "" } else { "s" },
+                        ));
+                    }
+                } else if state.phase == MetadataEditorPhase::InlineEdit {
+                    // Single-field inline edit: insert first line at cursor.
+                    if let Some(ref mut input) = state.edit_input {
+                        let first_line = text.lines().next().unwrap_or("");
+                        for c in first_line.chars() {
+                            input.insert_char(c);
+                        }
+                    }
+                }
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+        }
         _ => {
             // Paste ignored outside text-entry contexts.
         }
