@@ -528,7 +528,7 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::Analyze => {
-            let cmd = super::command::Command::Analyze;
+            let cmd = super::command::Command::Analyze { force: false };
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::Verify => {

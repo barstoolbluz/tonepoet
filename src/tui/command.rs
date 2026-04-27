@@ -43,7 +43,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "bookmarks", "bm",
     "rename-all", "renameall", "bulk-rename",
     "password", "pw",
-    "analyze", "analysis", "dr",
+    "analyze", "analyze!", "analysis", "dr",
     "write-dr", "writedr",
     "write-rg-track", "write-rg-album",
     "import-cue",
@@ -232,7 +232,8 @@ pub enum Command {
     /// Open the bulk rename wizard for the current selection.
     BulkRename,
     /// Analyze selected audio file(s) — DR, peak, clipping, etc.
-    Analyze,
+    /// `force`: if true, skip cache and re-analyze.
+    Analyze { force: bool },
     /// Write DR analysis report to each album directory.
     WriteDr,
     /// Write ReplayGain track tags via loudgain.
@@ -341,7 +342,8 @@ pub fn parse_command(input: &str) -> Command {
         "recent" | "recents" => Command::Recent,
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
         "rename-all" | "renameall" | "bulk-rename" => Command::BulkRename,
-        "analyze" | "analysis" | "dr" => Command::Analyze,
+        "analyze" | "analysis" | "dr" => Command::Analyze { force: false },
+        "analyze!" => Command::Analyze { force: true },
         "verify" | "test" => Command::Verify,
         "cue" => Command::GenerateCue { single_image: false },
         "cue!" => Command::GenerateCue { single_image: true },
@@ -687,7 +689,7 @@ pub fn execute_command(
                 app.set_status("No file selected");
             }
         }
-        Command::Analyze => {
+        Command::Analyze { force } => {
             // Collect paths to analyze from the current context.
             // On Browse, directories are expanded recursively to find
             // nested audio files (e.g., disc 01/disc 02 folders).
@@ -713,20 +715,25 @@ pub fn execute_command(
                 app.analysis_results.clear();
 
                 // Check DB cache for each path; only spawn analysis for misses.
+                // :analyze! skips the cache entirely.
                 let mut to_analyze = Vec::new();
-                for path in &paths {
-                    let cached = std::fs::metadata(path).ok().and_then(|meta| {
-                        let mtime = meta.modified()
-                            .map(crate::db::systemtime_to_unix)
-                            .unwrap_or(0);
-                        app.db.get_cached_analysis(
-                            &path.display().to_string(), mtime, meta.len(),
-                        )
-                    });
-                    if let Some(result) = cached {
-                        app.analysis_results.push(result);
-                    } else {
-                        to_analyze.push(path.clone());
+                if force {
+                    to_analyze = paths.clone();
+                } else {
+                    for path in &paths {
+                        let cached = std::fs::metadata(path).ok().and_then(|meta| {
+                            let mtime = meta.modified()
+                                .map(crate::db::systemtime_to_unix)
+                                .unwrap_or(0);
+                            app.db.get_cached_analysis(
+                                &path.display().to_string(), mtime, meta.len(),
+                            )
+                        });
+                        if let Some(result) = cached {
+                            app.analysis_results.push(result);
+                        } else {
+                            to_analyze.push(path.clone());
+                        }
                     }
                 }
 
@@ -748,14 +755,16 @@ pub fn execute_command(
                         let tx = tx.clone();
                         tokio::spawn(async move {
                             let pcm_path = path.clone();
-                            let lufs_path = path;
+                            let lufs_path = path.clone();
+                            let hdcd_path = path;
 
-                            // Run PCM analysis and loudgain in parallel.
-                            let (pcm_result, lufs_result) = tokio::join!(
+                            // Run PCM analysis, loudgain, and HDCD detection in parallel.
+                            let (pcm_result, lufs_result, hdcd_result) = tokio::join!(
                                 tokio::task::spawn_blocking(move || {
                                     super::analyze::analyze_file(&pcm_path)
                                 }),
                                 super::analyze::measure_loudness(&lufs_path),
+                                super::analyze::detect_hdcd(&hdcd_path),
                             );
 
                             // Merge results and send (always send to decrement pending counter).
@@ -784,6 +793,18 @@ pub fn execute_command(
                                             "{}; verify de-emphasis was not applied during ripping",
                                             cm.detail
                                         ));
+                                    }
+
+                                    // HDCD detection (only meaningful for 16-bit sources).
+                                    if result.declared_bit_depth == Some(16)
+                                        || (result.declared_bit_depth.is_none() && result.actual_bit_depth <= 16)
+                                    {
+                                        if let Some(hdcd) = hdcd_result {
+                                            result.hdcd_detected = Some(hdcd.detected);
+                                            if hdcd.detected {
+                                                result.hdcd_detail = Some(hdcd.detail);
+                                            }
+                                        }
                                     }
 
                                     Ok(Box::new(result))

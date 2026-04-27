@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 14;
+const CURRENT_VERSION: u32 = 15;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -106,6 +106,9 @@ impl Database {
         }
         if version < 14 {
             self.migrate_v14()?;
+        }
+        if version < 15 {
+            self.migrate_v15()?;
         }
 
         self.conn
@@ -454,6 +457,15 @@ impl Database {
         Ok(())
     }
 
+    /// v15: add HDCD columns to analysis_cache.
+    fn migrate_v15(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            ALTER TABLE analysis_cache ADD COLUMN hdcd_detected INTEGER;
+            ALTER TABLE analysis_cache ADD COLUMN hdcd_detail TEXT;
+        ").map_err(|e| format!("v15 migration failed: {}", e))?;
+        Ok(())
+    }
+
     // ── Search tag cache ─────────────────────────────────────────
 
     /// Look up cached tag string. Returns (tag_string, title, artist, album, genre, year)
@@ -530,7 +542,7 @@ impl Database {
 
     /// Bump this when the analysis algorithm changes to invalidate
     /// cached results computed by an older version.
-    const ANALYSIS_ALGO_VERSION: i32 = 23;
+    const ANALYSIS_ALGO_VERSION: i32 = 24;
 
     /// Look up cached analysis. Returns None if not cached, stale,
     /// or computed by an older algorithm version.
@@ -544,7 +556,7 @@ impl Database {
             "SELECT dr_value, peak_db, rms_db, clipping_count, dc_bias,
                     actual_bit_depth, declared_bit_depth, sample_rate, channels,
                     duration_secs, lufs, true_peak_dbtp, preemphasis, preemphasis_corr,
-                    preemphasis_detail
+                    preemphasis_detail, hdcd_detected, hdcd_detail
              FROM analysis_cache
              WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3
                AND algo_version = ?4",
@@ -557,6 +569,7 @@ impl Database {
                     Some(1) => Some(crate::tui::preemphasis::PreemphasisConfidence::Possible),
                     _ => None,
                 };
+                let hdcd_int: Option<i32> = row.get(15)?;
                 Ok(crate::tui::analyze::AnalysisResult {
                     path: std::path::PathBuf::from(file_path),
                     dr_value: row.get(0)?,
@@ -574,6 +587,8 @@ impl Database {
                     preemphasis,
                     preemphasis_corr: row.get(13)?,
                     preemphasis_detail: row.get(14)?,
+                    hdcd_detected: hdcd_int.map(|v| v != 0),
+                    hdcd_detail: row.get(16)?,
                 })
             },
         ).ok()
@@ -593,8 +608,8 @@ impl Database {
                 dr_value, peak_db, rms_db, clipping_count, dc_bias,
                 actual_bit_depth, declared_bit_depth, sample_rate, channels,
                 duration_secs, lufs, true_peak_dbtp, preemphasis, preemphasis_corr,
-                preemphasis_detail, analyzed_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                preemphasis_detail, hdcd_detected, hdcd_detail, analyzed_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 file_path, mtime, size as i64, Self::ANALYSIS_ALGO_VERSION,
                 r.dr_value, r.peak_db, r.rms_db, r.clipping_count as i64, r.dc_bias,
@@ -609,6 +624,8 @@ impl Database {
                 }),
                 r.preemphasis_corr,
                 r.preemphasis_detail,
+                r.hdcd_detected.map(|b| if b { 1i32 } else { 0 }),
+                r.hdcd_detail,
                 chrono::Utc::now().to_rfc3339(),
             ],
         ).map_err(|e| format!("analysis cache store: {}", e))?;
@@ -1232,6 +1249,7 @@ impl CachedProbeRow {
                 r128_track_gain: self.r128_track_gain.clone(),
                 r128_album_gain: self.r128_album_gain.clone(),
                 preemphasis_metadata: None, // Not cached; re-detected on probe.
+                hdcd_detail: None, // Populated from analysis cache if available.
             },
         })
     }

@@ -891,6 +891,28 @@ fn entry_info_lines(
                     ]);
                 }
 
+                // HDCD — shown if previously analyzed and detected.
+                // "HDCD" in the value text rendered gold.
+                if let Some(ref hdcd) = cached.metadata.hdcd_detail {
+                    let val_max = max_value_chars.saturating_sub(11);
+                    let mut spans = vec![
+                        Span::styled("   HDCD    ", theme::muted()),
+                    ];
+                    if let Some(rest) = hdcd.strip_prefix("HDCD") {
+                        spans.push(Span::styled("HDCD", Style::default().fg(theme::AMBER).add_modifier(ratatui::style::Modifier::BOLD)));
+                        spans.push(Span::styled(
+                            truncate_to(rest, val_max.saturating_sub(4)),
+                            theme::text(),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            truncate_to(hdcd, val_max),
+                            theme::text(),
+                        ));
+                    }
+                    lines.push(spans);
+                }
+
                 // ReplayGain / R128 — shown with technical info since
                 // these are measurement data, not user-editable metadata.
                 let meta = &cached.metadata;

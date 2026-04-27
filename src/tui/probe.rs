@@ -50,6 +50,10 @@ pub struct SourceMetadata {
     /// Pre-emphasis detected via metadata (tags, CUE files, catalog number).
     /// None = not detected. Some(source) = evidence found (e.g. "tag", "CUE file", "catalog (35DP-4)").
     pub preemphasis_metadata: Option<String>,
+
+    /// HDCD detection result from analysis cache. Populated when the file
+    /// has been previously analyzed. None = not yet analyzed.
+    pub hdcd_detail: Option<String>,
 }
 
 /// Convert an R128 Q7.8 fixed-point integer (stored as a string) into a

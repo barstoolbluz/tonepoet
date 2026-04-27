@@ -1142,6 +1142,23 @@ fn draw_analysis(
                 Span::styled(value.clone(), Style::default().fg(*color)),
             ]));
         }
+
+        // HDCD — "HDCD" in value text rendered gold.
+        if let Some(true) = r.hdcd_detected {
+            if let Some(ref detail) = r.hdcd_detail {
+                let mut spans = vec![
+                    Span::styled(format!("    {:<width$}", "HDCD", width = label_w), theme::muted()),
+                ];
+                // Split "HDCD (details...)" into gold "HDCD" + normal rest.
+                if let Some(rest) = detail.strip_prefix("HDCD") {
+                    spans.push(Span::styled("HDCD", Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(rest.to_string(), Style::default().fg(theme::TEXT_BRIGHT)));
+                } else {
+                    spans.push(Span::styled(detail.clone(), Style::default().fg(theme::TEXT_BRIGHT)));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
     }
 
     let total = lines.len();
@@ -1153,6 +1170,8 @@ fn draw_analysis(
 
     // Footer pills.
     let footer = Line::from(vec![
+        footer_pill(":analyze!", theme::AMBER),
+        pill_gap(),
         footer_pill(":write-dr", theme::BLUE),
         pill_gap(),
         footer_pill(":write-rg-track", theme::GREEN),

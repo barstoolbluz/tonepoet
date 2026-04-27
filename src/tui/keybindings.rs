@@ -2509,6 +2509,7 @@ fn handle_generic_overlay_mouse(
                     let x = (area.0.saturating_sub(w)) / 2;
                     let y = (area.1.saturating_sub(h)) / 2;
                     (Rect::new(x, y, w, h), vec![
+                        (":analyze!", ":analyze!"),
                         (":write-dr", ":write-dr"),
                         (":write-rg-track", ":write-rg-track"),
                         (":write-rg-album", ":write-rg-album"),
@@ -5181,7 +5182,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             TuiButton::SourceAnalyzeButton => {
-                let cmd = super::command::Command::Analyze;
+                let cmd = super::command::Command::Analyze { force: false };
                 super::command::execute_command(app, cmd, tx);
             }
             TuiButton::SourceEnqueueButton => {
@@ -5508,7 +5509,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 super::command::execute_edit_metadata_pub(app, field);
             }
             TuiButton::BrowseInfoAnalyze => {
-                let cmd = super::command::Command::Analyze;
+                let cmd = super::command::Command::Analyze { force: false };
                 super::command::execute_command(app, cmd, tx);
             }
             TuiButton::BrowseInfoEditTags => {

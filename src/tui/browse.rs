@@ -1588,6 +1588,14 @@ impl BrowseState {
                             // PE metadata check not stored in DB — run it now.
                             info.metadata.preemphasis_metadata =
                                 super::probe::preemphasis_metadata_check_pub(&path);
+                            // HDCD info from analysis cache (if previously analyzed).
+                            if let Some(analysis) = db.get_cached_analysis(
+                                &path.display().to_string(), mtime_unix, entry.size,
+                            ) {
+                                if analysis.hdcd_detected == Some(true) {
+                                    info.metadata.hdcd_detail = analysis.hdcd_detail;
+                                }
+                            }
                             self.probe_cache
                                 .insert(path, Some(std::sync::Arc::new(info)));
                             return;

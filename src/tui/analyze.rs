@@ -38,6 +38,10 @@ pub struct AnalysisResult {
     /// Human-readable pre-emphasis detail string (e.g., "CUE file confirmed",
     /// "catalog 35DP-25 matches known PE pressing: Asia - Asia").
     pub preemphasis_detail: Option<String>,
+    /// HDCD detection result. None = not scanned (e.g., not 16-bit).
+    pub hdcd_detected: Option<bool>,
+    /// Human-readable HDCD detail (active/passive, peak extend, packets).
+    pub hdcd_detail: Option<String>,
 }
 
 /// Analyze an audio file: decode to PCM and compute all metrics in one pass.
@@ -331,6 +335,8 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
         preemphasis: None,
         preemphasis_corr: None,
         preemphasis_detail: None,
+        hdcd_detected: None,
+        hdcd_detail: None,
     })
 }
 
@@ -423,6 +429,115 @@ pub async fn measure_loudness(path: &Path) -> Option<(f64, f64)> {
         }
     }
     None
+}
+
+// ── HDCD detection ──────────────────────────────────────────────────
+
+/// HDCD detection result from ffmpeg's af_hdcd filter.
+pub struct HdcdResult {
+    pub detected: bool,
+    pub peak_extend: bool,
+    pub total_packets: u64,
+    pub max_gain: f64,
+    pub packet_type: String,
+    pub detail: String,
+}
+
+/// Detect HDCD encoding by running ffmpeg's af_hdcd filter on the first
+/// 30 seconds and parsing the verbose stderr output.
+pub async fn detect_hdcd(path: &Path) -> Option<HdcdResult> {
+    use tokio::process::Command;
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner", "-nostats", "-y", "-v", "info",
+            "-t", "1",
+        ])
+        .arg("-i").arg(path)
+        .args(["-af", "hdcd", "-f", "s24le", "/dev/null"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .ok()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_hdcd_output(&stderr)
+}
+
+/// Parse ffmpeg's HDCD filter info-level output into a structured result.
+///
+/// The info-level output produces a single summary line per channel, e.g.:
+/// `[Parsed_hdcd_0 @ ...] HDCD detected: yes, peak_extend: enabled permanently, max_gain_adj: 0.0 dB, transient_filter: detected, detectable errors: 0`
+/// or:
+/// `[Parsed_hdcd_0 @ ...] HDCD detected: no`
+fn parse_hdcd_output(stderr: &str) -> Option<HdcdResult> {
+    // Find the HDCD detection summary line(s). There may be multiple
+    // (one per output context). Any "yes" means HDCD is present.
+    let mut detected = false;
+    let mut summary_line = String::new();
+    for line in stderr.lines() {
+        if line.contains("HDCD detected:") {
+            if line.contains("HDCD detected: yes") {
+                detected = true;
+                summary_line = line.to_string();
+            } else if summary_line.is_empty() {
+                summary_line = line.to_string();
+            }
+        }
+    }
+
+    if summary_line.is_empty() {
+        return None;
+    }
+
+    // Parse details from the summary line.
+    let peak_extend = summary_line.contains("peak_extend: enabled");
+    let transient_filter = summary_line.contains("transient_filter: detected");
+
+    let max_gain = summary_line.split("max_gain_adj:")
+        .nth(1)
+        .and_then(|s| s.split("dB").next())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+
+    let errors = summary_line.split("detectable errors:")
+        .nth(1)
+        .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // Build human-readable detail.
+    let detail = if detected {
+        let mut parts = Vec::new();
+        if peak_extend {
+            parts.push("peak extend".to_string());
+        }
+        if max_gain.abs() > 0.0 {
+            parts.push(format!("gain adj {:.1} dB", max_gain));
+        }
+        if transient_filter {
+            parts.push("transient filter".to_string());
+        }
+        if !peak_extend && max_gain.abs() == 0.0 && !transient_filter {
+            parts.push("passive (no features used)".to_string());
+        }
+        if errors > 0 {
+            parts.push(format!("{} errors", errors));
+        }
+        format!("HDCD ({})", parts.join(", "))
+    } else {
+        "not detected".to_string()
+    };
+
+    Some(HdcdResult {
+        detected,
+        peak_extend,
+        total_packets: 0, // not reported at info level
+        max_gain,
+        packet_type: String::new(), // not reported at info level
+        detail,
+    })
 }
 
 /// DR value quality label.

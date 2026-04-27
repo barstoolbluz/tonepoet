@@ -347,6 +347,19 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         }
                     }
 
+                    // Update probe cache with HDCD info so the info
+                    // pane shows it without re-probing.
+                    if result.hdcd_detected == Some(true) {
+                        if let Some(Some(cached)) = app.browse.probe_cache.get(&result.path) {
+                            let mut info = (**cached).clone();
+                            info.metadata.hdcd_detail = result.hdcd_detail.clone();
+                            app.browse.probe_cache.insert(
+                                result.path.clone(),
+                                Some(std::sync::Arc::new(info)),
+                            );
+                        }
+                    }
+
                     app.analysis_results.push(*result);
                     if app.analysis_pending == 0 {
                         // Sort results by disc/track for logical display order.
