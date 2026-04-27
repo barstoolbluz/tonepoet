@@ -1231,6 +1231,7 @@ impl CachedProbeRow {
                 rg_album_peak: self.rg_album_peak.clone(),
                 r128_track_gain: self.r128_track_gain.clone(),
                 r128_album_gain: self.r128_album_gain.clone(),
+                preemphasis_metadata: None, // Not cached; re-detected on probe.
             },
         })
     }

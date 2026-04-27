@@ -46,6 +46,10 @@ pub struct SourceMetadata {
     /// Computed from the Q7.8 fixed-point integers by dividing by 256.
     pub r128_track_gain: Option<String>,
     pub r128_album_gain: Option<String>,
+
+    /// Pre-emphasis detected via metadata (tags, CUE files, catalog number).
+    /// None = not detected. Some(source) = evidence found (e.g. "tag", "CUE file", "catalog (35DP-4)").
+    pub preemphasis_metadata: Option<String>,
 }
 
 /// Convert an R128 Q7.8 fixed-point integer (stored as a string) into a
@@ -395,7 +399,37 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
         }
     }
 
+    // Quick pre-emphasis metadata check (tags + CUE/log + catalog).
+    meta.preemphasis_metadata = preemphasis_metadata_check(path);
+
     Ok(meta)
+}
+
+/// Public wrapper for PE metadata check (used by browse DB cache path).
+pub fn preemphasis_metadata_check_pub(path: &Path) -> Option<String> {
+    preemphasis_metadata_check(path)
+}
+
+/// Lightweight pre-emphasis check using metadata evidence only (no
+/// spectral analysis). Checks tags, CUE/log files in the same directory,
+/// and catalog number against the known PE disc database.
+fn preemphasis_metadata_check(path: &Path) -> Option<String> {
+    use super::preemphasis::metadata::{check_tag_evidence, check_file_evidence};
+    use super::preemphasis::catalog::check_catalog_evidence;
+
+    // Tags (fastest).
+    if let Some(ev) = check_tag_evidence(path) {
+        return Some(ev.label().to_string());
+    }
+    // CUE and log files in the same directory.
+    if let Some(ev) = check_file_evidence(path) {
+        return Some(ev.label().to_string());
+    }
+    // Catalog number matching.
+    if let Some(cm) = check_catalog_evidence(path) {
+        return Some(format!("catalog ({})", cm.catalog_number));
+    }
+    None
 }
 
 // ── Metadata writing ────────────────────────────────────────────────

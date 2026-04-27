@@ -1584,7 +1584,10 @@ impl BrowseState {
                         mtime_unix,
                         entry.size,
                     ) {
-                        if let Some(info) = row.to_cached_info(entry.size) {
+                        if let Some(mut info) = row.to_cached_info(entry.size) {
+                            // PE metadata check not stored in DB — run it now.
+                            info.metadata.preemphasis_metadata =
+                                super::probe::preemphasis_metadata_check_pub(&path);
                             self.probe_cache
                                 .insert(path, Some(std::sync::Arc::new(info)));
                             return;

@@ -879,6 +879,18 @@ fn entry_info_lines(
                     Span::styled(info.size_display(), theme::text()),
                 ]);
 
+                // Pre-emphasis — show if metadata evidence detected.
+                if let Some(ref pe) = cached.metadata.preemphasis_metadata {
+                    lines.push(vec![
+                        Span::styled("   pre-emph", theme::muted()),
+                        Span::raw(" "),
+                        Span::styled(
+                            truncate_to(&format!("detected ({})", pe), max_value_chars.saturating_sub(11)),
+                            Style::default().fg(theme::RED),
+                        ),
+                    ]);
+                }
+
                 // ReplayGain / R128 — shown with technical info since
                 // these are measurement data, not user-editable metadata.
                 let meta = &cached.metadata;
