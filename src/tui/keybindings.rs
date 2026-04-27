@@ -1525,8 +1525,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         }
         ActiveOverlay::MetadataEditor(mut state) => {
             handle_metadata_editor_key(app, key, &mut state, tx);
-            // If the handler didn't close the overlay, put state back.
-            if !matches!(app.active_overlay, ActiveOverlay::None) {
+            // If the handler didn't close or replace the overlay, put state back.
+            if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
         }
@@ -3082,10 +3082,7 @@ fn handle_metadata_editor_mouse(
             // Left click on footer: pill button hit-testing.
             MouseEventKind::Down(MouseButton::Left) if in_footer => {
                 if state.phase == MetadataEditorPhase::Editing {
-                    // Pill layout (centered): [d delete] [u undo] [a add] [w save] [Esc close]
-                    // Each pill: " label " (label.len() + 2 for padding), 1-char gap between.
                     let pills: &[(&str, &str)] = &[
-                        (":import-cue", ":import-cue"),
                         (":fix-caps", ":fix-caps"),
                         ("d delete", "d"),
                         ("u undo", "u"),
@@ -3093,7 +3090,7 @@ fn handle_metadata_editor_mouse(
                         ("w save", "w"),
                         ("Esc close", "esc"),
                     ];
-                    if let Some(action) = footer_pill_hit(pills, mx, inner_x, inner_w) {
+                    if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                             let cmd = super::command::parse_command(&action[1..]);
@@ -3141,14 +3138,31 @@ fn handle_metadata_editor_mouse(
                         }
                     }
                 } else if state.phase == MetadataEditorPhase::DetailEdit {
-                    // Detail overlay pills: [Enter edit] [Esc back]
-                    // or [Enter confirm] [Esc cancel] during inline edit.
-                    let pills: &[(&str, &str)] = if state.detail_edit.is_some() {
-                        &[("Enter confirm", "enter"), ("Esc cancel", "esc")]
+                    // Dynamic pills: [:import-cue (FIELD)] if CUE-compatible, Enter, Esc.
+                    let cue_label: String;
+                    let mut pills: Vec<(&str, &str)> = Vec::new();
+                    if let Some(entry) = state.entries.get(state.detail_field_idx) {
+                        if super::command::is_cue_importable(&entry.display_key) {
+                            cue_label = format!(":import-cue ({})", entry.display_key);
+                            pills.push((&cue_label, ":import-cue"));
+                        }
+                    }
+                    if state.detail_edit.is_some() {
+                        pills.extend_from_slice(&[
+                            ("Enter confirm", "enter"), ("Esc cancel", "esc"),
+                        ]);
                     } else {
-                        &[("Enter edit", "enter"), ("Esc back", "esc")]
-                    };
-                    if let Some(action) = footer_pill_hit(pills, mx, inner_x, inner_w) {
+                        pills.extend_from_slice(&[
+                            ("Enter edit", "enter"), ("Esc back", "esc"),
+                        ]);
+                    }
+                    if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
+                        if action.starts_with(':') {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                            let cmd = super::command::parse_command(&action[1..]);
+                            super::command::execute_command(app, cmd, _tx);
+                            return;
+                        }
                         let fake_key = match action {
                             "enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                             "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -3163,7 +3177,6 @@ fn handle_metadata_editor_mouse(
                 } else if state.phase == MetadataEditorPhase::InlineEdit
                     || state.phase == MetadataEditorPhase::AddingKey
                 {
-                    // Pill layout: [Enter confirm] [Esc cancel]
                     let pills: &[(&str, &str)] = &[
                         ("Enter confirm", "enter"),
                         ("Esc cancel", "esc"),

@@ -1487,8 +1487,6 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
     // Footer: clickable pill-style buttons with key hints.
     let footer = match state.phase {
         MetadataEditorPhase::Editing => Line::from(vec![
-            footer_pill(":import-cue", theme::BLUE),
-            pill_gap(),
             footer_pill(":fix-caps", theme::BLUE),
             pill_gap(),
             footer_pill("d delete", theme::RED),
@@ -1501,7 +1499,12 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
             pill_gap(),
             footer_pill("Esc close", theme::PURPLE),
         ]),
-        MetadataEditorPhase::InlineEdit | MetadataEditorPhase::AddingKey => Line::from(vec![
+        MetadataEditorPhase::InlineEdit => Line::from(vec![
+            footer_pill("Enter confirm", theme::GREEN),
+            pill_gap(),
+            footer_pill("Esc cancel", theme::PURPLE),
+        ]),
+        MetadataEditorPhase::AddingKey => Line::from(vec![
             footer_pill("Enter confirm", theme::GREEN),
             pill_gap(),
             footer_pill("Esc cancel", theme::PURPLE),
@@ -1621,17 +1624,41 @@ fn draw_metadata_detail(
 
     // Footer.
     let footer = if state.detail_edit.is_some() {
-        Line::from(vec![
+        // Currently editing a per-file value.
+        let mut pills = Vec::new();
+        if let Some(entry) = state.entries.get(state.detail_field_idx) {
+            if super::command::is_cue_importable(&entry.display_key) {
+                pills.push(footer_pill(
+                    &format!(":import-cue ({})", entry.display_key),
+                    theme::BLUE,
+                ));
+                pills.push(pill_gap());
+            }
+        }
+        pills.extend_from_slice(&[
             footer_pill("Enter confirm", theme::GREEN),
             pill_gap(),
             footer_pill("Esc cancel", theme::PURPLE),
-        ])
+        ]);
+        Line::from(pills)
     } else {
-        Line::from(vec![
+        // Browsing per-file values.
+        let mut pills = Vec::new();
+        if let Some(entry) = state.entries.get(state.detail_field_idx) {
+            if super::command::is_cue_importable(&entry.display_key) {
+                pills.push(footer_pill(
+                    &format!(":import-cue ({})", entry.display_key),
+                    theme::BLUE,
+                ));
+                pills.push(pill_gap());
+            }
+        }
+        pills.extend_from_slice(&[
             footer_pill("Enter edit", theme::GREEN),
             pill_gap(),
             footer_pill("Esc back", theme::PURPLE),
-        ])
+        ]);
+        Line::from(pills)
     };
     f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), footer_area);
 }

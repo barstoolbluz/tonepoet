@@ -1261,9 +1261,25 @@ pub fn execute_command(
                             }
                         };
 
-                        // Build the diff against current tags.
+                        // Determine which field to scope the import to.
+                        let field_name: Option<String> = app.pending_metadata_editor.as_ref()
+                            .and_then(|s| s.entries.get(s.cursor))
+                            .map(|e| e.display_key.clone());
+
+                        if let Some(ref f) = field_name {
+                            if !is_cue_importable(f) {
+                                let _ = std::fs::remove_file(&temp_path);
+                                if let Some(parked) = app.pending_metadata_editor.take() {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                                }
+                                app.set_status(format!("CUE has no data for {}", f));
+                                return;
+                            }
+                        }
+
+                        // Build the diff, scoped to the focused field.
                         let changes = if let Some(ref state) = app.pending_metadata_editor {
-                            build_cue_diff(state, &sheet)
+                            build_cue_diff(state, &sheet, field_name.as_deref())
                         } else {
                             Vec::new()
                         };
@@ -2142,11 +2158,26 @@ fn expand_path(path: &str) -> String {
 
 /// Build a list of proposed changes by comparing CUE sheet metadata
 /// against the current tags in the metadata editor.
+/// CUE fields that can be imported, mapped to their tag display keys.
+const CUE_IMPORTABLE_FIELDS: &[&str] = &["TITLE", "ARTIST", "ALBUM", "TRACKNUMBER"];
+
+/// Check if a tag field has corresponding CUE data.
+pub fn is_cue_importable(field: &str) -> bool {
+    let upper = field.to_ascii_uppercase();
+    CUE_IMPORTABLE_FIELDS.iter().any(|&f| f == upper)
+        || upper == "PERFORMER"
+}
+
 fn build_cue_diff(
     state: &super::app::MetadataEditorState,
     sheet: &super::cue_parser::CueSheet,
+    field_filter: Option<&str>,
 ) -> Vec<super::app::CueImportChange> {
     let mut changes = Vec::new();
+
+    // Map the filter to the CUE field it corresponds to.
+    // ARTIST and PERFORMER both map to CUE performer.
+    let filter_upper = field_filter.map(|f| f.to_ascii_uppercase());
 
     for (i, path) in state.paths.iter().enumerate() {
         let stem = path.file_name()
@@ -2156,12 +2187,10 @@ fn build_cue_diff(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| stem.clone());
 
-        // Match CUE track by filename, then by index.
         let track = sheet.tracks.iter()
             .find(|t| t.file.as_deref() == Some(stem.as_str()))
             .or_else(|| sheet.tracks.get(i));
 
-        // Collect proposed values for this file.
         let mut proposed: Vec<(&str, String)> = Vec::new();
 
         if let Some(t) = track {
@@ -2179,8 +2208,16 @@ fn build_cue_diff(
             proposed.push(("ALBUM", album.clone()));
         }
 
-        // Compare each proposed value against the current tag.
         for (field, new_value) in proposed {
+            // Apply field filter if set.
+            if let Some(ref filter) = filter_upper {
+                let field_upper = field.to_ascii_uppercase();
+                // PERFORMER filter matches ARTIST CUE data.
+                let matches = field_upper == *filter
+                    || (filter == "PERFORMER" && field_upper == "ARTIST");
+                if !matches { continue; }
+            }
+
             let old_value = state.entries.iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(field))
                 .map(|e| e.per_file_values.get(i).cloned().unwrap_or_default())
