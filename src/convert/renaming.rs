@@ -389,12 +389,20 @@ pub fn rename_audio_files(folder_path: &Path) -> Result<Vec<PathBuf>> {
 
 pub fn capitalize_title(title: &str) -> String {
     log::info!("🔤 capitalize_title input: '{}'", title);
+    // If the entire input is all-caps, lowercase it first.
+    let title = if title.len() > 1
+        && title.chars().all(|c| !c.is_alphabetic() || c.is_uppercase())
+    {
+        std::borrow::Cow::Owned(title.to_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(title)
+    };
     // Use regex to split while keeping parentheses and their content separate
     let re = Regex::new(r"(\([^)]*\))").unwrap();
     let mut result = String::new();
     let mut last_end = 0;
     
-    for cap in re.find_iter(title) {
+    for cap in re.find_iter(&title) {
         // Process text before the parentheses
         if cap.start() > last_end {
             let before = &title[last_end..cap.start()];
@@ -437,6 +445,16 @@ pub fn capitalize_title(title: &str) -> String {
 }
 
 pub fn capitalize_section(section: &str) -> String {
+    // If the entire input is all-caps, lowercase it first so that
+    // the acronym-preservation heuristic (2-5 char all-caps words)
+    // doesn't misfire on normal words like "THE", "BAND", etc.
+    let section = if section.len() > 1
+        && section.chars().all(|c| !c.is_alphabetic() || c.is_uppercase())
+    {
+        std::borrow::Cow::Owned(section.to_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(section)
+    };
     let words: Vec<&str> = section.split_whitespace().collect();
     let mut capitalized_words = Vec::new();
 
