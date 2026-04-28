@@ -2973,6 +2973,40 @@ fn handle_generic_overlay_mouse(
             }
         }
 
+        // Left click in content area: GnudbSelect (click to select, double-click to confirm).
+        MouseEventKind::Down(MouseButton::Left)
+            if in_popup && !on_footer
+                && matches!(app.active_overlay, ActiveOverlay::GnudbSelect { .. }) =>
+        {
+            if let ActiveOverlay::GnudbSelect { matches, mut selected, scroll, paths } =
+                std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+            {
+                let content_y = popup.y + 1;
+                if my >= content_y && my < footer_y {
+                    let clicked_row = (my - content_y) as usize + scroll;
+                    if clicked_row < matches.len() {
+                        if clicked_row == selected {
+                            // Click on already-selected row = confirm (like double-click).
+                            let m = &matches[clicked_row];
+                            let category = m.category.clone();
+                            let disc_id = m.disc_id.clone();
+                            app.set_status(format!("Reading {}...", m.title));
+                            let tx = _tx.clone();
+                            let paths_c = paths.clone();
+                            tokio::spawn(async move {
+                                let result = super::gnudb::read_gnudb(&category, &disc_id).await;
+                                let _ = tx.send(AppMessage::GnudbReadComplete { result, paths: paths_c }).await;
+                            });
+                            return true;
+                        }
+                        selected = clicked_row;
+                    }
+                }
+                app.active_overlay = ActiveOverlay::GnudbSelect { matches, selected, scroll, paths };
+            }
+            return true;
+        }
+
         // Left click in content area: position cursor for GnudbReview.
         MouseEventKind::Down(MouseButton::Left)
             if in_popup && !on_footer
