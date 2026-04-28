@@ -109,4 +109,9 @@ pub enum AppMessage {
         result: Result<crate::tui::gnudb::GnudbEntry, String>,
         paths: Vec<std::path::PathBuf>,
     },
+    /// Result of a multi-disc GNUDB query (sequential queries per disc).
+    GnudbMultiDiscComplete {
+        /// Per-disc results: (disc_label, entry, file_paths).
+        entries: Vec<(String, crate::tui::gnudb::GnudbEntry, Vec<std::path::PathBuf>)>,
+    },
 }

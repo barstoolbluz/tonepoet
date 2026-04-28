@@ -311,6 +311,110 @@ pub fn populate_editor_from_gnudb(
     state.dirty = true;
 }
 
+/// Populate a single file's tags in the metadata editor from a GNUDB entry.
+/// Used by multi-disc flow where each disc populates its own files.
+pub fn populate_editor_file(
+    state: &mut super::app::MetadataEditorState,
+    file_idx: usize,
+    entry: &GnudbEntry,
+    track_idx: usize,
+) {
+    let n = state.paths.len();
+    if file_idx >= n { return; }
+
+    fn find_or_create(
+        entries: &mut Vec<super::probe::TagEntry>,
+        key: &str,
+        item_key: lofty::tag::ItemKey,
+        n: usize,
+    ) -> usize {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+            return i;
+        }
+        entries.push(super::probe::TagEntry {
+            display_key: key.to_string(),
+            item_key,
+            value: String::new(),
+            original: String::new(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vec![String::new(); n],
+            per_file_originals: vec![String::new(); n],
+        });
+        entries.len() - 1
+    }
+
+    let title_idx = find_or_create(&mut state.entries, "TITLE", lofty::tag::ItemKey::TrackTitle, n);
+    let artist_idx = find_or_create(&mut state.entries, "ARTIST", lofty::tag::ItemKey::TrackArtist, n);
+    let album_idx = find_or_create(&mut state.entries, "ALBUM", lofty::tag::ItemKey::AlbumTitle, n);
+    let tn_idx = find_or_create(&mut state.entries, "TRACKNUMBER", lofty::tag::ItemKey::TrackNumber, n);
+    let year_idx = find_or_create(&mut state.entries, "DATE", lofty::tag::ItemKey::Year, n);
+    let genre_idx = find_or_create(&mut state.entries, "GENRE", lofty::tag::ItemKey::Genre, n);
+
+    if let Some(title) = entry.tracks.get(track_idx) {
+        state.entries[title_idx].per_file_values[file_idx] = title.clone();
+    }
+    state.entries[artist_idx].per_file_values[file_idx] = entry.artist.clone();
+    state.entries[album_idx].per_file_values[file_idx] = entry.album.clone();
+    state.entries[tn_idx].per_file_values[file_idx] = (track_idx + 1).to_string();
+    if !entry.year.is_empty() {
+        state.entries[year_idx].per_file_values[file_idx] = entry.year.clone();
+    }
+    if !entry.genre.is_empty() {
+        state.entries[genre_idx].per_file_values[file_idx] = entry.genre.clone();
+    }
+
+    // Update merged display values for all modified fields.
+    for idx in [title_idx, artist_idx, album_idx, tn_idx, year_idx, genre_idx] {
+        let e = &mut state.entries[idx];
+        let all_same = e.per_file_values.windows(2).all(|w| w[0] == w[1]);
+        e.is_mixed = !all_same && n > 1;
+        e.value = if e.is_mixed {
+            "<multiple values>".to_string()
+        } else {
+            e.per_file_values.first().cloned().unwrap_or_default()
+        };
+    }
+}
+
+/// Group audio file paths by parent directory (disc detection).
+///
+/// Returns `(disc_label, paths)` pairs sorted by disc number. If all
+/// files share the same parent directory, returns a single group with
+/// an empty label. Multi-disc layouts produce one group per subdirectory
+/// (e.g., "Disc 1", "Disc 2").
+pub fn group_by_disc(paths: &[PathBuf]) -> Vec<(String, Vec<PathBuf>)> {
+    use std::collections::BTreeMap;
+
+    // Group by parent directory path.
+    let mut groups: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    for path in paths {
+        let parent = path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+        groups.entry(parent).or_default().push(path.clone());
+    }
+
+    if groups.len() <= 1 {
+        // Single directory — return one group with empty label.
+        let paths = groups.into_values().next().unwrap_or_default();
+        return vec![("".to_string(), paths)];
+    }
+
+    // Multiple directories — sort by disc number and label.
+    let mut result: Vec<(u32, String, Vec<PathBuf>)> = groups.into_iter().map(|(dir, files)| {
+        // Use the first file to detect disc number.
+        let disc_num = files.first()
+            .map(|p| super::probe::extract_disc_from_path(p))
+            .unwrap_or(1);
+        let label = dir.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("Disc {}", disc_num));
+        (disc_num, label, files)
+    }).collect();
+
+    result.sort_by_key(|(num, _, _)| *num);
+    result.into_iter().map(|(_, label, files)| (label, files)).collect()
+}
+
 /// Collect track durations for audio files. Checks the probe cache first,
 /// falls back to direct ffmpeg probe for files not yet cached.
 pub fn collect_durations(

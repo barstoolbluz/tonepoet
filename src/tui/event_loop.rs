@@ -705,6 +705,39 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
+        AppMessage::GnudbMultiDiscComplete { entries } => {
+            if entries.is_empty() {
+                app.set_status("GNUDB: no matches found for any disc");
+                return;
+            }
+
+            // Open metadata editor with all files.
+            super::keybindings::open_metadata_editor(app);
+            if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
+                // Populate each disc's data, mapping tracks to the right files.
+                let mut disc_labels = Vec::new();
+                for (label, entry, group_paths) in &entries {
+                    // Find where this disc's files start in the editor's path list.
+                    // Match by path since the editor may have re-sorted.
+                    for (track_idx, gpath) in group_paths.iter().enumerate() {
+                        if let Some(editor_idx) = state.paths.iter().position(|p| p == gpath) {
+                            // Populate this file's tags from GNUDB.
+                            super::gnudb::populate_editor_file(
+                                state, editor_idx, entry, track_idx,
+                            );
+                        }
+                    }
+                    disc_labels.push(format!("{}: {} / {}", label, entry.artist, entry.album));
+                }
+                state.dirty = true;
+                app.set_status(format!(
+                    "GNUDB: loaded {} disc{} ({})",
+                    entries.len(),
+                    if entries.len() == 1 { "" } else { "s" },
+                    disc_labels.join("; "),
+                ));
+            }
+        }
     }
 }
 

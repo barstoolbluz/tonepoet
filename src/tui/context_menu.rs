@@ -598,7 +598,7 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::QueryGnudb => {
-            // Collect audio file paths, compute disc ID, spawn GNUDB query.
+            // Collect audio file paths, group by disc, query GNUDB.
             let paths = super::command::collect_selection_for_file_ops(app);
             let mut audio_paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&paths)
                 .into_iter()
@@ -614,27 +614,65 @@ pub fn execute_context_action(
                 return;
             }
 
-            let durations = super::gnudb::collect_durations(
-                &audio_paths, &app.browse.probe_cache,
-            );
-            if durations.len() != audio_paths.len() {
-                app.set_status("Probe all files first (some durations missing)");
-                return;
+            let disc_groups = super::gnudb::group_by_disc(&audio_paths);
+
+            if disc_groups.len() == 1 {
+                // Single disc — original flow.
+                let (_, group_paths) = &disc_groups[0];
+                let durations = super::gnudb::collect_durations(
+                    group_paths, &app.browse.probe_cache,
+                );
+                if durations.len() != group_paths.len() {
+                    app.set_status("Probe all files first (some durations missing)");
+                    return;
+                }
+                let disc_id = super::gnudb::compute_disc_id(&durations);
+                app.set_status(format!("Querying gnudb.org (disc ID: {})...", disc_id.disc_id));
+                let paths_for_editor = group_paths.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let result = super::gnudb::query_gnudb(&disc_id).await;
+                    let _ = tx.send(super::message::AppMessage::GnudbQueryComplete {
+                        result,
+                        paths: paths_for_editor,
+                    }).await;
+                });
+            } else {
+                // Multi-disc — query each disc sequentially in one task.
+                app.set_status(format!(
+                    "Querying gnudb.org ({} discs)...", disc_groups.len(),
+                ));
+                // Pre-compute durations and disc IDs before spawning.
+                let mut disc_queries: Vec<(String, super::gnudb::DiscIdResult, Vec<std::path::PathBuf>)> = Vec::new();
+                for (label, group_paths) in disc_groups {
+                    let durations = super::gnudb::collect_durations(
+                        &group_paths, &app.browse.probe_cache,
+                    );
+                    if durations.len() != group_paths.len() { continue; }
+                    let disc_id = super::gnudb::compute_disc_id(&durations);
+                    disc_queries.push((label, disc_id, group_paths));
+                }
+                if disc_queries.is_empty() {
+                    app.set_status("Could not probe disc durations");
+                    return;
+                }
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut all_entries = Vec::new();
+                    for (label, disc_id, group_paths) in disc_queries {
+                        if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
+                            if let Some(m) = matches.first() {
+                                if let Ok(entry) = super::gnudb::read_gnudb(&m.category, &m.disc_id).await {
+                                    all_entries.push((label, entry, group_paths));
+                                }
+                            }
+                        }
+                    }
+                    let _ = tx.send(super::message::AppMessage::GnudbMultiDiscComplete {
+                        entries: all_entries,
+                    }).await;
+                });
             }
-
-            let disc_id = super::gnudb::compute_disc_id(&durations);
-            app.set_status(format!("Querying gnudb.org (disc ID: {})...", disc_id.disc_id));
-
-            // Store paths for later use when populating the metadata editor.
-            let paths_for_editor = audio_paths;
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let result = super::gnudb::query_gnudb(&disc_id).await;
-                let _ = tx.send(super::message::AppMessage::GnudbQueryComplete {
-                    result,
-                    paths: paths_for_editor,
-                }).await;
-            });
         }
         ContextAction::ImportCueFromBrowse => {
             // Open metadata editor, then trigger :import-cue.
