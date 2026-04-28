@@ -1511,6 +1511,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::GnudbReview(mut state) => {
             use super::app::GnudbRowKind;
 
+            let page_rows = &state.pages[state.active_page].rows;
+
             if state.edit_input.is_some() {
                 // ── Inline edit mode ──
                 match key.code {
@@ -1519,20 +1521,20 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
                     KeyCode::Enter => {
-                        // Commit the edited value.
                         if let Some(ref input) = state.edit_input {
                             let new_val = input.text.clone();
-                            match &state.rows[state.cursor] {
+                            let page = &mut state.pages[state.active_page];
+                            match &page.rows[state.cursor] {
                                 GnudbRowKind::AlbumField(field) => {
                                     match *field {
-                                        "Album" => state.album = new_val,
-                                        "Year" => state.year = new_val,
-                                        "Genre" => state.genre = new_val,
+                                        "Album" => page.album = new_val,
+                                        "Year" => page.year = new_val,
+                                        "Genre" => page.genre = new_val,
                                         _ => {}
                                     }
                                 }
-                                GnudbRowKind::TrackField { disc_idx, track_idx, field } => {
-                                    let track = &mut state.discs[*disc_idx].tracks[*track_idx];
+                                GnudbRowKind::TrackField { track_idx, field } => {
+                                    let track = &mut page.tracks[*track_idx];
                                     match *field {
                                         "Title" => track.title = new_val,
                                         "Artist" => track.artist = new_val,
@@ -1554,39 +1556,56 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             } else {
                 // ── Navigation mode ──
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
                         app.active_overlay = ActiveOverlay::None;
                         app.set_status("GNUDB review cancelled");
                     }
-                    KeyCode::Up => {
-                        // Move cursor up, skipping TrackHeader rows.
-                        let mut new_cursor = state.cursor;
+                    // Left / Right: switch disc page (only in navigation mode,
+                    // not while editing — edit mode returns early above).
+                    (KeyCode::Left, _) => {
+                        if state.pages.len() > 1 && state.active_page > 0 {
+                            state.active_page -= 1;
+                            state.cursor = 0;
+                            state.scroll = 0;
+                            state.edit_input = None;
+                        }
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    (KeyCode::Right, _) => {
+                        if state.active_page + 1 < state.pages.len() {
+                            state.active_page += 1;
+                            state.cursor = 0;
+                            state.scroll = 0;
+                            state.edit_input = None;
+                        }
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    (KeyCode::Up, _) => {
+                        let mut nc = state.cursor;
                         loop {
-                            if new_cursor == 0 { break; }
-                            new_cursor -= 1;
-                            if !matches!(state.rows.get(new_cursor), Some(GnudbRowKind::TrackHeader { .. })) {
+                            if nc == 0 { break; }
+                            nc -= 1;
+                            if !matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
                                 break;
                             }
                         }
-                        state.cursor = new_cursor;
-                        // Ensure visible.
+                        state.cursor = nc;
                         if state.cursor < state.scroll {
                             state.scroll = state.cursor;
                         }
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
-                    KeyCode::Down => {
-                        let mut new_cursor = state.cursor;
+                    (KeyCode::Down, _) => {
+                        let mut nc = state.cursor;
                         loop {
-                            if new_cursor + 1 >= state.rows.len() { break; }
-                            new_cursor += 1;
-                            if !matches!(state.rows.get(new_cursor), Some(GnudbRowKind::TrackHeader { .. })) {
+                            if nc + 1 >= page_rows.len() { break; }
+                            nc += 1;
+                            if !matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
                                 break;
                             }
                         }
-                        state.cursor = new_cursor;
-                        // Ensure visible.
+                        state.cursor = nc;
                         let visible_h = crossterm::terminal::size()
                             .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
                             .unwrap_or(20);
@@ -1595,17 +1614,17 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         }
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
-                    KeyCode::Enter => {
-                        // Open inline edit for current row.
-                        let value = match &state.rows[state.cursor] {
+                    (KeyCode::Enter, _) => {
+                        let page = &state.pages[state.active_page];
+                        let value = match &page.rows[state.cursor] {
                             GnudbRowKind::AlbumField(field) => match *field {
-                                "Album" => Some(state.album.clone()),
-                                "Year" => Some(state.year.clone()),
-                                "Genre" => Some(state.genre.clone()),
+                                "Album" => Some(page.album.clone()),
+                                "Year" => Some(page.year.clone()),
+                                "Genre" => Some(page.genre.clone()),
                                 _ => None,
                             },
-                            GnudbRowKind::TrackField { disc_idx, track_idx, field } => {
-                                let track = &state.discs[*disc_idx].tracks[*track_idx];
+                            GnudbRowKind::TrackField { track_idx, field } => {
+                                let track = &page.tracks[*track_idx];
                                 match *field {
                                     "Title" => Some(track.title.clone()),
                                     "Artist" => Some(track.artist.clone()),
@@ -1621,7 +1640,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         }
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
-                    KeyCode::PageUp => {
+                    (KeyCode::PageUp, _) => {
                         let jump = crossterm::terminal::size()
                             .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
                             .unwrap_or(20);
@@ -1629,7 +1648,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             let mut nc = state.cursor;
                             if nc == 0 { break; }
                             nc -= 1;
-                            while nc > 0 && matches!(state.rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
+                            while nc > 0 && matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
                                 nc -= 1;
                             }
                             state.cursor = nc;
@@ -1639,15 +1658,15 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         }
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
-                    KeyCode::PageDown => {
+                    (KeyCode::PageDown, _) => {
                         let jump = crossterm::terminal::size()
                             .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
                             .unwrap_or(20);
                         for _ in 0..jump {
                             let mut nc = state.cursor;
-                            if nc + 1 >= state.rows.len() { break; }
+                            if nc + 1 >= page_rows.len() { break; }
                             nc += 1;
-                            while nc + 1 < state.rows.len() && matches!(state.rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
+                            while nc + 1 < page_rows.len() && matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
                                 nc += 1;
                             }
                             state.cursor = nc;
@@ -1660,33 +1679,34 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         }
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
-                    KeyCode::Char('a') => {
-                        // Accept: open metadata editor and populate.
+                    (KeyCode::Char('a'), _) => {
+                        // Accept ALL pages.
                         super::keybindings::open_metadata_editor(app);
                         if let ActiveOverlay::MetadataEditor(ref mut editor_state) = app.active_overlay {
                             super::gnudb::populate_editor_from_review(editor_state, &state);
+                            let first_page = &state.pages[0];
+                            let artist = first_page.tracks.first()
+                                .map(|t| t.artist.as_str())
+                                .unwrap_or("?");
                             app.set_status(format!(
-                                "GNUDB tags loaded — {} / {}",
-                                state.discs.first()
-                                    .and_then(|d| d.tracks.first())
-                                    .map(|t| t.artist.as_str())
-                                    .unwrap_or("?"),
-                                state.album,
+                                "GNUDB tags loaded — {} / {} ({} disc{})",
+                                artist, first_page.album,
+                                state.pages.len(),
+                                if state.pages.len() == 1 { "" } else { "s" },
                             ));
                         }
                     }
-                    KeyCode::Char('c') => {
-                        // Apply capitalization rules.
+                    (KeyCode::Char('c'), _) => {
+                        // Apply capitalization to current page.
                         use crate::convert::renaming::{capitalize_title, capitalize_section};
-                        state.album = capitalize_section(&state.album);
-                        state.genre = capitalize_section(&state.genre);
-                        for disc in &mut state.discs {
-                            for track in &mut disc.tracks {
-                                track.title = capitalize_title(&track.title);
-                                track.artist = capitalize_section(&track.artist);
-                            }
+                        let page = &mut state.pages[state.active_page];
+                        page.album = capitalize_section(&page.album);
+                        page.genre = capitalize_section(&page.genre);
+                        for track in &mut page.tracks {
+                            track.title = capitalize_title(&track.title);
+                            track.artist = capitalize_section(&track.artist);
                         }
-                        app.set_status("Capitalization applied");
+                        app.set_status("Capitalization applied to current disc");
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
                     _ => {}
@@ -2961,11 +2981,79 @@ fn handle_generic_overlay_mouse(
             if let ActiveOverlay::GnudbReview(mut state) = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
                 use super::app::GnudbRowKind;
                 let content_y = popup.y + 1; // below top border
+                let is_multi = state.pages.len() > 1;
+                let row_offset = if is_multi { 2 } else { 0 };
                 if my >= content_y && my < footer_y {
-                    let clicked_row = (my - content_y) as usize + state.scroll;
-                    if clicked_row < state.rows.len() {
-                        if !matches!(state.rows.get(clicked_row), Some(GnudbRowKind::TrackHeader { .. })) {
+                    let visual_row = (my - content_y) as usize;
+                    if is_multi && visual_row == 0 {
+                        // Click on disc pill row — determine which pill.
+                        let inner_x_pos = popup.x + 1;
+                        let click_x = mx.saturating_sub(inner_x_pos) as usize;
+                        // Pills are rendered as: "  [disc 01] [disc 02] ..."
+                        // Each pill: " {label} " (label.len() + 2) + 1 gap.
+                        let mut x_pos = 2usize; // leading "  "
+                        for (i, pg) in state.pages.iter().enumerate() {
+                            let label = if pg.label.is_empty() {
+                                format!("disc {}", i + 1)
+                            } else {
+                                pg.label.clone()
+                            };
+                            let pill_w = label.len() + 2; // " label "
+                            if click_x >= x_pos && click_x < x_pos + pill_w {
+                                state.active_page = i;
+                                state.cursor = 0;
+                                state.scroll = 0;
+                                state.edit_input = None;
+                                break;
+                            }
+                            x_pos += pill_w + 1; // pill + gap
+                        }
+                    } else if visual_row >= row_offset {
+                        let clicked_row = (visual_row - row_offset) + state.scroll;
+                        let page_rows = &state.pages[state.active_page].rows;
+                        if clicked_row < page_rows.len()
+                            && !matches!(page_rows.get(clicked_row), Some(GnudbRowKind::TrackHeader { .. }))
+                        {
+                            // Double-click detection.
+                            let now = std::time::Instant::now();
+                            let is_double = state.last_click
+                                .map(|(prev_row, prev_time)| {
+                                    prev_row == clicked_row
+                                        && now.duration_since(prev_time).as_millis() < 400
+                                })
+                                .unwrap_or(false);
+
                             state.cursor = clicked_row;
+
+                            if is_double {
+                                // Open inline edit.
+                                let page = &state.pages[state.active_page];
+                                let value = match &page.rows[clicked_row] {
+                                    GnudbRowKind::AlbumField(field) => match *field {
+                                        "Album" => Some(page.album.clone()),
+                                        "Year" => Some(page.year.clone()),
+                                        "Genre" => Some(page.genre.clone()),
+                                        _ => None,
+                                    },
+                                    GnudbRowKind::TrackField { track_idx, field } => {
+                                        let track = &page.tracks[*track_idx];
+                                        match *field {
+                                            "Title" => Some(track.title.clone()),
+                                            "Artist" => Some(track.artist.clone()),
+                                            _ => None,
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(val) = value {
+                                    state.edit_input = Some(
+                                        super::text_input::TextInputState::new(val),
+                                    );
+                                }
+                                state.last_click = None;
+                            } else {
+                                state.last_click = Some((clicked_row, now));
+                            }
                         }
                     }
                 }

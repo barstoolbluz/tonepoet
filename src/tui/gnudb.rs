@@ -396,22 +396,23 @@ pub fn build_review_state(
         });
     }
 
-    let discs = vec![GnudbReviewDisc {
+    let rows = build_page_rows(&tracks);
+    let pages = vec![GnudbReviewPage {
         label: String::new(),
-        tracks,
-    }];
-
-    let rows = build_rows(&discs);
-
-    GnudbReviewState {
         album: entry.album.clone(),
         year: entry.year.clone(),
         genre: entry.genre.clone(),
-        discs,
+        tracks,
         rows,
+    }];
+
+    GnudbReviewState {
+        pages,
+        active_page: 0,
         cursor: 0,
         scroll: 0,
         edit_input: None,
+        last_click: None,
         paths,
     }
 }
@@ -423,13 +424,7 @@ pub fn build_multi_disc_review_state(
     use super::app::*;
 
     let mut all_paths = Vec::new();
-    let mut discs = Vec::new();
-
-    // Use first entry's album-level data as defaults.
-    let first = &entries[0].1;
-    let album = first.album.clone();
-    let year = first.year.clone();
-    let genre = first.genre.clone();
+    let mut pages = Vec::new();
 
     for (label, entry, group_paths) in entries {
         let base_file_idx = all_paths.len();
@@ -445,29 +440,30 @@ pub fn build_multi_disc_review_state(
             });
         }
 
-        discs.push(GnudbReviewDisc {
+        let rows = build_page_rows(&tracks);
+        pages.push(GnudbReviewPage {
             label: label.clone(),
+            album: entry.album.clone(),
+            year: entry.year.clone(),
+            genre: entry.genre.clone(),
             tracks,
+            rows,
         });
     }
 
-    let rows = build_rows(&discs);
-
     GnudbReviewState {
-        album,
-        year,
-        genre,
-        discs,
-        rows,
+        pages,
+        active_page: 0,
         cursor: 0,
         scroll: 0,
         edit_input: None,
+        last_click: None,
         paths: all_paths,
     }
 }
 
-/// Build the flattened row map from disc/track data.
-fn build_rows(discs: &[super::app::GnudbReviewDisc]) -> Vec<super::app::GnudbRowKind> {
+/// Build the flattened row map for a single page.
+fn build_page_rows(tracks: &[super::app::GnudbReviewTrack]) -> Vec<super::app::GnudbRowKind> {
     use super::app::GnudbRowKind;
 
     let mut rows = vec![
@@ -476,12 +472,10 @@ fn build_rows(discs: &[super::app::GnudbReviewDisc]) -> Vec<super::app::GnudbRow
         GnudbRowKind::AlbumField("Genre"),
     ];
 
-    for (di, disc) in discs.iter().enumerate() {
-        for (ti, _track) in disc.tracks.iter().enumerate() {
-            rows.push(GnudbRowKind::TrackHeader { disc_idx: di, track_idx: ti });
-            rows.push(GnudbRowKind::TrackField { disc_idx: di, track_idx: ti, field: "Title" });
-            rows.push(GnudbRowKind::TrackField { disc_idx: di, track_idx: ti, field: "Artist" });
-        }
+    for (ti, _track) in tracks.iter().enumerate() {
+        rows.push(GnudbRowKind::TrackHeader { track_idx: ti });
+        rows.push(GnudbRowKind::TrackField { track_idx: ti, field: "Title" });
+        rows.push(GnudbRowKind::TrackField { track_idx: ti, field: "Artist" });
     }
 
     rows
@@ -523,19 +517,19 @@ pub fn populate_editor_from_review(
     let year_idx = find_or_create(&mut state.entries, "DATE", lofty::tag::ItemKey::Year, n);
     let genre_idx = find_or_create(&mut state.entries, "GENRE", lofty::tag::ItemKey::Genre, n);
 
-    for disc in &review.discs {
-        for track in &disc.tracks {
+    for page in &review.pages {
+        for track in &page.tracks {
             let i = track.file_index;
             if i >= n { continue; }
             state.entries[title_idx].per_file_values[i] = track.title.clone();
             state.entries[artist_idx].per_file_values[i] = track.artist.clone();
-            state.entries[album_idx].per_file_values[i] = review.album.clone();
+            state.entries[album_idx].per_file_values[i] = page.album.clone();
             state.entries[tn_idx].per_file_values[i] = track.track_number.to_string();
-            if !review.year.is_empty() {
-                state.entries[year_idx].per_file_values[i] = review.year.clone();
+            if !page.year.is_empty() {
+                state.entries[year_idx].per_file_values[i] = page.year.clone();
             }
-            if !review.genre.is_empty() {
-                state.entries[genre_idx].per_file_values[i] = review.genre.clone();
+            if !page.genre.is_empty() {
+                state.entries[genre_idx].per_file_values[i] = page.genre.clone();
             }
         }
     }

@@ -2177,6 +2177,8 @@ fn draw_gnudb_select(
 fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
     use super::app::GnudbRowKind;
 
+    let page = &state.pages[state.active_page];
+
     let area = f.size();
     let w = (area.width * 85 / 100).max(50).min(area.width.saturating_sub(2));
     let h = (area.height * 85 / 100).max(14).min(area.height.saturating_sub(2));
@@ -2186,11 +2188,10 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
 
     f.render_widget(Clear, popup);
 
-    let artist = state.discs.first()
-        .and_then(|d| d.tracks.first())
+    let artist = page.tracks.first()
         .map(|t| t.artist.as_str())
         .unwrap_or("Unknown");
-    let title = format!(" GNUDB Review — {} / {} ", artist, state.album);
+    let title = format!(" GNUDB Review — {} / {} ", artist, page.album);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2212,16 +2213,42 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for (row_idx, row) in state.rows.iter().enumerate() {
+    // Disc page indicator for multi-disc (first content line).
+    if state.pages.len() > 1 {
+        let mut spans: Vec<Span> = vec![Span::raw("  ")];
+        for (i, pg) in state.pages.iter().enumerate() {
+            let label = if pg.label.is_empty() {
+                format!("disc {}", i + 1)
+            } else {
+                pg.label.clone()
+            };
+            if i == state.active_page {
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::CYAN).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(theme::TEXT_DIM),
+                ));
+            }
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(""));
+    }
+
+    for (row_idx, row) in page.rows.iter().enumerate() {
         let is_cursor = row_idx == state.cursor;
         let is_editing = is_cursor && state.edit_input.is_some();
 
         match row {
             GnudbRowKind::AlbumField(field) => {
                 let value = match *field {
-                    "Album" => &state.album,
-                    "Year" => &state.year,
-                    "Genre" => &state.genre,
+                    "Album" => &page.album,
+                    "Year" => &page.year,
+                    "Genre" => &page.genre,
                     _ => "",
                 };
                 let label_style = if is_cursor {
@@ -2255,14 +2282,9 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                 ]));
             }
 
-            GnudbRowKind::TrackHeader { disc_idx, track_idx } => {
-                let disc = &state.discs[*disc_idx];
-                let track = &disc.tracks[*track_idx];
-                let header = if disc.label.is_empty() {
-                    format!("Track {:02}", track.track_number)
-                } else {
-                    format!("{}, Track {:02}", disc.label, track.track_number)
-                };
+            GnudbRowKind::TrackHeader { track_idx } => {
+                let track = &page.tracks[*track_idx];
+                let header = format!("Track {:02}", track.track_number);
                 let dashes = inner_w.saturating_sub(header.len() + 5);
                 lines.push(Line::from(Span::styled(
                     format!(" ── {} {}", header, "─".repeat(dashes)),
@@ -2270,9 +2292,8 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                 )));
             }
 
-            GnudbRowKind::TrackField { disc_idx, track_idx, field } => {
-                let disc = &state.discs[*disc_idx];
-                let track = &disc.tracks[*track_idx];
+            GnudbRowKind::TrackField { track_idx, field } => {
+                let track = &page.tracks[*track_idx];
                 let value = match *field {
                     "Title" => &track.title,
                     "Artist" => &track.artist,
@@ -2316,6 +2337,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
+    // Footer.
     let footer = if state.edit_input.is_some() {
         Line::from(vec![
             footer_pill("Enter confirm", theme::GREEN),
@@ -2323,15 +2345,16 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
             footer_pill("Esc cancel", theme::PURPLE),
         ])
     } else {
-        Line::from(vec![
+        let mut pills = vec![
             footer_pill("Enter edit", theme::GREEN),
             pill_gap(),
             footer_pill("c fix-caps", theme::BLUE),
             pill_gap(),
             footer_pill("a accept", theme::CYAN),
             pill_gap(),
-            footer_pill("Esc cancel", theme::PURPLE),
-        ])
+        ];
+        pills.push(footer_pill("Esc cancel", theme::PURPLE));
+        Line::from(pills)
     };
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),

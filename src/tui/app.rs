@@ -853,33 +853,37 @@ pub enum ActiveOverlay {
 /// State for the GNUDB review overlay.
 #[derive(Debug, Clone)]
 pub struct GnudbReviewState {
-    /// Album title (editable).
-    pub album: String,
-    /// Release year (editable).
-    pub year: String,
-    /// Genre (editable).
-    pub genre: String,
-    /// Per-track data grouped by disc.
-    pub discs: Vec<GnudbReviewDisc>,
-    /// Flattened row map for cursor navigation.
-    pub rows: Vec<GnudbRowKind>,
-    /// Current cursor position in `rows`.
+    /// Per-disc pages. Single-disc albums have one page.
+    pub pages: Vec<GnudbReviewPage>,
+    /// Active page index (0-based).
+    pub active_page: usize,
+    /// Current cursor position in active page's rows.
     pub cursor: usize,
     /// Scroll offset.
     pub scroll: usize,
     /// Active inline edit (if any).
     pub edit_input: Option<crate::tui::text_input::TextInputState>,
-    /// Audio file paths for populating the metadata editor on accept.
+    /// Last click for double-click detection: (row_index, timestamp).
+    pub last_click: Option<(usize, std::time::Instant)>,
+    /// ALL audio file paths across ALL discs.
     pub paths: Vec<std::path::PathBuf>,
 }
 
-/// A disc within the GNUDB review.
+/// A single page (disc) in the GNUDB review overlay.
 #[derive(Debug, Clone)]
-pub struct GnudbReviewDisc {
+pub struct GnudbReviewPage {
     /// Disc label (e.g., "disc 01"). Empty for single-disc albums.
     pub label: String,
+    /// Album title for this disc (editable).
+    pub album: String,
+    /// Release year (editable).
+    pub year: String,
+    /// Genre (editable).
+    pub genre: String,
     /// Tracks on this disc.
     pub tracks: Vec<GnudbReviewTrack>,
+    /// Flattened row map for this page.
+    pub rows: Vec<GnudbRowKind>,
 }
 
 /// A track within the GNUDB review.
@@ -895,15 +899,15 @@ pub struct GnudbReviewTrack {
     pub file_index: usize,
 }
 
-/// What each row in the flattened GNUDB review view represents.
+/// What each row in a GNUDB review page represents.
 #[derive(Debug, Clone)]
 pub enum GnudbRowKind {
     /// Album-level field: "Album", "Year", or "Genre".
     AlbumField(&'static str),
     /// Per-track header line (non-selectable, cursor skips).
-    TrackHeader { disc_idx: usize, track_idx: usize },
+    TrackHeader { track_idx: usize },
     /// Per-track editable field: "Title" or "Artist".
-    TrackField { disc_idx: usize, track_idx: usize, field: &'static str },
+    TrackField { track_idx: usize, field: &'static str },
 }
 
 /// A single proposed change from a CUE import.
