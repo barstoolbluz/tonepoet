@@ -123,6 +123,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::CueImportReview { ref changes, scroll } => {
             draw_cue_import_review(f, changes, scroll);
         }
+        ActiveOverlay::GnudbSelect { ref matches, selected, scroll, .. } => {
+            draw_gnudb_select(f, matches, selected, scroll);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -2087,6 +2090,77 @@ fn draw_cue_import_review(
 
     let footer = Line::from(vec![
         footer_pill("Enter accept", theme::GREEN),
+        pill_gap(),
+        footer_pill("Esc cancel", theme::PURPLE),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
+}
+
+/// Draw the GNUDB match selection overlay.
+fn draw_gnudb_select(
+    f: &mut Frame,
+    matches: &[super::gnudb::GnudbMatch],
+    selected: usize,
+    scroll: usize,
+) {
+    let area = f.size();
+    let w = (area.width * 70 / 100).max(40).min(area.width.saturating_sub(2));
+    let h = (area.height * 60 / 100).max(8).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let title = format!(" GNUDB — {} match{} ",
+        matches.len(), if matches.len() == 1 { "" } else { "es" });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::CYAN))
+        .title(Span::styled(title, Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 { return; }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let content_h = chunks[0].height as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, m) in matches.iter().enumerate() {
+        let is_sel = i == selected;
+        let prefix = if is_sel { " ► " } else { "   " };
+        let style = if is_sel {
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT_BRIGHT)
+        };
+        let cat_style = if is_sel {
+            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(format!("[{}] ", m.category), cat_style),
+            Span::styled(m.title.clone(), style),
+        ]));
+    }
+
+    let total = lines.len();
+    let scroll = scroll.min(total.saturating_sub(content_h));
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    let footer = Line::from(vec![
+        footer_pill("Enter select", theme::GREEN),
         pill_gap(),
         footer_pill("Esc cancel", theme::PURPLE),
     ]);

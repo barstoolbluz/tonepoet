@@ -1475,6 +1475,39 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
+        ActiveOverlay::GnudbSelect { ref matches, mut selected, scroll, ref paths } => {
+            let matches = matches.clone();
+            let paths = paths.clone();
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::GnudbSelect { matches, selected, scroll, paths };
+                }
+                KeyCode::Down => {
+                    if selected + 1 < matches.len() {
+                        selected += 1;
+                    }
+                    app.active_overlay = ActiveOverlay::GnudbSelect { matches, selected, scroll, paths };
+                }
+                KeyCode::Enter => {
+                    if let Some(m) = matches.get(selected) {
+                        let category = m.category.clone();
+                        let disc_id = m.disc_id.clone();
+                        app.set_status(format!("Reading {}...", m.title));
+                        app.active_overlay = ActiveOverlay::None;
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let result = super::gnudb::read_gnudb(&category, &disc_id).await;
+                            let _ = tx.send(AppMessage::GnudbReadComplete { result, paths }).await;
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
         ActiveOverlay::Verify { mut scroll } => {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -2613,6 +2646,16 @@ fn handle_generic_overlay_mouse(
                     let y = (area.1.saturating_sub(h)) / 2;
                     (Rect::new(x, y, w, h), vec![
                         ("Enter accept", "enter"),
+                        ("Esc cancel", "esc"),
+                    ])
+                }
+                ActiveOverlay::GnudbSelect { .. } => {
+                    let w = ((area.0 as usize) * 70 / 100).max(40).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 60 / 100).max(8).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![
+                        ("Enter select", "enter"),
                         ("Esc cancel", "esc"),
                     ])
                 }

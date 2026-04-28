@@ -96,6 +96,10 @@ pub enum ContextAction {
     ClearCompareReference,
     /// Detect CD pre-emphasis on selected audio file(s).
     DetectPreemphasis,
+    /// Look up tags from gnudb.org (CDDB).
+    QueryGnudb,
+    /// Import tags from a CUE sheet (opens metadata editor + external editor).
+    ImportCueFromBrowse,
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -212,6 +216,21 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
     }
 }
 
+/// Build the "Tagging" submenu (GNUDB lookup, CUE import).
+/// `has_cue` controls whether the CUE import option is shown.
+fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
+    let mut children = vec![
+        item("Get tags from gnudb.org", ContextAction::QueryGnudb),
+    ];
+    if has_cue {
+        children.push(item("Get tags from CUE", ContextAction::ImportCueFromBrowse));
+    }
+    ContextMenuEntry::Submenu {
+        label: "Tagging".to_string(),
+        children,
+    }
+}
+
 /// Build the "Utilities" submenu. Compare items change based on whether
 /// a reference is currently stored.
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
@@ -255,6 +274,16 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
+            // Check if a CUE file exists in the directory.
+            let has_cue = entry.path.parent()
+                .and_then(|d| std::fs::read_dir(d).ok())
+                .map(|entries| entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.path().extension()
+                        .map(|ext| ext.to_ascii_lowercase() == "cue")
+                        .unwrap_or(false)))
+                .unwrap_or(false);
+            items.push(build_tagging_submenu(has_cue));
             items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(true));
@@ -278,6 +307,15 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open", ContextAction::OpenEntry));
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
+            // Check if a CUE file exists inside the directory.
+            let has_cue = std::fs::read_dir(&entry.path).ok()
+                .map(|entries| entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.path().extension()
+                        .map(|ext| ext.to_ascii_lowercase() == "cue")
+                        .unwrap_or(false)))
+                .unwrap_or(false);
+            items.push(build_tagging_submenu(has_cue));
             items.push(build_utilities_submenu(app));
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
@@ -557,6 +595,51 @@ pub fn execute_context_action(
         }
         ContextAction::DetectPreemphasis => {
             let cmd = super::command::Command::DetectPreemphasis;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::QueryGnudb => {
+            // Collect audio file paths, compute disc ID, spawn GNUDB query.
+            let paths = super::command::collect_selection_for_file_ops(app);
+            let mut audio_paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&paths)
+                .into_iter()
+                .filter(|p| matches!(
+                    super::browse::classify_file(p),
+                    super::browse::EntryKind::AudioFile(_)
+                ))
+                .collect();
+            super::probe::sort_paths_by_track(&mut audio_paths);
+
+            if audio_paths.is_empty() {
+                app.set_status("No audio files for GNUDB lookup");
+                return;
+            }
+
+            let durations = super::gnudb::collect_durations(
+                &audio_paths, &app.browse.probe_cache,
+            );
+            if durations.len() != audio_paths.len() {
+                app.set_status("Probe all files first (some durations missing)");
+                return;
+            }
+
+            let disc_id = super::gnudb::compute_disc_id(&durations);
+            app.set_status(format!("Querying gnudb.org (disc ID: {})...", disc_id.disc_id));
+
+            // Store paths for later use when populating the metadata editor.
+            let paths_for_editor = audio_paths;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = super::gnudb::query_gnudb(&disc_id).await;
+                let _ = tx.send(super::message::AppMessage::GnudbQueryComplete {
+                    result,
+                    paths: paths_for_editor,
+                }).await;
+            });
+        }
+        ContextAction::ImportCueFromBrowse => {
+            // Open metadata editor, then trigger :import-cue.
+            super::keybindings::open_metadata_editor(app);
+            let cmd = super::command::Command::ImportCue;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::BulkRename => {

@@ -837,6 +837,14 @@ pub enum ActiveOverlay {
         changes: Vec<CueImportChange>,
         scroll: usize,
     },
+    /// GNUDB match selection overlay (when multiple matches are returned).
+    GnudbSelect {
+        matches: Vec<crate::tui::gnudb::GnudbMatch>,
+        selected: usize,
+        scroll: usize,
+        /// Audio file paths for populating the metadata editor after selection.
+        paths: Vec<std::path::PathBuf>,
+    },
 }
 
 /// A single proposed change from a CUE import.

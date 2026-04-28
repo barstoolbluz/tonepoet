@@ -640,6 +640,54 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.active_overlay = ActiveOverlay::None;
             app.browse.probe_current_with_db(tx, Some(&app.db));
         }
+        AppMessage::GnudbQueryComplete { result, paths } => {
+            match result {
+                Ok(matches) if matches.len() == 1 => {
+                    // Single match: auto-read the entry.
+                    let m = matches[0].clone();
+                    app.set_status(format!("GNUDB: found {} — reading...", m.title));
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = super::gnudb::read_gnudb(&m.category, &m.disc_id).await;
+                        let _ = tx.send(AppMessage::GnudbReadComplete { result, paths }).await;
+                    });
+                }
+                Ok(matches) if matches.is_empty() => {
+                    app.set_status("GNUDB: no matches found");
+                }
+                Ok(matches) => {
+                    // Multiple matches: show selection overlay.
+                    app.set_status(format!("GNUDB: {} matches found", matches.len()));
+                    app.active_overlay = ActiveOverlay::GnudbSelect {
+                        matches,
+                        selected: 0,
+                        scroll: 0,
+                        paths,
+                    };
+                }
+                Err(e) => {
+                    app.set_status(format!("GNUDB error: {}", e));
+                }
+            }
+        }
+        AppMessage::GnudbReadComplete { result, paths: _ } => {
+            match result {
+                Ok(entry) => {
+                    // Open metadata editor, then populate with GNUDB data.
+                    super::keybindings::open_metadata_editor(app);
+                    if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
+                        super::gnudb::populate_editor_from_gnudb(state, &entry);
+                        app.set_status(format!(
+                            "GNUDB: loaded {} / {} ({} tracks)",
+                            entry.artist, entry.album, entry.tracks.len(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    app.set_status(format!("GNUDB read error: {}", e));
+                }
+            }
+        }
     }
 }
 

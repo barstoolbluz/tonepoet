@@ -99,4 +99,14 @@ pub enum AppMessage {
         result: Box<Result<crate::tui::archive_listing::ArchiveListing, String>>,
         password: Option<String>,
     },
+    /// Result of an async GNUDB query.
+    GnudbQueryComplete {
+        result: Result<Vec<crate::tui::gnudb::GnudbMatch>, String>,
+        paths: Vec<std::path::PathBuf>,
+    },
+    /// Result of an async GNUDB read (single entry).
+    GnudbReadComplete {
+        result: Result<crate::tui::gnudb::GnudbEntry, String>,
+        paths: Vec<std::path::PathBuf>,
+    },
 }
