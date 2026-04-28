@@ -1077,8 +1077,12 @@ impl BrowseState {
         self.type_ahead_buffer.push(c);
         self.type_ahead_last_keystroke = Some(Instant::now());
 
-        let prefix = self.type_ahead_buffer.to_lowercase();
-        if let Some(idx) = self.entries.iter().position(|e| e.name_lower.starts_with(&prefix)) {
+        let query = self.type_ahead_buffer.to_lowercase();
+        // Priority 1: prefix match.
+        // Priority 2: substring/contains match.
+        let idx = self.entries.iter().position(|e| e.name_lower.starts_with(&query))
+            .or_else(|| self.entries.iter().position(|e| e.name_lower.contains(&query)));
+        if let Some(idx) = idx {
             self.selected_index = idx;
             self.ensure_visible();
         }
@@ -1092,8 +1096,10 @@ impl BrowseState {
             self.type_ahead_last_keystroke = None;
         } else {
             self.type_ahead_last_keystroke = Some(Instant::now());
-            let prefix = self.type_ahead_buffer.to_lowercase();
-            if let Some(idx) = self.entries.iter().position(|e| e.name_lower.starts_with(&prefix)) {
+            let query = self.type_ahead_buffer.to_lowercase();
+            let idx = self.entries.iter().position(|e| e.name_lower.starts_with(&query))
+                .or_else(|| self.entries.iter().position(|e| e.name_lower.contains(&query)));
+            if let Some(idx) = idx {
                 self.selected_index = idx;
                 self.ensure_visible();
             }
