@@ -126,6 +126,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::GnudbSelect { ref matches, selected, scroll, .. } => {
             draw_gnudb_select(f, matches, selected, scroll);
         }
+        ActiveOverlay::GnudbReview(ref state) => {
+            draw_gnudb_review(f, state);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -2164,6 +2167,172 @@ fn draw_gnudb_select(
         pill_gap(),
         footer_pill("Esc cancel", theme::PURPLE),
     ]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
+}
+
+/// Draw the GNUDB review overlay — editable preview of GNUDB tags.
+fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
+    use super::app::GnudbRowKind;
+
+    let area = f.size();
+    let w = (area.width * 85 / 100).max(50).min(area.width.saturating_sub(2));
+    let h = (area.height * 85 / 100).max(14).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let artist = state.discs.first()
+        .and_then(|d| d.tracks.first())
+        .map(|t| t.artist.as_str())
+        .unwrap_or("Unknown");
+    let title = format!(" GNUDB Review — {} / {} ", artist, state.album);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::CYAN))
+        .title(Span::styled(title, Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 { return; }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let content_h = chunks[0].height as usize;
+    let inner_w = chunks[0].width as usize;
+    let label_w = 12usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (row_idx, row) in state.rows.iter().enumerate() {
+        let is_cursor = row_idx == state.cursor;
+        let is_editing = is_cursor && state.edit_input.is_some();
+
+        match row {
+            GnudbRowKind::AlbumField(field) => {
+                let value = match *field {
+                    "Album" => &state.album,
+                    "Year" => &state.year,
+                    "Genre" => &state.genre,
+                    _ => "",
+                };
+                let label_style = if is_cursor {
+                    Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+                } else {
+                    theme::muted()
+                };
+
+                if is_editing {
+                    if let Some(ref input) = state.edit_input {
+                        let val_max = inner_w.saturating_sub(label_w + 1);
+                        let (visible, cursor_col) = input.view(val_max);
+                        let cp = cursor_col as usize;
+                        let chars: Vec<char> = visible.chars().collect();
+                        let before: String = chars[..cp.min(chars.len())].iter().collect();
+                        let cur_ch: String = if cp < chars.len() { chars[cp].to_string() } else { " ".to_string() };
+                        let after: String = if cp + 1 < chars.len() { chars[cp + 1..].iter().collect() } else { String::new() };
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("    {:<w$}", field, w = label_w - 4), label_style),
+                            Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                            Span::styled(cur_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                            Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
+                        ]));
+                        continue;
+                    }
+                }
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {:<w$}", field, w = label_w - 4), label_style),
+                    Span::styled(value.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                ]));
+            }
+
+            GnudbRowKind::TrackHeader { disc_idx, track_idx } => {
+                let disc = &state.discs[*disc_idx];
+                let track = &disc.tracks[*track_idx];
+                let header = if disc.label.is_empty() {
+                    format!("Track {:02}", track.track_number)
+                } else {
+                    format!("{}, Track {:02}", disc.label, track.track_number)
+                };
+                let dashes = inner_w.saturating_sub(header.len() + 5);
+                lines.push(Line::from(Span::styled(
+                    format!(" ── {} {}", header, "─".repeat(dashes)),
+                    theme::muted(),
+                )));
+            }
+
+            GnudbRowKind::TrackField { disc_idx, track_idx, field } => {
+                let disc = &state.discs[*disc_idx];
+                let track = &disc.tracks[*track_idx];
+                let value = match *field {
+                    "Title" => &track.title,
+                    "Artist" => &track.artist,
+                    _ => "",
+                };
+                let label_style = if is_cursor {
+                    Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+                } else {
+                    theme::muted()
+                };
+
+                if is_editing {
+                    if let Some(ref input) = state.edit_input {
+                        let val_max = inner_w.saturating_sub(label_w + 1);
+                        let (visible, cursor_col) = input.view(val_max);
+                        let cp = cursor_col as usize;
+                        let chars: Vec<char> = visible.chars().collect();
+                        let before: String = chars[..cp.min(chars.len())].iter().collect();
+                        let cur_ch: String = if cp < chars.len() { chars[cp].to_string() } else { " ".to_string() };
+                        let after: String = if cp + 1 < chars.len() { chars[cp + 1..].iter().collect() } else { String::new() };
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("    {:<w$}", field, w = label_w - 4), label_style),
+                            Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                            Span::styled(cur_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                            Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
+                        ]));
+                        continue;
+                    }
+                }
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {:<w$}", field, w = label_w - 4), label_style),
+                    Span::styled(value.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                ]));
+            }
+        }
+    }
+
+    let total = lines.len();
+    let scroll = state.scroll.min(total.saturating_sub(content_h));
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    let footer = if state.edit_input.is_some() {
+        Line::from(vec![
+            footer_pill("Enter confirm", theme::GREEN),
+            pill_gap(),
+            footer_pill("Esc cancel", theme::PURPLE),
+        ])
+    } else {
+        Line::from(vec![
+            footer_pill("Enter edit", theme::GREEN),
+            pill_gap(),
+            footer_pill("c fix-caps", theme::BLUE),
+            pill_gap(),
+            footer_pill("a accept", theme::CYAN),
+            pill_gap(),
+            footer_pill("Esc cancel", theme::PURPLE),
+        ])
+    };
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],

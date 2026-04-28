@@ -845,6 +845,65 @@ pub enum ActiveOverlay {
         /// Audio file paths for populating the metadata editor after selection.
         paths: Vec<std::path::PathBuf>,
     },
+    /// GNUDB review overlay — editable preview of GNUDB tags before
+    /// accepting into the metadata editor.
+    GnudbReview(Box<GnudbReviewState>),
+}
+
+/// State for the GNUDB review overlay.
+#[derive(Debug, Clone)]
+pub struct GnudbReviewState {
+    /// Album title (editable).
+    pub album: String,
+    /// Release year (editable).
+    pub year: String,
+    /// Genre (editable).
+    pub genre: String,
+    /// Per-track data grouped by disc.
+    pub discs: Vec<GnudbReviewDisc>,
+    /// Flattened row map for cursor navigation.
+    pub rows: Vec<GnudbRowKind>,
+    /// Current cursor position in `rows`.
+    pub cursor: usize,
+    /// Scroll offset.
+    pub scroll: usize,
+    /// Active inline edit (if any).
+    pub edit_input: Option<crate::tui::text_input::TextInputState>,
+    /// Audio file paths for populating the metadata editor on accept.
+    pub paths: Vec<std::path::PathBuf>,
+}
+
+/// A disc within the GNUDB review.
+#[derive(Debug, Clone)]
+pub struct GnudbReviewDisc {
+    /// Disc label (e.g., "disc 01"). Empty for single-disc albums.
+    pub label: String,
+    /// Tracks on this disc.
+    pub tracks: Vec<GnudbReviewTrack>,
+}
+
+/// A track within the GNUDB review.
+#[derive(Debug, Clone)]
+pub struct GnudbReviewTrack {
+    /// Track title (editable).
+    pub title: String,
+    /// Track artist (editable).
+    pub artist: String,
+    /// Track number (1-based).
+    pub track_number: u32,
+    /// Index into `GnudbReviewState.paths` for this track's file.
+    pub file_index: usize,
+}
+
+/// What each row in the flattened GNUDB review view represents.
+#[derive(Debug, Clone)]
+pub enum GnudbRowKind {
+    /// Album-level field: "Album", "Year", or "Genre".
+    AlbumField(&'static str),
+    /// Per-track header line (non-selectable, cursor skips).
+    TrackHeader { disc_idx: usize, track_idx: usize },
+    /// Per-track editable field: "Title" or "Artist".
+    TrackField { disc_idx: usize, track_idx: usize, field: &'static str },
 }
 
 /// A single proposed change from a CUE import.

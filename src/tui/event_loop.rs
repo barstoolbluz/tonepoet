@@ -687,18 +687,16 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
-        AppMessage::GnudbReadComplete { result, paths: _ } => {
+        AppMessage::GnudbReadComplete { result, paths } => {
             match result {
                 Ok(entry) => {
-                    // Open metadata editor, then populate with GNUDB data.
-                    super::keybindings::open_metadata_editor(app);
-                    if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
-                        super::gnudb::populate_editor_from_gnudb(state, &entry);
-                        app.set_status(format!(
-                            "GNUDB: loaded {} / {} ({} tracks)",
-                            entry.artist, entry.album, entry.tracks.len(),
-                        ));
-                    }
+                    // Open GNUDB review overlay for user editing before accept.
+                    let review = super::gnudb::build_review_state(&entry, paths);
+                    app.set_status(format!(
+                        "GNUDB: {} / {} ({} tracks) — review and edit",
+                        entry.artist, entry.album, entry.tracks.len(),
+                    ));
+                    app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
                 }
                 Err(e) => {
                     app.set_status(format!("GNUDB read error: {}", e));
@@ -711,32 +709,15 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 return;
             }
 
-            // Open metadata editor with all files.
-            super::keybindings::open_metadata_editor(app);
-            if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
-                // Populate each disc's data, mapping tracks to the right files.
-                let mut disc_labels = Vec::new();
-                for (label, entry, group_paths) in &entries {
-                    // Find where this disc's files start in the editor's path list.
-                    // Match by path since the editor may have re-sorted.
-                    for (track_idx, gpath) in group_paths.iter().enumerate() {
-                        if let Some(editor_idx) = state.paths.iter().position(|p| p == gpath) {
-                            // Populate this file's tags from GNUDB.
-                            super::gnudb::populate_editor_file(
-                                state, editor_idx, entry, track_idx,
-                            );
-                        }
-                    }
-                    disc_labels.push(format!("{}: {} / {}", label, entry.artist, entry.album));
-                }
-                state.dirty = true;
-                app.set_status(format!(
-                    "GNUDB: loaded {} disc{} ({})",
-                    entries.len(),
-                    if entries.len() == 1 { "" } else { "s" },
-                    disc_labels.join("; "),
-                ));
-            }
+            // Open GNUDB review overlay with multi-disc data.
+            let review = super::gnudb::build_multi_disc_review_state(&entries);
+            let n_discs = entries.len();
+            let n_tracks: usize = entries.iter().map(|(_, e, _)| e.tracks.len()).sum();
+            app.set_status(format!(
+                "GNUDB: {} disc{}, {} tracks — review and edit",
+                n_discs, if n_discs == 1 { "" } else { "s" }, n_tracks,
+            ));
+            app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
     }
 }

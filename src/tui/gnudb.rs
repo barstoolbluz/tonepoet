@@ -377,6 +377,183 @@ pub fn populate_editor_file(
     }
 }
 
+// ── Review state builders ────────────────────────────────────────────
+
+/// Build a GnudbReviewState from a single GNUDB entry.
+pub fn build_review_state(
+    entry: &GnudbEntry,
+    paths: Vec<PathBuf>,
+) -> super::app::GnudbReviewState {
+    use super::app::*;
+
+    let mut tracks = Vec::new();
+    for (i, title) in entry.tracks.iter().enumerate() {
+        tracks.push(GnudbReviewTrack {
+            title: title.clone(),
+            artist: entry.artist.clone(),
+            track_number: (i + 1) as u32,
+            file_index: i,
+        });
+    }
+
+    let discs = vec![GnudbReviewDisc {
+        label: String::new(),
+        tracks,
+    }];
+
+    let rows = build_rows(&discs);
+
+    GnudbReviewState {
+        album: entry.album.clone(),
+        year: entry.year.clone(),
+        genre: entry.genre.clone(),
+        discs,
+        rows,
+        cursor: 0,
+        scroll: 0,
+        edit_input: None,
+        paths,
+    }
+}
+
+/// Build a GnudbReviewState from multiple disc entries.
+pub fn build_multi_disc_review_state(
+    entries: &[(String, GnudbEntry, Vec<PathBuf>)],
+) -> super::app::GnudbReviewState {
+    use super::app::*;
+
+    let mut all_paths = Vec::new();
+    let mut discs = Vec::new();
+
+    // Use first entry's album-level data as defaults.
+    let first = &entries[0].1;
+    let album = first.album.clone();
+    let year = first.year.clone();
+    let genre = first.genre.clone();
+
+    for (label, entry, group_paths) in entries {
+        let base_file_idx = all_paths.len();
+        all_paths.extend(group_paths.iter().cloned());
+
+        let mut tracks = Vec::new();
+        for (i, title) in entry.tracks.iter().enumerate() {
+            tracks.push(GnudbReviewTrack {
+                title: title.clone(),
+                artist: entry.artist.clone(),
+                track_number: (i + 1) as u32,
+                file_index: base_file_idx + i,
+            });
+        }
+
+        discs.push(GnudbReviewDisc {
+            label: label.clone(),
+            tracks,
+        });
+    }
+
+    let rows = build_rows(&discs);
+
+    GnudbReviewState {
+        album,
+        year,
+        genre,
+        discs,
+        rows,
+        cursor: 0,
+        scroll: 0,
+        edit_input: None,
+        paths: all_paths,
+    }
+}
+
+/// Build the flattened row map from disc/track data.
+fn build_rows(discs: &[super::app::GnudbReviewDisc]) -> Vec<super::app::GnudbRowKind> {
+    use super::app::GnudbRowKind;
+
+    let mut rows = vec![
+        GnudbRowKind::AlbumField("Album"),
+        GnudbRowKind::AlbumField("Year"),
+        GnudbRowKind::AlbumField("Genre"),
+    ];
+
+    for (di, disc) in discs.iter().enumerate() {
+        for (ti, _track) in disc.tracks.iter().enumerate() {
+            rows.push(GnudbRowKind::TrackHeader { disc_idx: di, track_idx: ti });
+            rows.push(GnudbRowKind::TrackField { disc_idx: di, track_idx: ti, field: "Title" });
+            rows.push(GnudbRowKind::TrackField { disc_idx: di, track_idx: ti, field: "Artist" });
+        }
+    }
+
+    rows
+}
+
+/// Populate a metadata editor from the reviewed GNUDB state.
+pub fn populate_editor_from_review(
+    state: &mut super::app::MetadataEditorState,
+    review: &super::app::GnudbReviewState,
+) {
+    let n = state.paths.len();
+
+    fn find_or_create(
+        entries: &mut Vec<super::probe::TagEntry>,
+        key: &str,
+        item_key: lofty::tag::ItemKey,
+        n: usize,
+    ) -> usize {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+            return i;
+        }
+        entries.push(super::probe::TagEntry {
+            display_key: key.to_string(),
+            item_key,
+            value: String::new(),
+            original: String::new(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vec![String::new(); n],
+            per_file_originals: vec![String::new(); n],
+        });
+        entries.len() - 1
+    }
+
+    let title_idx = find_or_create(&mut state.entries, "TITLE", lofty::tag::ItemKey::TrackTitle, n);
+    let artist_idx = find_or_create(&mut state.entries, "ARTIST", lofty::tag::ItemKey::TrackArtist, n);
+    let album_idx = find_or_create(&mut state.entries, "ALBUM", lofty::tag::ItemKey::AlbumTitle, n);
+    let tn_idx = find_or_create(&mut state.entries, "TRACKNUMBER", lofty::tag::ItemKey::TrackNumber, n);
+    let year_idx = find_or_create(&mut state.entries, "DATE", lofty::tag::ItemKey::Year, n);
+    let genre_idx = find_or_create(&mut state.entries, "GENRE", lofty::tag::ItemKey::Genre, n);
+
+    for disc in &review.discs {
+        for track in &disc.tracks {
+            let i = track.file_index;
+            if i >= n { continue; }
+            state.entries[title_idx].per_file_values[i] = track.title.clone();
+            state.entries[artist_idx].per_file_values[i] = track.artist.clone();
+            state.entries[album_idx].per_file_values[i] = review.album.clone();
+            state.entries[tn_idx].per_file_values[i] = track.track_number.to_string();
+            if !review.year.is_empty() {
+                state.entries[year_idx].per_file_values[i] = review.year.clone();
+            }
+            if !review.genre.is_empty() {
+                state.entries[genre_idx].per_file_values[i] = review.genre.clone();
+            }
+        }
+    }
+
+    for idx in [title_idx, artist_idx, album_idx, tn_idx, year_idx, genre_idx] {
+        let e = &mut state.entries[idx];
+        let all_same = e.per_file_values.windows(2).all(|w| w[0] == w[1]);
+        e.is_mixed = !all_same && n > 1;
+        e.value = if e.is_mixed {
+            "<multiple values>".to_string()
+        } else {
+            e.per_file_values.first().cloned().unwrap_or_default()
+        };
+    }
+
+    state.dirty = true;
+}
+
 /// Group audio file paths by parent directory (disc detection).
 ///
 /// Returns `(disc_label, paths)` pairs sorted by disc number. If all

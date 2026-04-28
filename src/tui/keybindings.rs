@@ -1508,6 +1508,191 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
+        ActiveOverlay::GnudbReview(mut state) => {
+            use super::app::GnudbRowKind;
+
+            if state.edit_input.is_some() {
+                // ── Inline edit mode ──
+                match key.code {
+                    KeyCode::Esc => {
+                        state.edit_input = None;
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    KeyCode::Enter => {
+                        // Commit the edited value.
+                        if let Some(ref input) = state.edit_input {
+                            let new_val = input.text.clone();
+                            match &state.rows[state.cursor] {
+                                GnudbRowKind::AlbumField(field) => {
+                                    match *field {
+                                        "Album" => state.album = new_val,
+                                        "Year" => state.year = new_val,
+                                        "Genre" => state.genre = new_val,
+                                        _ => {}
+                                    }
+                                }
+                                GnudbRowKind::TrackField { disc_idx, track_idx, field } => {
+                                    let track = &mut state.discs[*disc_idx].tracks[*track_idx];
+                                    match *field {
+                                        "Title" => track.title = new_val,
+                                        "Artist" => track.artist = new_val,
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        state.edit_input = None;
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    _ => {
+                        if let Some(ref mut input) = state.edit_input {
+                            super::text_input::handle_text_input_key(input, &key);
+                        }
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                }
+            } else {
+                // ── Navigation mode ──
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        app.active_overlay = ActiveOverlay::None;
+                        app.set_status("GNUDB review cancelled");
+                    }
+                    KeyCode::Up => {
+                        // Move cursor up, skipping TrackHeader rows.
+                        let mut new_cursor = state.cursor;
+                        loop {
+                            if new_cursor == 0 { break; }
+                            new_cursor -= 1;
+                            if !matches!(state.rows.get(new_cursor), Some(GnudbRowKind::TrackHeader { .. })) {
+                                break;
+                            }
+                        }
+                        state.cursor = new_cursor;
+                        // Ensure visible.
+                        if state.cursor < state.scroll {
+                            state.scroll = state.cursor;
+                        }
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    KeyCode::Down => {
+                        let mut new_cursor = state.cursor;
+                        loop {
+                            if new_cursor + 1 >= state.rows.len() { break; }
+                            new_cursor += 1;
+                            if !matches!(state.rows.get(new_cursor), Some(GnudbRowKind::TrackHeader { .. })) {
+                                break;
+                            }
+                        }
+                        state.cursor = new_cursor;
+                        // Ensure visible.
+                        let visible_h = crossterm::terminal::size()
+                            .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
+                            .unwrap_or(20);
+                        if state.cursor >= state.scroll + visible_h {
+                            state.scroll = state.cursor.saturating_sub(visible_h) + 1;
+                        }
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    KeyCode::Enter => {
+                        // Open inline edit for current row.
+                        let value = match &state.rows[state.cursor] {
+                            GnudbRowKind::AlbumField(field) => match *field {
+                                "Album" => Some(state.album.clone()),
+                                "Year" => Some(state.year.clone()),
+                                "Genre" => Some(state.genre.clone()),
+                                _ => None,
+                            },
+                            GnudbRowKind::TrackField { disc_idx, track_idx, field } => {
+                                let track = &state.discs[*disc_idx].tracks[*track_idx];
+                                match *field {
+                                    "Title" => Some(track.title.clone()),
+                                    "Artist" => Some(track.artist.clone()),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(val) = value {
+                            state.edit_input = Some(
+                                super::text_input::TextInputState::new(val),
+                            );
+                        }
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    KeyCode::PageUp => {
+                        let jump = crossterm::terminal::size()
+                            .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
+                            .unwrap_or(20);
+                        for _ in 0..jump {
+                            let mut nc = state.cursor;
+                            if nc == 0 { break; }
+                            nc -= 1;
+                            while nc > 0 && matches!(state.rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
+                                nc -= 1;
+                            }
+                            state.cursor = nc;
+                        }
+                        if state.cursor < state.scroll {
+                            state.scroll = state.cursor;
+                        }
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    KeyCode::PageDown => {
+                        let jump = crossterm::terminal::size()
+                            .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
+                            .unwrap_or(20);
+                        for _ in 0..jump {
+                            let mut nc = state.cursor;
+                            if nc + 1 >= state.rows.len() { break; }
+                            nc += 1;
+                            while nc + 1 < state.rows.len() && matches!(state.rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
+                                nc += 1;
+                            }
+                            state.cursor = nc;
+                        }
+                        let visible_h = crossterm::terminal::size()
+                            .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
+                            .unwrap_or(20);
+                        if state.cursor >= state.scroll + visible_h {
+                            state.scroll = state.cursor.saturating_sub(visible_h) + 1;
+                        }
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    KeyCode::Char('a') => {
+                        // Accept: open metadata editor and populate.
+                        super::keybindings::open_metadata_editor(app);
+                        if let ActiveOverlay::MetadataEditor(ref mut editor_state) = app.active_overlay {
+                            super::gnudb::populate_editor_from_review(editor_state, &state);
+                            app.set_status(format!(
+                                "GNUDB tags loaded — {} / {}",
+                                state.discs.first()
+                                    .and_then(|d| d.tracks.first())
+                                    .map(|t| t.artist.as_str())
+                                    .unwrap_or("?"),
+                                state.album,
+                            ));
+                        }
+                    }
+                    KeyCode::Char('c') => {
+                        // Apply capitalization rules.
+                        use crate::convert::renaming::{capitalize_title, capitalize_section};
+                        state.album = capitalize_section(&state.album);
+                        state.genre = capitalize_section(&state.genre);
+                        for disc in &mut state.discs {
+                            for track in &mut disc.tracks {
+                                track.title = capitalize_title(&track.title);
+                                track.artist = capitalize_section(&track.artist);
+                            }
+                        }
+                        app.set_status("Capitalization applied");
+                        app.active_overlay = ActiveOverlay::GnudbReview(state);
+                    }
+                    _ => {}
+                }
+            }
+        }
         ActiveOverlay::Verify { mut scroll } => {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -2659,6 +2844,25 @@ fn handle_generic_overlay_mouse(
                         ("Esc cancel", "esc"),
                     ])
                 }
+                ActiveOverlay::GnudbReview(ref state) => {
+                    let w = ((area.0 as usize) * 85 / 100).max(50).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 85 / 100).max(14).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    if state.edit_input.is_some() {
+                        (Rect::new(x, y, w, h), vec![
+                            ("Enter confirm", "enter"),
+                            ("Esc cancel", "esc"),
+                        ])
+                    } else {
+                        (Rect::new(x, y, w, h), vec![
+                            ("Enter edit", "enter"),
+                            ("c fix-caps", "c"),
+                            ("a accept", "a"),
+                            ("Esc cancel", "esc"),
+                        ])
+                    }
+                }
                 ActiveOverlay::Confirmation { .. } => {
                     // Already has button_map support — skip.
                     return false;
@@ -2747,6 +2951,27 @@ fn handle_generic_overlay_mouse(
                 }
                 return true;
             }
+        }
+
+        // Left click in content area: position cursor for GnudbReview.
+        MouseEventKind::Down(MouseButton::Left)
+            if in_popup && !on_footer
+                && matches!(app.active_overlay, ActiveOverlay::GnudbReview(_)) =>
+        {
+            if let ActiveOverlay::GnudbReview(mut state) = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+                use super::app::GnudbRowKind;
+                let content_y = popup.y + 1; // below top border
+                if my >= content_y && my < footer_y {
+                    let clicked_row = (my - content_y) as usize + state.scroll;
+                    if clicked_row < state.rows.len() {
+                        if !matches!(state.rows.get(clicked_row), Some(GnudbRowKind::TrackHeader { .. })) {
+                            state.cursor = clicked_row;
+                        }
+                    }
+                }
+                app.active_overlay = ActiveOverlay::GnudbReview(state);
+            }
+            return true;
         }
 
         // Right-click anywhere: close overlay.
