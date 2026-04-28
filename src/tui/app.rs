@@ -867,6 +867,8 @@ pub struct GnudbReviewState {
     pub last_click: Option<(usize, std::time::Instant)>,
     /// ALL audio file paths across ALL discs.
     pub paths: Vec<std::path::PathBuf>,
+    /// Original match list for "back" navigation (None for single-match queries).
+    pub origin_matches: Option<Vec<crate::tui::gnudb::GnudbMatch>>,
 }
 
 /// A single page (disc) in the GNUDB review overlay.

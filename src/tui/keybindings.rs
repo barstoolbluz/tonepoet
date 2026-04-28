@@ -1499,9 +1499,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         app.set_status(format!("Reading {}...", m.title));
                         app.active_overlay = ActiveOverlay::None;
                         let tx = tx.clone();
+                        let origin = matches.clone();
                         tokio::spawn(async move {
                             let result = super::gnudb::read_gnudb(&category, &disc_id).await;
-                            let _ = tx.send(AppMessage::GnudbReadComplete { result, paths }).await;
+                            let _ = tx.send(AppMessage::GnudbReadComplete {
+                                result, paths, origin_matches: Some(origin),
+                            }).await;
                         });
                     }
                 }
@@ -1560,6 +1563,21 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
                         app.active_overlay = ActiveOverlay::None;
                         app.set_status("GNUDB review cancelled");
+                    }
+                    // Back to match list (if came from multi-match selection).
+                    (KeyCode::Char('b'), _) => {
+                        if let Some(matches) = state.origin_matches.take() {
+                            let paths = state.paths;
+                            app.active_overlay = ActiveOverlay::GnudbSelect {
+                                matches,
+                                selected: 0,
+                                scroll: 0,
+                                paths,
+                            };
+                            app.set_status("Back to match list");
+                        } else {
+                            app.active_overlay = ActiveOverlay::GnudbReview(state);
+                        }
                     }
                     // Left / Right: switch disc page (only in navigation mode,
                     // not while editing — edit mode returns early above).
@@ -2875,12 +2893,17 @@ fn handle_generic_overlay_mouse(
                             ("Esc cancel", "esc"),
                         ])
                     } else {
-                        (Rect::new(x, y, w, h), vec![
+                        let mut pills = Vec::new();
+                        if state.origin_matches.is_some() {
+                            pills.push(("b back", "b"));
+                        }
+                        pills.extend_from_slice(&[
                             ("Enter edit", "enter"),
                             ("c fix-caps", "c"),
                             ("a accept", "a"),
                             ("Esc cancel", "esc"),
-                        ])
+                        ]);
+                        (Rect::new(x, y, w, h), pills)
                     }
                 }
                 ActiveOverlay::Confirmation { .. } => {
@@ -2993,9 +3016,12 @@ fn handle_generic_overlay_mouse(
                             app.set_status(format!("Reading {}...", m.title));
                             let tx = _tx.clone();
                             let paths_c = paths.clone();
+                            let origin = matches.clone();
                             tokio::spawn(async move {
                                 let result = super::gnudb::read_gnudb(&category, &disc_id).await;
-                                let _ = tx.send(AppMessage::GnudbReadComplete { result, paths: paths_c }).await;
+                                let _ = tx.send(AppMessage::GnudbReadComplete {
+                                    result, paths: paths_c, origin_matches: Some(origin),
+                                }).await;
                             });
                             return true;
                         }

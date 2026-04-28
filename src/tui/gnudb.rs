@@ -413,6 +413,7 @@ pub fn build_review_state(
         scroll: 0,
         edit_input: None,
         last_click: None,
+        origin_matches: None,
         paths,
     }
 }
@@ -458,6 +459,7 @@ pub fn build_multi_disc_review_state(
         scroll: 0,
         edit_input: None,
         last_click: None,
+        origin_matches: None,
         paths: all_paths,
     }
 }

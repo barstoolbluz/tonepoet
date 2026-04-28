@@ -2345,15 +2345,20 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
             footer_pill("Esc cancel", theme::PURPLE),
         ])
     } else {
-        let mut pills = vec![
+        let mut pills = Vec::new();
+        if state.origin_matches.is_some() {
+            pills.push(footer_pill("b back", theme::AMBER));
+            pills.push(pill_gap());
+        }
+        pills.extend_from_slice(&[
             footer_pill("Enter edit", theme::GREEN),
             pill_gap(),
             footer_pill("c fix-caps", theme::BLUE),
             pill_gap(),
             footer_pill("a accept", theme::CYAN),
             pill_gap(),
-        ];
-        pills.push(footer_pill("Esc cancel", theme::PURPLE));
+            footer_pill("Esc cancel", theme::PURPLE),
+        ]);
         Line::from(pills)
     };
     f.render_widget(

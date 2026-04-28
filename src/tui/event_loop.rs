@@ -666,7 +666,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         let result = super::gnudb::read_gnudb(&m.category, &m.disc_id).await;
-                        let _ = tx.send(AppMessage::GnudbReadComplete { result, paths }).await;
+                        let _ = tx.send(AppMessage::GnudbReadComplete { result, paths, origin_matches: None }).await;
                     });
                 }
                 Ok(matches) if matches.is_empty() => {
@@ -687,11 +687,12 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
-        AppMessage::GnudbReadComplete { result, paths } => {
+        AppMessage::GnudbReadComplete { result, paths, origin_matches } => {
             match result {
                 Ok(entry) => {
                     // Open GNUDB review overlay for user editing before accept.
-                    let review = super::gnudb::build_review_state(&entry, paths);
+                    let mut review = super::gnudb::build_review_state(&entry, paths);
+                    review.origin_matches = origin_matches;
                     app.set_status(format!(
                         "GNUDB: {} / {} ({} tracks) — review and edit",
                         entry.artist, entry.album, entry.tracks.len(),

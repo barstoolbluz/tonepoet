@@ -108,6 +108,8 @@ pub enum AppMessage {
     GnudbReadComplete {
         result: Result<crate::tui::gnudb::GnudbEntry, String>,
         paths: Vec<std::path::PathBuf>,
+        /// Original match list for "back" navigation (None for single/auto-read).
+        origin_matches: Option<Vec<crate::tui::gnudb::GnudbMatch>>,
     },
     /// Result of a multi-disc GNUDB query (sequential queries per disc).
     GnudbMultiDiscComplete {
