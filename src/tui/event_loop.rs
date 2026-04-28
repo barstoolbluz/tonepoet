@@ -254,7 +254,24 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         AppMessage::AudioProbeComplete { path, result } => {
             app.browse.probe_pending.remove(&path);
             match *result {
-                Ok(info) => {
+                Ok(mut info) => {
+                    // Check analysis cache for HDCD / PE info that should
+                    // be surfaced in the info pane.
+                    info.metadata.preemphasis_metadata =
+                        super::probe::preemphasis_metadata_check_pub(&path);
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        let mtime = meta.modified()
+                            .map(crate::db::systemtime_to_unix)
+                            .unwrap_or(0);
+                        if let Some(analysis) = app.db.get_cached_analysis(
+                            &path.display().to_string(), mtime, meta.len(),
+                        ) {
+                            if analysis.hdcd_detected == Some(true) {
+                                info.metadata.hdcd_detail = analysis.hdcd_detail;
+                            }
+                        }
+                    }
+
                     // Clone for the browse cache (shared via Arc).
                     app.browse
                         .probe_cache
