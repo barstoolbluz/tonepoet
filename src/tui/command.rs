@@ -1422,18 +1422,8 @@ pub fn execute_command(
                         app.set_status(format!("AccurateRip: {}", e));
                     }
                     Ok((sample_counts, sample_rate)) => {
-                        // Log disc ID for diagnostics.
-                        let disc_id = super::accuraterip::compute_ar_disc_id(
-                            &sample_counts, sample_rate,
-                        );
-                        let url = super::accuraterip::ar_url(&disc_id);
-                        log::info!(
-                            "AccurateRip: {} tracks, id1={:08x} id2={:08x} freedb={:08x} url={}",
-                            disc_id.track_count, disc_id.id1, disc_id.id2, disc_id.freedb_id, url,
-                        );
                         app.set_status(format!(
-                            "AccurateRip: verifying {} tracks (id1={:08x})...",
-                            n, disc_id.id1,
+                            "AccurateRip: verifying {} tracks...", n,
                         ));
 
                         let full_scan = force;
