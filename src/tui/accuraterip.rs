@@ -1301,7 +1301,8 @@ async fn offset_correction_inner(
     if let Ok(entries) = std::fs::read_dir(orig_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("log")).unwrap_or(false) {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ext == "log" || ext == "cue" {
                 let dest = tmp_dir.join(p.file_name().unwrap());
                 let _ = std::fs::copy(&p, &dest);
             }
@@ -1457,13 +1458,46 @@ async fn offset_correction_inner(
     }
 
     // 5. All verified at offset 0 — replace originals.
+    //
+    // Safety: back up each original to .bak BEFORE overwriting. If any
+    // copy fails mid-loop, restore all .bak files so the album is never
+    // left in a partially-corrected state.
     let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
         "Offset correction: replacing originals...".into(),
     )).await;
 
-    for (orig, corrected) in paths.iter().zip(corrected_paths.iter()) {
-        std::fs::copy(corrected, orig)
-            .map_err(|e| format!("Failed to replace {}: {}", orig.display(), e))?;
+    // Phase A: create backups.
+    let mut backed_up: Vec<(PathBuf, PathBuf)> = Vec::new(); // (original, backup)
+    for orig in paths.iter() {
+        let bak = orig.with_extension(format!(
+            "{}.bak",
+            orig.extension().and_then(|e| e.to_str()).unwrap_or("flac"),
+        ));
+        if let Err(e) = std::fs::rename(orig, &bak) {
+            // Restore any backups we already made.
+            for (o, b) in &backed_up {
+                let _ = std::fs::rename(b, o);
+            }
+            return Err(format!("Failed to back up {}: {}", orig.display(), e));
+        }
+        backed_up.push((orig.clone(), bak));
+    }
+
+    // Phase B: copy corrected files over originals.
+    for (i, (orig, _bak)) in backed_up.iter().enumerate() {
+        let corrected = &corrected_paths[i];
+        if let Err(e) = std::fs::copy(corrected, orig) {
+            // Restore ALL backups — undo everything.
+            for (o, b) in &backed_up {
+                let _ = std::fs::rename(b, o);
+            }
+            return Err(format!("Failed to write corrected {}: {}. All originals restored.", orig.display(), e));
+        }
+    }
+
+    // Phase C: remove backups (all copies succeeded).
+    for (_orig, bak) in &backed_up {
+        let _ = std::fs::remove_file(bak);
     }
 
     Ok(format!(
@@ -1487,20 +1521,25 @@ async fn copy_flac_metadata(src: &Path, dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("metaflac export failed: {}", e))?;
 
     if export.status.success() && !export.stdout.is_empty() {
-        let import = TokioCommand::new("metaflac")
+        let mut child = TokioCommand::new("metaflac")
             .arg("--import-tags-from=-")
             .arg(dst)
             .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("metaflac import spawn failed: {}", e))?;
 
-        if let Ok(mut child) = import {
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(&export.stdout).await;
-                drop(stdin);
-            }
-            let _ = child.wait().await;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(&export.stdout).await
+                .map_err(|e| format!("metaflac import write failed: {}", e))?;
+            drop(stdin);
+        }
+        let output = child.wait_with_output().await
+            .map_err(|e| format!("metaflac import failed: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("metaflac tag import failed for {}: {}", dst.display(), stderr));
         }
     }
 
