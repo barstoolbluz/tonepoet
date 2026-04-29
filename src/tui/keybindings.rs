@@ -2971,6 +2971,9 @@ fn handle_generic_overlay_mouse(
                     if result.was_common_scan && has_unmatched {
                         pills.push((":ar! full scan", ":ar!"));
                     }
+                    if super::accuraterip::detect_uniform_offset(result).is_some() {
+                        pills.push((":ar-fix correct offset", ":ar-fix"));
+                    }
                     (Rect::new(x, y, w, h), pills)
                 }
                 ActiveOverlay::Confirmation { .. } => {
@@ -5318,6 +5321,18 @@ fn execute_confirm_action(
                 parts.push(format!("{} errors", errors));
             }
             app.set_status(parts.join(", "));
+        }
+        ConfirmAction::OffsetCorrection { paths, offset } => {
+            let paths = paths.clone();
+            let offset = *offset;
+            let tx = tx.clone();
+            app.set_status("Applying offset correction...".to_string());
+            tokio::spawn(async move {
+                let result = super::accuraterip::apply_offset_correction(
+                    &paths, offset, tx.clone(),
+                ).await;
+                let _ = tx.send(AppMessage::OffsetCorrectionComplete { result }).await;
+            });
         }
     }
 }

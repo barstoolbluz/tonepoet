@@ -2536,6 +2536,10 @@ fn draw_accuraterip_verify(
         pills.push(pill_gap());
         pills.push(footer_pill(":ar! full scan", theme::BLUE));
     }
+    if super::accuraterip::detect_uniform_offset(result).is_some() {
+        pills.push(pill_gap());
+        pills.push(footer_pill(":ar-fix correct offset", theme::PURPLE));
+    }
 
     let footer = Line::from(pills);
     f.render_widget(

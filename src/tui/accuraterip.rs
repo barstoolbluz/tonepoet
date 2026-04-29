@@ -703,21 +703,12 @@ pub fn compute_ar_crcs_at_offset(
 /// Maximum offset in samples for the full scan range.
 pub const MAX_OFFSET: usize = 1200;
 
-/// Decode a track to raw interleaved 16-bit stereo PCM and return as
-/// u32 DWORDs, with `margin` extra DWORDs of silence on each side.
+/// Decode a track to raw interleaved 16-bit stereo PCM (i16 pairs).
 ///
-/// For CD audio (16-bit 44.1 kHz stereo), each DWORD is one sample pair:
-/// `[L_lo, L_hi, R_lo, R_hi]` read as little-endian u32.
-///
-/// For non-16-bit sources (24-bit FLAC, etc.), we truncate to 16-bit
-/// since AccurateRip only works with CD-quality audio.
-///
-/// Returns `(dwords_with_margin, track_len)` where `track_len` is the
-/// actual number of track DWORDs (excluding margin).
-pub fn decode_track_to_dwords(
-    path: &Path,
-    margin: usize,
-) -> Result<(Vec<u32>, usize), String> {
+/// For non-16-bit sources (24-bit FLAC, etc.), truncates to 16-bit
+/// since AccurateRip only works with CD-quality audio. Returns
+/// interleaved `[L, R, L, R, ...]` i16 values.
+pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
     use ffmpeg_next as ffmpeg;
     use ffmpeg_next::media::Type;
     use ffmpeg_next::util::format::sample::{Sample, Type as SampleType};
@@ -745,15 +736,12 @@ pub fn decode_track_to_dwords(
     }
 
     let sample_fmt = decoder.format();
-
-    // Collect all decoded samples as interleaved i16 pairs.
     let mut raw_i16: Vec<i16> = Vec::new();
-
     let mut decoded = ffmpeg::util::frame::Audio::empty();
 
     macro_rules! decode_frame {
         () => {
-            let n = decoded.samples(); // per-channel sample count
+            let n = decoded.samples();
             if n == 0 { continue; }
 
             match sample_fmt {
@@ -776,7 +764,6 @@ pub fn decode_track_to_dwords(
                     let left = decoded.plane::<i32>(0);
                     let right = decoded.plane::<i32>(1);
                     for i in 0..n {
-                        // Truncate 32-bit to 16-bit (CD quality).
                         raw_i16.push((left[i] >> 16) as i16);
                         raw_i16.push((right[i] >> 16) as i16);
                     }
@@ -848,15 +835,26 @@ pub fn decode_track_to_dwords(
         decode_frame!();
     }
 
-    // Convert interleaved i16 pairs to u32 DWORDs.
-    // Each DWORD = [L_lo, L_hi, R_lo, R_hi] as little-endian u32.
+    Ok(raw_i16)
+}
+
+/// Decode a track to u32 DWORDs with margin, for AR CRC computation.
+///
+/// Wraps `decode_track_to_raw_i16` and converts to DWORDs with
+/// leading/trailing silence margin for offset scanning.
+pub fn decode_track_to_dwords(
+    path: &Path,
+    margin: usize,
+) -> Result<(Vec<u32>, usize), String> {
+    let raw_i16 = decode_track_to_raw_i16(path)?;
+
     let track_len = raw_i16.len() / 2; // number of stereo sample pairs
     let mut dwords = Vec::with_capacity(margin + track_len + margin);
 
     // Leading margin (silence)
     dwords.resize(margin, 0u32);
 
-    // Track data
+    // Track data: each DWORD = [L_lo, L_hi, R_lo, R_hi] as LE u32.
     for i in 0..track_len {
         let l = raw_i16[i * 2] as u16;
         let r = raw_i16[i * 2 + 1] as u16;
@@ -1219,4 +1217,319 @@ pub fn format_summary(result: &ArVerifyResult) -> String {
         "{}/{} verified, confidence {}, offset {}",
         verified, total, max_confidence, offset_str,
     )
+}
+
+// ── Offset correction ───────────────────────────────────────────────
+
+/// Check if all tracks in a result verified at the same non-zero offset.
+/// Returns `Some(offset)` if so, `None` otherwise.
+pub fn detect_uniform_offset(result: &ArVerifyResult) -> Option<i32> {
+    if result.tracks.is_empty() {
+        return None;
+    }
+    let mut common_offset: Option<i32> = None;
+    for t in &result.tracks {
+        if t.status != ArTrackStatus::Verified {
+            return None; // all must be verified
+        }
+        let off = t.offset?;
+        if off == 0 {
+            return None; // already at offset 0
+        }
+        if let Some(prev) = common_offset {
+            if prev != off {
+                return None; // mixed offsets
+            }
+        } else {
+            common_offset = Some(off);
+        }
+    }
+    common_offset
+}
+
+/// Apply offset correction to a set of tracks.
+///
+/// Decodes each track, shifts the audio by `-offset` samples (correcting
+/// the drive read offset), re-encodes to FLAC, preserves metadata, then
+/// verifies the corrected files at offset 0. Only replaces originals if
+/// ALL tracks verify at offset 0.
+///
+/// Both positive and negative offsets are supported. Returns a summary
+/// on success or an error message on failure.
+pub async fn apply_offset_correction(
+    paths: &[PathBuf],
+    offset: i32,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) -> Result<String, String> {
+    if offset == 0 {
+        return Err("Offset is already 0 — no correction needed".into());
+    }
+
+    let n = paths.len();
+    let abs_offset = offset.unsigned_abs() as usize;
+    let sample_shift = abs_offset * 2; // i16 values (stereo pairs)
+
+    // Create temp directory.
+    let tmp_dir = std::env::temp_dir().join(format!("tonepoet-offset-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+    // Run the pipeline; clean up temp dir regardless of outcome.
+    let result = offset_correction_inner(paths, offset, abs_offset, sample_shift, n, &tmp_dir, &tx).await;
+
+    // Always clean up temp dir.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    result
+}
+
+/// Inner pipeline for offset correction. Separated so the caller can
+/// always clean up the temp directory regardless of success or failure.
+async fn offset_correction_inner(
+    paths: &[PathBuf],
+    offset: i32,
+    abs_offset: usize,
+    sample_shift: usize,
+    n: usize,
+    tmp_dir: &Path,
+    tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) -> Result<String, String> {
+    use tokio::process::Command as TokioCommand;
+
+    // Copy log file(s) to temp dir for TOC lookup during verification.
+    let orig_dir = paths[0].parent().unwrap_or(Path::new("."));
+    if let Ok(entries) = std::fs::read_dir(orig_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("log")).unwrap_or(false) {
+                let dest = tmp_dir.join(p.file_name().unwrap());
+                let _ = std::fs::copy(&p, &dest);
+            }
+        }
+    }
+
+    // Decode all tracks first (needed for both shift directions).
+    let mut all_raw: Vec<Vec<i16>> = Vec::with_capacity(n);
+    for (i, path) in paths.iter().enumerate() {
+        let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
+            format!("Offset correction: decoding track {}/{}...", i + 1, n),
+        )).await;
+
+        let path_clone = path.clone();
+        let raw = tokio::task::spawn_blocking(move || {
+            decode_track_to_raw_i16(&path_clone)
+        }).await
+            .map_err(|e| format!("decode task failed: {}", e))?
+            .map_err(|e| format!("decode failed for {}: {}", path.display(), e))?;
+
+        if raw.len() < sample_shift {
+            return Err(format!(
+                "Track {} too short ({} samples) for offset correction of {} samples",
+                i + 1, raw.len() / 2, abs_offset,
+            ));
+        }
+        all_raw.push(raw);
+    }
+
+    // Build corrected tracks.
+    //
+    // Positive AR offset: audio is shifted LEFT (drive read too early).
+    //   Correction: shift RIGHT. Each track: prepend overflow from previous
+    //   (silence for track 1), drop last N samples (they flow to next track).
+    //
+    // Negative AR offset: audio is shifted RIGHT (drive read too late).
+    //   Correction: shift LEFT. Each track: drop first N samples (they
+    //   belong to previous track), append first N of next track (silence
+    //   for last track).
+    for (i, raw) in all_raw.iter().enumerate() {
+        let corrected = if offset > 0 {
+            // Shift RIGHT: prepend from previous, drop end.
+            let prefix = if i == 0 {
+                vec![0i16; sample_shift] // silence before disc
+            } else {
+                let prev = &all_raw[i - 1];
+                prev[prev.len() - sample_shift..].to_vec()
+            };
+            let mut c = Vec::with_capacity(raw.len());
+            c.extend_from_slice(&prefix);
+            c.extend_from_slice(&raw[..raw.len() - sample_shift]);
+            c
+        } else {
+            // Shift LEFT: drop start, append from next.
+            let suffix = if i + 1 < n {
+                all_raw[i + 1][..sample_shift].to_vec()
+            } else {
+                vec![0i16; sample_shift] // silence after disc
+            };
+            let mut c = Vec::with_capacity(raw.len());
+            c.extend_from_slice(&raw[sample_shift..]);
+            c.extend_from_slice(&suffix);
+            c
+        };
+
+        // Sanity check: corrected must have same length as original.
+        if corrected.len() != raw.len() {
+            return Err(format!(
+                "Internal error: corrected track {} has {} samples, expected {}",
+                i + 1, corrected.len() / 2, raw.len() / 2,
+            ));
+        }
+
+        // Encode corrected PCM to FLAC via ffmpeg.
+        let path = &paths[i];
+        let out_name = path.file_name().unwrap_or_default();
+        let out_path = tmp_dir.join(out_name);
+
+        let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
+            format!("Offset correction: encoding track {}/{}...", i + 1, n),
+        )).await;
+
+        // Convert i16 to raw bytes (little-endian, which i16 already is on LE platforms).
+        let raw_bytes: Vec<u8> = corrected.iter()
+            .flat_map(|&s| s.to_le_bytes())
+            .collect();
+
+        let mut child = TokioCommand::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "s16le", "-ar", "44100", "-ac", "2",
+                "-i", "pipe:0",
+                "-compression_level", "8",
+            ])
+            .arg(&out_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
+
+        // Write PCM to stdin.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(&raw_bytes).await
+                .map_err(|e| format!("Failed to write to ffmpeg stdin: {}", e))?;
+            drop(stdin); // close stdin to signal EOF
+        }
+
+        let output = child.wait_with_output().await
+            .map_err(|e| format!("ffmpeg failed: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("ffmpeg encode failed for track {}: {}", i + 1, stderr));
+        }
+
+        // Copy metadata from original to corrected.
+        copy_flac_metadata(path, &out_path).await?;
+    }
+
+    // 4. Verify corrected files at offset 0.
+    let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
+        "Offset correction: verifying corrected files...".into(),
+    )).await;
+
+    let corrected_paths: Vec<PathBuf> = paths.iter()
+        .map(|p| tmp_dir.join(p.file_name().unwrap_or_default()))
+        .collect();
+
+    let (sample_counts, sample_rate) = collect_sample_counts(&corrected_paths)?;
+    let verify_result = verify_album(&corrected_paths, &sample_counts, sample_rate, false).await;
+
+    // Check all tracks verified at offset 0.
+    for (i, t) in verify_result.tracks.iter().enumerate() {
+        if t.status != ArTrackStatus::Verified {
+            return Err(format!(
+                "Verification failed: track {} — {}. Originals unchanged.",
+                i + 1,
+                match &t.status {
+                    ArTrackStatus::Mismatch => "CRC mismatch at offset 0".to_string(),
+                    ArTrackStatus::NoDiscInDatabase => "disc not in database".to_string(),
+                    ArTrackStatus::Error(e) => format!("error: {}", e),
+                    ArTrackStatus::Verified => unreachable!(),
+                },
+            ));
+        }
+        if t.offset != Some(0) {
+            return Err(format!(
+                "Verification failed: track {} verified at offset {:+}, expected +0. Originals unchanged.",
+                i + 1, t.offset.unwrap_or(-999),
+            ));
+        }
+    }
+
+    // 5. All verified at offset 0 — replace originals.
+    let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
+        "Offset correction: replacing originals...".into(),
+    )).await;
+
+    for (orig, corrected) in paths.iter().zip(corrected_paths.iter()) {
+        std::fs::copy(corrected, orig)
+            .map_err(|e| format!("Failed to replace {}: {}", orig.display(), e))?;
+    }
+
+    Ok(format!(
+        "Offset corrected: {} tracks shifted by {:+} samples, all verified at offset +0",
+        n, -offset,
+    ))
+}
+
+/// Copy FLAC metadata (tags + embedded pictures) from source to destination.
+async fn copy_flac_metadata(src: &Path, dst: &Path) -> Result<(), String> {
+    use tokio::process::Command as TokioCommand;
+
+    // Export and import tags.
+    let export = TokioCommand::new("metaflac")
+        .arg("--export-tags-to=-")
+        .arg(src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("metaflac export failed: {}", e))?;
+
+    if export.status.success() && !export.stdout.is_empty() {
+        let import = TokioCommand::new("metaflac")
+            .arg("--import-tags-from=-")
+            .arg(dst)
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        if let Ok(mut child) = import {
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(&export.stdout).await;
+                drop(stdin);
+            }
+            let _ = child.wait().await;
+        }
+    }
+
+    // Export and import embedded picture (if any).
+    let tmp_pic = std::env::temp_dir().join(format!(
+        "tonepoet-pic-{}-{}.bin",
+        std::process::id(),
+        src.file_name().unwrap_or_default().to_string_lossy(),
+    ));
+    let pic_export = TokioCommand::new("metaflac")
+        .arg(format!("--export-picture-to={}", tmp_pic.display()))
+        .arg(src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+
+    if let Ok(status) = pic_export {
+        if status.success() && tmp_pic.exists() {
+            let _ = TokioCommand::new("metaflac")
+                .arg(format!("--import-picture-from={}", tmp_pic.display()))
+                .arg(dst)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            let _ = std::fs::remove_file(&tmp_pic);
+        }
+    }
+
+    Ok(())
 }

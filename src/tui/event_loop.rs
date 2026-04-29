@@ -725,6 +725,19 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
 
+        AppMessage::OffsetCorrectionComplete { result } => {
+            match result {
+                Ok(summary) => {
+                    app.set_status(summary);
+                    app.active_overlay = ActiveOverlay::None;
+                    // Refresh browse listing since files were replaced.
+                    app.browse.refresh();
+                }
+                Err(e) => {
+                    app.set_status(format!("Offset correction failed: {}", e));
+                }
+            }
+        }
         AppMessage::AccurateRipComplete { pages } => {
             // Aggregate summary across all discs.
             let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();

@@ -51,6 +51,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "search", "s", "rs", "rsearch",
     "context", "menu",
     "ar", "ar!", "accuraterip", "accuraterip!",
+    "ar-fix",
     "view", "cat", "edit-file", "ef",
 ];
 
@@ -274,6 +275,8 @@ pub enum Command {
     /// AccurateRip verification on selected audio files/folder.
     /// `force`: if true, full offset scan (-1200 to +1200).
     AccurateRip { force: bool },
+    /// Apply AccurateRip offset correction.
+    ArFix,
     /// View a text file in read-only mode.
     ViewFile(std::path::PathBuf),
     /// Edit a text file (not .log files).
@@ -404,6 +407,7 @@ pub fn parse_command(input: &str) -> Command {
         "context" | "menu" => Command::ContextMenu,
         "ar" | "accuraterip" => Command::AccurateRip { force: false },
         "ar!" | "accuraterip!" => Command::AccurateRip { force: true },
+        "ar-fix" => Command::ArFix,
         "view" | "cat" => Command::ViewFile(std::path::PathBuf::from(args)),
         "edit-file" | "ef" => Command::EditFile(std::path::PathBuf::from(args)),
         _ => Command::Unknown(input.to_string()),
@@ -1418,6 +1422,31 @@ pub fn execute_command(
                         }
                     });
                 }
+            }
+        }
+        Command::ArFix => {
+            // Check that the AR verification overlay is active.
+            if let ActiveOverlay::AccurateRipVerify(ref state) = app.active_overlay {
+                let page = &state.pages[state.active_page];
+                if let Some(offset) = super::accuraterip::detect_uniform_offset(&page.result) {
+                    let paths: Vec<std::path::PathBuf> = page.result.tracks.iter()
+                        .map(|t| t.path.clone())
+                        .collect();
+                    let n = paths.len();
+                    app.active_overlay = ActiveOverlay::Confirmation {
+                        message: format!(
+                            "Apply offset correction ({:+} samples) to {} tracks?\n\
+                             Files will be re-encoded to FLAC and verified at offset +0\n\
+                             before replacing originals.",
+                            offset, n,
+                        ),
+                        action: super::app::ConfirmAction::OffsetCorrection { paths, offset },
+                    };
+                } else {
+                    app.set_status("No uniform non-zero offset detected — correction not applicable");
+                }
+            } else {
+                app.set_status(":ar-fix requires the AccurateRip verification overlay to be open");
             }
         }
         Command::ViewFile(path) => {

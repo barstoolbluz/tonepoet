@@ -1235,6 +1235,11 @@ pub enum ConfirmAction {
     ClearQueue,
     /// Move the given paths to the system trash (XDG Trash / Finder Trash).
     TrashSelection(Vec<PathBuf>),
+    /// Apply AccurateRip offset correction to a set of tracks.
+    OffsetCorrection {
+        paths: Vec<PathBuf>,
+        offset: i32,
+    },
 }
 
 // ── Main application state ───────────────────────────────────────────
