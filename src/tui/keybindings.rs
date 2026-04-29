@@ -1826,6 +1826,42 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
+        ActiveOverlay::AccurateRipVerify { result, mut scroll } => {
+            // Total rendered lines: 3 (summary + disc ID + blank) + 2 per track (label + detail).
+            let total_lines = 3 + result.tracks.len() * 2;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = (scroll + 1).min(total_lines.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(15);
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                }
+                KeyCode::PageDown => {
+                    scroll = (scroll + 15).min(total_lines.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    scroll = 0;
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    scroll = total_lines.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                }
+                _ => {
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                }
+            }
+        }
         ActiveOverlay::None => {}
     }
 }
@@ -2905,6 +2941,20 @@ fn handle_generic_overlay_mouse(
                         ]);
                         (Rect::new(x, y, w, h), pills)
                     }
+                }
+                ActiveOverlay::AccurateRipVerify { ref result, .. } => {
+                    let w = ((area.0 as usize) * 70 / 100).max(50).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    let mut pills = vec![("Esc close", "esc")];
+                    let has_unmatched = result.tracks.iter().any(|t|
+                        t.status == super::accuraterip::ArTrackStatus::Mismatch
+                    );
+                    if result.was_common_scan && has_unmatched {
+                        pills.push((":ar! full scan", ":ar!"));
+                    }
+                    (Rect::new(x, y, w, h), pills)
                 }
                 ActiveOverlay::Confirmation { .. } => {
                     // Already has button_map support — skip.

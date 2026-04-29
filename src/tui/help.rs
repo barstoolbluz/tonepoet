@@ -86,6 +86,8 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     (":del", "Move selected to trash"),
                     (":pw", "Set archive password"),
                     (":analyze", "Audio analysis (DR, peak, clipping, etc.)"),
+                    (":ar", "AccurateRip verify (common offsets)"),
+                    (":ar!", "AccurateRip verify (full offset scan)"),
                 ],
             },
             HelpSection {

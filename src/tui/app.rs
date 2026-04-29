@@ -848,6 +848,11 @@ pub enum ActiveOverlay {
     /// GNUDB review overlay — editable preview of GNUDB tags before
     /// accepting into the metadata editor.
     GnudbReview(Box<GnudbReviewState>),
+    /// AccurateRip verification results overlay.
+    AccurateRipVerify {
+        result: Box<crate::tui::accuraterip::ArVerifyResult>,
+        scroll: usize,
+    },
 }
 
 /// State for the GNUDB review overlay.

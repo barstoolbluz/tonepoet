@@ -1,5 +1,6 @@
 //! TUI module for standalone tonepoet interface
 
+pub mod accuraterip;
 pub mod analyze;
 pub mod app;
 pub mod archive_listing;

@@ -100,6 +100,8 @@ pub enum ContextAction {
     QueryGnudb,
     /// Import tags from a CUE sheet (opens metadata editor + external editor).
     ImportCueFromBrowse,
+    /// AccurateRip verification (common offsets).
+    VerifyAccurateRip,
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -236,6 +238,7 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
         item("Verify", ContextAction::Verify),
+        item("AccurateRip verify", ContextAction::VerifyAccurateRip),
         item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
         item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
         separator(),
@@ -571,6 +574,10 @@ pub fn execute_context_action(
         }
         ContextAction::Verify => {
             let cmd = super::command::Command::Verify;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::VerifyAccurateRip => {
+            let cmd = super::command::Command::AccurateRip { force: false };
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::GenerateCueMultiFile => {

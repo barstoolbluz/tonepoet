@@ -720,6 +720,15 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             ));
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
+
+        AppMessage::AccurateRipComplete { result } => {
+            let summary = crate::tui::accuraterip::format_summary(&result);
+            app.set_status(format!("AccurateRip: {}", summary));
+            app.active_overlay = ActiveOverlay::AccurateRipVerify {
+                result,
+                scroll: 0,
+            };
+        }
     }
 }
 

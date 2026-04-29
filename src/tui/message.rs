@@ -116,4 +116,8 @@ pub enum AppMessage {
         /// Per-disc results: (disc_label, entry, file_paths).
         entries: Vec<(String, crate::tui::gnudb::GnudbEntry, Vec<std::path::PathBuf>)>,
     },
+    /// Result of an async AccurateRip verification.
+    AccurateRipComplete {
+        result: Box<crate::tui::accuraterip::ArVerifyResult>,
+    },
 }

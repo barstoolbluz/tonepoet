@@ -50,6 +50,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "fix-caps", "fixcaps",
     "search", "s", "rs", "rsearch",
     "context", "menu",
+    "ar", "ar!", "accuraterip", "accuraterip!",
 ];
 
 /// Commands that take a preset name as their argument. Used by the
@@ -269,6 +270,9 @@ pub enum Command {
     Password,
     /// Open the context menu at the current selection.
     ContextMenu,
+    /// AccurateRip verification on selected audio files/folder.
+    /// `force`: if true, full offset scan (-1200 to +1200).
+    AccurateRip { force: bool },
     Unknown(String),
 }
 
@@ -393,6 +397,8 @@ pub fn parse_command(input: &str) -> Command {
         "fix-caps" | "fixcaps" => Command::FixCaps,
         "password" | "pw" => Command::Password,
         "context" | "menu" => Command::ContextMenu,
+        "ar" | "accuraterip" => Command::AccurateRip { force: false },
+        "ar!" | "accuraterip!" => Command::AccurateRip { force: true },
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -1384,6 +1390,64 @@ pub fn execute_command(
                 app.set_status(format!("Capitalization applied ({} values changed)", changed));
             } else {
                 app.set_status(":fix-caps only works in the metadata editor");
+            }
+        }
+        Command::AccurateRip { force } => {
+            // Collect audio file paths from the current context.
+            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
+                        .collect()
+                }
+                AppScreen::Convert => app.convert.source.mode.all_paths(),
+                _ => Vec::new(),
+            };
+            super::probe::sort_paths_by_track(&mut paths);
+            if paths.is_empty() {
+                app.set_status("No audio files for AccurateRip verification");
+            } else {
+                let n = paths.len();
+                app.set_status(format!("AccurateRip: verifying {} tracks...", n));
+
+                // Collect exact sample counts (blocking probe, but fast).
+                let sample_data = super::accuraterip::collect_sample_counts(&paths);
+                match sample_data {
+                    Err(e) => {
+                        app.set_status(format!("AccurateRip: {}", e));
+                    }
+                    Ok((sample_counts, sample_rate)) => {
+                        // Log disc ID for diagnostics.
+                        let disc_id = super::accuraterip::compute_ar_disc_id(
+                            &sample_counts, sample_rate,
+                        );
+                        let url = super::accuraterip::ar_url(&disc_id);
+                        log::info!(
+                            "AccurateRip: {} tracks, id1={:08x} id2={:08x} freedb={:08x} url={}",
+                            disc_id.track_count, disc_id.id1, disc_id.id2, disc_id.freedb_id, url,
+                        );
+                        app.set_status(format!(
+                            "AccurateRip: verifying {} tracks (id1={:08x})...",
+                            n, disc_id.id1,
+                        ));
+
+                        let full_scan = force;
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let result = super::accuraterip::verify_album(
+                                &paths, &sample_counts, sample_rate, full_scan,
+                            ).await;
+                            let _ = tx.send(AppMessage::AccurateRipComplete {
+                                result: Box::new(result),
+                            }).await;
+                        });
+                    }
+                }
             }
         }
         Command::ContextMenu => {

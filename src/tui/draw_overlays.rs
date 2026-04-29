@@ -129,6 +129,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::GnudbReview(ref state) => {
             draw_gnudb_review(f, state);
         }
+        ActiveOverlay::AccurateRipVerify { ref result, scroll } => {
+            draw_accuraterip_verify(f, result, scroll);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -2361,6 +2364,143 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
         ]);
         Line::from(pills)
     };
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
+}
+
+// ── AccurateRip verification results overlay ────────────────────────
+
+fn draw_accuraterip_verify(
+    f: &mut Frame,
+    result: &super::accuraterip::ArVerifyResult,
+    scroll: usize,
+) {
+    use super::accuraterip::ArTrackStatus;
+
+    let area = f.size();
+    let w = (area.width * 70 / 100).max(50).min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let n_tracks = result.tracks.len();
+    let verified = result.tracks.iter()
+        .filter(|t| t.status == ArTrackStatus::Verified)
+        .count();
+    let border_color = if verified == n_tracks && n_tracks > 0 {
+        theme::GREEN
+    } else if verified > 0 {
+        theme::AMBER
+    } else {
+        theme::RED
+    };
+
+    let title = format!(" AccurateRip Verification — {} tracks ", n_tracks);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 || result.tracks.is_empty() {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Summary line.
+    let summary = super::accuraterip::format_summary(result);
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(summary, Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD)),
+    ]));
+    // Disc ID for diagnostics.
+    lines.push(Line::from(vec![
+        Span::styled("  Disc ID: ", Style::default().fg(theme::TEXT_DIM)),
+        Span::styled(&result.disc_id_str, Style::default().fg(theme::TEXT_DIM)),
+    ]));
+    lines.push(Line::from(""));
+
+    // Per-track results.
+    for t in &result.tracks {
+        let name = t.path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| t.path.display().to_string());
+
+        let (icon, icon_color, detail) = match &t.status {
+            ArTrackStatus::Verified => {
+                let conf = t.confidence.unwrap_or(0);
+                let off = t.offset.unwrap_or(0);
+                let offset_str = if off >= 0 { format!("+{}", off) } else { format!("{}", off) };
+                (
+                    " ✓ ",
+                    theme::GREEN,
+                    format!("AR confidence {} (offset {})", conf, offset_str),
+                )
+            }
+            ArTrackStatus::Mismatch => (
+                " ✗ ",
+                theme::RED,
+                "not in database".to_string(),
+            ),
+            ArTrackStatus::NoDiscInDatabase => (
+                " ? ",
+                theme::AMBER,
+                "disc not in database".to_string(),
+            ),
+            ArTrackStatus::Error(e) => (
+                " ! ",
+                theme::RED,
+                format!("error: {}", e),
+            ),
+        };
+
+        // Track number + filename.
+        let track_label = format!("{:02} - {}", t.track_number, name);
+        lines.push(Line::from(vec![
+            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(track_label, Style::default().fg(theme::TEXT_BRIGHT)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("     ", Style::default()),
+            Span::styled(detail, Style::default().fg(theme::TEXT_DIM)),
+        ]));
+    }
+
+    let total = lines.len();
+    let visible = chunks[0].height as usize;
+    let scroll = scroll.min(total.saturating_sub(visible));
+
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    // Footer pills.
+    let mut pills = vec![
+        footer_pill("Esc close", theme::GREEN),
+    ];
+    // Show "full scan" pill only if this was a common-offsets scan AND
+    // there are unmatched tracks.
+    let has_unmatched = result.tracks.iter().any(|t| t.status == ArTrackStatus::Mismatch);
+    if result.was_common_scan && has_unmatched {
+        pills.push(pill_gap());
+        pills.push(footer_pill(":ar! full scan", theme::BLUE));
+    }
+
+    let footer = Line::from(pills);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
