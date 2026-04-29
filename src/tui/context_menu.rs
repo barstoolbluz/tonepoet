@@ -102,6 +102,10 @@ pub enum ContextAction {
     ImportCueFromBrowse,
     /// AccurateRip verification (common offsets).
     VerifyAccurateRip,
+    /// View a text file in read-only mode.
+    ViewFile(PathBuf),
+    /// Edit a text file (not available for .log files).
+    EditFile(PathBuf),
     /// Toggle hidden-file visibility.
     ToggleHidden,
     /// Cycle the sort field.
@@ -335,6 +339,13 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Deselect", ContextAction::Deselect));
         }
         EntryKind::OtherFile => {
+            if super::browse::is_viewable_text_file(&entry.path) {
+                items.push(item("View", ContextAction::ViewFile(entry.path.clone())));
+                if super::browse::is_editable_text_file(&entry.path) {
+                    items.push(item("Edit", ContextAction::EditFile(entry.path.clone())));
+                }
+                items.push(separator());
+            }
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
             items.push(item("Select Inverse", ContextAction::SelectInverse));
@@ -578,6 +589,14 @@ pub fn execute_context_action(
         }
         ContextAction::VerifyAccurateRip => {
             let cmd = super::command::Command::AccurateRip { force: false };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::ViewFile(path) => {
+            let cmd = super::command::Command::ViewFile(path);
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::EditFile(path) => {
+            let cmd = super::command::Command::EditFile(path);
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::GenerateCueMultiFile => {

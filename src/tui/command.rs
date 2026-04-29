@@ -51,6 +51,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "search", "s", "rs", "rsearch",
     "context", "menu",
     "ar", "ar!", "accuraterip", "accuraterip!",
+    "view", "cat", "edit-file", "ef",
 ];
 
 /// Commands that take a preset name as their argument. Used by the
@@ -273,6 +274,10 @@ pub enum Command {
     /// AccurateRip verification on selected audio files/folder.
     /// `force`: if true, full offset scan (-1200 to +1200).
     AccurateRip { force: bool },
+    /// View a text file in read-only mode.
+    ViewFile(std::path::PathBuf),
+    /// Edit a text file (not .log files).
+    EditFile(std::path::PathBuf),
     Unknown(String),
 }
 
@@ -399,6 +404,8 @@ pub fn parse_command(input: &str) -> Command {
         "context" | "menu" => Command::ContextMenu,
         "ar" | "accuraterip" => Command::AccurateRip { force: false },
         "ar!" | "accuraterip!" => Command::AccurateRip { force: true },
+        "view" | "cat" => Command::ViewFile(std::path::PathBuf::from(args)),
+        "edit-file" | "ef" => Command::EditFile(std::path::PathBuf::from(args)),
         _ => Command::Unknown(input.to_string()),
     }
 }
@@ -1411,6 +1418,55 @@ pub fn execute_command(
                         }
                     });
                 }
+            }
+        }
+        Command::ViewFile(path) => {
+            // Resolve path: if empty, use current browse selection.
+            let target = if path.as_os_str().is_empty() {
+                if app.current_screen != AppScreen::Browse {
+                    app.set_status(":view only works on the browse screen");
+                    return;
+                }
+                let entry = app.browse.selected_entry();
+                match entry {
+                    Some(e) if super::browse::is_viewable_text_file(&e.path) => e.path.clone(),
+                    Some(_) => { app.set_status("Selected file is not a viewable text file"); return; }
+                    None => { app.set_status("No file selected"); return; }
+                }
+            } else {
+                path
+            };
+            match super::external_editor::open_in_viewer(&target) {
+                Ok(_) => { app.force_redraw = true; }
+                Err(e) => app.set_status(format!("View error: {}", e)),
+            }
+        }
+        Command::EditFile(path) => {
+            let target = if path.as_os_str().is_empty() {
+                if app.current_screen != AppScreen::Browse {
+                    app.set_status(":edit-file only works on the browse screen");
+                    return;
+                }
+                let entry = app.browse.selected_entry();
+                match entry {
+                    Some(e) if super::browse::is_editable_text_file(&e.path) => e.path.clone(),
+                    Some(e) if super::browse::is_viewable_text_file(&e.path) => {
+                        app.set_status("Cannot edit log files — use :view instead");
+                        return;
+                    }
+                    Some(_) => { app.set_status("Selected file is not an editable text file"); return; }
+                    None => { app.set_status("No file selected"); return; }
+                }
+            } else {
+                if !super::browse::is_editable_text_file(&path) && super::browse::is_viewable_text_file(&path) {
+                    app.set_status("Cannot edit log files — use :view instead");
+                    return;
+                }
+                path
+            };
+            match super::external_editor::open_in_editor(&target) {
+                Ok(_) => { app.force_redraw = true; }
+                Err(e) => app.set_status(format!("Edit error: {}", e)),
             }
         }
         Command::ContextMenu => {

@@ -16,6 +16,8 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
         crossterm::cursor::Show,
         crossterm::terminal::LeaveAlternateScreen,
     );
@@ -30,6 +32,8 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
         crossterm::cursor::Hide,
     );
     let _ = crossterm::terminal::enable_raw_mode();
@@ -43,6 +47,85 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
     );
 
     Ok(status.success())
+}
+
+/// Open a file in read-only view mode.
+///
+/// Same TUI suspend/restore as `open_in_editor`, but passes a
+/// read-only flag to the editor (vim: `-R`, nano: `-v`). Falls back
+/// to `less` if no editor is found.
+pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
+    let editor = detect_editor_for_view()?;
+
+    // Determine read-only flag based on editor.
+    let editor_base = std::path::Path::new(&editor)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&editor)
+        .to_lowercase();
+    let readonly_flag: Option<&str> = match editor_base.as_str() {
+        "vim" | "vi" | "nvim" => Some("-R"),
+        "nano" => Some("-v"),
+        "less" | "more" | "bat" | "cat" => None, // inherently read-only
+        _ => Some("-R"), // best guess (vim-compatible)
+    };
+
+    // Suspend TUI.
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show,
+        crossterm::terminal::LeaveAlternateScreen,
+    );
+
+    // Build and run command.
+    let mut cmd = Command::new(&editor);
+    if let Some(flag) = readonly_flag {
+        cmd.arg(flag);
+    }
+    cmd.arg(path);
+    let status = cmd.status()
+        .map_err(|e| format!("failed to run {}: {}", editor, e))?;
+
+    // Restore TUI.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
+        crossterm::cursor::Hide,
+    );
+    let _ = crossterm::terminal::enable_raw_mode();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+    );
+
+    Ok(status.success())
+}
+
+/// Detect editor for viewing. Prefers $EDITOR/$VISUAL, falls back to
+/// `less` (better for read-only viewing than nano/vim).
+fn detect_editor_for_view() -> Result<String, String> {
+    // Check environment variables first.
+    for var in &["EDITOR", "VISUAL"] {
+        if let Ok(editor) = std::env::var(var) {
+            if !editor.is_empty() {
+                return Ok(editor);
+            }
+        }
+    }
+
+    // For viewing, prefer `less` over editors.
+    for candidate in &["less", "nano", "vim", "vi", "more"] {
+        if which(candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err("no viewer found — set $EDITOR".to_string())
 }
 
 /// Detect the user's preferred editor from environment variables,

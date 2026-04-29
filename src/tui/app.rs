@@ -1319,6 +1319,10 @@ pub struct AppState {
     pub status_message: Option<(String, std::time::Instant)>,
     pub processing_active: bool,
     pub should_quit: bool,
+    /// Set after returning from an external editor to force ratatui
+    /// to repaint the entire screen (diff-based rendering would
+    /// otherwise leave stale regions blank).
+    pub force_redraw: bool,
 
     /// Last browse-entry click: (entry_path, click_time). Used for double-click detection.
     /// Path-based rather than index-based so directory refreshes / sort changes between
@@ -1434,6 +1438,7 @@ impl AppState {
             status_message: None,
             processing_active: false,
             should_quit: false,
+            force_redraw: false,
             last_browse_click: None,
             pending_browse_rename: None,
             recent,

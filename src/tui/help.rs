@@ -88,6 +88,8 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     (":analyze", "Audio analysis (DR, peak, clipping, etc.)"),
                     (":ar", "AccurateRip verify (common offsets)"),
                     (":ar!", "AccurateRip verify (full offset scan)"),
+                    (":view", "View text file (read-only)"),
+                    (":edit-file", "Edit text file (not .log)"),
                 ],
             },
             HelpSection {

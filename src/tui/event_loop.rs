@@ -39,6 +39,10 @@ pub async fn run_app(
         }
 
         // 2. Render
+        if app.force_redraw {
+            terminal.clear()?;
+            app.force_redraw = false;
+        }
         terminal.draw(|f| draw_ui(f, app))?;
 
         // 3. Check quit

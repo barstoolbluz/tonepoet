@@ -2173,6 +2173,33 @@ pub(super) fn classify_file(path: &Path) -> EntryKind {
     }
 }
 
+/// Text file extensions that can be viewed in the built-in viewer.
+const VIEWABLE_TEXT_EXTENSIONS: &[&str] = &[
+    "cue", "log", "nfo", "txt", "json", "html", "htm",
+    "xml", "md", "yaml", "yml", "toml", "ini", "cfg", "conf",
+    "m3u", "m3u8",
+];
+
+/// Check if a file is a viewable text file (by extension).
+pub fn is_viewable_text_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| VIEWABLE_TEXT_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Check if a file is an editable text file. Same as viewable but
+/// excludes `.log` files (rip integrity records should not be modified).
+pub fn is_editable_text_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let lower = e.to_lowercase();
+            lower != "log" && VIEWABLE_TEXT_EXTENSIONS.contains(&lower.as_str())
+        })
+        .unwrap_or(false)
+}
+
 /// Derive a short display label for an archive from its extension.
 fn archive_label(path: &Path) -> String {
     let name = path
