@@ -414,7 +414,7 @@ fn parse_eac_log_toc(path: &Path) -> Option<Vec<u32>> {
 /// Only works for single-image CUE sheets (one FILE with multiple TRACKs).
 /// Returns sector offsets WITH 150-frame lead-in.
 fn parse_cue_index_offsets(path: &Path) -> Option<Vec<u32>> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = String::from_utf8_lossy(&std::fs::read(path).ok()?).into_owned();
     let mut offsets: Vec<u32> = Vec::new();
     let mut file_count = 0;
     let mut audio_file: Option<String> = None;
