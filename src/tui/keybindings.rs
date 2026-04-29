@@ -3200,7 +3200,8 @@ fn handle_generic_overlay_mouse(
                 let content_y = popup.y + 1;
                 if state.pages.len() > 1 && my >= content_y && my < footer_y {
                     let visual_row = (my - content_y) as usize;
-                    if visual_row == 0 {
+                    let content_row = visual_row + state.scroll;
+                    if content_row == 0 {
                         // Click on disc pill row — determine which pill.
                         let inner_x_pos = popup.x + 1;
                         let click_x = mx.saturating_sub(inner_x_pos) as usize;
