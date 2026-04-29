@@ -417,6 +417,7 @@ fn parse_cue_index_offsets(path: &Path) -> Option<Vec<u32>> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut offsets: Vec<u32> = Vec::new();
     let mut file_count = 0;
+    let mut audio_file: Option<String> = None;
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -426,6 +427,11 @@ fn parse_cue_index_offsets(path: &Path) -> Option<Vec<u32>> {
             if file_count > 1 {
                 // Multi-file CUE — INDEX timestamps are per-file, not useful.
                 return None;
+            }
+            // Extract the filename: FILE "name.flac" WAVE
+            // or FILE name.flac WAVE
+            if let Some(name) = extract_cue_filename(trimmed) {
+                audio_file = Some(name);
             }
         }
 
@@ -440,11 +446,41 @@ fn parse_cue_index_offsets(path: &Path) -> Option<Vec<u32>> {
         }
     }
 
-    // We need the leadout too, which CUE sheets don't provide.
-    // Without it, we can't compute the disc ID.
-    // Return None — CUE alone isn't sufficient without knowing the
-    // total disc length.
-    None
+    if offsets.is_empty() {
+        return None;
+    }
+
+    // Derive the leadout from the referenced audio file's total duration.
+    let cue_dir = path.parent()?;
+    let audio_path = cue_dir.join(audio_file?);
+    if !audio_path.exists() {
+        return None;
+    }
+    let (samples, sample_rate) = probe_sample_count(&audio_path).ok()?;
+    let samples_per_frame = (sample_rate / 75) as u64;
+    let total_frames = (samples / samples_per_frame) as u32;
+    // Leadout = total frames + 150-frame lead-in.
+    offsets.push(total_frames + 150);
+
+    Some(offsets)
+}
+
+/// Extract the filename from a CUE FILE directive.
+///
+/// Handles both quoted (`FILE "name.flac" WAVE`) and unquoted
+/// (`FILE name.flac WAVE`) forms.
+fn extract_cue_filename(line: &str) -> Option<String> {
+    let after_file = line.strip_prefix("FILE ")?.trim();
+    if after_file.starts_with('"') {
+        // Quoted: find closing quote.
+        let end = after_file[1..].find('"')?;
+        Some(after_file[1..1 + end].to_string())
+    } else {
+        // Unquoted: take everything up to the last whitespace-separated token
+        // (which is the format type like WAVE, BINARY, etc.).
+        let last_space = after_file.rfind(' ')?;
+        Some(after_file[..last_space].trim().to_string())
+    }
 }
 
 /// Parse a CUE "MM:SS:FF" timestamp to a frame count.
