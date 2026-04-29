@@ -52,7 +52,8 @@ pub fn compute_disc_id(durations_secs: &[f64]) -> DiscIdResult {
         frame += (dur * 75.0).round() as u32;
     }
     let leadout = frame;
-    let total_secs = (leadout - offsets[0]) / 75;
+    // CDDB standard: divide THEN subtract (integer truncation matters).
+    let total_secs = leadout / 75 - offsets[0] / 75;
 
     // Checksum: sum of digit-sums of each track's start time in seconds.
     let mut checksum = 0u32;

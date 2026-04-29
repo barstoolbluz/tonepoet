@@ -173,7 +173,10 @@ fn compute_freedb_id(offsets: &[u32], n_tracks: usize) -> u32 {
     // CDDB uses offsets WITH 150-frame lead-in.
     let toc_offsets: Vec<u32> = offsets.iter().map(|&o| o + 150).collect();
     let leadout_toc = *toc_offsets.last().unwrap();
-    let total_secs = (leadout_toc - toc_offsets[0]) / 75;
+
+    // CDDB standard: divide THEN subtract, not subtract then divide.
+    // Integer truncation makes these differ for some discs.
+    let total_secs = leadout_toc / 75 - toc_offsets[0] / 75;
 
     let mut checksum = 0u32;
     for &off in &toc_offsets[..n_tracks] {
@@ -925,11 +928,38 @@ pub async fn verify_album(
     // sample counts (works when the pre-gap is included in track 1).
     let dir = paths[0].parent().unwrap_or(Path::new("."));
     log::info!("AccurateRip: looking for TOC in {}", dir.display());
-    let disc_id = if let Some(toc_sectors) = find_toc_offsets(dir) {
+    let toc = find_toc_offsets(dir);
+
+    // Track 1 pre-gap: number of extra frames at the start of track 1's
+    // file when the rip includes the pre-gap (EAC "Gap appended to
+    // previous track"). This is the LBA offset of track 1's INDEX 01.
+    // The pre-gap audio must be trimmed before CRC computation.
+    //
+    // We also compute the expected track 1 duration from the TOC so we
+    // can detect whether the file actually includes the pre-gap or not.
+    let track1_pregap_frames: usize;
+    let track1_toc_duration_frames: usize;
+    if let Some(ref sectors) = toc {
+        // TOC sectors include 150-frame lead-in. LBA = sector - 150.
+        let lba = sectors[0].saturating_sub(150) as usize;
+        track1_pregap_frames = lba;
+        // Track 1 TOC duration = track 2 start - track 1 start (in sectors).
+        if sectors.len() >= 2 {
+            let t1_start = sectors[0].saturating_sub(150) as usize;
+            let t2_start = sectors[1].saturating_sub(150) as usize;
+            track1_toc_duration_frames = t2_start - t1_start;
+        } else {
+            track1_toc_duration_frames = 0;
+        }
+    } else {
+        track1_pregap_frames = 0;
+        track1_toc_duration_frames = 0;
+    };
+
+    let disc_id = if let Some(ref toc_sectors) = toc {
         log::info!("AccurateRip: found TOC with {} entries: {:?}", toc_sectors.len(), toc_sectors);
-        // TOC sectors include the 150-frame lead-in. AR uses offsets without it.
         if toc_sectors.len() == n + 1 {
-            compute_ar_disc_id_from_toc(&toc_sectors)
+            compute_ar_disc_id_from_toc(toc_sectors)
         } else {
             log::warn!(
                 "AccurateRip: TOC has {} entries but expected {} (tracks+leadout), falling back to sample counts",
@@ -1044,16 +1074,40 @@ pub async fn verify_album(
                 });
             }
             Ok((full_dwords, track_len)) => {
+                // For track 1: if the file includes a pre-gap (extra
+                // frames at the start), trim them. The pre-gap samples
+                // are not part of the AR CRC. We detect this by comparing
+                // the file's decoded length against the TOC-derived track
+                // duration. Only trim if the file is longer than expected.
+                let (eff_margin, eff_track_len) = if is_first && track1_pregap_frames > 0 && track1_toc_duration_frames > 0 {
+                    let pregap_dwords = track1_pregap_frames * SAMPLES_PER_SECTOR;
+                    let toc_dwords = track1_toc_duration_frames * SAMPLES_PER_SECTOR;
+                    let file_frames = track_len / SAMPLES_PER_SECTOR;
+                    if file_frames > track1_toc_duration_frames {
+                        // File includes pre-gap — trim it.
+                        log::info!(
+                            "AccurateRip: track 1 has {} frames, TOC says {}, trimming {} pre-gap frames",
+                            file_frames, track1_toc_duration_frames, track1_pregap_frames,
+                        );
+                        (margin + pregap_dwords, toc_dwords)
+                    } else {
+                        // File matches or is shorter than TOC — no pre-gap to trim.
+                        (margin, track_len)
+                    }
+                } else {
+                    (margin, track_len)
+                };
+
                 // Compute CRCs at offset 0 for display.
                 let (crc_v1_0, crc_v2_0) = compute_ar_crcs(
-                    &full_dwords[margin..margin + track_len],
+                    &full_dwords[eff_margin..eff_margin + eff_track_len],
                     is_first,
                     is_last,
                 );
 
                 // Try matching at all offsets.
                 match try_offsets(
-                    &full_dwords, track_len, margin,
+                    &full_dwords, eff_track_len, eff_margin,
                     is_first, is_last,
                     &pressings, i,
                     &offsets,
