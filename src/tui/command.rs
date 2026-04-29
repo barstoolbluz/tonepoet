@@ -1214,140 +1214,78 @@ pub fn execute_command(
             }
         }
         Command::ImportCue => {
-            // Restore parked metadata editor so we can read its state.
-            if let Some(parked) = app.pending_metadata_editor.take() {
-                app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+            // Collect audio paths from current browse selection.
+            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            super::probe::sort_paths_by_track(&mut paths);
+
+            if paths.is_empty() {
+                app.set_status("No audio files for CUE import");
+                return;
             }
-            if let ActiveOverlay::MetadataEditor(ref state) = app.active_overlay {
-                let dir = match state.paths.first().and_then(|p| p.parent()) {
-                    Some(d) => d.to_path_buf(),
-                    None => {
-                        app.set_status("No file path to search for CUE");
-                        return;
-                    }
-                };
 
-                // Find .cue file in the directory.
-                let cue_path = match std::fs::read_dir(&dir) {
-                    Ok(entries) => {
-                        let mut cues: Vec<std::path::PathBuf> = entries
-                            .filter_map(|e| e.ok())
-                            .map(|e| e.path())
-                            .filter(|p| {
-                                p.extension()
-                                    .map(|e| e.to_ascii_lowercase() == "cue")
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-                        cues.sort();
-                        cues.into_iter().next()
-                    }
-                    Err(_) => None,
-                };
+            let groups = super::gnudb::group_by_disc(&paths);
 
-                let cue_path = match cue_path {
+            if groups.len() <= 1 {
+                // Single disc.
+                let (_, group_paths) = groups.into_iter().next().unwrap();
+                let dir = group_paths[0].parent().unwrap_or(std::path::Path::new("."));
+                let cue_path = match super::gnudb::find_cue_in_dir(dir) {
                     Some(p) => p,
                     None => {
                         app.set_status("No CUE file found in directory");
                         return;
                     }
                 };
-
-                // Copy CUE to temp file for editing.
-                let temp_dir = std::env::temp_dir();
-                let temp_name = format!("tonepoet-cue-{}.cue",
-                    std::process::id());
-                let temp_path = temp_dir.join(temp_name);
-                if let Err(e) = std::fs::copy(&cue_path, &temp_path) {
-                    app.set_status(format!("Failed to copy CUE: {}", e));
+                let sheet = match super::cue_parser::parse_cue_file(&cue_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        app.set_status(format!("CUE parse error: {}", e));
+                        return;
+                    }
+                };
+                let n_tracks = sheet.tracks.len();
+                let review = super::gnudb::build_review_state_from_cue(&sheet, group_paths);
+                app.set_status(format!(
+                    "CUE import: {} tracks from {}",
+                    n_tracks,
+                    cue_path.file_name().unwrap_or_default().to_string_lossy(),
+                ));
+                app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
+            } else {
+                // Multi-disc: find CUE in each subdirectory.
+                let mut entries = Vec::new();
+                for (label, group_paths) in groups {
+                    let dir = group_paths[0].parent().unwrap_or(std::path::Path::new("."));
+                    if let Some(cue_path) = super::gnudb::find_cue_in_dir(dir) {
+                        if let Ok(sheet) = super::cue_parser::parse_cue_file(&cue_path) {
+                            entries.push((label, sheet, group_paths));
+                        }
+                    }
+                }
+                if entries.is_empty() {
+                    app.set_status("No CUE files found in any disc directory");
                     return;
                 }
-
-                // Park the metadata editor state for later.
-                if let ActiveOverlay::MetadataEditor(state) =
-                    std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
-                {
-                    app.pending_metadata_editor = Some(state);
-                }
-
-                // Open external editor (blocks, TUI suspended).
-                let editor_ok = super::external_editor::open_in_editor(&temp_path);
-
-                match editor_ok {
-                    Ok(true) => {
-                        // Parse the edited CUE.
-                        let sheet = match super::cue_parser::parse_cue_file(&temp_path) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                let _ = std::fs::remove_file(&temp_path);
-                                if let Some(parked) = app.pending_metadata_editor.take() {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(parked);
-                                }
-                                app.set_status(format!("CUE parse error: {}", e));
-                                return;
-                            }
-                        };
-
-                        // Determine which field to scope the import to.
-                        let field_name: Option<String> = app.pending_metadata_editor.as_ref()
-                            .and_then(|s| s.entries.get(s.cursor))
-                            .map(|e| e.display_key.clone());
-
-                        if let Some(ref f) = field_name {
-                            if !is_cue_importable(f) {
-                                let _ = std::fs::remove_file(&temp_path);
-                                if let Some(parked) = app.pending_metadata_editor.take() {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(parked);
-                                }
-                                app.set_status(format!("CUE has no data for {}", f));
-                                return;
-                            }
-                        }
-
-                        // Build the diff, scoped to the focused field.
-                        let changes = if let Some(ref state) = app.pending_metadata_editor {
-                            build_cue_diff(state, &sheet, field_name.as_deref())
-                        } else {
-                            Vec::new()
-                        };
-
-                        if changes.is_empty() {
-                            // No differences — restore editor.
-                            if let Some(parked) = app.pending_metadata_editor.take() {
-                                app.active_overlay = ActiveOverlay::MetadataEditor(parked);
-                            }
-                            app.set_status("No changes from CUE import");
-                        } else {
-                            let n = changes.len();
-                            // Show review overlay (editor stays parked).
-                            app.active_overlay = ActiveOverlay::CueImportReview {
-                                changes,
-                                scroll: 0,
-                            };
-                            app.set_status(format!(
-                                "CUE import: {} change{} to review",
-                                n, if n == 1 { "" } else { "s" },
-                            ));
-                        }
-                    }
-                    Ok(false) => {
-                        // Editor exited with error — cancel.
-                        if let Some(parked) = app.pending_metadata_editor.take() {
-                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
-                        }
-                        app.set_status("CUE import cancelled");
-                    }
-                    Err(e) => {
-                        if let Some(parked) = app.pending_metadata_editor.take() {
-                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
-                        }
-                        app.set_status(format!("Editor error: {}", e));
-                    }
-                }
-
-                let _ = std::fs::remove_file(&temp_path);
-            } else {
-                app.set_status(":import-cue only works in the metadata editor");
+                let n_discs = entries.len();
+                let n_tracks: usize = entries.iter().map(|(_, s, _)| s.tracks.len()).sum();
+                let review = super::gnudb::build_multi_disc_review_state_from_cue(&entries);
+                app.set_status(format!(
+                    "CUE import: {} disc{}, {} tracks",
+                    n_discs, if n_discs == 1 { "" } else { "s" }, n_tracks,
+                ));
+                app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
             }
         }
         Command::FixCaps => {
@@ -2278,6 +2216,7 @@ pub fn is_cue_importable(field: &str) -> bool {
         || upper == "PERFORMER"
 }
 
+#[allow(dead_code)] // Legacy CUE diff flow; will be removed in cleanup.
 fn build_cue_diff(
     state: &super::app::MetadataEditorState,
     sheet: &super::cue_parser::CueSheet,

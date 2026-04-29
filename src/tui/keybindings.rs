@@ -1707,7 +1707,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                                 .map(|t| t.artist.as_str())
                                 .unwrap_or("?");
                             app.set_status(format!(
-                                "GNUDB tags loaded — {} / {} ({} disc{})",
+                                "Tags loaded — {} / {} ({} disc{})",
                                 artist, first_page.album,
                                 state.pages.len(),
                                 if state.pages.len() == 1 { "" } else { "s" },

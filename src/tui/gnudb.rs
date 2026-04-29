@@ -589,6 +589,114 @@ pub fn group_by_disc(paths: &[PathBuf]) -> Vec<(String, Vec<PathBuf>)> {
     result.into_iter().map(|(_, label, files)| (label, files)).collect()
 }
 
+// ── CUE → review state builders ─────────────────────────────────────
+
+/// Build a GnudbReviewState from a parsed CUE sheet.
+pub fn build_review_state_from_cue(
+    sheet: &super::cue_parser::CueSheet,
+    paths: Vec<PathBuf>,
+) -> super::app::GnudbReviewState {
+    use super::app::*;
+
+    let album_performer = sheet.performer.clone().unwrap_or_default();
+
+    let mut tracks = Vec::new();
+    for (i, ct) in sheet.tracks.iter().enumerate() {
+        tracks.push(GnudbReviewTrack {
+            title: ct.title.clone().unwrap_or_default(),
+            artist: ct.performer.clone().unwrap_or_else(|| album_performer.clone()),
+            track_number: ct.number,
+            file_index: i,
+        });
+    }
+
+    let rows = build_page_rows(&tracks);
+    let pages = vec![GnudbReviewPage {
+        label: String::new(),
+        album: sheet.title.clone().unwrap_or_default(),
+        year: sheet.date.clone().unwrap_or_default(),
+        genre: sheet.genre.clone().unwrap_or_default(),
+        tracks,
+        rows,
+    }];
+
+    GnudbReviewState {
+        pages,
+        active_page: 0,
+        cursor: 0,
+        scroll: 0,
+        edit_input: None,
+        last_click: None,
+        origin_matches: None,
+        paths,
+    }
+}
+
+/// Build a GnudbReviewState from multiple disc CUE sheets.
+pub fn build_multi_disc_review_state_from_cue(
+    entries: &[(String, super::cue_parser::CueSheet, Vec<PathBuf>)],
+) -> super::app::GnudbReviewState {
+    use super::app::*;
+
+    let mut all_paths = Vec::new();
+    let mut pages = Vec::new();
+
+    for (label, sheet, group_paths) in entries {
+        let base_file_idx = all_paths.len();
+        all_paths.extend(group_paths.iter().cloned());
+
+        let album_performer = sheet.performer.clone().unwrap_or_default();
+        let mut tracks = Vec::new();
+        for (i, ct) in sheet.tracks.iter().enumerate() {
+            tracks.push(GnudbReviewTrack {
+                title: ct.title.clone().unwrap_or_default(),
+                artist: ct.performer.clone().unwrap_or_else(|| album_performer.clone()),
+                track_number: ct.number,
+                file_index: base_file_idx + i,
+            });
+        }
+
+        let rows = build_page_rows(&tracks);
+        pages.push(GnudbReviewPage {
+            label: label.clone(),
+            album: sheet.title.clone().unwrap_or_default(),
+            year: sheet.date.clone().unwrap_or_default(),
+            genre: sheet.genre.clone().unwrap_or_default(),
+            tracks,
+            rows,
+        });
+    }
+
+    GnudbReviewState {
+        pages,
+        active_page: 0,
+        cursor: 0,
+        scroll: 0,
+        edit_input: None,
+        last_click: None,
+        origin_matches: None,
+        paths: all_paths,
+    }
+}
+
+/// Find a .cue file in a directory. Returns the first one found
+/// (sorted alphabetically for determinism).
+pub fn find_cue_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut cues: Vec<PathBuf> = std::fs::read_dir(dir).ok()?
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("cue")).unwrap_or(false) {
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .collect();
+    cues.sort();
+    cues.into_iter().next()
+}
+
 /// Collect track durations for audio files. Checks the probe cache first,
 /// falls back to direct ffmpeg probe for files not yet cached.
 pub fn collect_durations(

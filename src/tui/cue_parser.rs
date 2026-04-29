@@ -1,8 +1,8 @@
-//! Minimal CUE sheet parser for the bulk rename wizard.
+//! CUE sheet parser for metadata import and bulk rename.
 //!
-//! Extracts track number, title, performer, and file reference from a
-//! CUE sheet. Handles both single-image (one FILE + many TRACKs) and
-//! track-by-track (one FILE per TRACK) layouts.
+//! Extracts album/track metadata (title, performer, date, genre) and
+//! file references from a CUE sheet. Handles both single-image (one
+//! FILE + many TRACKs) and track-by-track (one FILE per TRACK) layouts.
 
 use std::path::Path;
 
@@ -13,6 +13,10 @@ pub struct CueSheet {
     pub title: Option<String>,
     /// Album-level performer.
     pub performer: Option<String>,
+    /// Release date (from `REM DATE` or `REM YEAR`).
+    pub date: Option<String>,
+    /// Genre (from `REM GENRE`).
+    pub genre: Option<String>,
     /// Tracks in order.
     pub tracks: Vec<CueTrack>,
 }
@@ -33,8 +37,9 @@ pub struct CueTrack {
 
 /// Parse a CUE sheet from a file path.
 pub fn parse_cue_file(path: &Path) -> Result<CueSheet, String> {
-    let content = std::fs::read_to_string(path)
+    let raw = std::fs::read(path)
         .map_err(|e| format!("failed to read CUE file: {}", e))?;
+    let content = String::from_utf8_lossy(&raw);
     Ok(parse_cue(&content))
 }
 
@@ -97,7 +102,21 @@ pub fn parse_cue(content: &str) -> CueSheet {
             continue;
         }
 
-        // Other lines (REM, INDEX, FLAGS, etc.) are ignored.
+        // REM DATE / REM YEAR / REM GENRE (album-level, before any TRACK).
+        if current_track.is_none() {
+            if let Some(val) = parse_rem_field(trimmed, "DATE")
+                .or_else(|| parse_rem_field(trimmed, "YEAR"))
+            {
+                sheet.date = Some(val);
+                continue;
+            }
+            if let Some(val) = parse_rem_field(trimmed, "GENRE") {
+                sheet.genre = Some(val);
+                continue;
+            }
+        }
+
+        // Other lines (INDEX, FLAGS, etc.) are ignored.
     }
 
     // Commit the last track.
@@ -142,6 +161,19 @@ fn extract_quoted(s: &str) -> Option<String> {
     let s = s.strip_prefix('"')?;
     let end = s.find('"')?;
     Some(s[..end].to_string())
+}
+
+/// Parse a `REM FIELD value` or `REM FIELD "value"` line.
+fn parse_rem_field(line: &str, field: &str) -> Option<String> {
+    let rest = line.strip_prefix("REM")?.trim_start();
+    let rest = rest.strip_prefix(field)?.trim_start();
+    // Handle both quoted and unquoted values.
+    if rest.starts_with('"') {
+        extract_quoted(rest)
+    } else {
+        let val = rest.trim();
+        if val.is_empty() { None } else { Some(val.to_string()) }
+    }
 }
 
 #[cfg(test)]

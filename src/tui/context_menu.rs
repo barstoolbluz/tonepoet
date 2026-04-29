@@ -682,8 +682,6 @@ pub fn execute_context_action(
             }
         }
         ContextAction::ImportCueFromBrowse => {
-            // Open metadata editor, then trigger :import-cue.
-            super::keybindings::open_metadata_editor(app);
             let cmd = super::command::Command::ImportCue;
             super::command::execute_command(app, cmd, tx);
         }
