@@ -129,8 +129,8 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::GnudbReview(ref state) => {
             draw_gnudb_review(f, state);
         }
-        ActiveOverlay::AccurateRipVerify { ref result, scroll } => {
-            draw_accuraterip_verify(f, result, scroll);
+        ActiveOverlay::AccurateRipVerify(ref state) => {
+            draw_accuraterip_verify(f, state);
         }
     }
 
@@ -2374,8 +2374,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
 
 fn draw_accuraterip_verify(
     f: &mut Frame,
-    result: &super::accuraterip::ArVerifyResult,
-    scroll: usize,
+    state: &super::app::ArVerifyState,
 ) {
     use super::accuraterip::ArTrackStatus;
 
@@ -2387,6 +2386,9 @@ fn draw_accuraterip_verify(
     let popup = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, popup);
+
+    let page = &state.pages[state.active_page];
+    let result = &page.result;
 
     let n_tracks = result.tracks.len();
     let verified = result.tracks.iter()
@@ -2400,7 +2402,19 @@ fn draw_accuraterip_verify(
         theme::RED
     };
 
-    let title = format!(" AccurateRip Verification — {} tracks ", n_tracks);
+    let title = if state.pages.len() > 1 {
+        // Multi-disc: aggregate stats in title.
+        let total_all: usize = state.pages.iter().map(|p| p.result.tracks.len()).sum();
+        let verified_all: usize = state.pages.iter().map(|p|
+            p.result.tracks.iter()
+                .filter(|t| t.status == ArTrackStatus::Verified)
+                .count()
+        ).sum();
+        format!(" AccurateRip — {} discs, {}/{} verified ", state.pages.len(), verified_all, total_all)
+    } else {
+        format!(" AccurateRip Verification — {} tracks ", n_tracks)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
@@ -2422,7 +2436,33 @@ fn draw_accuraterip_verify(
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Summary line.
+    // Disc pills for multi-disc navigation.
+    if state.pages.len() > 1 {
+        let mut spans: Vec<Span> = vec![Span::raw("  ")];
+        for (i, pg) in state.pages.iter().enumerate() {
+            let label = if pg.label.is_empty() {
+                format!("disc {}", i + 1)
+            } else {
+                pg.label.clone()
+            };
+            if i == state.active_page {
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::CYAN).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(theme::TEXT_DIM),
+                ));
+            }
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(""));
+    }
+
+    // Summary line for this disc.
     let summary = super::accuraterip::format_summary(result);
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
@@ -2469,7 +2509,6 @@ fn draw_accuraterip_verify(
             ),
         };
 
-        // Track number + filename.
         let track_label = format!("{:02} - {}", t.track_number, name);
         lines.push(Line::from(vec![
             Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
@@ -2483,7 +2522,7 @@ fn draw_accuraterip_verify(
 
     let total = lines.len();
     let visible = chunks[0].height as usize;
-    let scroll = scroll.min(total.saturating_sub(visible));
+    let scroll = state.scroll.min(total.saturating_sub(visible));
 
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
@@ -2492,8 +2531,6 @@ fn draw_accuraterip_verify(
     let mut pills = vec![
         footer_pill("Esc close", theme::GREEN),
     ];
-    // Show "full scan" pill only if this was a common-offsets scan AND
-    // there are unmatched tracks.
     let has_unmatched = result.tracks.iter().any(|t| t.status == ArTrackStatus::Mismatch);
     if result.was_common_scan && has_unmatched {
         pills.push(pill_gap());

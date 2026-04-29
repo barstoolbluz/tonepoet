@@ -848,11 +848,29 @@ pub enum ActiveOverlay {
     /// GNUDB review overlay — editable preview of GNUDB tags before
     /// accepting into the metadata editor.
     GnudbReview(Box<GnudbReviewState>),
-    /// AccurateRip verification results overlay.
-    AccurateRipVerify {
-        result: Box<crate::tui::accuraterip::ArVerifyResult>,
-        scroll: usize,
-    },
+    /// AccurateRip verification results overlay (supports multi-disc).
+    AccurateRipVerify(Box<ArVerifyState>),
+}
+
+/// State for the AccurateRip verification overlay.
+/// Supports multi-disc: each page is one disc's results.
+#[derive(Debug, Clone)]
+pub struct ArVerifyState {
+    /// Per-disc result pages. Single-disc albums have one page.
+    pub pages: Vec<ArVerifyPage>,
+    /// Active page index (0-based).
+    pub active_page: usize,
+    /// Scroll offset within the active page.
+    pub scroll: usize,
+}
+
+/// A single page (disc) in the AccurateRip verification overlay.
+#[derive(Debug, Clone)]
+pub struct ArVerifyPage {
+    /// Disc label (e.g., "disc 01"). Empty for single-disc albums.
+    pub label: String,
+    /// Verification result for this disc.
+    pub result: crate::tui::accuraterip::ArVerifyResult,
 }
 
 /// State for the GNUDB review overlay.

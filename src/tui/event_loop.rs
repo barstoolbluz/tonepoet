@@ -721,13 +721,30 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
 
-        AppMessage::AccurateRipComplete { result } => {
-            let summary = crate::tui::accuraterip::format_summary(&result);
-            app.set_status(format!("AccurateRip: {}", summary));
-            app.active_overlay = ActiveOverlay::AccurateRipVerify {
-                result,
-                scroll: 0,
-            };
+        AppMessage::AccurateRipComplete { pages } => {
+            // Aggregate summary across all discs.
+            let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
+            let verified: usize = pages.iter().map(|p|
+                p.result.tracks.iter()
+                    .filter(|t| t.status == crate::tui::accuraterip::ArTrackStatus::Verified)
+                    .count()
+            ).sum();
+            if pages.len() == 1 {
+                let summary = crate::tui::accuraterip::format_summary(&pages[0].result);
+                app.set_status(format!("AccurateRip: {}", summary));
+            } else {
+                app.set_status(format!(
+                    "AccurateRip: {} discs, {}/{} tracks verified",
+                    pages.len(), verified, total,
+                ));
+            }
+            app.active_overlay = ActiveOverlay::AccurateRipVerify(
+                Box::new(crate::tui::app::ArVerifyState {
+                    pages,
+                    active_page: 0,
+                    scroll: 0,
+                }),
+            );
         }
     }
 }

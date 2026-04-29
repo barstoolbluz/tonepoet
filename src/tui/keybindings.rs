@@ -1826,39 +1826,55 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
-        ActiveOverlay::AccurateRipVerify { result, mut scroll } => {
-            // Total rendered lines: 3 (summary + disc ID + blank) + 2 per track (label + detail).
-            let total_lines = 3 + result.tracks.len() * 2;
+        ActiveOverlay::AccurateRipVerify(mut state) => {
+            let page = &state.pages[state.active_page];
+            // Rendered lines: disc pills (2 if multi) + 3 (summary + ID + blank) + 2 per track.
+            let disc_header = if state.pages.len() > 1 { 2 } else { 0 };
+            let total_lines = disc_header + 3 + page.result.tracks.len() * 2;
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     app.active_overlay = ActiveOverlay::None;
                 }
+                KeyCode::Left => {
+                    if state.pages.len() > 1 && state.active_page > 0 {
+                        state.active_page -= 1;
+                        state.scroll = 0;
+                    }
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
+                }
+                KeyCode::Right => {
+                    if state.active_page + 1 < state.pages.len() {
+                        state.active_page += 1;
+                        state.scroll = 0;
+                    }
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
-                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                    state.scroll = state.scroll.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    scroll = (scroll + 1).min(total_lines.saturating_sub(1));
-                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                    state.scroll = (state.scroll + 1).min(total_lines.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
                 }
                 KeyCode::PageUp => {
-                    scroll = scroll.saturating_sub(15);
-                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                    state.scroll = state.scroll.saturating_sub(15);
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
                 }
                 KeyCode::PageDown => {
-                    scroll = (scroll + 15).min(total_lines.saturating_sub(1));
-                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                    state.scroll = (state.scroll + 15).min(total_lines.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
-                    scroll = 0;
-                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                    state.scroll = 0;
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    scroll = total_lines.saturating_sub(1);
-                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                    state.scroll = total_lines.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
                 }
                 _ => {
-                    app.active_overlay = ActiveOverlay::AccurateRipVerify { result, scroll };
+                    app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
                 }
             }
         }
@@ -2942,12 +2958,13 @@ fn handle_generic_overlay_mouse(
                         (Rect::new(x, y, w, h), pills)
                     }
                 }
-                ActiveOverlay::AccurateRipVerify { ref result, .. } => {
+                ActiveOverlay::AccurateRipVerify(ref state) => {
                     let w = ((area.0 as usize) * 70 / 100).max(50).min(area.0 as usize - 2) as u16;
                     let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
                     let x = (area.0.saturating_sub(w)) / 2;
                     let y = (area.1.saturating_sub(h)) / 2;
                     let mut pills = vec![("Esc close", "esc")];
+                    let result = &state.pages[state.active_page].result;
                     let has_unmatched = result.tracks.iter().any(|t|
                         t.status == super::accuraterip::ArTrackStatus::Mismatch
                     );

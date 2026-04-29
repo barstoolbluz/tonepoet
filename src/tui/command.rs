@@ -1412,31 +1412,66 @@ pub fn execute_command(
             if paths.is_empty() {
                 app.set_status("No audio files for AccurateRip verification");
             } else {
-                let n = paths.len();
-                app.set_status(format!("AccurateRip: verifying {} tracks...", n));
+                let groups = super::gnudb::group_by_disc(&paths);
+                let n_groups = groups.len();
+                let n_tracks: usize = groups.iter().map(|(_, p)| p.len()).sum();
+                let full_scan = force;
+                let tx = tx.clone();
 
-                // Collect exact sample counts (blocking probe, but fast).
-                let sample_data = super::accuraterip::collect_sample_counts(&paths);
-                match sample_data {
-                    Err(e) => {
-                        app.set_status(format!("AccurateRip: {}", e));
+                if n_groups <= 1 {
+                    // Single disc — existing flow.
+                    let group_paths = groups.into_iter().next().unwrap().1;
+                    let sample_data = super::accuraterip::collect_sample_counts(&group_paths);
+                    match sample_data {
+                        Err(e) => {
+                            app.set_status(format!("AccurateRip: {}", e));
+                        }
+                        Ok((sample_counts, sample_rate)) => {
+                            app.set_status(format!(
+                                "AccurateRip: verifying {} tracks...", n_tracks,
+                            ));
+                            tokio::spawn(async move {
+                                let result = super::accuraterip::verify_album(
+                                    &group_paths, &sample_counts, sample_rate, full_scan,
+                                ).await;
+                                let _ = tx.send(AppMessage::AccurateRipComplete {
+                                    pages: vec![super::app::ArVerifyPage {
+                                        label: String::new(),
+                                        result,
+                                    }],
+                                }).await;
+                            });
+                        }
                     }
-                    Ok((sample_counts, sample_rate)) => {
-                        app.set_status(format!(
-                            "AccurateRip: verifying {} tracks...", n,
-                        ));
-
-                        let full_scan = force;
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let result = super::accuraterip::verify_album(
-                                &paths, &sample_counts, sample_rate, full_scan,
-                            ).await;
-                            let _ = tx.send(AppMessage::AccurateRipComplete {
-                                result: Box::new(result),
-                            }).await;
-                        });
-                    }
+                } else {
+                    // Multi-disc — verify each disc sequentially in one task.
+                    app.set_status(format!(
+                        "AccurateRip: verifying {} discs, {} tracks...",
+                        n_groups, n_tracks,
+                    ));
+                    tokio::spawn(async move {
+                        let mut pages = Vec::with_capacity(n_groups);
+                        for (label, group_paths) in groups {
+                            let sample_data = super::accuraterip::collect_sample_counts(&group_paths);
+                            match sample_data {
+                                Ok((sample_counts, sample_rate)) => {
+                                    let result = super::accuraterip::verify_album(
+                                        &group_paths, &sample_counts, sample_rate, full_scan,
+                                    ).await;
+                                    pages.push(super::app::ArVerifyPage {
+                                        label,
+                                        result,
+                                    });
+                                }
+                                Err(e) => {
+                                    log::warn!("AccurateRip: skipping disc '{}': {}", label, e);
+                                }
+                            }
+                        }
+                        if !pages.is_empty() {
+                            let _ = tx.send(AppMessage::AccurateRipComplete { pages }).await;
+                        }
+                    });
                 }
             }
         }
