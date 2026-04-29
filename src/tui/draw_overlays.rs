@@ -2455,7 +2455,7 @@ fn draw_accuraterip_verify(
             ArTrackStatus::Mismatch => (
                 " ✗ ",
                 theme::RED,
-                "not in database".to_string(),
+                "CRC mismatch".to_string(),
             ),
             ArTrackStatus::NoDiscInDatabase => (
                 " ? ",
