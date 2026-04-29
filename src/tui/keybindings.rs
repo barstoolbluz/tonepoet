@@ -3189,6 +3189,43 @@ fn handle_generic_overlay_mouse(
             return true;
         }
 
+        // Left click in content area: disc pill click for AccurateRipVerify.
+        MouseEventKind::Down(MouseButton::Left)
+            if in_popup && !on_footer
+                && matches!(app.active_overlay, ActiveOverlay::AccurateRipVerify(_)) =>
+        {
+            if let ActiveOverlay::AccurateRipVerify(mut state) =
+                std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+            {
+                let content_y = popup.y + 1;
+                if state.pages.len() > 1 && my >= content_y && my < footer_y {
+                    let visual_row = (my - content_y) as usize;
+                    if visual_row == 0 {
+                        // Click on disc pill row — determine which pill.
+                        let inner_x_pos = popup.x + 1;
+                        let click_x = mx.saturating_sub(inner_x_pos) as usize;
+                        let mut x_pos = 2usize; // leading "  "
+                        for (i, pg) in state.pages.iter().enumerate() {
+                            let label = if pg.label.is_empty() {
+                                format!("disc {}", i + 1)
+                            } else {
+                                pg.label.clone()
+                            };
+                            let pill_w = label.len() + 2; // " label "
+                            if click_x >= x_pos && click_x < x_pos + pill_w {
+                                state.active_page = i;
+                                state.scroll = 0;
+                                break;
+                            }
+                            x_pos += pill_w + 1; // pill + gap
+                        }
+                    }
+                }
+                app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
+            }
+            return true;
+        }
+
         // Right-click anywhere: close overlay.
         MouseEventKind::Down(MouseButton::Right) => {
             if app.bookmarks.overlay_open {
