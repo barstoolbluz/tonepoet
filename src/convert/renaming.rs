@@ -43,6 +43,9 @@ lazy_static! {
         m.insert("mtv".to_string(), "MTV");
         m.insert("bbc".to_string(), "BBC");
         m.insert("zz".to_string(), "ZZ");  // for ZZ Top
+        m.insert("xrcd".to_string(), "XRCD");
+        m.insert("xrcd2".to_string(), "XRCD2");
+        m.insert("xrcd24".to_string(), "XRCD24");
         
         // Roman numerals
         m.insert("ii".to_string(), "II");
