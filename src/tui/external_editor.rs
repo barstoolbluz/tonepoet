@@ -10,7 +10,8 @@ use std::process::Command;
 /// editor exited successfully, `Ok(false)` if it exited with an error
 /// (e.g., user killed it), or `Err` if no editor could be found.
 pub fn open_in_editor(path: &Path) -> Result<bool, String> {
-    let editor = detect_editor()?;
+    let editor_str = detect_editor()?;
+    let (program, args) = split_command(&editor_str);
 
     // Suspend TUI: restore normal terminal mode so the editor can run.
     let _ = crossterm::terminal::disable_raw_mode();
@@ -23,10 +24,11 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
     );
 
     // Run the editor, blocking until it exits.
-    let status = Command::new(&editor)
+    let status = Command::new(program)
+        .args(&args)
         .arg(path)
         .status()
-        .map_err(|e| format!("failed to run {}: {}", editor, e))?;
+        .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
 
     // Restore TUI: re-enter raw mode and alternate screen.
     let _ = crossterm::execute!(
@@ -55,13 +57,14 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
 /// read-only flag to the editor (vim: `-R`, nano: `-v`). Falls back
 /// to `less` if no editor is found.
 pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
-    let editor = detect_editor_for_view()?;
+    let editor_str = detect_editor_for_view()?;
+    let (program, args) = split_command(&editor_str);
 
-    // Determine read-only flag based on editor.
-    let editor_base = std::path::Path::new(&editor)
+    // Determine read-only flag based on the program basename.
+    let editor_base = std::path::Path::new(program)
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or(&editor)
+        .unwrap_or(program)
         .to_lowercase();
     let readonly_flag: Option<&str> = match editor_base.as_str() {
         "vim" | "vi" | "nvim" => Some("-R"),
@@ -81,13 +84,14 @@ pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
     );
 
     // Build and run command.
-    let mut cmd = Command::new(&editor);
+    let mut cmd = Command::new(program);
+    cmd.args(&args);
     if let Some(flag) = readonly_flag {
         cmd.arg(flag);
     }
     cmd.arg(path);
     let status = cmd.status()
-        .map_err(|e| format!("failed to run {}: {}", editor, e))?;
+        .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
 
     // Restore TUI.
     let _ = crossterm::execute!(
@@ -104,6 +108,17 @@ pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
     );
 
     Ok(status.success())
+}
+
+/// Split a command string into program and arguments.
+///
+/// Handles `EDITOR="vim -u NONE"`, `EDITOR="code --wait"`, etc.
+/// The first whitespace-separated token is the program; the rest are args.
+fn split_command(cmd: &str) -> (&str, Vec<&str>) {
+    let mut parts = cmd.split_whitespace();
+    let program = parts.next().unwrap_or(cmd);
+    let args: Vec<&str> = parts.collect();
+    (program, args)
 }
 
 /// Detect editor for viewing. Prefers $EDITOR/$VISUAL, falls back to
