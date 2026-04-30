@@ -480,17 +480,8 @@ fn extract_cue_filename(line: &str) -> Option<String> {
     }
 }
 
-/// Parse a CUE "MM:SS:FF" timestamp to a frame count.
-fn parse_cue_timestamp(ts: &str) -> Option<u32> {
-    let parts: Vec<&str> = ts.split(':').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let mm: u32 = parts[0].parse().ok()?;
-    let ss: u32 = parts[1].parse().ok()?;
-    let ff: u32 = parts[2].parse().ok()?;
-    Some(mm * 60 * 75 + ss * 75 + ff)
-}
+// parse_cue_timestamp is in cue_parser.rs
+use super::cue_parser::parse_cue_timestamp;
 
 /// Resolve a CUE FILE reference to an actual file path.
 ///

@@ -4,7 +4,7 @@
 //! file references from a CUE sheet. Handles both single-image (one
 //! FILE + many TRACKs) and track-by-track (one FILE per TRACK) layouts.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A parsed CUE sheet.
 #[derive(Debug, Clone, Default)]
@@ -33,6 +33,9 @@ pub struct CueTrack {
     /// FILE reference associated with this track. For single-image CUEs,
     /// all tracks share the same file; for track-by-track, each has its own.
     pub file: Option<String>,
+    /// INDEX 01 offset in CUE frames (75 frames per second).
+    /// None if the CUE didn't have an INDEX 01 for this track.
+    pub index01_frames: Option<u32>,
 }
 
 /// Parse a CUE sheet from a file path.
@@ -116,7 +119,16 @@ pub fn parse_cue(content: &str) -> CueSheet {
             }
         }
 
-        // Other lines (INDEX, FLAGS, etc.) are ignored.
+        // INDEX 01 MM:SS:FF (track start position).
+        if let Some(ref mut track) = current_track {
+            if trimmed.starts_with("INDEX 01 ") {
+                let ts = trimmed[9..].trim();
+                track.index01_frames = parse_cue_timestamp(ts);
+                continue;
+            }
+        }
+
+        // Other lines (INDEX 00, FLAGS, etc.) are ignored.
     }
 
     // Commit the last track.
@@ -174,6 +186,98 @@ fn parse_rem_field(line: &str, field: &str) -> Option<String> {
         let val = rest.trim();
         if val.is_empty() { None } else { Some(val.to_string()) }
     }
+}
+
+/// Parse a CUE "MM:SS:FF" timestamp to a frame count (75 frames/second).
+pub fn parse_cue_timestamp(ts: &str) -> Option<u32> {
+    let parts: Vec<&str> = ts.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let mm: u32 = parts[0].parse().ok()?;
+    let ss: u32 = parts[1].parse().ok()?;
+    let ff: u32 = parts[2].parse().ok()?;
+    Some(mm * 60 * 75 + ss * 75 + ff)
+}
+
+// ── Single-image detection ──────────────────────────────────────────
+
+/// Information about a single-image CUE album (one audio file + CUE sheet).
+#[derive(Debug, Clone)]
+pub struct SingleImageInfo {
+    /// Path to the audio image file.
+    pub audio_path: PathBuf,
+    /// Path to the CUE sheet.
+    pub cue_path: PathBuf,
+    /// Parsed CUE sheet.
+    pub sheet: CueSheet,
+    /// Audio sample rate (e.g., 44100).
+    pub sample_rate: u32,
+    /// Total samples in the image file.
+    pub total_samples: u64,
+    /// Per-track boundaries: (start_sample, sample_count).
+    pub track_boundaries: Vec<(u64, u64)>,
+}
+
+/// Detect if `dir` contains a single-image CUE layout.
+///
+/// Returns `Some` if the directory has a CUE sheet with one FILE
+/// reference, multiple TRACKs with INDEX 01 timestamps, and the
+/// referenced audio file exists. Returns `None` for track-per-file
+/// layouts or directories without CUE sheets.
+pub fn detect_single_image(dir: &Path) -> Option<SingleImageInfo> {
+    let cue_path = crate::tui::gnudb::find_cue_in_dir(dir)?;
+    let sheet = parse_cue_file(&cue_path).ok()?;
+
+    // Must have multiple tracks with INDEX 01 timestamps.
+    if sheet.tracks.len() < 2 {
+        return None;
+    }
+    if !sheet.tracks.iter().all(|t| t.index01_frames.is_some()) {
+        return None;
+    }
+
+    // Must be a single-image layout (all tracks share the same FILE).
+    let first_file = sheet.tracks[0].file.as_ref()?;
+    let all_same_file = sheet.tracks.iter()
+        .all(|t| t.file.as_ref() == Some(first_file));
+    if !all_same_file {
+        return None;
+    }
+
+    // Resolve the audio file (handles extension mismatches).
+    let audio_path = crate::tui::accuraterip::resolve_cue_file_reference(dir, first_file)?;
+
+    // Probe for sample rate and total samples.
+    let (total_samples, sample_rate) = crate::tui::accuraterip::probe_sample_count(&audio_path).ok()?;
+    let samples_per_frame = (sample_rate / 75) as u64;
+
+    // Compute per-track boundaries from INDEX 01 frames.
+    let n = sheet.tracks.len();
+    let mut boundaries = Vec::with_capacity(n);
+    for i in 0..n {
+        let start_frames = sheet.tracks[i].index01_frames.unwrap() as u64;
+        let start_sample = start_frames * samples_per_frame;
+        let end_sample = if i + 1 < n {
+            let next_frames = sheet.tracks[i + 1].index01_frames.unwrap() as u64;
+            next_frames * samples_per_frame
+        } else {
+            total_samples
+        };
+        if end_sample <= start_sample {
+            return None; // invalid CUE: overlapping or zero-length tracks
+        }
+        boundaries.push((start_sample, end_sample - start_sample));
+    }
+
+    Some(SingleImageInfo {
+        audio_path,
+        cue_path,
+        sheet,
+        sample_rate,
+        total_samples,
+        track_boundaries: boundaries,
+    })
 }
 
 #[cfg(test)]
