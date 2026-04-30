@@ -348,7 +348,7 @@ pub fn extract_single_image_tracks(
 }
 
 /// Quick check if ffmpeg can open a file (without full decode).
-fn can_ffmpeg_read(path: &Path) -> bool {
+pub fn can_ffmpeg_read(path: &Path) -> bool {
     use std::process::Command;
     Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", "stream=codec_type"])

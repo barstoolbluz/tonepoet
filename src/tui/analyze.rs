@@ -45,7 +45,15 @@ pub struct AnalysisResult {
 }
 
 /// Analyze an audio file: decode to PCM and compute all metrics in one pass.
-pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
+///
+/// Optional `start_sample` seeks to that position before decoding.
+/// Optional `max_samples` stops decoding after that many per-channel samples.
+/// Both default to `None` for whole-file analysis.
+pub fn analyze_file(
+    path: &Path,
+    start_sample: Option<u64>,
+    max_samples: Option<u64>,
+) -> Result<AnalysisResult, String> {
     use ffmpeg_next as ffmpeg;
     use ffmpeg_next::media::Type;
     use ffmpeg_next::util::format::sample::{Sample, Type as SampleType};
@@ -79,8 +87,12 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
         if raw > 0 { Some(raw as u32) } else { None }
     };
 
-    // Duration from stream.
-    let duration_secs = audio_stream.duration() as f64 * f64::from(time_base);
+    // Duration: use max_samples if provided, otherwise stream metadata.
+    let duration_secs = if let Some(max) = max_samples {
+        max as f64 / sample_rate as f64
+    } else {
+        audio_stream.duration() as f64 * f64::from(time_base)
+    };
 
     // ── Accumulator state ────────────────────────────────────────
 
@@ -265,7 +277,20 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
         };
     }
 
-    for (stream, packet) in ictx.packets() {
+    // Seek to start position if specified.
+    if let Some(start) = start_sample {
+        // For most lossless formats, time_base = 1/sample_rate,
+        // so the timestamp in time_base units IS the sample number.
+        let ts = start as i64;
+        // Seek to the nearest keyframe at or before the target.
+        ictx.seek(ts, ..ts)
+            .map_err(|e| format!("seek failed: {}", e))?;
+    }
+
+    let sample_limit = max_samples.unwrap_or(u64::MAX);
+    let mut total_decoded: u64 = 0;
+
+    'decode: for (stream, packet) in ictx.packets() {
         if stream.index() != stream_idx {
             continue;
         }
@@ -273,13 +298,23 @@ pub fn analyze_file(path: &Path) -> Result<AnalysisResult, String> {
 
         while decoder.receive_frame(&mut decoded).is_ok() {
             process_frame!();
+            total_decoded += decoded.samples() as u64;
+            if total_decoded >= sample_limit {
+                break 'decode;
+            }
         }
     }
 
     // Flush decoder — process remaining buffered frames.
-    decoder.send_eof().map_err(|e| format!("send_eof: {}", e))?;
-    while decoder.receive_frame(&mut decoded).is_ok() {
-        process_frame!();
+    if total_decoded < sample_limit {
+        decoder.send_eof().map_err(|e| format!("send_eof: {}", e))?;
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            process_frame!();
+            total_decoded += decoded.samples() as u64;
+            if total_decoded >= sample_limit {
+                break;
+            }
+        }
     }
 
     // Flush last partial block (reference: dr_rms divides by actual count).

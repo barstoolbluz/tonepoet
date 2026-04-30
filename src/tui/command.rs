@@ -739,18 +739,14 @@ pub fn execute_command(
                 if let Some(ref dir) = dir {
                     if let Some(info) = super::cue_parser::detect_single_image(dir) {
                         let n = info.track_boundaries.len();
+                        let can_seek = super::cue_parser::can_ffmpeg_read(&info.audio_path);
                         app.set_status(format!(
-                            "Analyzing {} tracks (single image, extracting segments)...", n,
+                            "Analyzing {} tracks (single image)...", n,
                         ));
                         app.analysis_results.clear();
-
-                        let tmp_dir = std::env::temp_dir().join(
-                            format!("tonepoet-analyze-{}", std::process::id()),
-                        );
                         app.analysis_pending = n;
-                        app.analysis_temp_dir = Some(tmp_dir.clone());
 
-                        // Build display names from CUE metadata upfront.
+                        // Build display names from CUE metadata.
                         let display_paths: Vec<std::path::PathBuf> = info.sheet.tracks.iter()
                             .map(|t| {
                                 let name = format!("{:02} - {}.flac",
@@ -761,67 +757,28 @@ pub fn execute_command(
                             })
                             .collect();
 
-                        let tx = tx.clone();
-                        // Run extraction + analysis entirely off the main thread.
-                        tokio::spawn(async move {
-                            // Create temp dir and extract segments (blocking I/O).
-                            if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-                                // Send error for each pending track to decrement counter.
-                                for _ in 0..n {
-                                    let _ = tx.send(AppMessage::AnalysisComplete {
-                                        result: Err(format!("temp dir failed: {}", e)),
-                                    }).await;
-                                }
-                                return;
-                            }
-
-                            let track_paths = match tokio::task::spawn_blocking({
-                                let info = info.clone();
-                                let tmp_dir = tmp_dir.clone();
-                                move || super::cue_parser::extract_single_image_tracks(&info, &tmp_dir)
-                            }).await {
-                                Ok(Ok(paths)) => paths,
-                                result => {
-                                    let msg = match result {
-                                        Ok(Err(e)) => format!("segment extraction failed: {}", e),
-                                        Err(e) => format!("extraction task failed: {}", e),
-                                        _ => unreachable!(),
-                                    };
-                                    for _ in 0..n {
-                                        let _ = tx.send(AppMessage::AnalysisComplete {
-                                            result: Err(msg.clone()),
-                                        }).await;
-                                    }
-                                    return;
-                                }
-                            };
-
-                            // Spawn per-track analysis (same pipeline as multi-file).
-                            for (i, temp_path) in track_paths.into_iter().enumerate() {
+                        if can_seek {
+                            // Fast path: seek-based analysis (no temp files).
+                            for (i, &(start, count)) in info.track_boundaries.iter().enumerate() {
+                                let audio_path = info.audio_path.clone();
                                 let display_path = display_paths[i].clone();
                                 let original_path = info.audio_path.clone();
                                 let tx = tx.clone();
                                 tokio::spawn(async move {
-                                    let pcm_path = temp_path.clone();
-                                    let lufs_path = temp_path.clone();
-                                    let hdcd_path = temp_path;
+                                    let pcm_path = audio_path.clone();
 
-                                    let (pcm_result, lufs_result, hdcd_result) = tokio::join!(
+                                    let (pcm_result, hdcd_result) = tokio::join!(
                                         tokio::task::spawn_blocking(move || {
-                                            super::analyze::analyze_file(&pcm_path)
+                                            super::analyze::analyze_file(&pcm_path, Some(start), Some(count))
                                         }),
-                                        super::analyze::measure_loudness(&lufs_path),
-                                        super::analyze::detect_hdcd(&hdcd_path),
+                                        // HDCD: detect on the full image (first second is enough).
+                                        super::analyze::detect_hdcd(&audio_path),
                                     );
+                                    // LUFS: skip for seek-based (loudgain needs a real file per track).
 
                                     let final_result = match pcm_result {
                                         Ok(Ok(mut result)) => {
                                             result.path = display_path;
-
-                                            if let Some((lufs, tp)) = lufs_result {
-                                                result.lufs = Some(lufs);
-                                                result.true_peak_dbtp = Some(tp);
-                                            }
 
                                             let pe_evidence = super::preemphasis::metadata::check_tag_evidence(&original_path)
                                                 .or_else(|| super::preemphasis::metadata::check_file_evidence(&original_path));
@@ -862,7 +819,102 @@ pub fn execute_command(
                                     }).await;
                                 });
                             }
-                        });
+                        } else {
+                            // Slow path: extract to temp files (WavPack v4, etc.).
+                            let tmp_dir = std::env::temp_dir().join(
+                                format!("tonepoet-analyze-{}", std::process::id()),
+                            );
+                            app.analysis_temp_dir = Some(tmp_dir.clone());
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+                                    for _ in 0..n {
+                                        let _ = tx.send(AppMessage::AnalysisComplete {
+                                            result: Err(format!("temp dir failed: {}", e)),
+                                        }).await;
+                                    }
+                                    return;
+                                }
+                                let track_paths = match tokio::task::spawn_blocking({
+                                    let info = info.clone();
+                                    let tmp_dir = tmp_dir.clone();
+                                    move || super::cue_parser::extract_single_image_tracks(&info, &tmp_dir)
+                                }).await {
+                                    Ok(Ok(paths)) => paths,
+                                    result => {
+                                        let msg = match result {
+                                            Ok(Err(e)) => format!("extraction failed: {}", e),
+                                            Err(e) => format!("extraction task failed: {}", e),
+                                            _ => unreachable!(),
+                                        };
+                                        for _ in 0..n {
+                                            let _ = tx.send(AppMessage::AnalysisComplete {
+                                                result: Err(msg.clone()),
+                                            }).await;
+                                        }
+                                        return;
+                                    }
+                                };
+                                for (i, temp_path) in track_paths.into_iter().enumerate() {
+                                    let display_path = display_paths[i].clone();
+                                    let original_path = info.audio_path.clone();
+                                    let tx = tx.clone();
+                                    tokio::spawn(async move {
+                                        let pcm_path = temp_path.clone();
+                                        let lufs_path = temp_path.clone();
+                                        let hdcd_path = temp_path;
+                                        let (pcm_result, lufs_result, hdcd_result) = tokio::join!(
+                                            tokio::task::spawn_blocking(move || {
+                                                super::analyze::analyze_file(&pcm_path, None, None)
+                                            }),
+                                            super::analyze::measure_loudness(&lufs_path),
+                                            super::analyze::detect_hdcd(&hdcd_path),
+                                        );
+                                        let final_result = match pcm_result {
+                                            Ok(Ok(mut result)) => {
+                                                result.path = display_path;
+                                                if let Some((lufs, tp)) = lufs_result {
+                                                    result.lufs = Some(lufs);
+                                                    result.true_peak_dbtp = Some(tp);
+                                                }
+                                                let pe_evidence = super::preemphasis::metadata::check_tag_evidence(&original_path)
+                                                    .or_else(|| super::preemphasis::metadata::check_file_evidence(&original_path));
+                                                let catalog_match = super::preemphasis::catalog::check_catalog_evidence(&original_path);
+                                                if let Some(ev) = pe_evidence {
+                                                    result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
+                                                    result.preemphasis_detail = Some(format!(
+                                                        "{} indicates source disc used pre-emphasis; verify de-emphasis was not applied during ripping",
+                                                        ev.label()
+                                                    ));
+                                                } else if let Some(cm) = catalog_match {
+                                                    result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
+                                                    result.preemphasis_detail = Some(format!(
+                                                        "{}; verify de-emphasis was not applied during ripping",
+                                                        cm.detail
+                                                    ));
+                                                }
+                                                if result.declared_bit_depth == Some(16)
+                                                    || (result.declared_bit_depth.is_none() && result.actual_bit_depth <= 16)
+                                                {
+                                                    if let Some(hdcd) = hdcd_result {
+                                                        result.hdcd_detected = Some(hdcd.detected);
+                                                        if hdcd.detected {
+                                                            result.hdcd_detail = Some(hdcd.detail);
+                                                        }
+                                                    }
+                                                }
+                                                Ok(Box::new(result))
+                                            }
+                                            Ok(Err(e)) => Err(format!("track {}: {}", i + 1, e)),
+                                            Err(e) => Err(format!("task panicked: {}", e)),
+                                        };
+                                        let _ = tx.send(AppMessage::AnalysisComplete {
+                                            result: final_result,
+                                        }).await;
+                                    });
+                                }
+                            });
+                        }
                         return;
                     }
                 }
@@ -919,7 +971,7 @@ pub fn execute_command(
                             // Run PCM analysis, loudgain, and HDCD detection in parallel.
                             let (pcm_result, lufs_result, hdcd_result) = tokio::join!(
                                 tokio::task::spawn_blocking(move || {
-                                    super::analyze::analyze_file(&pcm_path)
+                                    super::analyze::analyze_file(&pcm_path, None, None)
                                 }),
                                 super::analyze::measure_loudness(&lufs_path),
                                 super::analyze::detect_hdcd(&hdcd_path),
