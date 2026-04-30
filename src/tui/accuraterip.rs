@@ -452,10 +452,7 @@ fn parse_cue_index_offsets(path: &Path) -> Option<Vec<u32>> {
 
     // Derive the leadout from the referenced audio file's total duration.
     let cue_dir = path.parent()?;
-    let audio_path = cue_dir.join(audio_file?);
-    if !audio_path.exists() {
-        return None;
-    }
+    let audio_path = resolve_cue_file_reference(cue_dir, &audio_file?)?;
     let (samples, sample_rate) = probe_sample_count(&audio_path).ok()?;
     let samples_per_frame = (sample_rate / 75) as u64;
     let total_frames = (samples / samples_per_frame) as u32;
@@ -493,6 +490,29 @@ fn parse_cue_timestamp(ts: &str) -> Option<u32> {
     let ss: u32 = parts[1].parse().ok()?;
     let ff: u32 = parts[2].parse().ok()?;
     Some(mm * 60 * 75 + ss * 75 + ff)
+}
+
+/// Resolve a CUE FILE reference to an actual file path.
+///
+/// CUE sheets often reference a filename with an extension that doesn't
+/// match the actual file (e.g., `album.wav` when the file is `album.flac`).
+/// Tries the original reference first, then common lossless extensions.
+pub fn resolve_cue_file_reference(dir: &Path, filename: &str) -> Option<PathBuf> {
+    let original = dir.join(filename);
+    if original.exists() {
+        return Some(original);
+    }
+
+    // Try alternative lossless extensions.
+    let stem = Path::new(filename).file_stem()?.to_str()?;
+    for ext in &["flac", "wav", "wave", "ape", "wv", "aiff", "aif", "m4a", "alac"] {
+        let alt = dir.join(format!("{}.{}", stem, ext));
+        if alt.exists() {
+            return Some(alt);
+        }
+    }
+
+    None
 }
 
 // ── Database URL construction ───────────────────────────────────────
