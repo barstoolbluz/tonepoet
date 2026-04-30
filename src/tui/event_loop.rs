@@ -351,6 +351,12 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         }
         AppMessage::AnalysisComplete { result } => {
             app.analysis_pending = app.analysis_pending.saturating_sub(1);
+            // Clean up single-image temp dir when all analysis tasks complete.
+            if app.analysis_pending == 0 {
+                if let Some(tmp_dir) = app.analysis_temp_dir.take() {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                }
+            }
             match result {
                 Ok(result) => {
                     // Persist to SQLite analysis cache for cross-session reuse.

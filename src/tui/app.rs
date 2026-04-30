@@ -1261,6 +1261,9 @@ pub struct AppState {
     /// Number of analysis tasks currently in flight. While > 0, the
     /// status bar shows a persistent "Analyzing..." message.
     pub analysis_pending: usize,
+    /// Temp directory for single-image analysis segment extraction.
+    /// Cleaned up when `analysis_pending` reaches 0.
+    pub analysis_temp_dir: Option<PathBuf>,
 
     /// Verify results from the last :verify command.
     pub verify_results: Vec<crate::tui::verify::VerifyResult>,
@@ -1453,6 +1456,7 @@ impl AppState {
             hover_target: None,
             analysis_results: Vec::new(),
             analysis_pending: 0,
+            analysis_temp_dir: None,
             verify_results: Vec::new(),
             verify_pending: 0,
             preemph_results: Vec::new(),

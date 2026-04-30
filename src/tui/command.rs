@@ -726,6 +726,147 @@ pub fn execute_command(
             };
             // Sort by disc/track for logical result order.
             super::probe::sort_paths_by_track(&mut paths);
+            // Check for single-image CUE layout.
+            if paths.len() <= 1 {
+                let dir = if paths.is_empty() {
+                    let sel = collect_selection_for_file_ops(app);
+                    sel.first().and_then(|p| {
+                        if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }
+                    })
+                } else {
+                    paths[0].parent().map(|d| d.to_path_buf())
+                };
+                if let Some(ref dir) = dir {
+                    if let Some(info) = super::cue_parser::detect_single_image(dir) {
+                        let n = info.track_boundaries.len();
+                        app.set_status(format!(
+                            "Analyzing {} tracks (single image, extracting segments)...", n,
+                        ));
+                        app.analysis_results.clear();
+
+                        let tmp_dir = std::env::temp_dir().join(
+                            format!("tonepoet-analyze-{}", std::process::id()),
+                        );
+                        app.analysis_pending = n;
+                        app.analysis_temp_dir = Some(tmp_dir.clone());
+
+                        // Build display names from CUE metadata upfront.
+                        let display_paths: Vec<std::path::PathBuf> = info.sheet.tracks.iter()
+                            .map(|t| {
+                                let name = format!("{:02} - {}.flac",
+                                    t.number,
+                                    t.title.as_deref().unwrap_or("Track"),
+                                );
+                                info.audio_path.parent().unwrap_or(std::path::Path::new(".")).join(name)
+                            })
+                            .collect();
+
+                        let tx = tx.clone();
+                        // Run extraction + analysis entirely off the main thread.
+                        tokio::spawn(async move {
+                            // Create temp dir and extract segments (blocking I/O).
+                            if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+                                // Send error for each pending track to decrement counter.
+                                for _ in 0..n {
+                                    let _ = tx.send(AppMessage::AnalysisComplete {
+                                        result: Err(format!("temp dir failed: {}", e)),
+                                    }).await;
+                                }
+                                return;
+                            }
+
+                            let track_paths = match tokio::task::spawn_blocking({
+                                let info = info.clone();
+                                let tmp_dir = tmp_dir.clone();
+                                move || super::cue_parser::extract_single_image_tracks(&info, &tmp_dir)
+                            }).await {
+                                Ok(Ok(paths)) => paths,
+                                result => {
+                                    let msg = match result {
+                                        Ok(Err(e)) => format!("segment extraction failed: {}", e),
+                                        Err(e) => format!("extraction task failed: {}", e),
+                                        _ => unreachable!(),
+                                    };
+                                    for _ in 0..n {
+                                        let _ = tx.send(AppMessage::AnalysisComplete {
+                                            result: Err(msg.clone()),
+                                        }).await;
+                                    }
+                                    return;
+                                }
+                            };
+
+                            // Spawn per-track analysis (same pipeline as multi-file).
+                            for (i, temp_path) in track_paths.into_iter().enumerate() {
+                                let display_path = display_paths[i].clone();
+                                let original_path = info.audio_path.clone();
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let pcm_path = temp_path.clone();
+                                    let lufs_path = temp_path.clone();
+                                    let hdcd_path = temp_path;
+
+                                    let (pcm_result, lufs_result, hdcd_result) = tokio::join!(
+                                        tokio::task::spawn_blocking(move || {
+                                            super::analyze::analyze_file(&pcm_path)
+                                        }),
+                                        super::analyze::measure_loudness(&lufs_path),
+                                        super::analyze::detect_hdcd(&hdcd_path),
+                                    );
+
+                                    let final_result = match pcm_result {
+                                        Ok(Ok(mut result)) => {
+                                            result.path = display_path;
+
+                                            if let Some((lufs, tp)) = lufs_result {
+                                                result.lufs = Some(lufs);
+                                                result.true_peak_dbtp = Some(tp);
+                                            }
+
+                                            let pe_evidence = super::preemphasis::metadata::check_tag_evidence(&original_path)
+                                                .or_else(|| super::preemphasis::metadata::check_file_evidence(&original_path));
+                                            let catalog_match = super::preemphasis::catalog::check_catalog_evidence(&original_path);
+
+                                            if let Some(ev) = pe_evidence {
+                                                result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
+                                                result.preemphasis_detail = Some(format!(
+                                                    "{} indicates source disc used pre-emphasis; verify de-emphasis was not applied during ripping",
+                                                    ev.label()
+                                                ));
+                                            } else if let Some(cm) = catalog_match {
+                                                result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
+                                                result.preemphasis_detail = Some(format!(
+                                                    "{}; verify de-emphasis was not applied during ripping",
+                                                    cm.detail
+                                                ));
+                                            }
+
+                                            if result.declared_bit_depth == Some(16)
+                                                || (result.declared_bit_depth.is_none() && result.actual_bit_depth <= 16)
+                                            {
+                                                if let Some(hdcd) = hdcd_result {
+                                                    result.hdcd_detected = Some(hdcd.detected);
+                                                    if hdcd.detected {
+                                                        result.hdcd_detail = Some(hdcd.detail);
+                                                    }
+                                                }
+                                            }
+
+                                            Ok(Box::new(result))
+                                        }
+                                        Ok(Err(e)) => Err(format!("track {}: {}", i + 1, e)),
+                                        Err(e) => Err(format!("task panicked: {}", e)),
+                                    };
+                                    let _ = tx.send(AppMessage::AnalysisComplete {
+                                        result: final_result,
+                                    }).await;
+                                });
+                            }
+                        });
+                        return;
+                    }
+                }
+            }
             if paths.is_empty() {
                 app.set_status("No audio files to analyze");
             } else {

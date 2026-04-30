@@ -280,6 +280,86 @@ pub fn detect_single_image(dir: &Path) -> Option<SingleImageInfo> {
     })
 }
 
+/// Extract each track from a single-image file to separate temp FLACs.
+///
+/// Uses `ffmpeg -ss <start> -t <duration>` to extract each segment.
+/// For WavPack v4 files (ffmpeg can't read), decodes the full image
+/// to a temp WAV via wvunpack first, then extracts segments from that.
+///
+/// Returns the list of temp track paths in order.
+pub fn extract_single_image_tracks(
+    info: &SingleImageInfo,
+    tmp_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    use std::process::Command;
+
+    // Try extracting directly from the source file. If ffmpeg can't
+    // read it (e.g., WavPack v4), decode to a temp WAV first.
+    let source_path = if can_ffmpeg_read(&info.audio_path) {
+        info.audio_path.clone()
+    } else {
+        // Decode via wvunpack to temp WAV.
+        let tmp_wav = tmp_dir.join("_image.wav");
+        let status = Command::new("wvunpack")
+            .args(["-q", "-o"])
+            .arg(&tmp_wav)
+            .arg(&info.audio_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("wvunpack failed: {}", e))?;
+        if !status.success() {
+            return Err("wvunpack decode failed".into());
+        }
+        tmp_wav
+    };
+
+    let mut track_paths = Vec::with_capacity(info.track_boundaries.len());
+
+    for (i, &(start_sample, sample_count)) in info.track_boundaries.iter().enumerate() {
+        let start_secs = start_sample as f64 / info.sample_rate as f64;
+        let duration_secs = sample_count as f64 / info.sample_rate as f64;
+
+        let out_path = tmp_dir.join(format!("track_{:02}.flac", i + 1));
+
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", &format!("{:.6}", start_secs),
+                "-t", &format!("{:.6}", duration_secs),
+                "-i",
+            ])
+            .arg(&source_path)
+            .args(["-c:a", "flac", "-compression_level", "0"]) // fast compression
+            .arg(&out_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .status()
+            .map_err(|e| format!("ffmpeg segment extract failed: {}", e))?;
+
+        if !status.success() {
+            return Err(format!("ffmpeg failed to extract track {}", i + 1));
+        }
+
+        track_paths.push(out_path);
+    }
+
+    Ok(track_paths)
+}
+
+/// Quick check if ffmpeg can open a file (without full decode).
+fn can_ffmpeg_read(path: &Path) -> bool {
+    use std::process::Command;
+    Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=codec_type"])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
