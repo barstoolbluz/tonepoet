@@ -1310,7 +1310,7 @@ async fn offset_correction_inner(
                 return Err("mac (Monkey's Audio) not found — required for APE encoding".into());
             }
         }
-        "wav" | "wave" | "aiff" | "aif" | "wv" => {} // ffmpeg handles these
+        "m4a" | "mp4" | "alac" | "wav" | "wave" | "aiff" | "aif" | "wv" => {} // ffmpeg handles these
         other => {
             return Err(format!("Offset correction not supported for .{} files", other));
         }
@@ -1539,6 +1539,7 @@ async fn encode_corrected_track(
             }
             Ok(())
         }
+        "m4a" | "mp4" | "alac" => encode_via_ffmpeg(&raw_bytes, out_path, &["-c:a", "alac"]).await,
         "wv" => encode_via_ffmpeg(&raw_bytes, out_path, &["-c:a", "wavpack"]).await,
         "wav" | "wave" => encode_via_ffmpeg(&raw_bytes, out_path, &["-c:a", "pcm_s16le"]).await,
         "aiff" | "aif" => encode_via_ffmpeg(&raw_bytes, out_path, &["-c:a", "pcm_s16be"]).await,
@@ -1594,7 +1595,7 @@ async fn copy_metadata(src: &Path, dst: &Path) -> Result<(), String> {
 
     match ext.as_str() {
         "flac" => copy_metadata_metaflac(src, dst).await,
-        "wv" | "ape" => {
+        "m4a" | "mp4" | "alac" | "wv" | "ape" => {
             let src = src.to_path_buf();
             let dst = dst.to_path_buf();
             tokio::task::spawn_blocking(move || copy_tags_via_lofty(&src, &dst))
