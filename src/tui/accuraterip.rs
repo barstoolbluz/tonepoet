@@ -196,6 +196,25 @@ fn compute_freedb_id(offsets: &[u32], n_tracks: usize) -> u32 {
 /// Uses ffmpeg's stream duration in time_base units, which for FLAC
 /// and other lossless formats is the exact sample count.
 pub fn probe_sample_count(path: &std::path::Path) -> Result<(u64, u32), String> {
+    // Try ffmpeg first (handles most formats).
+    match probe_sample_count_ffmpeg(path) {
+        Ok(result) => return Ok(result),
+        Err(_) => {}
+    }
+
+    // Fallback: format-specific native tools for files ffmpeg can't handle.
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "wv" => probe_sample_count_wvunpack(path),
+        _ => Err(format!("cannot probe {}", path.display())),
+    }
+}
+
+/// Probe sample count via ffmpeg-next (in-process).
+fn probe_sample_count_ffmpeg(path: &std::path::Path) -> Result<(u64, u32), String> {
     use ffmpeg_next as ffmpeg;
 
     crate::tui::probe::ensure_ffmpeg_init_pub();
@@ -222,18 +241,81 @@ pub fn probe_sample_count(path: &std::path::Path) -> Result<(u64, u32), String> 
         return Err("no duration in stream".into());
     }
 
-    // For most formats, time_base = 1/sample_rate, so duration = sample count.
-    // For others, convert: samples = duration * time_base * sample_rate.
     let samples = if time_base.denominator() == sample_rate as i32 && time_base.numerator() == 1 {
         duration as u64
     } else {
-        // General case: duration * (num/den) * sample_rate
         (duration as f64 * time_base.numerator() as f64 / time_base.denominator() as f64
             * sample_rate as f64)
             .round() as u64
     };
 
     Ok((samples, sample_rate))
+}
+
+/// Probe sample count via wvunpack (fallback for WavPack files ffmpeg can't read).
+///
+/// Parses `wvunpack -q -s` output for duration and sample rate.
+/// Example output:
+/// ```text
+/// source:            16-bit ints at 44100 Hz
+/// duration:          0:39:58.41
+/// ```
+fn probe_sample_count_wvunpack(path: &std::path::Path) -> Result<(u64, u32), String> {
+    let output = std::process::Command::new("wvunpack")
+        .args(["-q", "-s"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("wvunpack failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err("wvunpack returned error".into());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut sample_rate: Option<u32> = None;
+    let mut duration_secs: Option<f64> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // "source:            16-bit ints at 44100 Hz"
+        if trimmed.starts_with("source:") {
+            if let Some(hz_pos) = trimmed.find(" Hz") {
+                let before_hz = &trimmed[..hz_pos];
+                if let Some(at_pos) = before_hz.rfind("at ") {
+                    if let Ok(sr) = before_hz[at_pos + 3..].trim().parse::<u32>() {
+                        sample_rate = Some(sr);
+                    }
+                }
+            }
+        }
+        // "duration:          0:39:58.41"
+        if trimmed.starts_with("duration:") {
+            let dur_str = trimmed.split(':').skip(1).collect::<Vec<&str>>().join(":");
+            let dur_str = dur_str.trim();
+            // Parse H:MM:SS.ff or M:SS.ff
+            let parts: Vec<&str> = dur_str.split(':').collect();
+            if parts.len() == 3 {
+                // H:MM:SS.ff
+                let h: f64 = parts[0].trim().parse().unwrap_or(0.0);
+                let m: f64 = parts[1].trim().parse().unwrap_or(0.0);
+                let s: f64 = parts[2].trim().parse().unwrap_or(0.0);
+                duration_secs = Some(h * 3600.0 + m * 60.0 + s);
+            } else if parts.len() == 2 {
+                // M:SS.ff
+                let m: f64 = parts[0].trim().parse().unwrap_or(0.0);
+                let s: f64 = parts[1].trim().parse().unwrap_or(0.0);
+                duration_secs = Some(m * 60.0 + s);
+            }
+        }
+    }
+
+    let sr = sample_rate.ok_or("could not parse sample rate from wvunpack")?;
+    let dur = duration_secs.ok_or("could not parse duration from wvunpack")?;
+    let samples = (dur * sr as f64).round() as u64;
+
+    Ok((samples, sr))
 }
 
 /// Collect exact sample counts for a list of audio files.

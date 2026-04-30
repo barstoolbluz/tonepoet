@@ -709,9 +709,19 @@ pub fn collect_durations(
             durations.push(cached.source.duration_secs);
         } else {
             // Not in cache — probe directly (synchronous, but fast).
+            // Try ffmpeg first, fall back to format-specific tools
+            // (e.g., wvunpack for older WavPack files ffmpeg can't read).
             match super::probe::probe_audio(path) {
                 Ok(info) => durations.push(info.duration_secs),
-                Err(_) => {} // skip unreadable files
+                Err(_) => {
+                    // Fallback: use probe_sample_count which has
+                    // format-specific fallbacks (wvunpack, etc.).
+                    if let Ok((samples, sr)) = super::accuraterip::probe_sample_count(path) {
+                        durations.push(samples as f64 / sr as f64);
+                    }
+                    // If both fail, skip — durations vec will be short,
+                    // triggering the "some durations missing" error.
+                }
             }
         }
     }
