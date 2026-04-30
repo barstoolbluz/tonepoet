@@ -1294,9 +1294,29 @@ async fn offset_correction_inner(
     tmp_dir: &Path,
     tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) -> Result<String, String> {
-    use tokio::process::Command as TokioCommand;
+    // Check required tools for the input format.
+    let format_ext = paths[0].extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match format_ext.as_str() {
+        "flac" => {
+            if !tool_exists("metaflac") {
+                return Err("metaflac not found — required for FLAC metadata".into());
+            }
+        }
+        "ape" => {
+            if !tool_exists("mac") {
+                return Err("mac (Monkey's Audio) not found — required for APE encoding".into());
+            }
+        }
+        "wav" | "wave" | "aiff" | "aif" | "wv" => {} // ffmpeg handles these
+        other => {
+            return Err(format!("Offset correction not supported for .{} files", other));
+        }
+    }
 
-    // Copy log file(s) to temp dir for TOC lookup during verification.
+    // Copy log + CUE file(s) to temp dir for TOC lookup during verification.
     let orig_dir = paths[0].parent().unwrap_or(Path::new("."));
     if let Ok(entries) = std::fs::read_dir(orig_dir) {
         for entry in entries.flatten() {
@@ -1376,7 +1396,6 @@ async fn offset_correction_inner(
             ));
         }
 
-        // Encode corrected PCM to FLAC via ffmpeg.
         let path = &paths[i];
         let out_name = path.file_name().unwrap_or_default();
         let out_path = tmp_dir.join(out_name);
@@ -1385,42 +1404,8 @@ async fn offset_correction_inner(
             format!("Offset correction: encoding track {}/{}...", i + 1, n),
         )).await;
 
-        // Convert i16 to raw bytes (little-endian, which i16 already is on LE platforms).
-        let raw_bytes: Vec<u8> = corrected.iter()
-            .flat_map(|&s| s.to_le_bytes())
-            .collect();
-
-        let mut child = TokioCommand::new("ffmpeg")
-            .args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "s16le", "-ar", "44100", "-ac", "2",
-                "-i", "pipe:0",
-                "-compression_level", "8",
-            ])
-            .arg(&out_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
-
-        // Write PCM to stdin.
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(&raw_bytes).await
-                .map_err(|e| format!("Failed to write to ffmpeg stdin: {}", e))?;
-            drop(stdin); // close stdin to signal EOF
-        }
-
-        let output = child.wait_with_output().await
-            .map_err(|e| format!("ffmpeg failed: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("ffmpeg encode failed for track {}: {}", i + 1, stderr));
-        }
-
-        // Copy metadata from original to corrected.
-        copy_flac_metadata(path, &out_path).await?;
+        encode_corrected_track(&corrected, &out_path, path).await?;
+        copy_metadata(path, &out_path).await?;
     }
 
     // 4. Verify corrected files at offset 0.
@@ -1506,8 +1491,122 @@ async fn offset_correction_inner(
     ))
 }
 
-/// Copy FLAC metadata (tags + embedded pictures) from source to destination.
-async fn copy_flac_metadata(src: &Path, dst: &Path) -> Result<(), String> {
+/// Check if a command exists on the PATH.
+fn tool_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Encode corrected PCM to the target format, detected from src_path extension.
+async fn encode_corrected_track(
+    corrected: &[i16],
+    out_path: &Path,
+    src_path: &Path,
+) -> Result<(), String> {
+    use tokio::process::Command as TokioCommand;
+
+    let raw_bytes: Vec<u8> = corrected.iter()
+        .flat_map(|&s| s.to_le_bytes())
+        .collect();
+
+    let ext = src_path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "ape" => {
+            // APE: mac doesn't support stdin. Write temp WAV, then encode.
+            let tmp_wav = out_path.with_extension("tmp.wav");
+            encode_via_ffmpeg(&raw_bytes, &tmp_wav, &["-c:a", "pcm_s16le"]).await?;
+            let status = TokioCommand::new("mac")
+                .arg(&tmp_wav)
+                .arg(out_path)
+                .arg("-c2000") // compression level: normal
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .status()
+                .await
+                .map_err(|e| format!("Failed to run mac: {}", e))?;
+            let _ = std::fs::remove_file(&tmp_wav);
+            if !status.success() {
+                return Err(format!("mac encode failed for {}", out_path.display()));
+            }
+            Ok(())
+        }
+        "wv" => encode_via_ffmpeg(&raw_bytes, out_path, &["-c:a", "wavpack"]).await,
+        "wav" | "wave" => encode_via_ffmpeg(&raw_bytes, out_path, &["-c:a", "pcm_s16le"]).await,
+        "aiff" | "aif" => encode_via_ffmpeg(&raw_bytes, out_path, &["-c:a", "pcm_s16be"]).await,
+        _ => encode_via_ffmpeg(&raw_bytes, out_path, &["-compression_level", "8"]).await, // FLAC default
+    }
+}
+
+/// Encode raw PCM bytes to a file via ffmpeg with format-specific codec args.
+async fn encode_via_ffmpeg(
+    raw_bytes: &[u8],
+    out_path: &Path,
+    codec_args: &[&str],
+) -> Result<(), String> {
+    use tokio::process::Command as TokioCommand;
+
+    let mut cmd = TokioCommand::new("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error",
+              "-f", "s16le", "-ar", "44100", "-ac", "2",
+              "-i", "pipe:0"]);
+    for arg in codec_args {
+        cmd.arg(arg);
+    }
+    cmd.arg(out_path);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(raw_bytes).await
+            .map_err(|e| format!("Failed to write to ffmpeg stdin: {}", e))?;
+        drop(stdin);
+    }
+
+    let output = child.wait_with_output().await
+        .map_err(|e| format!("ffmpeg failed: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg encode failed: {}", stderr));
+    }
+    Ok(())
+}
+
+/// Copy metadata from source to destination, format-aware.
+async fn copy_metadata(src: &Path, dst: &Path) -> Result<(), String> {
+    let ext = src.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "flac" => copy_metadata_metaflac(src, dst).await,
+        "wv" | "ape" => {
+            let src = src.to_path_buf();
+            let dst = dst.to_path_buf();
+            tokio::task::spawn_blocking(move || copy_tags_via_lofty(&src, &dst))
+                .await
+                .map_err(|e| format!("metadata task failed: {}", e))?
+        }
+        _ => Ok(()), // WAV, AIFF — no metadata to copy
+    }
+}
+
+/// Copy FLAC metadata via metaflac (tags + embedded pictures).
+async fn copy_metadata_metaflac(src: &Path, dst: &Path) -> Result<(), String> {
     use tokio::process::Command as TokioCommand;
 
     // Export and import tags.
@@ -1569,6 +1668,48 @@ async fn copy_flac_metadata(src: &Path, dst: &Path) -> Result<(), String> {
             let _ = std::fs::remove_file(&tmp_pic);
         }
     }
+
+    Ok(())
+}
+
+/// Copy tags and pictures via lofty (for WavPack and APE).
+fn copy_tags_via_lofty(src: &Path, dst: &Path) -> Result<(), String> {
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::config::WriteOptions;
+
+    let src_tagged = lofty::read_from_path(src)
+        .map_err(|e| format!("Failed to read tags from {}: {}", src.display(), e))?;
+
+    let src_tag = match src_tagged.primary_tag() {
+        Some(t) => t,
+        None => return Ok(()), // no tags to copy
+    };
+
+    let mut dst_tagged = lofty::read_from_path(dst)
+        .map_err(|e| format!("Failed to read {}: {}", dst.display(), e))?;
+
+    // Get or create the primary tag on the destination.
+    let tag_type = src_tag.tag_type();
+    if dst_tagged.tag(tag_type).is_none() {
+        dst_tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+    }
+
+    if let Some(dst_tag) = dst_tagged.tag_mut(tag_type) {
+        // Remove existing items that we'll replace, then copy from source.
+        let keys: Vec<_> = src_tag.items().map(|item| item.key().clone()).collect();
+        for key in &keys {
+            dst_tag.remove_key(key);
+        }
+        for item in src_tag.items() {
+            dst_tag.push(item.clone());
+        }
+        for pic in src_tag.pictures() {
+            dst_tag.push_picture(pic.clone());
+        }
+    }
+
+    dst_tagged.save_to_path(dst, WriteOptions::default())
+        .map_err(|e| format!("Failed to write tags to {}: {}", dst.display(), e))?;
 
     Ok(())
 }

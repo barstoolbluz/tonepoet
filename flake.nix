@@ -77,6 +77,7 @@
           libopus
           opusfile
           wavpack
+          monkeys-audio
           lame
           _7zz
           atomicparsley
