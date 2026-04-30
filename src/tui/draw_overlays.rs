@@ -469,13 +469,13 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
 /// Draw a confirmation dialog
 fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState) {
     let area = f.size();
-    let popup = centered_rect(50, 7, area);
+    let popup = centered_rect(50, 9, area);
 
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(" Confirm ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        .border_style(Style::default().fg(theme::AMBER))
+        .title(Span::styled(" Confirm ", Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -492,19 +492,30 @@ fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState) {
         .alignment(Alignment::Center);
     f.render_widget(msg, chunks[0]);
 
-    let buttons = Paragraph::new(Line::from(vec![
-        Span::styled(" [Y]es ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::styled(" [N]o ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-    ]))
-    .alignment(Alignment::Center);
+    // Pill-styled buttons using the standard footer_pill pattern.
+    let yes_pill = footer_pill("Y yes", theme::GREEN);
+    let no_pill = footer_pill("N no", theme::RED);
+    let gap_span = pill_gap();
+    let yes_w = yes_pill.width() as u16;
+    let gap_w = gap_span.width() as u16;
+    let no_w = no_pill.width() as u16;
+    let total_w = yes_w + gap_w + no_w;
+
+    let line = Line::from(vec![yes_pill, gap_span, no_pill]);
+    let buttons = Paragraph::new(line).alignment(Alignment::Center);
     f.render_widget(buttons, chunks[1]);
 
-    // Record button areas
+    // Record button areas matching the centered layout.
     let btn_y = chunks[1].y;
-    let center_x = chunks[1].x + chunks[1].width / 2;
-    app.button_map.record_button(TuiButton::OverlayConfirm, Rect::new(center_x.saturating_sub(8), btn_y, 7, 1));
-    app.button_map.record_button(TuiButton::OverlayCancel, Rect::new(center_x + 2, btn_y, 6, 1));
+    let start_x = chunks[1].x + chunks[1].width.saturating_sub(total_w) / 2;
+    app.button_map.record_button(
+        TuiButton::OverlayConfirm,
+        Rect::new(start_x, btn_y, yes_w, 1),
+    );
+    app.button_map.record_button(
+        TuiButton::OverlayCancel,
+        Rect::new(start_x + yes_w + gap_w, btn_y, no_w, 1),
+    );
 }
 
 /// Draw an error detail popup

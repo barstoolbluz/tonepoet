@@ -5607,11 +5607,31 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     }
 
     // Don't dispatch button clicks while a modal overlay (TextEdit,
-    // FileInput, Confirmation, etc.) is open — the user must close it
-    // first. Without this guard, clicking a different field while
-    // editing silently replaces the overlay and loses the pending edit.
-    // Context menu dismissal is handled separately above.
+    // FileInput, etc.) is open — the user must close it first. Without
+    // this guard, clicking a different field while editing silently
+    // replaces the overlay and loses the pending edit.
+    // Exception: Confirmation overlay allows its own Yes/No pill clicks.
     if !matches!(app.active_overlay, ActiveOverlay::None) {
+        if matches!(app.active_overlay, ActiveOverlay::Confirmation { .. }) {
+            // Allow OverlayConfirm/OverlayCancel buttons through.
+            if let Some(button) = app.button_map.find_button_at(x, y) {
+                match button {
+                    TuiButton::OverlayConfirm => {
+                        if let ActiveOverlay::Confirmation { action, .. } = &app.active_overlay {
+                            let action = action.clone();
+                            app.active_overlay = ActiveOverlay::None;
+                            execute_confirm_action(app, &action, tx);
+                        }
+                        return;
+                    }
+                    TuiButton::OverlayCancel => {
+                        app.active_overlay = ActiveOverlay::None;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
         return;
     }
 
