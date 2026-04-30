@@ -1312,6 +1312,265 @@ pub fn format_summary(result: &ArVerifyResult) -> String {
     )
 }
 
+// ── Single-image verification ───────────────────────────────────────
+
+/// Verify a single-image CUE album against AccurateRip.
+///
+/// Decodes the full image file once, slices by CUE track boundaries,
+/// and computes per-track CRCs. Reuses the standard AR CRC algorithm
+/// and database fetch.
+pub async fn verify_single_image(
+    info: &super::cue_parser::SingleImageInfo,
+    full_scan: bool,
+) -> ArVerifyResult {
+    let n = info.track_boundaries.len();
+
+    // Compute disc ID from the CUE's INDEX 01 timestamps.
+    let disc_id = {
+        let toc = find_toc_offsets(info.cue_path.parent().unwrap_or(Path::new(".")));
+        if let Some(ref toc_sectors) = toc {
+            if toc_sectors.len() == n + 1 {
+                compute_ar_disc_id_from_toc(toc_sectors)
+            } else {
+                // Fallback: compute from track durations.
+                let sample_counts: Vec<u64> = info.track_boundaries.iter()
+                    .map(|&(_, count)| count)
+                    .collect();
+                compute_ar_disc_id(&sample_counts, info.sample_rate)
+            }
+        } else {
+            let sample_counts: Vec<u64> = info.track_boundaries.iter()
+                .map(|&(_, count)| count)
+                .collect();
+            compute_ar_disc_id(&sample_counts, info.sample_rate)
+        }
+    };
+    let url = ar_url(&disc_id);
+    let disc_id_str = format!(
+        "{:08x}-{:08x}-{:08x}",
+        disc_id.id1, disc_id.id2, disc_id.freedb_id,
+    );
+
+    // Fetch database.
+    let db_response = match fetch_ar_data(&disc_id).await {
+        Ok(Some(resp)) => resp,
+        Ok(None) => {
+            return ArVerifyResult {
+                tracks: (0..n).map(|i| ArTrackResult {
+                    path: info.audio_path.clone(),
+                    track_number: (i + 1) as u32,
+                    status: ArTrackStatus::NoDiscInDatabase,
+                    confidence: None,
+                    offset: None,
+                    crc_v1: 0,
+                    crc_v2: 0,
+                }).collect(),
+                was_common_scan: !full_scan,
+                disc_id_str,
+                url,
+            };
+        }
+        Err(e) => {
+            return ArVerifyResult {
+                tracks: (0..n).map(|i| ArTrackResult {
+                    path: info.audio_path.clone(),
+                    track_number: (i + 1) as u32,
+                    status: ArTrackStatus::Error(e.clone()),
+                    confidence: None,
+                    offset: None,
+                    crc_v1: 0,
+                    crc_v2: 0,
+                }).collect(),
+                was_common_scan: !full_scan,
+                disc_id_str,
+                url,
+            };
+        }
+    };
+
+    // Decode the full image to raw i16. Try ffmpeg first, fall back to
+    // wvunpack for WavPack v4 files.
+    let audio_path = info.audio_path.clone();
+    let raw_result = tokio::task::spawn_blocking(move || {
+        decode_track_to_raw_i16(&audio_path)
+            .or_else(|_| decode_to_raw_i16_wvunpack(&audio_path))
+    }).await;
+
+    let raw_i16 = match raw_result {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
+            return ArVerifyResult {
+                tracks: (0..n).map(|i| ArTrackResult {
+                    path: info.audio_path.clone(),
+                    track_number: (i + 1) as u32,
+                    status: ArTrackStatus::Error(e.clone()),
+                    confidence: None,
+                    offset: None,
+                    crc_v1: 0,
+                    crc_v2: 0,
+                }).collect(),
+                was_common_scan: !full_scan,
+                disc_id_str,
+                url,
+            };
+        }
+        Err(e) => {
+            return ArVerifyResult {
+                tracks: (0..n).map(|i| ArTrackResult {
+                    path: info.audio_path.clone(),
+                    track_number: (i + 1) as u32,
+                    status: ArTrackStatus::Error(format!("decode task failed: {}", e)),
+                    confidence: None,
+                    offset: None,
+                    crc_v1: 0,
+                    crc_v2: 0,
+                }).collect(),
+                was_common_scan: !full_scan,
+                disc_id_str,
+                url,
+            };
+        }
+    };
+
+    // Convert full image to DWORDs.
+    let total_dwords = raw_i16.len() / 2;
+    let all_dwords: Vec<u32> = (0..total_dwords)
+        .map(|i| {
+            let l = raw_i16[i * 2] as u16;
+            let r = raw_i16[i * 2 + 1] as u16;
+            (l as u32) | ((r as u32) << 16)
+        })
+        .collect();
+    drop(raw_i16); // free the i16 buffer
+
+    // Build offset list and margin.
+    let offsets: Vec<i32> = if full_scan {
+        (-1200..=1200).collect()
+    } else {
+        COMMON_OFFSETS.to_vec()
+    };
+    let margin = if full_scan { MAX_OFFSET } else {
+        COMMON_OFFSETS.iter().map(|o| o.unsigned_abs() as usize).max().unwrap_or(0)
+    };
+
+    // Verify each track by slicing the DWORDs buffer.
+    let pressings = &db_response.pressings;
+    let mut results = Vec::with_capacity(n);
+
+    for (i, &(start_sample, sample_count)) in info.track_boundaries.iter().enumerate() {
+        let is_first = i == 0;
+        let is_last = i == n - 1;
+        let start_dw = start_sample as usize;
+        let count_dw = sample_count as usize;
+
+        // Extend slice for offset scanning margin, using neighboring tracks'
+        // audio as natural margin (since the image is one continuous buffer).
+        let margin_start = start_dw.saturating_sub(margin);
+        let margin_end = (start_dw + count_dw + margin).min(total_dwords);
+        let eff_margin = start_dw - margin_start;
+
+        let track_slice = &all_dwords[margin_start..margin_end];
+
+        // CRC at offset 0 for display.
+        let (crc_v1_0, crc_v2_0) = compute_ar_crcs(
+            &track_slice[eff_margin..eff_margin + count_dw],
+            is_first,
+            is_last,
+        );
+
+        // Try matching at all offsets.
+        match try_offsets(
+            track_slice, count_dw, eff_margin,
+            is_first, is_last,
+            pressings, i,
+            &offsets,
+        ) {
+            Some((offset, confidence)) => {
+                results.push(ArTrackResult {
+                    path: info.audio_path.clone(),
+                    track_number: (i + 1) as u32,
+                    status: ArTrackStatus::Verified,
+                    confidence: Some(confidence),
+                    offset: Some(offset),
+                    crc_v1: crc_v1_0,
+                    crc_v2: crc_v2_0,
+                });
+            }
+            None => {
+                results.push(ArTrackResult {
+                    path: info.audio_path.clone(),
+                    track_number: (i + 1) as u32,
+                    status: ArTrackStatus::Mismatch,
+                    confidence: None,
+                    offset: None,
+                    crc_v1: crc_v1_0,
+                    crc_v2: crc_v2_0,
+                });
+            }
+        }
+    }
+
+    ArVerifyResult {
+        tracks: results,
+        was_common_scan: !full_scan,
+        disc_id_str,
+        url,
+    }
+}
+
+/// Decode a WavPack file to raw i16 via wvunpack (fallback for v4 files).
+///
+/// Runs `wvunpack -q -o - file.wv` which outputs raw PCM to stdout.
+fn decode_to_raw_i16_wvunpack(path: &Path) -> Result<Vec<i16>, String> {
+    let output = std::process::Command::new("wvunpack")
+        .args(["-q", "-o", "-"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("wvunpack decode failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err("wvunpack decode returned error".into());
+    }
+
+    // wvunpack -o - outputs WAV format (with header). We need to skip
+    // the WAV header (44 bytes for standard PCM WAV) and read raw i16.
+    let data = &output.stdout;
+    if data.len() < 44 {
+        return Err("wvunpack output too short".into());
+    }
+
+    // Find the "data" chunk in the WAV header.
+    let data_offset = find_wav_data_offset(data).unwrap_or(44);
+    let pcm_data = &data[data_offset..];
+
+    // Reinterpret as i16 (little-endian, which is native on LE platforms).
+    if pcm_data.len() % 2 != 0 {
+        return Err("wvunpack output has odd byte count".into());
+    }
+    let samples: Vec<i16> = pcm_data.chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    Ok(samples)
+}
+
+/// Find the offset of the "data" chunk payload in a WAV file.
+fn find_wav_data_offset(wav: &[u8]) -> Option<usize> {
+    // Search for "data" marker followed by chunk size.
+    let mut pos = 12; // skip RIFF header (12 bytes)
+    while pos + 8 <= wav.len() {
+        let chunk_id = &wav[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([wav[pos+4], wav[pos+5], wav[pos+6], wav[pos+7]]) as usize;
+        if chunk_id == b"data" {
+            return Some(pos + 8); // payload starts after chunk header
+        }
+        pos += 8 + chunk_size;
+    }
+    None
+}
+
 // ── Offset correction ───────────────────────────────────────────────
 
 /// Check if all tracks in a result verified at the same non-zero offset.

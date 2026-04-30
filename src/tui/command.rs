@@ -1358,6 +1358,39 @@ pub fn execute_command(
                 _ => Vec::new(),
             };
             super::probe::sort_paths_by_track(&mut paths);
+            // Check for single-image CUE layout before the normal multi-file flow.
+            if paths.len() <= 1 {
+                let dir = if paths.is_empty() {
+                    let sel = collect_selection_for_file_ops(app);
+                    sel.first().and_then(|p| {
+                        if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }
+                    })
+                } else {
+                    paths[0].parent().map(|d| d.to_path_buf())
+                };
+                if let Some(ref dir) = dir {
+                    if let Some(info) = super::cue_parser::detect_single_image(dir) {
+                        let n = info.track_boundaries.len();
+                        let full_scan = force;
+                        let tx = tx.clone();
+                        app.set_status(format!(
+                            "AccurateRip: verifying {} tracks (single image)...", n,
+                        ));
+                        tokio::spawn(async move {
+                            let result = super::accuraterip::verify_single_image(
+                                &info, full_scan,
+                            ).await;
+                            let _ = tx.send(AppMessage::AccurateRipComplete {
+                                pages: vec![super::app::ArVerifyPage {
+                                    label: String::new(),
+                                    result,
+                                }],
+                            }).await;
+                        });
+                        return;
+                    }
+                }
+            }
             if paths.is_empty() {
                 app.set_status("No audio files for AccurateRip verification");
             } else {
