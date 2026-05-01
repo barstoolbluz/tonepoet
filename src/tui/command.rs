@@ -1684,7 +1684,12 @@ pub fn execute_command(
                 app.set_status(":ar-batch only works on the browse screen");
                 return;
             }
-            let scan_dir = app.browse.current_dir.clone();
+            // Use the selected entry if it's a directory, otherwise
+            // use the current browse directory.
+            let scan_dir = app.browse.selected_entry()
+                .filter(|e| e.path.is_dir())
+                .map(|e| e.path.clone())
+                .unwrap_or_else(|| app.browse.current_dir.clone());
             app.set_status(format!("AccurateRip batch: scanning {}...", scan_dir.display()));
 
             let tx = tx.clone();
