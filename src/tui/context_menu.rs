@@ -635,58 +635,24 @@ pub fn execute_context_action(
                 .collect();
             super::probe::sort_paths_by_track(&mut audio_paths);
 
-            if audio_paths.is_empty() {
-                // Check for single-image CUE layout before giving up.
-                let sel_dir = super::command::collect_selection_for_file_ops(app);
-                let dir = sel_dir.first()
-                    .and_then(|p| if p.is_dir() { Some(p.as_path()) } else { p.parent() });
-                if let Some(dir) = dir {
+            // Check for single-image CUE layout (one audio file + CUE sheet).
+            if audio_paths.len() <= 1 {
+                let dir = if audio_paths.is_empty() {
+                    let sel_dir = super::command::collect_selection_for_file_ops(app);
+                    sel_dir.first().and_then(|p| {
+                        if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }
+                    })
+                } else {
+                    audio_paths[0].parent().map(|d| d.to_path_buf())
+                };
+                if let Some(ref dir) = dir {
                     if let Some(info) = super::cue_parser::detect_single_image(dir) {
-                        // Compute durations from CUE track boundaries.
-                        let durations: Vec<f64> = info.track_boundaries.iter()
-                            .map(|&(_, count)| count as f64 / info.sample_rate as f64)
-                            .collect();
-                        let disc_id = super::gnudb::compute_disc_id(&durations);
-                        app.set_status(format!("Querying gnudb.org (single image, disc ID: {})...", disc_id.disc_id));
-                        // Use the image path repeated for each track (editor needs paths).
-                        let paths_for_editor: Vec<std::path::PathBuf> = (0..info.sheet.tracks.len())
-                            .map(|_| info.audio_path.clone())
-                            .collect();
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let result = super::gnudb::query_gnudb(&disc_id).await;
-                            let _ = tx.send(super::message::AppMessage::GnudbQueryComplete {
-                                result,
-                                paths: paths_for_editor,
-                            }).await;
-                        });
+                        launch_single_image_gnudb(info, app, tx);
                         return;
                     }
                 }
-                app.set_status("No audio files for GNUDB lookup");
-                return;
-            }
-
-            // Check single-image before grouping (single audio file + CUE).
-            if audio_paths.len() == 1 {
-                let dir = audio_paths[0].parent().unwrap_or(std::path::Path::new("."));
-                if let Some(info) = super::cue_parser::detect_single_image(dir) {
-                    let durations: Vec<f64> = info.track_boundaries.iter()
-                        .map(|&(_, count)| count as f64 / info.sample_rate as f64)
-                        .collect();
-                    let disc_id = super::gnudb::compute_disc_id(&durations);
-                    app.set_status(format!("Querying gnudb.org (single image, disc ID: {})...", disc_id.disc_id));
-                    let paths_for_editor: Vec<std::path::PathBuf> = (0..info.sheet.tracks.len())
-                        .map(|_| info.audio_path.clone())
-                        .collect();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let result = super::gnudb::query_gnudb(&disc_id).await;
-                        let _ = tx.send(super::message::AppMessage::GnudbQueryComplete {
-                            result,
-                            paths: paths_for_editor,
-                        }).await;
-                    });
+                if audio_paths.is_empty() {
+                    app.set_status("No audio files for GNUDB lookup");
                     return;
                 }
             }
@@ -930,6 +896,30 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Launch a GNUDB query for a single-image CUE album.
+fn launch_single_image_gnudb(
+    info: super::cue_parser::SingleImageInfo,
+    app: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    let durations: Vec<f64> = info.track_boundaries.iter()
+        .map(|&(_, count)| count as f64 / info.sample_rate as f64)
+        .collect();
+    let disc_id = super::gnudb::compute_disc_id(&durations);
+    app.set_status(format!("Querying gnudb.org (single image, disc ID: {})...", disc_id.disc_id));
+    let paths_for_editor: Vec<std::path::PathBuf> = (0..info.sheet.tracks.len())
+        .map(|_| info.audio_path.clone())
+        .collect();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = super::gnudb::query_gnudb(&disc_id).await;
+        let _ = tx.send(super::message::AppMessage::GnudbQueryComplete {
+            result,
+            paths: paths_for_editor,
+        }).await;
+    });
 }
 
 /// Resolve whether a convert action should start processing.

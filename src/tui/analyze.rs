@@ -478,23 +478,30 @@ pub struct HdcdResult {
     pub detail: String,
 }
 
-/// Detect HDCD encoding by running ffmpeg's af_hdcd filter on the first
-/// 30 seconds and parsing the verbose stderr output.
-pub async fn detect_hdcd(path: &Path) -> Option<HdcdResult> {
+/// Detect HDCD encoding by running ffmpeg's af_hdcd filter and parsing
+/// the info-level stderr output.
+///
+/// Optional `seek_secs` and `duration_secs` allow scanning a specific
+/// segment of a single-image file (per-track HDCD detection).
+pub async fn detect_hdcd(
+    path: &Path,
+    seek_secs: Option<f64>,
+    duration_secs: Option<f64>,
+) -> Option<HdcdResult> {
     use tokio::process::Command;
 
-    let output = Command::new("ffmpeg")
-        .args([
-            "-hide_banner", "-nostats", "-y", "-v", "info",
-            "-t", "1",
-        ])
-        .arg("-i").arg(path)
-        .args(["-af", "hdcd", "-f", "s24le", "/dev/null"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .ok()?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-nostats", "-y", "-v", "info"]);
+    if let Some(ss) = seek_secs {
+        cmd.args(["-ss", &format!("{:.6}", ss)]);
+    }
+    cmd.args(["-t", &format!("{:.6}", duration_secs.unwrap_or(1.0))]);
+    cmd.arg("-i").arg(path);
+    cmd.args(["-af", "hdcd", "-f", "s24le", "/dev/null"]);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let output = cmd.output().await.ok()?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     parse_hdcd_output(&stderr)

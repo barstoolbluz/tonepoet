@@ -767,12 +767,13 @@ pub fn execute_command(
                                 tokio::spawn(async move {
                                     let pcm_path = audio_path.clone();
 
+                                    let seek = start as f64 / info.sample_rate as f64;
+                                    let dur = count as f64 / info.sample_rate as f64;
                                     let (pcm_result, hdcd_result) = tokio::join!(
                                         tokio::task::spawn_blocking(move || {
                                             super::analyze::analyze_file(&pcm_path, Some(start), Some(count))
                                         }),
-                                        // HDCD: detect on the full image (first second is enough).
-                                        super::analyze::detect_hdcd(&audio_path),
+                                        super::analyze::detect_hdcd(&audio_path, Some(seek), Some(dur)),
                                     );
                                     // LUFS: skip for seek-based (loudgain needs a real file per track).
 
@@ -868,7 +869,7 @@ pub fn execute_command(
                                                 super::analyze::analyze_file(&pcm_path, None, None)
                                             }),
                                             super::analyze::measure_loudness(&lufs_path),
-                                            super::analyze::detect_hdcd(&hdcd_path),
+                                            super::analyze::detect_hdcd(&hdcd_path, None, None),
                                         );
                                         let final_result = match pcm_result {
                                             Ok(Ok(mut result)) => {
@@ -974,7 +975,7 @@ pub fn execute_command(
                                     super::analyze::analyze_file(&pcm_path, None, None)
                                 }),
                                 super::analyze::measure_loudness(&lufs_path),
-                                super::analyze::detect_hdcd(&hdcd_path),
+                                super::analyze::detect_hdcd(&hdcd_path, None, None),
                             );
 
                             // Merge results and send (always send to decrement pending counter).
