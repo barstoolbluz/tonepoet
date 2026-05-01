@@ -261,7 +261,6 @@ fn build_accuraterip_submenu() -> ContextMenuEntry {
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
         item("Verify", ContextAction::Verify),
-        build_accuraterip_submenu(),
         item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
         item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
         separator(),
@@ -310,6 +309,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                         .unwrap_or(false)))
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
+            items.push(build_accuraterip_submenu());
             items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(true));
@@ -342,6 +342,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                         .unwrap_or(false)))
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
+            items.push(build_accuraterip_submenu());
             items.push(build_utilities_submenu(app));
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
