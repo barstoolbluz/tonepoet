@@ -132,6 +132,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::AccurateRipVerify(ref state) => {
             draw_accuraterip_verify(f, state);
         }
+        ActiveOverlay::ArBatchReport { ref result, scroll } => {
+            draw_ar_batch_report(f, result, scroll);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
@@ -2553,6 +2556,135 @@ fn draw_accuraterip_verify(
     }
 
     let footer = Line::from(pills);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
+}
+
+// ── AR batch report overlay ─────────────────────────────────────────
+
+fn draw_ar_batch_report(
+    f: &mut Frame,
+    result: &super::accuraterip::ArBatchResult,
+    scroll: usize,
+) {
+    let area = f.size();
+    let w = (area.width * 80 / 100).max(60).min(area.width.saturating_sub(2));
+    let h = (area.height * 80 / 100).max(12).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let total = result.albums.len();
+    let verified = result.albums.iter()
+        .filter(|a| a.verified == a.total_tracks && a.total_tracks > 0 && !a.not_in_db)
+        .count();
+
+    let title = format!(
+        " AccurateRip Batch — {}/{} albums verified ",
+        verified, total,
+    );
+    let border_color = if verified == total && total > 0 {
+        theme::GREEN
+    } else if verified > 0 {
+        theme::AMBER
+    } else {
+        theme::RED
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Summary header.
+    let not_in_db = result.albums.iter().filter(|a| a.not_in_db).count();
+    let mismatched = result.albums.iter().filter(|a| a.mismatched > 0 && !a.not_in_db).count();
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{} verified, {} not in DB, {} mismatch", verified, not_in_db, mismatched),
+            Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(ref rp) = result.report_path {
+        lines.push(Line::from(vec![
+            Span::styled("  Report: ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(rp.display().to_string(), Style::default().fg(theme::TEXT_DIM)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // Per-album results.
+    for a in &result.albums {
+        let (icon, color) = if a.error.is_some() {
+            (" ! ", theme::RED)
+        } else if a.not_in_db {
+            (" ? ", theme::AMBER)
+        } else if a.verified == a.total_tracks && a.total_tracks > 0 {
+            (" ✓ ", theme::GREEN)
+        } else if a.mismatched > 0 {
+            (" ✗ ", theme::RED)
+        } else {
+            (" ~ ", theme::AMBER)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(icon, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(&a.album_name, Style::default().fg(theme::TEXT_BRIGHT)),
+        ]));
+
+        let detail = if let Some(ref e) = a.error {
+            format!("error: {}", e)
+        } else if a.not_in_db {
+            "disc not in database".to_string()
+        } else {
+            let mut d = format!("{}/{} verified", a.verified, a.total_tracks);
+            if let Some(c) = a.confidence {
+                d.push_str(&format!(", confidence {}", c));
+            }
+            if let Some(o) = a.offset {
+                d.push_str(&format!(", offset {:+}", o));
+            }
+            if a.mismatched > 0 {
+                d.push_str(&format!(", {} mismatch", a.mismatched));
+            }
+            d
+        };
+        lines.push(Line::from(vec![
+            Span::styled("     ", Style::default()),
+            Span::styled(detail, Style::default().fg(theme::TEXT_DIM)),
+        ]));
+    }
+
+    let total_lines = lines.len();
+    let visible = chunks[0].height as usize;
+    let scroll = scroll.min(total_lines.saturating_sub(visible));
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    let footer = Line::from(vec![
+        footer_pill("Esc close", theme::GREEN),
+    ]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],

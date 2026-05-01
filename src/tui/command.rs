@@ -51,7 +51,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "search", "s", "rs", "rsearch",
     "context", "menu",
     "ar", "ar!", "accuraterip", "accuraterip!",
-    "ar-fix",
+    "ar-fix", "ar-batch",
     "view", "cat", "edit-file", "ef",
 ];
 
@@ -277,6 +277,8 @@ pub enum Command {
     AccurateRip { force: bool },
     /// Apply AccurateRip offset correction.
     ArFix,
+    /// Batch AccurateRip verification of current browse directory.
+    ArBatch,
     /// View a text file in read-only mode.
     ViewFile(std::path::PathBuf),
     /// Edit a text file (not .log files).
@@ -408,6 +410,7 @@ pub fn parse_command(input: &str) -> Command {
         "ar" | "accuraterip" => Command::AccurateRip { force: false },
         "ar!" | "accuraterip!" => Command::AccurateRip { force: true },
         "ar-fix" => Command::ArFix,
+        "ar-batch" => Command::ArBatch,
         "view" | "cat" => Command::ViewFile(std::path::PathBuf::from(args)),
         "edit-file" | "ef" => Command::EditFile(std::path::PathBuf::from(args)),
         _ => Command::Unknown(input.to_string()),
@@ -1675,6 +1678,22 @@ pub fn execute_command(
             } else {
                 app.set_status(":ar-fix requires the AccurateRip verification overlay to be open");
             }
+        }
+        Command::ArBatch => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":ar-batch only works on the browse screen");
+                return;
+            }
+            let scan_dir = app.browse.current_dir.clone();
+            app.set_status(format!("AccurateRip batch: scanning {}...", scan_dir.display()));
+
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = super::accuraterip::batch_verify(
+                    &scan_dir, tx.clone(),
+                ).await;
+                let _ = tx.send(AppMessage::ArBatchComplete { result }).await;
+            });
         }
         Command::ViewFile(path) => {
             // Resolve path: if empty, use current browse selection.

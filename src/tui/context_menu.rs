@@ -102,6 +102,12 @@ pub enum ContextAction {
     ImportCueFromBrowse,
     /// AccurateRip verification (common offsets).
     VerifyAccurateRip,
+    /// AccurateRip verification (full offset scan).
+    AccurateRipFullScan,
+    /// AccurateRip batch verification of current directory.
+    AccurateRipBatch,
+    /// AccurateRip offset correction.
+    AccurateRipFixOffset,
     /// View a text file in read-only mode.
     ViewFile(PathBuf),
     /// Edit a text file (not available for .log files).
@@ -239,10 +245,23 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
 
 /// Build the "Utilities" submenu. Compare items change based on whether
 /// a reference is currently stored.
+fn build_accuraterip_submenu() -> ContextMenuEntry {
+    ContextMenuEntry::Submenu {
+        label: "AccurateRip".to_string(),
+        children: vec![
+            item("Verify", ContextAction::VerifyAccurateRip),
+            item("Verify (full scan)", ContextAction::AccurateRipFullScan),
+            item("Batch verify", ContextAction::AccurateRipBatch),
+            separator(),
+            item("Fix offset", ContextAction::AccurateRipFixOffset),
+        ],
+    }
+}
+
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
         item("Verify", ContextAction::Verify),
-        item("AccurateRip verify", ContextAction::VerifyAccurateRip),
+        build_accuraterip_submenu(),
         item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
         item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
         separator(),
@@ -589,6 +608,18 @@ pub fn execute_context_action(
         }
         ContextAction::VerifyAccurateRip => {
             let cmd = super::command::Command::AccurateRip { force: false };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::AccurateRipFullScan => {
+            let cmd = super::command::Command::AccurateRip { force: true };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::AccurateRipBatch => {
+            let cmd = super::command::Command::ArBatch;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::AccurateRipFixOffset => {
+            let cmd = super::command::Command::ArFix;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::ViewFile(path) => {

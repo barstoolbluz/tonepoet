@@ -731,6 +731,23 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
 
+        AppMessage::ArBatchComplete { result } => {
+            let total = result.albums.len();
+            let verified = result.albums.iter()
+                .filter(|a| a.verified == a.total_tracks && a.total_tracks > 0 && !a.not_in_db)
+                .count();
+            let report_msg = result.report_path.as_ref()
+                .map(|p| format!(" — report: {}", p.display()))
+                .unwrap_or_default();
+            app.set_status(format!(
+                "Batch AR: {}/{} albums verified{}",
+                verified, total, report_msg,
+            ));
+            app.active_overlay = ActiveOverlay::ArBatchReport {
+                result,
+                scroll: 0,
+            };
+        }
         AppMessage::OffsetCorrectionComplete { result } => {
             match result {
                 Ok(summary) => {
@@ -761,6 +778,25 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     pages.len(), verified, total,
                 ));
             }
+            // Cache AR results per track (each track keyed by its own path).
+            for page in &pages {
+                for t in &page.result.tracks {
+                    if let Ok(meta) = std::fs::metadata(&t.path) {
+                        let mtime = meta.modified()
+                            .map(crate::db::systemtime_to_unix)
+                            .unwrap_or(0);
+                        if let Err(e) = app.db.store_ar(
+                            &t.path.display().to_string(),
+                            mtime, meta.len(),
+                            std::slice::from_ref(t),
+                            &page.result.disc_id_str,
+                        ) {
+                            log::error!("AR cache store failed: {}", e);
+                        }
+                    }
+                }
+            }
+
             app.active_overlay = ActiveOverlay::AccurateRipVerify(
                 Box::new(crate::tui::app::ArVerifyState {
                     pages,

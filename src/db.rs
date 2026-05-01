@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 15;
+const CURRENT_VERSION: u32 = 16;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -109,6 +109,9 @@ impl Database {
         }
         if version < 15 {
             self.migrate_v15()?;
+        }
+        if version < 16 {
+            self.migrate_v16()?;
         }
 
         self.conn
@@ -463,6 +466,114 @@ impl Database {
             ALTER TABLE analysis_cache ADD COLUMN hdcd_detected INTEGER;
             ALTER TABLE analysis_cache ADD COLUMN hdcd_detail TEXT;
         ").map_err(|e| format!("v15 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    /// v16: AccurateRip result cache.
+    fn migrate_v16(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS ar_cache (
+                file_path TEXT NOT NULL,
+                track_number INTEGER NOT NULL,
+                file_mtime INTEGER NOT NULL,
+                file_size INTEGER NOT NULL,
+                disc_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                confidence INTEGER,
+                ar_offset INTEGER,
+                crc_v1 INTEGER NOT NULL,
+                crc_v2 INTEGER NOT NULL,
+                verified_at TEXT NOT NULL,
+                PRIMARY KEY (file_path, track_number)
+            );
+        ").map_err(|e| format!("v16 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    // ── AccurateRip cache ───────────────────────────────────────
+
+    /// Look up cached AR results for a file. Returns None if not cached
+    /// or stale (mtime/size changed).
+    pub fn get_cached_ar(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: u64,
+    ) -> Option<Vec<crate::tui::accuraterip::ArTrackResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_number, status, confidence, ar_offset, crc_v1, crc_v2
+             FROM ar_cache
+             WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3
+             ORDER BY track_number"
+        ).ok()?;
+
+        let results: Vec<crate::tui::accuraterip::ArTrackResult> = stmt.query_map(
+            params![file_path, mtime, size as i64],
+            |row| {
+                let track_number: u32 = row.get(0)?;
+                let status_str: String = row.get(1)?;
+                let confidence: Option<u8> = row.get(2)?;
+                let ar_offset: Option<i32> = row.get(3)?;
+                let crc_v1: u32 = row.get::<_, i64>(4)? as u32;
+                let crc_v2: u32 = row.get::<_, i64>(5)? as u32;
+
+                let status = match status_str.as_str() {
+                    "verified" => crate::tui::accuraterip::ArTrackStatus::Verified,
+                    "mismatch" => crate::tui::accuraterip::ArTrackStatus::Mismatch,
+                    "not_in_db" => crate::tui::accuraterip::ArTrackStatus::NoDiscInDatabase,
+                    _ => crate::tui::accuraterip::ArTrackStatus::Error(status_str),
+                };
+
+                Ok(crate::tui::accuraterip::ArTrackResult {
+                    path: std::path::PathBuf::from(file_path),
+                    track_number,
+                    status,
+                    confidence,
+                    offset: ar_offset,
+                    crc_v1,
+                    crc_v2,
+                })
+            },
+        ).ok()?.filter_map(|r| r.ok()).collect();
+
+        if results.is_empty() { None } else { Some(results) }
+    }
+
+    /// Store AR verification results in the cache.
+    pub fn store_ar(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: u64,
+        results: &[crate::tui::accuraterip::ArTrackResult],
+        disc_id: &str,
+    ) -> Result<(), String> {
+        // Delete old entries for this file (might have different track count).
+        self.conn.execute(
+            "DELETE FROM ar_cache WHERE file_path = ?1",
+            params![file_path],
+        ).map_err(|e| format!("ar cache delete: {}", e))?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        for t in results {
+            let status_str = match &t.status {
+                crate::tui::accuraterip::ArTrackStatus::Verified => "verified",
+                crate::tui::accuraterip::ArTrackStatus::Mismatch => "mismatch",
+                crate::tui::accuraterip::ArTrackStatus::NoDiscInDatabase => "not_in_db",
+                crate::tui::accuraterip::ArTrackStatus::Error(_) => "error",
+            };
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ar_cache (
+                    file_path, track_number, file_mtime, file_size,
+                    disc_id, status, confidence, ar_offset, crc_v1, crc_v2, verified_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    file_path, t.track_number, mtime, size as i64,
+                    disc_id, status_str, t.confidence, t.offset,
+                    t.crc_v1 as i64, t.crc_v2 as i64, now,
+                ],
+            ).map_err(|e| format!("ar cache store: {}", e))?;
+        }
         Ok(())
     }
 

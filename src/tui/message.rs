@@ -120,6 +120,10 @@ pub enum AppMessage {
     AccurateRipComplete {
         pages: Vec<crate::tui::app::ArVerifyPage>,
     },
+    /// Result of an async AR batch verification.
+    ArBatchComplete {
+        result: Box<crate::tui::accuraterip::ArBatchResult>,
+    },
     /// Result of an async AR offset correction.
     OffsetCorrectionComplete {
         result: Result<String, String>,

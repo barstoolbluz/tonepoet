@@ -88,6 +88,28 @@ pub struct ArVerifyResult {
     pub url: String,
 }
 
+/// Result of a batch AR verification across a library.
+#[derive(Debug, Clone)]
+pub struct ArBatchResult {
+    pub albums: Vec<ArBatchAlbumResult>,
+    pub scan_dir: PathBuf,
+    pub report_path: Option<PathBuf>,
+}
+
+/// Summary for one album in a batch verification.
+#[derive(Debug, Clone)]
+pub struct ArBatchAlbumResult {
+    pub dir: PathBuf,
+    pub album_name: String,
+    pub total_tracks: usize,
+    pub verified: usize,
+    pub mismatched: usize,
+    pub not_in_db: bool,
+    pub confidence: Option<u8>,
+    pub offset: Option<i32>,
+    pub error: Option<String>,
+}
+
 // ── Disc ID computation ─────────────────────────────────────────────
 
 /// Compute the AccurateRip disc ID from exact per-track sample counts.
@@ -1310,6 +1332,187 @@ pub fn format_summary(result: &ArVerifyResult) -> String {
         "{}/{} verified, confidence {}, offset {}",
         verified, total, max_confidence, offset_str,
     )
+}
+
+// ── Batch verification ──────────────────────────────────────────────
+
+/// Batch-verify all albums under a directory tree.
+///
+/// Discovers albums by grouping audio files by parent directory,
+/// verifies each album sequentially (to avoid hammering the AR server),
+/// and returns a summary for all albums.
+pub async fn batch_verify(
+    scan_dir: &Path,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) -> Box<ArBatchResult> {
+    // Discover all audio files recursively.
+    let mut all_audio = super::browse::expand_paths_to_audio(&[scan_dir.to_path_buf()]);
+    super::probe::sort_paths_by_track(&mut all_audio);
+
+    if all_audio.is_empty() {
+        return Box::new(ArBatchResult {
+            albums: Vec::new(),
+            scan_dir: scan_dir.to_path_buf(),
+            report_path: None,
+        });
+    }
+
+    // Group by parent directory (each directory = one album).
+    let groups = super::gnudb::group_by_disc(&all_audio);
+    let total_albums = groups.len();
+    let mut albums: Vec<ArBatchAlbumResult> = Vec::with_capacity(total_albums);
+
+    for (idx, (label, group_paths)) in groups.into_iter().enumerate() {
+        let dir = group_paths[0].parent().unwrap_or(Path::new(".")).to_path_buf();
+        let album_name = if !label.is_empty() {
+            label.clone()
+        } else {
+            dir.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string()
+        };
+
+        let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
+            format!("Batch AR: {}/{} — {}...", idx + 1, total_albums, album_name),
+        )).await;
+
+        // Check for single-image layout.
+        let result = if let Some(info) = super::cue_parser::detect_single_image(&dir) {
+            verify_single_image(&info, false).await
+        } else {
+            // Multi-file: collect sample counts and verify.
+            match collect_sample_counts(&group_paths) {
+                Ok((sample_counts, sample_rate)) => {
+                    verify_album(&group_paths, &sample_counts, sample_rate, false).await
+                }
+                Err(e) => {
+                    albums.push(ArBatchAlbumResult {
+                        dir,
+                        album_name,
+                        total_tracks: group_paths.len(),
+                        verified: 0,
+                        mismatched: 0,
+                        not_in_db: false,
+                        confidence: None,
+                        offset: None,
+                        error: Some(e),
+                    });
+                    continue;
+                }
+            }
+        };
+
+        // Summarize this album.
+        let verified = result.tracks.iter()
+            .filter(|t| t.status == ArTrackStatus::Verified)
+            .count();
+        let mismatched = result.tracks.iter()
+            .filter(|t| t.status == ArTrackStatus::Mismatch)
+            .count();
+        let not_in_db = result.tracks.iter()
+            .any(|t| t.status == ArTrackStatus::NoDiscInDatabase);
+        let max_conf = result.tracks.iter()
+            .filter_map(|t| t.confidence)
+            .max();
+        let common_offset = result.tracks.iter()
+            .filter_map(|t| t.offset)
+            .next();
+
+        albums.push(ArBatchAlbumResult {
+            dir,
+            album_name,
+            total_tracks: result.tracks.len(),
+            verified,
+            mismatched,
+            not_in_db,
+            confidence: max_conf,
+            offset: common_offset,
+            error: None,
+        });
+    }
+
+    // Generate report file.
+    let report = format_batch_report(&albums, scan_dir);
+    let report_path = scan_dir.join("accuraterip-report.txt");
+    let report_path = match std::fs::write(&report_path, &report) {
+        Ok(()) => Some(report_path),
+        Err(e) => {
+            log::warn!("Failed to write AR batch report: {}", e);
+            None
+        }
+    };
+
+    Box::new(ArBatchResult {
+        albums,
+        scan_dir: scan_dir.to_path_buf(),
+        report_path,
+    })
+}
+
+/// Format a text report from batch verification results.
+fn format_batch_report(albums: &[ArBatchAlbumResult], scan_dir: &Path) -> String {
+    let total = albums.len();
+    let fully_verified = albums.iter().filter(|a| a.verified == a.total_tracks && a.total_tracks > 0 && !a.not_in_db).count();
+    let partial = albums.iter().filter(|a| a.verified > 0 && a.verified < a.total_tracks && !a.not_in_db).count();
+    let not_in_db = albums.iter().filter(|a| a.not_in_db).count();
+    let mismatch_only = albums.iter().filter(|a| a.mismatched > 0 && a.verified == 0 && !a.not_in_db).count();
+    let errors = albums.iter().filter(|a| a.error.is_some()).count();
+
+    let mut out = String::new();
+    out.push_str("AccurateRip Batch Verification Report\n");
+    out.push_str(&format!("Generated: {}\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+    out.push_str(&format!("Directory: {}\n\n", scan_dir.display()));
+
+    out.push_str(&format!("Summary:\n"));
+    out.push_str(&format!("  Albums scanned:    {:>5}\n", total));
+    out.push_str(&format!("  Fully verified:    {:>5} ({:.1}%)\n", fully_verified, fully_verified as f64 / total.max(1) as f64 * 100.0));
+    out.push_str(&format!("  Partial match:     {:>5} ({:.1}%)\n", partial, partial as f64 / total.max(1) as f64 * 100.0));
+    out.push_str(&format!("  Not in database:   {:>5} ({:.1}%)\n", not_in_db, not_in_db as f64 / total.max(1) as f64 * 100.0));
+    out.push_str(&format!("  CRC mismatch:      {:>5} ({:.1}%)\n", mismatch_only, mismatch_only as f64 / total.max(1) as f64 * 100.0));
+    if errors > 0 {
+        out.push_str(&format!("  Errors:            {:>5}\n", errors));
+    }
+    out.push_str("\n");
+    out.push_str(&"─".repeat(60));
+    out.push_str("\n\n");
+
+    for a in albums {
+        let icon = if a.error.is_some() {
+            "!"
+        } else if a.not_in_db {
+            "?"
+        } else if a.verified == a.total_tracks && a.total_tracks > 0 {
+            "✓"
+        } else if a.mismatched > 0 {
+            "✗"
+        } else {
+            "~"
+        };
+
+        out.push_str(&format!("{} {}\n", icon, a.album_name));
+        if let Some(ref e) = a.error {
+            out.push_str(&format!("  error: {}\n", e));
+        } else if a.not_in_db {
+            out.push_str("  Disc not in AccurateRip database\n");
+        } else {
+            let mut detail = format!("  {}/{} verified", a.verified, a.total_tracks);
+            if let Some(conf) = a.confidence {
+                detail.push_str(&format!(", confidence {}", conf));
+            }
+            if let Some(off) = a.offset {
+                detail.push_str(&format!(", offset {:+}", off));
+            }
+            if a.mismatched > 0 {
+                detail.push_str(&format!(", {} CRC mismatch", a.mismatched));
+            }
+            out.push_str(&detail);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    out
 }
 
 // ── Single-image verification ───────────────────────────────────────
