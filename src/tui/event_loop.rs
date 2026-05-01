@@ -797,6 +797,32 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
 
+            // If auto-fix was requested (context menu "Fix offset"),
+            // check for a fixable offset and go straight to confirmation.
+            if app.auto_fix_on_complete {
+                app.auto_fix_on_complete = false;
+                for page in &pages {
+                    if let Some(offset) = crate::tui::accuraterip::detect_uniform_offset(&page.result) {
+                        let paths: Vec<std::path::PathBuf> = page.result.tracks.iter()
+                            .map(|t| t.path.clone())
+                            .collect();
+                        let n = paths.len();
+                        app.active_overlay = ActiveOverlay::Confirmation {
+                            message: format!(
+                                "Apply offset correction ({:+} samples) to {} tracks?\n\
+                                 Files will be re-encoded to FLAC and verified at offset +0\n\
+                                 before replacing originals.",
+                                offset, n,
+                            ),
+                            action: crate::tui::app::ConfirmAction::OffsetCorrection { paths, offset },
+                        };
+                        return;
+                    }
+                }
+                // No fixable offset — show results normally.
+                app.set_status("No offset correction needed — showing verification results".to_string());
+            }
+
             app.active_overlay = ActiveOverlay::AccurateRipVerify(
                 Box::new(crate::tui::app::ArVerifyState {
                     pages,

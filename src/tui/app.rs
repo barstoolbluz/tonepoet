@@ -1336,6 +1336,10 @@ pub struct AppState {
     /// to repaint the entire screen (diff-based rendering would
     /// otherwise leave stale regions blank).
     pub force_redraw: bool,
+    /// When true, the next `AccurateRipComplete` handler will auto-check
+    /// for a fixable offset and show the correction confirmation dialog
+    /// instead of the normal results overlay.
+    pub auto_fix_on_complete: bool,
 
     /// Last browse-entry click: (entry_path, click_time). Used for double-click detection.
     /// Path-based rather than index-based so directory refreshes / sort changes between
@@ -1452,6 +1456,7 @@ impl AppState {
             processing_active: false,
             should_quit: false,
             force_redraw: false,
+            auto_fix_on_complete: false,
             last_browse_click: None,
             pending_browse_rename: None,
             recent,

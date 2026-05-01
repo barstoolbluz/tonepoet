@@ -1676,7 +1676,9 @@ pub fn execute_command(
                     app.set_status("No uniform non-zero offset detected — correction not applicable");
                 }
             } else {
-                app.set_status(":ar-fix requires the AccurateRip verification overlay to be open");
+                // No overlay open — run verification first, then auto-fix.
+                app.auto_fix_on_complete = true;
+                execute_command(app, Command::AccurateRip { force: false }, tx);
             }
         }
         Command::ArBatch => {
