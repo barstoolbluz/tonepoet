@@ -1826,38 +1826,54 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
-        ActiveOverlay::CtdbVerify { result, mut scroll } => {
-            let total_lines = 2 + result.tracks.len() * 2;
+        ActiveOverlay::CtdbVerify(mut state) => {
+            let page = &state.pages[state.active_page];
+            let disc_header = if state.pages.len() > 1 { 2 } else { 0 };
+            let total_lines = disc_header + 2 + page.result.tracks.len() * 2;
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     app.active_overlay = ActiveOverlay::None;
                 }
+                KeyCode::Left => {
+                    if state.pages.len() > 1 && state.active_page > 0 {
+                        state.active_page -= 1;
+                        state.scroll = 0;
+                    }
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
+                }
+                KeyCode::Right => {
+                    if state.active_page + 1 < state.pages.len() {
+                        state.active_page += 1;
+                        state.scroll = 0;
+                    }
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
-                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                    state.scroll = state.scroll.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    scroll = (scroll + 1).min(total_lines.saturating_sub(1));
-                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                    state.scroll = (state.scroll + 1).min(total_lines.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
                 }
                 KeyCode::PageUp => {
-                    scroll = scroll.saturating_sub(15);
-                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                    state.scroll = state.scroll.saturating_sub(15);
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
                 }
                 KeyCode::PageDown => {
-                    scroll = (scroll + 15).min(total_lines.saturating_sub(1));
-                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                    state.scroll = (state.scroll + 15).min(total_lines.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
-                    scroll = 0;
-                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                    state.scroll = 0;
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    scroll = total_lines.saturating_sub(1);
-                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                    state.scroll = total_lines.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
                 }
                 _ => {
-                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                    app.active_overlay = ActiveOverlay::CtdbVerify(state);
                 }
             }
         }
@@ -3028,7 +3044,7 @@ fn handle_generic_overlay_mouse(
                         (Rect::new(x, y, w, h), pills)
                     }
                 }
-                ActiveOverlay::CtdbVerify { .. } => {
+                ActiveOverlay::CtdbVerify(_) => {
                     let w = ((area.0 as usize) * 70 / 100).max(50).min(area.0 as usize - 2) as u16;
                     let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
                     let x = (area.0.saturating_sub(w)) / 2;
@@ -3310,6 +3326,43 @@ fn handle_generic_overlay_mouse(
                     }
                 }
                 app.active_overlay = ActiveOverlay::AccurateRipVerify(state);
+            }
+            return true;
+        }
+
+        // Left click in content area: disc pill click for CtdbVerify.
+        MouseEventKind::Down(MouseButton::Left)
+            if in_popup && !on_footer
+                && matches!(app.active_overlay, ActiveOverlay::CtdbVerify(_)) =>
+        {
+            if let ActiveOverlay::CtdbVerify(mut state) =
+                std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+            {
+                let content_y = popup.y + 1;
+                if state.pages.len() > 1 && my >= content_y && my < footer_y {
+                    let visual_row = (my - content_y) as usize;
+                    let content_row = visual_row + state.scroll;
+                    if content_row == 0 {
+                        let inner_x_pos = popup.x + 1;
+                        let click_x = mx.saturating_sub(inner_x_pos) as usize;
+                        let mut x_pos = 2usize;
+                        for (i, pg) in state.pages.iter().enumerate() {
+                            let label = if pg.label.is_empty() {
+                                format!("disc {}", i + 1)
+                            } else {
+                                pg.label.clone()
+                            };
+                            let pill_w = label.len() + 2;
+                            if click_x >= x_pos && click_x < x_pos + pill_w {
+                                state.active_page = i;
+                                state.scroll = 0;
+                                break;
+                            }
+                            x_pos += pill_w + 1;
+                        }
+                    }
+                }
+                app.active_overlay = ActiveOverlay::CtdbVerify(state);
             }
             return true;
         }

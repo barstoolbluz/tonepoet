@@ -731,13 +731,29 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
 
-        AppMessage::CtdbComplete { result } => {
-            let summary = crate::tui::ctdb::format_ctdb_summary(&result);
-            app.set_status(format!("CUETools DB: {}", summary));
-            app.active_overlay = ActiveOverlay::CtdbVerify {
-                result,
-                scroll: 0,
-            };
+        AppMessage::CtdbComplete { pages } => {
+            if pages.len() == 1 {
+                let summary = crate::tui::ctdb::format_ctdb_summary(&pages[0].result);
+                app.set_status(format!("CUETools DB: {}", summary));
+            } else {
+                let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
+                let verified: usize = pages.iter().map(|p|
+                    p.result.tracks.iter()
+                        .filter(|t| t.status == crate::tui::ctdb::CtdbTrackStatus::Verified)
+                        .count()
+                ).sum();
+                app.set_status(format!(
+                    "CUETools DB: {} discs, {}/{} tracks verified",
+                    pages.len(), verified, total,
+                ));
+            }
+            app.active_overlay = ActiveOverlay::CtdbVerify(
+                Box::new(crate::tui::app::CtdbVerifyState {
+                    pages,
+                    active_page: 0,
+                    scroll: 0,
+                }),
+            );
         }
         AppMessage::ArBatchComplete { result } => {
             let total = result.albums.len();

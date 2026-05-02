@@ -850,11 +850,8 @@ pub enum ActiveOverlay {
     GnudbReview(Box<GnudbReviewState>),
     /// AccurateRip verification results overlay (supports multi-disc).
     AccurateRipVerify(Box<ArVerifyState>),
-    /// CUETools DB verification results overlay.
-    CtdbVerify {
-        result: Box<crate::tui::ctdb::CtdbVerifyResult>,
-        scroll: usize,
-    },
+    /// CUETools DB verification results overlay (supports multi-disc).
+    CtdbVerify(Box<CtdbVerifyState>),
     /// AccurateRip batch verification report overlay.
     ArBatchReport {
         result: Box<crate::tui::accuraterip::ArBatchResult>,
@@ -881,6 +878,22 @@ pub struct ArVerifyPage {
     pub label: String,
     /// Verification result for this disc.
     pub result: crate::tui::accuraterip::ArVerifyResult,
+}
+
+/// State for the CUETools DB verification overlay.
+/// Supports multi-disc: each page is one disc's results.
+#[derive(Debug, Clone)]
+pub struct CtdbVerifyState {
+    pub pages: Vec<CtdbVerifyPage>,
+    pub active_page: usize,
+    pub scroll: usize,
+}
+
+/// A single page (disc) in the CTDB verification overlay.
+#[derive(Debug, Clone)]
+pub struct CtdbVerifyPage {
+    pub label: String,
+    pub result: crate::tui::ctdb::CtdbVerifyResult,
 }
 
 /// State for the GNUDB review overlay.

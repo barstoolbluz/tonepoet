@@ -132,8 +132,8 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::AccurateRipVerify(ref state) => {
             draw_accuraterip_verify(f, state);
         }
-        ActiveOverlay::CtdbVerify { ref result, scroll } => {
-            draw_ctdb_verify(f, result, scroll);
+        ActiveOverlay::CtdbVerify(ref state) => {
+            draw_ctdb_verify(f, state);
         }
         ActiveOverlay::ArBatchReport { ref result, scroll } => {
             draw_ar_batch_report(f, result, scroll);
@@ -2698,8 +2698,7 @@ fn draw_ar_batch_report(
 
 fn draw_ctdb_verify(
     f: &mut Frame,
-    result: &super::ctdb::CtdbVerifyResult,
-    scroll: usize,
+    state: &super::app::CtdbVerifyState,
 ) {
     use super::ctdb::CtdbTrackStatus;
 
@@ -2711,6 +2710,9 @@ fn draw_ctdb_verify(
     let popup = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, popup);
+
+    let page = &state.pages[state.active_page];
+    let result = &page.result;
 
     let n_tracks = result.tracks.len();
     let verified = result.tracks.iter()
@@ -2724,7 +2726,18 @@ fn draw_ctdb_verify(
         theme::RED
     };
 
-    let title = format!(" CUETools DB Verification — {} tracks ", n_tracks);
+    let title = if state.pages.len() > 1 {
+        let total_all: usize = state.pages.iter().map(|p| p.result.tracks.len()).sum();
+        let verified_all: usize = state.pages.iter().map(|p|
+            p.result.tracks.iter()
+                .filter(|t| t.status == CtdbTrackStatus::Verified)
+                .count()
+        ).sum();
+        format!(" CUETools DB — {} discs, {}/{} verified ", state.pages.len(), verified_all, total_all)
+    } else {
+        format!(" CUETools DB Verification — {} tracks ", n_tracks)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
@@ -2745,6 +2758,32 @@ fn draw_ctdb_verify(
         .split(inner);
 
     let mut lines: Vec<Line> = Vec::new();
+
+    // Disc pills for multi-disc navigation.
+    if state.pages.len() > 1 {
+        let mut spans: Vec<Span> = vec![Span::raw("  ")];
+        for (i, pg) in state.pages.iter().enumerate() {
+            let label = if pg.label.is_empty() {
+                format!("disc {}", i + 1)
+            } else {
+                pg.label.clone()
+            };
+            if i == state.active_page {
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::CYAN).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(theme::TEXT_DIM),
+                ));
+            }
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(""));
+    }
 
     let summary = super::ctdb::format_ctdb_summary(result);
     lines.push(Line::from(vec![
@@ -2789,7 +2828,7 @@ fn draw_ctdb_verify(
 
     let total = lines.len();
     let visible = chunks_v[0].height as usize;
-    let scroll = scroll.min(total.saturating_sub(visible));
+    let scroll = state.scroll.min(total.saturating_sub(visible));
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks_v[0]);
 

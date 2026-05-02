@@ -1721,7 +1721,10 @@ pub fn execute_command(
                         tokio::spawn(async move {
                             let result = super::ctdb::verify_ctdb_single_image(&info).await;
                             let _ = tx.send(AppMessage::CtdbComplete {
-                                result: Box::new(result),
+                                pages: vec![super::app::CtdbVerifyPage {
+                                    label: String::new(),
+                                    result,
+                                }],
                             }).await;
                         });
                         return;
@@ -1731,25 +1734,82 @@ pub fn execute_command(
             if paths.is_empty() {
                 app.set_status("No audio files for CTDB verification");
             } else {
-                let n = paths.len();
-                app.set_status(format!("CUETools DB: verifying {} tracks...", n));
+                let groups = super::gnudb::group_by_disc(&paths);
+                let n_groups = groups.len();
+                let n_tracks: usize = groups.iter().map(|(_, p)| p.len()).sum();
+                let tx = tx.clone();
 
-                let sample_data = super::accuraterip::collect_sample_counts(&paths);
-                match sample_data {
-                    Err(e) => {
-                        app.set_status(format!("CTDB: {}", e));
+                if n_groups <= 1 {
+                    // Single disc.
+                    let group_paths = groups.into_iter().next().unwrap().1;
+                    let sample_data = super::accuraterip::collect_sample_counts(&group_paths);
+                    match sample_data {
+                        Err(e) => {
+                            app.set_status(format!("CTDB: {}", e));
+                        }
+                        Ok((sample_counts, sample_rate)) => {
+                            app.set_status(format!(
+                                "CUETools DB: verifying {} tracks...", n_tracks,
+                            ));
+                            tokio::spawn(async move {
+                                let result = super::ctdb::verify_ctdb(
+                                    &group_paths, &sample_counts, sample_rate,
+                                ).await;
+                                let _ = tx.send(AppMessage::CtdbComplete {
+                                    pages: vec![super::app::CtdbVerifyPage {
+                                        label: String::new(),
+                                        result,
+                                    }],
+                                }).await;
+                            });
+                        }
                     }
-                    Ok((sample_counts, sample_rate)) => {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let result = super::ctdb::verify_ctdb(
-                                &paths, &sample_counts, sample_rate,
-                            ).await;
-                            let _ = tx.send(AppMessage::CtdbComplete {
-                                result: Box::new(result),
-                            }).await;
-                        });
-                    }
+                } else {
+                    // Multi-disc — verify each disc sequentially.
+                    app.set_status(format!(
+                        "CUETools DB: verifying {} discs, {} tracks...",
+                        n_groups, n_tracks,
+                    ));
+                    tokio::spawn(async move {
+                        let mut pages = Vec::with_capacity(n_groups);
+                        for (idx, (label, mut group_paths)) in groups.into_iter().enumerate() {
+                            let disc_name = if label.is_empty() {
+                                format!("disc {}", idx + 1)
+                            } else {
+                                label.clone()
+                            };
+                            let _ = tx.send(AppMessage::StatusMessage(
+                                format!("CUETools DB: verifying {}/{}  — {}...", idx + 1, n_groups, disc_name),
+                            )).await;
+                            super::probe::sort_paths_by_track(&mut group_paths);
+                            let dir = group_paths[0]
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .to_path_buf();
+
+                            // Per-disc single-image detection.
+                            let result = if let Some(info) = super::cue_parser::detect_single_image(&dir) {
+                                super::ctdb::verify_ctdb_single_image(&info).await
+                            } else {
+                                match super::accuraterip::collect_sample_counts(&group_paths) {
+                                    Ok((sample_counts, sample_rate)) => {
+                                        super::ctdb::verify_ctdb(
+                                            &group_paths, &sample_counts, sample_rate,
+                                        ).await
+                                    }
+                                    Err(e) => {
+                                        log::warn!("CTDB: skipping disc '{}': {}", label, e);
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            pages.push(super::app::CtdbVerifyPage { label, result });
+                        }
+                        if !pages.is_empty() {
+                            let _ = tx.send(AppMessage::CtdbComplete { pages }).await;
+                        }
+                    });
                 }
             }
         }

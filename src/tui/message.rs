@@ -120,9 +120,9 @@ pub enum AppMessage {
     AccurateRipComplete {
         pages: Vec<crate::tui::app::ArVerifyPage>,
     },
-    /// Result of an async CTDB verification.
+    /// Result of an async CTDB verification (one or more discs).
     CtdbComplete {
-        result: Box<crate::tui::ctdb::CtdbVerifyResult>,
+        pages: Vec<crate::tui::app::CtdbVerifyPage>,
     },
     /// Result of an async AR batch verification.
     ArBatchComplete {
