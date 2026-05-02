@@ -90,6 +90,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     (":ar!", "AccurateRip verify (full offset scan)"),
                     (":ar-fix", "Correct drive read offset (re-encode)"),
                     (":ar-batch", "Batch AR verify (current directory)"),
+                    (":ctdb", "CUETools DB verify (CRC32)"),
                     (":view", "View text file (read-only)"),
                     (":edit-file", "Edit text file (not .log)"),
                 ],

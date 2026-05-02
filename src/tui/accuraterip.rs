@@ -1724,7 +1724,7 @@ pub async fn verify_single_image(
 /// Decode a WavPack file to raw i16 via wvunpack (fallback for v4 files).
 ///
 /// Runs `wvunpack -q -o - file.wv` which outputs raw PCM to stdout.
-fn decode_to_raw_i16_wvunpack(path: &Path) -> Result<Vec<i16>, String> {
+pub fn decode_to_raw_i16_wvunpack(path: &Path) -> Result<Vec<i16>, String> {
     let output = std::process::Command::new("wvunpack")
         .args(["-q", "-o", "-"])
         .arg(path)

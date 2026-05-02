@@ -731,6 +731,14 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
 
+        AppMessage::CtdbComplete { result } => {
+            let summary = crate::tui::ctdb::format_ctdb_summary(&result);
+            app.set_status(format!("CUETools DB: {}", summary));
+            app.active_overlay = ActiveOverlay::CtdbVerify {
+                result,
+                scroll: 0,
+            };
+        }
         AppMessage::ArBatchComplete { result } => {
             let total = result.albums.len();
             let verified = result.albums.iter()

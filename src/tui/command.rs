@@ -52,6 +52,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "context", "menu",
     "ar", "ar!", "accuraterip", "accuraterip!",
     "ar-fix", "ar-batch",
+    "ctdb", "cuetools",
     "view", "cat", "edit-file", "ef",
 ];
 
@@ -279,6 +280,8 @@ pub enum Command {
     ArFix,
     /// Batch AccurateRip verification of current browse directory.
     ArBatch,
+    /// CUETools DB verification.
+    Ctdb,
     /// View a text file in read-only mode.
     ViewFile(std::path::PathBuf),
     /// Edit a text file (not .log files).
@@ -411,6 +414,7 @@ pub fn parse_command(input: &str) -> Command {
         "ar!" | "accuraterip!" => Command::AccurateRip { force: true },
         "ar-fix" => Command::ArFix,
         "ar-batch" => Command::ArBatch,
+        "ctdb" | "cuetools" => Command::Ctdb,
         "view" | "cat" => Command::ViewFile(std::path::PathBuf::from(args)),
         "edit-file" | "ef" => Command::EditFile(std::path::PathBuf::from(args)),
         _ => Command::Unknown(input.to_string()),
@@ -1679,6 +1683,74 @@ pub fn execute_command(
                 // No overlay open — run verification first, then auto-fix.
                 app.auto_fix_on_complete = true;
                 execute_command(app, Command::AccurateRip { force: false }, tx);
+            }
+        }
+        Command::Ctdb => {
+            // Same path collection as :ar.
+            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            super::probe::sort_paths_by_track(&mut paths);
+            // Check for single-image CUE layout.
+            if paths.len() <= 1 {
+                let dir = if paths.is_empty() {
+                    let sel = collect_selection_for_file_ops(app);
+                    sel.first().and_then(|p| {
+                        if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }
+                    })
+                } else {
+                    paths[0].parent().map(|d| d.to_path_buf())
+                };
+                if let Some(ref dir) = dir {
+                    if let Some(info) = super::cue_parser::detect_single_image(dir) {
+                        let n = info.track_boundaries.len();
+                        let tx = tx.clone();
+                        app.set_status(format!(
+                            "CUETools DB: verifying {} tracks (single image)...", n,
+                        ));
+                        tokio::spawn(async move {
+                            let result = super::ctdb::verify_ctdb_single_image(&info).await;
+                            let _ = tx.send(AppMessage::CtdbComplete {
+                                result: Box::new(result),
+                            }).await;
+                        });
+                        return;
+                    }
+                }
+            }
+            if paths.is_empty() {
+                app.set_status("No audio files for CTDB verification");
+            } else {
+                let n = paths.len();
+                app.set_status(format!("CUETools DB: verifying {} tracks...", n));
+
+                let sample_data = super::accuraterip::collect_sample_counts(&paths);
+                match sample_data {
+                    Err(e) => {
+                        app.set_status(format!("CTDB: {}", e));
+                    }
+                    Ok((sample_counts, sample_rate)) => {
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let result = super::ctdb::verify_ctdb(
+                                &paths, &sample_counts, sample_rate,
+                            ).await;
+                            let _ = tx.send(AppMessage::CtdbComplete {
+                                result: Box::new(result),
+                            }).await;
+                        });
+                    }
+                }
             }
         }
         Command::ArBatch => {

@@ -108,6 +108,8 @@ pub enum ContextAction {
     AccurateRipBatch,
     /// AccurateRip offset correction.
     AccurateRipFixOffset,
+    /// CUETools DB verification.
+    VerifyCtdb,
     /// View a text file in read-only mode.
     ViewFile(PathBuf),
     /// Edit a text file (not available for .log files).
@@ -245,22 +247,24 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
 
 /// Build the "Utilities" submenu. Compare items change based on whether
 /// a reference is currently stored.
-fn build_accuraterip_submenu() -> ContextMenuEntry {
+fn build_verify_submenu() -> ContextMenuEntry {
     ContextMenuEntry::Submenu {
-        label: "AccurateRip".to_string(),
+        label: "Verify".to_string(),
         children: vec![
-            item("Verify", ContextAction::VerifyAccurateRip),
-            item("Verify (full scan)", ContextAction::AccurateRipFullScan),
-            item("Batch verify", ContextAction::AccurateRipBatch),
+            item("Verify integrity", ContextAction::Verify),
             separator(),
-            item("Fix offset", ContextAction::AccurateRipFixOffset),
+            item("AccurateRip", ContextAction::VerifyAccurateRip),
+            item("AccurateRip (full scan)", ContextAction::AccurateRipFullScan),
+            item("AccurateRip batch", ContextAction::AccurateRipBatch),
+            item("AccurateRip fix offset", ContextAction::AccurateRipFixOffset),
+            separator(),
+            item("CUETools DB", ContextAction::VerifyCtdb),
         ],
     }
 }
 
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
-        item("Verify", ContextAction::Verify),
         item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
         item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
         separator(),
@@ -309,7 +313,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                         .unwrap_or(false)))
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
-            items.push(build_accuraterip_submenu());
+            items.push(build_verify_submenu());
             items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(true));
@@ -342,7 +346,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                         .unwrap_or(false)))
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
-            items.push(build_accuraterip_submenu());
+            items.push(build_verify_submenu());
             items.push(build_utilities_submenu(app));
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
@@ -621,6 +625,10 @@ pub fn execute_context_action(
         }
         ContextAction::AccurateRipFixOffset => {
             let cmd = super::command::Command::ArFix;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::VerifyCtdb => {
+            let cmd = super::command::Command::Ctdb;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::ViewFile(path) => {

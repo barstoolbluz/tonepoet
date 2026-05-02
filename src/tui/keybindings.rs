@@ -1826,6 +1826,41 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
+        ActiveOverlay::CtdbVerify { result, mut scroll } => {
+            let total_lines = 2 + result.tracks.len() * 2;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = (scroll + 1).min(total_lines.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(15);
+                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                }
+                KeyCode::PageDown => {
+                    scroll = (scroll + 15).min(total_lines.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    scroll = 0;
+                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    scroll = total_lines.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                }
+                _ => {
+                    app.active_overlay = ActiveOverlay::CtdbVerify { result, scroll };
+                }
+            }
+        }
         ActiveOverlay::ArBatchReport { result, mut scroll } => {
             let total_lines = 3 + result.albums.len() * 2;
             match key.code {
@@ -2992,6 +3027,13 @@ fn handle_generic_overlay_mouse(
                         ]);
                         (Rect::new(x, y, w, h), pills)
                     }
+                }
+                ActiveOverlay::CtdbVerify { .. } => {
+                    let w = ((area.0 as usize) * 70 / 100).max(50).min(area.0 as usize - 2) as u16;
+                    let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
+                    let x = (area.0.saturating_sub(w)) / 2;
+                    let y = (area.1.saturating_sub(h)) / 2;
+                    (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
                 }
                 ActiveOverlay::ArBatchReport { .. } => {
                     let w = ((area.0 as usize) * 80 / 100).max(60).min(area.0 as usize - 2) as u16;

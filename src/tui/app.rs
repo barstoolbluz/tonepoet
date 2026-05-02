@@ -850,6 +850,11 @@ pub enum ActiveOverlay {
     GnudbReview(Box<GnudbReviewState>),
     /// AccurateRip verification results overlay (supports multi-disc).
     AccurateRipVerify(Box<ArVerifyState>),
+    /// CUETools DB verification results overlay.
+    CtdbVerify {
+        result: Box<crate::tui::ctdb::CtdbVerifyResult>,
+        scroll: usize,
+    },
     /// AccurateRip batch verification report overlay.
     ArBatchReport {
         result: Box<crate::tui::accuraterip::ArBatchResult>,
