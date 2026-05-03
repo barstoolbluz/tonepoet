@@ -757,6 +757,10 @@ mod cuetools_translation_fixtures {
     }
 }
 
+// CUETools-source-faithful repair flow (round 2). See README in
+// ctdb_cuetools_repair_translation_patch.zip for source citations.
+include!("ctdb_cuetools_repair.rs");
+
 // ── Verification orchestrator ───────────────────────────────────────
 
 /// Verify an album against the CUETools Database.
@@ -1330,8 +1334,7 @@ pub async fn repair_album(
 
     let parity_clone = parity_bytes;
     let repair_result = tokio::task::spawn_blocking(move || {
-        let codec = crate::ctdb_rs::CtdbCodec::new();
-        codec.repair(&mut image, &parity_clone, npar, offset)
+        repair_disc_via_rs_with_npar_blocking(&mut image, &parity_clone, npar, offset)
             .map(|r| (r, image))
     }).await
         .map_err(|e| format!("Repair task failed: {}", e))?;
@@ -1530,8 +1533,7 @@ pub async fn repair_single_image(
     )).await;
 
     let repair_result = tokio::task::spawn_blocking(move || {
-        let codec = crate::ctdb_rs::CtdbCodec::new();
-        codec.repair(&mut image, &parity_bytes, npar, offset)
+        repair_disc_via_rs_with_npar_blocking(&mut image, &parity_bytes, npar, offset)
             .map(|r| (r, image))
     }).await
         .map_err(|e| format!("Repair task failed: {}", e))?;
