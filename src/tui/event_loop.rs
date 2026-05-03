@@ -737,9 +737,15 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 app.set_status(format!("CUETools DB: {}", summary));
             } else {
                 let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
+                // Both byte-exact `Verified` and RS-equivalent `VerifiedRs` count
+                // as verified, consistent with format_ctdb_summary.
                 let verified: usize = pages.iter().map(|p|
                     p.result.tracks.iter()
-                        .filter(|t| t.status == crate::tui::ctdb::CtdbTrackStatus::Verified)
+                        .filter(|t| matches!(
+                            t.status,
+                            crate::tui::ctdb::CtdbTrackStatus::Verified
+                            | crate::tui::ctdb::CtdbTrackStatus::VerifiedRs
+                        ))
                         .count()
                 ).sum();
                 app.set_status(format!(
@@ -747,13 +753,42 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     pages.len(), verified, total,
                 ));
             }
+
+            // If a context-menu / direct :ctdb-repair invoked us, find the
+            // first page that actually has something to repair (mismatches
+            // AND parity) and start the overlay there so the subsequent
+            // :ctdb-repair re-dispatch operates on a repairable disc.
+            let auto_repair = std::mem::replace(
+                &mut app.auto_repair_on_ctdb_complete, false,
+            );
+            let active_page = if auto_repair {
+                pages.iter().position(|p| {
+                    p.result.parity_url.is_some()
+                        && p.result.tracks.iter().any(|t|
+                            t.status == crate::tui::ctdb::CtdbTrackStatus::Mismatch
+                        )
+                }).unwrap_or(0)
+            } else {
+                0
+            };
+
             app.active_overlay = ActiveOverlay::CtdbVerify(
                 Box::new(crate::tui::app::CtdbVerifyState {
                     pages,
-                    active_page: 0,
+                    active_page,
                     scroll: 0,
                 }),
             );
+
+            if auto_repair {
+                // Re-enter Command::CtdbRepair now that the overlay is up.
+                // The handler will validate parity/mismatches/CRCs and
+                // either pop the confirmation dialog, defer to AR, or
+                // emit a status message ("No mismatches detected", etc.).
+                super::command::execute_command(
+                    app, super::command::Command::CtdbRepair, tx,
+                );
+            }
         }
         AppMessage::ArBatchComplete { result } => {
             let total = result.albums.len();
@@ -782,6 +817,18 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
                 Err(e) => {
                     app.set_status(format!("Offset correction failed: {}", e));
+                }
+            }
+        }
+        AppMessage::CtdbRepairComplete { result } => {
+            match result {
+                Ok(summary) => {
+                    app.set_status(summary);
+                    app.active_overlay = ActiveOverlay::None;
+                    app.browse.refresh();
+                }
+                Err(e) => {
+                    app.set_status(format!("CTDB repair failed: {}", e));
                 }
             }
         }
@@ -819,6 +866,98 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         }
                     }
                 }
+            }
+
+            // If a CTDB repair was deferred awaiting AR offset detection,
+            // and these AR results target the same disc, resolve the offset
+            // and open the repair confirmation dialog. Takes priority over
+            // auto_fix_on_complete when matched.
+            //
+            // Match the AR page whose first track path equals the pending
+            // repair's first path. If no match, leave pending intact —
+            // these AR results are unrelated (e.g. the user ran `:ar`
+            // manually for a different selection while the deferred repair
+            // was still waiting on its own AR run); pending will be
+            // consumed when its own AR run completes.
+            let matched_page_idx = app.pending_ctdb_repair.as_ref()
+                .and_then(|p| p.paths.first().cloned())
+                .and_then(|target| {
+                    pages.iter().position(|p|
+                        p.result.tracks.first().map(|t| &t.path) == Some(&target)
+                    )
+                });
+            if let Some(idx) = matched_page_idx {
+                let pending = app.pending_ctdb_repair.take().unwrap();
+                let page = &pages[idx];
+
+                // Extract a uniform offset from the AR result.
+                // Unlike `detect_uniform_offset`, we DO accept offset 0
+                // as a verified value (AR confirmed offset 0 is a valid
+                // result for our use case — we just need the right
+                // offset for the RS repair, not necessarily a non-zero
+                // one). Returns None only when the AR data is
+                // inconclusive (mixed offsets, unverified tracks,
+                // disc not in DB).
+                let resolved_offset: Option<i32> = {
+                    let tracks = &page.result.tracks;
+                    if tracks.is_empty() {
+                        None
+                    } else {
+                        let mut common: Option<i32> = None;
+                        let mut all_ok = true;
+                        for t in tracks {
+                            if t.status != crate::tui::accuraterip::ArTrackStatus::Verified {
+                                all_ok = false;
+                                break;
+                            }
+                            let off = match t.offset {
+                                Some(o) => o,
+                                None => { all_ok = false; break; }
+                            };
+                            match common {
+                                Some(prev) if prev != off => { all_ok = false; break; }
+                                None => common = Some(off),
+                                _ => {}
+                            }
+                        }
+                        if all_ok { common } else { None }
+                    }
+                };
+
+                let (offset, offset_note) = match resolved_offset {
+                    Some(n) => (n, format!("offset: {:+} samples (from AR verification)", n)),
+                    None => (0, "offset: +0 (AR could not determine a drive offset — \
+                                 proceeding at +0 may produce incorrect repairs if \
+                                 your drive has a real read offset)".to_string()),
+                };
+
+                let n_tracks = pending.paths.len();
+                let message = format!(
+                    "Apply CTDB Reed-Solomon repair to {} tracks?\n\
+                     Parity: {} symbols, {}\n\
+                     Files will be re-encoded and verified before replacing originals.",
+                    n_tracks, pending.npar, offset_note,
+                );
+
+                let action = match pending.single_image {
+                    Some(info) => crate::tui::app::ConfirmAction::CtdbRepairSingleImage {
+                        info,
+                        parity_url: pending.parity_url,
+                        npar: pending.npar,
+                        offset,
+                        expected_crcs: pending.expected_crcs,
+                    },
+                    None => crate::tui::app::ConfirmAction::CtdbRepair {
+                        paths: pending.paths,
+                        parity_url: pending.parity_url,
+                        npar: pending.npar,
+                        offset,
+                        expected_crcs: pending.expected_crcs,
+                    },
+                };
+
+                app.active_overlay = ActiveOverlay::Confirmation { message, action };
+                return;
             }
 
             // If auto-fix was requested (context menu "Fix offset"),

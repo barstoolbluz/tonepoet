@@ -1,5 +1,6 @@
 pub mod convert;
 pub mod config;
+pub mod ctdb_rs;
 pub mod db;
 pub mod tui;
 

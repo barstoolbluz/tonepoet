@@ -132,4 +132,8 @@ pub enum AppMessage {
     OffsetCorrectionComplete {
         result: Result<String, String>,
     },
+    /// Result of an async CTDB Reed-Solomon repair.
+    CtdbRepairComplete {
+        result: Result<String, String>,
+    },
 }

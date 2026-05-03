@@ -5471,6 +5471,36 @@ fn execute_confirm_action(
                 let _ = tx.send(AppMessage::OffsetCorrectionComplete { result }).await;
             });
         }
+        ConfirmAction::CtdbRepair { paths, parity_url, npar, offset, expected_crcs } => {
+            let paths = paths.clone();
+            let parity_url = parity_url.clone();
+            let npar = *npar;
+            let offset = *offset;
+            let expected_crcs = expected_crcs.clone();
+            let tx = tx.clone();
+            app.set_status("CTDB repair: starting...".to_string());
+            tokio::spawn(async move {
+                let result = super::ctdb::repair_album(
+                    &paths, &parity_url, npar, offset, &expected_crcs, tx.clone(),
+                ).await;
+                let _ = tx.send(AppMessage::CtdbRepairComplete { result }).await;
+            });
+        }
+        ConfirmAction::CtdbRepairSingleImage { info, parity_url, npar, offset, expected_crcs } => {
+            let info = info.clone();
+            let parity_url = parity_url.clone();
+            let npar = *npar;
+            let offset = *offset;
+            let expected_crcs = expected_crcs.clone();
+            let tx = tx.clone();
+            app.set_status("CTDB repair: starting (single image)...".to_string());
+            tokio::spawn(async move {
+                let result = super::ctdb::repair_single_image(
+                    &info, &parity_url, npar, offset, &expected_crcs, tx.clone(),
+                ).await;
+                let _ = tx.send(AppMessage::CtdbRepairComplete { result }).await;
+            });
+        }
     }
 }
 

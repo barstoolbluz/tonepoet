@@ -91,6 +91,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     (":ar-fix", "Correct drive read offset (re-encode)"),
                     (":ar-batch", "Batch AR verify (current directory)"),
                     (":ctdb", "CUETools DB verify (CRC32)"),
+                    (":ctdb-repair", "CTDB Reed-Solomon repair (parity)"),
                     (":view", "View text file (read-only)"),
                     (":edit-file", "Edit text file (not .log)"),
                 ],

@@ -2715,8 +2715,10 @@ fn draw_ctdb_verify(
     let result = &page.result;
 
     let n_tracks = result.tracks.len();
+    // Count both byte-exact `Verified` and RS-equivalent `VerifiedRs` as
+    // verified; consistent with `format_ctdb_summary` and CUETools' own UX.
     let verified = result.tracks.iter()
-        .filter(|t| t.status == CtdbTrackStatus::Verified)
+        .filter(|t| matches!(t.status, CtdbTrackStatus::Verified | CtdbTrackStatus::VerifiedRs))
         .count();
     let border_color = if verified == n_tracks && n_tracks > 0 {
         theme::GREEN
@@ -2730,7 +2732,7 @@ fn draw_ctdb_verify(
         let total_all: usize = state.pages.iter().map(|p| p.result.tracks.len()).sum();
         let verified_all: usize = state.pages.iter().map(|p|
             p.result.tracks.iter()
-                .filter(|t| t.status == CtdbTrackStatus::Verified)
+                .filter(|t| matches!(t.status, CtdbTrackStatus::Verified | CtdbTrackStatus::VerifiedRs))
                 .count()
         ).sum();
         format!(" CUETools DB — {} discs, {}/{} verified ", state.pages.len(), verified_all, total_all)
@@ -2803,6 +2805,19 @@ fn draw_ctdb_verify(
                 let parity = if t.has_parity { " [parity]" } else { "" };
                 (" ✓ ", theme::GREEN, format!("CTDB confidence {}{}", conf, parity))
             }
+            CtdbTrackStatus::VerifiedRs => {
+                // RS verification passed against the matched entry, but our
+                // computed CRC32 differs from that entry's `trackcrcs`.
+                // Audio is RS-equivalent (no repair needed) but byte-level
+                // CRCs come from a different submission/pressing.
+                let conf = t.confidence.unwrap_or(0);
+                (
+                    " ✓ ",
+                    theme::GREEN,
+                    format!("CTDB RS-verified, confidence {} (CRC differs: {:08X})",
+                        conf, t.computed_crc32),
+                )
+            }
             CtdbTrackStatus::Mismatch => {
                 let parity = if t.has_parity { " [repair available]" } else { "" };
                 (" ✗ ", theme::RED, format!("CRC mismatch (computed {:08X}){}", t.computed_crc32, parity))
@@ -2832,7 +2847,18 @@ fn draw_ctdb_verify(
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks_v[0]);
 
-    let footer_line = Line::from(vec![footer_pill("Esc close", theme::GREEN)]);
+    // Build footer with conditional repair pill.
+    let has_mismatch = result.tracks.iter().any(|t| {
+        t.status == CtdbTrackStatus::Mismatch
+    });
+    let has_parity = result.tracks.iter().any(|t| t.has_parity);
+
+    let mut footer_spans = vec![footer_pill("Esc close", theme::GREEN)];
+    if has_mismatch && has_parity {
+        footer_spans.push(Span::raw("  "));
+        footer_spans.push(footer_pill(":ctdb-repair", theme::AMBER));
+    }
+    let footer_line = Line::from(footer_spans);
     f.render_widget(
         Paragraph::new(footer_line).alignment(Alignment::Center),
         chunks_v[1],

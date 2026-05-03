@@ -52,7 +52,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "context", "menu",
     "ar", "ar!", "accuraterip", "accuraterip!",
     "ar-fix", "ar-batch",
-    "ctdb", "cuetools",
+    "ctdb", "ctdb-repair", "cuetools", "cuetools-repair",
     "view", "cat", "edit-file", "ef",
 ];
 
@@ -282,6 +282,8 @@ pub enum Command {
     ArBatch,
     /// CUETools DB verification.
     Ctdb,
+    /// CUETools DB Reed-Solomon repair.
+    CtdbRepair,
     /// View a text file in read-only mode.
     ViewFile(std::path::PathBuf),
     /// Edit a text file (not .log files).
@@ -415,6 +417,7 @@ pub fn parse_command(input: &str) -> Command {
         "ar-fix" => Command::ArFix,
         "ar-batch" => Command::ArBatch,
         "ctdb" | "cuetools" => Command::Ctdb,
+        "ctdb-repair" | "cuetools-repair" => Command::CtdbRepair,
         "view" | "cat" => Command::ViewFile(std::path::PathBuf::from(args)),
         "edit-file" | "ef" => Command::EditFile(std::path::PathBuf::from(args)),
         _ => Command::Unknown(input.to_string()),
@@ -1813,6 +1816,134 @@ pub fn execute_command(
                 }
             }
         }
+        Command::CtdbRepair => {
+            // If the CTDB overlay is open with parity available, extract
+            // repair parameters from it. Otherwise, run CTDB verify first.
+            if let ActiveOverlay::CtdbVerify(ref state) = app.active_overlay {
+                let page = &state.pages[state.active_page];
+                let result = &page.result;
+
+                // Check that parity is available.
+                let parity_url = match &result.parity_url {
+                    Some(url) => url.clone(),
+                    None => {
+                        app.set_status("No parity data available for this disc");
+                        return;
+                    }
+                };
+
+                let npar = match result.npar {
+                    Some(n) => n as usize,
+                    None => {
+                        app.set_status("CTDB entry missing npar value");
+                        return;
+                    }
+                };
+
+                // Check if any tracks have mismatches.
+                let has_mismatch = result.tracks.iter().any(|t| {
+                    t.status == super::ctdb::CtdbTrackStatus::Mismatch
+                });
+                if !has_mismatch {
+                    app.set_status("No mismatches detected — repair not needed");
+                    return;
+                }
+
+                let paths: Vec<std::path::PathBuf> = result.tracks.iter()
+                    .map(|t| t.path.clone())
+                    .collect();
+                let n = paths.len();
+
+                // Extract expected CRCs from the CTDB entry for post-repair
+                // verification. These come from the database, not our computation.
+                let expected_crcs: Vec<u32> = result.tracks.iter()
+                    .filter_map(|t| t.expected_crc32)
+                    .collect();
+                if expected_crcs.len() != n {
+                    app.set_status("Cannot repair: missing expected CRC for some tracks");
+                    return;
+                }
+
+                // Detect single-image CUE layout: all tracks point at the
+                // same file. Repair flow is different (decode once, repair
+                // whole image, re-encode single file).
+                let single_image: Option<Box<super::cue_parser::SingleImageInfo>> =
+                    if n > 1 && paths.iter().all(|p| p == &paths[0]) {
+                        let dir = paths[0].parent().unwrap_or(std::path::Path::new("."));
+                        match super::cue_parser::detect_single_image(dir) {
+                            Some(info) => Some(Box::new(info)),
+                            None => {
+                                app.set_status("Single-image CTDB repair: failed to detect CUE layout");
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                // For single-image, the path list seen by AR is the same
+                // file repeated N times. We want to query AR cache by the
+                // unique audio path, not N times.
+                let cache_query_paths: Vec<std::path::PathBuf> = if single_image.is_some() {
+                    vec![paths[0].clone()]
+                } else {
+                    paths.clone()
+                };
+
+                // Auto-detect drive read offset from AR cache. `None` means
+                // we don't have enough cached data to be sure — run :ar
+                // first and resume the confirmation when it completes.
+                match detect_ar_offset_from_cache(&app.db, &cache_query_paths) {
+                    Some(offset) => {
+                        let offset_note = if offset != 0 {
+                            format!("offset: {:+} samples (from AR cache)", offset)
+                        } else {
+                            "offset: +0 (verified by AR)".to_string()
+                        };
+
+                        let message = format!(
+                            "Apply CTDB Reed-Solomon repair to {} tracks?\n\
+                             Parity: {} symbols, {}\n\
+                             Files will be re-encoded and verified before replacing originals.",
+                            n, npar, offset_note,
+                        );
+
+                        let action = match single_image {
+                            Some(info) => super::app::ConfirmAction::CtdbRepairSingleImage {
+                                info, parity_url, npar, offset, expected_crcs,
+                            },
+                            None => super::app::ConfirmAction::CtdbRepair {
+                                paths, parity_url, npar, offset, expected_crcs,
+                            },
+                        };
+
+                        app.active_overlay = ActiveOverlay::Confirmation { message, action };
+                    }
+                    None => {
+                        // No usable AR cache — defer the repair until AR
+                        // verification completes and gives us an offset.
+                        app.pending_ctdb_repair = Some(super::app::PendingCtdbRepair {
+                            paths, parity_url, npar, expected_crcs, single_image,
+                        });
+                        app.set_status(
+                            "No AR offset cached — running AccurateRip to detect drive offset...",
+                        );
+                        execute_command(app, Command::AccurateRip { force: false }, tx);
+                    }
+                }
+            } else {
+                // No CTDB overlay open (e.g. invoked from the "CUETools DB
+                // repair" context menu, or directly via :ctdb-repair). Run
+                // CTDB verify first; the auto-repair flag tells the
+                // CtdbComplete handler to re-dispatch :ctdb-repair once
+                // the verification overlay is installed.
+                app.auto_repair_on_ctdb_complete = true;
+                app.set_status(
+                    "Running CUETools DB verification first to detect mismatches...",
+                );
+                execute_command(app, Command::Ctdb, tx);
+            }
+        }
         Command::ArBatch => {
             if app.current_screen != AppScreen::Browse {
                 app.set_status(":ar-batch only works on the browse screen");
@@ -2664,7 +2795,47 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
     }
 }
 
-/// Expand ~ to home directory
+/// Detect a uniform AR offset from the SQLite cache for a set of track files.
+///
+/// Returns:
+/// - `Some(n)` if every track has a fresh cache entry, all are verified, and
+///   they share a single offset value `n` (which may be 0 — meaning AR
+///   confirmed offset 0). The caller can use `n` directly.
+/// - `None` if at least one track has no cache entry, results are stale, any
+///   track is not verified, or offsets disagree across tracks. The caller
+///   should run `:ar` to resolve before proceeding.
+fn detect_ar_offset_from_cache(db: &crate::db::Database, paths: &[PathBuf]) -> Option<i32> {
+    let mut common_offset: Option<i32> = None;
+
+    for path in paths {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta.modified()
+            .map(crate::db::systemtime_to_unix)
+            .unwrap_or(0);
+        let size = meta.len();
+        let path_str = path.display().to_string();
+
+        let cached = db.get_cached_ar(&path_str, mtime, size)?;
+
+        for t in &cached {
+            if t.status != super::accuraterip::ArTrackStatus::Verified {
+                return None;
+            }
+            // `offset = None` means AR did not record an offset for this
+            // track — treat as indeterminate and re-run.
+            let off = t.offset?;
+            match common_offset {
+                Some(prev) if prev != off => return None, // mixed offsets
+                None => common_offset = Some(off),
+                _ => {} // same offset, continue
+            }
+        }
+    }
+
+    common_offset
+}
+
+/// Expand ~ to home directory.
 fn expand_path(path: &str) -> String {
     if path.starts_with('~') {
         if let Ok(home) = std::env::var("HOME") {

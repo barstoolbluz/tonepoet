@@ -1263,6 +1263,42 @@ pub enum ConfirmAction {
         paths: Vec<PathBuf>,
         offset: i32,
     },
+    /// Apply CTDB Reed-Solomon repair to a set of tracks.
+    CtdbRepair {
+        paths: Vec<PathBuf>,
+        parity_url: String,
+        npar: usize,
+        offset: i32,
+        /// Expected per-track CRC32 values from the CTDB entry.
+        /// Used to verify the repair before replacing originals.
+        expected_crcs: Vec<u32>,
+    },
+    /// Apply CTDB Reed-Solomon repair to a single-image CUE album
+    /// (one audio file containing all tracks). The `info` carries the
+    /// CUE-derived track boundaries needed for per-track CRC verification.
+    CtdbRepairSingleImage {
+        info: Box<crate::tui::cue_parser::SingleImageInfo>,
+        parity_url: String,
+        npar: usize,
+        offset: i32,
+        expected_crcs: Vec<u32>,
+    },
+}
+
+/// Repair parameters parked while AR verification runs to resolve
+/// the drive read offset. Populated by `Command::CtdbRepair` when the
+/// AR cache is empty/inconclusive; consumed by the `AccurateRipComplete`
+/// handler which then opens the CTDB repair confirmation dialog.
+#[derive(Debug, Clone)]
+pub struct PendingCtdbRepair {
+    pub paths: Vec<PathBuf>,
+    pub parity_url: String,
+    pub npar: usize,
+    pub expected_crcs: Vec<u32>,
+    /// `Some` when the source is a single-image CUE; the AR-complete
+    /// handler will dispatch to `CtdbRepairSingleImage` instead of
+    /// `CtdbRepair`.
+    pub single_image: Option<Box<crate::tui::cue_parser::SingleImageInfo>>,
 }
 
 // ── Main application state ───────────────────────────────────────────
@@ -1358,6 +1394,20 @@ pub struct AppState {
     /// for a fixable offset and show the correction confirmation dialog
     /// instead of the normal results overlay.
     pub auto_fix_on_complete: bool,
+
+    /// Set when `:ctdb-repair` was invoked but the AR cache had no usable
+    /// offset data, so AR was kicked off first. The next
+    /// `AccurateRipComplete` handler consumes this, derives the offset
+    /// from the AR results, and opens the CTDB repair confirmation
+    /// dialog instead of the normal results overlay.
+    pub pending_ctdb_repair: Option<PendingCtdbRepair>,
+
+    /// Set when `:ctdb-repair` was invoked without a CTDB overlay open
+    /// (e.g. via the "CUETools DB repair" context menu item). The next
+    /// `CtdbComplete` handler consumes this and re-dispatches
+    /// `Command::CtdbRepair` so the existing repair flow can run against
+    /// the just-installed verification overlay.
+    pub auto_repair_on_ctdb_complete: bool,
 
     /// Last browse-entry click: (entry_path, click_time). Used for double-click detection.
     /// Path-based rather than index-based so directory refreshes / sort changes between
@@ -1475,6 +1525,8 @@ impl AppState {
             should_quit: false,
             force_redraw: false,
             auto_fix_on_complete: false,
+            pending_ctdb_repair: None,
+            auto_repair_on_ctdb_complete: false,
             last_browse_click: None,
             pending_browse_rename: None,
             recent,

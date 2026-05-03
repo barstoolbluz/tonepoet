@@ -2,132 +2,82 @@
 
 ## What is tonepoet?
 
-Tonepoet is a Rust CLI+TUI audio conversion toolkit. The main interface is a ratatui-based TUI with 5 tabs: Browse (1, default), Library (2, placeholder), Convert (3), Queue (4), Config (5). The user navigates their filesystem in Browse, selects files, configures conversion settings, and processes them through a multi-worker pipeline.
+Tonepoet is a Rust CLI+TUI audio conversion toolkit. Read `CLAUDE.md` in the project root for build instructions, workspace structure, key types, and coding conventions. Everything builds inside `nix develop`.
 
-Read `CLAUDE.md` in the project root for build instructions, workspace structure, key types, and coding conventions. Everything builds inside `nix develop`.
+## Where we are
 
-## What has been built (in rough chronological order)
+The CTDB Reed-Solomon repair pipeline is **functionally complete and compiles clean**, but **has not been validated end-to-end against real CDs yet**. The next session is dedicated to debugging the integration — exercising it with actual rips, surfacing latent bugs, and tightening the user-facing flows.
 
-### Core TUI infrastructure
-- Tokyo Night themed ratatui interface with vi-style keybindings
-- Two-pass rendering: draw (immutable state), then register mouse buttons (mutable ButtonRenderMap)
-- Vi command mode (`:` opens command input): `:q`, `:e`, `:set`, `:preset`, `:cd`, `:sort`, `:filter`, `:rename`, `:cp`, `:mv`, `:del`, etc.
-- PillState<T> generic pill selector widget for format options
-- All overlay footers are clickable pill buttons with mouse support
-- Context menus (right-click / `:context`) with side-by-side submenu rendering
+The approved repair plan is at `docs/ctdb-repair-plan.md`. The previous two sessions implemented the plan; nothing in the plan is outstanding.
 
-### Browse screen (primary focus of recent work)
-- Full file browser with sortable columns (Name, Size, Date, Type)
-- Async directory scanning and audio probing (ffmpeg-next + lofty)
-- Info pane showing technical details, ReplayGain/R128, metadata
-- Inline search panel with fuzzy matching, recursive search, tag search, multiple sort modes
-- SQLite tag cache with LRU eviction for search
-- Multi-select: click, Ctrl+click toggle, Ctrl+double-click range, Ctrl+V visual mode
-- Enter/double-click = select (not load into Convert)
-- Context menu with submenus:
-  - **Convert >** (Custom, Last Used, presets)
-  - Select/Select All/Select Inverse/Deselect
-  - Edit metadata / Analyze
-  - **Utilities >** (Verify, CUE sheet multi-file, CUE sheet single-image, Bit compare mark/compare/clear)
-  - **File operations >** (Rename, Bulk Rename, Copy to..., Move to..., Move to Trash)
-  - Copy path
-- Type-to-navigate: bare letter keys accumulate into a prefix buffer and jump to the first matching entry; resets after 1.5s timeout; Esc clears
-- Bookmarks overlay
-- Recent files overlay
-- Bulk rename wizard with template engine and CUE import (`:rename-all`)
-- Archive support: 7z listing, password keychain, multi-format
+### What was built and audited in the previous sessions
 
-### Analysis features
-- DR meter (TT algorithm, matching foobar2000)
-- Peak, RMS, clipping count, DC bias, actual bit depth
-- LUFS + true peak via loudgain subprocess
-- Pre-emphasis detection: metadata evidence (tags, CUE FLAGS PRE, log files, catalog number lookup) + spectral analysis (full M0/M1/M2 model comparison with corpus training — developed in a separate session, lives in `src/tui/preemphasis/`)
-- SQLite analysis cache with algorithm versioning
+| Area | Status |
+|------|--------|
+| RS codec (`src/ctdb_rs/mod.rs`) | 5 unit tests pass; 1109 LOC; the underlying math is solid. |
+| Per-track repair (`ctdb::repair_album`) | Wired end-to-end: download parity, decode, assemble disc image with STRIDE leadin/leadout, RS repair, split, re-encode, copy metadata, per-track CRC32 verify, backup/restore replace. |
+| Single-image CUE repair (`ctdb::repair_single_image`) | Decode once, repair the whole image, re-encode single file, per-track CRC verify via CUE boundaries, single-file backup/restore. |
+| AR offset auto-detect | `detect_ar_offset_from_cache()` returns `Option<i32>`; `Some(n)` for confirmed cached value (n may be 0), `None` to force a fresh `:ar` run. |
+| Deferred-AR flow | If AR cache is empty, `:ctdb-repair` stashes a `PendingCtdbRepair` in `AppState`, dispatches `:ar`, and the `AccurateRipComplete` handler resolves the offset and pops the repair confirmation. |
+| Context-menu / direct `:ctdb-repair` from no overlay | Sets `auto_repair_on_ctdb_complete`, dispatches `:ctdb`, and the `CtdbComplete` handler picks the first repairable page and re-dispatches `Command::CtdbRepair`. |
+| Confirmation messages | Distinguish "from AR cache", "verified by AR", "from AR verification", and "AR could not determine a drive offset — proceeding at +0 may produce incorrect repairs" (yes/no dialog gives the user the call). |
+| Safety net | Post-repair CRC32 must match the CTDB-database expected value for **every** track before originals are touched. Backup/restore on any failure. |
+| Clean compile | `cargo check` zero warnings; `cargo test --lib` 195 pass + 1 pre-existing baseline fail (`command_completion_prefix_con_matches_convert` — unrelated, "context" was added before this work). |
 
-### Metadata editing
-- Full tag editor overlay: all tags enumerated, multi-file merge with `<multiple values>`
-- Per-file detail overlay for mixed fields
-- Auto-populate title/track from filenames
-- Disc/track sorting
-- Batch write with backup/restore
+### Where bugs are most likely to surface
 
-### Utilities (under the Utilities submenu)
-- **Verify**: FLAC `--test --silent`, WavPack `-vq`, ffmpeg decode-to-null for others
-- **CUE sheet generation**: multi-file (one FILE per track) and single-image (cumulative timestamps)
-- **Bit compare**: two-phase mark-then-compare workflow. Decodes both files to s32le via ffmpeg pipes, compares chunk-by-chunk with fill_buf for correctness. Also `:compare path1 path2` command mode.
+These are the places to probe first when something misbehaves on a real disc:
 
-### Convert screen
-- 4-pane layout: Source, Metadata, Format (pills), Output Options
-- Tab reorder, `:queue`/`:commit`/`:go` gate
-- SourceMode enum (Empty, Single, Batch)
-- Batch render + expand overlay
-- Tab completion for commands
-- CLI file args
-- Async probe
+1. **Single-image repair, every step.** `repair_single_image` at `ctdb.rs:840` was implemented from spec; it has never been run against real audio. Specific risks:
+   - **Embedded `CUESHEET` block loss** — `copy_metadata_metaflac` in `accuraterip.rs:2165` copies tags + embedded picture but does not preserve the FLAC `CUESHEET` block. The external `.cue` file is unaffected, but tools that read embedded CUE will lose it. Pre-existing helper limitation; if a user reports it, add `--export-cuesheet-to`/`--import-cuesheet-from` calls.
+   - **Encode for unusual extensions** — `encode_corrected_track` in `accuraterip.rs:2061` falls through to FLAC compression flags for unknown extensions. Single-image albums in ALAC/m4a, WavPack, APE are explicitly handled; others (e.g. raw PCM, `.tta`) will not round-trip correctly.
+   - **Decode/probe length mismatch** — `info.total_samples` (set at single-image detection) versus `decode_track_to_raw_i16(&audio_path).len()` (used at repair time) are computed via different paths. If they disagree, `compute_suffix_skip(info.total_samples)` may not align with the actual audio buffer length. Verify with a real disc.
+2. **Deferred-AR offset path with multi-disc selections.** The match-by-first-track-path logic (`event_loop.rs:847`) handles the typical case but has not been exercised with a real multi-disc album. If `pending_ctdb_repair` doesn't match any AR page, pending is preserved (correctly, but the user sees the AR overlay instead of the expected repair confirmation).
+3. **Single-image AR cache storage.** `db.rs::store_ar` does `DELETE WHERE file_path = ?1` then INSERT in a per-track loop; for single-image albums where N tracks share `info.audio_path`, only the last track's cache entry survives. `detect_ar_offset_from_cache` works around this in practice (drive offset is uniform across tracks in the real world), but the cache is technically lossy here. **Pre-existing**, not introduced by the repair work — flag for later if cache reliability matters.
+4. **Recursive command dispatch.** `Command::CtdbRepair` no-overlay branch dispatches `Command::Ctdb`, and the `CtdbComplete` handler re-dispatches `Command::CtdbRepair`. Each dispatch returns synchronously. Should not loop, but watch for it if the user sees status flicker or duplicate confirmations.
+5. **Pre-emphasis discs.** CRC32 is computed over raw PCM regardless of pre-emphasis state, so this should not affect repair correctness — but the project memory note `project_preemph_dr.md` flags pre-emph for analysis. If a repair on a pre-emph disc fails CRC verification, suspect the AR/CTDB database having a different pre-emph assumption rather than the repair pipeline.
+6. **`:ar` failures.** If `:ar` fires (deferred path) but the multi-disc all-fail branch in `command.rs:1812` skips the `AccurateRipComplete` send, `pending_ctdb_repair` lingers and is consumed by the next unrelated `:ar`. Worst case is a spurious confirmation the user cancels; not a data-loss path.
 
-### Queue screen
-- Processing with progress tracking
-- Pause/resume, retry failed, clear completed
+### Key files
 
-### Database (SQLite, WAL mode)
-- Schema versioning via PRAGMA user_version (currently v10+, may be higher from the PE session)
-- Tables: presets, bookmarks, recent_files, analysis_cache, conversion_queue, search_tag_cache, pe_corpus (from the PE session)
+| File | What's there |
+|------|--------------|
+| `docs/ctdb-repair-plan.md` | The approved plan — source of truth for design decisions. |
+| `src/ctdb_rs/mod.rs` | RS codec API: `CtdbCodec::repair()`, `STRIDE = 11_760` (i16 count), `RepairResult`, `RepairError`. Offset arg is CD stereo sample-pair count. |
+| `src/tui/ctdb.rs` | `repair_album` (line ~638), `repair_single_image` (line ~840), `download_parity`, `compute_suffix_skip`, `compute_track_crc32`, verify functions. |
+| `src/tui/command.rs` | `Command::CtdbRepair` handler (line ~1819, with-overlay + no-overlay branches), `detect_ar_offset_from_cache` (line ~2800). |
+| `src/tui/app.rs` | `ConfirmAction::CtdbRepair` / `CtdbRepairSingleImage`, `PendingCtdbRepair`, `pending_ctdb_repair`, `auto_repair_on_ctdb_complete`. |
+| `src/tui/event_loop.rs` | `CtdbComplete` handler with auto-repair re-dispatch (~line 734); `AccurateRipComplete` handler with deferred-repair consumer (~line 847). |
+| `src/tui/keybindings.rs` | `execute_confirm_action` arms for both `CtdbRepair` and `CtdbRepairSingleImage` (~line 5474–5503). |
+| `src/tui/accuraterip.rs` | `detect_uniform_offset`, `encode_corrected_track`, `copy_metadata`. AR offset is in stereo sample pairs. |
+| `src/tui/cue_parser.rs` | `SingleImageInfo`, `detect_single_image`. `track_boundaries` are `(start_sample, count_sample)` in stereo pairs. |
+| `src/tui/context_menu.rs` | "CUETools DB repair" Verify-submenu entry dispatching `Command::CtdbRepair`. |
+| `src/db.rs` | `get_cached_ar` / `store_ar` (single-image cache caveat above). |
 
-## Architecture patterns
+### How to verify
 
-- **Async**: tokio runtime, mpsc channels for TUI messages, Arc<AtomicBool> cancel flags
-- **Event loop**: crossterm events + AppMessage channel, merged in select!
-- **Overlays**: ActiveOverlay enum with per-overlay scroll/state, key handlers in keybindings.rs
-- **Mouse**: ButtonRenderMap records rects during draw, keybindings.rs dispatches clicks via find_button_at
-- **Commands**: Command enum parsed in command.rs, dispatched in execute_command
-- **Context menu**: ContextMenuEntry::Item / Separator / Submenu, two-level side-by-side rendering
+1. `nix develop --extra-experimental-features 'nix-command flakes'`
+2. `cargo check` — should be clean, zero warnings.
+3. `cargo test --lib` — 195 pass, 1 pre-existing fail (`command_completion_prefix_con_matches_convert`).
+4. Real-world smoke matrix to step through:
+   - Per-track album, AR cache present (offset 0 and offset != 0): run `:ctdb` → `:ctdb-repair` from overlay; expect "from AR cache" confirmation.
+   - Per-track album, no AR cache: `:ctdb-repair` from overlay → expect "Running AccurateRip..." status → confirmation with derived offset.
+   - Per-track album, no overlay (context menu "CUETools DB repair"): expect verify run → first repairable disc auto-selected → confirmation pops.
+   - Single-image CUE album with mismatches + parity: expect end-to-end repair, originals replaced only after all-track CRC32 verify.
+   - Single-image CUE album with no mismatches: status "No mismatches detected — repair not needed", originals untouched.
+   - Multi-disc album with mixed mismatches: confirm first repairable disc is auto-selected.
+   - Disc not in CTDB: status "No parity data available" or "Disc not in CUETools database".
+5. Audit after each bug fix. The user's standing rule: "Whenever we fix bugs we change code, whenever we change code we re-audit." Re-audit not just the fix but the surrounding context.
 
-## What's next
+### Not committed / not pushed
 
-### Browse screen polish (nearly done)
-- The browse screen is mature. Most features are implemented and tested.
-- Minor deferred items in memory files: preset bar clicks, hover highlighting, text field click-to-edit
+The current branch (`main`) has all the repair work staged in the working tree but **not committed**. The user has been explicit about not committing without permission. Do not run `git commit` or `git push` unless asked.
 
-### Library screen (next major milestone)
-- Placeholder tab exists, no implementation yet
-- Design direction: metadata-indexed persistent catalog of curated paths
-- Search results return individual tracks grouped under album headers
-- Full metadata index in SQLite, exposable via `:sql` for ad hoc queries
-- Reuses browse infrastructure (search, metadata editing, analysis) mutatis mutandis
-- "Open in Library" context menu action from Browse
-- See `project_library_todo.md` and `project_search_architecture.md` in memory
+### User preferences (carried over)
 
-### Other deferred items
-- Metadata editor: CUE sheet import pill, clipboard paste pill
-- Archive descent (browse into archives)
-- freedb/MusicBrainz query facility (discussed, not planned)
-
-## User preferences
-
-- Plans before implementation, validation before execution, audits after implementation
-- "Whenever we fix bugs we change code, whenever we change code we re-audit"
-- Prefers concise communication, no unnecessary summaries
-- Commit and push when asked, not proactively
-- Uses the TUI extensively for testing — mouse mode means can't copy/paste from terminal
-- Has a large music library at ~/library/ organized as `Artist - Album (Year) [Format] {Pressing info}`
-- **Do NOT modify any files in ~/library/**
-
-## Key files for orientation
-
-| File | Purpose |
-|------|---------|
-| `CLAUDE.md` | Full project docs, build, structure, conventions |
-| `src/tui/app.rs` | AppState, all overlay/state enums |
-| `src/tui/keybindings.rs` | All key + mouse event dispatch (~5000+ LOC) |
-| `src/tui/command.rs` | Command enum, parser, execute_command |
-| `src/tui/context_menu.rs` | Menu builders and action dispatch |
-| `src/tui/browse.rs` | BrowseState, search, directory operations |
-| `src/tui/draw_browse.rs` | Browse screen rendering + button registration |
-| `src/tui/draw_overlays.rs` | All overlay rendering |
-| `src/tui/event_loop.rs` | Async event loop, message handlers |
-| `src/tui/message.rs` | AppMessage enum |
-| `src/tui/probe.rs` | Audio probing (ffmpeg-next) + metadata (lofty) |
-| `src/tui/analyze.rs` | DR meter, peak/RMS/clipping analysis |
-| `src/tui/preemphasis/` | Pre-emphasis detection (multi-file module) |
-| `src/db.rs` | SQLite database, migrations, all cache operations |
-| `src/config.rs` | TonepoetConfig, UiConfig |
+- **Develop a rigorous plan before implementing. Report the plan for approval. Do not freewheel.**
+- Audit after implementation. Re-audit after fixing bugs found in audit.
+- Concise communication, no unnecessary summaries.
+- Commit and push only when asked.
+- Use `nix develop` for all builds. Do not use system Rust.
+- For yes/no decisions affecting the user, use the existing `ActiveOverlay::Confirmation` dialog rather than silent fallbacks.

@@ -110,6 +110,8 @@ pub enum ContextAction {
     AccurateRipFixOffset,
     /// CUETools DB verification.
     VerifyCtdb,
+    /// CUETools DB Reed-Solomon repair.
+    CtdbRepair,
     /// View a text file in read-only mode.
     ViewFile(PathBuf),
     /// Edit a text file (not available for .log files).
@@ -259,6 +261,7 @@ fn build_verify_submenu() -> ContextMenuEntry {
             item("AccurateRip fix offset", ContextAction::AccurateRipFixOffset),
             separator(),
             item("CUETools DB", ContextAction::VerifyCtdb),
+            item("CUETools DB repair", ContextAction::CtdbRepair),
         ],
     }
 }
@@ -629,6 +632,10 @@ pub fn execute_context_action(
         }
         ContextAction::VerifyCtdb => {
             let cmd = super::command::Command::Ctdb;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::CtdbRepair => {
+            let cmd = super::command::Command::CtdbRepair;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::ViewFile(path) => {

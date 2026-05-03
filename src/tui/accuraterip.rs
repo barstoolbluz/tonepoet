@@ -2058,7 +2058,7 @@ fn tool_exists(cmd: &str) -> bool {
 }
 
 /// Encode corrected PCM to the target format, detected from src_path extension.
-async fn encode_corrected_track(
+pub async fn encode_corrected_track(
     corrected: &[i16],
     out_path: &Path,
     src_path: &Path,
@@ -2142,7 +2142,7 @@ async fn encode_via_ffmpeg(
 }
 
 /// Copy metadata from source to destination, format-aware.
-async fn copy_metadata(src: &Path, dst: &Path) -> Result<(), String> {
+pub async fn copy_metadata(src: &Path, dst: &Path) -> Result<(), String> {
     let ext = src.extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")

@@ -2206,8 +2206,10 @@ name = "tonepoet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
+ "crc32fast",
  "crossterm",
  "dirs",
  "env_logger 0.10.2",
