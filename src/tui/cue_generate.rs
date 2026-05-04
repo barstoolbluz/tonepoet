@@ -25,6 +25,8 @@ pub struct CueTrackInfo {
     /// the noncompliant CUE form should emit `INDEX 00` in the previous
     /// FILE block at offset `(prev_track_length - n)`.
     pub pregap_frames: Option<u32>,
+    /// CD ISRC code (12 alphanumerics, no separators), if present in tags.
+    pub isrc: Option<String>,
 }
 
 /// Generate a multi-file CUE sheet.
@@ -61,6 +63,7 @@ pub fn generate_multifile_cue(album: &CueAlbumInfo, tracks: &[CueTrackInfo]) -> 
             cue.push_str(&format!("  TRACK {:02} AUDIO\n", t.track_number));
             cue.push_str(&format!("    TITLE \"{}\"\n", escape(&t.title)));
             cue.push_str(&format!("    PERFORMER \"{}\"\n", escape(&t.artist)));
+            push_isrc_line(&mut cue, t.isrc.as_deref());
         }
         cue.push_str("    INDEX 01 00:00:00\n");
 
@@ -74,6 +77,7 @@ pub fn generate_multifile_cue(album: &CueAlbumInfo, tracks: &[CueTrackInfo]) -> 
                     cue.push_str(&format!("  TRACK {:02} AUDIO\n", next.track_number));
                     cue.push_str(&format!("    TITLE \"{}\"\n", escape(&next.title)));
                     cue.push_str(&format!("    PERFORMER \"{}\"\n", escape(&next.artist)));
+                    push_isrc_line(&mut cue, next.isrc.as_deref());
                     cue.push_str(&format!(
                         "    INDEX 00 {}\n",
                         frames_to_cue_timestamp(index00)
@@ -107,6 +111,7 @@ pub fn generate_single_image_cue(
         cue.push_str(&format!("  TRACK {:02} AUDIO\n", t.track_number));
         cue.push_str(&format!("    TITLE \"{}\"\n", escape(&t.title)));
         cue.push_str(&format!("    PERFORMER \"{}\"\n", escape(&t.artist)));
+        push_isrc_line(&mut cue, t.isrc.as_deref());
 
         let cumulative_frames = duration_to_frames(&cumulative);
         if i > 0 {
@@ -177,6 +182,17 @@ fn write_header(cue: &mut String, album: &CueAlbumInfo) {
 
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Emit an `ISRC <code>` line under a TRACK block when the tag holds a
+/// non-empty value. Trim surrounding whitespace; emit nothing on empty.
+fn push_isrc_line(cue: &mut String, isrc: Option<&str>) {
+    let Some(raw) = isrc else { return };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    cue.push_str(&format!("    ISRC {}\n", trimmed));
 }
 
 fn format_timestamp(d: &Duration) -> String {
@@ -268,6 +284,8 @@ pub fn gather_cue_info(
             .and_then(|m| m.artist.clone())
             .unwrap_or_default();
 
+        let isrc = meta.as_ref().and_then(|m| m.isrc.clone());
+
         // Collect album-level info from first file that has it.
         if album_title.is_none() {
             album_title = meta.as_ref().and_then(|m| m.album.clone());
@@ -290,6 +308,7 @@ pub fn gather_cue_info(
             duration,
             format_tag,
             pregap_frames: None,
+            isrc,
         });
     }
 
@@ -362,7 +381,14 @@ mod tests {
             duration,
             format_tag: "FLAC".to_string(),
             pregap_frames: pregap,
+            isrc: None,
         }
+    }
+
+    fn track_with_isrc(num: u32, duration: Duration, isrc: &str) -> CueTrackInfo {
+        let mut t = track(num, duration, None);
+        t.isrc = Some(isrc.to_string());
+        t
     }
 
     fn album() -> CueAlbumInfo {
@@ -428,6 +454,54 @@ mod tests {
 
         assert!(!cue.contains("INDEX 00"), "pregap exceeding prev track must be skipped");
         assert_eq!(cue.matches("  TRACK 02 AUDIO").count(), 1);
+    }
+
+    #[test]
+    fn multifile_cue_emits_isrc_line_when_present() {
+        let tracks = vec![
+            track_with_isrc(1, Duration::from_secs(240), "USRC17607839"),
+            track(2, Duration::from_secs(180), None),
+        ];
+        let cue = generate_multifile_cue(&album(), &tracks);
+        assert!(cue.contains("    ISRC USRC17607839\n"));
+        // No ISRC line for track 2.
+        assert_eq!(cue.matches("ISRC ").count(), 1);
+    }
+
+    #[test]
+    fn isrc_line_skipped_for_empty_or_whitespace_isrc() {
+        let mut t = track(1, Duration::from_secs(60), None);
+        t.isrc = Some("   ".to_string());
+        let cue = generate_multifile_cue(&album(), &[t]);
+        assert!(!cue.contains("ISRC"));
+    }
+
+    #[test]
+    fn isrc_emitted_in_pregap_injected_track_block() {
+        // Track 2's ISRC must appear inside track 1's FILE block (where its
+        // TRACK declaration was emitted because of pregap), not in track 2's
+        // FILE block.
+        let t1 = track(1, Duration::from_secs(240), None);
+        let mut t2 = track(2, Duration::from_secs(180), Some(75));
+        t2.isrc = Some("USRC17607840".to_string());
+        let cue = generate_multifile_cue(&album(), &[t1, t2]);
+
+        let file1_pos = cue.find("FILE \"01 - Track.flac\"").unwrap();
+        let file2_pos = cue.find("FILE \"02 - Track.flac\"").unwrap();
+        let isrc_pos = cue.find("ISRC USRC17607840").unwrap();
+        assert!(isrc_pos > file1_pos && isrc_pos < file2_pos,
+            "ISRC for track 2 should sit inside track 1's FILE block (pregap injection)");
+    }
+
+    #[test]
+    fn single_image_cue_emits_isrc_line() {
+        let tracks = vec![
+            track_with_isrc(1, Duration::from_secs(240), "USRC17607839"),
+            track_with_isrc(2, Duration::from_secs(180), "USRC17607840"),
+        ];
+        let cue = generate_single_image_cue(&album(), &tracks, "image.flac", "FLAC");
+        assert!(cue.contains("    ISRC USRC17607839\n"));
+        assert!(cue.contains("    ISRC USRC17607840\n"));
     }
 
     #[test]

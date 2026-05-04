@@ -1485,6 +1485,7 @@ impl CachedProbeRow {
                 r128_album_gain: self.r128_album_gain.clone(),
                 preemphasis_metadata: None, // Not cached; re-detected on probe.
                 hdcd_detail: None, // Populated from analysis cache if available.
+                isrc: None, // Not cached; re-read on full probe (only used by :cue).
             },
         })
     }

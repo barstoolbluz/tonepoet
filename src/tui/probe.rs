@@ -54,6 +54,10 @@ pub struct SourceMetadata {
     /// HDCD detection result from analysis cache. Populated when the file
     /// has been previously analyzed. None = not yet analyzed.
     pub hdcd_detail: Option<String>,
+
+    /// CD ISRC code, when present in the file's tags (typically populated by
+    /// EAC reading subchannel data during the rip). Used by CUE generation.
+    pub isrc: Option<String>,
 }
 
 /// Convert an R128 Q7.8 fixed-point integer (stored as a string) into a
@@ -354,6 +358,11 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
         }
         if meta.track_number.is_none() {
             meta.track_number = tag.track();
+        }
+        if meta.isrc.is_none() {
+            meta.isrc = tag
+                .get_string(&ItemKey::Isrc)
+                .map(|s| s.to_string());
         }
         if meta.catalog_number.is_none() {
             // CATALOGNUMBER is a Vorbis comment convention; also used in
