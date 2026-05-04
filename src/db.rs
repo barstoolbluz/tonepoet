@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 17;
+const CURRENT_VERSION: u32 = 18;
 
 // ── CTDB parity matrix cache tunables ─────────────────────────────────
 //
@@ -23,6 +23,13 @@ const CURRENT_VERSION: u32 = 17;
 const CTDB_PARITY_CACHE_MAX_ROWS: usize = 2000;
 const CTDB_PARITY_CACHE_EVICT_THRESHOLD: usize = (CTDB_PARITY_CACHE_MAX_ROWS * 110) / 100;
 const CTDB_PARITY_CACHE_EVICT_TARGET: usize = (CTDB_PARITY_CACHE_MAX_ROWS * 90) / 100;
+
+// MusicBrainz TOC lookup cache. Each row stores a JSON release blob keyed by
+// disc TOC string. 30-day TTL; LRU eviction when row count exceeds threshold.
+const MB_CACHE_MAX_ROWS: usize = 5000;
+const MB_CACHE_EVICT_THRESHOLD: usize = (MB_CACHE_MAX_ROWS * 110) / 100;
+const MB_CACHE_EVICT_TARGET: usize = (MB_CACHE_MAX_ROWS * 90) / 100;
+const MB_CACHE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -129,6 +136,9 @@ impl Database {
         }
         if version < 17 {
             self.migrate_v17()?;
+        }
+        if version < 18 {
+            self.migrate_v18()?;
         }
 
         self.conn
@@ -525,6 +535,20 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v18(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS musicbrainz_toc_cache (
+                toc_string TEXT PRIMARY KEY,
+                response_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                accessed_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mb_accessed
+                ON musicbrainz_toc_cache (accessed_at);
+        ").map_err(|e| format!("v18 migration failed: {}", e))?;
+        Ok(())
+    }
+
     // ── AccurateRip cache ───────────────────────────────────────
 
     /// Look up cached AR results for a file. Returns None if not cached
@@ -698,6 +722,74 @@ impl Database {
             ).map_err(|e| format!("ctdb parity cache evict: {}", e))?;
         }
 
+        Ok(())
+    }
+
+    // ── MusicBrainz TOC cache ────────────────────────────────────
+
+    /// Look up a cached MusicBrainz response by TOC string. Returns the raw
+    /// JSON body on hit. Returns `None` on miss or when the entry is older
+    /// than the 30-day TTL. Touches `accessed_at` on hit (LRU).
+    pub fn get_cached_mb_response(&self, toc_string: &str) -> Option<String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT response_json, fetched_at FROM musicbrainz_toc_cache
+             WHERE toc_string = ?1"
+        ).ok()?;
+
+        let row: Option<(String, String)> = stmt.query_row(
+            params![toc_string],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).ok();
+        let (json, fetched_at) = row?;
+
+        // TTL check: parse RFC3339, drop entry if older than 30 days.
+        if let Ok(fetched) = chrono::DateTime::parse_from_rfc3339(&fetched_at) {
+            let age = chrono::Utc::now().signed_duration_since(fetched.with_timezone(&chrono::Utc));
+            if age.num_seconds() > MB_CACHE_TTL_SECS {
+                return None;
+            }
+        } else {
+            return None;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE musicbrainz_toc_cache SET accessed_at = ?1 WHERE toc_string = ?2",
+            params![now, toc_string],
+        );
+        Some(json)
+    }
+
+    /// Store a MusicBrainz response. Triggers LRU eviction when the row
+    /// count exceeds `MB_CACHE_EVICT_THRESHOLD`, trimming to
+    /// `MB_CACHE_EVICT_TARGET`.
+    pub fn store_mb_response(&self, toc_string: &str, response_json: &str) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO musicbrainz_toc_cache
+                 (toc_string, response_json, fetched_at, accessed_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![toc_string, response_json, now],
+        ).map_err(|e| format!("mb cache store: {}", e))?;
+
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM musicbrainz_toc_cache",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| format!("mb cache count: {}", e))?;
+
+        if (count as usize) > MB_CACHE_EVICT_THRESHOLD {
+            let to_remove = (count as usize) - MB_CACHE_EVICT_TARGET;
+            self.conn.execute(
+                "DELETE FROM musicbrainz_toc_cache
+                 WHERE rowid IN (
+                     SELECT rowid FROM musicbrainz_toc_cache
+                     ORDER BY accessed_at ASC
+                     LIMIT ?1
+                 )",
+                params![to_remove as i64],
+            ).map_err(|e| format!("mb cache evict: {}", e))?;
+        }
         Ok(())
     }
 

@@ -36,6 +36,7 @@ pub mod help;
 pub mod keychain;
 pub mod keybindings;
 pub mod message;
+pub mod musicbrainz;
 pub mod pill;
 pub mod preemphasis;
 pub mod presets;
