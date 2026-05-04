@@ -46,7 +46,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "analyze", "analyze!", "analysis", "dr",
     "write-dr", "writedr",
     "write-rg-track", "write-rg-album",
-    "import-cue",
+    "import-cue", "cue", "cue!", "cue-mb", "cue-mb!",
     "fix-caps", "fixcaps",
     "search", "s", "rs", "rsearch",
     "context", "menu",
@@ -253,6 +253,10 @@ pub enum Command {
     /// Generate a CUE sheet from the selected audio files.
     /// `single_image`: false = multi-file, true = single image with cumulative timestamps.
     GenerateCue { single_image: bool },
+    /// Generate a CUE sheet driven by a MusicBrainz disc-TOC lookup. Title,
+    /// performer, ISRC, catalog, barcode all come from MB; durations and
+    /// pregaps come from local probe + EAC log.
+    GenerateCueMb { single_image: bool },
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -366,6 +370,8 @@ pub fn parse_command(input: &str) -> Command {
         "verify" | "test" => Command::Verify,
         "cue" => Command::GenerateCue { single_image: false },
         "cue!" => Command::GenerateCue { single_image: true },
+        "cue-mb" => Command::GenerateCueMb { single_image: false },
+        "cue-mb!" => Command::GenerateCueMb { single_image: true },
         "preemphasis" | "preemph" | "pe" => Command::DetectPreemphasis,
         "preemph-calibrate" | "pe-calibrate" => {
             let mut parts = args.splitn(2, char::is_whitespace);
@@ -1164,6 +1170,95 @@ pub fn execute_command(
                         app.set_status(format!("CUE generation failed: {}", e));
                     }
                 }
+            }
+        }
+        Command::GenerateCueMb { single_image } => {
+            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            if paths.is_empty() {
+                app.set_status("No audio files for MusicBrainz CUE generation");
+            } else {
+                super::probe::sort_paths_by_track(&mut paths);
+                let output_dir = if app.current_screen == AppScreen::Browse {
+                    let sel = collect_selection_for_file_ops(app);
+                    if sel.len() == 1 && sel[0].is_dir() {
+                        sel[0].clone()
+                    } else {
+                        paths[0].parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf()
+                    }
+                } else {
+                    paths[0].parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf()
+                };
+
+                // Compute TOC sectors (with 150 leadin). Try a colocated
+                // EAC log / single-image CUE first, fall back to deriving
+                // from sample counts of the selected tracks.
+                let sectors: Vec<u32> = match super::accuraterip::find_toc_offsets(&output_dir) {
+                    Some(s) => s,
+                    None => match super::accuraterip::collect_sample_counts(&paths) {
+                        Ok((sample_counts, sample_rate)) => {
+                            let samples_per_frame = (sample_rate / 75) as u64;
+                            let mut sectors = Vec::with_capacity(sample_counts.len() + 1);
+                            let mut frame: u64 = 150;
+                            for &count in &sample_counts {
+                                sectors.push(frame as u32);
+                                frame += count / samples_per_frame;
+                            }
+                            sectors.push(frame as u32);
+                            sectors
+                        }
+                        Err(e) => {
+                            app.set_status(format!("MusicBrainz CUE: {}", e));
+                            return;
+                        }
+                    },
+                };
+
+                let toc_string = match super::musicbrainz::build_mb_toc(&sectors) {
+                    Some(s) => s,
+                    None => {
+                        app.set_status("MusicBrainz CUE: TOC too short".to_string());
+                        return;
+                    }
+                };
+                let cached = app.db.get_cached_mb_response(&toc_string);
+                let n_cached = if cached.is_some() { "cached" } else { "fetching" };
+                app.set_status(format!(
+                    "MusicBrainz CUE: {} disc TOC ({} tracks)…",
+                    n_cached, sectors.len() - 1,
+                ));
+
+                let tx = tx.clone();
+                let toc_for_msg = toc_string.clone();
+                let paths_for_msg = paths.clone();
+                let output_dir_for_msg = output_dir.clone();
+                tokio::spawn(async move {
+                    let outcome = super::musicbrainz::lookup_release_by_toc(
+                        &sectors, cached,
+                    ).await;
+                    let _ = tx.send(AppMessage::CueMbComplete {
+                        outcome,
+                        paths: paths_for_msg,
+                        output_dir: output_dir_for_msg,
+                        single_image,
+                        toc_string: toc_for_msg,
+                    }).await;
+                });
             }
         }
         Command::MarkCompareRef => {

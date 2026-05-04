@@ -11,8 +11,6 @@
 //! We respect by setting a UA and relying on the SQLite cache to coalesce
 //! repeated lookups. Single-shot calls never need an explicit sleep.
 
-use crate::db::Database;
-
 /// Parsed MusicBrainz release matching a disc TOC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MbRelease {
@@ -63,20 +61,39 @@ const USER_AGENT: &str = concat!(
     " (https://github.com/barstoolbluz/tonepoet)"
 );
 
-/// Look up the highest-scoring MusicBrainz release matching the supplied
-/// TOC. On cache hit, returns the cached parse without an HTTP call.
-/// `None` means "no release matched"; `Err(_)` means a transport/parse
-/// failure the caller should surface.
+/// Result of a TOC lookup: the parsed release (if matched) and the raw
+/// JSON body the caller should write to the cache. `cache_response` is
+/// `None` when the lookup was satisfied from a passed-in cached body so
+/// the caller can skip a redundant store.
+#[derive(Debug)]
+pub struct MbLookupOutcome {
+    pub release: Option<MbRelease>,
+    pub cache_response: Option<String>,
+}
+
+/// Look up the best-matching MusicBrainz release for a disc TOC.
+///
+/// Database-free for use inside `tokio::spawn`: caller owns cache
+/// retrieval (pass the cached JSON body via `cached_response`) and cache
+/// storage (write `outcome.cache_response` back if `Some`). On cache hit
+/// the function does no HTTP.
+///
+/// `Ok(MbLookupOutcome { release: None, .. })` means "no release matched
+/// this TOC"; `Err(_)` is a transport/parse failure the caller should
+/// surface.
 pub async fn lookup_release_by_toc(
-    db: &Database,
     sectors: &[u32],
-) -> Result<Option<MbRelease>, String> {
+    cached_response: Option<String>,
+) -> Result<MbLookupOutcome, String> {
     let toc = build_mb_toc(sectors)
         .ok_or_else(|| "TOC must have at least 2 sector entries".to_string())?;
     let n_tracks = sectors.len() - 1;
 
-    if let Some(json) = db.get_cached_mb_response(&toc) {
-        return parse_mb_response(&json, n_tracks);
+    if let Some(json) = cached_response {
+        return Ok(MbLookupOutcome {
+            release: parse_mb_response(&json, n_tracks)?,
+            cache_response: None,
+        });
     }
 
     let url = format!(
@@ -98,16 +115,20 @@ pub async fn lookup_release_by_toc(
         .map_err(|e| format!("MusicBrainz response error: {}", e))?;
 
     if status == reqwest::StatusCode::NOT_FOUND {
-        // Cache the negative response too so we don't re-query on retry.
-        let _ = db.store_mb_response(&toc, &body);
-        return Ok(None);
+        return Ok(MbLookupOutcome {
+            release: None,
+            cache_response: Some(body),
+        });
     }
     if !status.is_success() {
         return Err(format!("MusicBrainz returned HTTP {}", status));
     }
 
-    let _ = db.store_mb_response(&toc, &body);
-    parse_mb_response(&body, n_tracks)
+    let release = parse_mb_response(&body, n_tracks)?;
+    Ok(MbLookupOutcome {
+        release,
+        cache_response: Some(body),
+    })
 }
 
 /// Parse a MusicBrainz JSON response and select the best release.

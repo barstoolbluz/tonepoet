@@ -136,4 +136,17 @@ pub enum AppMessage {
     CtdbRepairComplete {
         result: Result<String, String>,
     },
+    /// Result of an async MusicBrainz disc-TOC lookup driving `:cue-mb`.
+    /// `outcome` is `Err` when transport/parse failed; `Ok(None)` means
+    /// no release matched. `paths`, `output_dir`, `single_image` carry
+    /// the original command context to the main thread for CUE writing.
+    /// `toc_string` is provided so the handler can write `cache_response`
+    /// back into the SQLite cache.
+    CueMbComplete {
+        outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
+        paths: Vec<std::path::PathBuf>,
+        output_dir: std::path::PathBuf,
+        single_image: bool,
+        toc_string: String,
+    },
 }

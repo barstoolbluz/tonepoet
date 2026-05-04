@@ -844,6 +844,11 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
+        AppMessage::CueMbComplete { outcome, paths, output_dir, single_image, toc_string } => {
+            handle_cue_mb_complete(
+                app, tx, outcome, paths, output_dir, single_image, toc_string,
+            );
+        }
         AppMessage::AccurateRipComplete { pages } => {
             // Aggregate summary across all discs.
             let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
@@ -1148,3 +1153,84 @@ fn handle_paste(app: &mut AppState, text: &str) {
         }
     }
 }
+
+/// Handle the result of a `:cue-mb` MusicBrainz lookup. Caches the response,
+/// builds a CUE from MB-overridden tag/probe data, and writes it to disk.
+fn handle_cue_mb_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    outcome: Result<super::musicbrainz::MbLookupOutcome, String>,
+    paths: Vec<std::path::PathBuf>,
+    output_dir: std::path::PathBuf,
+    single_image: bool,
+    toc_string: String,
+) {
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            app.set_status(format!("MusicBrainz CUE lookup failed: {}", e));
+            return;
+        }
+    };
+
+    // Cache the response (positive or negative) so retries don't re-hit MB.
+    if let Some(json) = outcome.cache_response.as_deref() {
+        if let Err(e) = app.db.store_mb_response(&toc_string, json) {
+            log::warn!("MB cache store failed: {}", e);
+        }
+    }
+
+    let release = match outcome.release {
+        Some(r) => r,
+        None => {
+            app.set_status("MusicBrainz CUE: no release matched this disc TOC".to_string());
+            return;
+        }
+    };
+
+    let (mut album, mut tracks) = match super::cue_generate::gather_cue_info(&paths, &output_dir) {
+        Ok(pair) => pair,
+        Err(e) => {
+            app.set_status(format!("MusicBrainz CUE: {}", e));
+            return;
+        }
+    };
+
+    super::cue_generate::apply_mb_overrides(&mut album, &mut tracks, &release);
+
+    let cue_content = if single_image {
+        let image_name = super::cue_generate::derive_image_filename(&album, &paths[0]);
+        let ext = paths[0].extension().and_then(|e| e.to_str()).unwrap_or("flac");
+        let fmt = super::cue_generate::cue_format_tag(ext);
+        super::cue_generate::generate_single_image_cue(&album, &tracks, &image_name, fmt)
+    } else {
+        super::cue_generate::generate_multifile_cue(&album, &tracks)
+    };
+
+    let cue_filename = super::cue_generate::cue_output_filename(&album);
+    let cue_path = output_dir.join(&cue_filename);
+
+    match std::fs::write(&cue_path, &cue_content) {
+        Ok(()) => {
+            let mode = if single_image { "single image" } else { "multi-file" };
+            let pregaps = tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
+            let pregap_note = if pregaps > 0 {
+                format!(", {} pregap{}", pregaps, if pregaps == 1 { "" } else { "s" })
+            } else {
+                String::new()
+            };
+            app.set_status(format!(
+                "MusicBrainz CUE ({}, MB-enriched: \"{}\"{}) written: {}",
+                mode, album.title, pregap_note, cue_filename,
+            ));
+            if app.current_screen == AppScreen::Browse {
+                app.browse.refresh();
+                app.browse.probe_current_with_db(tx, Some(&app.db));
+            }
+        }
+        Err(e) => {
+            app.set_status(format!("MusicBrainz CUE write failed: {}", e));
+        }
+    }
+}
+
