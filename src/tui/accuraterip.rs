@@ -513,6 +513,98 @@ fn parse_eac_log_toc(path: &Path) -> Option<Vec<u32>> {
     Some(result)
 }
 
+/// Find the first `.log` file in a directory.
+pub fn find_eac_log(dir: &Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("log"))
+            .unwrap_or(false)
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Parse an EAC log for per-track pregap (INDEX 00) lengths.
+///
+/// Returns one entry per track in 1-based order: `pregaps[track_number - 1]`
+/// is `Some(frames)` when the log carries a pregap line for that track,
+/// otherwise `None`. Track 1's pregap is always `None` because EAC reports the
+/// 2-second mandatory CD lead-in on track 1, which is not part of the rip.
+///
+/// EAC pregap line format: `Pre-gap length  H:MM:SS.FF` (75 frames/sec).
+pub fn parse_eac_log_pregaps(path: &Path) -> Option<Vec<Option<u32>>> {
+    let raw = std::fs::read(path).ok()?;
+    let content = if raw.starts_with(&[0xFF, 0xFE]) {
+        let u16s: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&u16s)
+    } else {
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+
+    let mut pregaps: Vec<Option<u32>> = Vec::new();
+    let mut current_track: Option<usize> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // "Track  N" header. Reject lines that are TOC table rows ("Track |").
+        if let Some(rest) = trimmed.strip_prefix("Track ") {
+            let token = rest.trim_start().split_whitespace().next().unwrap_or("");
+            if let Ok(n) = token.parse::<usize>() {
+                while pregaps.len() < n {
+                    pregaps.push(None);
+                }
+                current_track = Some(n);
+                continue;
+            }
+        }
+
+        // English EAC: "Pre-gap length  H:MM:SS.FF". Skip track 1's
+        // mandatory CD lead-in pregap (not in the rip).
+        if let Some(rest) = trimmed.strip_prefix("Pre-gap length") {
+            if let Some(track) = current_track {
+                if track == 1 {
+                    continue;
+                }
+                let token = rest.trim().split_whitespace().next().unwrap_or("");
+                if let Some(frames) = parse_eac_pregap_timestamp(token) {
+                    if frames > 0 && track <= pregaps.len() {
+                        pregaps[track - 1] = Some(frames);
+                    }
+                }
+            }
+        }
+    }
+
+    if pregaps.is_empty() {
+        None
+    } else {
+        Some(pregaps)
+    }
+}
+
+/// Parse an EAC pregap timestamp `H:MM:SS.FF` into 75-fps frame count.
+fn parse_eac_pregap_timestamp(s: &str) -> Option<u32> {
+    let (hms, frames_str) = s.rsplit_once('.')?;
+    let parts: Vec<&str> = hms.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: u32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let s: u32 = parts[2].parse().ok()?;
+    let f: u32 = frames_str.parse().ok()?;
+    Some(((h * 60 + m) * 60 + s) * 75 + f)
+}
+
 /// Parse a CUE sheet for INDEX 01 timestamps and convert to sector offsets.
 ///
 /// Only works for single-image CUE sheets (one FILE with multiple TRACKs).
@@ -2268,4 +2360,66 @@ fn copy_tags_via_lofty(src: &Path, dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to write tags to {}: {}", dst.display(), e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod eac_log_pregap_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_log(content: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(content.as_bytes()).expect("write");
+        f
+    }
+
+    #[test]
+    fn parse_eac_pregap_timestamp_basic() {
+        assert_eq!(parse_eac_pregap_timestamp("0:00:00.00"), Some(0));
+        assert_eq!(parse_eac_pregap_timestamp("0:00:01.06"), Some(75 + 6));
+        assert_eq!(parse_eac_pregap_timestamp("0:00:02.00"), Some(150));
+        assert_eq!(parse_eac_pregap_timestamp("0:01:00.00"), Some(60 * 75));
+    }
+
+    #[test]
+    fn parse_eac_log_pregaps_extracts_per_track() {
+        let log = "\
+Track  1
+     Pre-gap length  0:00:02.00
+Track  2
+     Peak level 87.1 %
+Track  3
+     Pre-gap length  0:00:01.06
+Track  4
+     Peak level 87.9 %
+";
+        let f = write_log(log);
+        let pregaps = parse_eac_log_pregaps(f.path()).expect("parse");
+        // Track 1's lead-in is intentionally skipped.
+        assert_eq!(pregaps[0], None);
+        assert_eq!(pregaps[1], None);
+        assert_eq!(pregaps[2], Some(75 + 6));
+        assert_eq!(pregaps[3], None);
+    }
+
+    #[test]
+    fn parse_eac_log_pregaps_ignores_toc_table_track_lines() {
+        // The TOC table has "Track | Start | ..." rows; our parser should not
+        // mistake them for "Track  N" headers.
+        let log = "\
+TOC of the extracted CD
+
+     Track |   Start  |  Length  | Start sector | End sector
+    ---------------------------------------------------------
+        1  |  0:00.00 |  4:18.15 |         0    |    19364
+        2  |  4:18.15 |  3:44.43 |     19365    |    36207
+
+Track  3
+     Pre-gap length  0:00:01.06
+";
+        let f = write_log(log);
+        let pregaps = parse_eac_log_pregaps(f.path()).expect("parse");
+        assert_eq!(pregaps.len(), 3);
+        assert_eq!(pregaps[2], Some(81));
+    }
 }

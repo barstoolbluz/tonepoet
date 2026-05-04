@@ -1115,6 +1115,9 @@ pub fn execute_command(
 
                 match super::cue_generate::gather_cue_info(&paths, &output_dir) {
                     Ok((album, tracks)) => {
+                        let pregap_count = tracks.iter()
+                            .filter(|t| t.pregap_frames.is_some())
+                            .count();
                         let cue_content = if single_image {
                             let image_name =
                                 super::cue_generate::derive_image_filename(&album, &paths[0]);
@@ -1136,9 +1139,15 @@ pub fn execute_command(
                         match std::fs::write(&cue_path, &cue_content) {
                             Ok(()) => {
                                 let mode = if single_image { "single image" } else { "multi-file" };
+                                let pregap_note = if pregap_count > 0 {
+                                    format!(", with {} EAC pregap{}", pregap_count,
+                                        if pregap_count == 1 { "" } else { "s" })
+                                } else {
+                                    String::new()
+                                };
                                 app.set_status(format!(
-                                    "CUE sheet ({}) written: {}",
-                                    mode, cue_filename,
+                                    "CUE sheet ({}{}) written: {}",
+                                    mode, pregap_note, cue_filename,
                                 ));
                                 // Refresh browse to show the new file.
                                 if app.current_screen == AppScreen::Browse {
