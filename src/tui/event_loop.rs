@@ -731,7 +731,19 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
 
-        AppMessage::CtdbComplete { pages } => {
+        AppMessage::CtdbComplete { mut pages } => {
+            // Drain freshly computed parity matrices into the cache before
+            // the pages move into the long-lived overlay state. Each
+            // `parity_cache_write` carries (cache_key, ~376 KB matrix);
+            // taking it ensures the matrix is dropped after the DB write
+            // and never propagates through CtdbVerifyState clones.
+            for page in pages.iter_mut() {
+                if let Some((key, parity)) = page.result.parity_cache_write.take() {
+                    if let Err(e) = app.db.store_ctdb_parity(&key, 16, &parity) {
+                        log::warn!("CTDB parity cache store failed: {}", e);
+                    }
+                }
+            }
             if pages.len() == 1 {
                 let summary = crate::tui::ctdb::format_ctdb_summary(&pages[0].result);
                 app.set_status(format!("CUETools DB: {}", summary));

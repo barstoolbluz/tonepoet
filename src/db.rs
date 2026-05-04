@@ -8,7 +8,21 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 16;
+const CURRENT_VERSION: u32 = 17;
+
+// ── CTDB parity matrix cache tunables ─────────────────────────────────
+//
+// Each cached entry is `STRIDE * NPAR * 2` bytes — for STRIDE=11_760, NPAR=16
+// that's 376_320 bytes per disc. With CTDB_PARITY_CACHE_MAX_ROWS=2000 the
+// upper bound is roughly 750 MB. Eviction trips when the row count exceeds
+// CTDB_PARITY_CACHE_EVICT_THRESHOLD (110% of the cap) and trims down to
+// CTDB_PARITY_CACHE_EVICT_TARGET (90% of the cap), removing the
+// least-recently-used rows by `accessed_at`. Batch eviction amortizes
+// the deletion cost across many cache stores.
+
+const CTDB_PARITY_CACHE_MAX_ROWS: usize = 2000;
+const CTDB_PARITY_CACHE_EVICT_THRESHOLD: usize = (CTDB_PARITY_CACHE_MAX_ROWS * 110) / 100;
+const CTDB_PARITY_CACHE_EVICT_TARGET: usize = (CTDB_PARITY_CACHE_MAX_ROWS * 90) / 100;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -112,6 +126,9 @@ impl Database {
         }
         if version < 16 {
             self.migrate_v16()?;
+        }
+        if version < 17 {
+            self.migrate_v17()?;
         }
 
         self.conn
@@ -490,6 +507,24 @@ impl Database {
         Ok(())
     }
 
+    /// v17: CTDB parity matrix cache (LRU by accessed_at).
+    fn migrate_v17(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS ctdb_parity_cache (
+                cache_key TEXT NOT NULL,
+                npar INTEGER NOT NULL,
+                stride INTEGER NOT NULL,
+                parity_blob BLOB NOT NULL,
+                cached_at TEXT NOT NULL,
+                accessed_at TEXT NOT NULL,
+                PRIMARY KEY (cache_key, npar)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ctdb_parity_accessed
+                ON ctdb_parity_cache (accessed_at);
+        ").map_err(|e| format!("v17 migration failed: {}", e))?;
+        Ok(())
+    }
+
     // ── AccurateRip cache ───────────────────────────────────────
 
     /// Look up cached AR results for a file. Returns None if not cached
@@ -574,6 +609,95 @@ impl Database {
                 ],
             ).map_err(|e| format!("ar cache store: {}", e))?;
         }
+        Ok(())
+    }
+
+    // ── CTDB parity matrix cache ────────────────────────────────
+
+    /// Look up the cached CTDB parity matrix for a disc, keyed by a
+    /// content hash of the audio inputs. Returns the deserialized matrix
+    /// on hit and updates the row's `accessed_at` so LRU eviction reflects
+    /// recent use. Returns `None` on cache miss or any decode error.
+    pub fn get_cached_ctdb_parity(
+        &self,
+        cache_key: &str,
+        npar: u32,
+    ) -> Option<Vec<Vec<u16>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT stride, parity_blob FROM ctdb_parity_cache
+             WHERE cache_key = ?1 AND npar = ?2"
+        ).ok()?;
+
+        let row: Option<(i64, Vec<u8>)> = stmt.query_row(
+            params![cache_key, npar as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).ok();
+
+        let (stride_i64, blob) = row?;
+        let stride = stride_i64 as usize;
+        let parity = crate::ctdb_rs::syndrome::try_bytes_to_parity(
+            &blob, stride, npar as usize,
+        ).ok()?;
+
+        // Touch accessed_at so LRU treats this as recent. Failures here are
+        // non-fatal — the cache hit is still valid; we just missed a bookkeeping
+        // update.
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE ctdb_parity_cache SET accessed_at = ?1
+             WHERE cache_key = ?2 AND npar = ?3",
+            params![now, cache_key, npar as i64],
+        );
+
+        Some(parity)
+    }
+
+    /// Store a parity matrix in the cache. Triggers LRU eviction if the
+    /// row count exceeds `CTDB_PARITY_CACHE_EVICT_THRESHOLD`, trimming
+    /// down to `CTDB_PARITY_CACHE_EVICT_TARGET` by evicting the least
+    /// recently accessed rows.
+    pub fn store_ctdb_parity(
+        &self,
+        cache_key: &str,
+        npar: u32,
+        parity: &[Vec<u16>],
+    ) -> Result<(), String> {
+        if parity.is_empty() {
+            return Err("empty parity matrix".to_string());
+        }
+        let stride = parity.len();
+        let blob = crate::ctdb_rs::syndrome::parity_to_bytes(parity, stride, npar as usize);
+
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ctdb_parity_cache
+                 (cache_key, npar, stride, parity_blob, cached_at, accessed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![cache_key, npar as i64, stride as i64, blob, now],
+        ).map_err(|e| format!("ctdb parity cache store: {}", e))?;
+
+        // Eviction: only deletes when count exceeds the threshold, then
+        // trims down to the target. Cheap on the common case (single
+        // SELECT COUNT).
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ctdb_parity_cache",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| format!("ctdb parity cache count: {}", e))?;
+
+        if (count as usize) > CTDB_PARITY_CACHE_EVICT_THRESHOLD {
+            let to_remove = (count as usize) - CTDB_PARITY_CACHE_EVICT_TARGET;
+            self.conn.execute(
+                "DELETE FROM ctdb_parity_cache
+                 WHERE rowid IN (
+                     SELECT rowid FROM ctdb_parity_cache
+                     ORDER BY accessed_at ASC
+                     LIMIT ?1
+                 )",
+                params![to_remove as i64],
+            ).map_err(|e| format!("ctdb parity cache evict: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -1626,6 +1750,85 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn ctdb_parity_cache_round_trip() {
+        let db = Database::open_memory().unwrap();
+        let parity: Vec<Vec<u16>> = (0..10).map(|j| {
+            (0..16).map(|i| (j as u16 * 16 + i as u16).wrapping_mul(0x1357)).collect()
+        }).collect();
+
+        // Miss before store
+        assert!(db.get_cached_ctdb_parity("test_key", 16).is_none());
+
+        // Store + hit
+        db.store_ctdb_parity("test_key", 16, &parity).unwrap();
+        let got = db.get_cached_ctdb_parity("test_key", 16).unwrap();
+        assert_eq!(got, parity);
+
+        // Different npar = miss (composite primary key)
+        assert!(db.get_cached_ctdb_parity("test_key", 8).is_none());
+
+        // Different cache_key = miss
+        assert!(db.get_cached_ctdb_parity("other_key", 16).is_none());
+
+        // Re-store same key = INSERT OR REPLACE (idempotent)
+        db.store_ctdb_parity("test_key", 16, &parity).unwrap();
+        let again = db.get_cached_ctdb_parity("test_key", 16).unwrap();
+        assert_eq!(again, parity);
+    }
+
+    #[test]
+    fn ctdb_parity_cache_lru_eviction_trims_oldest() {
+        let db = Database::open_memory().unwrap();
+        // Tiny parity matrices to keep the test cheap; the real eviction
+        // logic only cares about row count, not blob size.
+        let parity: Vec<Vec<u16>> = (0..2).map(|j| vec![j as u16; 4]).collect();
+
+        // Push past the eviction threshold to force a trim cycle.
+        // Each store is also touching accessed_at via INSERT OR REPLACE.
+        let n = CTDB_PARITY_CACHE_EVICT_THRESHOLD + 5;
+        for i in 0..n {
+            let key = format!("key_{:04}", i);
+            db.store_ctdb_parity(&key, 4, &parity).unwrap();
+        }
+
+        let count: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM ctdb_parity_cache",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+
+        // Eviction trims to TARGET when the count exceeds THRESHOLD.
+        // Between trims the count can climb back up toward THRESHOLD, so
+        // the steady-state invariant is `count <= THRESHOLD` — strictly
+        // less than `THRESHOLD + 1`.
+        assert!(
+            (count as usize) <= CTDB_PARITY_CACHE_EVICT_THRESHOLD,
+            "expected count <= threshold ({}), got {}",
+            CTDB_PARITY_CACHE_EVICT_THRESHOLD, count
+        );
+        // Also assert that an eviction has actually fired (we pushed past
+        // the threshold and then some) — count must be below where we'd
+        // have landed without any eviction.
+        let n_inserted = CTDB_PARITY_CACHE_EVICT_THRESHOLD + 5;
+        assert!(
+            (count as usize) < n_inserted,
+            "expected count < {} (no eviction would have fired), got {}",
+            n_inserted, count
+        );
+
+        // The most recent insertions must still be present (LRU keeps
+        // newest by accessed_at).
+        for i in (n - 5)..n {
+            let key = format!("key_{:04}", i);
+            assert!(
+                db.get_cached_ctdb_parity(&key, 4).is_some(),
+                "expected recent key {} to survive eviction",
+                key
+            );
+        }
     }
 
     #[test]

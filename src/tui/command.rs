@@ -1721,8 +1721,15 @@ pub fn execute_command(
                         app.set_status(format!(
                             "CUETools DB: verifying {} tracks (single image)...", n,
                         ));
+                        // Cache lookup before spawn (needs &app.db on main thread).
+                        let cache_paths = vec![info.audio_path.clone()];
+                        let cache_key = super::ctdb::compute_ctdb_parity_cache_key(&cache_paths);
+                        let cached_parity = cache_key.as_deref()
+                            .and_then(|k| app.db.get_cached_ctdb_parity(k, 16));
                         tokio::spawn(async move {
-                            let result = super::ctdb::verify_ctdb_single_image(&info).await;
+                            let result = super::ctdb::verify_ctdb_single_image(
+                                &info, cache_key, cached_parity,
+                            ).await;
                             let _ = tx.send(AppMessage::CtdbComplete {
                                 pages: vec![super::app::CtdbVerifyPage {
                                     label: String::new(),
@@ -1754,9 +1761,13 @@ pub fn execute_command(
                             app.set_status(format!(
                                 "CUETools DB: verifying {} tracks...", n_tracks,
                             ));
+                            let cache_key = super::ctdb::compute_ctdb_parity_cache_key(&group_paths);
+                            let cached_parity = cache_key.as_deref()
+                                .and_then(|k| app.db.get_cached_ctdb_parity(k, 16));
                             tokio::spawn(async move {
                                 let result = super::ctdb::verify_ctdb(
                                     &group_paths, &sample_counts, sample_rate,
+                                    cache_key, cached_parity,
                                 ).await;
                                 let _ = tx.send(AppMessage::CtdbComplete {
                                     pages: vec![super::app::CtdbVerifyPage {
@@ -1790,14 +1801,23 @@ pub fn execute_command(
                                 .unwrap_or(std::path::Path::new("."))
                                 .to_path_buf();
 
-                            // Per-disc single-image detection.
+                            // Per-disc single-image detection. Cache key is computed
+                            // inside the spawn (file-metadata-only, no DB access).
+                            // cached_parity is None here — multi-disc spawns populate
+                            // the cache from each result's parity_cache_write after
+                            // the spawn completes; the cache helps subsequent
+                            // single-disc verifies.
                             let result = if let Some(info) = super::cue_parser::detect_single_image(&dir) {
-                                super::ctdb::verify_ctdb_single_image(&info).await
+                                let cache_paths = vec![info.audio_path.clone()];
+                                let cache_key = super::ctdb::compute_ctdb_parity_cache_key(&cache_paths);
+                                super::ctdb::verify_ctdb_single_image(&info, cache_key, None).await
                             } else {
                                 match super::accuraterip::collect_sample_counts(&group_paths) {
                                     Ok((sample_counts, sample_rate)) => {
+                                        let cache_key = super::ctdb::compute_ctdb_parity_cache_key(&group_paths);
                                         super::ctdb::verify_ctdb(
                                             &group_paths, &sample_counts, sample_rate,
+                                            cache_key, None,
                                         ).await
                                     }
                                     Err(e) => {

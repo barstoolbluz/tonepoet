@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use super::message::AppMessage;
 
@@ -66,6 +67,13 @@ pub struct CtdbVerifyResult {
     pub stride: Option<usize>,
     /// Parity download URL from the best CTDB entry (for repair).
     pub parity_url: Option<String>,
+    /// When the verify path computed a fresh parity matrix (i.e. didn't
+    /// receive a cached one), this carries `(cache_key, parity)` for the
+    /// caller to persist via `Database::store_ctdb_parity`. The event-loop
+    /// `CtdbComplete` handler must `take()` this field immediately after
+    /// the verify task completes — leaving it populated would propagate
+    /// a ~376 KB matrix into long-lived overlay state.
+    pub parity_cache_write: Option<(String, Vec<Vec<u16>>)>,
 }
 
 // ── TOC construction ────────────────────────────────────────────────
@@ -278,6 +286,41 @@ pub struct RsVerifiedMatch {
 }
 
 const CUETOOLS_MAX_NPAR: usize = 16;
+
+/// Compute a content-addressed cache key for the parity matrix of a disc's
+/// audio inputs. SHA-256 hex digest of `(path bytes, mtime u64 LE, size u64 LE)`
+/// for each path in caller order, separated by a tag byte. Returns `None` if
+/// any path can't be stat'd — caller should treat as a cache miss and skip
+/// caching rather than risk a stale entry.
+pub fn compute_ctdb_parity_cache_key(paths: &[PathBuf]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    for path in paths {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta.modified()
+            .map(crate::db::systemtime_to_unix)
+            .unwrap_or(0) as u64;
+        let size = meta.len();
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(mtime.to_le_bytes());
+        hasher.update(size.to_le_bytes());
+        // Separator so paths with similar prefixes can't collide via length-extension.
+        hasher.update([0u8]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Compute the audio's full CTDB parity matrix at maxNpar=16. Synchronous
+/// CPU-bound work; orchestrators should run this in `spawn_blocking`.
+pub fn compute_audio_parity16(audio: &[i16]) -> Option<Vec<Vec<u16>>> {
+    let gf = crate::ctdb_rs::Galois16::new();
+    crate::ctdb_rs::syndrome::compute_parity_matrix_from_audio(
+        &gf, audio, CUETOOLS_MAX_NPAR,
+    )
+    .ok()
+}
 
 #[derive(Clone, Debug)]
 struct CuetoolsSyndromeContext {
@@ -677,6 +720,25 @@ pub async fn verify_disc_via_rs(
     .flatten()
 }
 
+/// Variant of `verify_disc_via_rs` that takes a precomputed parity matrix.
+/// The orchestrator can populate `parity16` from the parity cache to skip
+/// the (~20 sec) `compute_parity_matrix_from_audio` step.
+pub async fn verify_disc_via_rs_with_parity_matrix(
+    audio: &[i16],
+    parity16: Vec<Vec<u16>>,
+    entries: &[CtdbEntry],
+    offset_window: i32,
+) -> Option<RsVerifiedMatch> {
+    let audio = audio.to_vec();
+    let entries = entries.to_vec();
+    tokio::task::spawn_blocking(move || {
+        verify_disc_via_rs_blocking_with_parity(&audio, &parity16, &entries, offset_window)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 fn verify_disc_via_rs_blocking(
     audio: &[i16],
     entries: &[CtdbEntry],
@@ -684,7 +746,6 @@ fn verify_disc_via_rs_blocking(
 ) -> Option<RsVerifiedMatch> {
     let codec = crate::ctdb_rs::CtdbCodec::new();
     let gf = codec.galois();
-    let ctx = cuetools_build_syndrome_context(audio)?;
 
     // matches CUETools.AccurateRip/AccurateRip.cs:2247-2252
     // matches CUETools.AccurateRip/AccurateRip.cs:2798-2802
@@ -692,6 +753,18 @@ fn verify_disc_via_rs_blocking(
         gf, audio, CUETOOLS_MAX_NPAR,
     )
     .ok()?;
+    verify_disc_via_rs_blocking_with_parity(audio, &parity16, entries, offset_window)
+}
+
+fn verify_disc_via_rs_blocking_with_parity(
+    audio: &[i16],
+    parity16: &[Vec<u16>],
+    entries: &[CtdbEntry],
+    offset_window: i32,
+) -> Option<RsVerifiedMatch> {
+    let codec = crate::ctdb_rs::CtdbCodec::new();
+    let gf = codec.galois();
+    let ctx = cuetools_build_syndrome_context(audio)?;
 
     let stride = crate::ctdb_rs::STRIDE as i32;
     let source_lo = 1 - stride / 2;
@@ -705,7 +778,7 @@ fn verify_disc_via_rs_blocking(
 
     for entry in entries {
         let candidate = verify_entry_via_syndrome_fast_path(
-            gf, &parity16, &ctx, entry, offset_lo, offset_hi,
+            gf, parity16, &ctx, entry, offset_lo, offset_hi,
         );
 
         if let Some(candidate) = candidate {
@@ -767,10 +840,19 @@ include!("ctdb_cuetools_repair.rs");
 ///
 /// Builds a TOC, queries CTDB, decodes each track, computes CRC32,
 /// and uses Reed-Solomon parity as the album-level verification signal.
+///
+/// `cache_key` and `cached_parity` are the parity cache hooks: pass
+/// `Some(key)` when the caller wants the resulting parity matrix written
+/// back to the cache, and pass `Some(parity)` when the caller already has
+/// a cached matrix (skips the ~20 sec parity computation). On a cache
+/// miss, the result's `parity_cache_write` is populated for the caller
+/// to persist via `Database::store_ctdb_parity`.
 pub async fn verify_ctdb(
     paths: &[PathBuf],
     sample_counts: &[u64],
     sample_rate: u32,
+    cache_key: Option<String>,
+    cached_parity: Option<Vec<Vec<u16>>>,
 ) -> CtdbVerifyResult {
     let n = paths.len();
     if n == 0 {
@@ -780,6 +862,7 @@ pub async fn verify_ctdb(
             npar: None,
             stride: None,
             parity_url: None,
+            parity_cache_write: None,
         };
     }
 
@@ -815,6 +898,7 @@ pub async fn verify_ctdb(
                 npar: None,
                 stride: None,
                 parity_url: None,
+                parity_cache_write: None,
             };
         }
         Err(e) => {
@@ -832,6 +916,7 @@ pub async fn verify_ctdb(
                 npar: None,
                 stride: None,
                 parity_url: None,
+                parity_cache_write: None,
             };
         }
     };
@@ -853,6 +938,7 @@ pub async fn verify_ctdb(
                 npar: None,
                 stride: None,
                 parity_url: None,
+                parity_cache_write: None,
             };
         }
     };
@@ -886,15 +972,48 @@ pub async fn verify_ctdb(
         }
     }
 
-    let rs_match = match assemble_ctdb_disc_image_from_tracks(&decoded_tracks) {
+    // Cache-aware parity flow: use cached parity if supplied, else compute
+    // fresh and stash for the caller to write back if cache_key is Some.
+    let (rs_match, parity_cache_write) = match assemble_ctdb_disc_image_from_tracks(&decoded_tracks) {
         Some(image) => {
-            verify_disc_via_rs(
-                &image,
-                &db_response.entries,
-                CTDB_RS_OFFSET_WINDOW_SAMPLES,
-            ).await
+            // Resolve parity: from cache, or freshly computed.
+            let parity_and_write: Option<(Vec<Vec<u16>>, Option<(String, Vec<Vec<u16>>)>)> =
+                match cached_parity {
+                    Some(p) => {
+                        log::info!("CTDB RS: using cached parity matrix");
+                        Some((p, None))
+                    }
+                    None => {
+                        let image_for_parity = image.clone();
+                        let computed = tokio::task::spawn_blocking(move || {
+                            compute_audio_parity16(&image_for_parity)
+                        }).await.ok().flatten();
+                        computed.map(|p| {
+                            let cache_write = cache_key.map(|k| (k, p.clone()));
+                            (p, cache_write)
+                        })
+                    }
+                };
+
+            match parity_and_write {
+                Some((parity, cache_write)) => {
+                    let m = verify_disc_via_rs_with_parity_matrix(
+                        &image,
+                        parity,
+                        &db_response.entries,
+                        CTDB_RS_OFFSET_WINDOW_SAMPLES,
+                    ).await;
+                    (m, cache_write)
+                }
+                None => {
+                    log::warn!(
+                        "CTDB RS: failed to compute parity matrix; skipping RS verification"
+                    );
+                    (None, None)
+                }
+            }
         }
-        None => None,
+        None => (None, None),
     };
 
     let entry = rs_match
@@ -976,6 +1095,7 @@ pub async fn verify_ctdb(
         npar: result_npar,
         stride: result_stride,
         parity_url: result_parity_url,
+        parity_cache_write,
     }
 }
 
@@ -1020,8 +1140,12 @@ pub fn format_ctdb_summary(result: &CtdbVerifyResult) -> String {
 ///
 /// Decodes the full image, splits by CUE boundaries, computes per-track
 /// CRC32, and uses Reed-Solomon parity as the album-level verification signal.
+///
+/// `cache_key` and `cached_parity` mirror `verify_ctdb`'s parity cache hooks.
 pub async fn verify_ctdb_single_image(
     info: &super::cue_parser::SingleImageInfo,
+    cache_key: Option<String>,
+    cached_parity: Option<Vec<Vec<u16>>>,
 ) -> CtdbVerifyResult {
     let n = info.track_boundaries.len();
 
@@ -1063,6 +1187,7 @@ pub async fn verify_ctdb_single_image(
                 npar: None,
                 stride: None,
                 parity_url: None,
+                parity_cache_write: None,
             };
         }
         Err(e) => {
@@ -1080,6 +1205,7 @@ pub async fn verify_ctdb_single_image(
                 npar: None,
                 stride: None,
                 parity_url: None,
+                parity_cache_write: None,
             };
         }
     };
@@ -1101,6 +1227,7 @@ pub async fn verify_ctdb_single_image(
                 npar: None,
                 stride: None,
                 parity_url: None,
+                parity_cache_write: None,
             };
         }
     };
@@ -1129,6 +1256,7 @@ pub async fn verify_ctdb_single_image(
                 npar: None,
                 stride: None,
                 parity_url: None,
+                parity_cache_write: None,
             };
         }
         Err(e) => {
@@ -1146,16 +1274,49 @@ pub async fn verify_ctdb_single_image(
                 npar: None,
                 stride: None,
                 parity_url: None,
+                parity_cache_write: None,
             };
         }
     };
 
     let image = assemble_ctdb_disc_image_from_audio(&raw_i16);
-    let rs_match = verify_disc_via_rs(
-        &image,
-        &db_response.entries,
-        CTDB_RS_OFFSET_WINDOW_SAMPLES,
-    ).await;
+
+    // Cache-aware parity flow (mirrors verify_ctdb).
+    let parity_and_write: Option<(Vec<Vec<u16>>, Option<(String, Vec<Vec<u16>>)>)> =
+        match cached_parity {
+            Some(p) => {
+                log::info!("CTDB RS: using cached parity matrix");
+                Some((p, None))
+            }
+            None => {
+                let image_for_parity = image.clone();
+                let computed = tokio::task::spawn_blocking(move || {
+                    compute_audio_parity16(&image_for_parity)
+                }).await.ok().flatten();
+                computed.map(|p| {
+                    let cache_write = cache_key.map(|k| (k, p.clone()));
+                    (p, cache_write)
+                })
+            }
+        };
+
+    let (rs_match, parity_cache_write) = match parity_and_write {
+        Some((parity, cache_write)) => {
+            let m = verify_disc_via_rs_with_parity_matrix(
+                &image,
+                parity,
+                &db_response.entries,
+                CTDB_RS_OFFSET_WINDOW_SAMPLES,
+            ).await;
+            (m, cache_write)
+        }
+        None => {
+            log::warn!(
+                "CTDB RS: failed to compute parity matrix; skipping RS verification"
+            );
+            (None, None)
+        }
+    };
     drop(image);
 
     let entry = rs_match
@@ -1234,6 +1395,7 @@ pub async fn verify_ctdb_single_image(
         npar: result_npar,
         stride: result_stride,
         parity_url: result_parity_url,
+        parity_cache_write,
     }
 }
 
