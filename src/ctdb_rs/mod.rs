@@ -252,18 +252,24 @@ pub mod syndrome {
         audio: &[i16],
         npar: usize,
     ) -> Result<Vec<Vec<u16>>, CtdbRsError> {
+        use rayon::prelude::*;
+
         let rows = data_row_count(audio.len())?;
         let gx = make_generator_poly(gf, npar)?;
         let mut parity = vec![vec![0u16; npar]; STRIDE];
 
-        for col in 0..STRIDE {
-            let mut wr = vec![0u16; npar];
-            for row in 0..rows {
-                let idx = STRIDE + row * STRIDE + col;
-                update_lfsr(gf, &gx, &mut wr, i16_to_u16_bits(audio[idx]));
-            }
-            parity[col] = wr;
-        }
+        // Each disc-image column is an independent LFSR — parallelize across
+        // STRIDE columns. `gf`/`gx`/`audio` are shared immutable borrows, and
+        // each thread mutates only its own `parity[col]`. No data races.
+        parity
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(col, wr)| {
+                for row in 0..rows {
+                    let idx = STRIDE + row * STRIDE + col;
+                    update_lfsr(gf, &gx, wr, i16_to_u16_bits(audio[idx]));
+                }
+            });
 
         Ok(parity)
     }
@@ -273,18 +279,21 @@ pub mod syndrome {
         words: &[u16],
         npar: usize,
     ) -> Result<Vec<Vec<u16>>, CtdbRsError> {
+        use rayon::prelude::*;
+
         let rows = data_row_count(words.len())?;
         let gx = make_generator_poly(gf, npar)?;
         let mut parity = vec![vec![0u16; npar]; STRIDE];
 
-        for col in 0..STRIDE {
-            let mut wr = vec![0u16; npar];
-            for row in 0..rows {
-                let idx = STRIDE + row * STRIDE + col;
-                update_lfsr(gf, &gx, &mut wr, words[idx]);
-            }
-            parity[col] = wr;
-        }
+        parity
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(col, wr)| {
+                for row in 0..rows {
+                    let idx = STRIDE + row * STRIDE + col;
+                    update_lfsr(gf, &gx, wr, words[idx]);
+                }
+            });
 
         Ok(parity)
     }
@@ -1032,6 +1041,66 @@ mod tests {
         let bytes = syndrome::parity_to_bytes(&parity, 3, 4);
         let decoded = syndrome::try_bytes_to_parity(&bytes, 3, 4).unwrap();
         assert_eq!(decoded, parity);
+    }
+
+    /// Parallel `compute_parity_matrix_from_audio` must produce byte-identical
+    /// output to a sequential reference loop. Tests against three rows of
+    /// non-trivial synthetic audio so any per-column LFSR state leak between
+    /// rayon threads would flip at least one symbol.
+    #[test]
+    fn parity_matrix_parallel_matches_sequential_reference() {
+        let gf = Galois16::new();
+        let npar = 4;
+        let rows = 3;
+        let total = STRIDE * (rows + 2);
+        let mut audio = vec![0i16; total];
+        // Fill the protected region with a deterministic non-zero pattern; leave
+        // the leadin/leadout zeros (matches CTDB convention).
+        for idx in STRIDE..STRIDE + rows * STRIDE {
+            let word = ((idx as u32 * 257 + 0x1234) & 0xffff) as u16;
+            audio[idx] = word as i16;
+        }
+
+        let parallel = syndrome::compute_parity_matrix_from_audio(&gf, &audio, npar).unwrap();
+
+        // Sequential reference implementation, identical to the loop body
+        // before the rayon conversion.
+        let gx = syndrome::make_generator_poly(&gf, npar).unwrap();
+        let mut sequential = vec![vec![0u16; npar]; STRIDE];
+        for col in 0..STRIDE {
+            let mut wr = vec![0u16; npar];
+            for row in 0..rows {
+                let idx = STRIDE + row * STRIDE + col;
+                let data_word = audio[idx] as u16;
+                let feedback = wr[0] ^ data_word;
+                let mut new_wr = vec![0u16; npar];
+                for i in 0..(npar - 1) {
+                    new_wr[i] = wr[i + 1] ^ gf.mul(gx[i], feedback);
+                }
+                new_wr[npar - 1] = gf.mul(gx[npar - 1], feedback);
+                wr = new_wr;
+            }
+            sequential[col] = wr;
+        }
+
+        assert_eq!(parallel, sequential);
+    }
+
+    /// Determinism check — the same input should always produce the same
+    /// parity matrix, regardless of rayon's scheduling.
+    #[test]
+    fn parity_matrix_parallel_is_deterministic() {
+        let gf = Galois16::new();
+        let npar = 8;
+        let rows = 5;
+        let mut audio = vec![0i16; STRIDE * (rows + 2)];
+        for idx in STRIDE..STRIDE + rows * STRIDE {
+            audio[idx] = (idx as i32 * 31 - 0x4000) as i16;
+        }
+
+        let a = syndrome::compute_parity_matrix_from_audio(&gf, &audio, npar).unwrap();
+        let b = syndrome::compute_parity_matrix_from_audio(&gf, &audio, npar).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
