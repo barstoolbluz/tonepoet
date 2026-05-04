@@ -1780,6 +1780,65 @@ mod tests {
     }
 
     #[test]
+    fn ctdb_parity_cache_lru_promotes_on_hit() {
+        // The promote-on-hit invariant: a `get` updates the row's
+        // `accessed_at`, so a row that's read just before eviction
+        // must survive even if it was the oldest when inserted.
+        let db = Database::open_memory().unwrap();
+        let parity: Vec<Vec<u16>> = (0..2).map(|j| vec![j as u16; 4]).collect();
+
+        // Insert one key first, so it has the oldest accessed_at.
+        db.store_ctdb_parity("first", 4, &parity).unwrap();
+
+        // Fill up to (and not over) the eviction threshold. After this
+        // loop, count = threshold, and "first" still has the oldest
+        // accessed_at of all rows.
+        let threshold = CTDB_PARITY_CACHE_EVICT_THRESHOLD;
+        for i in 0..(threshold - 1) {
+            let key = format!("key_{:04}", i);
+            db.store_ctdb_parity(&key, 4, &parity).unwrap();
+        }
+
+        let count_before: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM ctdb_parity_cache",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            count_before as usize, threshold,
+            "expected count to be at threshold before eviction trigger",
+        );
+
+        // Hit "first". This must bump its accessed_at to now — making it
+        // newer than every key_NNNN that was just inserted.
+        assert!(db.get_cached_ctdb_parity("first", 4).is_some());
+
+        // Trigger eviction by inserting one more row.
+        db.store_ctdb_parity("trigger", 4, &parity).unwrap();
+
+        // After eviction, count is at target. "first" must survive
+        // because the get bumped its accessed_at; if the promote-on-hit
+        // logic ever regressed (UPDATE missing, fired with wrong key,
+        // etc), "first" would have been the oldest and would be gone.
+        assert!(
+            db.get_cached_ctdb_parity("first", 4).is_some(),
+            "row was evicted despite cache hit promotion — \
+             accessed_at UPDATE in get_cached_ctdb_parity may be broken",
+        );
+        // The trigger row (newest) must survive.
+        assert!(
+            db.get_cached_ctdb_parity("trigger", 4).is_some(),
+            "newest row was evicted",
+        );
+        // key_0000 was the second-oldest after "first"; with "first"
+        // promoted, key_0000 is now the oldest and must be evicted.
+        assert!(
+            db.get_cached_ctdb_parity("key_0000", 4).is_none(),
+            "expected key_0000 to be evicted as oldest after \"first\" promotion",
+        );
+    }
+
+    #[test]
     fn ctdb_parity_cache_lru_eviction_trims_oldest() {
         let db = Database::open_memory().unwrap();
         // Tiny parity matrices to keep the test cheap; the real eviction
