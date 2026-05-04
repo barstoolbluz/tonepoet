@@ -198,7 +198,11 @@ fn cuetools_repair_audio_index(
     actual_offset: i32,
     audio_len: usize,
 ) -> Option<usize> {
-    let idx = crate::ctdb_rs::STRIDE as i64
+    // Chien position 0 corresponds to the first row of CUETools' protected
+    // middle span — i.e., payload row 1 (audio offset 2*STRIDE), because the
+    // first stride of payload lives in leadin and is excluded from the LFSR.
+    // matches CUETools.AccurateRip/AccurateRip.cs:3099-3105
+    let idx = 2_i64 * crate::ctdb_rs::STRIDE as i64
         + row as i64 * crate::ctdb_rs::STRIDE as i64
         + column as i64
         - 2_i64 * actual_offset as i64;
@@ -219,11 +223,7 @@ fn cuetools_repaired_audio_matches_blob(
     let Some(ctx) = cuetools_build_syndrome_context(audio) else {
         return false;
     };
-    let Ok(parity16) = crate::ctdb_rs::syndrome::compute_parity_matrix_from_audio(
-        gf,
-        audio,
-        CUETOOLS_MAX_NPAR,
-    ) else {
+    let Some(parity16) = compute_audio_parity16(audio) else {
         return false;
     };
     let Some(our_syndrome) =
@@ -259,14 +259,13 @@ pub fn repair_disc_via_rs_blocking(
         npar,
     )?;
 
-    // CUETools VerifyParity computes GetSyndrome(npar, -1, -actualOffset).
+    // CUETools VerifyParity computes GetSyndrome(npar, -1, -actualOffset) over
+    // the middle-span parity workspace — first stride and final laststride live
+    // in leadin/leadout, not in the LFSR.
     // matches CUETools.AccurateRip/CDRepair.cs:1363
-    let parity16 = crate::ctdb_rs::syndrome::compute_parity_matrix_from_audio(
-        gf,
-        audio,
-        CUETOOLS_MAX_NPAR,
-    )
-    .map_err(crate::ctdb_rs::RepairError::from)?;
+    // matches CUETools.AccurateRip/AccurateRip.cs:3099-3105
+    let parity16 = compute_audio_parity16(audio)
+        .ok_or_else(|| ctdb_repair_invalid_input("failed to compute CTDB parity workspace"))?;
     let our_syndrome = cuetools_get_syndrome_matrix(gf, &parity16, &ctx, npar, -actual_offset)
         .ok_or_else(|| ctdb_repair_invalid_input("failed to compute CUETools syndrome matrix"))?;
 
@@ -508,19 +507,32 @@ mod cuetools_repair_translation_fixtures {
         assert_eq!(syndrome[11], vec![0x153f, 0x298d, 0x8195, 0xb443]);
     }
 
+    /// Build a synthetic disc image whose payload spans 5 strides, giving
+    /// stridecount=3 (5 full payload strides minus the first stride and the
+    /// final laststride) under CUETools' middle-span parity model. Errors
+    /// injected into payload rows 1, 2, 3 fall inside the protected span and
+    /// land at Chien positions 0, 1, 2.
+    fn repair_fixture_audio_middle_span() -> Vec<i16> {
+        let stride = crate::ctdb_rs::STRIDE;
+        let full_rows = 7usize; // lead-in pad + 5 payload rows + lead-out pad.
+        let mut audio = vec![0i16; full_rows * stride];
+        for idx in stride..(stride + 5 * stride) {
+            let word = ((idx as u32 * 257 + 0x1234) & 0xffff) as u16;
+            audio[idx] = word as i16;
+        }
+        audio
+    }
+
     #[test]
     fn cuetools_repair_synthetic_syndrome_blob_fixture() {
         let gf = crate::ctdb_rs::Galois16::new();
         let npar = 4usize;
-        let mut audio = repair_fixture_audio();
+        let mut audio = repair_fixture_audio_middle_span();
         let original = audio.clone();
         let ctx = cuetools_build_syndrome_context(&audio).unwrap();
-        let parity16 = crate::ctdb_rs::syndrome::compute_parity_matrix_from_audio(
-            &gf,
-            &audio,
-            CUETOOLS_MAX_NPAR,
-        )
-        .unwrap();
+        // Use the production middle-span parity so the test's clean syndrome
+        // matches what repair_disc_via_rs_blocking sees at runtime.
+        let parity16 = compute_audio_parity16(&audio).unwrap();
         let clean_syndrome = cuetools_get_syndrome_matrix(&gf, &parity16, &ctx, npar, 0).unwrap();
         let blob = crate::ctdb_rs::syndrome::parity_to_bytes(
             &clean_syndrome,
@@ -529,9 +541,10 @@ mod cuetools_repair_translation_fixtures {
         );
 
         let stride = crate::ctdb_rs::STRIDE;
-        audio[stride + 10] ^= 0x0101u16 as i16;
-        audio[stride + stride + 11] ^= 0x7777u16 as i16;
-        audio[stride + 2 * stride + 10] ^= 0x0202u16 as i16;
+        // Inject errors into payload rows 1, 2, 3 — the protected middle span.
+        audio[stride + stride + 10] ^= 0x0101u16 as i16;
+        audio[stride + 2 * stride + 11] ^= 0x7777u16 as i16;
+        audio[stride + 3 * stride + 10] ^= 0x0202u16 as i16;
 
         let entry = CtdbEntry {
             id: "synthetic".to_string(),
@@ -562,19 +575,19 @@ mod cuetools_repair_translation_fixtures {
                     row: 0,
                     column: 10,
                     magnitude: 0x0101,
-                    audio_index: stride + 10,
+                    audio_index: stride + stride + 10,
                 },
                 CuetoolsRepairCorrection {
                     row: 1,
                     column: 11,
                     magnitude: 0x7777,
-                    audio_index: stride + stride + 11,
+                    audio_index: stride + 2 * stride + 11,
                 },
                 CuetoolsRepairCorrection {
                     row: 2,
                     column: 10,
                     magnitude: 0x0202,
-                    audio_index: stride + 2 * stride + 10,
+                    audio_index: stride + 3 * stride + 10,
                 },
             ]
         );

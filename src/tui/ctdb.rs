@@ -296,19 +296,24 @@ pub fn compute_ctdb_parity_cache_key(paths: &[PathBuf]) -> Option<String> {
     if paths.is_empty() {
         return None;
     }
+
     let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-ctdb-cuetools-middle-span-v2\0");
+
     for path in paths {
         let meta = std::fs::metadata(path).ok()?;
-        let mtime = meta.modified()
+        let mtime = meta
+            .modified()
             .map(crate::db::systemtime_to_unix)
             .unwrap_or(0) as u64;
         let size = meta.len();
+
         hasher.update(path.to_string_lossy().as_bytes());
         hasher.update(mtime.to_le_bytes());
         hasher.update(size.to_le_bytes());
-        // Separator so paths with similar prefixes can't collide via length-extension.
         hasher.update([0u8]);
     }
+
     Some(format!("{:x}", hasher.finalize()))
 }
 
@@ -316,10 +321,87 @@ pub fn compute_ctdb_parity_cache_key(paths: &[PathBuf]) -> Option<String> {
 /// CPU-bound work; orchestrators should run this in `spawn_blocking`.
 pub fn compute_audio_parity16(audio: &[i16]) -> Option<Vec<Vec<u16>>> {
     let gf = crate::ctdb_rs::Galois16::new();
+    let middle_image = cuetools_middle_span_image_for_parity(audio)?;
     crate::ctdb_rs::syndrome::compute_parity_matrix_from_audio(
-        &gf, audio, CUETOOLS_MAX_NPAR,
+        &gf,
+        &middle_image,
+        CUETOOLS_MAX_NPAR,
     )
     .ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CuetoolsDiscSpan {
+    /// The real decoded PCM payload inside tonepoet's padded image.
+    payload_start: usize,
+    payload_len: usize,
+    /// CUETools CDRepair.stridecount: floor(payload_words / STRIDE) - 2.
+    ///
+    /// matches CUETools.AccurateRip/CDRepair.cs:1127-1129
+    stridecount: usize,
+    /// CUETools CDRepair.laststride: STRIDE + payload_words % STRIDE.
+    ///
+    /// matches CUETools.AccurateRip/CDRepair.cs:1127
+    laststride: usize,
+}
+
+fn cuetools_disc_span(audio: &[i16]) -> Option<CuetoolsDiscSpan> {
+    let stride = crate::ctdb_rs::STRIDE;
+    if audio.len() < stride.checked_mul(2)? {
+        return None;
+    }
+
+    // tonepoet's CTDB image shape is [STRIDE synthetic pad] + real decoded PCM
+    // + [STRIDE synthetic pad].  CUETools' CDRepair formulas are defined over
+    // the real decoded PCM length, not over the synthetic pads.
+    let payload_start = stride;
+    let payload_len = audio.len().checked_sub(stride.checked_mul(2)?)?;
+    let full_payload_rows = payload_len / stride;
+
+    // CUETools excludes the first stride and the final laststride from the LFSR
+    // parity workspace.  The first/tail words live only in leadin/leadout context
+    // and are introduced by GetSyndrome boundary corrections as offsets move.
+    let stridecount = full_payload_rows.checked_sub(2)?;
+    let laststride = stride.checked_add(payload_len % stride)?;
+
+    Some(CuetoolsDiscSpan {
+        payload_start,
+        payload_len,
+        stridecount,
+        laststride,
+    })
+}
+
+fn cuetools_payload_from_disc_image(audio: &[i16]) -> Option<&[i16]> {
+    let span = cuetools_disc_span(audio)?;
+    audio.get(span.payload_start..span.payload_start.checked_add(span.payload_len)?)
+}
+
+/// Build a temporary padded image whose protected region is exactly the middle
+/// rows that CUETools feeds into its parity LFSR.
+///
+/// This lets us reuse the validated low-level codec without changing
+/// src/ctdb_rs/mod.rs.  The temporary image is:
+///
+///   [STRIDE zero pad] + payload[STRIDE .. STRIDE + stridecount*STRIDE]
+///   + [STRIDE zero pad]
+///
+/// matches CUETools.AccurateRip/AccurateRip.cs:3099-3105
+fn cuetools_middle_span_image_for_parity(audio: &[i16]) -> Option<Vec<i16>> {
+    let stride = crate::ctdb_rs::STRIDE;
+    let span = cuetools_disc_span(audio)?;
+    let payload = audio.get(span.payload_start..span.payload_start.checked_add(span.payload_len)?)?;
+
+    let protected_start = stride;
+    let protected_len = span.stridecount.checked_mul(stride)?;
+    let protected_end = protected_start.checked_add(protected_len)?;
+    let protected = payload.get(protected_start..protected_end)?;
+
+    let mut out = Vec::with_capacity(stride.checked_add(protected.len())?.checked_add(stride)?);
+    out.extend(std::iter::repeat(0i16).take(stride));
+    out.extend_from_slice(protected);
+    out.extend(std::iter::repeat(0i16).take(stride));
+    Some(out)
 }
 
 #[derive(Clone, Debug)]
@@ -339,42 +421,162 @@ fn i16_as_u16_bits(sample: i16) -> u16 {
 /// Reconstructs the side buffers that CUETools AccurateRipVerify.GetSyndrome()
 /// reads when an offset crosses the first/last RS column boundary.
 ///
+/// tonepoet's CTDB image is padded as:
+///   [STRIDE zeros] + real disc PCM + [STRIDE zeros]
+///
+/// CUETools.NET does not feed those synthetic padding rows into
+/// AccurateRipVerify.leadin / leadout. AccurateRip.cs:3293-3310 fills those
+/// arrays from the actual decoded sample stream. Therefore this helper strips
+/// tonepoet's artificial CTDB padding before rebuilding the side buffers.
+///
 /// matches CUETools.AccurateRip/CDRepair.cs:1113-1129
 /// matches CUETools.AccurateRip/AccurateRip.cs:2915-2933
-/// matches CUETools.AccurateRip/AccurateRip.cs:3607-3622
+/// matches CUETools.AccurateRip/AccurateRip.cs:3293-3310
 fn cuetools_build_syndrome_context(audio: &[i16]) -> Option<CuetoolsSyndromeContext> {
     let stride = crate::ctdb_rs::STRIDE;
-    if audio.len() < stride * 2 {
-        return None;
-    }
+    let span = cuetools_disc_span(audio)?;
+    let payload = cuetools_payload_from_disc_image(audio)?;
 
-    // Image passed to the codec is:
-    //   [STRIDE i16 lead-in padding] + track data + [STRIDE i16 lead-out padding]
-    let data_words = audio.len().checked_sub(stride * 2)?;
-    let stridecount = data_words / stride;
-    let laststride = stride + (data_words % stride);
-
-    // CUETools allocates at least stride*2 words of lead-in context.
-    let mut leadin = vec![0u16; stride * 2];
-    for (dst, src) in leadin.iter_mut().zip(audio.iter()) {
+    // CUETools allocates at least stride*2 words of lead-in context and fills it
+    // from the first two strides of decoded PCM as Write() streams samples.
+    let mut leadin = vec![0u16; stride.checked_mul(2)?];
+    for (dst, src) in leadin.iter_mut().zip(payload.iter()) {
         *dst = i16_as_u16_bits(*src);
     }
 
-    // CUETools stores leadout in reverse order; index 0 is the final word seen.
-    let mut leadout = vec![0u16; stride + laststride];
+    // CUETools stores leadout in reverse order: leadout[0] is the final word of
+    // decoded PCM, leadout[1] the previous word, and so on.
+    let mut leadout = vec![0u16; stride.checked_add(span.laststride)?];
     for (dst_index, dst) in leadout.iter_mut().enumerate() {
-        if let Some(src_index) = audio.len().checked_sub(1 + dst_index) {
-            *dst = i16_as_u16_bits(audio[src_index]);
+        if let Some(src_index) = payload.len().checked_sub(1 + dst_index) {
+            *dst = i16_as_u16_bits(payload[src_index]);
         }
     }
 
     Some(CuetoolsSyndromeContext {
         stride,
-        stridecount,
-        laststride,
+        stridecount: span.stridecount,
+        laststride: span.laststride,
         leadin,
         leadout,
     })
+}
+
+#[cfg(test)]
+mod cuetools_boundary_context_regression {
+    use super::*;
+
+    #[test]
+    fn cuetools_context_uses_payload_not_artificial_padding() {
+        let stride = crate::ctdb_rs::STRIDE;
+        let mut image = Vec::new();
+        image.extend(std::iter::repeat(0i16).take(stride));
+        image.extend((0..stride * 3).map(|i| ((i as u16).wrapping_add(1)) as i16));
+        image.extend(std::iter::repeat(0i16).take(stride));
+
+        let ctx = cuetools_build_syndrome_context(&image).unwrap();
+
+        assert_eq!(ctx.leadin[0], 1);
+        assert_eq!(ctx.leadin[stride], (stride as u16).wrapping_add(1));
+        assert_eq!(ctx.leadout[0], (stride * 3) as u16);
+    }
+}
+
+/// One CUETools FindOffset candidate-row diagnostic.
+#[derive(Debug, Clone)]
+pub struct CtdbSyndromeProbeRow {
+    pub offset: i32,
+    pub exact_zero: bool,
+    pub nonzero_syndrome_words: usize,
+    pub delta_or: u16,
+    pub errors_found: Option<usize>,
+    pub chien_succeeds: bool,
+    pub positions: Vec<usize>,
+}
+
+/// Diagnostic version of CUETools.AccurateRip/CDRepair.cs::FindOffset.
+/// Iterates candidate offsets and reports per-row exact-zero / BM / Chien status
+/// without selecting a winner.
+pub fn ctdb_probe_entry_offsets_with_parity(
+    audio: &[i16],
+    parity16: &[Vec<u16>],
+    entry: &CtdbEntry,
+    offset_window: i32,
+) -> Option<Vec<CtdbSyndromeProbeRow>> {
+    if entry.stride != crate::ctdb_rs::STRIDE {
+        return None;
+    }
+
+    let codec = crate::ctdb_rs::CtdbCodec::new();
+    let gf = codec.galois();
+    let ctx = cuetools_build_syndrome_context(audio)?;
+    let (entry_row, npar, _source) = decode_entry_row_cuetools(gf, entry)?;
+    if npar == 0 || entry_row.len() < npar {
+        return None;
+    }
+
+    let stride = crate::ctdb_rs::STRIDE as i32;
+    let source_lo = 1 - stride / 2;
+    let source_hi = stride / 2 - 1;
+    let requested = offset_window.abs();
+    let offset_lo = source_lo.max(-requested);
+    let offset_hi = source_hi.min(requested);
+
+    let mut out = Vec::with_capacity((offset_hi - offset_lo + 1).max(0) as usize);
+    for candidate_offset in offset_lo..=offset_hi {
+        let our_row = cuetools_get_syndrome_row(gf, parity16, &ctx, npar, -candidate_offset)?;
+
+        let mut delta = vec![0u16; npar];
+        let mut delta_or = 0u16;
+        let mut nonzero_syndrome_words = 0usize;
+        for i in 0..npar {
+            let word = our_row[i] ^ entry_row[i];
+            delta[i] = word;
+            delta_or |= word;
+            if word != 0 {
+                nonzero_syndrome_words += 1;
+            }
+        }
+
+        if delta_or == 0 {
+            out.push(CtdbSyndromeProbeRow {
+                offset: candidate_offset,
+                exact_zero: true,
+                nonzero_syndrome_words,
+                delta_or,
+                errors_found: Some(0),
+                chien_succeeds: false,
+                positions: Vec::new(),
+            });
+            continue;
+        }
+
+        let mut errors_found = None;
+        let mut chien_succeeds = false;
+        let mut positions = Vec::new();
+
+        if let Some((sigma, count)) = crate::ctdb_rs::berlekamp_massey(gf, &delta, npar) {
+            errors_found = Some(count);
+            if count > 0 {
+                if let Some(found) = crate::ctdb_rs::chien_search(gf, &sigma, count, ctx.stridecount) {
+                    chien_succeeds = found.len() == count;
+                    positions = found;
+                }
+            }
+        }
+
+        out.push(CtdbSyndromeProbeRow {
+            offset: candidate_offset,
+            exact_zero: false,
+            nonzero_syndrome_words,
+            delta_or,
+            errors_found,
+            chien_succeeds,
+            positions,
+        });
+    }
+
+    Some(out)
 }
 
 #[inline]
@@ -744,15 +946,7 @@ fn verify_disc_via_rs_blocking(
     entries: &[CtdbEntry],
     offset_window: i32,
 ) -> Option<RsVerifiedMatch> {
-    let codec = crate::ctdb_rs::CtdbCodec::new();
-    let gf = codec.galois();
-
-    // matches CUETools.AccurateRip/AccurateRip.cs:2247-2252
-    // matches CUETools.AccurateRip/AccurateRip.cs:2798-2802
-    let parity16 = crate::ctdb_rs::syndrome::compute_parity_matrix_from_audio(
-        gf, audio, CUETOOLS_MAX_NPAR,
-    )
-    .ok()?;
+    let parity16 = compute_audio_parity16(audio)?;
     verify_disc_via_rs_blocking_with_parity(audio, &parity16, entries, offset_window)
 }
 
@@ -827,6 +1021,60 @@ mod cuetools_translation_fixtures {
         }
         let got = cuetools_bytes_to_syndrome_matrix(&bytes, 2, 2).unwrap();
         assert_eq!(got, vec![vec![0x1111, 0x2222], vec![0x3333, 0x4444]]);
+    }
+
+
+    #[test]
+    fn cuetools_context_uses_middle_span_stridecount_and_real_payload_edges() {
+        let stride = crate::ctdb_rs::STRIDE;
+        let payload_rows = 5usize;
+        let rem = 1176usize;
+        let payload_len = payload_rows * stride + rem;
+        let mut audio = vec![0i16; stride + payload_len + stride];
+
+        let payload_start = stride;
+        audio[payload_start] = 0x1111i16;
+        audio[payload_start + stride] = 0x2222i16;
+        audio[payload_start + payload_len - 1] = 0x3333i16;
+
+        let ctx = cuetools_build_syndrome_context(&audio).unwrap();
+        assert_eq!(ctx.stridecount, payload_rows - 2);
+        assert_eq!(ctx.laststride, stride + rem);
+        assert_eq!(ctx.leadin[0], 0x1111);
+        assert_eq!(ctx.leadin[stride], 0x2222);
+        assert_eq!(ctx.leadout[0], 0x3333);
+    }
+
+    #[test]
+    fn cuetools_parity_excludes_first_stride_and_final_laststride() {
+        let stride = crate::ctdb_rs::STRIDE;
+        let payload_rows = 5usize;
+        let rem = 1176usize;
+        let payload_len = payload_rows * stride + rem;
+        let payload_start = stride;
+
+        let mut audio = vec![0i16; stride + payload_len + stride];
+
+        // These are outside CUETools' LFSR-protected middle span: row 0 and the
+        // final laststride.  They should not affect compute_audio_parity16();
+        // GetSyndrome boundary corrections account for them separately.
+        audio[payload_start + 123] = 0x1357i16;
+        audio[payload_start + (payload_rows - 1) * stride + 456] = 0x2468i16;
+        audio[payload_start + payload_rows * stride + 17] = 0x55aai16;
+
+        let parity = compute_audio_parity16(&audio).unwrap();
+        assert!(
+            parity.iter().all(|col| col.iter().all(|&word| word == 0)),
+            "first stride / final laststride leaked into the CUETools parity workspace"
+        );
+
+        // This word is in protected middle row 1, so it must affect the parity.
+        audio[payload_start + stride + 789] = 0x7b7bi16;
+        let parity = compute_audio_parity16(&audio).unwrap();
+        assert!(
+            parity.iter().any(|col| col.iter().any(|&word| word != 0)),
+            "middle protected rows were not fed into the CUETools parity workspace"
+        );
     }
 }
 
