@@ -3036,10 +3036,12 @@ mod completion_tests {
     }
 
     #[test]
-    fn command_completion_prefix_con_matches_convert() {
-        // "con" matches "convert" (the "c" alias doesn't match since it's shorter).
+    fn command_completion_prefix_con_matches_convert_and_context() {
         let got = compute_completion("con", 3).expect("should have candidates");
-        assert_eq!(got.candidates, vec!["convert".to_string()]);
+        assert_eq!(
+            got.candidates,
+            vec!["convert".to_string(), "context".to_string()]
+        );
     }
 
     #[test]
