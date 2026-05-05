@@ -2002,9 +2002,9 @@ mod mb_select_state_tests {
 
     fn rel(id: &str) -> MbRelease {
         MbRelease {
-            release_id: id.into(), title: id.into(),
-            artist: String::new(), year: None, catalog: None,
-            barcode: None, tracks: vec![],
+            release_id: id.into(),
+            title: id.into(),
+            ..Default::default()
         }
     }
 

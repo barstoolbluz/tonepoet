@@ -828,7 +828,6 @@ mod tests {
             title: "MB Title".to_string(),
             artist: "MB Artist".to_string(),
             year: Some("1971".to_string()),
-            catalog: None,
             barcode: Some("MB-BARCODE".to_string()),
             tracks: vec![
                 MbTrack {
@@ -836,8 +835,10 @@ mod tests {
                     title: "MB Track 1".to_string(),
                     artist: "MB Performer".to_string(),
                     isrc: Some("USRC17607839".to_string()),
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let stats = fill_cue_with_mb(&mut album, &mut tracks, &mb);
 
@@ -873,9 +874,12 @@ mod tests {
         };
         let mut tracks: Vec<CueTrackInfo> = vec![];
         let mb = MbRelease {
-            release_id: "x".to_string(), title: "MB".to_string(),
-            artist: "MB".to_string(), year: Some("1972".to_string()),
-            catalog: None, barcode: Some("X".to_string()), tracks: vec![],
+            release_id: "x".to_string(),
+            title: "MB".to_string(),
+            artist: "MB".to_string(),
+            year: Some("1972".to_string()),
+            barcode: Some("X".to_string()),
+            ..Default::default()
         };
         let stats = fill_cue_with_mb(&mut album, &mut tracks, &mb);
         assert!(stats.is_empty());
@@ -903,7 +907,6 @@ mod tests {
             title: "MB Title".to_string(),
             artist: "MB Artist".to_string(),
             year: Some("1971".to_string()),
-            catalog: None,
             barcode: Some("0044007735428".to_string()),
             tracks: vec![
                 MbTrack {
@@ -911,15 +914,15 @@ mod tests {
                     title: "MB Track 1".to_string(),
                     artist: "Track Artist 1".to_string(),
                     isrc: Some("USRC17607839".to_string()),
+                    ..Default::default()
                 },
                 MbTrack {
                     // Empty title from MB → must NOT clobber tag value.
                     position: 2,
-                    title: String::new(),
-                    artist: String::new(),
-                    isrc: None,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         apply_mb_overrides(&mut album, &mut tracks, &mb);
 

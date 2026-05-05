@@ -1716,7 +1716,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             // also write the MB-only fields (ISRC, catalog)
                             // that the review UI didn't surface.
                             if let Some(ref mb) = state.mb_release {
-                                super::musicbrainz::populate_editor_isrc_catalog_from_mb(
+                                super::musicbrainz::populate_editor_mb_supplemental(
                                     editor_state, mb,
                                 );
                             }
