@@ -854,6 +854,9 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 app, tx, outcome, cue_path, *album, tracks, layout, toc_string,
             );
         }
+        AppMessage::TagsFromMbComplete { outcome, paths, toc_string } => {
+            handle_tags_from_mb_complete(app, tx, outcome, paths, toc_string);
+        }
         AppMessage::AccurateRipComplete { pages } => {
             // Aggregate summary across all discs.
             let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
@@ -1231,6 +1234,70 @@ fn handle_cue_mb_complete(
         super::app::CuePreviewState::new(cue_content, cue_path, summary.clone()),
     ));
     app.set_status(summary);
+}
+
+/// Handle the result of a `:tags-mb` MusicBrainz lookup. Caches the
+/// response, opens the metadata editor on the same selection that
+/// triggered the lookup, then overlays MB-derived values onto the editor
+/// state. Existing per-file tag values are preserved when MB fields are
+/// empty; non-empty MB fields replace them.
+fn handle_tags_from_mb_complete(
+    app: &mut AppState,
+    _tx: &mpsc::Sender<AppMessage>,
+    outcome: Result<super::musicbrainz::MbLookupOutcome, String>,
+    paths: Vec<std::path::PathBuf>,
+    toc_string: String,
+) {
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            app.set_status(format!(":tags-mb: lookup failed: {}", e));
+            return;
+        }
+    };
+
+    if let Some(json) = outcome.cache_response.as_deref() {
+        if let Err(e) = app.db.store_mb_response(&toc_string, json) {
+            log::warn!("MB cache store failed: {}", e);
+        }
+    }
+
+    let release = match outcome.release {
+        Some(r) => r,
+        None => {
+            app.set_status(":tags-mb: no MusicBrainz release matched this disc TOC".to_string());
+            return;
+        }
+    };
+
+    // Open the editor on the current selection, then verify that the
+    // selection still matches the paths we computed the TOC for. If the
+    // user navigated between :tags-mb invoke and async result, abort
+    // before applying MB values to the wrong files.
+    super::keybindings::open_metadata_editor(app);
+    let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    match prior {
+        ActiveOverlay::MetadataEditor(mut state) => {
+            if state.paths != paths {
+                app.set_status(":tags-mb: selection changed since lookup; rerun".to_string());
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            super::musicbrainz::populate_editor_from_mb(&mut state, &release);
+            let label = if release.title.is_empty() { "(untitled)" } else { &release.title };
+            app.set_status(format!(
+                ":tags-mb: applied \"{}\" — review then save",
+                label,
+            ));
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        other => {
+            // open_metadata_editor didn't produce a MetadataEditor (no
+            // audio files / read-tag error). Restore whatever it left
+            // and surface a status if it didn't already.
+            app.active_overlay = other;
+        }
+    }
 }
 
 /// Handle the result of a `:cue-fill` MusicBrainz lookup. Caches the response,

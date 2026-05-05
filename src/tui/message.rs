@@ -160,6 +160,14 @@ pub enum AppMessage {
         layout: CueFillLayout,
         toc_string: String,
     },
+    /// Result of an async MusicBrainz lookup driving `:tags-mb`. Carries
+    /// the audio paths so the metadata editor can be opened on the same
+    /// selection that triggered the lookup.
+    TagsFromMbComplete {
+        outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
+        paths: Vec<std::path::PathBuf>,
+        toc_string: String,
+    },
 }
 
 /// Re-emission target form for `:cue-fill`. Captures whether the source

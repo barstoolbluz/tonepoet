@@ -104,6 +104,8 @@ pub enum ContextAction {
     DetectPreemphasis,
     /// Look up tags from gnudb.org (CDDB).
     QueryGnudb,
+    /// Look up tags from MusicBrainz (disc-TOC).
+    TagsFromMb,
     /// Import tags from a CUE sheet (opens metadata editor + external editor).
     ImportCueFromBrowse,
     /// AccurateRip verification (common offsets).
@@ -243,6 +245,7 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
 fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
     let mut children = vec![
         item("Get tags from gnudb.org", ContextAction::QueryGnudb),
+        item("Get tags from MusicBrainz", ContextAction::TagsFromMb),
     ];
     if has_cue {
         children.push(item("Get tags from CUE", ContextAction::ImportCueFromBrowse));
@@ -673,6 +676,10 @@ pub fn execute_context_action(
         }
         ContextAction::FillCueFromMb => {
             let cmd = super::command::Command::CueFill;
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::TagsFromMb => {
+            let cmd = super::command::Command::TagsFromMb;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::MarkCompareReference => {

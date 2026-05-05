@@ -47,6 +47,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "write-dr", "writedr",
     "write-rg-track", "write-rg-album",
     "import-cue", "cue", "cue!", "cue-mb", "cue-mb!", "cue-fill", "cue-enrich",
+    "tags-mb", "mb-tags", "musicbrainz-tags",
     "g", "G", "top", "bot", "bottom",
     "fix-caps", "fixcaps",
     "search", "s", "rs", "rsearch",
@@ -268,6 +269,9 @@ pub enum Command {
     CueScrollBottom,
     /// Begin editing the 1-based `line` of the parked CUE preview.
     CueEditLine(usize),
+    /// Open the metadata editor pre-populated with track-level + album-level
+    /// values from a MusicBrainz disc-TOC lookup.
+    TagsFromMb,
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -394,6 +398,7 @@ pub fn parse_command(input: &str) -> Command {
         "cue-mb" => Command::GenerateCueMb { single_image: false },
         "cue-mb!" => Command::GenerateCueMb { single_image: true },
         "cue-fill" | "cue-enrich" => Command::CueFill,
+        "tags-mb" | "mb-tags" | "musicbrainz-tags" => Command::TagsFromMb,
         "g" | "top" => Command::CueScrollTop,
         "G" | "bot" | "bottom" => Command::CueScrollBottom,
         "preemphasis" | "preemph" | "pe" => Command::DetectPreemphasis,
@@ -1344,6 +1349,77 @@ pub fn execute_command(
                     }).await;
                 });
             }
+        }
+        Command::TagsFromMb => {
+            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
+                AppScreen::Browse => {
+                    let sel = collect_selection_for_file_ops(app);
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        ))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            if paths.is_empty() {
+                app.set_status(":tags-mb: no audio files in selection");
+                return;
+            }
+            super::probe::sort_paths_by_track(&mut paths);
+            let dir = paths[0].parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+
+            let sectors: Vec<u32> = match super::accuraterip::find_toc_offsets(&dir) {
+                Some(s) => s,
+                None => match super::accuraterip::collect_sample_counts(&paths) {
+                    Ok((sample_counts, sample_rate)) => {
+                        let samples_per_frame = (sample_rate / 75) as u64;
+                        let mut sectors = Vec::with_capacity(sample_counts.len() + 1);
+                        let mut frame: u64 = 150;
+                        for &count in &sample_counts {
+                            sectors.push(frame as u32);
+                            frame += count / samples_per_frame;
+                        }
+                        sectors.push(frame as u32);
+                        sectors
+                    }
+                    Err(e) => {
+                        app.set_status(format!(":tags-mb: {}", e));
+                        return;
+                    }
+                },
+            };
+            let toc_string = match super::musicbrainz::build_mb_toc(&sectors) {
+                Some(s) => s,
+                None => {
+                    app.set_status(":tags-mb: TOC too short".to_string());
+                    return;
+                }
+            };
+            let cached = app.db.get_cached_mb_response(&toc_string);
+            let n_cached = if cached.is_some() { "cached" } else { "fetching" };
+            app.set_status(format!(
+                ":tags-mb: {} disc TOC ({} tracks)…",
+                n_cached, sectors.len() - 1,
+            ));
+
+            let tx = tx.clone();
+            let toc_for_msg = toc_string.clone();
+            let paths_for_msg = paths.clone();
+            tokio::spawn(async move {
+                let outcome = super::musicbrainz::lookup_release_by_toc(
+                    &sectors, cached,
+                ).await;
+                let _ = tx.send(AppMessage::TagsFromMbComplete {
+                    outcome,
+                    paths: paths_for_msg,
+                    toc_string: toc_for_msg,
+                }).await;
+            });
         }
         Command::CueFill => {
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {

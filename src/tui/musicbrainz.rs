@@ -234,6 +234,108 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
     Some(MbTrack { position, title, artist, isrc })
 }
 
+/// Populate a metadata editor state with values from a MusicBrainz release.
+/// Track-level fields (TITLE, ARTIST, TRACKNUMBER, ISRC) come from the
+/// matching `MbTrack.position`; album-level fields (ALBUM, DATE,
+/// CATALOGNUMBER) apply to every track. Existing per-file tag values are
+/// only overwritten when the MB value is non-empty — empty MB fields
+/// preserve whatever the file currently has.
+///
+/// Mirrors `super::gnudb::populate_editor_from_gnudb`.
+pub fn populate_editor_from_mb(
+    state: &mut crate::tui::app::MetadataEditorState,
+    release: &MbRelease,
+) {
+    use lofty::tag::ItemKey;
+
+    let n = state.paths.len();
+
+    fn find_or_create(
+        entries: &mut Vec<crate::tui::probe::TagEntry>,
+        key: &str,
+        item_key: ItemKey,
+        n: usize,
+    ) -> usize {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+            return i;
+        }
+        entries.push(crate::tui::probe::TagEntry {
+            display_key: key.to_string(),
+            item_key,
+            value: String::new(),
+            original: String::new(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vec![String::new(); n],
+            per_file_originals: vec![String::new(); n],
+        });
+        entries.len() - 1
+    }
+
+    let title_idx = find_or_create(&mut state.entries, "TITLE", ItemKey::TrackTitle, n);
+    let artist_idx = find_or_create(&mut state.entries, "ARTIST", ItemKey::TrackArtist, n);
+    let album_idx = find_or_create(&mut state.entries, "ALBUM", ItemKey::AlbumTitle, n);
+    let tn_idx = find_or_create(&mut state.entries, "TRACKNUMBER", ItemKey::TrackNumber, n);
+    let date_idx = find_or_create(&mut state.entries, "DATE", ItemKey::Year, n);
+    let isrc_idx = find_or_create(&mut state.entries, "ISRC", ItemKey::Isrc, n);
+    let catalog_idx = find_or_create(
+        &mut state.entries,
+        "CATALOGNUMBER",
+        ItemKey::CatalogNumber,
+        n,
+    );
+
+    // Catalog: prefer label catalog number; fall back to barcode.
+    let catalog_value = release.catalog.as_deref()
+        .or(release.barcode.as_deref())
+        .unwrap_or("")
+        .to_string();
+
+    for i in 0..n {
+        // Match MB track by 1-based position; tolerate gaps.
+        let mt = release.tracks.iter().find(|m| m.position as usize == i + 1);
+
+        if let Some(mt) = mt {
+            if !mt.title.is_empty() {
+                state.entries[title_idx].per_file_values[i] = mt.title.clone();
+            }
+            if !mt.artist.is_empty() {
+                state.entries[artist_idx].per_file_values[i] = mt.artist.clone();
+            }
+            if let Some(isrc) = mt.isrc.as_deref().filter(|s| !s.is_empty()) {
+                state.entries[isrc_idx].per_file_values[i] = isrc.to_string();
+            }
+        }
+
+        if !release.title.is_empty() {
+            state.entries[album_idx].per_file_values[i] = release.title.clone();
+        }
+        // Track number is always 1-based by file position. (MB position
+        // matches this in practice.)
+        state.entries[tn_idx].per_file_values[i] = (i + 1).to_string();
+        if let Some(year) = release.year.as_deref().filter(|s| !s.is_empty()) {
+            state.entries[date_idx].per_file_values[i] = year.to_string();
+        }
+        if !catalog_value.is_empty() {
+            state.entries[catalog_idx].per_file_values[i] = catalog_value.clone();
+        }
+    }
+
+    // Recalculate the merged display value + mixed state per touched entry.
+    for idx in [title_idx, artist_idx, album_idx, tn_idx, date_idx, isrc_idx, catalog_idx] {
+        let entry = &mut state.entries[idx];
+        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+        entry.is_mixed = !all_same && n > 1;
+        entry.value = if entry.is_mixed {
+            "<multiple values>".to_string()
+        } else {
+            entry.per_file_values.first().cloned().unwrap_or_default()
+        };
+    }
+
+    state.dirty = true;
+}
+
 /// Render a MusicBrainz `artist-credit` array into a single performer
 /// string with `joinphrase` separators preserved.
 fn artist_credit_string(value: Option<&serde_json::Value>) -> String {
@@ -363,6 +465,67 @@ mod tests {
         assert!(db.get_cached_mb_response(toc).is_none());
         db.store_mb_response(toc, body).unwrap();
         assert_eq!(db.get_cached_mb_response(toc).as_deref(), Some(body));
+    }
+
+    #[test]
+    fn populate_editor_from_mb_fills_track_and_album_fields() {
+        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+
+        let mut state = MetadataEditorState {
+            paths: vec![
+                std::path::PathBuf::from("/tmp/01.flac"),
+                std::path::PathBuf::from("/tmp/02.flac"),
+            ],
+            entries: Vec::new(),
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false,
+            deleted: Vec::new(),
+            file_labels: vec!["01".into(), "02".into()],
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+        };
+        let release = MbRelease {
+            release_id: "x".to_string(),
+            title: "Album".to_string(),
+            artist: "Artist".to_string(),
+            year: Some("1971".to_string()),
+            catalog: Some("UICY-94626".to_string()),
+            barcode: Some("0044007735428".to_string()),
+            tracks: vec![
+                MbTrack {
+                    position: 1, title: "Track 1".into(),
+                    artist: "Artist".into(), isrc: Some("USRC17607839".into()),
+                },
+                MbTrack {
+                    position: 2, title: "Track 2".into(),
+                    artist: "Artist".into(), isrc: None,
+                },
+            ],
+        };
+        populate_editor_from_mb(&mut state, &release);
+
+        let lookup = |key: &str| -> Vec<String> {
+            state.entries.iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case(key))
+                .map(|e| e.per_file_values.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(lookup("TITLE"), vec!["Track 1", "Track 2"]);
+        assert_eq!(lookup("ARTIST"), vec!["Artist", "Artist"]);
+        assert_eq!(lookup("ALBUM"), vec!["Album", "Album"]);
+        assert_eq!(lookup("TRACKNUMBER"), vec!["1", "2"]);
+        assert_eq!(lookup("DATE"), vec!["1971", "1971"]);
+        assert_eq!(lookup("ISRC"), vec!["USRC17607839", ""]);
+        // Catalog prefers label catalog over barcode.
+        assert_eq!(lookup("CATALOGNUMBER"), vec!["UICY-94626", "UICY-94626"]);
+        assert!(state.dirty);
     }
 
     #[test]
