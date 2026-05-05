@@ -2217,7 +2217,8 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
     let artist = page.tracks.first()
         .map(|t| t.artist.as_str())
         .unwrap_or("Unknown");
-    let title = format!(" GNUDB Review — {} / {} ", artist, page.album);
+    let source = if state.mb_release.is_some() { "MusicBrainz" } else { "GNUDB" };
+    let title = format!(" {} Review — {} / {} ", source, artist, page.album);
 
     let block = Block::default()
         .borders(Borders::ALL)

@@ -1570,8 +1570,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 // ── Navigation mode ──
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
+                        let source = if state.mb_release.is_some() { "MusicBrainz" } else { "GNUDB" };
                         app.active_overlay = ActiveOverlay::None;
-                        app.set_status("GNUDB review cancelled");
+                        app.set_status(format!("{} review cancelled", source));
                     }
                     // Back to match list (if came from multi-match selection).
                     (KeyCode::Char('b'), _) => {
