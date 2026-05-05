@@ -849,6 +849,11 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 app, tx, outcome, paths, output_dir, single_image, toc_string,
             );
         }
+        AppMessage::CueFillComplete { outcome, cue_path, album, tracks, layout, toc_string } => {
+            handle_cue_fill_complete(
+                app, tx, outcome, cue_path, *album, tracks, layout, toc_string,
+            );
+        }
         AppMessage::AccurateRipComplete { pages } => {
             // Aggregate summary across all discs.
             let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
@@ -1231,6 +1236,93 @@ fn handle_cue_mb_complete(
         Err(e) => {
             app.set_status(format!("MusicBrainz CUE write failed: {}", e));
         }
+    }
+}
+
+/// Handle the result of a `:cue-fill` MusicBrainz lookup. Caches the response,
+/// fills only empty/absent fields on the parsed CUE, and writes back to the
+/// original `.cue` path preserving its single-image vs multi-file form.
+fn handle_cue_fill_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    outcome: Result<super::musicbrainz::MbLookupOutcome, String>,
+    cue_path: std::path::PathBuf,
+    mut album: super::cue_generate::CueAlbumInfo,
+    mut tracks: Vec<super::cue_generate::CueTrackInfo>,
+    layout: super::message::CueFillLayout,
+    toc_string: String,
+) {
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            app.set_status(format!(":cue-fill: lookup failed: {}", e));
+            return;
+        }
+    };
+
+    if let Some(json) = outcome.cache_response.as_deref() {
+        if let Err(e) = app.db.store_mb_response(&toc_string, json) {
+            log::warn!("MB cache store failed: {}", e);
+        }
+    }
+
+    let release = match outcome.release {
+        Some(r) => r,
+        None => {
+            app.set_status(":cue-fill: no MusicBrainz release matched this disc TOC".to_string());
+            return;
+        }
+    };
+
+    let stats = super::cue_generate::fill_cue_with_mb(&mut album, &mut tracks, &release);
+    if stats.is_empty() {
+        app.set_status(format!(
+            ":cue-fill: nothing to fill (CUE already complete) — {}",
+            cue_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        ));
+        return;
+    }
+
+    let cue_content = match layout {
+        super::message::CueFillLayout::SingleImage { image_filename, format_tag } => {
+            super::cue_generate::generate_single_image_cue(
+                &album, &tracks, &image_filename, &format_tag,
+            )
+        }
+        super::message::CueFillLayout::MultiFile => {
+            super::cue_generate::generate_multifile_cue(&album, &tracks)
+        }
+    };
+
+    if let Err(e) = std::fs::write(&cue_path, &cue_content) {
+        app.set_status(format!(":cue-fill: write failed: {}", e));
+        return;
+    }
+
+    let mut parts = Vec::new();
+    if stats.titles_filled > 0 {
+        parts.push(format!("{} title{}", stats.titles_filled,
+            if stats.titles_filled == 1 { "" } else { "s" }));
+    }
+    if stats.artists_filled > 0 {
+        parts.push(format!("{} performer{}", stats.artists_filled,
+            if stats.artists_filled == 1 { "" } else { "s" }));
+    }
+    if stats.isrcs_filled > 0 {
+        parts.push(format!("{} ISRC{}", stats.isrcs_filled,
+            if stats.isrcs_filled == 1 { "" } else { "s" }));
+    }
+    if stats.year_filled { parts.push("date".to_string()); }
+    if stats.catalog_filled { parts.push("catalog".to_string()); }
+    let summary = parts.join(", ");
+    let cue_filename = cue_path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    app.set_status(format!("Filled CUE: {} → {}", summary, cue_filename));
+
+    if app.current_screen == AppScreen::Browse {
+        app.browse.refresh();
+        app.browse.probe_current_with_db(tx, Some(&app.db));
     }
 }
 

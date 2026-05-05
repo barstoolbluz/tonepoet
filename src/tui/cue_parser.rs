@@ -17,6 +17,8 @@ pub struct CueSheet {
     pub date: Option<String>,
     /// Genre (from `REM GENRE`).
     pub genre: Option<String>,
+    /// 13-digit UPC/EAN from a `CATALOG` line.
+    pub catalog: Option<String>,
     /// Tracks in order.
     pub tracks: Vec<CueTrack>,
 }
@@ -36,6 +38,12 @@ pub struct CueTrack {
     /// INDEX 01 offset in CUE frames (75 frames per second).
     /// None if the CUE didn't have an INDEX 01 for this track.
     pub index01_frames: Option<u32>,
+    /// INDEX 00 (pregap) offset, in CUE frames. For multi-file noncompliant
+    /// CUEs this is the position inside the **previous** FILE block; for
+    /// single-image it's an absolute cumulative position.
+    pub index00_frames: Option<u32>,
+    /// CD ISRC code from an `ISRC` line inside the TRACK block.
+    pub isrc: Option<String>,
 }
 
 /// Parse a CUE sheet from a file path.
@@ -117,6 +125,13 @@ pub fn parse_cue(content: &str) -> CueSheet {
                 sheet.genre = Some(val);
                 continue;
             }
+            // CATALOG <13 digits>
+            if let Some(val) = trimmed.strip_prefix("CATALOG").map(|s| s.trim()) {
+                if !val.is_empty() {
+                    sheet.catalog = Some(val.to_string());
+                    continue;
+                }
+            }
         }
 
         // INDEX 01 MM:SS:FF (track start position).
@@ -126,9 +141,23 @@ pub fn parse_cue(content: &str) -> CueSheet {
                 track.index01_frames = parse_cue_timestamp(ts);
                 continue;
             }
+            // INDEX 00 MM:SS:FF (pregap position).
+            if trimmed.starts_with("INDEX 00 ") {
+                let ts = trimmed[9..].trim();
+                track.index00_frames = parse_cue_timestamp(ts);
+                continue;
+            }
+            // ISRC <code>
+            if let Some(rest) = trimmed.strip_prefix("ISRC") {
+                let val = rest.trim();
+                if !val.is_empty() {
+                    track.isrc = Some(val.to_string());
+                    continue;
+                }
+            }
         }
 
-        // Other lines (INDEX 00, FLAGS, etc.) are ignored.
+        // Other lines (FLAGS, etc.) are ignored.
     }
 
     // Commit the last track.
@@ -446,5 +475,37 @@ FILE "02 - Second.flac" WAVE
         assert_eq!(extract_quoted("\"hello world\" extra"), Some("hello world".to_string()));
         assert_eq!(extract_quoted("no quotes"), None);
         assert_eq!(extract_quoted("\"\""), Some("".to_string()));
+    }
+
+    #[test]
+    fn parse_extracts_index00_isrc_and_catalog() {
+        // Noncompliant CUE shape: TRACK 03 declared inside FILE 02 with
+        // INDEX 00, then FILE 03 + INDEX 01.
+        let content = "\
+CATALOG 0044007735428
+PERFORMER \"The Allman Brothers Band\"
+TITLE \"At Fillmore East\"
+REM DATE 1971
+FILE \"02 - Trouble.wav\" WAVE
+  TRACK 02 AUDIO
+    TITLE \"Trouble No More\"
+    ISRC USRC17607840
+    INDEX 01 00:00:00
+  TRACK 03 AUDIO
+    TITLE \"Don't Keep Me Wonderin'\"
+    ISRC H2HF37290000
+    INDEX 00 03:43:37
+FILE \"03 - Wonderin.wav\" WAVE
+    INDEX 01 00:00:00
+";
+        let sheet = parse_cue(content);
+        assert_eq!(sheet.catalog.as_deref(), Some("0044007735428"));
+        assert_eq!(sheet.tracks.len(), 2);
+        assert_eq!(sheet.tracks[0].isrc.as_deref(), Some("USRC17607840"));
+        assert!(sheet.tracks[0].index00_frames.is_none());
+        assert_eq!(sheet.tracks[1].isrc.as_deref(), Some("H2HF37290000"));
+        // 03:43:37 = 3*60*75 + 43*75 + 37 = 13500 + 3225 + 37 = 16762
+        assert_eq!(sheet.tracks[1].index00_frames, Some(16762));
+        assert_eq!(sheet.tracks[1].index01_frames, Some(0));
     }
 }

@@ -515,12 +515,21 @@ fn parse_eac_log_toc(path: &Path) -> Option<Vec<u32>> {
 
 /// Find the first `.log` file in a directory.
 pub fn find_eac_log(dir: &Path) -> Option<std::path::PathBuf> {
+    find_first_with_ext(dir, "log")
+}
+
+/// Find the first `.cue` file in a directory.
+pub fn find_cue_file(dir: &Path) -> Option<std::path::PathBuf> {
+    find_first_with_ext(dir, "cue")
+}
+
+fn find_first_with_ext(dir: &Path, ext: &str) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("log"))
+            .map(|e| e.eq_ignore_ascii_case(ext))
             .unwrap_or(false)
         {
             return Some(path);

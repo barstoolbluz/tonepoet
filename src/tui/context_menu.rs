@@ -88,6 +88,12 @@ pub enum ContextAction {
     GenerateCueMultiFile,
     /// Generate a single-image CUE sheet (one FILE, cumulative timestamps).
     GenerateCueSingleImage,
+    /// Generate a multi-file CUE driven by a MusicBrainz disc-TOC lookup.
+    GenerateCueMbMultiFile,
+    /// Generate a single-image CUE driven by a MusicBrainz disc-TOC lookup.
+    GenerateCueMbSingleImage,
+    /// Fill empty/absent fields on the colocated CUE from a MusicBrainz lookup.
+    FillCueFromMb,
     /// Mark current selection as the bit-compare reference.
     MarkCompareReference,
     /// Run bit comparison against the stored reference.
@@ -268,8 +274,11 @@ fn build_verify_submenu() -> ContextMenuEntry {
 
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
-        item("CUE sheet (multi-file)", ContextAction::GenerateCueMultiFile),
-        item("CUE sheet (single image)", ContextAction::GenerateCueSingleImage),
+        item("CUE sheet from tags (multi-file)", ContextAction::GenerateCueMultiFile),
+        item("CUE sheet from tags (single image)", ContextAction::GenerateCueSingleImage),
+        item("CUE sheet from MusicBrainz (multi-file)", ContextAction::GenerateCueMbMultiFile),
+        item("CUE sheet from MusicBrainz (single image)", ContextAction::GenerateCueMbSingleImage),
+        item("Fill CUE from MusicBrainz", ContextAction::FillCueFromMb),
         separator(),
     ];
 
@@ -652,6 +661,18 @@ pub fn execute_context_action(
         }
         ContextAction::GenerateCueSingleImage => {
             let cmd = super::command::Command::GenerateCue { single_image: true };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::GenerateCueMbMultiFile => {
+            let cmd = super::command::Command::GenerateCueMb { single_image: false };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::GenerateCueMbSingleImage => {
+            let cmd = super::command::Command::GenerateCueMb { single_image: true };
+            super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::FillCueFromMb => {
+            let cmd = super::command::Command::CueFill;
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::MarkCompareReference => {

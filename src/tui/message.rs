@@ -149,4 +149,24 @@ pub enum AppMessage {
         single_image: bool,
         toc_string: String,
     },
+    /// Result of an async MusicBrainz lookup driving `:cue-fill`. Carries
+    /// the path of the original `.cue` and the pre-built album/tracks
+    /// (with parsed pregaps and durations applied) ready for fill+write.
+    CueFillComplete {
+        outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
+        cue_path: std::path::PathBuf,
+        album: Box<crate::tui::cue_generate::CueAlbumInfo>,
+        tracks: Vec<crate::tui::cue_generate::CueTrackInfo>,
+        layout: CueFillLayout,
+        toc_string: String,
+    },
+}
+
+/// Re-emission target form for `:cue-fill`. Captures whether the source
+/// CUE was single-image (one FILE) or multi-file, and for single-image
+/// the FILE name + format keyword needed to reproduce it.
+#[derive(Debug, Clone)]
+pub enum CueFillLayout {
+    MultiFile,
+    SingleImage { image_filename: String, format_tag: String },
 }

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Album-level metadata for CUE header.
+#[derive(Debug, Clone)]
 pub struct CueAlbumInfo {
     pub title: String,
     pub artist: String,
@@ -17,6 +18,7 @@ pub struct CueAlbumInfo {
 }
 
 /// Per-track metadata for a CUE entry.
+#[derive(Debug, Clone)]
 pub struct CueTrackInfo {
     pub filename: String,
     pub title: String,
@@ -376,6 +378,185 @@ pub fn derive_image_filename(album: &CueAlbumInfo, first_path: &Path) -> String 
     format!("{}.{}", sanitised, ext)
 }
 
+/// Bridge a parsed CueSheet + colocated audio paths into the (album, tracks)
+/// shape used by the generators, with pregaps reconstructed from `INDEX 00`
+/// and durations probed from the audio files.
+///
+/// Used by `:cue-fill` so re-emission preserves the user's track boundaries
+/// without depending on a separate EAC log.
+///
+/// `audio_paths` must be sorted by track order and have the same length as
+/// `sheet.tracks` (multi-file) or len == 1 (single-image). Returns `Err` on
+/// length mismatch.
+pub fn cue_sheet_to_track_info(
+    sheet: &super::cue_parser::CueSheet,
+    audio_paths: &[std::path::PathBuf],
+    cue_dir: &std::path::Path,
+) -> Result<(CueAlbumInfo, Vec<CueTrackInfo>), String> {
+    if sheet.tracks.is_empty() {
+        return Err("parsed CUE has no tracks".to_string());
+    }
+    let single_image = audio_paths.len() == 1 && sheet.tracks.len() > 1;
+
+    // Probe each audio file once for duration. For single-image, this is
+    // the one image file; for multi-file, it's each track file in order.
+    let durations: Vec<Duration> = audio_paths.iter()
+        .map(|p| {
+            super::probe::probe_audio(p)
+                .map(|info| Duration::from_secs_f64(info.duration_secs))
+                .unwrap_or(Duration::ZERO)
+        })
+        .collect();
+
+    let mut tracks = Vec::with_capacity(sheet.tracks.len());
+
+    for (i, ct) in sheet.tracks.iter().enumerate() {
+        // Resolve the audio file we'll reference from the CUE. For
+        // multi-file we take the i-th selected audio path; for single-image
+        // every track shares audio_paths[0].
+        let audio_path: &std::path::PathBuf = if single_image {
+            &audio_paths[0]
+        } else {
+            audio_paths.get(i).ok_or_else(|| format!(
+                "audio path missing for track {}; expected {} files, got {}",
+                ct.number, sheet.tracks.len(), audio_paths.len(),
+            ))?
+        };
+
+        // Per-track duration. Multi-file: probe of this file. Single-image:
+        // INDEX 01 delta (or remaining file length for the final track).
+        let duration = if single_image {
+            let total = durations.first().copied().unwrap_or_default();
+            let total_frames = (total.as_secs_f64() * 75.0).round() as u32;
+            let this_idx01 = ct.index01_frames.unwrap_or(0);
+            let next_idx01 = sheet.tracks.get(i + 1)
+                .and_then(|n| n.index01_frames)
+                .unwrap_or(total_frames);
+            let frames = next_idx01.saturating_sub(this_idx01);
+            Duration::from_secs_f64(frames as f64 / 75.0)
+        } else {
+            durations[i]
+        };
+
+        // Pregap reconstruction.
+        let pregap_frames = ct.index00_frames.and_then(|idx00| {
+            if single_image {
+                // Absolute cumulative: pregap = INDEX 01 - INDEX 00
+                ct.index01_frames.and_then(|idx01| idx01.checked_sub(idx00))
+            } else if i == 0 {
+                // Track 1's INDEX 00 is the lead-in pregap (not in rip).
+                None
+            } else {
+                // Multi-file noncompliant: INDEX 00 is in prev FILE.
+                // pregap = (prev track length frames) - INDEX 00 position
+                let prev_dur = durations.get(i - 1).copied().unwrap_or_default();
+                let prev_frames = (prev_dur.as_secs_f64() * 75.0).round() as u32;
+                prev_frames.checked_sub(idx00)
+            }
+        }).filter(|&n| n > 0);
+
+        let filename = audio_path
+            .strip_prefix(cue_dir)
+            .unwrap_or(audio_path)
+            .to_string_lossy()
+            .to_string();
+        let ext = audio_path.extension().and_then(|e| e.to_str()).unwrap_or("flac");
+        let format_tag = cue_format_tag(ext).to_string();
+
+        tracks.push(CueTrackInfo {
+            filename,
+            title: ct.title.clone().unwrap_or_default(),
+            artist: ct.performer.clone().unwrap_or_default(),
+            track_number: ct.number,
+            duration,
+            format_tag,
+            pregap_frames,
+            isrc: ct.isrc.clone(),
+        });
+    }
+
+    let album = CueAlbumInfo {
+        title: sheet.title.clone().unwrap_or_default(),
+        artist: sheet.performer.clone().unwrap_or_default(),
+        year: sheet.date.clone(),
+        genre: sheet.genre.clone(),
+        catalog: sheet.catalog.clone(),
+    };
+    Ok((album, tracks))
+}
+
+/// Counts of fields actually changed by `fill_cue_with_mb`, for status messaging.
+#[derive(Debug, Clone, Default)]
+pub struct FillStats {
+    pub titles_filled: usize,
+    pub artists_filled: usize,
+    pub isrcs_filled: usize,
+    pub year_filled: bool,
+    pub catalog_filled: bool,
+}
+
+impl FillStats {
+    /// True when no field was filled — caller can short-circuit the write.
+    pub fn is_empty(&self) -> bool {
+        self.titles_filled == 0
+            && self.artists_filled == 0
+            && self.isrcs_filled == 0
+            && !self.year_filled
+            && !self.catalog_filled
+    }
+}
+
+/// Fill *only* empty/absent fields on `album` and `tracks` from a MusicBrainz
+/// release. Used by `:cue-fill` (enrich semantics): user-typed values are
+/// preserved verbatim; only fields where the existing value is empty/absent
+/// get the MB value. Returns counts of what was changed.
+///
+/// Distinct from `apply_mb_overrides` which has overwrite semantics.
+pub fn fill_cue_with_mb(
+    album: &mut CueAlbumInfo,
+    tracks: &mut [CueTrackInfo],
+    mb: &super::musicbrainz::MbRelease,
+) -> FillStats {
+    let mut stats = FillStats::default();
+
+    fn fill_string(field: &mut String, candidate: &str) -> bool {
+        if !field.trim().is_empty() {
+            return false;
+        }
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        *field = trimmed.to_string();
+        true
+    }
+    fn fill_opt(field: &mut Option<String>, candidate: Option<&str>) -> bool {
+        if field.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            return false;
+        }
+        if let Some(c) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            *field = Some(c.to_string());
+            return true;
+        }
+        false
+    }
+
+    if fill_string(&mut album.title, &mb.title) { stats.titles_filled += 1; }
+    if fill_string(&mut album.artist, &mb.artist) { stats.artists_filled += 1; }
+    if fill_opt(&mut album.year, mb.year.as_deref()) { stats.year_filled = true; }
+    if fill_opt(&mut album.catalog, mb.barcode.as_deref()) { stats.catalog_filled = true; }
+
+    for t in tracks.iter_mut() {
+        if let Some(mt) = mb.tracks.iter().find(|m| m.position == t.track_number) {
+            if fill_string(&mut t.title, &mt.title) { stats.titles_filled += 1; }
+            if fill_string(&mut t.artist, &mt.artist) { stats.artists_filled += 1; }
+            if fill_opt(&mut t.isrc, mt.isrc.as_deref()) { stats.isrcs_filled += 1; }
+        }
+    }
+
+    stats
+}
+
 /// Overlay MusicBrainz data on a tag-derived album + tracks.
 ///
 /// MB values win when present and non-empty; the existing tag-derived
@@ -561,6 +742,89 @@ mod tests {
     fn header_skips_catalog_line_when_album_has_none() {
         let cue = generate_multifile_cue(&album(), &[track(1, Duration::from_secs(60), None)]);
         assert!(!cue.contains("CATALOG"));
+    }
+
+    #[test]
+    fn fill_cue_only_changes_empty_fields() {
+        use super::super::musicbrainz::{MbRelease, MbTrack};
+
+        let mut album = CueAlbumInfo {
+            title: "User Title".to_string(),
+            artist: "".to_string(),  // empty → fill from MB
+            year: None,              // absent → fill from MB
+            genre: None,
+            catalog: Some("USER-CAT".to_string()),  // present → keep
+        };
+        let mut tracks = vec![
+            // ISRC absent → fill; title present → keep
+            CueTrackInfo {
+                filename: "01.flac".to_string(),
+                title: "User Track 1".to_string(),
+                artist: "".to_string(),
+                track_number: 1,
+                duration: Duration::from_secs(60),
+                format_tag: "FLAC".to_string(),
+                pregap_frames: None,
+                isrc: None,
+            },
+        ];
+        let mb = MbRelease {
+            release_id: "x".to_string(),
+            title: "MB Title".to_string(),
+            artist: "MB Artist".to_string(),
+            year: Some("1971".to_string()),
+            catalog: None,
+            barcode: Some("MB-BARCODE".to_string()),
+            tracks: vec![
+                MbTrack {
+                    position: 1,
+                    title: "MB Track 1".to_string(),
+                    artist: "MB Performer".to_string(),
+                    isrc: Some("USRC17607839".to_string()),
+                },
+            ],
+        };
+        let stats = fill_cue_with_mb(&mut album, &mut tracks, &mb);
+
+        // Album: title preserved, artist filled, year filled, catalog preserved
+        assert_eq!(album.title, "User Title");
+        assert_eq!(album.artist, "MB Artist");
+        assert_eq!(album.year.as_deref(), Some("1971"));
+        assert_eq!(album.catalog.as_deref(), Some("USER-CAT"));
+
+        // Track 1: title preserved, artist filled, isrc filled
+        assert_eq!(tracks[0].title, "User Track 1");
+        assert_eq!(tracks[0].artist, "MB Performer");
+        assert_eq!(tracks[0].isrc.as_deref(), Some("USRC17607839"));
+
+        // Stats: artist+isrc per track, year at album level. titles_filled
+        // counts only what was actually filled.
+        assert_eq!(stats.titles_filled, 0);
+        assert_eq!(stats.artists_filled, 2);  // album + 1 track
+        assert_eq!(stats.isrcs_filled, 1);
+        assert!(stats.year_filled);
+        assert!(!stats.catalog_filled);
+        assert!(!stats.is_empty());
+    }
+
+    #[test]
+    fn fill_cue_is_empty_when_nothing_to_fill() {
+        use super::super::musicbrainz::MbRelease;
+
+        let mut album = CueAlbumInfo {
+            title: "T".to_string(), artist: "A".to_string(),
+            year: Some("1971".to_string()), genre: None,
+            catalog: Some("C".to_string()),
+        };
+        let mut tracks: Vec<CueTrackInfo> = vec![];
+        let mb = MbRelease {
+            release_id: "x".to_string(), title: "MB".to_string(),
+            artist: "MB".to_string(), year: Some("1972".to_string()),
+            catalog: None, barcode: Some("X".to_string()), tracks: vec![],
+        };
+        let stats = fill_cue_with_mb(&mut album, &mut tracks, &mb);
+        assert!(stats.is_empty());
+        assert_eq!(album.title, "T"); // unchanged
     }
 
     #[test]
