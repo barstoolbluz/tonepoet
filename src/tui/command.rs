@@ -266,6 +266,8 @@ pub enum Command {
     CueScrollTop,
     /// Scroll the parked CUE preview overlay to the bottom.
     CueScrollBottom,
+    /// Begin editing the 1-based `line` of the parked CUE preview.
+    CueEditLine(usize),
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -321,7 +323,17 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "wq" => Command::WriteQuit,
-        "e" | "edit" => Command::Edit(args.to_string()),
+        "e" | "edit" => {
+            // `:e <N>` (positive integer) targets a line in the parked
+            // CUE preview overlay. Anything else falls through to the
+            // existing path-or-field handler.
+            if let Ok(line) = args.trim().parse::<usize>() {
+                if line >= 1 {
+                    return Command::CueEditLine(line);
+                }
+            }
+            Command::Edit(args.to_string())
+        }
         "o" | "output" => Command::Output(args.to_string()),
         "cd" => Command::Cd(args.to_string()),
         "c" | "convert" | "qa" | "queue" | "qa!" | "queue!" => {
@@ -461,6 +473,11 @@ pub fn execute_command(
         Command::Write => {
             // If a CUE preview is parked, :w writes the previewed CUE.
             if let Some(state) = app.pending_cue_preview.take() {
+                if let Err(reason) = super::cue_generate::validate_cue_content(&state.content) {
+                    app.pending_cue_preview = Some(state);
+                    app.set_status(format!("CUE invalid, not written: {}", reason));
+                    return;
+                }
                 let path = state.write_path.clone();
                 match std::fs::write(&path, &state.content) {
                     Ok(()) => {
@@ -497,6 +514,33 @@ pub fn execute_command(
             }
         }
         Command::WriteQuit => {
+            // If a CUE preview is parked, :wq writes the CUE then closes
+            // the overlay (does not quit the app).
+            if let Some(state) = app.pending_cue_preview.take() {
+                if let Err(reason) = super::cue_generate::validate_cue_content(&state.content) {
+                    app.pending_cue_preview = Some(state);
+                    app.set_status(format!("CUE invalid, not written: {}", reason));
+                    return;
+                }
+                let path = state.write_path.clone();
+                match std::fs::write(&path, &state.content) {
+                    Ok(()) => {
+                        let name = path.file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string());
+                        app.set_status(format!("CUE written: {}", name));
+                        if app.current_screen == AppScreen::Browse {
+                            app.browse.refresh();
+                            app.browse.probe_current_with_db(tx, Some(&app.db));
+                        }
+                    }
+                    Err(e) => {
+                        app.pending_cue_preview = Some(state);
+                        app.set_status(format!("CUE write failed: {}", e));
+                    }
+                }
+                return;
+            }
             if let Some(name) = &app.preset.active_preset.clone() {
                 let preset = super::presets::TuiPreset::from_pill_state(
                     name, &app.convert.format, &app.convert.output_options,
@@ -1468,6 +1512,24 @@ pub fn execute_command(
                 let last = state.content.lines().count().saturating_sub(1);
                 state.scroll = last;
                 app.active_overlay = super::app::ActiveOverlay::CuePreview(state);
+            }
+        }
+        Command::CueEditLine(line_1based) => {
+            let Some(mut state) = app.pending_cue_preview.take() else {
+                app.set_status("no CUE preview to edit");
+                return;
+            };
+            let idx = line_1based.saturating_sub(1);
+            if state.begin_edit(idx) {
+                // Auto-scroll so the edited line is visible.
+                state.scroll = idx.saturating_sub(2);
+                app.active_overlay = super::app::ActiveOverlay::CuePreview(state);
+            } else {
+                let total = state.line_count();
+                app.pending_cue_preview = Some(state);
+                app.set_status(format!(
+                    "line {} out of range (1..={})", line_1based, total,
+                ));
             }
         }
         Command::MarkCompareRef => {

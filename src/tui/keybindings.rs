@@ -1757,11 +1757,32 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
         }
         ActiveOverlay::CuePreview(mut state) => {
-            // Actions (save, cancel, jump-top, jump-bottom) all live behind
-            // colon commands (`:w`, `:q`, `:g`, `:G`); pressing `:` parks
-            // the overlay and opens CommandInput, mirroring the
-            // MetadataEditor parking pattern. Navigation primitives
-            // (arrows, PageUp/PageDown, Esc) work directly.
+            // Two modes:
+            // - Read-only (default): `:` parks the overlay + opens command
+            //   input; arrows / PageUp / PageDown scroll; Esc cancels.
+            // - Editing (after `:e <N>`): keys flow through TextInputState;
+            //   Enter commits the line splice; Esc cancels the edit
+            //   without splicing.
+            if state.is_editing() {
+                match key.code {
+                    KeyCode::Enter => {
+                        state.commit_edit();
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                    }
+                    KeyCode::Esc => {
+                        state.cancel_edit();
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                    }
+                    _ => {
+                        if let Some(ref mut input) = state.edit {
+                            super::text_input::handle_text_input_key(input, &key);
+                        }
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                    }
+                }
+                return;
+            }
+
             let max_line = state.content.lines().count().saturating_sub(1);
             match key.code {
                 KeyCode::Char(':') => {

@@ -2929,11 +2929,42 @@ fn draw_cue_preview(f: &mut Frame, state: &CuePreviewState) {
     let max_scroll = total_lines.saturating_sub(visible_height);
     let scroll = state.scroll.min(max_scroll);
 
+    let gutter_width = total_lines.to_string().len().max(2);
+    let editing_line = state.cursor;
+    let edit_text = state.edit.as_ref().map(|i| i.text.as_str());
+
     let lines: Vec<Line> = state.content
         .lines()
+        .enumerate()
         .skip(scroll)
         .take(visible_height)
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme::TEXT))))
+        .map(|(idx, l)| {
+            let line_no = format!("{:>width$}", idx + 1, width = gutter_width);
+            let on_edit = editing_line == Some(idx);
+            let body_text = if on_edit {
+                edit_text.unwrap_or(l).to_string()
+            } else {
+                l.to_string()
+            };
+            let body_style = if on_edit {
+                Style::default()
+                    .fg(theme::TEXT_BRIGHT)
+                    .bg(theme::SURFACE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+            let gutter_style = if on_edit {
+                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+            } else {
+                theme::muted()
+            };
+            Line::from(vec![
+                Span::styled(format!(" {} ", line_no), gutter_style),
+                Span::styled("│ ", theme::muted()),
+                Span::styled(body_text, body_style),
+            ])
+        })
         .collect();
     f.render_widget(Paragraph::new(lines), chunks[2]);
 
@@ -2946,17 +2977,28 @@ fn draw_cue_preview(f: &mut Frame, state: &CuePreviewState) {
             total_lines,
         )
     };
-    let footer = Line::from(vec![
-        Span::styled(" :w ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
-        Span::styled("save  ", theme::muted()),
-        Span::styled(":q ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
-        Span::styled("cancel  ", theme::muted()),
-        Span::styled(":g/:G ", Style::default().fg(theme::TEXT_BRIGHT)),
-        Span::styled("top/bottom  ", theme::muted()),
-        Span::styled("↑↓ PgUp/PgDn ", Style::default().fg(theme::TEXT_BRIGHT)),
-        Span::styled("scroll", theme::muted()),
-        Span::styled(format!("    {}", pos), theme::muted()),
-    ]);
+    let footer = if state.is_editing() {
+        Line::from(vec![
+            Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled("commit  ", theme::muted()),
+            Span::styled("Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel edit", theme::muted()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" :w ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled("save  ", theme::muted()),
+            Span::styled(":q ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel  ", theme::muted()),
+            Span::styled(":e N ", Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled("edit line  ", theme::muted()),
+            Span::styled(":g/:G ", Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled("top/bottom  ", theme::muted()),
+            Span::styled("↑↓ PgUp/PgDn ", Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled("scroll", theme::muted()),
+            Span::styled(format!("    {}", pos), theme::muted()),
+        ])
+    };
     f.render_widget(Paragraph::new(footer), chunks[3]);
 }
 

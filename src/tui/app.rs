@@ -1029,7 +1029,9 @@ pub struct MetadataEditorState {
 }
 
 /// State for the CUE preview overlay opened by `:cue-mb` / `:cue-mb!` /
-/// `:cue-fill`. Read-only in Stage 2; Stage 3 will add line editing.
+/// `:cue-fill`. Read-only by default; in-place line editing is reachable
+/// via the `:e <N>` command, which seeds `edit` with a `TextInputState`
+/// scoped to the chosen line.
 #[derive(Debug, Clone)]
 pub struct CuePreviewState {
     /// Rendered CUE content to be written on save.
@@ -1042,16 +1044,72 @@ pub struct CuePreviewState {
     pub summary: String,
     /// Top row of the visible window for vim-smooth scroll.
     pub scroll: usize,
+    /// 0-based line being edited (for renderer highlight + commit
+    /// splice). `None` when not in edit mode.
+    pub cursor: Option<usize>,
+    /// Active text input when editing a single line. `Enter` commits;
+    /// `Esc` cancels without splicing.
+    pub edit: Option<crate::tui::text_input::TextInputState>,
 }
 
 impl CuePreviewState {
     pub fn new(content: String, write_path: std::path::PathBuf, summary: String) -> Self {
-        Self { content, write_path, summary, scroll: 0 }
+        Self {
+            content,
+            write_path,
+            summary,
+            scroll: 0,
+            cursor: None,
+            edit: None,
+        }
     }
 
     /// Number of content lines (cached for scroll bounds + display).
     pub fn line_count(&self) -> usize {
         self.content.lines().count()
+    }
+
+    /// True while a single line is being edited via `:e <N>`.
+    pub fn is_editing(&self) -> bool {
+        self.edit.is_some()
+    }
+
+    /// Begin editing the 0-based `line_idx`. Seeds the `TextInputState`
+    /// with that line's current text and parks the cursor on it. No-op
+    /// when `line_idx` is out of range.
+    pub fn begin_edit(&mut self, line_idx: usize) -> bool {
+        let Some(line) = self.content.lines().nth(line_idx) else {
+            return false;
+        };
+        self.edit = Some(crate::tui::text_input::TextInputState::new(line.to_string()));
+        self.cursor = Some(line_idx);
+        true
+    }
+
+    /// Commit the current edit by splicing the input's text in place of
+    /// the cursor's line. Clears `edit` and `cursor` on success.
+    pub fn commit_edit(&mut self) {
+        let (Some(idx), Some(input)) = (self.cursor, self.edit.take()) else {
+            return;
+        };
+        let new_text = input.text;
+        let mut lines: Vec<String> = self.content.lines().map(str::to_string).collect();
+        if idx < lines.len() {
+            lines[idx] = new_text;
+        }
+        // Preserve trailing newline if the source had one.
+        let trailing = self.content.ends_with('\n');
+        self.content = lines.join("\n");
+        if trailing {
+            self.content.push('\n');
+        }
+        self.cursor = None;
+    }
+
+    /// Discard the current edit without splicing.
+    pub fn cancel_edit(&mut self) {
+        self.edit = None;
+        self.cursor = None;
     }
 }
 
@@ -1846,5 +1904,58 @@ mod cue_preview_state_tests {
             String::new(),
         );
         assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn begin_edit_seeds_input_with_line_text() {
+        let mut s = CuePreviewState::new(
+            "FILE \"x.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_string(),
+            std::path::PathBuf::from("/tmp/test.cue"),
+            String::new(),
+        );
+        assert!(s.begin_edit(1));
+        assert!(s.is_editing());
+        assert_eq!(s.cursor, Some(1));
+        assert_eq!(s.edit.as_ref().unwrap().text, "  TRACK 01 AUDIO");
+    }
+
+    #[test]
+    fn begin_edit_out_of_range_returns_false() {
+        let mut s = CuePreviewState::new(
+            "one\ntwo\n".to_string(),
+            std::path::PathBuf::from("/tmp/test.cue"),
+            String::new(),
+        );
+        assert!(!s.begin_edit(99));
+        assert!(!s.is_editing());
+    }
+
+    #[test]
+    fn commit_edit_splices_input_text_into_content() {
+        let mut s = CuePreviewState::new(
+            "alpha\nbeta\ngamma\n".to_string(),
+            std::path::PathBuf::from("/tmp/test.cue"),
+            String::new(),
+        );
+        s.begin_edit(1);
+        s.edit.as_mut().unwrap().text = "BETA-EDITED".to_string();
+        s.commit_edit();
+        assert_eq!(s.content, "alpha\nBETA-EDITED\ngamma\n");
+        assert!(!s.is_editing());
+        assert_eq!(s.cursor, None);
+    }
+
+    #[test]
+    fn cancel_edit_does_not_modify_content() {
+        let mut s = CuePreviewState::new(
+            "alpha\nbeta\n".to_string(),
+            std::path::PathBuf::from("/tmp/test.cue"),
+            String::new(),
+        );
+        s.begin_edit(1);
+        s.edit.as_mut().unwrap().text = "WOULD-CHANGE".to_string();
+        s.cancel_edit();
+        assert_eq!(s.content, "alpha\nbeta\n");
+        assert!(!s.is_editing());
     }
 }

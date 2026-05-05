@@ -485,6 +485,28 @@ pub fn cue_sheet_to_track_info(
     Ok((album, tracks))
 }
 
+/// Sanity-check a CUE content string before writing. Returns `Ok(())`
+/// when the parsed sheet has at least one track, every track has an
+/// `INDEX 01`, and at least one FILE reference is present. Used by the
+/// preview overlay's save action so a user-edited CUE can't accidentally
+/// be written in a structurally broken state.
+pub fn validate_cue_content(content: &str) -> Result<(), String> {
+    let sheet = super::cue_parser::parse_cue(content);
+    if sheet.tracks.is_empty() {
+        return Err("CUE has no TRACK declarations".to_string());
+    }
+    let any_file = sheet.tracks.iter().any(|t| t.file.is_some());
+    if !any_file {
+        return Err("CUE has no FILE references".to_string());
+    }
+    for t in &sheet.tracks {
+        if t.index01_frames.is_none() {
+            return Err(format!("track {:02} is missing INDEX 01", t.number));
+        }
+    }
+    Ok(())
+}
+
 /// Counts of fields actually changed by `fill_cue_with_mb`, for status messaging.
 #[derive(Debug, Clone, Default)]
 pub struct FillStats {
@@ -742,6 +764,39 @@ mod tests {
     fn header_skips_catalog_line_when_album_has_none() {
         let cue = generate_multifile_cue(&album(), &[track(1, Duration::from_secs(60), None)]);
         assert!(!cue.contains("CATALOG"));
+    }
+
+    #[test]
+    fn validate_cue_accepts_minimal_valid_content() {
+        let cue = "FILE \"x.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        assert!(validate_cue_content(cue).is_ok());
+    }
+
+    #[test]
+    fn validate_cue_rejects_empty_content() {
+        assert!(validate_cue_content("").is_err());
+    }
+
+    #[test]
+    fn validate_cue_rejects_no_tracks() {
+        let cue = "FILE \"x.flac\" FLAC\nTITLE \"Album\"\n";
+        let err = validate_cue_content(cue).unwrap_err();
+        assert!(err.contains("no TRACK"));
+    }
+
+    #[test]
+    fn validate_cue_rejects_track_missing_index01() {
+        let cue = "FILE \"x.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"x\"\n";
+        let err = validate_cue_content(cue).unwrap_err();
+        assert!(err.contains("INDEX 01"));
+    }
+
+    #[test]
+    fn validate_cue_rejects_no_file() {
+        // Track without a FILE line — none associated.
+        let cue = "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let err = validate_cue_content(cue).unwrap_err();
+        assert!(err.contains("no FILE"));
     }
 
     #[test]
