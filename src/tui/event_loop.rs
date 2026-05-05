@@ -1188,7 +1188,7 @@ fn handle_cue_mb_complete(
         }
     }
 
-    let release = match outcome.release {
+    let release = match outcome.releases.into_iter().next() {
         Some(r) => r,
         None => {
             app.set_status("MusicBrainz CUE: no release matched this disc TOC".to_string());
@@ -1262,42 +1262,47 @@ fn handle_tags_from_mb_complete(
         }
     }
 
-    let release = match outcome.release {
-        Some(r) => r,
-        None => {
+    match outcome.releases.len() {
+        0 => {
             app.set_status(":tags-mb: no MusicBrainz release matched this disc TOC".to_string());
-            return;
         }
-    };
-
-    // Open the editor on the current selection, then verify that the
-    // selection still matches the paths we computed the TOC for. If the
-    // user navigated between :tags-mb invoke and async result, abort
-    // before applying MB values to the wrong files.
-    super::keybindings::open_metadata_editor(app);
-    let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
-    match prior {
-        ActiveOverlay::MetadataEditor(mut state) => {
-            if state.paths != paths {
-                app.set_status(":tags-mb: selection changed since lookup; rerun".to_string());
-                app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                return;
-            }
-            super::musicbrainz::populate_editor_from_mb(&mut state, &release);
-            let label = if release.title.is_empty() { "(untitled)" } else { &release.title };
+        1 => {
+            // Single match: skip the picker, go straight to review.
+            let release = outcome.releases.into_iter().next().expect("len == 1");
+            open_mb_review(app, release, paths);
+        }
+        n => {
             app.set_status(format!(
-                ":tags-mb: applied \"{}\" — review then save",
-                label,
+                ":tags-mb: {} releases matched — pick one (:ok / :1..:9 / :q)",
+                n,
             ));
-            app.active_overlay = ActiveOverlay::MetadataEditor(state);
-        }
-        other => {
-            // open_metadata_editor didn't produce a MetadataEditor (no
-            // audio files / read-tag error). Restore whatever it left
-            // and surface a status if it didn't already.
-            app.active_overlay = other;
+            app.active_overlay = ActiveOverlay::MbSelect(Box::new(
+                super::app::MbSelectState::new(outcome.releases, paths),
+            ));
         }
     }
+}
+
+/// Open the GnudbReview overlay on `release` (reused for MB review since
+/// the data shape lines up). The held `mb_release` carries ISRC and
+/// catalog forward to the editor populate step. Called both for single-
+/// match `:tags-mb` and after MbSelect accepts.
+pub(super) fn open_mb_review(
+    app: &mut AppState,
+    release: super::musicbrainz::MbRelease,
+    paths: Vec<std::path::PathBuf>,
+) {
+    let label = if release.title.is_empty() {
+        "(untitled)".to_string()
+    } else {
+        release.title.clone()
+    };
+    let review = super::musicbrainz::build_review_state_from_mb(release, paths);
+    app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
+    app.set_status(format!(
+        ":tags-mb: review \"{}\" — accept (a) to commit to editor",
+        label,
+    ));
 }
 
 /// Handle the result of a `:cue-fill` MusicBrainz lookup. Caches the response,
@@ -1327,7 +1332,7 @@ fn handle_cue_fill_complete(
         }
     }
 
-    let release = match outcome.release {
+    let release = match outcome.releases.into_iter().next() {
         Some(r) => r,
         None => {
             app.set_status(":cue-fill: no MusicBrainz release matched this disc TOC".to_string());

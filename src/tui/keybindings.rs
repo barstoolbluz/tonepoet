@@ -1347,6 +1347,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             app.active_overlay = ActiveOverlay::CuePreview(parked);
                         }
                     }
+                    // Same for parked MB select.
+                    if let Some(parked) = app.pending_mb_select.take() {
+                        if matches!(app.active_overlay, ActiveOverlay::None) {
+                            app.active_overlay = ActiveOverlay::MbSelect(parked);
+                        }
+                    }
                     return;
                 }
                 KeyCode::Esc => {
@@ -1357,6 +1363,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     }
                     if let Some(parked) = app.pending_cue_preview.take() {
                         app.active_overlay = ActiveOverlay::CuePreview(parked);
+                    }
+                    if let Some(parked) = app.pending_mb_select.take() {
+                        app.active_overlay = ActiveOverlay::MbSelect(parked);
                     }
                     return;
                 }
@@ -1711,13 +1720,22 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         super::keybindings::open_metadata_editor(app);
                         if let ActiveOverlay::MetadataEditor(ref mut editor_state) = app.active_overlay {
                             super::gnudb::populate_editor_from_review(editor_state, &state);
+                            // When the review came from a MusicBrainz lookup,
+                            // also write the MB-only fields (ISRC, catalog)
+                            // that the review UI didn't surface.
+                            if let Some(ref mb) = state.mb_release {
+                                super::musicbrainz::populate_editor_isrc_catalog_from_mb(
+                                    editor_state, mb,
+                                );
+                            }
                             let first_page = &state.pages[0];
                             let artist = first_page.tracks.first()
                                 .map(|t| t.artist.as_str())
                                 .unwrap_or("?");
+                            let source = if state.mb_release.is_some() { "MB" } else { "GNUDB" };
                             app.set_status(format!(
-                                "Tags loaded — {} / {} ({} disc{})",
-                                artist, first_page.album,
+                                "Tags loaded ({}) — {} / {} ({} disc{})",
+                                source, artist, first_page.album,
                                 state.pages.len(),
                                 if state.pages.len() == 1 { "" } else { "s" },
                             ));
@@ -1754,6 +1772,45 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.active_overlay = ActiveOverlay::Verify { scroll };
                 }
                 _ => {}
+            }
+        }
+        ActiveOverlay::MbSelect(mut state) => {
+            // Actions (accept / pick by index / cancel) live behind colon
+            // commands; pressing `:` parks the picker into
+            // `pending_mb_select` and opens CommandInput. Arrows /
+            // PageUp / PageDown move the cursor; Esc cancels.
+            let n = state.releases.len();
+            match key.code {
+                KeyCode::Char(':') => {
+                    app.pending_mb_select = Some(state);
+                    app.active_overlay = ActiveOverlay::CommandInput {
+                        input: super::text_input::TextInputState::empty(),
+                        completion: None,
+                    };
+                }
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("MusicBrainz picker cancelled".to_string());
+                }
+                KeyCode::Up => {
+                    state.selected = state.selected.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::MbSelect(state);
+                }
+                KeyCode::Down => {
+                    state.selected = (state.selected + 1).min(n.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::MbSelect(state);
+                }
+                KeyCode::PageUp => {
+                    state.selected = state.selected.saturating_sub(10);
+                    app.active_overlay = ActiveOverlay::MbSelect(state);
+                }
+                KeyCode::PageDown => {
+                    state.selected = (state.selected + 10).min(n.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::MbSelect(state);
+                }
+                _ => {
+                    app.active_overlay = ActiveOverlay::MbSelect(state);
+                }
             }
         }
         ActiveOverlay::CuePreview(mut state) => {

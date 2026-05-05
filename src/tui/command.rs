@@ -48,6 +48,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "write-rg-track", "write-rg-album",
     "import-cue", "cue", "cue!", "cue-mb", "cue-mb!", "cue-fill", "cue-enrich",
     "tags-mb", "mb-tags", "musicbrainz-tags",
+    "ok", "accept",
     "g", "G", "top", "bot", "bottom",
     "fix-caps", "fixcaps",
     "search", "s", "rs", "rsearch",
@@ -272,6 +273,10 @@ pub enum Command {
     /// Open the metadata editor pre-populated with track-level + album-level
     /// values from a MusicBrainz disc-TOC lookup.
     TagsFromMb,
+    /// Accept the cursor-highlighted release in the parked MbSelect overlay.
+    MbSelectAccept,
+    /// Accept the 1-based `Nth` release in the parked MbSelect overlay.
+    MbSelectByIndex(usize),
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -399,6 +404,15 @@ pub fn parse_command(input: &str) -> Command {
         "cue-mb!" => Command::GenerateCueMb { single_image: true },
         "cue-fill" | "cue-enrich" => Command::CueFill,
         "tags-mb" | "mb-tags" | "musicbrainz-tags" => Command::TagsFromMb,
+        "ok" | "accept" => Command::MbSelectAccept,
+        s if s.len() <= 3 && s.chars().all(|c| c.is_ascii_digit()) => {
+            // `:1`..`:999` selects the Nth entry in the parked MbSelect overlay.
+            // Falls through to Unknown when no MbSelect is parked (handler no-op).
+            match s.parse::<usize>() {
+                Ok(n) if n >= 1 => Command::MbSelectByIndex(n),
+                _ => Command::Unknown(format!("unknown: {}", input)),
+            }
+        }
         "g" | "top" => Command::CueScrollTop,
         "G" | "bot" | "bottom" => Command::CueScrollBottom,
         "preemphasis" | "preemph" | "pe" => Command::DetectPreemphasis,
@@ -471,6 +485,11 @@ pub fn execute_command(
             // rather than quitting the app.
             if app.pending_cue_preview.take().is_some() {
                 app.set_status("CUE preview cancelled".to_string());
+                return;
+            }
+            // Same for MB picker.
+            if app.pending_mb_select.take().is_some() {
+                app.set_status("MusicBrainz picker cancelled".to_string());
                 return;
             }
             app.should_quit = true;
@@ -1349,6 +1368,30 @@ pub fn execute_command(
                     }).await;
                 });
             }
+        }
+        Command::MbSelectAccept => {
+            let Some(state) = app.pending_mb_select.take() else {
+                app.set_status("no MusicBrainz picker active");
+                return;
+            };
+            let idx = state.selected;
+            mb_select_commit(app, *state, idx, tx);
+        }
+        Command::MbSelectByIndex(n_1based) => {
+            let Some(state) = app.pending_mb_select.take() else {
+                app.set_status("no MusicBrainz picker active");
+                return;
+            };
+            let idx = n_1based.saturating_sub(1);
+            if idx >= state.releases.len() {
+                let total = state.releases.len();
+                app.pending_mb_select = Some(state);
+                app.set_status(format!(
+                    ":{} out of range (1..={})", n_1based, total,
+                ));
+                return;
+            }
+            mb_select_commit(app, *state, idx, tx);
         }
         Command::TagsFromMb => {
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
@@ -3451,6 +3494,22 @@ pub fn apply_cue_changes(
     }
 
     state.dirty = true;
+}
+
+/// Pull the chosen release out of an `MbSelectState` and route it into
+/// the review overlay.
+fn mb_select_commit(
+    app: &mut AppState,
+    mut state: super::app::MbSelectState,
+    idx: usize,
+    _tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    if idx >= state.releases.len() {
+        return;
+    }
+    let release = state.releases.swap_remove(idx);
+    let paths = std::mem::take(&mut state.paths);
+    super::event_loop::open_mb_review(app, release, paths);
 }
 
 #[cfg(test)]

@@ -416,6 +416,7 @@ pub fn build_review_state(
         last_click: None,
         origin_matches: None,
         paths,
+        mb_release: None,
     }
 }
 
@@ -462,6 +463,7 @@ pub fn build_multi_disc_review_state(
         last_click: None,
         origin_matches: None,
         paths: all_paths,
+        mb_release: None,
     }
 }
 
@@ -629,6 +631,7 @@ pub fn build_review_state_from_cue(
         last_click: None,
         origin_matches: None,
         paths,
+        mb_release: None,
     }
 }
 
@@ -676,6 +679,7 @@ pub fn build_multi_disc_review_state_from_cue(
         last_click: None,
         origin_matches: None,
         paths: all_paths,
+        mb_release: None,
     }
 }
 

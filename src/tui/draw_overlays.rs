@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::convert::ConversionStatus;
-use super::app::{ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState, SourceMode};
+use super::app::{ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState, MbSelectState, SourceMode};
 use super::button_map::TuiButton;
 use super::theme;
 
@@ -113,6 +113,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         }
         ActiveOverlay::CuePreview(ref state) => {
             draw_cue_preview(f, state);
+        }
+        ActiveOverlay::MbSelect(ref state) => {
+            draw_mb_select(f, state);
         }
         ActiveOverlay::Verify { scroll } => {
             draw_verify(f, &app.verify_results, scroll);
@@ -2999,6 +3002,104 @@ fn draw_cue_preview(f: &mut Frame, state: &CuePreviewState) {
             Span::styled(format!("    {}", pos), theme::muted()),
         ])
     };
+    f.render_widget(Paragraph::new(footer), chunks[3]);
+}
+
+fn draw_mb_select(f: &mut Frame, state: &MbSelectState) {
+    let area = f.size();
+    let w = (area.width * 80 / 100).max(60).min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100).max(12).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::PURPLE))
+        .title(Span::styled(
+            format!(" MusicBrainz · {} matches ", state.releases.len()),
+            Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 || state.releases.is_empty() {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // header
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // footer
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "  #  Title · Year · Catalog · Score",
+            Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD),
+        )),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(chunks[1].width as usize),
+            theme::muted(),
+        )),
+        chunks[1],
+    );
+
+    let visible_height = chunks[2].height as usize;
+    let max_scroll = state.releases.len().saturating_sub(visible_height);
+    // Auto-scroll to keep cursor visible.
+    let scroll = state.scroll
+        .min(max_scroll)
+        .min(state.selected)
+        .max(state.selected.saturating_sub(visible_height.saturating_sub(1)));
+
+    let lines: Vec<Line> = state.releases
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_height)
+        .map(|(i, r)| {
+            let is_cursor = i == state.selected;
+            let prefix = if is_cursor { "▸ " } else { "  " };
+            let n = format!("{:>2}", i + 1);
+            let title = if r.title.is_empty() { "(untitled)" } else { &r.title };
+            let year = r.year.as_deref().unwrap_or("—");
+            let cat = r.catalog.as_deref()
+                .or(r.barcode.as_deref())
+                .unwrap_or("—");
+            let body = format!(
+                "{}{}  {}  ·  {}  ·  {}",
+                prefix, n, title, year, cat,
+            );
+            let style = if is_cursor {
+                Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+            Line::from(Span::styled(body, style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), chunks[2]);
+
+    let footer = Line::from(vec![
+        Span::styled(" :ok ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled("accept  ", theme::muted()),
+        Span::styled(":N ", Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled("pick Nth  ", theme::muted()),
+        Span::styled(":q ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled("cancel  ", theme::muted()),
+        Span::styled("↑↓ PgUp/PgDn ", Style::default().fg(theme::TEXT_BRIGHT)),
+        Span::styled("scroll", theme::muted()),
+    ]);
     f.render_widget(Paragraph::new(footer), chunks[3]);
 }
 

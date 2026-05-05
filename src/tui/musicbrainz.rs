@@ -61,14 +61,24 @@ const USER_AGENT: &str = concat!(
     " (https://github.com/barstoolbluz/tonepoet)"
 );
 
-/// Result of a TOC lookup: the parsed release (if matched) and the raw
-/// JSON body the caller should write to the cache. `cache_response` is
-/// `None` when the lookup was satisfied from a passed-in cached body so
-/// the caller can skip a redundant store.
+/// Result of a TOC lookup: all matching releases sorted by descending
+/// score, plus the raw JSON body the caller should write to the cache.
+/// `cache_response` is `None` when the lookup was satisfied from a
+/// passed-in cached body so the caller can skip a redundant store.
 #[derive(Debug)]
 pub struct MbLookupOutcome {
-    pub release: Option<MbRelease>,
+    /// All matching releases, highest-scoring first. Empty when MB
+    /// returned no match (HTTP 404 or `releases: []`).
+    pub releases: Vec<MbRelease>,
     pub cache_response: Option<String>,
+}
+
+impl MbLookupOutcome {
+    /// First (highest-scoring) match, if any. Convenience for callers
+    /// like `:cue-mb` and `:cue-fill` which don't surface a picker.
+    pub fn release(&self) -> Option<&MbRelease> {
+        self.releases.first()
+    }
 }
 
 /// Look up the best-matching MusicBrainz release for a disc TOC.
@@ -78,7 +88,7 @@ pub struct MbLookupOutcome {
 /// storage (write `outcome.cache_response` back if `Some`). On cache hit
 /// the function does no HTTP.
 ///
-/// `Ok(MbLookupOutcome { release: None, .. })` means "no release matched
+/// `Ok(MbLookupOutcome { releases: [], .. })` means "no release matched
 /// this TOC"; `Err(_)` is a transport/parse failure the caller should
 /// surface.
 pub async fn lookup_release_by_toc(
@@ -91,7 +101,7 @@ pub async fn lookup_release_by_toc(
 
     if let Some(json) = cached_response {
         return Ok(MbLookupOutcome {
-            release: parse_mb_response(&json, n_tracks)?,
+            releases: parse_mb_response_all(&json, n_tracks)?,
             cache_response: None,
         });
     }
@@ -116,7 +126,7 @@ pub async fn lookup_release_by_toc(
 
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(MbLookupOutcome {
-            release: None,
+            releases: Vec::new(),
             cache_response: Some(body),
         });
     }
@@ -124,41 +134,57 @@ pub async fn lookup_release_by_toc(
         return Err(format!("MusicBrainz returned HTTP {}", status));
     }
 
-    let release = parse_mb_response(&body, n_tracks)?;
+    let releases = parse_mb_response_all(&body, n_tracks)?;
     Ok(MbLookupOutcome {
-        release,
+        releases,
         cache_response: Some(body),
     })
 }
 
-/// Parse a MusicBrainz JSON response and select the best release.
-/// Returns `Ok(None)` when no releases match; `Err(_)` on JSON parse
-/// failure or unexpected schema.
+/// Parse a MusicBrainz JSON response into all matching releases sorted
+/// by descending score. Empty `Vec` when no releases match. `Err(_)` on
+/// JSON parse failure or unexpected schema.
 ///
-/// `n_tracks` is the track count implied by the queried TOC; it disambiguates
-/// the correct medium for multi-disc releases.
-pub fn parse_mb_response(body: &str, n_tracks: usize) -> Result<Option<MbRelease>, String> {
+/// `n_tracks` is the track count implied by the queried TOC; it
+/// disambiguates the correct medium for multi-disc releases.
+pub fn parse_mb_response_all(
+    body: &str,
+    n_tracks: usize,
+) -> Result<Vec<MbRelease>, String> {
     use serde_json::Value;
     let v: Value = serde_json::from_str(body)
         .map_err(|e| format!("MusicBrainz JSON parse error: {}", e))?;
 
     // 404 body shape: {"error": "..."} → treat as miss.
     if v.get("error").is_some() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let releases = match v.get("releases").and_then(|r| r.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return Ok(None),
+        _ => return Ok(Vec::new()),
     };
 
-    // MB does not always include `score`; fall back to the first release.
-    let pick = releases
+    // Stable sort by descending score (default 0 when absent).
+    let mut indexed: Vec<(i64, &Value)> = releases
         .iter()
-        .max_by_key(|r| r.get("score").and_then(|s| s.as_i64()).unwrap_or(0))
-        .unwrap_or(&releases[0]);
+        .map(|r| (r.get("score").and_then(|s| s.as_i64()).unwrap_or(0), r))
+        .collect();
+    indexed.sort_by(|a, b| b.0.cmp(&a.0));
 
-    Ok(Some(release_from_json(pick, n_tracks)))
+    Ok(indexed
+        .into_iter()
+        .map(|(_, r)| release_from_json(r, n_tracks))
+        .collect())
+}
+
+/// Convenience wrapper that returns the highest-scoring release (or
+/// `None`). Used by `:cue-mb` and `:cue-fill` which auto-pick.
+pub fn parse_mb_response(
+    body: &str,
+    n_tracks: usize,
+) -> Result<Option<MbRelease>, String> {
+    Ok(parse_mb_response_all(body, n_tracks)?.into_iter().next())
 }
 
 fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
@@ -232,6 +258,128 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         .map(|s| s.to_string());
 
     Some(MbTrack { position, title, artist, isrc })
+}
+
+/// Build a review-state from a MusicBrainz release. The same shape as
+/// gnudb's so the existing GnudbReview overlay (render + key handling)
+/// can show MB results too. The source release is held in
+/// `mb_release` so the accept step can populate MB-only fields (ISRC,
+/// catalog) that the review UI doesn't expose.
+pub fn build_review_state_from_mb(
+    release: MbRelease,
+    paths: Vec<std::path::PathBuf>,
+) -> crate::tui::app::GnudbReviewState {
+    use crate::tui::app::{GnudbReviewPage, GnudbReviewState, GnudbReviewTrack, GnudbRowKind};
+
+    let mut tracks = Vec::with_capacity(release.tracks.len());
+    for (i, mt) in release.tracks.iter().enumerate() {
+        tracks.push(GnudbReviewTrack {
+            title: mt.title.clone(),
+            artist: if mt.artist.is_empty() { release.artist.clone() } else { mt.artist.clone() },
+            track_number: mt.position,
+            file_index: i,
+        });
+    }
+
+    let mut rows: Vec<GnudbRowKind> = Vec::new();
+    rows.push(GnudbRowKind::AlbumField("Album"));
+    rows.push(GnudbRowKind::AlbumField("Year"));
+    rows.push(GnudbRowKind::AlbumField("Genre"));
+    for (idx, _) in tracks.iter().enumerate() {
+        rows.push(GnudbRowKind::TrackHeader { track_idx: idx });
+        rows.push(GnudbRowKind::TrackField { track_idx: idx, field: "Title" });
+        rows.push(GnudbRowKind::TrackField { track_idx: idx, field: "Artist" });
+    }
+
+    let pages = vec![GnudbReviewPage {
+        label: String::new(),
+        album: release.title.clone(),
+        year: release.year.clone().unwrap_or_default(),
+        genre: String::new(), // MB doesn't reliably surface genre.
+        tracks,
+        rows,
+    }];
+
+    GnudbReviewState {
+        pages,
+        active_page: 0,
+        cursor: 0,
+        scroll: 0,
+        edit_input: None,
+        last_click: None,
+        origin_matches: None,
+        paths,
+        mb_release: Some(Box::new(release)),
+    }
+}
+
+/// Populate a metadata editor state with ISRC and CATALOGNUMBER from a
+/// MusicBrainz release. Used after `populate_editor_from_review` to
+/// supplement reviewed Title/Artist/etc. with the MB-only fields the
+/// review UI doesn't surface.
+pub fn populate_editor_isrc_catalog_from_mb(
+    state: &mut crate::tui::app::MetadataEditorState,
+    release: &MbRelease,
+) {
+    use lofty::tag::ItemKey;
+
+    let n = state.paths.len();
+
+    fn find_or_create(
+        entries: &mut Vec<crate::tui::probe::TagEntry>,
+        key: &str,
+        item_key: ItemKey,
+        n: usize,
+    ) -> usize {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+            return i;
+        }
+        entries.push(crate::tui::probe::TagEntry {
+            display_key: key.to_string(),
+            item_key,
+            value: String::new(),
+            original: String::new(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vec![String::new(); n],
+            per_file_originals: vec![String::new(); n],
+        });
+        entries.len() - 1
+    }
+
+    let isrc_idx = find_or_create(&mut state.entries, "ISRC", ItemKey::Isrc, n);
+    let catalog_idx = find_or_create(
+        &mut state.entries, "CATALOGNUMBER", ItemKey::CatalogNumber, n,
+    );
+
+    let catalog_value = release.catalog.as_deref()
+        .or(release.barcode.as_deref())
+        .unwrap_or("")
+        .to_string();
+
+    for i in 0..n {
+        if let Some(mt) = release.tracks.iter().find(|m| m.position as usize == i + 1) {
+            if let Some(isrc) = mt.isrc.as_deref().filter(|s| !s.is_empty()) {
+                state.entries[isrc_idx].per_file_values[i] = isrc.to_string();
+            }
+        }
+        if !catalog_value.is_empty() {
+            state.entries[catalog_idx].per_file_values[i] = catalog_value.clone();
+        }
+    }
+
+    for idx in [isrc_idx, catalog_idx] {
+        let entry = &mut state.entries[idx];
+        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+        entry.is_mixed = !all_same && n > 1;
+        entry.value = if entry.is_mixed {
+            "<multiple values>".to_string()
+        } else {
+            entry.per_file_values.first().cloned().unwrap_or_default()
+        };
+    }
+
+    state.dirty = true;
 }
 
 /// Populate a metadata editor state with values from a MusicBrainz release.
@@ -403,6 +551,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_mb_response_all_sorted_by_score_desc() {
+        let body = r#"{
+            "releases": [
+                { "id": "low", "score": 50, "title": "Low", "media": [] },
+                { "id": "high", "score": 100, "title": "High", "media": [] },
+                { "id": "mid", "score": 75, "title": "Mid", "media": [] }
+            ]
+        }"#;
+        let releases = parse_mb_response_all(body, 0).unwrap();
+        assert_eq!(releases.len(), 3);
+        assert_eq!(releases[0].release_id, "high");
+        assert_eq!(releases[1].release_id, "mid");
+        assert_eq!(releases[2].release_id, "low");
+    }
+
+    #[test]
+    fn parse_mb_response_all_returns_empty_on_no_match() {
+        assert!(parse_mb_response_all(r#"{"releases":[]}"#, 0).unwrap().is_empty());
+        assert!(parse_mb_response_all(r#"{"error":"not found"}"#, 0).unwrap().is_empty());
+    }
+
+    #[test]
     fn parse_mb_response_picks_medium_matching_track_count() {
         // Multi-disc release: 2 media (10 tracks, 9 tracks). Querying with
         // n_tracks=9 must select the second medium.
@@ -465,6 +635,80 @@ mod tests {
         assert!(db.get_cached_mb_response(toc).is_none());
         db.store_mb_response(toc, body).unwrap();
         assert_eq!(db.get_cached_mb_response(toc).as_deref(), Some(body));
+    }
+
+    #[test]
+    fn build_review_state_from_mb_populates_pages_and_carries_release() {
+        let release = MbRelease {
+            release_id: "rid".into(),
+            title: "Album".into(),
+            artist: "Artist".into(),
+            year: Some("1971".into()),
+            catalog: Some("CAT-001".into()),
+            barcode: Some("0044007735428".into()),
+            tracks: vec![
+                MbTrack { position: 1, title: "One".into(), artist: "Artist".into(), isrc: Some("USRC1".into()) },
+                MbTrack { position: 2, title: "Two".into(), artist: String::new(), isrc: None },
+            ],
+        };
+        let paths = vec![
+            std::path::PathBuf::from("/x/01.flac"),
+            std::path::PathBuf::from("/x/02.flac"),
+        ];
+        let review = build_review_state_from_mb(release.clone(), paths.clone());
+        assert_eq!(review.pages.len(), 1);
+        let page = &review.pages[0];
+        assert_eq!(page.album, "Album");
+        assert_eq!(page.year, "1971");
+        assert_eq!(page.tracks.len(), 2);
+        assert_eq!(page.tracks[0].title, "One");
+        // Empty track artist falls back to release artist.
+        assert_eq!(page.tracks[1].artist, "Artist");
+        assert_eq!(review.paths, paths);
+        assert!(review.mb_release.is_some());
+        assert_eq!(review.mb_release.as_ref().unwrap().release_id, "rid");
+    }
+
+    #[test]
+    fn populate_editor_isrc_catalog_only_writes_those_fields() {
+        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+
+        let mut state = MetadataEditorState {
+            paths: vec![
+                std::path::PathBuf::from("/tmp/01.flac"),
+                std::path::PathBuf::from("/tmp/02.flac"),
+            ],
+            entries: Vec::new(),
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false, deleted: Vec::new(),
+            file_labels: vec!["01".into(), "02".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+        };
+        let release = MbRelease {
+            release_id: "x".into(), title: "Album".into(), artist: "A".into(),
+            year: Some("1971".into()),
+            catalog: Some("CAT-001".into()),
+            barcode: Some("BAR".into()),
+            tracks: vec![
+                MbTrack { position: 1, title: "T1".into(), artist: "A".into(), isrc: Some("USRC1".into()) },
+                MbTrack { position: 2, title: "T2".into(), artist: "A".into(), isrc: None },
+            ],
+        };
+        populate_editor_isrc_catalog_from_mb(&mut state, &release);
+
+        let lookup = |key: &str| -> Vec<String> {
+            state.entries.iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case(key))
+                .map(|e| e.per_file_values.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(lookup("ISRC"), vec!["USRC1", ""]);
+        assert_eq!(lookup("CATALOGNUMBER"), vec!["CAT-001", "CAT-001"]);
+        // Helper does NOT write Title/Album/Artist/etc.
+        assert!(state.entries.iter().find(|e| e.display_key == "TITLE").is_none());
+        assert!(state.entries.iter().find(|e| e.display_key == "ALBUM").is_none());
     }
 
     #[test]

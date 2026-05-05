@@ -849,6 +849,10 @@ pub enum ActiveOverlay {
         /// Audio file paths for populating the metadata editor after selection.
         paths: Vec<std::path::PathBuf>,
     },
+    /// MusicBrainz release selection overlay (when MB returns >1 match).
+    /// User picks one; on accept the chosen release flows into the
+    /// metadata editor.
+    MbSelect(Box<MbSelectState>),
     /// GNUDB review overlay — editable preview of GNUDB tags before
     /// accepting into the metadata editor.
     GnudbReview(Box<GnudbReviewState>),
@@ -919,6 +923,11 @@ pub struct GnudbReviewState {
     pub paths: Vec<std::path::PathBuf>,
     /// Original match list for "back" navigation (None for single-match queries).
     pub origin_matches: Option<Vec<crate::tui::gnudb::GnudbMatch>>,
+    /// When this review was built from a MusicBrainz release rather than
+    /// a GNUDB entry, the source release is held here so the accept
+    /// step can additionally populate MB-only fields (ISRC, catalog)
+    /// that the review UI doesn't surface.
+    pub mb_release: Option<Box<crate::tui::musicbrainz::MbRelease>>,
 }
 
 /// A single page (disc) in the GNUDB review overlay.
@@ -1026,6 +1035,32 @@ pub struct MetadataEditorState {
     pub detail_scroll: usize,
     /// Inline edit within the detail overlay.
     pub detail_edit: Option<crate::tui::text_input::TextInputState>,
+}
+
+/// State for the MusicBrainz release-selection overlay shown when MB
+/// returns >1 candidate release for a disc TOC. Lists releases sorted
+/// by descending score; user picks one to advance to the metadata
+/// editor.
+#[derive(Debug, Clone)]
+pub struct MbSelectState {
+    /// Candidate releases (highest-scoring first).
+    pub releases: Vec<crate::tui::musicbrainz::MbRelease>,
+    /// Cursor position (0-based index into `releases`).
+    pub selected: usize,
+    /// Top row of the visible window (vim-smooth scroll).
+    pub scroll: usize,
+    /// Audio file paths the lookup was computed for (used to populate
+    /// the metadata editor after the user accepts).
+    pub paths: Vec<std::path::PathBuf>,
+}
+
+impl MbSelectState {
+    pub fn new(
+        releases: Vec<crate::tui::musicbrainz::MbRelease>,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Self {
+        Self { releases, selected: 0, scroll: 0, paths }
+    }
 }
 
 /// State for the CUE preview overlay opened by `:cue-mb` / `:cue-mb!` /
@@ -1476,6 +1511,11 @@ pub struct AppState {
     /// the CUE) and `:q` (cancels), or restored unchanged if neither.
     pub pending_cue_preview: Option<Box<CuePreviewState>>,
 
+    /// Parked MbSelectState while command mode is open. Set when `:`
+    /// is pressed in the MB select overlay; consumed by `:ok` /
+    /// `:N` / `:q` or restored otherwise.
+    pub pending_mb_select: Option<Box<MbSelectState>>,
+
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
     pub processing_active: bool,
@@ -1615,6 +1655,7 @@ impl AppState {
             pending_bulk_rename: None,
             pending_metadata_editor: None,
             pending_cue_preview: None,
+            pending_mb_select: None,
             status_message: None,
             processing_active: false,
             should_quit: false,
@@ -1957,5 +1998,37 @@ mod cue_preview_state_tests {
         s.cancel_edit();
         assert_eq!(s.content, "alpha\nbeta\n");
         assert!(!s.is_editing());
+    }
+}
+
+#[cfg(test)]
+mod mb_select_state_tests {
+    use super::*;
+    use crate::tui::musicbrainz::MbRelease;
+
+    fn rel(id: &str) -> MbRelease {
+        MbRelease {
+            release_id: id.into(), title: id.into(),
+            artist: String::new(), year: None, catalog: None,
+            barcode: None, tracks: vec![],
+        }
+    }
+
+    #[test]
+    fn new_starts_at_first_release_no_scroll() {
+        let s = MbSelectState::new(
+            vec![rel("a"), rel("b"), rel("c")],
+            vec![std::path::PathBuf::from("/x.flac")],
+        );
+        assert_eq!(s.selected, 0);
+        assert_eq!(s.scroll, 0);
+        assert_eq!(s.releases.len(), 3);
+    }
+
+    #[test]
+    fn new_with_empty_releases_handles_gracefully() {
+        let s = MbSelectState::new(vec![], vec![]);
+        assert_eq!(s.releases.len(), 0);
+        assert_eq!(s.selected, 0);
     }
 }
