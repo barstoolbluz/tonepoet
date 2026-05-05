@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::convert::ConversionStatus;
-use super::app::{ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, SourceMode};
+use super::app::{ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState, SourceMode};
 use super::button_map::TuiButton;
 use super::theme;
 
@@ -110,6 +110,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         }
         ActiveOverlay::MetadataEditor(ref state) => {
             draw_metadata_editor(f, state);
+        }
+        ActiveOverlay::CuePreview(ref state) => {
+            draw_cue_preview(f, state);
         }
         ActiveOverlay::Verify { scroll } => {
             draw_verify(f, &app.verify_results, scroll);
@@ -2864,3 +2867,96 @@ fn draw_ctdb_verify(
         chunks_v[1],
     );
 }
+
+fn draw_cue_preview(f: &mut Frame, state: &CuePreviewState) {
+    let area = f.size();
+    let w = (area.width * 80 / 100).max(60).min(area.width.saturating_sub(2));
+    let h = (area.height * 80 / 100).max(15).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup);
+
+    let title_name = state.write_path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| state.write_path.display().to_string());
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::AMBER))
+        .title(Span::styled(
+            format!(" CUE preview · {} ", title_name),
+            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let summary = if state.summary.is_empty() {
+        "review the proposed CUE; press s to write, q to cancel"
+    } else {
+        state.summary.as_str()
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(summary, Style::default().fg(theme::TEXT_BRIGHT))),
+        chunks[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(chunks[1].width as usize),
+            theme::muted(),
+        )),
+        chunks[1],
+    );
+
+    let total_lines = state.line_count();
+    let visible_height = chunks[2].height as usize;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = state.scroll.min(max_scroll);
+
+    let lines: Vec<Line> = state.content
+        .lines()
+        .skip(scroll)
+        .take(visible_height)
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme::TEXT))))
+        .collect();
+    f.render_widget(Paragraph::new(lines), chunks[2]);
+
+    let pos = if total_lines == 0 {
+        "0/0".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            (scroll + visible_height).min(total_lines),
+            total_lines,
+        )
+    };
+    let footer = Line::from(vec![
+        Span::styled(" :w ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled("save  ", theme::muted()),
+        Span::styled(":q ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled("cancel  ", theme::muted()),
+        Span::styled(":g/:G ", Style::default().fg(theme::TEXT_BRIGHT)),
+        Span::styled("top/bottom  ", theme::muted()),
+        Span::styled("↑↓ PgUp/PgDn ", Style::default().fg(theme::TEXT_BRIGHT)),
+        Span::styled("scroll", theme::muted()),
+        Span::styled(format!("    {}", pos), theme::muted()),
+    ]);
+    f.render_widget(Paragraph::new(footer), chunks[3]);
+}
+

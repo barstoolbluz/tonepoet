@@ -1341,6 +1341,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             app.active_overlay = ActiveOverlay::MetadataEditor(parked);
                         }
                     }
+                    // Same for parked CUE preview.
+                    if let Some(parked) = app.pending_cue_preview.take() {
+                        if matches!(app.active_overlay, ActiveOverlay::None) {
+                            app.active_overlay = ActiveOverlay::CuePreview(parked);
+                        }
+                    }
                     return;
                 }
                 KeyCode::Esc => {
@@ -1348,6 +1354,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     // Restore parked metadata editor on cancel.
                     if let Some(parked) = app.pending_metadata_editor.take() {
                         app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                    }
+                    if let Some(parked) = app.pending_cue_preview.take() {
+                        app.active_overlay = ActiveOverlay::CuePreview(parked);
                     }
                     return;
                 }
@@ -1745,6 +1754,46 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.active_overlay = ActiveOverlay::Verify { scroll };
                 }
                 _ => {}
+            }
+        }
+        ActiveOverlay::CuePreview(mut state) => {
+            // Actions (save, cancel, jump-top, jump-bottom) all live behind
+            // colon commands (`:w`, `:q`, `:g`, `:G`); pressing `:` parks
+            // the overlay and opens CommandInput, mirroring the
+            // MetadataEditor parking pattern. Navigation primitives
+            // (arrows, PageUp/PageDown, Esc) work directly.
+            let max_line = state.content.lines().count().saturating_sub(1);
+            match key.code {
+                KeyCode::Char(':') => {
+                    app.pending_cue_preview = Some(state);
+                    app.active_overlay = ActiveOverlay::CommandInput {
+                        input: super::text_input::TextInputState::empty(),
+                        completion: None,
+                    };
+                }
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("CUE preview cancelled".to_string());
+                }
+                KeyCode::Up => {
+                    state.scroll = state.scroll.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::CuePreview(state);
+                }
+                KeyCode::Down => {
+                    state.scroll = state.scroll.saturating_add(1).min(max_line);
+                    app.active_overlay = ActiveOverlay::CuePreview(state);
+                }
+                KeyCode::PageUp => {
+                    state.scroll = state.scroll.saturating_sub(10);
+                    app.active_overlay = ActiveOverlay::CuePreview(state);
+                }
+                KeyCode::PageDown => {
+                    state.scroll = state.scroll.saturating_add(10).min(max_line);
+                    app.active_overlay = ActiveOverlay::CuePreview(state);
+                }
+                _ => {
+                    app.active_overlay = ActiveOverlay::CuePreview(state);
+                }
             }
         }
         ActiveOverlay::BitCompare { mut scroll } => {

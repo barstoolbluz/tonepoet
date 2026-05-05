@@ -47,6 +47,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "write-dr", "writedr",
     "write-rg-track", "write-rg-album",
     "import-cue", "cue", "cue!", "cue-mb", "cue-mb!", "cue-fill", "cue-enrich",
+    "g", "G", "top", "bot", "bottom",
     "fix-caps", "fixcaps",
     "search", "s", "rs", "rsearch",
     "context", "menu",
@@ -261,6 +262,10 @@ pub enum Command {
     /// disc-TOC lookup, write back. Preserves the existing CUE form
     /// (single-image vs multi-file) and user-typed values.
     CueFill,
+    /// Scroll the parked CUE preview overlay to the top.
+    CueScrollTop,
+    /// Scroll the parked CUE preview overlay to the bottom.
+    CueScrollBottom,
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -377,6 +382,8 @@ pub fn parse_command(input: &str) -> Command {
         "cue-mb" => Command::GenerateCueMb { single_image: false },
         "cue-mb!" => Command::GenerateCueMb { single_image: true },
         "cue-fill" | "cue-enrich" => Command::CueFill,
+        "g" | "top" => Command::CueScrollTop,
+        "G" | "bot" | "bottom" => Command::CueScrollBottom,
         "preemphasis" | "preemph" | "pe" => Command::DetectPreemphasis,
         "preemph-calibrate" | "pe-calibrate" => {
             let mut parts = args.splitn(2, char::is_whitespace);
@@ -443,9 +450,37 @@ pub fn execute_command(
 ) {
     match cmd {
         Command::Quit => {
+            // If a CUE preview is parked, :q just cancels the preview
+            // rather than quitting the app.
+            if app.pending_cue_preview.take().is_some() {
+                app.set_status("CUE preview cancelled".to_string());
+                return;
+            }
             app.should_quit = true;
         }
         Command::Write => {
+            // If a CUE preview is parked, :w writes the previewed CUE.
+            if let Some(state) = app.pending_cue_preview.take() {
+                let path = state.write_path.clone();
+                match std::fs::write(&path, &state.content) {
+                    Ok(()) => {
+                        let name = path.file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string());
+                        app.set_status(format!("CUE written: {}", name));
+                        if app.current_screen == AppScreen::Browse {
+                            app.browse.refresh();
+                            app.browse.probe_current_with_db(tx, Some(&app.db));
+                        }
+                    }
+                    Err(e) => {
+                        // Re-park so the user can retry.
+                        app.pending_cue_preview = Some(state);
+                        app.set_status(format!("CUE write failed: {}", e));
+                    }
+                }
+                return;
+            }
             if let Some(name) = &app.preset.active_preset.clone() {
                 let preset = super::presets::TuiPreset::from_pill_state(
                     name, &app.convert.format, &app.convert.output_options,
@@ -1421,6 +1456,19 @@ pub fn execute_command(
                     toc_string: toc_for_msg,
                 }).await;
             });
+        }
+        Command::CueScrollTop => {
+            if let Some(mut state) = app.pending_cue_preview.take() {
+                state.scroll = 0;
+                app.active_overlay = super::app::ActiveOverlay::CuePreview(state);
+            }
+        }
+        Command::CueScrollBottom => {
+            if let Some(mut state) = app.pending_cue_preview.take() {
+                let last = state.content.lines().count().saturating_sub(1);
+                state.scroll = last;
+                app.active_overlay = super::app::ActiveOverlay::CuePreview(state);
+            }
         }
         Command::MarkCompareRef => {
             if app.current_screen != AppScreen::Browse {

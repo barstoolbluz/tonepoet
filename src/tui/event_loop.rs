@@ -1215,28 +1215,22 @@ fn handle_cue_mb_complete(
     let cue_filename = super::cue_generate::cue_output_filename(&album);
     let cue_path = output_dir.join(&cue_filename);
 
-    match std::fs::write(&cue_path, &cue_content) {
-        Ok(()) => {
-            let mode = if single_image { "single image" } else { "multi-file" };
-            let pregaps = tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
-            let pregap_note = if pregaps > 0 {
-                format!(", {} pregap{}", pregaps, if pregaps == 1 { "" } else { "s" })
-            } else {
-                String::new()
-            };
-            app.set_status(format!(
-                "MusicBrainz CUE ({}, MB-enriched: \"{}\"{}) written: {}",
-                mode, album.title, pregap_note, cue_filename,
-            ));
-            if app.current_screen == AppScreen::Browse {
-                app.browse.refresh();
-                app.browse.probe_current_with_db(tx, Some(&app.db));
-            }
-        }
-        Err(e) => {
-            app.set_status(format!("MusicBrainz CUE write failed: {}", e));
-        }
-    }
+    let mode = if single_image { "single image" } else { "multi-file" };
+    let pregaps = tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
+    let pregap_note = if pregaps > 0 {
+        format!(", {} pregap{}", pregaps, if pregaps == 1 { "" } else { "s" })
+    } else {
+        String::new()
+    };
+    let summary = format!(
+        "MusicBrainz CUE ({}, MB-enriched: \"{}\"{})",
+        mode, album.title, pregap_note,
+    );
+    let _ = tx; // overlay handles save; nothing to dispatch here.
+    app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+        super::app::CuePreviewState::new(cue_content, cue_path, summary.clone()),
+    ));
+    app.set_status(summary);
 }
 
 /// Handle the result of a `:cue-fill` MusicBrainz lookup. Caches the response,
@@ -1294,11 +1288,6 @@ fn handle_cue_fill_complete(
         }
     };
 
-    if let Err(e) = std::fs::write(&cue_path, &cue_content) {
-        app.set_status(format!(":cue-fill: write failed: {}", e));
-        return;
-    }
-
     let mut parts = Vec::new();
     if stats.titles_filled > 0 {
         parts.push(format!("{} title{}", stats.titles_filled,
@@ -1314,15 +1303,11 @@ fn handle_cue_fill_complete(
     }
     if stats.year_filled { parts.push("date".to_string()); }
     if stats.catalog_filled { parts.push("catalog".to_string()); }
-    let summary = parts.join(", ");
-    let cue_filename = cue_path.file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    app.set_status(format!("Filled CUE: {} → {}", summary, cue_filename));
-
-    if app.current_screen == AppScreen::Browse {
-        app.browse.refresh();
-        app.browse.probe_current_with_db(tx, Some(&app.db));
-    }
+    let summary = format!("Will fill: {}", parts.join(", "));
+    let _ = tx;
+    app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+        super::app::CuePreviewState::new(cue_content, cue_path, summary.clone()),
+    ));
+    app.set_status(summary);
 }
 

@@ -818,6 +818,10 @@ pub enum ActiveOverlay {
     },
     /// Full metadata tag editor overlay.
     MetadataEditor(Box<MetadataEditorState>),
+    /// Read-only preview of a proposed CUE sheet (from `:cue-mb` /
+    /// `:cue-mb!` / `:cue-fill`). User reviews + presses `s` to commit
+    /// the write, `q`/`Esc` to cancel.
+    CuePreview(Box<CuePreviewState>),
     /// Verify results overlay showing pass/fail per file.
     Verify {
         scroll: usize,
@@ -1022,6 +1026,33 @@ pub struct MetadataEditorState {
     pub detail_scroll: usize,
     /// Inline edit within the detail overlay.
     pub detail_edit: Option<crate::tui::text_input::TextInputState>,
+}
+
+/// State for the CUE preview overlay opened by `:cue-mb` / `:cue-mb!` /
+/// `:cue-fill`. Read-only in Stage 2; Stage 3 will add line editing.
+#[derive(Debug, Clone)]
+pub struct CuePreviewState {
+    /// Rendered CUE content to be written on save.
+    pub content: String,
+    /// Destination path (existing CUE for `:cue-fill`, derived filename
+    /// for `:cue-mb`).
+    pub write_path: std::path::PathBuf,
+    /// One-line summary shown in the title bar
+    /// (e.g., `"Filled CUE: 7 ISRCs, 1 catalog"`).
+    pub summary: String,
+    /// Top row of the visible window for vim-smooth scroll.
+    pub scroll: usize,
+}
+
+impl CuePreviewState {
+    pub fn new(content: String, write_path: std::path::PathBuf, summary: String) -> Self {
+        Self { content, write_path, summary, scroll: 0 }
+    }
+
+    /// Number of content lines (cached for scroll bounds + display).
+    pub fn line_count(&self) -> usize {
+        self.content.lines().count()
+    }
 }
 
 /// Focus area within the bulk rename overlay.
@@ -1382,6 +1413,11 @@ pub struct AppState {
     /// restored after the command executes or review completes.
     pub pending_metadata_editor: Option<Box<MetadataEditorState>>,
 
+    /// Parked CuePreviewState while command mode is open. Set when `:`
+    /// is pressed in the CUE preview overlay; consumed by `:w` (writes
+    /// the CUE) and `:q` (cancels), or restored unchanged if neither.
+    pub pending_cue_preview: Option<Box<CuePreviewState>>,
+
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
     pub processing_active: bool,
@@ -1520,6 +1556,7 @@ impl AppState {
             active_overlay: ActiveOverlay::None,
             pending_bulk_rename: None,
             pending_metadata_editor: None,
+            pending_cue_preview: None,
             status_message: None,
             processing_active: false,
             should_quit: false,
@@ -1767,5 +1804,47 @@ impl AppState {
             )
         };
         self.set_status(status);
+    }
+}
+
+#[cfg(test)]
+mod cue_preview_state_tests {
+    use super::*;
+
+    #[test]
+    fn line_count_counts_lines_correctly() {
+        let s = CuePreviewState::new(
+            "FILE \"x.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_string(),
+            std::path::PathBuf::from("/tmp/test.cue"),
+            "summary".to_string(),
+        );
+        assert_eq!(s.line_count(), 3);
+    }
+
+    #[test]
+    fn line_count_handles_empty_and_no_trailing_newline() {
+        let empty = CuePreviewState::new(
+            String::new(),
+            std::path::PathBuf::from("/tmp/test.cue"),
+            String::new(),
+        );
+        assert_eq!(empty.line_count(), 0);
+
+        let no_trailing = CuePreviewState::new(
+            "one\ntwo".to_string(),
+            std::path::PathBuf::from("/tmp/test.cue"),
+            String::new(),
+        );
+        assert_eq!(no_trailing.line_count(), 2);
+    }
+
+    #[test]
+    fn new_starts_at_scroll_zero() {
+        let s = CuePreviewState::new(
+            "x".to_string(),
+            std::path::PathBuf::from("/tmp/test.cue"),
+            String::new(),
+        );
+        assert_eq!(s.scroll, 0);
     }
 }
