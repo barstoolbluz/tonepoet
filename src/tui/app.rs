@@ -1511,11 +1511,6 @@ pub struct AppState {
     /// the CUE) and `:q` (cancels), or restored unchanged if neither.
     pub pending_cue_preview: Option<Box<CuePreviewState>>,
 
-    /// Parked MbSelectState while command mode is open. Set when `:`
-    /// is pressed in the MB select overlay; consumed by `:ok` /
-    /// `:N` / `:q` or restored otherwise.
-    pub pending_mb_select: Option<Box<MbSelectState>>,
-
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
     pub processing_active: bool,
@@ -1655,7 +1650,6 @@ impl AppState {
             pending_bulk_rename: None,
             pending_metadata_editor: None,
             pending_cue_preview: None,
-            pending_mb_select: None,
             status_message: None,
             processing_active: false,
             should_quit: false,

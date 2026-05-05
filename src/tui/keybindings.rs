@@ -1347,12 +1347,6 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             app.active_overlay = ActiveOverlay::CuePreview(parked);
                         }
                     }
-                    // Same for parked MB select.
-                    if let Some(parked) = app.pending_mb_select.take() {
-                        if matches!(app.active_overlay, ActiveOverlay::None) {
-                            app.active_overlay = ActiveOverlay::MbSelect(parked);
-                        }
-                    }
                     return;
                 }
                 KeyCode::Esc => {
@@ -1363,9 +1357,6 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     }
                     if let Some(parked) = app.pending_cue_preview.take() {
                         app.active_overlay = ActiveOverlay::CuePreview(parked);
-                    }
-                    if let Some(parked) = app.pending_mb_select.take() {
-                        app.active_overlay = ActiveOverlay::MbSelect(parked);
                     }
                     return;
                 }
@@ -1775,22 +1766,22 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
         }
         ActiveOverlay::MbSelect(mut state) => {
-            // Actions (accept / pick by index / cancel) live behind colon
-            // commands; pressing `:` parks the picker into
-            // `pending_mb_select` and opens CommandInput. Arrows /
-            // PageUp / PageDown move the cursor; Esc cancels.
+            // Picker has only two actions: accept the cursor's release
+            // (Enter) or cancel (Esc). Both are navigation primitives,
+            // so no command-mode parking is needed.
             let n = state.releases.len();
             match key.code {
-                KeyCode::Char(':') => {
-                    app.pending_mb_select = Some(state);
-                    app.active_overlay = ActiveOverlay::CommandInput {
-                        input: super::text_input::TextInputState::empty(),
-                        completion: None,
-                    };
-                }
                 KeyCode::Esc => {
                     app.active_overlay = ActiveOverlay::None;
                     app.set_status("MusicBrainz picker cancelled".to_string());
+                }
+                KeyCode::Enter => {
+                    let idx = state.selected;
+                    if idx < state.releases.len() {
+                        let release = state.releases.swap_remove(idx);
+                        let paths = std::mem::take(&mut state.paths);
+                        super::event_loop::open_mb_review(app, release, paths);
+                    }
                 }
                 KeyCode::Up => {
                     state.selected = state.selected.saturating_sub(1);

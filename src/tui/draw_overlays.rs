@@ -3091,11 +3091,9 @@ fn draw_mb_select(f: &mut Frame, state: &MbSelectState) {
     f.render_widget(Paragraph::new(lines), chunks[2]);
 
     let footer = Line::from(vec![
-        Span::styled(" :ok ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
         Span::styled("accept  ", theme::muted()),
-        Span::styled(":N ", Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("pick Nth  ", theme::muted()),
-        Span::styled(":q ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled("Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
         Span::styled("cancel  ", theme::muted()),
         Span::styled("↑↓ PgUp/PgDn ", Style::default().fg(theme::TEXT_BRIGHT)),
         Span::styled("scroll", theme::muted()),
