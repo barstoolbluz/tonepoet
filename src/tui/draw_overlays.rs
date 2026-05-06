@@ -1784,13 +1784,14 @@ fn draw_metadata_detail(
         if let Some(entry) = entry_opt {
             if super::probe::entry_has_mb_proposed(entry) {
                 let pill_state = super::probe::mb_pill_state_field(entry);
-                let revert_label_opt = match pill_state {
-                    super::probe::MbRevertPill::Revert => Some(" [revert] "),
-                    super::probe::MbRevertPill::UseMb => Some(" [use MB] "),
-                    super::probe::MbRevertPill::None => None,
+                let (revert_label_opt, revert_bg) = match pill_state {
+                    super::probe::MbRevertPill::Revert => (Some("revert"), theme::AMBER),
+                    super::probe::MbRevertPill::UseMb => (Some("use MB"), theme::CYAN),
+                    super::probe::MbRevertPill::None => (None, theme::PURPLE),
                 };
-                let restore_label = " [restore] ";
-                pills.push(pill_gap());
+                // Wider gap to set the MB-action pills apart from the
+                // navigation pills (Enter/Esc).
+                pills.push(Span::raw("    "));
                 // Track offsets in chars from start of the footer line
                 // for click-rect registration.
                 let mut running: u16 = 0;
@@ -1798,28 +1799,18 @@ fn draw_metadata_detail(
                     running += span.content.chars().count() as u16;
                 }
                 if let Some(label) = revert_label_opt {
-                    let revert_style = match pill_state {
-                        super::probe::MbRevertPill::Revert => {
-                            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
-                        }
-                        super::probe::MbRevertPill::UseMb => {
-                            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)
-                        }
-                        super::probe::MbRevertPill::None => Style::default(),
-                    };
-                    revert_w_chars = label.chars().count() as u16;
+                    let span = footer_pill(label, revert_bg);
+                    revert_w_chars = span.content.chars().count() as u16;
                     revert_offset = Some(running);
-                    pills.push(Span::styled(label.to_string(), revert_style));
+                    pills.push(span);
                     running += revert_w_chars;
                     pills.push(pill_gap());
                     running += 1;
                 }
-                restore_w_chars = restore_label.chars().count() as u16;
+                let restore_span = footer_pill("restore", theme::PURPLE);
+                restore_w_chars = restore_span.content.chars().count() as u16;
                 restore_offset = Some(running);
-                pills.push(Span::styled(
-                    restore_label.to_string(),
-                    Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
-                ));
+                pills.push(restore_span);
             }
         }
         let footer_line = Line::from(pills);
