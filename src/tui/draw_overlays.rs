@@ -1784,10 +1784,10 @@ fn draw_metadata_detail(
         if let Some(entry) = entry_opt {
             if super::probe::entry_has_mb_proposed(entry) {
                 let pill_state = super::probe::mb_pill_state_field(entry);
-                let (revert_label_opt, revert_bg) = match pill_state {
-                    super::probe::MbRevertPill::Revert => (Some("revert"), theme::AMBER),
-                    super::probe::MbRevertPill::UseMb => (Some("use MB"), theme::CYAN),
-                    super::probe::MbRevertPill::None => (None, theme::PURPLE),
+                let revert_pill: Option<(&str, ratatui::style::Color)> = match pill_state {
+                    super::probe::MbRevertPill::Revert => Some(("revert", theme::AMBER)),
+                    super::probe::MbRevertPill::UseMb => Some(("use MB", theme::CYAN)),
+                    super::probe::MbRevertPill::None => None,
                 };
                 // Wider gap to set the MB-action pills apart from the
                 // navigation pills (Enter/Esc).
@@ -1798,8 +1798,8 @@ fn draw_metadata_detail(
                 for span in &pills {
                     running += span.content.chars().count() as u16;
                 }
-                if let Some(label) = revert_label_opt {
-                    let span = footer_pill(label, revert_bg);
+                if let Some((label, bg)) = revert_pill {
+                    let span = footer_pill(label, bg);
                     revert_w_chars = span.content.chars().count() as u16;
                     revert_offset = Some(running);
                     pills.push(span);
@@ -1807,7 +1807,7 @@ fn draw_metadata_detail(
                     pills.push(pill_gap());
                     running += 1;
                 }
-                let restore_span = footer_pill("restore", theme::PURPLE);
+                let restore_span = footer_pill("restore", theme::BLUE);
                 restore_w_chars = restore_span.content.chars().count() as u16;
                 restore_offset = Some(running);
                 pills.push(restore_span);
