@@ -1267,13 +1267,13 @@ fn handle_tags_from_mb_complete(
             app.set_status(":tags-mb: no MusicBrainz release matched this disc TOC".to_string());
         }
         1 => {
-            // Single match: skip the picker, go straight to review.
+            // Single match: skip the picker, go straight to editor.
             let release = outcome.releases.into_iter().next().expect("len == 1");
-            open_mb_review(app, release, paths);
+            open_editor_with_mb_release(app, &release, &paths);
         }
         n => {
             app.set_status(format!(
-                ":tags-mb: {} releases matched — pick one (:ok / :1..:9 / :q)",
+                ":tags-mb: {} releases matched — pick one (Enter / Esc / arrows)",
                 n,
             ));
             app.active_overlay = ActiveOverlay::MbSelect(Box::new(
@@ -1283,26 +1283,38 @@ fn handle_tags_from_mb_complete(
     }
 }
 
-/// Open the GnudbReview overlay on `release` (reused for MB review since
-/// the data shape lines up). The held `mb_release` carries ISRC and
-/// catalog forward to the editor populate step. Called both for single-
-/// match `:tags-mb` and after MbSelect accepts.
-pub(super) fn open_mb_review(
+/// Open the metadata editor on the supplied `paths`, populated with the
+/// chosen MusicBrainz release. Skips the GnudbReview "preview" step since
+/// the editor surfaces the same fields plus more (and now supports
+/// per-row revert via the proposed-value tracking on TagEntry).
+///
+/// Used by both single-match `:tags-mb` and the post-MbSelect commit path.
+pub(super) fn open_editor_with_mb_release(
     app: &mut AppState,
-    release: super::musicbrainz::MbRelease,
-    paths: Vec<std::path::PathBuf>,
+    release: &super::musicbrainz::MbRelease,
+    paths: &[std::path::PathBuf],
 ) {
-    let label = if release.title.is_empty() {
-        "(untitled)".to_string()
-    } else {
-        release.title.clone()
-    };
-    let review = super::musicbrainz::build_review_state_from_mb(release, paths);
-    app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
-    app.set_status(format!(
-        ":tags-mb: review \"{}\" — accept (a) to commit to editor",
-        label,
-    ));
+    super::keybindings::open_metadata_editor(app);
+    let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    match prior {
+        ActiveOverlay::MetadataEditor(mut state) => {
+            if state.paths != paths {
+                app.set_status(":tags-mb: selection changed since lookup; rerun".to_string());
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            super::musicbrainz::populate_editor_from_mb(&mut state, release);
+            let label = if release.title.is_empty() { "(untitled)" } else { &release.title };
+            app.set_status(format!(
+                ":tags-mb: applied \"{}\" — review then save",
+                label,
+            ));
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        other => {
+            app.active_overlay = other;
+        }
+    }
 }
 
 /// Handle the result of a `:cue-fill` MusicBrainz lookup. Caches the response,

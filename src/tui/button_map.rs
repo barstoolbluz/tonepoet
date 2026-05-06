@@ -79,6 +79,10 @@ pub enum TuiButton {
     OverlayConfirm,
     OverlayCancel,
 
+    /// MetadataEditor per-row revert/use-MB pill. Argument is the
+    /// 0-based index into `MetadataEditorState.entries`.
+    MetadataEntryRevert(usize),
+
     // Browse screen
     BrowseEntry(usize),
     BrowseColumn(ColumnKind),
@@ -105,7 +109,10 @@ impl TuiButton {
     pub fn screen(&self) -> Option<super::app::AppScreen> {
         use super::app::AppScreen;
         match self {
-            Self::Tab(_) | Self::OverlayConfirm | Self::OverlayCancel => None,
+            Self::Tab(_)
+            | Self::OverlayConfirm
+            | Self::OverlayCancel
+            | Self::MetadataEntryRevert(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)

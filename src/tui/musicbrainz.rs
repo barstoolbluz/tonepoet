@@ -341,59 +341,6 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
     })
 }
 
-/// Build a review-state from a MusicBrainz release. The same shape as
-/// gnudb's so the existing GnudbReview overlay (render + key handling)
-/// can show MB results too. The source release is held in
-/// `mb_release` so the accept step can populate MB-only fields (ISRC,
-/// catalog) that the review UI doesn't expose.
-pub fn build_review_state_from_mb(
-    release: MbRelease,
-    paths: Vec<std::path::PathBuf>,
-) -> crate::tui::app::GnudbReviewState {
-    use crate::tui::app::{GnudbReviewPage, GnudbReviewState, GnudbReviewTrack, GnudbRowKind};
-
-    let mut tracks = Vec::with_capacity(release.tracks.len());
-    for (i, mt) in release.tracks.iter().enumerate() {
-        tracks.push(GnudbReviewTrack {
-            title: mt.title.clone(),
-            artist: if mt.artist.is_empty() { release.artist.clone() } else { mt.artist.clone() },
-            track_number: mt.position,
-            file_index: i,
-        });
-    }
-
-    let mut rows: Vec<GnudbRowKind> = Vec::new();
-    rows.push(GnudbRowKind::AlbumField("Album"));
-    rows.push(GnudbRowKind::AlbumField("Year"));
-    rows.push(GnudbRowKind::AlbumField("Genre"));
-    for (idx, _) in tracks.iter().enumerate() {
-        rows.push(GnudbRowKind::TrackHeader { track_idx: idx });
-        rows.push(GnudbRowKind::TrackField { track_idx: idx, field: "Title" });
-        rows.push(GnudbRowKind::TrackField { track_idx: idx, field: "Artist" });
-    }
-
-    let pages = vec![GnudbReviewPage {
-        label: String::new(),
-        album: release.title.clone(),
-        year: release.year.clone().unwrap_or_default(),
-        genre: String::new(), // MB doesn't reliably surface genre.
-        tracks,
-        rows,
-    }];
-
-    GnudbReviewState {
-        pages,
-        active_page: 0,
-        cursor: 0,
-        scroll: 0,
-        edit_input: None,
-        last_click: None,
-        origin_matches: None,
-        paths,
-        mb_release: Some(Box::new(release)),
-    }
-}
-
 /// Populate a metadata editor state with the MB-only fields that the
 /// GnudbReview UI doesn't surface: ISRC, CATALOGNUMBER, MusicBrainz
 /// IDs, RELEASECOUNTRY, ORIGINALDATE.
@@ -427,84 +374,129 @@ pub fn populate_editor_mb_supplemental(
             is_mixed: false,
             per_file_values: vec![String::new(); n],
             per_file_originals: vec![String::new(); n],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
         });
         entries.len() - 1
     }
 
-    // Per-track entries.
-    let isrc_idx = find_or_create(&mut state.entries, "ISRC", ItemKey::Isrc, n);
-    let recording_idx = find_or_create(
-        &mut state.entries, "MUSICBRAINZ_TRACKID", ItemKey::MusicBrainzRecordingId, n,
-    );
-    let track_idx = find_or_create(
-        &mut state.entries, "MUSICBRAINZ_RELEASETRACKID", ItemKey::MusicBrainzTrackId, n,
-    );
-    let artist_idx = find_or_create(
-        &mut state.entries, "MUSICBRAINZ_ARTISTID", ItemKey::MusicBrainzArtistId, n,
-    );
+    // Per-track presence pre-pass: only create the entry when at least
+    // one track in the release has data for that field. Tracks with no
+    // data leave their per-file value as the empty string (matching the
+    // pre-existing "MB silent on this track" behavior).
+    let any_isrc = release.tracks.iter()
+        .any(|t| t.isrc.as_deref().is_some_and(|s| !s.is_empty()));
+    let any_recording = release.tracks.iter()
+        .any(|t| t.recording_id.as_deref().is_some_and(|s| !s.is_empty()));
+    let any_track = release.tracks.iter()
+        .any(|t| t.track_id.as_deref().is_some_and(|s| !s.is_empty()));
+    let any_track_artist = release.tracks.iter()
+        .any(|t| t.artist_id.as_deref().is_some_and(|s| !s.is_empty()));
 
-    // Album-level entries (replicated per file).
-    let catalog_idx = find_or_create(
-        &mut state.entries, "CATALOGNUMBER", ItemKey::CatalogNumber, n,
-    );
-    let album_id_idx = find_or_create(
-        &mut state.entries, "MUSICBRAINZ_ALBUMID", ItemKey::MusicBrainzReleaseId, n,
-    );
-    let album_artist_id_idx = find_or_create(
-        &mut state.entries, "MUSICBRAINZ_ALBUMARTISTID", ItemKey::MusicBrainzReleaseArtistId, n,
-    );
-    let release_group_idx = find_or_create(
-        &mut state.entries, "MUSICBRAINZ_RELEASEGROUPID", ItemKey::MusicBrainzReleaseGroupId, n,
-    );
-    let original_date_idx = find_or_create(
-        &mut state.entries, "ORIGINALDATE", ItemKey::OriginalReleaseDate, n,
-    );
-    let country_idx = find_or_create(
-        &mut state.entries,
-        "RELEASECOUNTRY",
-        ItemKey::Unknown("RELEASECOUNTRY".to_string()),
-        n,
-    );
+    let isrc_idx = if any_isrc {
+        Some(find_or_create(&mut state.entries, "ISRC", ItemKey::Isrc, n))
+    } else { None };
+    let recording_idx = if any_recording {
+        Some(find_or_create(
+            &mut state.entries, "MUSICBRAINZ_TRACKID", ItemKey::MusicBrainzRecordingId, n,
+        ))
+    } else { None };
+    let track_idx = if any_track {
+        Some(find_or_create(
+            &mut state.entries, "MUSICBRAINZ_RELEASETRACKID", ItemKey::MusicBrainzTrackId, n,
+        ))
+    } else { None };
+    let artist_idx = if any_track_artist {
+        Some(find_or_create(
+            &mut state.entries, "MUSICBRAINZ_ARTISTID", ItemKey::MusicBrainzArtistId, n,
+        ))
+    } else { None };
 
+    // Album-level — gate each entry on MB actually having a value.
     let catalog_value = release.catalog.as_deref()
         .or(release.barcode.as_deref())
-        .unwrap_or("")
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let catalog_idx = if catalog_value.is_some() {
+        Some(find_or_create(&mut state.entries, "CATALOGNUMBER", ItemKey::CatalogNumber, n))
+    } else { None };
+    let album_id_idx = if !release.release_id.is_empty() {
+        Some(find_or_create(
+            &mut state.entries, "MUSICBRAINZ_ALBUMID", ItemKey::MusicBrainzReleaseId, n,
+        ))
+    } else { None };
+    let album_artist_id_idx = if release.artist_id.as_deref().is_some_and(|s| !s.is_empty()) {
+        Some(find_or_create(
+            &mut state.entries, "MUSICBRAINZ_ALBUMARTISTID", ItemKey::MusicBrainzReleaseArtistId, n,
+        ))
+    } else { None };
+    let release_group_idx = if release.release_group_id.as_deref().is_some_and(|s| !s.is_empty()) {
+        Some(find_or_create(
+            &mut state.entries, "MUSICBRAINZ_RELEASEGROUPID", ItemKey::MusicBrainzReleaseGroupId, n,
+        ))
+    } else { None };
+    let original_date_idx = if release.original_date.as_deref().is_some_and(|s| !s.is_empty()) {
+        Some(find_or_create(
+            &mut state.entries, "ORIGINALDATE", ItemKey::OriginalReleaseDate, n,
+        ))
+    } else { None };
+    let country_idx = if release.country.as_deref().is_some_and(|s| !s.is_empty()) {
+        Some(find_or_create(
+            &mut state.entries,
+            "RELEASECOUNTRY",
+            ItemKey::Unknown("RELEASECOUNTRY".to_string()),
+            n,
+        ))
+    } else { None };
 
     for i in 0..n {
-        // Per-track from the matching MbTrack.
         if let Some(mt) = release.tracks.iter().find(|m| m.position as usize == i + 1) {
-            if let Some(s) = mt.isrc.as_deref().filter(|s| !s.is_empty()) {
-                state.entries[isrc_idx].per_file_values[i] = s.to_string();
+            if let (Some(idx), Some(s)) = (
+                isrc_idx, mt.isrc.as_deref().filter(|s| !s.is_empty()),
+            ) {
+                state.entries[idx].per_file_values[i] = s.to_string();
             }
-            if let Some(s) = mt.recording_id.as_deref().filter(|s| !s.is_empty()) {
-                state.entries[recording_idx].per_file_values[i] = s.to_string();
+            if let (Some(idx), Some(s)) = (
+                recording_idx, mt.recording_id.as_deref().filter(|s| !s.is_empty()),
+            ) {
+                state.entries[idx].per_file_values[i] = s.to_string();
             }
-            if let Some(s) = mt.track_id.as_deref().filter(|s| !s.is_empty()) {
-                state.entries[track_idx].per_file_values[i] = s.to_string();
+            if let (Some(idx), Some(s)) = (
+                track_idx, mt.track_id.as_deref().filter(|s| !s.is_empty()),
+            ) {
+                state.entries[idx].per_file_values[i] = s.to_string();
             }
-            if let Some(s) = mt.artist_id.as_deref().filter(|s| !s.is_empty()) {
-                state.entries[artist_idx].per_file_values[i] = s.to_string();
+            if let (Some(idx), Some(s)) = (
+                artist_idx, mt.artist_id.as_deref().filter(|s| !s.is_empty()),
+            ) {
+                state.entries[idx].per_file_values[i] = s.to_string();
             }
         }
-        // Album-level — replicate across all files.
-        if !catalog_value.is_empty() {
-            state.entries[catalog_idx].per_file_values[i] = catalog_value.clone();
+        if let (Some(idx), Some(s)) = (catalog_idx, catalog_value.as_deref()) {
+            state.entries[idx].per_file_values[i] = s.to_string();
         }
-        if !release.release_id.is_empty() {
-            state.entries[album_id_idx].per_file_values[i] = release.release_id.clone();
+        if let Some(idx) = album_id_idx {
+            state.entries[idx].per_file_values[i] = release.release_id.clone();
         }
-        if let Some(s) = release.release_group_id.as_deref().filter(|s| !s.is_empty()) {
-            state.entries[release_group_idx].per_file_values[i] = s.to_string();
+        if let (Some(idx), Some(s)) = (
+            album_artist_id_idx, release.artist_id.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            state.entries[idx].per_file_values[i] = s.to_string();
         }
-        if let Some(s) = release.artist_id.as_deref().filter(|s| !s.is_empty()) {
-            state.entries[album_artist_id_idx].per_file_values[i] = s.to_string();
+        if let (Some(idx), Some(s)) = (
+            release_group_idx, release.release_group_id.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            state.entries[idx].per_file_values[i] = s.to_string();
         }
-        if let Some(s) = release.original_date.as_deref().filter(|s| !s.is_empty()) {
-            state.entries[original_date_idx].per_file_values[i] = s.to_string();
+        if let (Some(idx), Some(s)) = (
+            original_date_idx, release.original_date.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            state.entries[idx].per_file_values[i] = s.to_string();
         }
-        if let Some(s) = release.country.as_deref().filter(|s| !s.is_empty()) {
-            state.entries[country_idx].per_file_values[i] = s.to_string();
+        if let (Some(idx), Some(s)) = (
+            country_idx, release.country.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            state.entries[idx].per_file_values[i] = s.to_string();
         }
     }
 
@@ -512,18 +504,40 @@ pub fn populate_editor_mb_supplemental(
         isrc_idx, recording_idx, track_idx, artist_idx,
         catalog_idx, album_id_idx, album_artist_id_idx, release_group_idx,
         original_date_idx, country_idx,
-    ] {
-        let entry = &mut state.entries[idx];
-        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
-        entry.is_mixed = !all_same && n > 1;
-        entry.value = if entry.is_mixed {
-            "<multiple values>".to_string()
-        } else {
-            entry.per_file_values.first().cloned().unwrap_or_default()
-        };
+    ].iter().filter_map(|x| *x) {
+        recompute_and_stamp_mb_proposed(&mut state.entries[idx], n);
     }
 
+    crate::tui::probe::sort_entries_standard_first(&mut state.entries);
     state.dirty = true;
+}
+
+/// Recompute `value` / `is_mixed` for an entry after a populate touched
+/// its `per_file_values`, and stamp `mb_proposed_value` /
+/// `mb_proposed_per_file` so the editor can show a `[revert]` /
+/// `[use MB]` toggle pill.
+///
+/// Stamps only when the resulting value actually differs from the
+/// pre-populate `original` — fields where MB happened to match what the
+/// file already had don't need a toggle.
+fn recompute_and_stamp_mb_proposed(
+    entry: &mut crate::tui::probe::TagEntry,
+    n: usize,
+) {
+    let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+    entry.is_mixed = !all_same && n > 1;
+    entry.value = if entry.is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        entry.per_file_values.first().cloned().unwrap_or_default()
+    };
+
+    if entry.value != entry.original
+        || entry.per_file_values != entry.per_file_originals
+    {
+        entry.mb_proposed_value = Some(entry.value.clone());
+        entry.mb_proposed_per_file = Some(entry.per_file_values.clone());
+    }
 }
 
 /// Populate a metadata editor state with values from a MusicBrainz release.
@@ -567,46 +581,61 @@ pub fn populate_editor_from_mb(
             is_mixed: false,
             per_file_values: vec![String::new(); n],
             per_file_originals: vec![String::new(); n],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
         });
         entries.len() - 1
     }
 
-    let title_idx = find_or_create(&mut state.entries, "TITLE", ItemKey::TrackTitle, n);
-    let artist_idx = find_or_create(&mut state.entries, "ARTIST", ItemKey::TrackArtist, n);
-    let album_idx = find_or_create(&mut state.entries, "ALBUM", ItemKey::AlbumTitle, n);
+    // Per-track presence pre-pass: only create entries when at least
+    // one track in the release has data for that field.
+    let any_title = release.tracks.iter().any(|t| !t.title.is_empty());
+    let any_artist = release.tracks.iter().any(|t| !t.artist.is_empty());
+
+    let title_idx = if any_title {
+        Some(find_or_create(&mut state.entries, "TITLE", ItemKey::TrackTitle, n))
+    } else { None };
+    let artist_idx = if any_artist {
+        Some(find_or_create(&mut state.entries, "ARTIST", ItemKey::TrackArtist, n))
+    } else { None };
+    let album_idx = if !release.title.is_empty() {
+        Some(find_or_create(&mut state.entries, "ALBUM", ItemKey::AlbumTitle, n))
+    } else { None };
+    // TRACKNUMBER is always 1-based-by-file-position, computed locally —
+    // doesn't depend on MB content. Always create.
     let tn_idx = find_or_create(&mut state.entries, "TRACKNUMBER", ItemKey::TrackNumber, n);
-    let date_idx = find_or_create(&mut state.entries, "DATE", ItemKey::Year, n);
+    let date_idx = if release.year.as_deref().is_some_and(|s| !s.is_empty()) {
+        Some(find_or_create(&mut state.entries, "DATE", ItemKey::Year, n))
+    } else { None };
 
     for i in 0..n {
         let mt = release.tracks.iter().find(|m| m.position as usize == i + 1);
         if let Some(mt) = mt {
-            if !mt.title.is_empty() {
-                state.entries[title_idx].per_file_values[i] = mt.title.clone();
+            if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
+                state.entries[idx].per_file_values[i] = mt.title.clone();
             }
-            if !mt.artist.is_empty() {
-                state.entries[artist_idx].per_file_values[i] = mt.artist.clone();
+            if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
+                state.entries[idx].per_file_values[i] = mt.artist.clone();
             }
         }
-        if !release.title.is_empty() {
-            state.entries[album_idx].per_file_values[i] = release.title.clone();
+        if let Some(idx) = album_idx {
+            state.entries[idx].per_file_values[i] = release.title.clone();
         }
         state.entries[tn_idx].per_file_values[i] = (i + 1).to_string();
-        if let Some(year) = release.year.as_deref().filter(|s| !s.is_empty()) {
-            state.entries[date_idx].per_file_values[i] = year.to_string();
+        if let (Some(idx), Some(year)) = (
+            date_idx, release.year.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            state.entries[idx].per_file_values[i] = year.to_string();
         }
     }
 
-    for idx in [title_idx, artist_idx, album_idx, tn_idx, date_idx] {
-        let entry = &mut state.entries[idx];
-        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
-        entry.is_mixed = !all_same && n > 1;
-        entry.value = if entry.is_mixed {
-            "<multiple values>".to_string()
-        } else {
-            entry.per_file_values.first().cloned().unwrap_or_default()
-        };
+    for idx in [title_idx, artist_idx, album_idx, Some(tn_idx), date_idx]
+        .iter().filter_map(|x| *x)
+    {
+        recompute_and_stamp_mb_proposed(&mut state.entries[idx], n);
     }
 
+    crate::tui::probe::sort_entries_standard_first(&mut state.entries);
     state.dirty = true;
 }
 
@@ -817,34 +846,6 @@ mod tests {
         assert_eq!(r.tracks[0].recording_id.as_deref(), Some("rec1"));
     }
 
-    #[test]
-    fn build_review_state_from_mb_populates_pages_and_carries_release() {
-        let mut release = rel("rid", vec![
-            trk(1, "One", "Artist", Some("USRC1")),
-            trk(2, "Two", "", None),
-        ]);
-        release.title = "Album".into();
-        release.year = Some("1971".into());
-        release.catalog = Some("CAT-001".into());
-        release.barcode = Some("0044007735428".into());
-        let paths = vec![
-            std::path::PathBuf::from("/x/01.flac"),
-            std::path::PathBuf::from("/x/02.flac"),
-        ];
-        let review = build_review_state_from_mb(release.clone(), paths.clone());
-        assert_eq!(review.pages.len(), 1);
-        let page = &review.pages[0];
-        assert_eq!(page.album, "Album");
-        assert_eq!(page.year, "1971");
-        assert_eq!(page.tracks.len(), 2);
-        assert_eq!(page.tracks[0].title, "One");
-        // Empty track artist falls back to release artist.
-        assert_eq!(page.tracks[1].artist, "Artist");
-        assert_eq!(review.paths, paths);
-        assert!(review.mb_release.is_some());
-        assert_eq!(review.mb_release.as_ref().unwrap().release_id, "rid");
-    }
-
     fn empty_editor_state(n: usize) -> crate::tui::app::MetadataEditorState {
         use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
         MetadataEditorState {
@@ -859,6 +860,88 @@ mod tests {
             file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
         }
+    }
+
+    #[test]
+    fn populate_sorts_entries_with_mb_keys_in_logical_positions() {
+        let mut state = empty_editor_state(2);
+        let mut release = rel("rid", vec![
+            trk(1, "T1", "A", Some("USRC1")),
+            trk(2, "T2", "A", Some("USRC2")),
+        ]);
+        release.title = "Album".into();
+        release.year = Some("1971".into());
+        release.original_date = Some("1969".into());
+        release.barcode = Some("0044007735428".into());
+        release.country = Some("US".into());
+        release.release_group_id = Some("rgid".into());
+        release.tracks[0].recording_id = Some("rec1".into());
+        release.tracks[1].recording_id = Some("rec2".into());
+
+        populate_editor_from_mb(&mut state, &release);
+
+        let pos = |key: &str| -> Option<usize> {
+            state.entries.iter().position(|e| e.display_key == key)
+        };
+
+        // STANDARD_KEY_ORDER positions enforced.
+        assert!(pos("TITLE") < pos("ARTIST"));
+        assert!(pos("ARTIST") < pos("ALBUM"));
+        assert!(pos("ALBUM") < pos("DATE"));
+        assert!(pos("DATE") < pos("ORIGINALDATE"));
+        assert!(pos("ORIGINALDATE") < pos("TRACKNUMBER"));
+        assert!(pos("TRACKNUMBER") < pos("CATALOGNUMBER"));
+        assert!(pos("CATALOGNUMBER") < pos("RELEASECOUNTRY"));
+        assert!(pos("RELEASECOUNTRY") < pos("ISRC"));
+        assert!(pos("ISRC") < pos("MUSICBRAINZ_ALBUMID"));
+        assert!(pos("MUSICBRAINZ_ALBUMID") < pos("MUSICBRAINZ_RELEASEGROUPID"));
+        assert!(pos("MUSICBRAINZ_RELEASEGROUPID") < pos("MUSICBRAINZ_TRACKID"));
+    }
+
+    #[test]
+    fn populate_supplemental_skips_entries_for_fields_mb_didnt_supply() {
+        let mut state = empty_editor_state(2);
+        // MB returns release_id only — no catalog/barcode/country/IDs/etc.
+        let release = rel("rid", vec![
+            trk(1, "T1", "A", None),
+            trk(2, "T2", "A", None),
+        ]);
+        populate_editor_mb_supplemental(&mut state, &release);
+
+        // ALBUMID gets created because release_id is non-empty.
+        assert!(state.entries.iter().any(|e| e.display_key == "MUSICBRAINZ_ALBUMID"));
+        // None of these MB-only entries should exist (MB had nothing).
+        for absent in [
+            "ISRC", "MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RELEASETRACKID",
+            "MUSICBRAINZ_ARTISTID", "MUSICBRAINZ_ALBUMARTISTID",
+            "MUSICBRAINZ_RELEASEGROUPID", "ORIGINALDATE", "RELEASECOUNTRY",
+            "CATALOGNUMBER",
+        ] {
+            assert!(
+                state.entries.iter().find(|e| e.display_key == absent).is_none(),
+                "expected no {} entry but found one", absent,
+            );
+        }
+    }
+
+    #[test]
+    fn populate_stamps_mb_proposed_for_changed_fields() {
+        let mut state = empty_editor_state(2);
+        let mut release = rel("rid", vec![
+            trk(1, "Track 1", "Artist", Some("USRC1")),
+            trk(2, "Track 2", "Artist", None),
+        ]);
+        release.title = "Album".into();
+        release.year = Some("1971".into());
+        populate_editor_from_mb(&mut state, &release);
+
+        let title_entry = state.entries.iter()
+            .find(|e| e.display_key == "TITLE").expect("TITLE entry");
+        assert!(title_entry.mb_proposed_value.is_some());
+        assert_eq!(
+            title_entry.mb_proposed_per_file.as_ref().unwrap(),
+            &vec!["Track 1".to_string(), "Track 2".to_string()],
+        );
     }
 
     #[test]

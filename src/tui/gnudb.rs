@@ -265,6 +265,8 @@ pub fn populate_editor_from_gnudb(
             is_mixed: false,
             per_file_values: vec![String::new(); n],
             per_file_originals: vec![String::new(); n],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
         });
         entries.len() - 1
     }
@@ -341,6 +343,8 @@ pub fn populate_editor_file(
             is_mixed: false,
             per_file_values: vec![String::new(); n],
             per_file_originals: vec![String::new(); n],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
         });
         entries.len() - 1
     }
@@ -416,7 +420,6 @@ pub fn build_review_state(
         last_click: None,
         origin_matches: None,
         paths,
-        mb_release: None,
     }
 }
 
@@ -463,7 +466,6 @@ pub fn build_multi_disc_review_state(
         last_click: None,
         origin_matches: None,
         paths: all_paths,
-        mb_release: None,
     }
 }
 
@@ -511,6 +513,8 @@ pub fn populate_editor_from_review(
             is_mixed: false,
             per_file_values: vec![String::new(); n],
             per_file_originals: vec![String::new(); n],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
         });
         entries.len() - 1
     }
@@ -631,7 +635,6 @@ pub fn build_review_state_from_cue(
         last_click: None,
         origin_matches: None,
         paths,
-        mb_release: None,
     }
 }
 
@@ -679,7 +682,6 @@ pub fn build_multi_disc_review_state_from_cue(
         last_click: None,
         origin_matches: None,
         paths: all_paths,
-        mb_release: None,
     }
 }
 

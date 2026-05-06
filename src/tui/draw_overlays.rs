@@ -109,7 +109,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             super::help::draw_help(f, screen, scroll);
         }
         ActiveOverlay::MetadataEditor(ref state) => {
-            draw_metadata_editor(f, state);
+            draw_metadata_editor(f, state, &mut app.button_map);
         }
         ActiveOverlay::CuePreview(ref state) => {
             draw_cue_preview(f, state);
@@ -1219,7 +1219,11 @@ fn draw_analysis(
 }
 
 /// Draw the full metadata editor overlay.
-fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) {
+fn draw_metadata_editor(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
     use super::app::MetadataEditorPhase;
 
     let area = f.size();
@@ -1488,12 +1492,62 @@ fn draw_metadata_editor(f: &mut Frame, state: &super::app::MetadataEditorState) 
             Style::default().fg(theme::TEXT_BRIGHT)
         };
 
-        let val_truncated = truncate_to_chars(&value_display, val_max);
+        let pill = super::probe::mb_pill_state(entry);
+        let pill_text = match pill {
+            super::probe::MbRevertPill::None => "",
+            super::probe::MbRevertPill::Revert => " [revert]",
+            super::probe::MbRevertPill::UseMb => " [use MB]",
+        };
+        let pill_w = pill_text.chars().count();
+        let val_for_pill = val_max.saturating_sub(pill_w);
+        let val_truncated = truncate_to_chars(&value_display, val_for_pill);
 
-        lines.push(Line::from(vec![
+        let pill_style = match pill {
+            super::probe::MbRevertPill::Revert => {
+                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+            }
+            super::probe::MbRevertPill::UseMb => {
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)
+            }
+            super::probe::MbRevertPill::None => Style::default(),
+        };
+
+        let mut spans = vec![
             Span::styled(key_display, key_style),
-            Span::styled(val_truncated, val_style),
-        ]));
+            Span::styled(val_truncated.clone(), val_style),
+        ];
+        if pill_w > 0 {
+            // Pad value column to right-align the pill at val_max.
+            let val_chars = val_truncated.chars().count();
+            let pad = val_for_pill.saturating_sub(val_chars);
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            spans.push(Span::styled(pill_text.to_string(), pill_style));
+
+            // Register the pill rect for click. Visible row index =
+            // entries-row-index minus scroll. Out-of-view rows still
+            // register but the click handler will reject by row range.
+            if i >= scroll && i < scroll + content_h {
+                let visible_row = (i - scroll) as u16;
+                let pill_x = chunks[0].x
+                    + (key_chars + val_for_pill) as u16
+                    + chunks[0].x.saturating_sub(chunks[0].x); // no-op; explicit
+                let _ = pill_x;
+                let pill_screen_x = chunks[0].x
+                    + (key_chars + val_for_pill) as u16;
+                button_map.record_button(
+                    super::button_map::TuiButton::MetadataEntryRevert(i),
+                    Rect::new(
+                        pill_screen_x,
+                        chunks[0].y + visible_row,
+                        pill_w as u16,
+                        1,
+                    ),
+                );
+            }
+        }
+        lines.push(Line::from(spans));
     }
 
     // "+ Add field..." row
@@ -2217,8 +2271,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
     let artist = page.tracks.first()
         .map(|t| t.artist.as_str())
         .unwrap_or("Unknown");
-    let source = if state.mb_release.is_some() { "MusicBrainz" } else { "GNUDB" };
-    let title = format!(" {} Review — {} / {} ", source, artist, page.album);
+    let title = format!(" GNUDB Review — {} / {} ", artist, page.album);
 
     let block = Block::default()
         .borders(Borders::ALL)

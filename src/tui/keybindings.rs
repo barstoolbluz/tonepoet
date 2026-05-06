@@ -1570,9 +1570,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 // ── Navigation mode ──
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
-                        let source = if state.mb_release.is_some() { "MusicBrainz" } else { "GNUDB" };
                         app.active_overlay = ActiveOverlay::None;
-                        app.set_status(format!("{} review cancelled", source));
+                        app.set_status("GNUDB review cancelled".to_string());
                     }
                     // Back to match list (if came from multi-match selection).
                     (KeyCode::Char('b'), _) => {
@@ -1712,22 +1711,13 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         super::keybindings::open_metadata_editor(app);
                         if let ActiveOverlay::MetadataEditor(ref mut editor_state) = app.active_overlay {
                             super::gnudb::populate_editor_from_review(editor_state, &state);
-                            // When the review came from a MusicBrainz lookup,
-                            // also write the MB-only fields (ISRC, catalog)
-                            // that the review UI didn't surface.
-                            if let Some(ref mb) = state.mb_release {
-                                super::musicbrainz::populate_editor_mb_supplemental(
-                                    editor_state, mb,
-                                );
-                            }
                             let first_page = &state.pages[0];
                             let artist = first_page.tracks.first()
                                 .map(|t| t.artist.as_str())
                                 .unwrap_or("?");
-                            let source = if state.mb_release.is_some() { "MB" } else { "GNUDB" };
                             app.set_status(format!(
-                                "Tags loaded ({}) — {} / {} ({} disc{})",
-                                source, artist, first_page.album,
+                                "Tags loaded — {} / {} ({} disc{})",
+                                artist, first_page.album,
                                 state.pages.len(),
                                 if state.pages.len() == 1 { "" } else { "s" },
                             ));
@@ -1781,7 +1771,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     if idx < state.releases.len() {
                         let release = state.releases.swap_remove(idx);
                         let paths = std::mem::take(&mut state.paths);
-                        super::event_loop::open_mb_review(app, release, paths);
+                        super::event_loop::open_editor_with_mb_release(app, &release, &paths);
                     }
                 }
                 KeyCode::Up => {
@@ -2632,6 +2622,8 @@ fn handle_metadata_editor_key(
                             is_mixed: false,
                             per_file_values: vec![String::new(); n],
                             per_file_originals: vec![String::new(); n],
+                            mb_proposed_value: None,
+                            mb_proposed_per_file: None,
                         });
                         state.cursor = state.entries.len() - 1;
                         state.add_key_input = None;
@@ -2823,6 +2815,8 @@ pub fn open_metadata_editor(app: &mut AppState) {
                     is_mixed: false,
                     per_file_values: vec![String::new(); n],
                     per_file_originals: vec![String::new(); n],
+                    mb_proposed_value: None,
+                    mb_proposed_per_file: None,
                 });
                 entries.len() - 1
             }
@@ -2841,6 +2835,8 @@ pub fn open_metadata_editor(app: &mut AppState) {
                     is_mixed: false,
                     per_file_values: vec![String::new(); n],
                     per_file_originals: vec![String::new(); n],
+                    mb_proposed_value: None,
+                    mb_proposed_per_file: None,
                 });
                 entries.len() - 1
             }
@@ -6406,6 +6402,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::OverlayCancel => {
                 app.active_overlay = ActiveOverlay::None;
+            }
+            TuiButton::MetadataEntryRevert(idx) => {
+                if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
+                    if state.entries.get(idx).is_some() {
+                        super::probe::toggle_mb_revert(&mut state.entries[idx]);
+                        state.dirty = super::probe::metadata_editor_has_changes(state);
+                    }
+                }
             }
         }
     }

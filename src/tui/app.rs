@@ -923,11 +923,6 @@ pub struct GnudbReviewState {
     pub paths: Vec<std::path::PathBuf>,
     /// Original match list for "back" navigation (None for single-match queries).
     pub origin_matches: Option<Vec<crate::tui::gnudb::GnudbMatch>>,
-    /// When this review was built from a MusicBrainz release rather than
-    /// a GNUDB entry, the source release is held here so the accept
-    /// step can additionally populate MB-only fields (ISRC, catalog)
-    /// that the review UI doesn't surface.
-    pub mb_release: Option<Box<crate::tui::musicbrainz::MbRelease>>,
 }
 
 /// A single page (disc) in the GNUDB review overlay.

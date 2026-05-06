@@ -48,6 +48,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "write-rg-track", "write-rg-album",
     "import-cue", "cue", "cue!", "cue-mb", "cue-mb!", "cue-fill", "cue-enrich",
     "tags-mb", "mb-tags", "musicbrainz-tags",
+    "revert",
     "g", "G", "top", "bot", "bottom",
     "fix-caps", "fixcaps",
     "search", "s", "rs", "rsearch",
@@ -272,6 +273,11 @@ pub enum Command {
     /// Open the metadata editor pre-populated with track-level + album-level
     /// values from a MusicBrainz disc-TOC lookup.
     TagsFromMb,
+    /// Toggle the cursor row of the metadata editor between its
+    /// MB-proposed value and the file's original (pre-MB) value.
+    /// No-op when the row wasn't touched by MB or has been manually
+    /// edited away from both endpoints.
+    MbRevert,
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -399,6 +405,7 @@ pub fn parse_command(input: &str) -> Command {
         "cue-mb!" => Command::GenerateCueMb { single_image: true },
         "cue-fill" | "cue-enrich" => Command::CueFill,
         "tags-mb" | "mb-tags" | "musicbrainz-tags" => Command::TagsFromMb,
+        "revert" => Command::MbRevert,
         "g" | "top" => Command::CueScrollTop,
         "G" | "bot" | "bottom" => Command::CueScrollBottom,
         "preemphasis" | "preemph" | "pe" => Command::DetectPreemphasis,
@@ -1349,6 +1356,31 @@ pub fn execute_command(
                     }).await;
                 });
             }
+        }
+        Command::MbRevert => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status(":revert only works in the metadata editor");
+                return;
+            };
+            let cursor = state.cursor;
+            if let Some(entry) = state.entries.get_mut(cursor) {
+                let pill_before = super::probe::mb_pill_state(entry);
+                if matches!(pill_before, super::probe::MbRevertPill::None) {
+                    app.set_status(":revert: cursor row was not changed by MusicBrainz");
+                } else {
+                    super::probe::toggle_mb_revert(entry);
+                    let after = super::probe::mb_pill_state(entry);
+                    let display_key = entry.display_key.clone();
+                    state.dirty = super::probe::metadata_editor_has_changes(&state);
+                    let label = match after {
+                        super::probe::MbRevertPill::Revert => "applied MB value",
+                        super::probe::MbRevertPill::UseMb => "reverted to file value",
+                        super::probe::MbRevertPill::None => "no change",
+                    };
+                    app.set_status(format!(":revert: {} ({})", display_key, label));
+                }
+            }
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
         Command::TagsFromMb => {
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
@@ -3429,6 +3461,8 @@ pub fn apply_cue_changes(
                     is_mixed: false,
                     per_file_values: vec![String::new(); n],
                     per_file_originals: vec![String::new(); n],
+                    mb_proposed_value: None,
+                    mb_proposed_per_file: None,
                 });
                 state.entries.len() - 1
             }

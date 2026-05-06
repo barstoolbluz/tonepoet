@@ -572,6 +572,94 @@ pub struct TagEntry {
     pub per_file_values: Vec<String>,
     /// Per-file original values at read time (for per-file write diff).
     pub per_file_originals: Vec<String>,
+    /// MB-proposed displayed value, when the entry was touched by a
+    /// MusicBrainz populate. Lets the editor show a `[revert]` /
+    /// `[use MB]` toggle pill that swaps `value` between the file's
+    /// pre-populate `original` and the MB suggestion.
+    pub mb_proposed_value: Option<String>,
+    /// Per-file MB-proposed values, paired with `mb_proposed_value`.
+    pub mb_proposed_per_file: Option<Vec<String>>,
+}
+
+/// True when at least one entry has been changed from its on-disk
+/// original value, or there are pending deletions queued. Used to
+/// refresh the editor's `dirty` flag after a revert toggle so the
+/// indicator accurately reflects whether anything would be written
+/// on save.
+pub fn metadata_editor_has_changes(state: &super::app::MetadataEditorState) -> bool {
+    !state.deleted.is_empty()
+        || state.entries.iter().any(|e|
+            e.value != e.original
+            || e.per_file_values != e.per_file_originals
+        )
+}
+
+/// State of the per-row revert toggle pill in the metadata editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MbRevertPill {
+    /// Field wasn't touched by MB or was manually edited; no pill.
+    None,
+    /// Current value is the MB suggestion; pill says `[revert]` and
+    /// flips to the file's original value.
+    Revert,
+    /// Current value is the file's original; pill says `[use MB]` and
+    /// flips to the MB suggestion.
+    UseMb,
+}
+
+/// Decide which pill (if any) to show on a row of the metadata editor.
+///
+/// `None` when the entry wasn't populated from MB, or when the user
+/// has manually edited away from both the MB suggestion and the
+/// file's original (toggle would be ambiguous; user can use undo).
+pub fn mb_pill_state(entry: &TagEntry) -> MbRevertPill {
+    let Some(ref proposed) = entry.mb_proposed_value else {
+        return MbRevertPill::None;
+    };
+    if entry.value == *proposed {
+        MbRevertPill::Revert
+    } else if entry.value == entry.original {
+        MbRevertPill::UseMb
+    } else {
+        MbRevertPill::None
+    }
+}
+
+/// Flip a TagEntry between its MB-proposed value and the pre-populate
+/// original. No-op when there is no MB-proposed value, or when the
+/// user has manually edited away from both endpoints.
+///
+/// Touches `value`, `per_file_values`, and `is_mixed`. `original` and
+/// `mb_proposed_*` are preserved so the toggle can flip again.
+pub fn toggle_mb_revert(entry: &mut TagEntry) {
+    let proposed = match &entry.mb_proposed_value {
+        Some(p) => p.clone(),
+        None => return,
+    };
+    let proposed_per_file = match &entry.mb_proposed_per_file {
+        Some(p) => p.clone(),
+        None => return,
+    };
+
+    if entry.value == proposed {
+        // MB → original
+        entry.value = entry.original.clone();
+        entry.per_file_values = entry.per_file_originals.clone();
+    } else if entry.value == entry.original {
+        // original → MB
+        entry.value = proposed;
+        entry.per_file_values = proposed_per_file;
+    } else {
+        // Manual edit; toggle is ambiguous. No-op.
+        return;
+    }
+
+    let n = entry.per_file_values.len();
+    let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+    entry.is_mixed = !all_same && n > 1;
+    if entry.is_mixed {
+        entry.value = "<multiple values>".to_string();
+    }
 }
 
 /// Extract a track number from a filename stem by taking leading digits.
@@ -710,11 +798,37 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
 
 /// Priority order for standard fields (displayed first, in this order).
 pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
-    "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE", "DATE", "YEAR",
+    "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE",
+    "DATE", "ORIGINALDATE", "YEAR",
     "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL",
-    "CATALOGNUMBER", "COMMENT", "COMPOSER", "CONDUCTOR", "LABEL",
+    "CATALOGNUMBER", "RELEASECOUNTRY",
+    "COMMENT", "COMPOSER", "CONDUCTOR", "LABEL",
     "ISRC", "BARCODE",
+    "MUSICBRAINZ_ALBUMID", "MUSICBRAINZ_ALBUMARTISTID",
+    "MUSICBRAINZ_RELEASEGROUPID",
+    "MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RELEASETRACKID",
+    "MUSICBRAINZ_ARTISTID",
 ];
+
+/// Sort `entries` so STANDARD_KEY_ORDER fields lead in their listed
+/// order, with the remainder sorted alphabetically by display key.
+/// Used by `read_all_tags_merged` and the MusicBrainz / GNUDB populate
+/// paths so post-populate entries fall into their logical positions
+/// instead of trailing.
+pub fn sort_entries_standard_first(entries: &mut Vec<TagEntry>) {
+    entries.sort_by(|a, b| {
+        let a_upper = a.display_key.to_ascii_uppercase();
+        let b_upper = b.display_key.to_ascii_uppercase();
+        let a_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
+        let b_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == b_upper);
+        match (a_idx, b_idx) {
+            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a_upper.cmp(&b_upper),
+        }
+    });
+}
 
 /// Map an ItemKey to a human-readable display name using the tag's
 /// format-specific key string. Falls back to Debug format for unmapped keys.
@@ -761,22 +875,12 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
             is_mixed: false,
             per_file_values: vec![value.clone()],
             per_file_originals: vec![value],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
         });
     }
 
-    // Sort: standard fields first (in STANDARD_KEY_ORDER), then rest alphabetically.
-    entries.sort_by(|a, b| {
-        let a_upper = a.display_key.to_ascii_uppercase();
-        let b_upper = b.display_key.to_ascii_uppercase();
-        let a_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
-        let b_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == b_upper);
-        match (a_idx, b_idx) {
-            (Some(ai), Some(bi)) => ai.cmp(&bi),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a_upper.cmp(&b_upper),
-        }
-    });
+    sort_entries_standard_first(&mut entries);
 
     Ok(entries)
 }
@@ -886,22 +990,13 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             is_mixed,
             per_file_values: data.values.clone(),
             per_file_originals: data.values.clone(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
         });
     }
 
     // Sort with standard key priority.
-    entries.sort_by(|a, b| {
-        let a_upper = a.display_key.to_ascii_uppercase();
-        let b_upper = b.display_key.to_ascii_uppercase();
-        let a_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
-        let b_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == b_upper);
-        match (a_idx, b_idx) {
-            (Some(ai), Some(bi)) => ai.cmp(&bi),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a_upper.cmp(&b_upper),
-        }
-    });
+    sort_entries_standard_first(&mut entries);
 
     Ok(entries)
 }
@@ -1005,5 +1100,158 @@ mod tests {
     #[test]
     fn r128_raw_to_db_whitespace_trimmed() {
         assert_eq!(r128_raw_to_db("  -1664  ").as_deref(), Some("-6.50 dB"));
+    }
+
+    fn entry_with_mb_proposed(
+        original: &str,
+        proposed: &str,
+        per_file_count: usize,
+    ) -> TagEntry {
+        TagEntry {
+            display_key: "TITLE".to_string(),
+            item_key: lofty::tag::ItemKey::TrackTitle,
+            value: proposed.to_string(),
+            original: original.to_string(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vec![proposed.to_string(); per_file_count],
+            per_file_originals: vec![original.to_string(); per_file_count],
+            mb_proposed_value: Some(proposed.to_string()),
+            mb_proposed_per_file: Some(vec![proposed.to_string(); per_file_count]),
+        }
+    }
+
+    #[test]
+    fn pill_state_revert_when_value_matches_proposed() {
+        let e = entry_with_mb_proposed("File Title", "MB Title", 1);
+        assert_eq!(mb_pill_state(&e), MbRevertPill::Revert);
+    }
+
+    #[test]
+    fn pill_state_use_mb_after_revert() {
+        let mut e = entry_with_mb_proposed("File Title", "MB Title", 1);
+        toggle_mb_revert(&mut e);
+        assert_eq!(e.value, "File Title");
+        assert_eq!(mb_pill_state(&e), MbRevertPill::UseMb);
+    }
+
+    #[test]
+    fn pill_state_none_for_manual_edit() {
+        let mut e = entry_with_mb_proposed("File Title", "MB Title", 1);
+        e.value = "User Hand-Edit".to_string();
+        e.per_file_values = vec!["User Hand-Edit".to_string()];
+        assert_eq!(mb_pill_state(&e), MbRevertPill::None);
+    }
+
+    #[test]
+    fn pill_state_none_when_not_from_mb() {
+        let e = TagEntry {
+            display_key: "TITLE".into(),
+            item_key: lofty::tag::ItemKey::TrackTitle,
+            value: "x".into(), original: "x".into(),
+            is_binary: false, is_mixed: false,
+            per_file_values: vec!["x".into()],
+            per_file_originals: vec!["x".into()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        };
+        assert_eq!(mb_pill_state(&e), MbRevertPill::None);
+    }
+
+    #[test]
+    fn toggle_round_trips_between_mb_and_original() {
+        let mut e = entry_with_mb_proposed("File", "MB", 1);
+        toggle_mb_revert(&mut e); // MB → File
+        assert_eq!(e.value, "File");
+        toggle_mb_revert(&mut e); // File → MB
+        assert_eq!(e.value, "MB");
+        toggle_mb_revert(&mut e); // MB → File
+        assert_eq!(e.value, "File");
+    }
+
+    #[test]
+    fn toggle_no_op_on_manual_edit() {
+        let mut e = entry_with_mb_proposed("File", "MB", 1);
+        e.value = "Hand-Edit".into();
+        e.per_file_values = vec!["Hand-Edit".into()];
+        toggle_mb_revert(&mut e);
+        assert_eq!(e.value, "Hand-Edit");  // unchanged
+    }
+
+    #[test]
+    fn toggle_swaps_per_file_values_too() {
+        let mut e = entry_with_mb_proposed("File", "MB", 3);
+        toggle_mb_revert(&mut e);
+        assert_eq!(e.per_file_values, vec!["File", "File", "File"]);
+        assert!(!e.is_mixed);
+        toggle_mb_revert(&mut e);
+        assert_eq!(e.per_file_values, vec!["MB", "MB", "MB"]);
+    }
+
+    #[test]
+    fn metadata_editor_has_changes_true_with_pending_deletion() {
+        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        // No value changes, but one entry marked for deletion → dirty.
+        let state = MetadataEditorState {
+            paths: vec![std::path::PathBuf::from("/tmp/01.flac")],
+            entries: vec![TagEntry {
+                display_key: "TITLE".into(),
+                item_key: lofty::tag::ItemKey::TrackTitle,
+                value: "x".into(), original: "x".into(),
+                is_binary: false, is_mixed: false,
+                per_file_values: vec!["x".into()],
+                per_file_originals: vec!["x".into()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            }],
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false, deleted: vec![0],
+            file_labels: vec!["01".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+        };
+        assert!(metadata_editor_has_changes(&state));
+    }
+
+    #[test]
+    fn metadata_editor_has_changes_false_after_full_revert() {
+        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        let mut state = MetadataEditorState {
+            paths: vec![std::path::PathBuf::from("/tmp/01.flac")],
+            entries: vec![
+                entry_with_mb_proposed("File", "MB", 1),
+                entry_with_mb_proposed("File2", "MB2", 1),
+            ],
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: true, deleted: Vec::new(),
+            file_labels: vec!["01".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+        };
+        // Both entries currently show the MB value → has changes.
+        assert!(metadata_editor_has_changes(&state));
+
+        // Revert both.
+        toggle_mb_revert(&mut state.entries[0]);
+        toggle_mb_revert(&mut state.entries[1]);
+        assert!(!metadata_editor_has_changes(&state));
+    }
+
+    #[test]
+    fn toggle_no_op_when_no_mb_proposed() {
+        let mut e = TagEntry {
+            display_key: "TITLE".into(),
+            item_key: lofty::tag::ItemKey::TrackTitle,
+            value: "x".into(), original: "y".into(),
+            is_binary: false, is_mixed: false,
+            per_file_values: vec!["x".into()],
+            per_file_originals: vec!["y".into()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        };
+        toggle_mb_revert(&mut e);
+        assert_eq!(e.value, "x");
     }
 }
