@@ -1274,6 +1274,18 @@ mod tests {
     }
 
     #[test]
+    fn stack_rects_no_shift_when_cascade_fits() {
+        // Wide terminal, narrow cascade — origin should be unchanged.
+        let level1 = MenuLevel::new(vec![submenu("AA", vec![leaf("noop")])]);
+        let level2 = MenuLevel::new(vec![leaf("end")]);
+        let levels = vec![level1, level2];
+        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
+            &levels, (5, 5), 200, 24,
+        );
+        assert_eq!(rects[0].x, 5, "root should sit at its anchor when no shift needed");
+    }
+
+    #[test]
     fn stack_rects_partial_shift_when_terminal_too_narrow() {
         // Cascade is genuinely wider than the terminal even with full
         // shift. Verify root goes to x=0 (max shift) and the function
