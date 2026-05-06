@@ -4625,7 +4625,10 @@ pub fn context_menu_stack_rects<'a>(
     if levels.is_empty() {
         return (rects, None);
     }
-    let root = context_menu_panel_rect(&levels[0].entries, origin, area_w, area_h);
+    // Root: clamp x to fit on screen (right-click near the right edge
+    // shouldn't render off-screen). Cascaded levels do NOT clamp — we
+    // post-process the whole stack with a uniform left shift instead.
+    let root = context_menu_panel_rect(&levels[0].entries, origin, area_w, area_h, true);
     rects.push(root);
     for i in 1..levels.len() {
         let parent_rect = rects[i - 1];
@@ -4634,7 +4637,7 @@ pub fn context_menu_stack_rects<'a>(
         let sel_row = super::draw_overlays::selected_entry_row_pub(parent_entries, parent_sel);
         let sub_x = parent_rect.x + parent_rect.width - 1;
         let sub_y = parent_rect.y + sel_row + 1;
-        let r = context_menu_panel_rect(&levels[i].entries, (sub_x, sub_y), area_w, area_h);
+        let r = context_menu_panel_rect(&levels[i].entries, (sub_x, sub_y), area_w, area_h, false);
         rects.push(r);
     }
 
@@ -4658,24 +4661,29 @@ pub fn context_menu_stack_rects<'a>(
                 let sel_row = super::draw_overlays::selected_entry_row_pub(entries, sel);
                 let pv_x = parent_rect.x + parent_rect.width - 1;
                 let pv_y = parent_rect.y + sel_row + 1;
-                let pv_rect = context_menu_panel_rect(children, (pv_x, pv_y), area_w, area_h);
+                let pv_rect = context_menu_panel_rect(children, (pv_x, pv_y), area_w, area_h, false);
                 rects.push(pv_rect);
                 preview = Some((children.as_slice(), rects.len() - 1));
             }
         }
     }
 
-    // Width-overflow correction: if cumulative right edge exceeds the
-    // terminal, shift all rects left so the deepest panel sits flush
-    // right. Each rect already clamps its own x via panel_rect, but
-    // the cascade compounds offsets — without this shift, deep panels
-    // would stack on top of each other against the right edge.
+    // Width-overflow correction: if the deepest panel extends past the
+    // right edge, shift the whole stack left uniformly so the cascade
+    // visual is preserved. The shift is bounded by the root's x — we
+    // never push the root off-screen left. If even shifting fully isn't
+    // enough (extremely narrow terminal at depth 4), the deepest panels
+    // will be partially clipped on render; the cascade still navigates.
     if let Some(last) = rects.last() {
-        let right = last.x + last.width;
+        let right = last.x.saturating_add(last.width);
         if right > area_w {
-            let shift = right - area_w;
-            for r in &mut rects {
-                r.x = r.x.saturating_sub(shift);
+            let needed = right - area_w;
+            let max_shift = rects[0].x;
+            let shift = needed.min(max_shift);
+            if shift > 0 {
+                for r in &mut rects {
+                    r.x = r.x.saturating_sub(shift);
+                }
             }
         }
     }
@@ -4683,11 +4691,18 @@ pub fn context_menu_stack_rects<'a>(
     (rects, preview)
 }
 
+/// Compute a menu panel's rect.
+///
+/// `clamp_x`:
+/// - true (root only): clamp `x` so the panel fits within the terminal.
+/// - false (cascaded levels + preview): allow `x` to overflow the right
+///   edge — the caller will shift the whole stack left as needed.
 fn context_menu_panel_rect(
     entries: &[super::context_menu::ContextMenuEntry],
     origin: (u16, u16),
     area_w: u16,
     area_h: u16,
+    clamp_x: bool,
 ) -> Rect {
     use super::context_menu::ContextMenuEntry;
     let max_label_w: usize = entries
@@ -4705,7 +4720,11 @@ fn context_menu_panel_rect(
         .unwrap_or(10);
     let menu_w = (max_label_w + 4).min(area_w as usize) as u16;
     let menu_h = (entries.len() + 2).min(area_h as usize) as u16;
-    let x = origin.0.min(area_w.saturating_sub(menu_w));
+    let x = if clamp_x {
+        origin.0.min(area_w.saturating_sub(menu_w))
+    } else {
+        origin.0
+    };
     let y = origin.1.min(area_h.saturating_sub(menu_h));
     Rect::new(x, y, menu_w, menu_h)
 }

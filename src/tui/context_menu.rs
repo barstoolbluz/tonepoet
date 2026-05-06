@@ -1251,6 +1251,71 @@ mod tests {
     }
 
     #[test]
+    fn stack_rects_shift_left_when_cascade_overflows() {
+        // 100-col terminal, root anchored at x=20, 3 levels deep with
+        // narrower labels — the shift should fit everything.
+        let level1 = MenuLevel::new(vec![submenu("AAAA", vec![leaf("noop")])]);
+        let level2 = MenuLevel::new(vec![submenu("BBBB", vec![leaf("noop")])]);
+        let level3 = MenuLevel::new(vec![submenu("CCCC", vec![leaf("noop")])]);
+        let levels = vec![level1, level2, level3];
+        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
+            &levels, (75, 5), 100, 24,
+        );
+        // 3 levels + preview = 4 rects, all fit within 100 after shift.
+        let last = rects.last().unwrap();
+        let dump: Vec<(u16, u16, u16)> = rects.iter().map(|r| (r.x, r.width, r.x + r.width)).collect();
+        assert!(
+            last.x + last.width <= 100,
+            "deepest panel right edge ({}) exceeds 100 even after shift; rects = {:?}",
+            last.x + last.width, dump,
+        );
+        // The shift should have moved the root left of its origin (75).
+        assert!(rects[0].x < 75, "root must have shifted left from origin 75; got x={}", rects[0].x);
+    }
+
+    #[test]
+    fn stack_rects_partial_shift_when_terminal_too_narrow() {
+        // Cascade is genuinely wider than the terminal even with full
+        // shift. Verify root goes to x=0 (max shift) and the function
+        // doesn't panic.
+        let level1 = MenuLevel::new(vec![
+            submenu("AAAAAAAAAAAAAAAAAAAA", vec![leaf("noop")]),
+        ]);
+        let level2 = MenuLevel::new(vec![
+            submenu("BBBBBBBBBBBBBBBBBBBB", vec![leaf("noop")]),
+        ]);
+        let level3 = MenuLevel::new(vec![
+            submenu("CCCCCCCCCCCCCCCCCCCC", vec![leaf("noop")]),
+        ]);
+        let levels = vec![level1, level2, level3];
+        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
+            &levels, (10, 5), 80, 24,
+        );
+        // Root pinned at x=0 after max shift.
+        assert_eq!(rects[0].x, 0, "root should be flush left when terminal too narrow");
+    }
+
+    #[test]
+    fn stack_rects_shift_clamped_by_root_x() {
+        // Root anchored at x=0 — no headroom for the shift to work in.
+        // Cascade overflows but root stays at x=0.
+        let level1 = MenuLevel::new(vec![
+            submenu("AAAAAAAAAAAAAAAAAAAAAAAAAA", vec![leaf("noop")]), // wide
+        ]);
+        let level2 = MenuLevel::new(vec![
+            submenu("BBBBBBBBBBBBBBBBBBBBBBBBBB", vec![leaf("noop")]),
+        ]);
+        let level3 = MenuLevel::new(vec![
+            submenu("CCCCCCCCCCCCCCCCCCCCCCCCCC", vec![leaf("noop")]),
+        ]);
+        let levels = vec![level1, level2, level3];
+        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
+            &levels, (0, 5), 80, 24,
+        );
+        assert_eq!(rects[0].x, 0, "root must stay at x=0 when anchored there");
+    }
+
+    #[test]
     fn verify_submenu_is_three_levels() {
         // The Verify submenu is now: Verify > {AccurateRip, CUETools DB} > leaves.
         let v = build_verify_submenu();
