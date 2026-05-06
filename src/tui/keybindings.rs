@@ -1410,16 +1410,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::BatchList { scroll } => {
             handle_batch_list_key(app, key, scroll, tx);
         }
-        ActiveOverlay::ContextMenu {
-            entries, selected, origin,
-            submenu_entries, submenu_selected,
-            show_submenu, focus_submenu,
-        } => {
-            handle_context_menu_key(
-                app, key, entries, selected, origin,
-                submenu_entries, submenu_selected,
-                show_submenu, focus_submenu, tx,
-            );
+        ActiveOverlay::ContextMenu { levels, origin } => {
+            handle_context_menu_key(app, key, levels, origin, tx);
         }
         ActiveOverlay::BulkRename(state) => {
             handle_bulk_rename_key(app, key, *state, tx);
@@ -2133,26 +2125,27 @@ fn run_context_action_restoring_parked(
     }
 }
 
-/// Handle key events for the context menu overlay. Two-level side-by-side
-/// model: parent menu stays visible; submenu appears to the right when
-/// the cursor is on a Submenu entry. `focus_submenu` tracks which panel
-/// has keyboard focus.
-#[allow(clippy::too_many_arguments)]
+/// Keyboard handler for the context menu.
+///
+/// Model: `levels` is the explicitly navigated stack; `levels.last()` is
+/// the focused panel. The renderer additionally previews children of
+/// the focused panel's selected entry as a "phantom" deeper panel when
+/// that entry is a Submenu — that phantom is *not* in `levels`.
+///
+/// - Up/Down: move selection in `levels.last()`
+/// - Right / Enter on Submenu: push children as new focused level (cap MAX)
+/// - Enter on Item: execute action, close menu
+/// - Left: pop focused level; close menu at root
+/// - Esc: close menu entirely
 fn handle_context_menu_key(
     app: &mut AppState,
     key: KeyEvent,
-    entries: Vec<super::context_menu::ContextMenuEntry>,
-    mut selected: usize,
+    mut levels: Vec<super::context_menu::MenuLevel>,
     origin: (u16, u16),
-    mut submenu_entries: Vec<super::context_menu::ContextMenuEntry>,
-    mut submenu_selected: usize,
-    mut show_submenu: bool,
-    mut focus_submenu: bool,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    use super::context_menu::ContextMenuEntry;
+    use super::context_menu::{ContextMenuEntry, MenuLevel, MAX_CONTEXT_MENU_DEPTH};
 
-    /// Build selectable-index list for a set of entries.
     fn selectable_indices(entries: &[ContextMenuEntry]) -> Vec<usize> {
         entries
             .iter()
@@ -2165,88 +2158,68 @@ fn handle_context_menu_key(
             .collect()
     }
 
-    let parent_selectable = selectable_indices(&entries);
+    if levels.is_empty() {
+        close_context_menu_restoring_parked(app);
+        return;
+    }
 
     match key.code {
         KeyCode::Esc => {
-            if focus_submenu {
-                // Esc in submenu → return focus to parent.
-                focus_submenu = false;
-            } else {
-                // Esc in parent → close entirely (restoring parked overlay).
-                close_context_menu_restoring_parked(app);
-                return;
-            }
+            close_context_menu_restoring_parked(app);
+            return;
         }
         KeyCode::Left => {
-            if focus_submenu {
-                focus_submenu = false;
+            if levels.len() > 1 {
+                levels.pop();
             } else {
                 close_context_menu_restoring_parked(app);
                 return;
             }
         }
         KeyCode::Right => {
-            if !focus_submenu && show_submenu {
-                // Move focus into the submenu.
-                focus_submenu = true;
-                submenu_selected = 0;
-            } else if focus_submenu {
-                // In submenu, Right on a Submenu item could open a 3rd
-                // level — for v1 we don't support 3 levels, so Enter
-                // is needed for leaf items.
+            let depth = levels.len();
+            let cur = &levels[depth - 1];
+            let sel = selectable_indices(&cur.entries);
+            if let Some(&idx) = sel.get(cur.selected) {
+                if let ContextMenuEntry::Submenu { children, .. } = &cur.entries[idx] {
+                    if depth < MAX_CONTEXT_MENU_DEPTH {
+                        levels.push(MenuLevel::new(children.clone()));
+                    }
+                }
             }
         }
-        // Enter = default action, q = inverted (enqueue-only ↔ start).
         KeyCode::Enter | KeyCode::Char('q') => {
             let invert = key.code == KeyCode::Char('q');
-            if focus_submenu {
-                let sub_selectable = selectable_indices(&submenu_entries);
-                if let Some(&idx) = sub_selectable.get(submenu_selected) {
-                    if let ContextMenuEntry::Item(item) = &submenu_entries[idx] {
+            let depth = levels.len();
+            let cur = &levels[depth - 1];
+            let sel = selectable_indices(&cur.entries);
+            if let Some(&idx) = sel.get(cur.selected) {
+                match &cur.entries[idx] {
+                    ContextMenuEntry::Item(item) => {
                         let action = item.action.clone();
                         run_context_action_restoring_parked(app, action, tx, invert);
                         return;
                     }
-                }
-            } else {
-                if let Some(&idx) = parent_selectable.get(selected) {
-                    match &entries[idx] {
-                        ContextMenuEntry::Submenu { .. } if show_submenu => {
-                            focus_submenu = true;
-                            submenu_selected = 0;
+                    ContextMenuEntry::Submenu { children, .. } => {
+                        if depth < MAX_CONTEXT_MENU_DEPTH {
+                            levels.push(MenuLevel::new(children.clone()));
                         }
-                        ContextMenuEntry::Item(item) => {
-                            let action = item.action.clone();
-                            run_context_action_restoring_parked(app, action, tx, invert);
-                            return;
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if focus_submenu {
-                if submenu_selected > 0 {
-                    submenu_selected -= 1;
-                }
-            } else {
-                if selected > 0 {
-                    selected -= 1;
-                }
+            let cur = levels.last_mut().unwrap();
+            if cur.selected > 0 {
+                cur.selected -= 1;
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if focus_submenu {
-                let sub_selectable = selectable_indices(&submenu_entries);
-                if submenu_selected + 1 < sub_selectable.len() {
-                    submenu_selected += 1;
-                }
-            } else {
-                if selected + 1 < parent_selectable.len() {
-                    selected += 1;
-                }
+            let cur = levels.last_mut().unwrap();
+            let n = selectable_indices(&cur.entries).len();
+            if cur.selected + 1 < n {
+                cur.selected += 1;
             }
         }
         _ => {
@@ -2255,34 +2228,7 @@ fn handle_context_menu_key(
         }
     }
 
-    // After cursor movement in the parent, update the submenu to match
-    // the newly selected entry (if it's a Submenu).
-    if !focus_submenu {
-        if let Some(&idx) = parent_selectable.get(selected) {
-            match &entries[idx] {
-                ContextMenuEntry::Submenu { children, .. } => {
-                    submenu_entries = children.clone();
-                    submenu_selected = 0;
-                    show_submenu = true;
-                }
-                _ => {
-                    show_submenu = false;
-                    submenu_entries.clear();
-                    submenu_selected = 0;
-                }
-            }
-        }
-    }
-
-    app.active_overlay = ActiveOverlay::ContextMenu {
-        entries,
-        selected,
-        origin,
-        submenu_entries,
-        submenu_selected,
-        show_submenu,
-        focus_submenu,
-    };
+    app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
 }
 
 /// Build and open the context menu for the current screen. `x, y` is
@@ -2318,22 +2264,20 @@ pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
-    // Check if the first entry is a Submenu — if so, auto-show its children.
-    let (submenu_entries, show_submenu) = match entries.first() {
-        Some(super::context_menu::ContextMenuEntry::Submenu { children, .. }) => {
-            (children.clone(), true)
+    let mut levels = vec![super::context_menu::MenuLevel::new(entries)];
+    // If the root's first entry is a Submenu, auto-push it so users
+    // see the cascade preview without first arrowing down.
+    if let Some(super::context_menu::ContextMenuEntry::Submenu { children, .. }) =
+        levels[0].entries.first()
+    {
+        if levels.len() < super::context_menu::MAX_CONTEXT_MENU_DEPTH {
+            levels.push(super::context_menu::MenuLevel::new(children.clone()));
         }
-        _ => (Vec::new(), false),
-    };
+    }
 
     app.active_overlay = ActiveOverlay::ContextMenu {
-        entries,
-        selected: 0,
+        levels,
         origin: (x, y),
-        submenu_entries,
-        submenu_selected: 0,
-        show_submenu,
-        focus_submenu: false,
     };
 }
 
@@ -3867,13 +3811,8 @@ fn handle_cue_preview_mouse(
             let entries = build_cue_preview_context_menu(line_idx, is_editing);
             app.pending_cue_preview = Some(state);
             app.active_overlay = ActiveOverlay::ContextMenu {
-                entries,
-                selected: 0,
+                levels: vec![super::context_menu::MenuLevel::new(entries)],
                 origin: (mx, my),
-                submenu_entries: Vec::new(),
-                submenu_selected: 0,
-                show_submenu: false,
-                focus_submenu: false,
             };
         }
         _ => {
@@ -4001,13 +3940,8 @@ fn handle_mb_select_mouse(
                 let entries = build_mb_select_context_menu();
                 app.pending_mb_select = Some(state);
                 app.active_overlay = ActiveOverlay::ContextMenu {
-                    entries,
-                    selected: 0,
+                    levels: vec![super::context_menu::MenuLevel::new(entries)],
                     origin: (mx, my),
-                    submenu_entries: Vec::new(),
-                    submenu_selected: 0,
-                    show_submenu: false,
-                    focus_submenu: false,
                 };
             } else {
                 app.set_status("MusicBrainz picker cancelled".to_string());
@@ -4114,13 +4048,8 @@ fn handle_metadata_editor_mouse(
                             let entries = build_metadata_detail_context_menu(&state);
                             app.pending_metadata_editor = Some(state);
                             app.active_overlay = ActiveOverlay::ContextMenu {
-                                entries,
-                                selected: 0,
+                                levels: vec![super::context_menu::MenuLevel::new(entries)],
                                 origin: (mx, my),
-                                submenu_entries: Vec::new(),
-                                submenu_selected: 0,
-                                show_submenu: false,
-                                focus_submenu: false,
                             };
                         } else {
                             // Right-click outside popup: back out.
@@ -4137,13 +4066,8 @@ fn handle_metadata_editor_mouse(
                             let entries = build_metadata_row_context_menu(&state, row);
                             app.pending_metadata_editor = Some(state);
                             app.active_overlay = ActiveOverlay::ContextMenu {
-                                entries,
-                                selected: 0,
+                                levels: vec![super::context_menu::MenuLevel::new(entries)],
                                 origin: (mx, my),
-                                submenu_entries: Vec::new(),
-                                submenu_selected: 0,
-                                show_submenu: false,
-                                focus_submenu: false,
                             };
                         } else {
                             // Right-click on the "+ Add field..." line or
@@ -4160,13 +4084,8 @@ fn handle_metadata_editor_mouse(
                             ];
                             app.pending_metadata_editor = Some(state);
                             app.active_overlay = ActiveOverlay::ContextMenu {
-                                entries,
-                                selected: 0,
+                                levels: vec![super::context_menu::MenuLevel::new(entries)],
                                 origin: (mx, my),
-                                submenu_entries: Vec::new(),
-                                submenu_selected: 0,
-                                show_submenu: false,
-                                focus_submenu: false,
                             };
                         }
                     }
@@ -4684,6 +4603,86 @@ fn recalc_dirty(state: &mut super::app::MetadataEditorState) {
 
 /// Compute the screen rect for a context menu panel, matching
 /// `render_menu_panel` in draw_overlays.rs.
+/// Compute the cascade rects for a stack of menu levels plus an
+/// optional phantom "preview" level. The preview is the children of the
+/// focused level's selected entry when that entry is a Submenu — the
+/// renderer / hover handler treats it as visible but it isn't part of
+/// the navigated stack.
+///
+/// Returns:
+/// - `rects`: one Rect per element, in the same order as `levels`,
+///   followed by the preview rect (if any).
+/// - `preview`: Some((entries, rect_index)) when a preview was added,
+///   else None.
+pub fn context_menu_stack_rects<'a>(
+    levels: &'a [super::context_menu::MenuLevel],
+    origin: (u16, u16),
+    area_w: u16,
+    area_h: u16,
+) -> (Vec<Rect>, Option<(&'a [super::context_menu::ContextMenuEntry], usize)>) {
+    use super::context_menu::{ContextMenuEntry, MAX_CONTEXT_MENU_DEPTH};
+    let mut rects: Vec<Rect> = Vec::with_capacity(levels.len() + 1);
+    if levels.is_empty() {
+        return (rects, None);
+    }
+    let root = context_menu_panel_rect(&levels[0].entries, origin, area_w, area_h);
+    rects.push(root);
+    for i in 1..levels.len() {
+        let parent_rect = rects[i - 1];
+        let parent_entries = &levels[i - 1].entries;
+        let parent_sel = levels[i - 1].selected;
+        let sel_row = super::draw_overlays::selected_entry_row_pub(parent_entries, parent_sel);
+        let sub_x = parent_rect.x + parent_rect.width - 1;
+        let sub_y = parent_rect.y + sel_row + 1;
+        let r = context_menu_panel_rect(&levels[i].entries, (sub_x, sub_y), area_w, area_h);
+        rects.push(r);
+    }
+
+    // Preview: focused level's selected entry, if it's a Submenu and
+    // we have headroom in the depth cap.
+    let mut preview: Option<(&[ContextMenuEntry], usize)> = None;
+    if levels.len() < MAX_CONTEXT_MENU_DEPTH {
+        let focused = &levels[levels.len() - 1];
+        let entries = &focused.entries;
+        let sel = focused.selected;
+        let selectable: Vec<usize> = entries.iter().enumerate()
+            .filter_map(|(i, e)| match e {
+                ContextMenuEntry::Item(item) if item.enabled => Some(i),
+                ContextMenuEntry::Submenu { .. } => Some(i),
+                _ => None,
+            })
+            .collect();
+        if let Some(&idx) = selectable.get(sel) {
+            if let ContextMenuEntry::Submenu { children, .. } = &entries[idx] {
+                let parent_rect = *rects.last().unwrap();
+                let sel_row = super::draw_overlays::selected_entry_row_pub(entries, sel);
+                let pv_x = parent_rect.x + parent_rect.width - 1;
+                let pv_y = parent_rect.y + sel_row + 1;
+                let pv_rect = context_menu_panel_rect(children, (pv_x, pv_y), area_w, area_h);
+                rects.push(pv_rect);
+                preview = Some((children.as_slice(), rects.len() - 1));
+            }
+        }
+    }
+
+    // Width-overflow correction: if cumulative right edge exceeds the
+    // terminal, shift all rects left so the deepest panel sits flush
+    // right. Each rect already clamps its own x via panel_rect, but
+    // the cascade compounds offsets — without this shift, deep panels
+    // would stack on top of each other against the right edge.
+    if let Some(last) = rects.last() {
+        let right = last.x + last.width;
+        if right > area_w {
+            let shift = right - area_w;
+            for r in &mut rects {
+                r.x = r.x.saturating_sub(shift);
+            }
+        }
+    }
+
+    (rects, preview)
+}
+
 fn context_menu_panel_rect(
     entries: &[super::context_menu::ContextMenuEntry],
     origin: (u16, u16),
@@ -4750,52 +4749,48 @@ fn context_menu_hit_test(
 
 /// Handle mouse hover over the context menu — update selected item.
 fn context_menu_mouse_hover(app: &mut AppState, mx: u16, my: u16) {
-    use super::context_menu::ContextMenuEntry;
+    use super::context_menu::MenuLevel;
     let area = crossterm::terminal::size().unwrap_or((80, 24));
 
-    if let ActiveOverlay::ContextMenu {
-        ref entries, ref mut selected, origin,
-        ref mut submenu_entries, ref mut submenu_selected,
-        ref mut show_submenu, ref mut focus_submenu, ..
-    } = app.active_overlay
-    {
-        let parent_rect = context_menu_panel_rect(entries, origin, area.0, area.1);
+    // Extract levels + origin without holding a borrow during mutation.
+    let (mut levels, origin) = match &app.active_overlay {
+        ActiveOverlay::ContextMenu { levels, origin } => (levels.clone(), *origin),
+        _ => return,
+    };
 
-        // Check submenu first (if visible and has focus or mouse is in it).
-        if *show_submenu && !submenu_entries.is_empty() {
-            let sel_row = super::draw_overlays::selected_entry_row_pub(entries, *selected);
-            let sub_x = parent_rect.x + parent_rect.width - 1;
-            let sub_y = parent_rect.y + sel_row + 1;
-            let sub_rect = context_menu_panel_rect(submenu_entries, (sub_x, sub_y), area.0, area.1);
-            if let Some(idx) = context_menu_hit_test(submenu_entries, sub_rect, mx, my) {
-                *submenu_selected = idx;
-                *focus_submenu = true;
-                return;
+    let (rects, preview_owned): (Vec<Rect>, Option<(Vec<super::context_menu::ContextMenuEntry>, usize)>) = {
+        let (r, p) = context_menu_stack_rects(&levels, origin, area.0, area.1);
+        (r, p.map(|(es, idx)| (es.to_vec(), idx)))
+    };
+    let preview = preview_owned.as_ref().map(|(v, i)| (v.as_slice(), *i));
+
+    // Hover priority: deepest panel first (preview, then innermost level).
+    if let Some((preview_entries, preview_idx)) = preview {
+        let pv_rect = rects[preview_idx];
+        if let Some(idx) = context_menu_hit_test(preview_entries, pv_rect, mx, my) {
+            // Hovering the preview promotes it to a real focused level
+            // (truncate any deeper levels — none exist now since preview
+            // sat after the focused level — and push the preview).
+            if levels.len() < super::context_menu::MAX_CONTEXT_MENU_DEPTH {
+                let mut new_level = MenuLevel::new(preview_entries.to_vec());
+                new_level.selected = idx;
+                levels.push(new_level);
+                app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
             }
+            return;
         }
+    }
 
-        // Check parent menu.
-        if let Some(idx) = context_menu_hit_test(entries, parent_rect, mx, my) {
-            *selected = idx;
-            *focus_submenu = false;
-            // Update submenu if hovering a Submenu entry.
-            let selectable: Vec<usize> = entries.iter().enumerate()
-                .filter_map(|(i, e)| match e {
-                    ContextMenuEntry::Item(item) if item.enabled => Some(i),
-                    ContextMenuEntry::Submenu { .. } => Some(i),
-                    _ => None,
-                })
-                .collect();
-            if let Some(&entry_idx) = selectable.get(idx) {
-                if let ContextMenuEntry::Submenu { children, .. } = &entries[entry_idx] {
-                    *submenu_entries = children.clone();
-                    *submenu_selected = 0;
-                    *show_submenu = true;
-                } else {
-                    *show_submenu = false;
-                    *submenu_entries = Vec::new();
-                }
-            }
+    // Walk visible levels from deepest to shallowest. Hovering an
+    // ancestor truncates the stack to that level (drops cascaded
+    // children) and updates its selection.
+    for level_idx in (0..levels.len()).rev() {
+        let entries = levels[level_idx].entries.clone();
+        if let Some(idx) = context_menu_hit_test(&entries, rects[level_idx], mx, my) {
+            levels.truncate(level_idx + 1);
+            levels[level_idx].selected = idx;
+            app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
+            return;
         }
     }
 }
@@ -4810,73 +4805,89 @@ fn context_menu_mouse_click(
     tx: &mpsc::Sender<AppMessage>,
     invert: bool,
 ) -> bool {
-    use super::context_menu::ContextMenuEntry;
+    use super::context_menu::{ContextMenuEntry, MenuLevel, MAX_CONTEXT_MENU_DEPTH};
     let area = crossterm::terminal::size().unwrap_or((80, 24));
 
-    // Extract state — we need to close the overlay before executing.
-    let (entries, selected, origin, submenu_entries, _submenu_selected,
-         show_submenu, _focus_submenu) = match &app.active_overlay {
-        ActiveOverlay::ContextMenu {
-            entries, selected, origin,
-            submenu_entries, submenu_selected,
-            show_submenu, focus_submenu,
-        } => (
-            entries.clone(), *selected, *origin,
-            submenu_entries.clone(), *submenu_selected,
-            *show_submenu, *focus_submenu,
-        ),
+    let (mut levels, origin) = match &app.active_overlay {
+        ActiveOverlay::ContextMenu { levels, origin } => (levels.clone(), *origin),
         _ => return false,
     };
 
-    let parent_rect = context_menu_panel_rect(&entries, origin, area.0, area.1);
+    // Compute rects + preview, then immediately clone the preview's
+    // entries so we can drop the borrow on `levels` before mutating it.
+    let (rects, preview_owned): (Vec<Rect>, Option<(Vec<ContextMenuEntry>, usize)>) = {
+        let (r, p) = context_menu_stack_rects(&levels, origin, area.0, area.1);
+        (r, p.map(|(es, idx)| (es.to_vec(), idx)))
+    };
+    let preview = preview_owned.as_ref().map(|(v, i)| (v.as_slice(), *i));
 
-    // Check submenu first.
-    if show_submenu && !submenu_entries.is_empty() {
-        let sel_row = super::draw_overlays::selected_entry_row_pub(&entries, selected);
-        let sub_x = parent_rect.x + parent_rect.width - 1;
-        let sub_y = parent_rect.y + sel_row + 1;
-        let sub_rect = context_menu_panel_rect(&submenu_entries, (sub_x, sub_y), area.0, area.1);
-        if let Some(idx) = context_menu_hit_test(&submenu_entries, sub_rect, mx, my) {
-            // Find the actual entry at this selectable index.
-            let mut count = 0;
-            for e in &submenu_entries {
-                let is_sel = matches!(e, ContextMenuEntry::Item(item) if item.enabled)
-                    || matches!(e, ContextMenuEntry::Submenu { .. });
-                if is_sel {
-                    if count == idx {
-                        if let ContextMenuEntry::Item(item) = e {
-                            let action = item.action.clone();
-                            run_context_action_restoring_parked(app, action, tx, invert);
+    /// Map a selectable index to the entry-list position it represents.
+    fn entry_index_at(entries: &[ContextMenuEntry], selectable_idx: usize) -> Option<usize> {
+        let mut count = 0;
+        for (i, e) in entries.iter().enumerate() {
+            let is_sel = matches!(e, ContextMenuEntry::Item(item) if item.enabled)
+                || matches!(e, ContextMenuEntry::Submenu { .. });
+            if is_sel {
+                if count == selectable_idx { return Some(i); }
+                count += 1;
+            }
+        }
+        None
+    }
+
+    // Click priority: preview first, then innermost level outward.
+    if let Some((preview_entries, preview_idx)) = preview {
+        if let Some(idx) = context_menu_hit_test(preview_entries, rects[preview_idx], mx, my) {
+            if let Some(entry_idx) = entry_index_at(preview_entries, idx) {
+                match &preview_entries[entry_idx] {
+                    ContextMenuEntry::Item(item) => {
+                        let action = item.action.clone();
+                        run_context_action_restoring_parked(app, action, tx, invert);
+                        return true;
+                    }
+                    ContextMenuEntry::Submenu { children, .. } => {
+                        // Promote preview to focused. Push the child too
+                        // if depth permits; otherwise the next render's
+                        // preview computation will surface it.
+                        if levels.len() < MAX_CONTEXT_MENU_DEPTH {
+                            let mut new_level = MenuLevel::new(preview_entries.to_vec());
+                            new_level.selected = idx;
+                            levels.push(new_level);
+                            if levels.len() < MAX_CONTEXT_MENU_DEPTH {
+                                levels.push(MenuLevel::new(children.clone()));
+                            }
+                            app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
                             return true;
                         }
                     }
-                    count += 1;
+                    _ => {}
                 }
             }
         }
     }
 
-    // Check parent menu.
-    if let Some(idx) = context_menu_hit_test(&entries, parent_rect, mx, my) {
-        let selectable: Vec<usize> = entries.iter().enumerate()
-            .filter_map(|(i, e)| match e {
-                ContextMenuEntry::Item(item) if item.enabled => Some(i),
-                ContextMenuEntry::Submenu { .. } => Some(i),
-                _ => None,
-            })
-            .collect();
-        if let Some(&entry_idx) = selectable.get(idx) {
-            match &entries[entry_idx] {
-                ContextMenuEntry::Item(item) => {
-                    let action = item.action.clone();
-                    run_context_action_restoring_parked(app, action, tx, invert);
-                    return true;
+    for level_idx in (0..levels.len()).rev() {
+        let entries = levels[level_idx].entries.clone();
+        if let Some(idx) = context_menu_hit_test(&entries, rects[level_idx], mx, my) {
+            if let Some(entry_idx) = entry_index_at(&entries, idx) {
+                match &entries[entry_idx] {
+                    ContextMenuEntry::Item(item) => {
+                        let action = item.action.clone();
+                        run_context_action_restoring_parked(app, action, tx, invert);
+                        return true;
+                    }
+                    ContextMenuEntry::Submenu { children, .. } => {
+                        // Truncate to this level, set its selection, push child.
+                        levels.truncate(level_idx + 1);
+                        levels[level_idx].selected = idx;
+                        if levels.len() < MAX_CONTEXT_MENU_DEPTH {
+                            levels.push(MenuLevel::new(children.clone()));
+                        }
+                        app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
+                        return true;
+                    }
+                    _ => {}
                 }
-                ContextMenuEntry::Submenu { .. } => {
-                    // Clicking a submenu parent just focuses it (hover already opened it).
-                    return true;
-                }
-                _ => {}
             }
         }
     }

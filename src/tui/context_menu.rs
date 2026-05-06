@@ -12,6 +12,25 @@ use crate::convert::ConversionStatus;
 
 // ── Data structures ─────────────────────────────────────────────────
 
+/// Hard cap on the cascade depth of context menus. The active overlay
+/// stores `Vec<MenuLevel>` and refuses to push beyond this depth.
+pub const MAX_CONTEXT_MENU_DEPTH: usize = 4;
+
+/// One panel in the cascade. The deepest level is the focused one;
+/// ancestor levels stay visible with a muted border, their selected
+/// row marking the breadcrumb.
+#[derive(Debug, Clone)]
+pub struct MenuLevel {
+    pub entries: Vec<ContextMenuEntry>,
+    pub selected: usize,
+}
+
+impl MenuLevel {
+    pub fn new(entries: Vec<ContextMenuEntry>) -> Self {
+        Self { entries, selected: 0 }
+    }
+}
+
 /// A single item in a context menu.
 #[derive(Debug, Clone)]
 pub struct ContextMenuItem {
@@ -302,13 +321,23 @@ fn build_verify_submenu() -> ContextMenuEntry {
         children: vec![
             item("Verify integrity", ContextAction::Verify),
             separator(),
-            item("AccurateRip", ContextAction::VerifyAccurateRip),
-            item("AccurateRip (full scan)", ContextAction::AccurateRipFullScan),
-            item("AccurateRip batch", ContextAction::AccurateRipBatch),
-            item("AccurateRip fix offset", ContextAction::AccurateRipFixOffset),
-            separator(),
-            item("CUETools DB", ContextAction::VerifyCtdb),
-            item("CUETools DB repair", ContextAction::CtdbRepair),
+            ContextMenuEntry::Submenu {
+                label: "AccurateRip".to_string(),
+                children: vec![
+                    item("Verify (common offsets)", ContextAction::VerifyAccurateRip),
+                    item("Verify (full offset scan)", ContextAction::AccurateRipFullScan),
+                    item("Batch verify directory", ContextAction::AccurateRipBatch),
+                    separator(),
+                    item("Fix offset", ContextAction::AccurateRipFixOffset),
+                ],
+            },
+            ContextMenuEntry::Submenu {
+                label: "CUETools DB".to_string(),
+                children: vec![
+                    item("Verify", ContextAction::VerifyCtdb),
+                    item("Reed-Solomon repair", ContextAction::CtdbRepair),
+                ],
+            },
         ],
     }
 }
@@ -1158,4 +1187,78 @@ fn launch_single_image_gnudb(
 fn resolve_convert_start(app: &AppState, invert: bool) -> bool {
     let default_is_start = app.config.ui.convert_default_action != "enqueue";
     default_is_start ^ invert
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf(label: &str) -> ContextMenuEntry {
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: label.to_string(),
+            action: ContextAction::Refresh, // dummy
+            shortcut: None,
+            enabled: true,
+        })
+    }
+
+    fn submenu(label: &str, children: Vec<ContextMenuEntry>) -> ContextMenuEntry {
+        ContextMenuEntry::Submenu { label: label.to_string(), children }
+    }
+
+    /// Synthesize a 4-deep cascade: A > B > C > D.
+    fn deep_4_menu() -> ContextMenuEntry {
+        submenu("A", vec![
+            submenu("B", vec![
+                submenu("C", vec![
+                    leaf("D-1"),
+                    leaf("D-2"),
+                ]),
+                leaf("C-leaf"),
+            ]),
+            leaf("B-leaf"),
+        ])
+    }
+
+    #[test]
+    fn deep_menu_compiles_and_nests_4_levels() {
+        let root = deep_4_menu();
+        // Walk the structure to confirm all 4 levels are reachable.
+        let ContextMenuEntry::Submenu { children: c1, .. } = &root else {
+            panic!("expected level-1 submenu");
+        };
+        let ContextMenuEntry::Submenu { children: c2, .. } = &c1[0] else {
+            panic!("expected level-2 submenu");
+        };
+        let ContextMenuEntry::Submenu { children: c3, .. } = &c2[0] else {
+            panic!("expected level-3 submenu (C)");
+        };
+        // Level 4 is the items inside C.
+        assert_eq!(c3.len(), 2);
+        assert!(matches!(c3[0], ContextMenuEntry::Item(_)));
+    }
+
+    #[test]
+    fn menu_level_starts_at_zero() {
+        let level = MenuLevel::new(vec![leaf("a"), leaf("b")]);
+        assert_eq!(level.selected, 0);
+        assert_eq!(level.entries.len(), 2);
+    }
+
+    #[test]
+    fn max_depth_is_four() {
+        assert_eq!(MAX_CONTEXT_MENU_DEPTH, 4);
+    }
+
+    #[test]
+    fn verify_submenu_is_three_levels() {
+        // The Verify submenu is now: Verify > {AccurateRip, CUETools DB} > leaves.
+        let v = build_verify_submenu();
+        let ContextMenuEntry::Submenu { children, .. } = v else {
+            panic!("Verify must be a Submenu");
+        };
+        // At least one child should itself be a Submenu (AccurateRip).
+        let has_nested = children.iter().any(|e| matches!(e, ContextMenuEntry::Submenu { .. }));
+        assert!(has_nested, "expected nested submenu inside Verify");
+    }
 }

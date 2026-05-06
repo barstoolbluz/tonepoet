@@ -785,23 +785,15 @@ pub enum ActiveOverlay {
         scroll: usize,
     },
     /// Context menu triggered by right-click or `m` keybinding.
-    /// Two-level side-by-side model (hexload-tui pattern): the parent
-    /// menu is always visible; when the cursor is on a `Submenu` entry,
-    /// its children appear as a second panel to the right. Both are
-    /// visible simultaneously.
+    /// Stack-based cascade model: each level appears as a panel to the
+    /// right of its parent (hexload-tui pattern, generalized to N
+    /// levels). The deepest level is the one with keyboard focus;
+    /// ancestor panels stay visible (Windows-style). Depth is capped
+    /// at `MAX_CONTEXT_MENU_DEPTH` (4).
     ContextMenu {
-        entries: Vec<crate::tui::context_menu::ContextMenuEntry>,
-        selected: usize,
+        levels: Vec<crate::tui::context_menu::MenuLevel>,
+        /// Anchor for the root level (right-click position).
         origin: (u16, u16),
-        /// Child submenu (populated when the selected parent entry is
-        /// a `Submenu` variant). Cleared when cursor moves to a
-        /// non-Submenu item.
-        submenu_entries: Vec<crate::tui::context_menu::ContextMenuEntry>,
-        submenu_selected: usize,
-        show_submenu: bool,
-        /// True when keyboard focus is in the submenu (Right opened it).
-        /// False when focus is in the parent menu.
-        focus_submenu: bool,
     },
     /// Bulk rename wizard overlay. Boxed because the state is large.
     BulkRename(Box<BulkRenameState>),

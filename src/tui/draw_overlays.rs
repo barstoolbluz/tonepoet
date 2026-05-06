@@ -87,16 +87,8 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::BatchList { scroll } => {
             draw_batch_list(f, app, scroll);
         }
-        ActiveOverlay::ContextMenu {
-            ref entries, selected, origin,
-            ref submenu_entries, submenu_selected,
-            show_submenu, focus_submenu,
-        } => {
-            draw_context_menu_side_by_side(
-                f, entries, selected, origin,
-                submenu_entries, submenu_selected,
-                show_submenu, focus_submenu,
-            );
+        ActiveOverlay::ContextMenu { ref levels, origin } => {
+            draw_context_menu_stack(f, levels, origin);
         }
         ActiveOverlay::BulkRename(ref state) => {
             let state = state.clone();
@@ -162,39 +154,48 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     }
 }
 
-/// Draw a context menu with optional side-by-side submenu (hexload-tui
-/// pattern). Parent menu at `origin`; when `show_submenu` is true, the
-/// child appears to the right of the selected parent item.
-#[allow(clippy::too_many_arguments)]
-fn draw_context_menu_side_by_side(
+/// Draw a stack of cascading context-menu panels. The deepest level
+/// (`levels.last()`) is the focused one (AMBER border); ancestor levels
+/// keep their selected row highlighted but render with a muted border.
+/// When the focused level's selected entry is a Submenu, its children
+/// are rendered as a "preview" panel after the focused panel — also
+/// muted, since the user hasn't explicitly entered it yet.
+fn draw_context_menu_stack(
     f: &mut Frame,
-    entries: &[super::context_menu::ContextMenuEntry],
-    selected: usize,
+    levels: &[super::context_menu::MenuLevel],
     origin: (u16, u16),
-    submenu_entries: &[super::context_menu::ContextMenuEntry],
-    submenu_selected: usize,
-    show_submenu: bool,
-    focus_submenu: bool,
 ) {
+    if levels.is_empty() { return; }
     let area = f.size();
 
-    // Draw parent menu.
-    let parent_rect = render_menu_panel(
-        f, entries, selected, origin, area,
-        !focus_submenu, // highlighted border when focused
+    // Reuse the same geometry helper that hover/click use, so all three
+    // paths agree on rect placement (incl. width-overflow shift).
+    let (rects, preview) = super::keybindings::context_menu_stack_rects(
+        levels, origin, area.width, area.height,
     );
 
-    // Draw submenu to the right if active.
-    if show_submenu && !submenu_entries.is_empty() {
-        let sub_x = parent_rect.x + parent_rect.width - 1;
-        let sub_y = parent_rect.y + selected_entry_row(entries, selected) + 1;
-        render_menu_panel(
+    let focused_idx = levels.len() - 1;
+    for (i, level) in levels.iter().enumerate() {
+        let has_focus = i == focused_idx;
+        let _ = render_menu_panel_at(
             f,
-            submenu_entries,
-            submenu_selected,
-            (sub_x, sub_y),
-            area,
-            focus_submenu,
+            &level.entries,
+            level.selected,
+            rects[i],
+            has_focus,
+        );
+    }
+
+    if let Some((preview_entries, rect_idx)) = preview {
+        // Preview is unfocused and has no selection — pass usize::MAX
+        // so neither the focus highlight nor the is-expanded breadcrumb
+        // highlight fires on any row.
+        let _ = render_menu_panel_at(
+            f,
+            preview_entries,
+            usize::MAX,
+            rects[rect_idx],
+            false,
         );
     }
 }
@@ -231,12 +232,13 @@ fn selected_entry_row(
 
 /// Render a single menu panel at the given origin, clipped to `area`.
 /// Returns the actual Rect used (for positioning child menus).
-fn render_menu_panel(
+/// Render a menu panel at a precomputed `Rect` (used by the
+/// stack renderer, which gets rects from `context_menu_stack_rects`).
+fn render_menu_panel_at(
     f: &mut Frame,
     entries: &[super::context_menu::ContextMenuEntry],
     selected: usize,
-    origin: (u16, u16),
-    area: Rect,
+    popup: Rect,
     has_focus: bool,
 ) -> Rect {
     use super::context_menu::ContextMenuEntry;
@@ -244,30 +246,6 @@ fn render_menu_panel(
     if entries.is_empty() {
         return Rect::default();
     }
-
-    let max_label_w: usize = entries
-        .iter()
-        .filter_map(|e| match e {
-            ContextMenuEntry::Item(item) => {
-                let shortcut_w = item
-                    .shortcut
-                    .as_ref()
-                    .map(|s| s.chars().count() + 3)
-                    .unwrap_or(0);
-                Some(item.label.chars().count() + shortcut_w)
-            }
-            ContextMenuEntry::Submenu { label, .. } => Some(label.chars().count() + 2),
-            ContextMenuEntry::Separator => None,
-        })
-        .max()
-        .unwrap_or(10);
-
-    let menu_w = (max_label_w + 4).min(area.width as usize) as u16;
-    let menu_h = (entries.len() + 2).min(area.height as usize) as u16;
-
-    let x = origin.0.min(area.width.saturating_sub(menu_w));
-    let y = origin.1.min(area.height.saturating_sub(menu_h));
-    let popup = Rect::new(x, y, menu_w, menu_h);
 
     f.render_widget(Clear, popup);
     let border_color = if has_focus { theme::AMBER } else { theme::BORDER_DIM };
