@@ -662,6 +662,90 @@ pub fn toggle_mb_revert(entry: &mut TagEntry) {
     }
 }
 
+/// Field-level pill state for the metadata-editor *detail* overlay.
+/// Operates on `per_file_values` instead of the displayed `value`, so it
+/// remains meaningful when the field shows `<multiple values>` in the
+/// main editor (where the value-based [`mb_pill_state`] would return
+/// `None`).
+///
+/// Returns:
+/// - `Revert` when current per-file values match the MB-proposed set
+///   (broadcasting `mb_proposed_value` if `mb_proposed_per_file` is None)
+/// - `UseMb` when current per-file values match the pre-MB originals
+/// - `None` when MB never touched this field, or the user has manually
+///   edited some files (toggle would be ambiguous)
+pub fn mb_pill_state_field(entry: &TagEntry) -> MbRevertPill {
+    let Some(ref proposed) = entry.mb_proposed_value else {
+        return MbRevertPill::None;
+    };
+    let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
+        Some(v) => v.clone(),
+        None => vec![proposed.clone(); entry.per_file_values.len()],
+    };
+    if entry.per_file_values == proposed_per_file {
+        MbRevertPill::Revert
+    } else if entry.per_file_values == entry.per_file_originals {
+        MbRevertPill::UseMb
+    } else {
+        MbRevertPill::None
+    }
+}
+
+/// Field-level revert toggle. Swaps `per_file_values` between the
+/// MB-proposed set and the pre-MB originals, recomputing `value` and
+/// `is_mixed`. No-op when MB never touched this field, or the user has
+/// manually edited (state isn't either endpoint).
+pub fn toggle_mb_revert_field(entry: &mut TagEntry) {
+    let Some(ref proposed) = entry.mb_proposed_value else { return; };
+    let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
+        Some(v) => v.clone(),
+        None => vec![proposed.clone(); entry.per_file_values.len()],
+    };
+
+    if entry.per_file_values == proposed_per_file {
+        entry.per_file_values = entry.per_file_originals.clone();
+    } else if entry.per_file_values == entry.per_file_originals {
+        entry.per_file_values = proposed_per_file;
+    } else {
+        return;
+    }
+
+    recompute_aggregate_value(entry);
+}
+
+/// Restore action for the detail overlay: discard any per-file user
+/// edits and snap `per_file_values` back to the as-retrieved MB
+/// proposal. Broadcasts `mb_proposed_value` when `mb_proposed_per_file`
+/// is None. No-op when MB never touched the field.
+pub fn restore_mb_proposed(entry: &mut TagEntry) {
+    let Some(ref proposed) = entry.mb_proposed_value else { return; };
+    let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
+        Some(v) => v.clone(),
+        None => vec![proposed.clone(); entry.per_file_values.len()],
+    };
+    entry.per_file_values = proposed_per_file;
+    recompute_aggregate_value(entry);
+}
+
+/// True when MB populated this field, so the detail overlay should
+/// surface a [restore] pill.
+pub fn entry_has_mb_proposed(entry: &TagEntry) -> bool {
+    entry.mb_proposed_value.is_some()
+}
+
+/// Re-derive `value` and `is_mixed` from `per_file_values`. Used after
+/// any field-level mutation that touches the per-file vector.
+fn recompute_aggregate_value(entry: &mut TagEntry) {
+    let n = entry.per_file_values.len();
+    let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+    entry.is_mixed = !all_same && n > 1;
+    entry.value = if entry.is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        entry.per_file_values.first().cloned().unwrap_or_default()
+    };
+}
+
 /// Extract a track number from a filename stem by taking leading digits.
 /// Returns 0 if no leading digits found.
 /// Examples: "01 - Foo" → 1, "Track 03" → 3, "Foo" → 0.

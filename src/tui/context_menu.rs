@@ -118,6 +118,15 @@ pub enum ContextAction {
     MetadataRestoreEntry,
     /// MetadataEditor: open the "add new field" input.
     MetadataAddField,
+    /// MetadataEditor detail overlay: field-level revert toggle
+    /// (operates on per_file_values).
+    MetadataDetailToggleRevert,
+    /// MetadataEditor detail overlay: snap per_file_values back to the
+    /// as-retrieved MB proposal.
+    MetadataDetailRestore,
+    /// MetadataEditor detail overlay: leave detail mode, back to the
+    /// field list.
+    MetadataDetailBack,
     /// MbSelect: accept the parked picker's currently-cursored row
     /// (open metadata editor populated from that release).
     MbSelectAcceptCurrent,
@@ -760,6 +769,33 @@ pub fn execute_context_action(
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 state.add_key_input = Some(super::text_input::TextInputState::empty());
                 state.phase = super::app::MetadataEditorPhase::AddingKey;
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataDetailToggleRevert => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let idx = state.detail_field_idx;
+                if let Some(entry) = state.entries.get_mut(idx) {
+                    super::probe::toggle_mb_revert_field(entry);
+                    state.dirty = super::probe::metadata_editor_has_changes(&state);
+                }
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataDetailRestore => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let idx = state.detail_field_idx;
+                if let Some(entry) = state.entries.get_mut(idx) {
+                    super::probe::restore_mb_proposed(entry);
+                    state.dirty = super::probe::metadata_editor_has_changes(&state);
+                }
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataDetailBack => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                state.detail_edit = None;
+                state.phase = super::app::MetadataEditorPhase::Editing;
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
         }

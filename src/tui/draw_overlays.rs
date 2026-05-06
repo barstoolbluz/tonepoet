@@ -1263,7 +1263,7 @@ fn draw_metadata_editor(
 
     // Detail edit mode: show per-file values for one field.
     if state.phase == MetadataEditorPhase::DetailEdit {
-        draw_metadata_detail(f, state, chunks[0], chunks[1], inner_w, content_h);
+        draw_metadata_detail(f, state, chunks[0], chunks[1], inner_w, content_h, button_map);
         return;
     }
 
@@ -1492,7 +1492,15 @@ fn draw_metadata_editor(
             Style::default().fg(theme::TEXT_BRIGHT)
         };
 
-        let pill = super::probe::mb_pill_state(entry);
+        // Hide the bulk pill on rows showing `<multiple values>`; the
+        // detail overlay surfaces a field-level pill + restore for
+        // those, since toggling a single value across diverging files
+        // would silently clobber per-file edits the user can't see here.
+        let pill = if entry.is_mixed {
+            super::probe::MbRevertPill::None
+        } else {
+            super::probe::mb_pill_state(entry)
+        };
         let pill_text = match pill {
             super::probe::MbRevertPill::None => "",
             super::probe::MbRevertPill::Revert => " [revert]",
@@ -1633,6 +1641,7 @@ fn draw_metadata_detail(
     footer_area: Rect,
     inner_w: usize,
     content_h: usize,
+    button_map: &mut super::button_map::ButtonRenderMap,
 ) {
     let field_idx = state.detail_field_idx;
     let entry = match state.entries.get(field_idx) {
@@ -1747,9 +1756,14 @@ fn draw_metadata_detail(
         ]);
         Line::from(pills)
     } else {
-        // Browsing per-file values.
+        // Browsing per-file values. Append [revert]/[use MB] +
+        // [restore] pills when MB populated this field, so the
+        // bulk-edit affordances are reachable when the field shows
+        // <multiple values> in the main editor (where the per-row
+        // pill is hidden).
         let mut pills = Vec::new();
-        if let Some(entry) = state.entries.get(state.detail_field_idx) {
+        let entry_opt = state.entries.get(state.detail_field_idx);
+        if let Some(entry) = entry_opt {
             if super::command::is_cue_importable(&entry.display_key) {
                 pills.push(footer_pill(
                     &format!(":import-cue ({})", entry.display_key),
@@ -1763,7 +1777,75 @@ fn draw_metadata_detail(
             pill_gap(),
             footer_pill("Esc back", theme::PURPLE),
         ]);
-        Line::from(pills)
+        let mut revert_offset: Option<u16> = None;
+        let mut revert_w_chars: u16 = 0;
+        let mut restore_offset: Option<u16> = None;
+        let mut restore_w_chars: u16 = 0;
+        if let Some(entry) = entry_opt {
+            if super::probe::entry_has_mb_proposed(entry) {
+                let pill_state = super::probe::mb_pill_state_field(entry);
+                let revert_label_opt = match pill_state {
+                    super::probe::MbRevertPill::Revert => Some(" [revert] "),
+                    super::probe::MbRevertPill::UseMb => Some(" [use MB] "),
+                    super::probe::MbRevertPill::None => None,
+                };
+                let restore_label = " [restore] ";
+                pills.push(pill_gap());
+                // Track offsets in chars from start of the footer line
+                // for click-rect registration.
+                let mut running: u16 = 0;
+                for span in &pills {
+                    running += span.content.chars().count() as u16;
+                }
+                if let Some(label) = revert_label_opt {
+                    let revert_style = match pill_state {
+                        super::probe::MbRevertPill::Revert => {
+                            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+                        }
+                        super::probe::MbRevertPill::UseMb => {
+                            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)
+                        }
+                        super::probe::MbRevertPill::None => Style::default(),
+                    };
+                    revert_w_chars = label.chars().count() as u16;
+                    revert_offset = Some(running);
+                    pills.push(Span::styled(label.to_string(), revert_style));
+                    running += revert_w_chars;
+                    pills.push(pill_gap());
+                    running += 1;
+                }
+                restore_w_chars = restore_label.chars().count() as u16;
+                restore_offset = Some(running);
+                pills.push(Span::styled(
+                    restore_label.to_string(),
+                    Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        let footer_line = Line::from(pills);
+        let total_chars = footer_line.spans.iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>() as u16;
+        // Center the line manually so we can compute pill rects.
+        let render_x = footer_area.x
+            + (footer_area.width.saturating_sub(total_chars)) / 2;
+        f.render_widget(
+            Paragraph::new(footer_line),
+            Rect::new(render_x, footer_area.y, total_chars, 1),
+        );
+        if let Some(off) = revert_offset {
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataDetailRevert,
+                Rect::new(render_x + off, footer_area.y, revert_w_chars, 1),
+            );
+        }
+        if let Some(off) = restore_offset {
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataDetailRestore,
+                Rect::new(render_x + off, footer_area.y, restore_w_chars, 1),
+            );
+        }
+        return;
     };
     f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), footer_area);
 }

@@ -82,6 +82,11 @@ pub enum TuiButton {
     /// MetadataEditor per-row revert/use-MB pill. Argument is the
     /// 0-based index into `MetadataEditorState.entries`.
     MetadataEntryRevert(usize),
+    /// MetadataEditor detail-overlay field-level revert/use-MB pill.
+    MetadataDetailRevert,
+    /// MetadataEditor detail-overlay restore pill (per-file values
+    /// snap back to the as-retrieved MB proposal).
+    MetadataDetailRestore,
 
     /// MbSelect overlay: clickable row (0-based index into `releases`).
     MbSelectRow(usize),
@@ -131,6 +136,8 @@ impl TuiButton {
             | Self::OverlayConfirm
             | Self::OverlayCancel
             | Self::MetadataEntryRevert(_)
+            | Self::MetadataDetailRevert
+            | Self::MetadataDetailRestore
             | Self::MbSelectRow(_)
             | Self::MbSelectAccept
             | Self::MbSelectCancel

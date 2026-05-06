@@ -3688,6 +3688,47 @@ fn build_cue_preview_context_menu(line_idx: Option<usize>, is_editing: bool)
     entries
 }
 
+/// Build the context menu for the metadata-editor detail overlay
+/// (right-click while browsing per-file values).
+fn build_metadata_detail_context_menu(state: &super::app::MetadataEditorState)
+    -> Vec<super::context_menu::ContextMenuEntry>
+{
+    use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
+    let mut entries: Vec<ContextMenuEntry> = Vec::new();
+    if let Some(entry) = state.entries.get(state.detail_field_idx) {
+        if super::probe::entry_has_mb_proposed(entry) {
+            let pill = super::probe::mb_pill_state_field(entry);
+            let label = match pill {
+                super::probe::MbRevertPill::Revert => Some("Revert to file values"),
+                super::probe::MbRevertPill::UseMb => Some("Use MusicBrainz values"),
+                super::probe::MbRevertPill::None => None,
+            };
+            if let Some(l) = label {
+                entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                    label: l.to_string(),
+                    action: ContextAction::MetadataDetailToggleRevert,
+                    shortcut: Some(":revert".to_string()),
+                    enabled: true,
+                }));
+            }
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Restore (snap to MB values)".to_string(),
+                action: ContextAction::MetadataDetailRestore,
+                shortcut: Some(":restore".to_string()),
+                enabled: true,
+            }));
+            entries.push(ContextMenuEntry::Separator);
+        }
+    }
+    entries.push(ContextMenuEntry::Item(ContextMenuItem {
+        label: "Back to field list".to_string(),
+        action: ContextAction::MetadataDetailBack,
+        shortcut: Some("Esc".to_string()),
+        enabled: true,
+    }));
+    entries
+}
+
 /// Mouse handler for the CuePreview overlay.
 fn handle_cue_preview_mouse(
     app: &mut AppState,
@@ -4062,9 +4103,31 @@ fn handle_metadata_editor_mouse(
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     }
                     MetadataEditorPhase::DetailEdit => {
-                        state.detail_edit = None;
-                        state.phase = MetadataEditorPhase::Editing;
-                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        // While inline-editing a per-file value, right-click
+                        // cancels the edit (preserves prior nuance). While
+                        // browsing per-file values, right-click opens a
+                        // context menu with field-level actions.
+                        if state.detail_edit.is_some() {
+                            state.detail_edit = None;
+                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        } else if in_popup {
+                            let entries = build_metadata_detail_context_menu(&state);
+                            app.pending_metadata_editor = Some(state);
+                            app.active_overlay = ActiveOverlay::ContextMenu {
+                                entries,
+                                selected: 0,
+                                origin: (mx, my),
+                                submenu_entries: Vec::new(),
+                                submenu_selected: 0,
+                                show_submenu: false,
+                                focus_submenu: false,
+                            };
+                        } else {
+                            // Right-click outside popup: back out.
+                            state.detail_edit = None;
+                            state.phase = MetadataEditorPhase::Editing;
+                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        }
                     }
                     MetadataEditorPhase::Editing if in_content => {
                         // Compute the clicked row (entry index).
@@ -4441,6 +4504,33 @@ fn handle_metadata_editor_mouse(
                         }
                     }
                 } else if state.phase == MetadataEditorPhase::DetailEdit {
+                    // Field-level revert / restore pills (only present
+                    // in browsing mode, when MB populated the field).
+                    if state.detail_edit.is_none() {
+                        match app.button_map.find_button_at(mx, my) {
+                            Some(super::button_map::TuiButton::MetadataDetailRevert) => {
+                                if let Some(entry) =
+                                    state.entries.get_mut(state.detail_field_idx)
+                                {
+                                    super::probe::toggle_mb_revert_field(entry);
+                                }
+                                state.dirty = super::probe::metadata_editor_has_changes(&state);
+                                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                return;
+                            }
+                            Some(super::button_map::TuiButton::MetadataDetailRestore) => {
+                                if let Some(entry) =
+                                    state.entries.get_mut(state.detail_field_idx)
+                                {
+                                    super::probe::restore_mb_proposed(entry);
+                                }
+                                state.dirty = super::probe::metadata_editor_has_changes(&state);
+                                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
                     // Dynamic pills: [:import-cue (FIELD)] if CUE-compatible, Enter, Esc.
                     let cue_label: String;
                     let mut pills: Vec<(&str, &str)> = Vec::new();
@@ -6953,8 +7043,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     }
                 }
             }
-            // MbSelect / CuePreview buttons are handled directly in their
-            // dedicated mouse handlers before reaching this generic dispatch.
+            // MbSelect / CuePreview / MetadataEditor-detail buttons are
+            // handled directly in their dedicated mouse handlers before
+            // reaching this generic dispatch.
             TuiButton::MbSelectRow(_)
             | TuiButton::MbSelectAccept
             | TuiButton::MbSelectCancel
@@ -6964,7 +7055,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::CuePreviewTop
             | TuiButton::CuePreviewBottom
             | TuiButton::CuePreviewEditCommit
-            | TuiButton::CuePreviewEditCancel => {}
+            | TuiButton::CuePreviewEditCancel
+            | TuiButton::MetadataDetailRevert
+            | TuiButton::MetadataDetailRestore => {}
         }
     }
 }

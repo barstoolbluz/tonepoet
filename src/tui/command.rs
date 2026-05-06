@@ -49,6 +49,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "import-cue", "cue", "cue!", "cue-mb", "cue-mb!", "cue-fill", "cue-enrich",
     "tags-mb", "mb-tags", "musicbrainz-tags",
     "revert",
+    "restore",
     "g", "G", "top", "bot", "bottom",
     "fix-caps", "fixcaps",
     "search", "s", "rs", "rsearch",
@@ -278,6 +279,7 @@ pub enum Command {
     /// No-op when the row wasn't touched by MB or has been manually
     /// edited away from both endpoints.
     MbRevert,
+    MbRestore,
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -406,6 +408,7 @@ pub fn parse_command(input: &str) -> Command {
         "cue-fill" | "cue-enrich" => Command::CueFill,
         "tags-mb" | "mb-tags" | "musicbrainz-tags" => Command::TagsFromMb,
         "revert" => Command::MbRevert,
+        "restore" => Command::MbRestore,
         "g" | "top" => Command::CueScrollTop,
         "G" | "bot" | "bottom" => Command::CueScrollBottom,
         "preemphasis" | "preemph" | "pe" => Command::DetectPreemphasis,
@@ -1362,22 +1365,66 @@ pub fn execute_command(
                 app.set_status(":revert only works in the metadata editor");
                 return;
             };
-            let cursor = state.cursor;
-            if let Some(entry) = state.entries.get_mut(cursor) {
-                let pill_before = super::probe::mb_pill_state(entry);
-                if matches!(pill_before, super::probe::MbRevertPill::None) {
-                    app.set_status(":revert: cursor row was not changed by MusicBrainz");
+            // In the detail overlay, :revert is a field-level toggle
+            // (operates on per_file_values vs the MB-proposed set).
+            // Outside, it's the cursor-row value-based toggle.
+            let in_detail = state.phase == super::app::MetadataEditorPhase::DetailEdit;
+            let target_idx = if in_detail { state.detail_field_idx } else { state.cursor };
+            if let Some(entry) = state.entries.get_mut(target_idx) {
+                if in_detail {
+                    let pill_before = super::probe::mb_pill_state_field(entry);
+                    if matches!(pill_before, super::probe::MbRevertPill::None) {
+                        app.set_status(":revert: field was not changed by MusicBrainz, or has manual edits");
+                    } else {
+                        super::probe::toggle_mb_revert_field(entry);
+                        let after = super::probe::mb_pill_state_field(entry);
+                        let display_key = entry.display_key.clone();
+                        state.dirty = super::probe::metadata_editor_has_changes(&state);
+                        let label = match after {
+                            super::probe::MbRevertPill::Revert => "applied MB values",
+                            super::probe::MbRevertPill::UseMb => "reverted to file values",
+                            super::probe::MbRevertPill::None => "no change",
+                        };
+                        app.set_status(format!(":revert: {} ({})", display_key, label));
+                    }
                 } else {
-                    super::probe::toggle_mb_revert(entry);
-                    let after = super::probe::mb_pill_state(entry);
+                    let pill_before = super::probe::mb_pill_state(entry);
+                    if matches!(pill_before, super::probe::MbRevertPill::None) {
+                        app.set_status(":revert: cursor row was not changed by MusicBrainz");
+                    } else {
+                        super::probe::toggle_mb_revert(entry);
+                        let after = super::probe::mb_pill_state(entry);
+                        let display_key = entry.display_key.clone();
+                        state.dirty = super::probe::metadata_editor_has_changes(&state);
+                        let label = match after {
+                            super::probe::MbRevertPill::Revert => "applied MB value",
+                            super::probe::MbRevertPill::UseMb => "reverted to file value",
+                            super::probe::MbRevertPill::None => "no change",
+                        };
+                        app.set_status(format!(":revert: {} ({})", display_key, label));
+                    }
+                }
+            }
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+        }
+        Command::MbRestore => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status(":restore only works in the metadata editor");
+                return;
+            };
+            // Field-target: in the detail overlay we use detail_field_idx;
+            // in the main editor we use the cursor row, so the user can
+            // restore a non-mixed row that doesn't surface the bulk pill.
+            let in_detail = state.phase == super::app::MetadataEditorPhase::DetailEdit;
+            let target_idx = if in_detail { state.detail_field_idx } else { state.cursor };
+            if let Some(entry) = state.entries.get_mut(target_idx) {
+                if !super::probe::entry_has_mb_proposed(entry) {
+                    app.set_status(":restore: field was not populated from MusicBrainz");
+                } else {
+                    super::probe::restore_mb_proposed(entry);
                     let display_key = entry.display_key.clone();
                     state.dirty = super::probe::metadata_editor_has_changes(&state);
-                    let label = match after {
-                        super::probe::MbRevertPill::Revert => "applied MB value",
-                        super::probe::MbRevertPill::UseMb => "reverted to file value",
-                        super::probe::MbRevertPill::None => "no change",
-                    };
-                    app.set_status(format!(":revert: {} ({})", display_key, label));
+                    app.set_status(format!(":restore: {} (snapped to MB values)", display_key));
                 }
             }
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
