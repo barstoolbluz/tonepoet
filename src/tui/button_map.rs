@@ -83,6 +83,24 @@ pub enum TuiButton {
     /// 0-based index into `MetadataEditorState.entries`.
     MetadataEntryRevert(usize),
 
+    /// MbSelect overlay: clickable row (0-based index into `releases`).
+    MbSelectRow(usize),
+    /// MbSelect footer "Accept" pill.
+    MbSelectAccept,
+    /// MbSelect footer "Cancel" pill.
+    MbSelectCancel,
+
+    /// CuePreview overlay: clickable content line (0-based line index).
+    CuePreviewLine(usize),
+    /// CuePreview footer pills (read-only mode).
+    CuePreviewSave,
+    CuePreviewCancel,
+    CuePreviewTop,
+    CuePreviewBottom,
+    /// CuePreview footer pills (edit mode).
+    CuePreviewEditCommit,
+    CuePreviewEditCancel,
+
     // Browse screen
     BrowseEntry(usize),
     BrowseColumn(ColumnKind),
@@ -112,7 +130,17 @@ impl TuiButton {
             Self::Tab(_)
             | Self::OverlayConfirm
             | Self::OverlayCancel
-            | Self::MetadataEntryRevert(_) => None,
+            | Self::MetadataEntryRevert(_)
+            | Self::MbSelectRow(_)
+            | Self::MbSelectAccept
+            | Self::MbSelectCancel
+            | Self::CuePreviewLine(_)
+            | Self::CuePreviewSave
+            | Self::CuePreviewCancel
+            | Self::CuePreviewTop
+            | Self::CuePreviewBottom
+            | Self::CuePreviewEditCommit
+            | Self::CuePreviewEditCancel => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)

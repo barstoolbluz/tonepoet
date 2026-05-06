@@ -1047,6 +1047,10 @@ pub struct MbSelectState {
     /// Audio file paths the lookup was computed for (used to populate
     /// the metadata editor after the user accepts).
     pub paths: Vec<std::path::PathBuf>,
+    /// Last left-click on a row, used for double-click-to-accept
+    /// detection. Skipped from Clone-derived semantics by being
+    /// reset on each click cycle.
+    pub last_click: Option<(usize, std::time::Instant)>,
 }
 
 impl MbSelectState {
@@ -1054,7 +1058,7 @@ impl MbSelectState {
         releases: Vec<crate::tui::musicbrainz::MbRelease>,
         paths: Vec<std::path::PathBuf>,
     ) -> Self {
-        Self { releases, selected: 0, scroll: 0, paths }
+        Self { releases, selected: 0, scroll: 0, paths, last_click: None }
     }
 }
 
@@ -1080,6 +1084,9 @@ pub struct CuePreviewState {
     /// Active text input when editing a single line. `Enter` commits;
     /// `Esc` cancels without splicing.
     pub edit: Option<crate::tui::text_input::TextInputState>,
+    /// Last left-click on a content line, used for double-click-to-edit
+    /// detection.
+    pub last_click: Option<(usize, std::time::Instant)>,
 }
 
 impl CuePreviewState {
@@ -1091,6 +1098,7 @@ impl CuePreviewState {
             scroll: 0,
             cursor: None,
             edit: None,
+            last_click: None,
         }
     }
 
@@ -1506,6 +1514,11 @@ pub struct AppState {
     /// the CUE) and `:q` (cancels), or restored unchanged if neither.
     pub pending_cue_preview: Option<Box<CuePreviewState>>,
 
+    /// Parked MbSelectState while a context menu is open over the
+    /// MusicBrainz release picker. Restored when the menu closes
+    /// without consuming the picker.
+    pub pending_mb_select: Option<Box<MbSelectState>>,
+
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
     pub processing_active: bool,
@@ -1645,6 +1658,7 @@ impl AppState {
             pending_bulk_rename: None,
             pending_metadata_editor: None,
             pending_cue_preview: None,
+            pending_mb_select: None,
             status_message: None,
             processing_active: false,
             should_quit: false,

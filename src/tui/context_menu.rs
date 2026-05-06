@@ -106,6 +106,35 @@ pub enum ContextAction {
     QueryGnudb,
     /// Look up tags from MusicBrainz (disc-TOC).
     TagsFromMb,
+    /// MetadataEditor: toggle the cursor row between MB-proposed and
+    /// the file's pre-MB value. No-op when the row was not modified by
+    /// MB or has been manually edited.
+    MetadataRevertMb,
+    /// MetadataEditor: open inline edit on the cursor row.
+    MetadataEditValue,
+    /// MetadataEditor: mark the cursor row for deletion.
+    MetadataDeleteEntry,
+    /// MetadataEditor: undo a pending deletion on the cursor row.
+    MetadataRestoreEntry,
+    /// MetadataEditor: open the "add new field" input.
+    MetadataAddField,
+    /// MbSelect: accept the parked picker's currently-cursored row
+    /// (open metadata editor populated from that release).
+    MbSelectAcceptCurrent,
+    /// MbSelect: cancel the parked picker (close without populating).
+    MbSelectCancelPicker,
+    /// CuePreview: save the parked CUE (writes to disk via Command::Write).
+    CuePreviewSave,
+    /// CuePreview: cancel the parked CUE preview without writing.
+    CuePreviewCancel,
+    /// CuePreview: begin editing the given 0-based line index (carried
+    /// in the action so the right-click handler doesn't have to mutate
+    /// the parked state to communicate the line).
+    CuePreviewEditLine(usize),
+    /// CuePreview: scroll to top.
+    CuePreviewScrollTop,
+    /// CuePreview: scroll to bottom.
+    CuePreviewScrollBottom,
     /// Import tags from a CUE sheet (opens metadata editor + external editor).
     ImportCueFromBrowse,
     /// AccurateRip verification (common offsets).
@@ -681,6 +710,97 @@ pub fn execute_context_action(
         ContextAction::TagsFromMb => {
             let cmd = super::command::Command::TagsFromMb;
             super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::MetadataRevertMb => {
+            // Toggle the parked editor's cursor row, mirroring :revert.
+            // The parking restore logic in `run_context_action_restoring_parked`
+            // puts the editor back as the active overlay after this returns.
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let cursor = state.cursor;
+                if let Some(entry) = state.entries.get_mut(cursor) {
+                    super::probe::toggle_mb_revert(entry);
+                    state.dirty = super::probe::metadata_editor_has_changes(&state);
+                }
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataEditValue => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let cursor = state.cursor;
+                if let Some(entry) = state.entries.get(cursor) {
+                    if !entry.is_binary {
+                        state.edit_input = Some(
+                            super::text_input::TextInputState::new(entry.value.clone()),
+                        );
+                        state.phase = super::app::MetadataEditorPhase::InlineEdit;
+                    }
+                }
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataDeleteEntry => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let cursor = state.cursor;
+                if cursor < state.entries.len() && !state.deleted.contains(&cursor) {
+                    state.deleted.push(cursor);
+                    state.dirty = true;
+                }
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataRestoreEntry => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let cursor = state.cursor;
+                state.deleted.retain(|&i| i != cursor);
+                state.dirty = super::probe::metadata_editor_has_changes(&state);
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataAddField => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                state.add_key_input = Some(super::text_input::TextInputState::empty());
+                state.phase = super::app::MetadataEditorPhase::AddingKey;
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MbSelectAcceptCurrent => {
+            if let Some(mut state) = app.pending_mb_select.take() {
+                let idx = state.selected;
+                if idx < state.releases.len() {
+                    let release = state.releases.swap_remove(idx);
+                    let paths = std::mem::take(&mut state.paths);
+                    super::event_loop::open_editor_with_mb_release(app, &release, &paths);
+                } else {
+                    // Out-of-range — restore the picker.
+                    app.active_overlay = super::app::ActiveOverlay::MbSelect(state);
+                }
+            }
+        }
+        ContextAction::MbSelectCancelPicker => {
+            // Discard parked state; close to no overlay.
+            app.pending_mb_select = None;
+            app.set_status("MusicBrainz picker cancelled".to_string());
+        }
+        ContextAction::CuePreviewSave => {
+            // Reuse Command::Write — its handler consumes
+            // pending_cue_preview (set by the right-click handler).
+            super::command::execute_command(app, super::command::Command::Write, tx);
+        }
+        ContextAction::CuePreviewCancel => {
+            super::command::execute_command(app, super::command::Command::Quit, tx);
+        }
+        ContextAction::CuePreviewEditLine(line_0based) => {
+            super::command::execute_command(
+                app,
+                super::command::Command::CueEditLine(line_0based.saturating_add(1)),
+                tx,
+            );
+        }
+        ContextAction::CuePreviewScrollTop => {
+            super::command::execute_command(app, super::command::Command::CueScrollTop, tx);
+        }
+        ContextAction::CuePreviewScrollBottom => {
+            super::command::execute_command(app, super::command::Command::CueScrollBottom, tx);
         }
         ContextAction::MarkCompareReference => {
             let cmd = super::command::Command::MarkCompareRef;

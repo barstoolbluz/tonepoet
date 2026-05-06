@@ -2077,6 +2077,62 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
     }
 }
 
+/// Close the active context-menu overlay and restore any parked
+/// stateful overlay (metadata editor / cue preview / mb select). When
+/// no overlay was parked, leaves `active_overlay = None`.
+///
+/// Called from every ContextMenu close path (Esc / Left / outside-click /
+/// post-action) so right-click → context menu → Esc round-trips back to
+/// the originating overlay. Mirrors the `pending_*.take()` pattern used
+/// by the CommandInput Enter/Esc handlers.
+fn close_context_menu_restoring_parked(app: &mut AppState) {
+    app.active_overlay = ActiveOverlay::None;
+    if let Some(parked) = app.pending_metadata_editor.take() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+        return;
+    }
+    if let Some(parked) = app.pending_cue_preview.take() {
+        app.active_overlay = ActiveOverlay::CuePreview(parked);
+        return;
+    }
+    if let Some(parked) = app.pending_mb_select.take() {
+        app.active_overlay = ActiveOverlay::MbSelect(parked);
+    }
+}
+
+/// Run a context-menu action, then restore any parked overlay if the
+/// action didn't set its own overlay. Wraps the common pattern:
+/// "close menu, run action, if action didn't take a parked state and
+/// didn't open something else, put the parked state back."
+fn run_context_action_restoring_parked(
+    app: &mut AppState,
+    action: super::context_menu::ContextAction,
+    tx: &mpsc::Sender<AppMessage>,
+    invert: bool,
+) {
+    app.active_overlay = ActiveOverlay::None;
+    super::context_menu::execute_context_action(app, action, tx, invert);
+    if matches!(app.active_overlay, ActiveOverlay::None) {
+        if let Some(parked) = app.pending_metadata_editor.take() {
+            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+            return;
+        }
+        if let Some(parked) = app.pending_cue_preview.take() {
+            app.active_overlay = ActiveOverlay::CuePreview(parked);
+            return;
+        }
+        if let Some(parked) = app.pending_mb_select.take() {
+            app.active_overlay = ActiveOverlay::MbSelect(parked);
+        }
+    } else {
+        // Action set its own overlay → drop any parked state (action
+        // consumed it or transitioned to a new flow).
+        app.pending_metadata_editor = None;
+        app.pending_cue_preview = None;
+        app.pending_mb_select = None;
+    }
+}
+
 /// Handle key events for the context menu overlay. Two-level side-by-side
 /// model: parent menu stays visible; submenu appears to the right when
 /// the cursor is on a Submenu entry. `focus_submenu` tracks which panel
@@ -2094,7 +2150,7 @@ fn handle_context_menu_key(
     mut focus_submenu: bool,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    use super::context_menu::{ContextMenuEntry, execute_context_action};
+    use super::context_menu::ContextMenuEntry;
 
     /// Build selectable-index list for a set of entries.
     fn selectable_indices(entries: &[ContextMenuEntry]) -> Vec<usize> {
@@ -2117,8 +2173,8 @@ fn handle_context_menu_key(
                 // Esc in submenu → return focus to parent.
                 focus_submenu = false;
             } else {
-                // Esc in parent → close entirely.
-                app.active_overlay = ActiveOverlay::None;
+                // Esc in parent → close entirely (restoring parked overlay).
+                close_context_menu_restoring_parked(app);
                 return;
             }
         }
@@ -2126,7 +2182,7 @@ fn handle_context_menu_key(
             if focus_submenu {
                 focus_submenu = false;
             } else {
-                app.active_overlay = ActiveOverlay::None;
+                close_context_menu_restoring_parked(app);
                 return;
             }
         }
@@ -2149,8 +2205,7 @@ fn handle_context_menu_key(
                 if let Some(&idx) = sub_selectable.get(submenu_selected) {
                     if let ContextMenuEntry::Item(item) = &submenu_entries[idx] {
                         let action = item.action.clone();
-                        app.active_overlay = ActiveOverlay::None;
-                        execute_context_action(app, action, tx, invert);
+                        run_context_action_restoring_parked(app, action, tx, invert);
                         return;
                     }
                 }
@@ -2163,8 +2218,7 @@ fn handle_context_menu_key(
                         }
                         ContextMenuEntry::Item(item) => {
                             let action = item.action.clone();
-                            app.active_overlay = ActiveOverlay::None;
-                            execute_context_action(app, action, tx, invert);
+                            run_context_action_restoring_parked(app, action, tx, invert);
                             return;
                         }
                         _ => {}
@@ -3513,6 +3567,417 @@ fn handle_generic_overlay_mouse(
 }
 
 /// Handle mouse events inside the metadata editor overlay.
+/// Build the row-level context menu for the MetadataEditor based on the
+/// clicked row's pill state (Revert / UseMb / None) and deletion mark.
+fn build_metadata_row_context_menu(
+    state: &super::app::MetadataEditorState,
+    row: usize,
+) -> Vec<super::context_menu::ContextMenuEntry> {
+    use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
+    let mut entries: Vec<ContextMenuEntry> = Vec::new();
+    let pill = state.entries.get(row)
+        .map(super::probe::mb_pill_state)
+        .unwrap_or(super::probe::MbRevertPill::None);
+    match pill {
+        super::probe::MbRevertPill::Revert => {
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Revert to file value".to_string(),
+                action: ContextAction::MetadataRevertMb,
+                shortcut: Some(":revert".to_string()),
+                enabled: true,
+            }));
+        }
+        super::probe::MbRevertPill::UseMb => {
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Use MusicBrainz value".to_string(),
+                action: ContextAction::MetadataRevertMb,
+                shortcut: Some(":revert".to_string()),
+                enabled: true,
+            }));
+        }
+        super::probe::MbRevertPill::None => {}
+    }
+    let is_binary = state.entries.get(row).map(|e| e.is_binary).unwrap_or(true);
+    if !is_binary {
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Edit value".to_string(),
+            action: ContextAction::MetadataEditValue,
+            shortcut: None,
+            enabled: true,
+        }));
+    }
+    if state.deleted.contains(&row) {
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Restore (cancel deletion)".to_string(),
+            action: ContextAction::MetadataRestoreEntry,
+            shortcut: None,
+            enabled: true,
+        }));
+    } else {
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Delete entry".to_string(),
+            action: ContextAction::MetadataDeleteEntry,
+            shortcut: None,
+            enabled: true,
+        }));
+    }
+    entries.push(ContextMenuEntry::Separator);
+    entries.push(ContextMenuEntry::Item(ContextMenuItem {
+        label: "Add new field".to_string(),
+        action: ContextAction::MetadataAddField,
+        shortcut: None,
+        enabled: true,
+    }));
+    entries
+}
+
+/// Build the row-level context menu for CuePreview. `line_idx` is set
+/// when the right-click landed on a content line (0-based); it adds an
+/// "Edit this line" entry that carries the index in the action variant.
+fn build_cue_preview_context_menu(line_idx: Option<usize>, is_editing: bool)
+    -> Vec<super::context_menu::ContextMenuEntry>
+{
+    use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
+    let mut entries: Vec<ContextMenuEntry> = Vec::new();
+    if is_editing {
+        // While editing, the only useful actions are commit/cancel-edit,
+        // which the keyboard handles via Enter/Esc — but expose them
+        // here too for parity.
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Cancel line edit".to_string(),
+            action: ContextAction::CuePreviewCancel,
+            shortcut: Some(":q".to_string()),
+            enabled: true,
+        }));
+        return entries;
+    }
+    if let Some(idx) = line_idx {
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Edit this line".to_string(),
+            action: ContextAction::CuePreviewEditLine(idx),
+            shortcut: Some(":e N".to_string()),
+            enabled: true,
+        }));
+        entries.push(ContextMenuEntry::Separator);
+    }
+    entries.push(ContextMenuEntry::Item(ContextMenuItem {
+        label: "Save".to_string(),
+        action: ContextAction::CuePreviewSave,
+        shortcut: Some(":w".to_string()),
+        enabled: true,
+    }));
+    entries.push(ContextMenuEntry::Item(ContextMenuItem {
+        label: "Cancel".to_string(),
+        action: ContextAction::CuePreviewCancel,
+        shortcut: Some(":q".to_string()),
+        enabled: true,
+    }));
+    entries.push(ContextMenuEntry::Separator);
+    entries.push(ContextMenuEntry::Item(ContextMenuItem {
+        label: "Scroll to top".to_string(),
+        action: ContextAction::CuePreviewScrollTop,
+        shortcut: Some(":g".to_string()),
+        enabled: true,
+    }));
+    entries.push(ContextMenuEntry::Item(ContextMenuItem {
+        label: "Scroll to bottom".to_string(),
+        action: ContextAction::CuePreviewScrollBottom,
+        shortcut: Some(":G".to_string()),
+        enabled: true,
+    }));
+    entries
+}
+
+/// Mouse handler for the CuePreview overlay.
+fn handle_cue_preview_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+        ActiveOverlay::CuePreview(s) => s,
+        other => {
+            app.active_overlay = other;
+            return;
+        }
+    };
+    let mx = mouse.column;
+    let my = mouse.row;
+
+    let area = crossterm::terminal::size().unwrap_or((80, 24));
+    let w = ((area.0 as u32 * 80 / 100) as u16).max(60).min(area.0.saturating_sub(2));
+    let h = ((area.1 as u32 * 80 / 100) as u16).max(15).min(area.1.saturating_sub(2));
+    let x = (area.0.saturating_sub(w)) / 2;
+    let y = (area.1.saturating_sub(h)) / 2;
+    let in_popup = mx >= x && mx < x + w && my >= y && my < y + h;
+    let is_editing = state.is_editing();
+
+    // Helper to park state and dispatch a command (for footer pills /
+    // context menu actions that consume `pending_cue_preview`).
+    fn park_and_run(
+        app: &mut AppState,
+        state: Box<super::app::CuePreviewState>,
+        cmd: super::command::Command,
+        tx: &mpsc::Sender<AppMessage>,
+    ) {
+        app.pending_cue_preview = Some(state);
+        super::command::execute_command(app, cmd, tx);
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            state.scroll = state.scroll.saturating_sub(1);
+            app.active_overlay = ActiveOverlay::CuePreview(state);
+        }
+        MouseEventKind::ScrollDown => {
+            let max_line = state.content.lines().count().saturating_sub(1);
+            state.scroll = state.scroll.saturating_add(1).min(max_line);
+            app.active_overlay = ActiveOverlay::CuePreview(state);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if is_editing {
+                // In edit mode, only the two edit pills are clickable.
+                match app.button_map.find_button_at(mx, my) {
+                    Some(super::button_map::TuiButton::CuePreviewEditCommit) => {
+                        state.commit_edit();
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                    }
+                    Some(super::button_map::TuiButton::CuePreviewEditCancel) => {
+                        state.cancel_edit();
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                    }
+                    _ => {
+                        if !in_popup {
+                            // Click outside: cancel the edit and close.
+                            state.cancel_edit();
+                            app.set_status("CUE preview cancelled".to_string());
+                        } else {
+                            app.active_overlay = ActiveOverlay::CuePreview(state);
+                        }
+                    }
+                }
+                return;
+            }
+            match app.button_map.find_button_at(mx, my) {
+                Some(super::button_map::TuiButton::CuePreviewSave) => {
+                    park_and_run(app, state, super::command::Command::Write, tx);
+                }
+                Some(super::button_map::TuiButton::CuePreviewCancel) => {
+                    park_and_run(app, state, super::command::Command::Quit, tx);
+                }
+                Some(super::button_map::TuiButton::CuePreviewTop) => {
+                    park_and_run(app, state, super::command::Command::CueScrollTop, tx);
+                }
+                Some(super::button_map::TuiButton::CuePreviewBottom) => {
+                    park_and_run(app, state, super::command::Command::CueScrollBottom, tx);
+                }
+                Some(super::button_map::TuiButton::CuePreviewLine(idx)) => {
+                    let total = state.content.lines().count();
+                    if idx < total {
+                        let now = std::time::Instant::now();
+                        let is_double = state.last_click
+                            .map(|(prev, t)| {
+                                prev == idx
+                                    && now.duration_since(t)
+                                        < std::time::Duration::from_millis(500)
+                            })
+                            .unwrap_or(false);
+                        if is_double {
+                            // Double-click → :e <idx+1>.
+                            state.last_click = None;
+                            park_and_run(
+                                app,
+                                state,
+                                super::command::Command::CueEditLine(idx + 1),
+                                tx,
+                            );
+                            return;
+                        }
+                        state.last_click = Some((idx, now));
+                    }
+                    app.active_overlay = ActiveOverlay::CuePreview(state);
+                }
+                _ => {
+                    if !in_popup {
+                        app.set_status("CUE preview cancelled".to_string());
+                    } else {
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                    }
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            if !in_popup {
+                app.set_status("CUE preview cancelled".to_string());
+                return;
+            }
+            // If right-click landed on a content line, pass the index
+            // into the menu builder; the "Edit this line" entry carries
+            // it in the action variant (no parked-state mutation).
+            let mut line_idx: Option<usize> = None;
+            if let Some(super::button_map::TuiButton::CuePreviewLine(idx)) =
+                app.button_map.find_button_at(mx, my)
+            {
+                let total = state.content.lines().count();
+                if idx < total {
+                    line_idx = Some(idx);
+                }
+            }
+            let entries = build_cue_preview_context_menu(line_idx, is_editing);
+            app.pending_cue_preview = Some(state);
+            app.active_overlay = ActiveOverlay::ContextMenu {
+                entries,
+                selected: 0,
+                origin: (mx, my),
+                submenu_entries: Vec::new(),
+                submenu_selected: 0,
+                show_submenu: false,
+                focus_submenu: false,
+            };
+        }
+        _ => {
+            app.active_overlay = ActiveOverlay::CuePreview(state);
+        }
+    }
+}
+
+/// Build the row-level context menu for the MbSelect picker.
+fn build_mb_select_context_menu()
+    -> Vec<super::context_menu::ContextMenuEntry>
+{
+    use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
+    vec![
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: "Accept this match".to_string(),
+            action: ContextAction::MbSelectAcceptCurrent,
+            shortcut: None,
+            enabled: true,
+        }),
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: "Cancel picker".to_string(),
+            action: ContextAction::MbSelectCancelPicker,
+            shortcut: None,
+            enabled: true,
+        }),
+    ]
+}
+
+/// Mouse handler for the MbSelect overlay. Handles row click (select),
+/// double-click (accept), right-click (context menu), footer pill clicks,
+/// and click-outside-to-cancel.
+fn handle_mb_select_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    _tx: &mpsc::Sender<AppMessage>,
+) {
+    let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+        ActiveOverlay::MbSelect(s) => s,
+        other => {
+            app.active_overlay = other;
+            return;
+        }
+    };
+    let mx = mouse.column;
+    let my = mouse.row;
+
+    // Compute popup geometry (must mirror draw_mb_select).
+    let area = crossterm::terminal::size().unwrap_or((80, 24));
+    let w = ((area.0 as u32 * 80 / 100) as u16).max(60).min(area.0.saturating_sub(2));
+    let h = ((area.1 as u32 * 70 / 100) as u16).max(12).min(area.1.saturating_sub(2));
+    let x = (area.0.saturating_sub(w)) / 2;
+    let y = (area.1.saturating_sub(h)) / 2;
+    let in_popup = mx >= x && mx < x + w && my >= y && my < y + h;
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            state.selected = state.selected.saturating_sub(1);
+            app.active_overlay = ActiveOverlay::MbSelect(state);
+        }
+        MouseEventKind::ScrollDown => {
+            let n = state.releases.len();
+            state.selected = (state.selected + 1).min(n.saturating_sub(1));
+            app.active_overlay = ActiveOverlay::MbSelect(state);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Footer Accept/Cancel pills (registered in button_map).
+            match app.button_map.find_button_at(mx, my) {
+                Some(super::button_map::TuiButton::MbSelectAccept) => {
+                    let idx = state.selected;
+                    if idx < state.releases.len() {
+                        let release = state.releases.swap_remove(idx);
+                        let paths = std::mem::take(&mut state.paths);
+                        super::event_loop::open_editor_with_mb_release(app, &release, &paths);
+                    }
+                    return;
+                }
+                Some(super::button_map::TuiButton::MbSelectCancel) => {
+                    app.set_status("MusicBrainz picker cancelled".to_string());
+                    return;
+                }
+                Some(super::button_map::TuiButton::MbSelectRow(idx)) => {
+                    if idx < state.releases.len() {
+                        // Double-click within ~500ms on the same row → accept.
+                        let now = std::time::Instant::now();
+                        let is_double = state.last_click
+                            .map(|(prev_idx, t)| {
+                                prev_idx == idx
+                                    && now.duration_since(t)
+                                        < std::time::Duration::from_millis(500)
+                            })
+                            .unwrap_or(false);
+                        state.selected = idx;
+                        if is_double {
+                            let release = state.releases.swap_remove(idx);
+                            let paths = std::mem::take(&mut state.paths);
+                            super::event_loop::open_editor_with_mb_release(app, &release, &paths);
+                            return;
+                        }
+                        state.last_click = Some((idx, now));
+                        app.active_overlay = ActiveOverlay::MbSelect(state);
+                    } else {
+                        app.active_overlay = ActiveOverlay::MbSelect(state);
+                    }
+                }
+                _ => {
+                    if !in_popup {
+                        // Click outside popup → cancel.
+                        app.set_status("MusicBrainz picker cancelled".to_string());
+                    } else {
+                        app.active_overlay = ActiveOverlay::MbSelect(state);
+                    }
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            if let Some(super::button_map::TuiButton::MbSelectRow(idx)) =
+                app.button_map.find_button_at(mx, my)
+            {
+                if idx < state.releases.len() {
+                    state.selected = idx;
+                }
+            }
+            if in_popup {
+                let entries = build_mb_select_context_menu();
+                app.pending_mb_select = Some(state);
+                app.active_overlay = ActiveOverlay::ContextMenu {
+                    entries,
+                    selected: 0,
+                    origin: (mx, my),
+                    submenu_entries: Vec::new(),
+                    submenu_selected: 0,
+                    show_submenu: false,
+                    focus_submenu: false,
+                };
+            } else {
+                app.set_status("MusicBrainz picker cancelled".to_string());
+            }
+        }
+        _ => {
+            app.active_overlay = ActiveOverlay::MbSelect(state);
+        }
+    }
+}
+
 fn handle_metadata_editor_mouse(
     app: &mut AppState,
     mouse: MouseEvent,
@@ -3580,7 +4045,8 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
 
-            // Right-click: cancel inline edit or close overlay.
+            // Right-click: cancel inline edit, or open a row-level
+            // context menu in plain Editing mode.
             MouseEventKind::Down(MouseButton::Right) => {
                 match state.phase {
                     MetadataEditorPhase::InlineEdit => {
@@ -3600,7 +4066,50 @@ fn handle_metadata_editor_mouse(
                         state.phase = MetadataEditorPhase::Editing;
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     }
+                    MetadataEditorPhase::Editing if in_content => {
+                        // Compute the clicked row (entry index).
+                        let row = (my - content_y) as usize + state.scroll;
+                        if row < state.entries.len() {
+                            state.cursor = row;
+                            let entries = build_metadata_row_context_menu(&state, row);
+                            app.pending_metadata_editor = Some(state);
+                            app.active_overlay = ActiveOverlay::ContextMenu {
+                                entries,
+                                selected: 0,
+                                origin: (mx, my),
+                                submenu_entries: Vec::new(),
+                                submenu_selected: 0,
+                                show_submenu: false,
+                                focus_submenu: false,
+                            };
+                        } else {
+                            // Right-click on the "+ Add field..." line or
+                            // empty space → simple add-field menu.
+                            let entries = vec![
+                                super::context_menu::ContextMenuEntry::Item(
+                                    super::context_menu::ContextMenuItem {
+                                        label: "Add new field".to_string(),
+                                        action: super::context_menu::ContextAction::MetadataAddField,
+                                        shortcut: None,
+                                        enabled: true,
+                                    },
+                                ),
+                            ];
+                            app.pending_metadata_editor = Some(state);
+                            app.active_overlay = ActiveOverlay::ContextMenu {
+                                entries,
+                                selected: 0,
+                                origin: (mx, my),
+                                submenu_entries: Vec::new(),
+                                submenu_selected: 0,
+                                show_submenu: false,
+                                focus_submenu: false,
+                            };
+                        }
+                    }
                     _ => {
+                        // Right-click outside content area in Editing
+                        // mode → close as before.
                         app.active_overlay = ActiveOverlay::None;
                     }
                 }
@@ -4194,7 +4703,7 @@ fn context_menu_mouse_click(
     tx: &mpsc::Sender<AppMessage>,
     invert: bool,
 ) -> bool {
-    use super::context_menu::{ContextMenuEntry, execute_context_action};
+    use super::context_menu::ContextMenuEntry;
     let area = crossterm::terminal::size().unwrap_or((80, 24));
 
     // Extract state — we need to close the overlay before executing.
@@ -4230,8 +4739,7 @@ fn context_menu_mouse_click(
                     if count == idx {
                         if let ContextMenuEntry::Item(item) = e {
                             let action = item.action.clone();
-                            app.active_overlay = ActiveOverlay::None;
-                            execute_context_action(app, action, tx, invert);
+                            run_context_action_restoring_parked(app, action, tx, invert);
                             return true;
                         }
                     }
@@ -4254,8 +4762,7 @@ fn context_menu_mouse_click(
             match &entries[entry_idx] {
                 ContextMenuEntry::Item(item) => {
                     let action = item.action.clone();
-                    app.active_overlay = ActiveOverlay::None;
-                    execute_context_action(app, action, tx, invert);
+                    run_context_action_restoring_parked(app, action, tx, invert);
                     return true;
                 }
                 ContextMenuEntry::Submenu { .. } => {
@@ -5706,6 +6213,18 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         handle_metadata_editor_mouse(app, mouse, tx);
         return;
     }
+    // MbSelect picker: dedicated handler (clickable rows, footer pills,
+    // right-click context menu, double-click-to-accept).
+    if matches!(app.active_overlay, ActiveOverlay::MbSelect(_)) {
+        handle_mb_select_mouse(app, mouse, tx);
+        return;
+    }
+    // CuePreview: dedicated handler (clickable lines, footer pills,
+    // right-click context menu, double-click-to-edit).
+    if matches!(app.active_overlay, ActiveOverlay::CuePreview(_)) {
+        handle_cue_preview_mouse(app, mouse, tx);
+        return;
+    }
 
     // Generic overlay mouse: click-outside-to-close + footer pill clicks
     // for all overlays (except MetadataEditor which has its own handler,
@@ -5770,14 +6289,20 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
         if matches!(mouse.kind, MouseEventKind::Down(_)) {
             if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
-                // Right-click: close old menu, fall through to open new one.
+                // Right-click: close old menu (the user is going to open
+                // a new one). Drop any parked overlay state since the
+                // user is shifting context. Fall through to open new.
                 app.active_overlay = ActiveOverlay::None;
+                app.pending_metadata_editor = None;
+                app.pending_cue_preview = None;
+                app.pending_mb_select = None;
             } else {
                 // Left-click: try to activate the hovered item.
                 if !context_menu_mouse_click(app, mouse.column, mouse.row, tx, false) {
-                    // Click was outside the menu — close it and select
-                    // the clicked browse/queue item if applicable.
-                    app.active_overlay = ActiveOverlay::None;
+                    // Click was outside the menu — close (restoring any
+                    // parked overlay) and select the clicked browse/queue
+                    // item if applicable.
+                    close_context_menu_restoring_parked(app);
                     let x = mouse.column;
                     let y = mouse.row;
                     match app.current_screen {
@@ -6411,6 +6936,18 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     }
                 }
             }
+            // MbSelect / CuePreview buttons are handled directly in their
+            // dedicated mouse handlers before reaching this generic dispatch.
+            TuiButton::MbSelectRow(_)
+            | TuiButton::MbSelectAccept
+            | TuiButton::MbSelectCancel
+            | TuiButton::CuePreviewLine(_)
+            | TuiButton::CuePreviewSave
+            | TuiButton::CuePreviewCancel
+            | TuiButton::CuePreviewTop
+            | TuiButton::CuePreviewBottom
+            | TuiButton::CuePreviewEditCommit
+            | TuiButton::CuePreviewEditCancel => {}
         }
     }
 }

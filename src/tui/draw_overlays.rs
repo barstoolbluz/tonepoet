@@ -112,10 +112,10 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             draw_metadata_editor(f, state, &mut app.button_map);
         }
         ActiveOverlay::CuePreview(ref state) => {
-            draw_cue_preview(f, state);
+            draw_cue_preview(f, state, &mut app.button_map);
         }
         ActiveOverlay::MbSelect(ref state) => {
-            draw_mb_select(f, state);
+            draw_mb_select(f, state, &mut app.button_map);
         }
         ActiveOverlay::Verify { scroll } => {
             draw_verify(f, &app.verify_results, scroll);
@@ -2925,7 +2925,11 @@ fn draw_ctdb_verify(
     );
 }
 
-fn draw_cue_preview(f: &mut Frame, state: &CuePreviewState) {
+fn draw_cue_preview(
+    f: &mut Frame,
+    state: &CuePreviewState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
     let area = f.size();
     let w = (area.width * 80 / 100).max(60).min(area.width.saturating_sub(2));
     let h = (area.height * 80 / 100).max(15).min(area.height.saturating_sub(2));
@@ -3016,6 +3020,12 @@ fn draw_cue_preview(f: &mut Frame, state: &CuePreviewState) {
             } else {
                 theme::muted()
             };
+            // Register the line rect for click hit-testing.
+            let visible_row = (idx - scroll) as u16;
+            button_map.record_button(
+                super::button_map::TuiButton::CuePreviewLine(idx),
+                Rect::new(chunks[2].x, chunks[2].y + visible_row, chunks[2].width, 1),
+            );
             Line::from(vec![
                 Span::styled(format!(" {} ", line_no), gutter_style),
                 Span::styled("│ ", theme::muted()),
@@ -3034,32 +3044,84 @@ fn draw_cue_preview(f: &mut Frame, state: &CuePreviewState) {
             total_lines,
         )
     };
-    let footer = if state.is_editing() {
-        Line::from(vec![
-            Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled("commit  ", theme::muted()),
-            Span::styled("Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel edit", theme::muted()),
-        ])
+    if state.is_editing() {
+        let commit_label = " [Commit] ";
+        let cancel_label = " [Cancel edit] ";
+        let footer = Line::from(vec![
+            Span::styled(
+                commit_label,
+                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                cancel_label,
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(footer), chunks[3]);
+        let cw = commit_label.chars().count() as u16;
+        let xw = cancel_label.chars().count() as u16;
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewEditCommit,
+            Rect::new(chunks[3].x, chunks[3].y, cw, 1),
+        );
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewEditCancel,
+            Rect::new(chunks[3].x + cw, chunks[3].y, xw, 1),
+        );
     } else {
-        Line::from(vec![
-            Span::styled(" :w ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled("save  ", theme::muted()),
-            Span::styled(":q ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel  ", theme::muted()),
-            Span::styled(":e N ", Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled("edit line  ", theme::muted()),
-            Span::styled(":g/:G ", Style::default().fg(theme::TEXT_BRIGHT)),
-            Span::styled("top/bottom  ", theme::muted()),
-            Span::styled("↑↓ PgUp/PgDn ", Style::default().fg(theme::TEXT_BRIGHT)),
-            Span::styled("scroll", theme::muted()),
+        let save_label = " [Save] ";
+        let cancel_label = " [Cancel] ";
+        let top_label = " [Top] ";
+        let bot_label = " [Bottom] ";
+        let footer = Line::from(vec![
+            Span::styled(
+                save_label,
+                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                cancel_label,
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                top_label,
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                bot_label,
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  double-click line to edit  ", theme::muted()),
             Span::styled(format!("    {}", pos), theme::muted()),
-        ])
-    };
-    f.render_widget(Paragraph::new(footer), chunks[3]);
+        ]);
+        f.render_widget(Paragraph::new(footer), chunks[3]);
+        let sw = save_label.chars().count() as u16;
+        let xw = cancel_label.chars().count() as u16;
+        let tw = top_label.chars().count() as u16;
+        let bw = bot_label.chars().count() as u16;
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewSave,
+            Rect::new(chunks[3].x, chunks[3].y, sw, 1),
+        );
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewCancel,
+            Rect::new(chunks[3].x + sw, chunks[3].y, xw, 1),
+        );
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewTop,
+            Rect::new(chunks[3].x + sw + xw, chunks[3].y, tw, 1),
+        );
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewBottom,
+            Rect::new(chunks[3].x + sw + xw + tw, chunks[3].y, bw, 1),
+        );
+    }
 }
 
-fn draw_mb_select(f: &mut Frame, state: &MbSelectState) {
+fn draw_mb_select(
+    f: &mut Frame,
+    state: &MbSelectState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
     let area = f.size();
     let w = (area.width * 80 / 100).max(60).min(area.width.saturating_sub(2));
     let h = (area.height * 70 / 100).max(12).min(area.height.saturating_sub(2));
@@ -3139,19 +3201,43 @@ fn draw_mb_select(f: &mut Frame, state: &MbSelectState) {
             } else {
                 Style::default().fg(theme::TEXT)
             };
+            // Register the row rect for mouse hit-testing.
+            let visible_row = (i - scroll) as u16;
+            button_map.record_button(
+                super::button_map::TuiButton::MbSelectRow(i),
+                Rect::new(chunks[2].x, chunks[2].y + visible_row, chunks[2].width, 1),
+            );
             Line::from(Span::styled(body, style))
         })
         .collect();
     f.render_widget(Paragraph::new(lines), chunks[2]);
 
+    // Footer pills: clickable Accept / Cancel + scroll hint.
+    let accept_label = " [Accept] ";
+    let cancel_label = " [Cancel] ";
+    let scroll_hint = "  ↑↓ PgUp/PgDn scroll";
     let footer = Line::from(vec![
-        Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
-        Span::styled("accept  ", theme::muted()),
-        Span::styled("Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
-        Span::styled("cancel  ", theme::muted()),
-        Span::styled("↑↓ PgUp/PgDn ", Style::default().fg(theme::TEXT_BRIGHT)),
-        Span::styled("scroll", theme::muted()),
+        Span::styled(
+            accept_label,
+            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            cancel_label,
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(scroll_hint, theme::muted()),
     ]);
     f.render_widget(Paragraph::new(footer), chunks[3]);
+    // Register footer pill rects.
+    let accept_w = accept_label.chars().count() as u16;
+    let cancel_w = cancel_label.chars().count() as u16;
+    button_map.record_button(
+        super::button_map::TuiButton::MbSelectAccept,
+        Rect::new(chunks[3].x, chunks[3].y, accept_w, 1),
+    );
+    button_map.record_button(
+        super::button_map::TuiButton::MbSelectCancel,
+        Rect::new(chunks[3].x + accept_w, chunks[3].y, cancel_w, 1),
+    );
 }
 
