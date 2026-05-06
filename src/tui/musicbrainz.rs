@@ -39,10 +39,6 @@ pub struct MbTrack {
     pub title: String,
     pub artist: String,
     pub isrc: Option<String>,
-    /// Composer(s), joined with `"; "` when MB lists multiple.
-    pub composer: Option<String>,
-    /// Lyricist(s), joined with `"; "` when MB lists multiple.
-    pub lyricist: Option<String>,
 }
 
 /// Build the MusicBrainz `toc=` query value from absolute sector offsets.
@@ -121,7 +117,7 @@ pub async fn lookup_release_by_toc(
     }
 
     let url = format!(
-        "{}?toc={}&inc=artist-credits+isrcs+labels+recordings+release-groups+recording-level-rels&fmt=json",
+        "{}?toc={}&inc=artist-credits+isrcs+labels+recordings+release-groups&fmt=json",
         MB_BASE, toc,
     );
 
@@ -333,14 +329,6 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let composer = relation_artists_by_type(
-        t.get("recording").and_then(|r| r.get("relations")),
-        "composer",
-    );
-    let lyricist = relation_artists_by_type(
-        t.get("recording").and_then(|r| r.get("relations")),
-        "lyricist",
-    );
 
     Some(MbTrack {
         position,
@@ -350,39 +338,7 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         title,
         artist,
         isrc,
-        composer,
-        lyricist,
     })
-}
-
-/// Walk a recording's `relations` array, collect names of artists
-/// linked via `kind` (e.g. `"composer"`, `"lyricist"`), join with
-/// `"; "`. Returns `None` when no matches.
-fn relation_artists_by_type(
-    relations: Option<&serde_json::Value>,
-    kind: &str,
-) -> Option<String> {
-    let arr = relations?.as_array()?;
-    let names: Vec<String> = arr.iter()
-        .filter(|r| {
-            r.get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| t == kind)
-                .unwrap_or(false)
-        })
-        .filter_map(|r| {
-            r.get("artist")
-                .and_then(|a| a.get("name"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
-        .collect();
-    if names.is_empty() {
-        None
-    } else {
-        Some(names.join("; "))
-    }
 }
 
 /// Build a review-state from a MusicBrainz release. The same shape as
@@ -440,7 +396,7 @@ pub fn build_review_state_from_mb(
 
 /// Populate a metadata editor state with the MB-only fields that the
 /// GnudbReview UI doesn't surface: ISRC, CATALOGNUMBER, MusicBrainz
-/// IDs, RELEASECOUNTRY, ORIGINALDATE, COMPOSER, and LYRICIST.
+/// IDs, RELEASECOUNTRY, ORIGINALDATE.
 ///
 /// Called after `populate_editor_from_review` to supplement the
 /// user-reviewed Title/Artist/Album/Year/Genre with the rest of MB's
@@ -486,8 +442,6 @@ pub fn populate_editor_mb_supplemental(
     let artist_idx = find_or_create(
         &mut state.entries, "MUSICBRAINZ_ARTISTID", ItemKey::MusicBrainzArtistId, n,
     );
-    let composer_idx = find_or_create(&mut state.entries, "COMPOSER", ItemKey::Composer, n);
-    let lyricist_idx = find_or_create(&mut state.entries, "LYRICIST", ItemKey::Lyricist, n);
 
     // Album-level entries (replicated per file).
     let catalog_idx = find_or_create(
@@ -532,12 +486,6 @@ pub fn populate_editor_mb_supplemental(
             if let Some(s) = mt.artist_id.as_deref().filter(|s| !s.is_empty()) {
                 state.entries[artist_idx].per_file_values[i] = s.to_string();
             }
-            if let Some(s) = mt.composer.as_deref().filter(|s| !s.is_empty()) {
-                state.entries[composer_idx].per_file_values[i] = s.to_string();
-            }
-            if let Some(s) = mt.lyricist.as_deref().filter(|s| !s.is_empty()) {
-                state.entries[lyricist_idx].per_file_values[i] = s.to_string();
-            }
         }
         // Album-level — replicate across all files.
         if !catalog_value.is_empty() {
@@ -561,7 +509,7 @@ pub fn populate_editor_mb_supplemental(
     }
 
     for idx in [
-        isrc_idx, recording_idx, track_idx, artist_idx, composer_idx, lyricist_idx,
+        isrc_idx, recording_idx, track_idx, artist_idx,
         catalog_idx, album_id_idx, album_artist_id_idx, release_group_idx,
         original_date_idx, country_idx,
     ] {
@@ -717,8 +665,6 @@ mod tests {
             title: title.into(),
             artist: artist.into(),
             isrc: isrc.map(String::from),
-            composer: None,
-            lyricist: None,
         }
     }
 
@@ -848,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_extracts_release_group_country_and_relations() {
+    fn parse_extracts_release_group_country_and_ids() {
         let body = r#"{
           "releases": [{
             "id": "rid", "title": "Album", "country": "US",
@@ -857,15 +803,7 @@ mod tests {
             "media": [{
               "tracks": [
                 {"id": "tk1", "position": 1, "title": "One",
-                 "recording": {
-                   "id": "rec1",
-                   "isrcs": ["USRC1"],
-                   "relations": [
-                     {"type": "composer", "artist": {"name": "Allman"}},
-                     {"type": "composer", "artist": {"name": "Betts"}},
-                     {"type": "lyricist", "artist": {"name": "Allman"}}
-                   ]
-                 }}
+                 "recording": {"id": "rec1", "isrcs": ["USRC1"]}}
               ]
             }]
           }]
@@ -877,18 +815,6 @@ mod tests {
         assert_eq!(r.artist_id.as_deref(), Some("art-id"));
         assert_eq!(r.tracks[0].track_id.as_deref(), Some("tk1"));
         assert_eq!(r.tracks[0].recording_id.as_deref(), Some("rec1"));
-        assert_eq!(r.tracks[0].composer.as_deref(), Some("Allman; Betts"));
-        assert_eq!(r.tracks[0].lyricist.as_deref(), Some("Allman"));
-    }
-
-    #[test]
-    fn relation_artists_by_type_returns_none_for_no_match() {
-        let v: serde_json::Value = serde_json::from_str(r#"[
-            {"type": "engineer", "artist": {"name": "Smith"}}
-        ]"#).unwrap();
-        assert!(relation_artists_by_type(Some(&v), "composer").is_none());
-        assert_eq!(relation_artists_by_type(Some(&v), "engineer").as_deref(), Some("Smith"));
-        assert!(relation_artists_by_type(None, "composer").is_none());
     }
 
     #[test]
@@ -952,8 +878,6 @@ mod tests {
         release.tracks[0].recording_id = Some("rec1".into());
         release.tracks[0].track_id = Some("tk1".into());
         release.tracks[0].artist_id = Some("artid".into());
-        release.tracks[0].composer = Some("Allman; Betts".into());
-        release.tracks[0].lyricist = Some("Allman".into());
 
         populate_editor_mb_supplemental(&mut state, &release);
 
@@ -973,8 +897,6 @@ mod tests {
         assert_eq!(lookup("MUSICBRAINZ_ARTISTID"), vec!["artid", ""]);
         assert_eq!(lookup("ORIGINALDATE"), vec!["1969", "1969"]);
         assert_eq!(lookup("RELEASECOUNTRY"), vec!["US", "US"]);
-        assert_eq!(lookup("COMPOSER"), vec!["Allman; Betts", ""]);
-        assert_eq!(lookup("LYRICIST"), vec!["Allman", ""]);
         // Helper does NOT write Title/Album/Artist/Date.
         assert!(state.entries.iter().find(|e| e.display_key == "TITLE").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "ALBUM").is_none());
