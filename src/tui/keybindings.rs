@@ -4117,6 +4117,23 @@ fn handle_metadata_editor_mouse(
 
             // Left click in content: move cursor, double-click to edit.
             MouseEventKind::Down(MouseButton::Left) if in_content => {
+                // Check first whether the click landed on a per-row
+                // revert/use-MB pill. The pill rect is registered by
+                // draw_metadata_editor; if hit, toggle and return.
+                if state.phase == MetadataEditorPhase::Editing {
+                    if let Some(super::button_map::TuiButton::MetadataEntryRevert(idx)) =
+                        app.button_map.find_button_at(mx, my)
+                    {
+                        if state.entries.get(idx).is_some() {
+                            super::probe::toggle_mb_revert(&mut state.entries[idx]);
+                            state.dirty = super::probe::metadata_editor_has_changes(&state);
+                            state.cursor = idx;
+                            ensure_cursor_visible(&mut state);
+                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                            return;
+                        }
+                    }
+                }
                 let row = (my - content_y) as usize + state.scroll;
 
                 // Detail overlay: click moves detail_cursor, double-click edits.
