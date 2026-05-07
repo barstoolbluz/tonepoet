@@ -137,6 +137,9 @@ pub enum ContextAction {
     MetadataRestoreEntry,
     /// MetadataEditor: open the "add new field" input.
     MetadataAddField,
+    /// MetadataEditor: open a read-only CuePreview seeded with the
+    /// cursor row's value (synthetic-preview rows like CUESHEET).
+    MetadataCueView,
     /// MetadataEditor detail overlay: field-level revert toggle
     /// (operates on per_file_values).
     MetadataDetailToggleRevert,
@@ -802,6 +805,33 @@ pub fn execute_context_action(
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
         }
+        ContextAction::MetadataCueView => {
+            // Open a read-only CuePreview seeded with the row's value.
+            // Identical contract to the `[view]` pill click and the
+            // :cue-view colon command — only triggers on synthetic-
+            // preview rows; falls back to a status when not.
+            if let Some(state) = app.pending_metadata_editor.take() {
+                let cursor = state.cursor;
+                let entry = match state.entries.get(cursor) {
+                    Some(e) if super::probe::is_synthetic_preview(e) => e,
+                    _ => {
+                        app.set_status("View CUE: cursor row has no embedded CUE sheet".to_string());
+                        app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                        return;
+                    }
+                };
+                let content = entry.value.clone();
+                let summary = format!(
+                    "{} (read-only · {})",
+                    entry.display_key,
+                    super::probe::cue_summary_string(&content),
+                );
+                app.pending_metadata_editor = Some(state);
+                app.active_overlay = super::app::ActiveOverlay::CuePreview(Box::new(
+                    super::app::CuePreviewState::new_readonly(content, summary),
+                ));
+            }
+        }
         ContextAction::MetadataDetailToggleRevert => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let idx = state.detail_field_idx;
@@ -1312,6 +1342,63 @@ mod tests {
         );
         // Sanity: function returned, rects are non-empty.
         assert!(!rects.is_empty());
+    }
+
+    #[test]
+    fn metadata_row_context_menu_includes_view_for_synthetic_preview() {
+        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        use crate::tui::probe::TagEntry;
+
+        let entries = vec![
+            TagEntry {
+                display_key: "TITLE".into(),
+                item_key: lofty::tag::ItemKey::TrackTitle,
+                value: "x".into(), original: "x".into(),
+                is_binary: false, is_mixed: false,
+                per_file_values: vec!["x".into()],
+                per_file_originals: vec!["x".into()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            },
+            TagEntry {
+                display_key: "CUESHEET".into(),
+                item_key: lofty::tag::ItemKey::Unknown("CUESHEET".into()),
+                value: "FILE \"a.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".into(),
+                original: "".into(),
+                is_binary: true, is_mixed: false,
+                per_file_values: vec!["FILE \"a.flac\" FLAC\n".into()],
+                per_file_originals: vec!["".into()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            },
+        ];
+        let state = MetadataEditorState {
+            paths: vec![std::path::PathBuf::from("/tmp/a.flac")],
+            entries,
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false, deleted: Vec::new(),
+            file_labels: vec!["01".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+        };
+
+        // Row 0 = TITLE: no View entry.
+        let menu_title = super::super::keybindings::build_metadata_row_context_menu(&state, 0);
+        let has_view_title = menu_title.iter().any(|e| match e {
+            ContextMenuEntry::Item(item) => item.label == "View CUE sheet",
+            _ => false,
+        });
+        assert!(!has_view_title, "TITLE row must not get a View entry");
+
+        // Row 1 = CUESHEET: View entry must be present and first.
+        let menu_cue = super::super::keybindings::build_metadata_row_context_menu(&state, 1);
+        let first_label = menu_cue.iter().find_map(|e| match e {
+            ContextMenuEntry::Item(item) => Some(item.label.clone()),
+            _ => None,
+        });
+        assert_eq!(first_label.as_deref(), Some("View CUE sheet"),
+            "CUESHEET row's first entry must be View CUE sheet");
     }
 
     #[test]

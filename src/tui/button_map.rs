@@ -82,6 +82,11 @@ pub enum TuiButton {
     /// MetadataEditor per-row revert/use-MB pill. Argument is the
     /// 0-based index into `MetadataEditorState.entries`.
     MetadataEntryRevert(usize),
+    /// MetadataEditor per-row `[view]` pill on synthetic-preview rows
+    /// (currently CUESHEET). Click opens a read-only CuePreview
+    /// overlay seeded with the entry's value. Argument is the same
+    /// row index as MetadataEntryRevert.
+    MetadataEntryView(usize),
     /// MetadataEditor detail-overlay field-level revert/use-MB pill.
     MetadataDetailRevert,
     /// MetadataEditor detail-overlay restore pill (per-file values
@@ -97,12 +102,14 @@ pub enum TuiButton {
 
     /// CuePreview overlay: clickable content line (0-based line index).
     CuePreviewLine(usize),
-    /// CuePreview footer pills (read-only mode).
+    /// CuePreview footer pills (browsing mode — not currently editing
+    /// a single line). Note: distinct from the overlay's `read_only`
+    /// flag, which is a separate axis (no-Save / no-edit / blocked-`:`).
     CuePreviewSave,
     CuePreviewCancel,
     CuePreviewTop,
     CuePreviewBottom,
-    /// CuePreview footer pills (edit mode).
+    /// CuePreview footer pills (line-edit mode).
     CuePreviewEditCommit,
     CuePreviewEditCancel,
 
@@ -136,6 +143,7 @@ impl TuiButton {
             | Self::OverlayConfirm
             | Self::OverlayCancel
             | Self::MetadataEntryRevert(_)
+            | Self::MetadataEntryView(_)
             | Self::MetadataDetailRevert
             | Self::MetadataDetailRestore
             | Self::MbSelectRow(_)

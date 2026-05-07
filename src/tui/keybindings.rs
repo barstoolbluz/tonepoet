@@ -1817,14 +1817,21 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             let max_line = state.content.lines().count().saturating_sub(1);
             match key.code {
                 KeyCode::Char(':') => {
-                    app.pending_cue_preview = Some(state);
-                    app.active_overlay = ActiveOverlay::CommandInput {
-                        input: super::text_input::TextInputState::empty(),
-                        completion: None,
-                    };
+                    if state.read_only {
+                        // Block command-mode parking in read-only.
+                        // Only Esc closes; nothing else applies to a
+                        // view-only overlay.
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                    } else {
+                        app.pending_cue_preview = Some(state);
+                        app.active_overlay = ActiveOverlay::CommandInput {
+                            input: super::text_input::TextInputState::empty(),
+                            completion: None,
+                        };
+                    }
                 }
                 KeyCode::Esc => {
-                    app.active_overlay = ActiveOverlay::None;
+                    close_cue_preview_restoring_parked(app);
                     app.set_status("CUE preview cancelled".to_string());
                 }
                 KeyCode::Up => {
@@ -2089,6 +2096,18 @@ fn close_context_menu_restoring_parked(app: &mut AppState) {
     }
     if let Some(parked) = app.pending_mb_select.take() {
         app.active_overlay = ActiveOverlay::MbSelect(parked);
+    }
+}
+
+/// Close the CuePreview overlay, restoring the metadata editor if it
+/// was parked (the `[view]` pill from a synthetic-preview row sets
+/// `pending_metadata_editor` before opening CuePreview in read-only
+/// mode). No-op for the other CuePreview entry paths (`:cue-mb`,
+/// `:cue-fill`) since they don't park anything.
+fn close_cue_preview_restoring_parked(app: &mut AppState) {
+    app.active_overlay = ActiveOverlay::None;
+    if let Some(parked) = app.pending_metadata_editor.take() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
     }
 }
 
@@ -3513,12 +3532,23 @@ fn handle_generic_overlay_mouse(
 /// Handle mouse events inside the metadata editor overlay.
 /// Build the row-level context menu for the MetadataEditor based on the
 /// clicked row's pill state (Revert / UseMb / None) and deletion mark.
-fn build_metadata_row_context_menu(
+pub(super) fn build_metadata_row_context_menu(
     state: &super::app::MetadataEditorState,
     row: usize,
 ) -> Vec<super::context_menu::ContextMenuEntry> {
     use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
     let mut entries: Vec<ContextMenuEntry> = Vec::new();
+    let is_synthetic = state.entries.get(row)
+        .map(super::probe::is_synthetic_preview)
+        .unwrap_or(false);
+    if is_synthetic {
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "View CUE sheet".to_string(),
+            action: ContextAction::MetadataCueView,
+            shortcut: Some(":cue-view".to_string()),
+            enabled: true,
+        }));
+    }
     let pill = state.entries.get(row)
         .map(super::probe::mb_pill_state)
         .unwrap_or(super::probe::MbRevertPill::None);
@@ -3743,6 +3773,40 @@ fn handle_cue_preview_mouse(
                 }
                 return;
             }
+            // In read-only, the Cancel/Close pill closes via the
+            // restoring helper (so the parked metadata editor comes
+            // back), and Save is gated to a no-op.
+            if state.read_only {
+                match app.button_map.find_button_at(mx, my) {
+                    Some(super::button_map::TuiButton::CuePreviewCancel) => {
+                        drop(state);
+                        close_cue_preview_restoring_parked(app);
+                        app.set_status("CUE preview closed".to_string());
+                        return;
+                    }
+                    Some(super::button_map::TuiButton::CuePreviewTop) => {
+                        state.scroll = 0;
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                        return;
+                    }
+                    Some(super::button_map::TuiButton::CuePreviewBottom) => {
+                        let last = state.content.lines().count().saturating_sub(1);
+                        state.scroll = last;
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                        return;
+                    }
+                    Some(super::button_map::TuiButton::CuePreviewSave) => {
+                        // Pill isn't drawn in read-only; defense in depth.
+                        app.set_status("CUE preview is read-only".to_string());
+                        app.active_overlay = ActiveOverlay::CuePreview(state);
+                        return;
+                    }
+                    _ => {}
+                }
+                // Read-only fall-through: any other left-click in popup
+                // is a no-op; outside-popup is handled by the default
+                // arm below.
+            }
             match app.button_map.find_button_at(mx, my) {
                 Some(super::button_map::TuiButton::CuePreviewSave) => {
                     park_and_run(app, state, super::command::Command::Write, tx);
@@ -3784,6 +3848,11 @@ fn handle_cue_preview_mouse(
                 }
                 _ => {
                     if !in_popup {
+                        // Click outside popup: close (restoring any
+                        // parked metadata editor — the `[view]` pill
+                        // from a synthetic-preview row sets that).
+                        drop(state);
+                        close_cue_preview_restoring_parked(app);
                         app.set_status("CUE preview cancelled".to_string());
                     } else {
                         app.active_overlay = ActiveOverlay::CuePreview(state);
@@ -3792,7 +3861,19 @@ fn handle_cue_preview_mouse(
             }
         }
         MouseEventKind::Down(MouseButton::Right) => {
+            // In read-only there's no actionable context menu; treat
+            // right-click as Esc (close + restore parked metadata
+            // editor). Otherwise fall through to the normal context-
+            // menu open.
+            if state.read_only {
+                drop(state);
+                close_cue_preview_restoring_parked(app);
+                app.set_status("CUE preview cancelled".to_string());
+                return;
+            }
             if !in_popup {
+                drop(state);
+                close_cue_preview_restoring_parked(app);
                 app.set_status("CUE preview cancelled".to_string());
                 return;
             }
@@ -4103,17 +4184,38 @@ fn handle_metadata_editor_mouse(
                 // revert/use-MB pill. The pill rect is registered by
                 // draw_metadata_editor; if hit, toggle and return.
                 if state.phase == MetadataEditorPhase::Editing {
-                    if let Some(super::button_map::TuiButton::MetadataEntryRevert(idx)) =
-                        app.button_map.find_button_at(mx, my)
-                    {
-                        if state.entries.get(idx).is_some() {
-                            super::probe::toggle_mb_revert(&mut state.entries[idx]);
-                            state.dirty = super::probe::metadata_editor_has_changes(&state);
-                            state.cursor = idx;
-                            ensure_cursor_visible(&mut state);
-                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                            return;
+                    match app.button_map.find_button_at(mx, my) {
+                        Some(super::button_map::TuiButton::MetadataEntryRevert(idx)) => {
+                            if state.entries.get(idx).is_some() {
+                                super::probe::toggle_mb_revert(&mut state.entries[idx]);
+                                state.dirty = super::probe::metadata_editor_has_changes(&state);
+                                state.cursor = idx;
+                                ensure_cursor_visible(&mut state);
+                                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                return;
+                            }
                         }
+                        Some(super::button_map::TuiButton::MetadataEntryView(idx)) => {
+                            // Open a read-only CuePreview seeded with
+                            // the row's value. Park the editor so Esc
+                            // / Close pill restores it.
+                            if let Some(entry) = state.entries.get(idx) {
+                                let content = entry.value.clone();
+                                let summary = format!(
+                                    "{} (read-only · {})",
+                                    entry.display_key,
+                                    super::probe::cue_summary_string(&content),
+                                );
+                                state.cursor = idx;
+                                ensure_cursor_visible(&mut state);
+                                app.pending_metadata_editor = Some(state);
+                                app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+                                    super::app::CuePreviewState::new_readonly(content, summary),
+                                ));
+                                return;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 let row = (my - content_y) as usize + state.scroll;
@@ -7152,7 +7254,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::CuePreviewEditCommit
             | TuiButton::CuePreviewEditCancel
             | TuiButton::MetadataDetailRevert
-            | TuiButton::MetadataDetailRestore => {}
+            | TuiButton::MetadataDetailRestore
+            | TuiButton::MetadataEntryView(_) => {}
         }
     }
 }

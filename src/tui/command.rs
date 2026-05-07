@@ -46,7 +46,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "analyze", "analyze!", "analysis", "dr",
     "write-dr", "writedr",
     "write-rg-track", "write-rg-album",
-    "import-cue", "cue", "cue!", "cue-mb", "cue-mb!", "cue-fill", "cue-enrich",
+    "import-cue", "cue", "cue!", "cue-mb", "cue-mb!", "cue-fill", "cue-enrich", "cue-view",
     "tags-mb", "mb-tags", "musicbrainz-tags",
     "revert",
     "restore",
@@ -265,6 +265,10 @@ pub enum Command {
     /// disc-TOC lookup, write back. Preserves the existing CUE form
     /// (single-image vs multi-file) and user-typed values.
     CueFill,
+    /// View the embedded CUE sheet on the metadata-editor cursor row
+    /// (synthetic-preview entry, e.g. CUESHEET) in a read-only
+    /// CuePreview overlay. Parks the metadata editor; Esc restores.
+    CueView,
     /// Scroll the parked CUE preview overlay to the top.
     CueScrollTop,
     /// Scroll the parked CUE preview overlay to the bottom.
@@ -406,6 +410,7 @@ pub fn parse_command(input: &str) -> Command {
         "cue-mb" => Command::GenerateCueMb { single_image: false },
         "cue-mb!" => Command::GenerateCueMb { single_image: true },
         "cue-fill" | "cue-enrich" => Command::CueFill,
+        "cue-view" => Command::CueView,
         "tags-mb" | "mb-tags" | "musicbrainz-tags" => Command::TagsFromMb,
         "revert" => Command::MbRevert,
         "restore" => Command::MbRestore,
@@ -1428,6 +1433,39 @@ pub fn execute_command(
                 }
             }
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+        }
+        Command::CueView => {
+            let Some(state) = app.pending_metadata_editor.take() else {
+                app.set_status(":cue-view only works in the metadata editor");
+                return;
+            };
+            let cursor = state.cursor;
+            let entry = match state.entries.get(cursor) {
+                Some(e) => e,
+                None => {
+                    app.set_status(":cue-view: no entry at cursor");
+                    app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+            };
+            if !super::probe::is_synthetic_preview(entry) {
+                app.set_status(format!(
+                    ":cue-view: row '{}' has no embedded CUE sheet",
+                    entry.display_key,
+                ));
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            let content = entry.value.clone();
+            let summary = format!(
+                "{} (read-only · {})",
+                entry.display_key,
+                super::probe::cue_summary_string(&content),
+            );
+            app.pending_metadata_editor = Some(state);
+            app.active_overlay = super::app::ActiveOverlay::CuePreview(Box::new(
+                super::app::CuePreviewState::new_readonly(content, summary),
+            ));
         }
         Command::TagsFromMb => {
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {

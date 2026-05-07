@@ -1079,6 +1079,11 @@ pub struct CuePreviewState {
     /// Last left-click on a content line, used for double-click-to-edit
     /// detection.
     pub last_click: Option<(usize, std::time::Instant)>,
+    /// Read-only mode: no [Save] pill, no inline edit, `:` and
+    /// right-click are blocked. Used when the overlay is showing an
+    /// embedded CUESHEET tag (opened via `[view]` from the metadata
+    /// editor).
+    pub read_only: bool,
 }
 
 impl CuePreviewState {
@@ -1091,6 +1096,23 @@ impl CuePreviewState {
             cursor: None,
             edit: None,
             last_click: None,
+            read_only: false,
+        }
+    }
+
+    /// Build a read-only preview (used by the metadata editor's `[view]`
+    /// pill on synthetic-preview rows like CUESHEET). No write path is
+    /// needed because the overlay can't save back to disk in this mode.
+    pub fn new_readonly(content: String, summary: String) -> Self {
+        Self {
+            content,
+            write_path: std::path::PathBuf::new(),
+            summary,
+            scroll: 0,
+            cursor: None,
+            edit: None,
+            last_click: None,
+            read_only: true,
         }
     }
 
@@ -1904,6 +1926,22 @@ impl AppState {
 #[cfg(test)]
 mod cue_preview_state_tests {
     use super::*;
+
+    #[test]
+    fn new_defaults_to_writable() {
+        let s = CuePreviewState::new("x".into(), std::path::PathBuf::from("/tmp/x.cue"), "s".into());
+        assert!(!s.read_only, "::new must default to writable");
+    }
+
+    #[test]
+    fn new_readonly_sets_flag_and_clears_write_path() {
+        let s = CuePreviewState::new_readonly("content\nline\n".into(), "summary".into());
+        assert!(s.read_only, "new_readonly must set read_only");
+        assert_eq!(s.write_path, std::path::PathBuf::new(),
+            "new_readonly must use empty write_path (no disk target)");
+        assert!(s.edit.is_none());
+        assert!(s.cursor.is_none());
+    }
 
     #[test]
     fn line_count_counts_lines_correctly() {

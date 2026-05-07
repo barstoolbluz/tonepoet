@@ -1489,7 +1489,17 @@ fn draw_metadata_editor(
             super::probe::MbRevertPill::UseMb => " [use MB]",
         };
         let pill_w = pill_text.chars().count();
-        let val_for_pill = val_max.saturating_sub(pill_w);
+        // Synthetic-preview rows (CUESHEET) also get a `[view]` pill
+        // before the revert pill, opening a read-only CuePreview
+        // overlay seeded with the value.
+        let view_text = if super::probe::is_synthetic_preview(entry) {
+            " [view]"
+        } else {
+            ""
+        };
+        let view_w = view_text.chars().count();
+        let combined_pill_w = view_w + pill_w;
+        let val_for_pill = val_max.saturating_sub(combined_pill_w);
         let val_truncated = truncate_to_chars(&value_display, val_for_pill);
 
         let pill_style = match pill {
@@ -1506,35 +1516,52 @@ fn draw_metadata_editor(
             Span::styled(key_display, key_style),
             Span::styled(val_truncated.clone(), val_style),
         ];
-        if pill_w > 0 {
-            // Pad value column to right-align the pill at val_max.
+        if combined_pill_w > 0 {
+            // Pad value column to right-align the pills at val_max.
             let val_chars = val_truncated.chars().count();
             let pad = val_for_pill.saturating_sub(val_chars);
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
-            spans.push(Span::styled(pill_text.to_string(), pill_style));
+            if view_w > 0 {
+                spans.push(Span::styled(
+                    view_text.to_string(),
+                    Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if pill_w > 0 {
+                spans.push(Span::styled(pill_text.to_string(), pill_style));
+            }
 
-            // Register the pill rect for click. Visible row index =
+            // Register the pill rect(s) for click. Visible row index =
             // entries-row-index minus scroll. Out-of-view rows still
             // register but the click handler will reject by row range.
             if i >= scroll && i < scroll + content_h {
                 let visible_row = (i - scroll) as u16;
-                let pill_x = chunks[0].x
-                    + (key_chars + val_for_pill) as u16
-                    + chunks[0].x.saturating_sub(chunks[0].x); // no-op; explicit
-                let _ = pill_x;
-                let pill_screen_x = chunks[0].x
+                let view_screen_x = chunks[0].x
                     + (key_chars + val_for_pill) as u16;
-                button_map.record_button(
-                    super::button_map::TuiButton::MetadataEntryRevert(i),
-                    Rect::new(
-                        pill_screen_x,
-                        chunks[0].y + visible_row,
-                        pill_w as u16,
-                        1,
-                    ),
-                );
+                if view_w > 0 {
+                    button_map.record_button(
+                        super::button_map::TuiButton::MetadataEntryView(i),
+                        Rect::new(
+                            view_screen_x,
+                            chunks[0].y + visible_row,
+                            view_w as u16,
+                            1,
+                        ),
+                    );
+                }
+                if pill_w > 0 {
+                    button_map.record_button(
+                        super::button_map::TuiButton::MetadataEntryRevert(i),
+                        Rect::new(
+                            view_screen_x + view_w as u16,
+                            chunks[0].y + visible_row,
+                            pill_w as u16,
+                            1,
+                        ),
+                    );
+                }
             }
         }
         lines.push(Line::from(spans));
@@ -3122,6 +3149,46 @@ fn draw_cue_preview(
         button_map.record_button(
             super::button_map::TuiButton::CuePreviewEditCancel,
             Rect::new(chunks[3].x + cw, chunks[3].y, xw, 1),
+        );
+    } else if state.read_only {
+        // Read-only: no Save, no double-click-to-edit hint. Just
+        // Close (Esc) + scroll affordances.
+        let close_label = " [Close] ";
+        let top_label = " [Top] ";
+        let bot_label = " [Bottom] ";
+        let footer = Line::from(vec![
+            Span::styled(
+                close_label,
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                top_label,
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                bot_label,
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  read-only  ", theme::muted()),
+            Span::styled(format!("    {}", pos), theme::muted()),
+        ]);
+        f.render_widget(Paragraph::new(footer), chunks[3]);
+        let cw = close_label.chars().count() as u16;
+        let tw = top_label.chars().count() as u16;
+        let bw = bot_label.chars().count() as u16;
+        // Reuse CuePreviewCancel for the Close pill — semantically
+        // "exit the overlay", which is what cancel already does.
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewCancel,
+            Rect::new(chunks[3].x, chunks[3].y, cw, 1),
+        );
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewTop,
+            Rect::new(chunks[3].x + cw, chunks[3].y, tw, 1),
+        );
+        button_map.record_button(
+            super::button_map::TuiButton::CuePreviewBottom,
+            Rect::new(chunks[3].x + cw + tw, chunks[3].y, bw, 1),
         );
     } else {
         let save_label = " [Save] ";
