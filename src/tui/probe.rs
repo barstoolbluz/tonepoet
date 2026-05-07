@@ -1323,6 +1323,89 @@ mod tests {
         assert!(!metadata_editor_has_changes(&state));
     }
 
+    /// Critical round-trip test for the CUESHEET tag embed plan:
+    /// confirm lofty preserves a multi-line Vorbis comment value
+    /// through write → read on a real FLAC file. If this test fails,
+    /// the embed plan must switch to FLAC's native CUESHEET metadata
+    /// block instead of a Vorbis comment.
+    ///
+    /// The save path uses `val.trim()` (probe.rs:1116-ish), so the
+    /// trailing newline gets stripped — we compare against the
+    /// trim_end of the producer output, not the raw producer.
+    #[test]
+    fn lofty_cuesheet_vorbis_comment_round_trips_multiline() {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/silence.flac");
+        assert!(
+            fixture.exists(),
+            "missing test fixture: {}",
+            fixture.display()
+        );
+        // Copy to a tmp file so we don't mutate the fixture.
+        let tmp = std::env::temp_dir()
+            .join(format!("tonepoet-cuesheet-roundtrip-{}.flac", std::process::id()));
+        std::fs::copy(&fixture, &tmp).expect("copy fixture");
+
+        let cue_payload = "REM GENRE Rock\n\
+            REM DATE 1970\n\
+            CATALOG 0044007735428\n\
+            TITLE \"Whole Album\"\n\
+            PERFORMER \"Album Artist\"\n\
+            FILE \"image.flac\" FLAC\n\
+              TRACK 01 AUDIO\n\
+                TITLE \"First\"\n\
+                PERFORMER \"Album Artist\"\n\
+                INDEX 01 00:00:00\n\
+              TRACK 02 AUDIO\n\
+                TITLE \"Second\"\n\
+                PERFORMER \"Album Artist\"\n\
+                INDEX 01 04:00:00\n";
+
+        // Write CUESHEET via lofty.
+        {
+            let mut tagged = lofty::read_from_path(&tmp).expect("read fixture");
+            if tagged.primary_tag().is_none() {
+                let tt = tagged.primary_tag_type();
+                tagged.insert_tag(lofty::tag::Tag::new(tt));
+            }
+            let tag = tagged.primary_tag_mut().expect("primary tag");
+            let key = ItemKey::Unknown("CUESHEET".to_string());
+            tag.remove_key(&key);
+            tag.insert_unchecked(TagItem::new(
+                key,
+                ItemValue::Text(cue_payload.trim().to_string()),
+            ));
+            tagged.save_to_path(&tmp, WriteOptions::default()).expect("save");
+        }
+
+        // Read CUESHEET back.
+        let read_back = {
+            let tagged = lofty::read_from_path(&tmp).expect("re-read");
+            let tag = tagged.primary_tag().expect("primary tag re-read");
+            let key = ItemKey::Unknown("CUESHEET".to_string());
+            tag.get_string(&key).map(|s| s.to_string())
+        };
+
+        let _ = std::fs::remove_file(&tmp);
+
+        let read_back = read_back.expect("CUESHEET tag should be present after save");
+        assert_eq!(
+            read_back, cue_payload.trim(),
+            "lofty should preserve multi-line Vorbis comment value byte-for-byte (modulo trim)"
+        );
+        // Sanity: the value still has internal newlines (lofty didn't
+        // collapse them).
+        assert!(read_back.contains('\n'), "internal newlines must be preserved");
+        assert!(
+            read_back.matches('\n').count() >= 5,
+            "multi-line content (≥5 newlines) must round-trip"
+        );
+    }
+
     #[test]
     fn toggle_no_op_when_no_mb_proposed() {
         let mut e = TagEntry {

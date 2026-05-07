@@ -39,6 +39,9 @@ pub struct MbTrack {
     pub title: String,
     pub artist: String,
     pub isrc: Option<String>,
+    /// Track length in milliseconds, when MB exposes it. Required for
+    /// generating an embedded CUESHEET tag on single-image rips.
+    pub length_ms: Option<u32>,
 }
 
 /// Build the MusicBrainz `toc=` query value from absolute sector offsets.
@@ -329,6 +332,15 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Length in ms, preferring the track-level value (the disc-encoded
+    // length); fall back to recording.length when the track doesn't
+    // carry its own.
+    let length_ms = t.get("length")
+        .and_then(|v| v.as_u64())
+        .or_else(|| t.get("recording")
+            .and_then(|r| r.get("length"))
+            .and_then(|v| v.as_u64()))
+        .map(|n| n as u32);
 
     Some(MbTrack {
         position,
@@ -338,6 +350,7 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         title,
         artist,
         isrc,
+        length_ms,
     })
 }
 
@@ -715,6 +728,7 @@ mod tests {
             title: title.into(),
             artist: artist.into(),
             isrc: isrc.map(String::from),
+            length_ms: None,
         }
     }
 
@@ -754,6 +768,28 @@ mod tests {
     fn parse_mb_response_returns_none_on_empty() {
         assert!(parse_mb_response(r#"{"releases":[]}"#, 0).unwrap().is_none());
         assert!(parse_mb_response(r#"{"error":"not found"}"#, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_mb_extracts_track_length_ms() {
+        // Track-level length wins; recording.length is a fallback.
+        let body = r#"{
+            "releases": [{
+                "id": "rid", "score": 100, "title": "Album",
+                "media": [{
+                    "tracks": [
+                        { "position": 1, "title": "A", "length": 240000 },
+                        { "position": 2, "title": "B",
+                          "recording": { "length": 180000 } },
+                        { "position": 3, "title": "C" }
+                    ]
+                }]
+            }]
+        }"#;
+        let r = parse_mb_response(body, 3).unwrap().unwrap();
+        assert_eq!(r.tracks[0].length_ms, Some(240000), "track-level length");
+        assert_eq!(r.tracks[1].length_ms, Some(180000), "recording-level fallback");
+        assert_eq!(r.tracks[2].length_ms, None, "no length means None");
     }
 
     #[test]

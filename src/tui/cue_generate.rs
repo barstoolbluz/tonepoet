@@ -138,6 +138,55 @@ pub fn generate_single_image_cue(
     cue
 }
 
+/// Build a CUE string from a MusicBrainz release for embedding as a
+/// `CUESHEET` tag on a single-image rip. The single image's filename
+/// (basename, not path) and its format extension drive the FILE line.
+///
+/// Refuses to generate when *any* track is missing `length_ms`: the
+/// timestamps would be wrong and silent corruption is worse than a
+/// caller-visible error.
+pub fn cue_from_mb_release(
+    release: &super::musicbrainz::MbRelease,
+    image_filename: &str,
+    image_ext: &str,
+) -> Result<String, String> {
+    if release.tracks.is_empty() {
+        return Err("MB release has no tracks".to_string());
+    }
+    let mut tracks_sorted: Vec<&super::musicbrainz::MbTrack> = release.tracks.iter().collect();
+    tracks_sorted.sort_by_key(|t| t.position);
+
+    let mut cue_tracks: Vec<CueTrackInfo> = Vec::with_capacity(tracks_sorted.len());
+    for t in &tracks_sorted {
+        let length_ms = t.length_ms.ok_or_else(|| format!(
+            "MB track {} ({:?}) has no length; cannot generate timestamps",
+            t.position, t.title,
+        ))?;
+        cue_tracks.push(CueTrackInfo {
+            filename: image_filename.to_string(),
+            title: t.title.clone(),
+            artist: if t.artist.is_empty() { release.artist.clone() } else { t.artist.clone() },
+            track_number: t.position,
+            duration: Duration::from_millis(length_ms as u64),
+            format_tag: cue_format_tag(image_ext).to_string(),
+            pregap_frames: None,
+            isrc: t.isrc.clone(),
+        });
+    }
+
+    let album = CueAlbumInfo {
+        title: release.title.clone(),
+        artist: release.artist.clone(),
+        year: release.year.clone(),
+        genre: None,
+        catalog: release.catalog.clone()
+            .or_else(|| release.barcode.clone())
+            .filter(|s| !s.is_empty()),
+    };
+    let format_tag = cue_format_tag(image_ext);
+    Ok(generate_single_image_cue(&album, &cue_tracks, image_filename, format_tag))
+}
+
 /// Map a file extension to the CUE FILE type keyword.
 pub fn cue_format_tag(ext: &str) -> &'static str {
     match ext.to_ascii_lowercase().as_str() {
@@ -937,6 +986,97 @@ mod tests {
         assert_eq!(tracks[1].title, "Track 2");
         assert_eq!(tracks[1].artist, "Artist");
         assert_eq!(tracks[1].isrc, None);
+    }
+
+    fn mb_track(position: u32, title: &str, length_ms: Option<u32>, isrc: Option<&str>)
+        -> super::super::musicbrainz::MbTrack
+    {
+        super::super::musicbrainz::MbTrack {
+            position,
+            track_id: None,
+            recording_id: None,
+            artist_id: None,
+            title: title.into(),
+            artist: String::new(),
+            isrc: isrc.map(String::from),
+            length_ms,
+        }
+    }
+
+    #[test]
+    fn cue_from_mb_release_produces_valid_cue_with_cumulative_timestamps() {
+        let release = super::super::musicbrainz::MbRelease {
+            release_id: "rid".into(),
+            release_group_id: None,
+            artist_id: None,
+            title: "Album".into(),
+            artist: "Artist".into(),
+            year: Some("1970".into()),
+            original_date: None,
+            country: None,
+            catalog: Some("CAT-1".into()),
+            barcode: None,
+            tracks: vec![
+                mb_track(1, "Track 1", Some(240_000), Some("USRC17607839")), // 4:00
+                mb_track(2, "Track 2", Some(180_000), None),                  // 3:00
+                mb_track(3, "Track 3", Some(120_000), None),                  // 2:00
+            ],
+        };
+        let cue = cue_from_mb_release(&release, "image.flac", "flac")
+            .expect("cue generation should succeed");
+        // Validates structurally.
+        validate_cue_content(&cue).expect("CUE must validate");
+        // FILE line carries the right name + format tag.
+        assert!(cue.contains("FILE \"image.flac\" FLAC"));
+        // Track 1 starts at 00:00:00, Track 2 at 04:00:00, Track 3 at 07:00:00.
+        assert!(cue.contains("    INDEX 01 00:00:00"), "track 1 INDEX 01\n{}", cue);
+        assert!(cue.contains("    INDEX 01 04:00:00"), "track 2 INDEX 01\n{}", cue);
+        assert!(cue.contains("    INDEX 01 07:00:00"), "track 3 INDEX 01\n{}", cue);
+        // ISRC carried per-track when MB provides it.
+        assert!(cue.contains("USRC17607839"));
+        // Catalog from release.
+        assert!(cue.contains("CATALOG"));
+    }
+
+    #[test]
+    fn cue_from_mb_release_refuses_when_lengths_missing() {
+        let release = super::super::musicbrainz::MbRelease {
+            release_id: "rid".into(),
+            release_group_id: None,
+            artist_id: None,
+            title: "Album".into(),
+            artist: "Artist".into(),
+            year: None,
+            original_date: None,
+            country: None,
+            catalog: None,
+            barcode: None,
+            tracks: vec![
+                mb_track(1, "Track 1", Some(240_000), None),
+                mb_track(2, "Track 2", None, None),
+            ],
+        };
+        let err = cue_from_mb_release(&release, "image.flac", "flac")
+            .expect_err("must refuse when a track has no length");
+        assert!(err.contains("length"), "error should mention length: {}", err);
+    }
+
+    #[test]
+    fn cue_from_mb_release_refuses_on_empty_tracks() {
+        let release = super::super::musicbrainz::MbRelease {
+            release_id: "rid".into(),
+            release_group_id: None,
+            artist_id: None,
+            title: "Album".into(),
+            artist: "Artist".into(),
+            year: None,
+            original_date: None,
+            country: None,
+            catalog: None,
+            barcode: None,
+            tracks: vec![],
+        };
+        assert!(cue_from_mb_release(&release, "image.flac", "flac").is_err());
     }
 
     #[test]
