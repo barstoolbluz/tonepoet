@@ -991,6 +991,13 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
         });
     }
 
+    // Force-binary on synthetic-preview rows (CUESHEET) so inline edit
+    // is blocked everywhere — those values can be 1-2KB of multi-line
+    // content and a synthetic summary is shown in the editor instead.
+    for e in &mut entries {
+        if is_synthetic_preview(e) { e.is_binary = true; }
+    }
+
     sort_entries_standard_first(&mut entries);
 
     Ok(entries)
@@ -1104,6 +1111,12 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
+    }
+
+    // Force-binary on synthetic-preview rows (CUESHEET) so inline
+    // edit is blocked — see read_all_tags for rationale.
+    for e in &mut entries {
+        if is_synthetic_preview(e) { e.is_binary = true; }
     }
 
     // Sort with standard key priority.
