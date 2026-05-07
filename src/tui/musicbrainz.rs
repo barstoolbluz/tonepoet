@@ -355,6 +355,12 @@ pub fn populate_editor_mb_supplemental(
     use lofty::tag::ItemKey;
 
     let n = state.paths.len();
+    // Single-image rip: one file representing a multi-track release.
+    // Track-level IDs (ISRC, MUSICBRAINZ_TRACKID, MUSICBRAINZ_RECORDINGID,
+    // per-track ARTISTID) don't apply when the file IS the album, so
+    // skip creating those entries. Album-level IDs (ALBUMID, etc.)
+    // still get written.
+    let single_image = n == 1 && release.tracks.len() > 1;
 
     fn find_or_create(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
@@ -383,14 +389,16 @@ pub fn populate_editor_mb_supplemental(
     // Per-track presence pre-pass: only create the entry when at least
     // one track in the release has data for that field. Tracks with no
     // data leave their per-file value as the empty string (matching the
-    // pre-existing "MB silent on this track" behavior).
-    let any_isrc = release.tracks.iter()
+    // pre-existing "MB silent on this track" behavior). For
+    // single-image rips, skip these entirely (track-level IDs are
+    // meaningless when the file is the whole album).
+    let any_isrc = !single_image && release.tracks.iter()
         .any(|t| t.isrc.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_recording = release.tracks.iter()
+    let any_recording = !single_image && release.tracks.iter()
         .any(|t| t.recording_id.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_track = release.tracks.iter()
+    let any_track = !single_image && release.tracks.iter()
         .any(|t| t.track_id.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_track_artist = release.tracks.iter()
+    let any_track_artist = !single_image && release.tracks.iter()
         .any(|t| t.artist_id.as_deref().is_some_and(|s| !s.is_empty()));
 
     let isrc_idx = if any_isrc {
@@ -608,9 +616,22 @@ pub fn populate_editor_from_mb(
         Some(find_or_create(&mut state.entries, "DATE", ItemKey::Year, n))
     } else { None };
 
+    // Single-image rip detection: one file, multi-track release. The
+    // file represents the whole album, so TITLE/ARTIST should carry
+    // the album-level values rather than track 1's. (Foobar2000 / EAC
+    // write the album title here for the same reason.)
+    let single_image = n == 1 && release.tracks.len() > 1;
+
     for i in 0..n {
         let mt = release.tracks.iter().find(|m| m.position as usize == i + 1);
-        if let Some(mt) = mt {
+        if single_image {
+            if let Some(idx) = title_idx {
+                state.entries[idx].per_file_values[i] = release.title.clone();
+            }
+            if let (Some(idx), false) = (artist_idx, release.artist.is_empty()) {
+                state.entries[idx].per_file_values[i] = release.artist.clone();
+            }
+        } else if let Some(mt) = mt {
             if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
                 state.entries[idx].per_file_values[i] = mt.title.clone();
             }
@@ -1014,6 +1035,48 @@ mod tests {
         // Catalog prefers label catalog over barcode.
         assert_eq!(lookup("CATALOGNUMBER"), vec!["UICY-94626", "UICY-94626"]);
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_uses_album_title() {
+        // Single-image rip: one file, multi-track release. TITLE should
+        // be the album title, NOT track 1's title (which is what the
+        // pre-fix code did). Track-level IDs (ISRC, MUSICBRAINZ_TRACKID,
+        // MUSICBRAINZ_ARTISTID) should not appear at all.
+        let mut state = empty_editor_state(1);
+        let mut release = rel("rid", vec![
+            {
+                let mut t = trk(1, "Lead-off Track", "Artist A", Some("USRC17607839"));
+                t.recording_id = Some("rec1".into());
+                t.track_id = Some("tk1".into());
+                t.artist_id = Some("artid1".into());
+                t
+            },
+            trk(2, "Second Track", "Artist B", None),
+            trk(3, "Third Track", "Artist C", None),
+        ]);
+        release.title = "Whole Album".into();
+        release.artist = "Album Artist".into();
+        release.year = Some("1970".into());
+        populate_editor_from_mb(&mut state, &release);
+
+        let lookup = |key: &str| -> Vec<String> {
+            state.entries.iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case(key))
+                .map(|e| e.per_file_values.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(lookup("TITLE"), vec!["Whole Album"], "TITLE must be album, not track 1");
+        assert_eq!(lookup("ARTIST"), vec!["Album Artist"], "ARTIST must be album-level");
+        assert_eq!(lookup("ALBUM"), vec!["Whole Album"]);
+        assert_eq!(lookup("DATE"), vec!["1970"]);
+        // Track-level IDs must NOT have been created.
+        assert!(state.entries.iter().find(|e| e.display_key == "ISRC").is_none(),
+            "ISRC must not be written for single-image");
+        assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_TRACKID").is_none(),
+            "MUSICBRAINZ_TRACKID must not be written for single-image");
+        assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID").is_none());
+        assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_ARTISTID").is_none());
     }
 
     #[test]
