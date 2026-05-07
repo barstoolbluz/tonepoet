@@ -313,18 +313,6 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
     }
 }
 
-/// "Verify" submenu — generic file-level integrity check. Disk-specific
-/// verification (AccurateRip, CUETools DB) lives under the separate
-/// "Disk Tools" submenu since those only apply to redbook CD rips.
-fn build_verify_submenu() -> ContextMenuEntry {
-    ContextMenuEntry::Submenu {
-        label: "Verify".to_string(),
-        children: vec![
-            item("Verify integrity", ContextAction::Verify),
-        ],
-    }
-}
-
 /// "Disk Tools" submenu — AccurateRip and CUETools DB lookups, both
 /// of which only return useful results for redbook CD rips (16-bit /
 /// 44.1 kHz with a known TOC).
@@ -355,6 +343,8 @@ fn build_disk_tools_submenu() -> ContextMenuEntry {
 
 fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
+        item("Verify integrity", ContextAction::Verify),
+        separator(),
         item("CUE sheet from tags (multi-file)", ContextAction::GenerateCueMultiFile),
         item("CUE sheet from tags (single image)", ContextAction::GenerateCueSingleImage),
         item("CUE sheet from MusicBrainz (multi-file)", ContextAction::GenerateCueMbMultiFile),
@@ -406,7 +396,6 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                         .unwrap_or(false)))
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
-            items.push(build_verify_submenu());
             items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
             items.push(separator());
@@ -440,7 +429,6 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                         .unwrap_or(false)))
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
-            items.push(build_verify_submenu());
             items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
             items.push(item("Select", ContextAction::Select));
