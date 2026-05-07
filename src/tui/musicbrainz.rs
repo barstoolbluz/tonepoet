@@ -689,19 +689,15 @@ pub fn populate_editor_from_mb(
             );
         } else if has_sidecar_cue(state.paths.first()) {
             log::info!(":tags-mb: skipping CUESHEET embed (sidecar .cue file exists)");
-        } else if let Some((file_ms, total_ms)) = state.paths.first()
-            .and_then(|p| check_file_duration_mismatch(p, release))
+        } else if let Some(skip_reason) = state.paths.first()
+            .and_then(|p| verify_single_image_matches_release(p, release))
         {
-            // File exists and is probable, but its duration disagrees
-            // with sum-of-MB-tracks beyond tolerance. Most common cause:
-            // the user has 1 track of an N-track release, and the
-            // count-only single_image heuristic mis-fired. Could also
-            // be HTOA-padded rip; either way, embedding would produce
-            // a CUE with wrong INDEX timestamps.
-            log::info!(
-                ":tags-mb: skipping CUESHEET embed (file {}ms vs MB total {}ms, > {}ms tolerance)",
-                file_ms, total_ms, DURATION_MISMATCH_TOLERANCE_MS,
-            );
+            // Strict-by-default: only embed when we have positive
+            // evidence the file matches the release (matching
+            // MUSICBRAINZ_ALBUMID tag OR probe-verified duration
+            // within ±3s). Probe failure / missing length data /
+            // duration mismatch all skip with a diagnostic reason.
+            log::info!(":tags-mb: skipping CUESHEET embed ({})", skip_reason);
         } else if let Some(filename) = state.paths.first()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
@@ -747,35 +743,101 @@ fn durations_consistent(file_ms: u64, release_total_ms: u64, tolerance_ms: u64) 
     diff <= tolerance_ms
 }
 
-/// Compare the audio file's actual duration to the sum of MB track
-/// lengths. Returns `Some((file_ms, release_total_ms))` when the two
-/// disagree by more than `DURATION_MISMATCH_TOLERANCE_MS` (caller
-/// should skip the embed and log the values). Returns `None` when:
-/// - any track is missing `length_ms` (can't compute total — the
-///   downstream length-check guard will refuse for the same reason)
-/// - the file can't be probed (permissive: don't punish weird-but-
-///   readable files; we'd be no worse off than before this guard)
-/// - the probed duration is zero (probe couldn't determine it)
-/// - the durations are within tolerance
-fn check_file_duration_mismatch(
-    audio_path: &std::path::Path,
-    release: &MbRelease,
-) -> Option<(u64, u64)> {
-    let release_total_ms: u64 = release.tracks.iter()
+/// True when the file already carries a MUSICBRAINZ_ALBUMID tag whose
+/// value matches `release.release_id`. Strong identity signal: the
+/// file was previously tagged as belonging to this MB release, so we
+/// can embed a CUESHEET confidently even if duration verification
+/// can't run (corrupt header, locked file, exotic codec).
+///
+/// Returns false when:
+/// - `release.release_id` is empty (no anchor to verify against)
+/// - lofty can't read the file or its primary tag
+/// - the MUSICBRAINZ_ALBUMID tag is absent or doesn't match
+fn release_already_tagged_on_file(audio_path: &std::path::Path, release: &MbRelease) -> bool {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::ItemKey;
+
+    if release.release_id.is_empty() {
+        return false;
+    }
+    let Ok(tagged) = lofty::read_from_path(audio_path) else { return false; };
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else { return false; };
+    matches!(
+        tag.get_string(&ItemKey::MusicBrainzReleaseId),
+        Some(s) if s == release.release_id,
+    )
+}
+
+/// Tri-state result of comparing the audio file's actual duration to
+/// the sum of MB track lengths. The caller decides what to do with
+/// each variant; in particular, `Unverifiable` is treated as a strict
+/// skip when no other identity signal (e.g. matching MB album-id tag)
+/// vouches for the file.
+enum DurationCheck {
+    /// Probe succeeded; durations are within
+    /// `DURATION_MISMATCH_TOLERANCE_MS`.
+    Match,
+    /// Probe succeeded; durations diverge beyond tolerance. Carries
+    /// `(file_ms, release_total_ms)` for logging.
+    Mismatch(u64, u64),
+    /// Couldn't determine match/mismatch: any of probe failure
+    /// (corrupt header, locked file, exotic codec, missing file),
+    /// zero probed duration, or any track missing `length_ms`.
+    Unverifiable,
+}
+
+fn check_file_duration(audio_path: &std::path::Path, release: &MbRelease) -> DurationCheck {
+    let Some(release_total_ms) = release.tracks.iter()
         .map(|t| t.length_ms.map(|n| n as u64))
-        .sum::<Option<u64>>()?;
+        .sum::<Option<u64>>()
+    else {
+        return DurationCheck::Unverifiable;
+    };
     let info = match super::probe::probe_audio(audio_path) {
         Ok(i) => i,
-        Err(_) => return None,
+        Err(_) => return DurationCheck::Unverifiable,
     };
     if info.duration_secs <= 0.0 {
-        return None;
+        return DurationCheck::Unverifiable;
     }
     let file_ms = (info.duration_secs * 1000.0).round() as u64;
     if durations_consistent(file_ms, release_total_ms, DURATION_MISMATCH_TOLERANCE_MS) {
-        None
+        DurationCheck::Match
     } else {
-        Some((file_ms, release_total_ms))
+        DurationCheck::Mismatch(file_ms, release_total_ms)
+    }
+}
+
+/// Decide whether to embed a CUESHEET tag into the file.
+///
+/// Returns `None` when verified to match the release (proceed with
+/// embed); `Some(reason)` when the file should NOT be embedded (caller
+/// logs the reason and skips).
+///
+/// Decision flow:
+/// 1. If the file already carries `MUSICBRAINZ_ALBUMID == release.release_id`
+///    we treat it as definitively this release — embed even if probe
+///    can't run (corrupt/locked/exotic).
+/// 2. Otherwise, require a positive duration verification:
+///    - `Match` → proceed
+///    - `Mismatch` → skip with diagnostic
+///    - `Unverifiable` → skip strictly (no positive evidence)
+fn verify_single_image_matches_release(
+    audio_path: &std::path::Path,
+    release: &MbRelease,
+) -> Option<String> {
+    if release_already_tagged_on_file(audio_path, release) {
+        return None;
+    }
+    match check_file_duration(audio_path, release) {
+        DurationCheck::Match => None,
+        DurationCheck::Mismatch(file_ms, total_ms) => Some(format!(
+            "duration mismatch: file {}ms vs MB total {}ms (>{}ms tolerance)",
+            file_ms, total_ms, DURATION_MISMATCH_TOLERANCE_MS,
+        )),
+        DurationCheck::Unverifiable => Some(
+            "can't verify file matches release (probe failed or no MUSICBRAINZ_ALBUMID tag)".to_string()
+        ),
     }
 }
 
@@ -1262,18 +1324,16 @@ mod tests {
         // Single-image rip with MB providing track lengths → CUESHEET
         // tag entry should be auto-created with the per-track listing
         // baked into a multi-line CUE string.
+        //
+        // Under strict verification we install the silence.flac fixture
+        // (100ms total) and pick MB lengths that sum within tolerance,
+        // exercising the duration-match path. Cumulative-timestamp
+        // correctness is verified independently in cue_generate.rs.
         let (mut state, _td) = empty_editor_state(1);
+        install_silence_at(&state);
         let mut release = rel("rid", vec![
-            {
-                let mut t = trk(1, "First", "Artist", None);
-                t.length_ms = Some(240_000);
-                t
-            },
-            {
-                let mut t = trk(2, "Second", "Artist", None);
-                t.length_ms = Some(180_000);
-                t
-            },
+            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(50);  t },
+            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(50);  t },
         ]);
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
@@ -1285,8 +1345,6 @@ mod tests {
         assert!(cue_entry.is_binary, "CUESHEET row must block inline edit");
         let cue = &cue_entry.per_file_values[0];
         assert!(cue.contains("FILE \"01.flac\" FLAC"));
-        assert!(cue.contains("    INDEX 01 00:00:00"));
-        assert!(cue.contains("    INDEX 01 04:00:00"));
         assert!(cue.contains("First"));
         assert!(cue.contains("Second"));
     }
@@ -1321,24 +1379,6 @@ mod tests {
     }
 
     #[test]
-    fn populate_editor_from_mb_single_image_creates_cuesheet_when_durations_match() {
-        // File is 100ms (silence.flac). MB tracks summing to ~100ms
-        // (50ms + 50ms) → within ±3s tolerance → embed proceeds.
-        let (mut state, _td) = empty_editor_state(1);
-        install_silence_at(&state);
-        let mut release = rel("rid", vec![
-            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(50);  t },
-            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(50);  t },
-        ]);
-        release.title = "Whole Album".into();
-        populate_editor_from_mb(&mut state, &release);
-        assert!(
-            state.entries.iter().any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")),
-            "CUESHEET should be created when file duration matches MB total within tolerance",
-        );
-    }
-
-    #[test]
     fn populate_editor_from_mb_single_image_skips_cuesheet_when_durations_mismatch() {
         // File is 100ms (silence.flac). MB tracks summing to 60_000ms
         // (60s) — far outside ±3s tolerance → skip.
@@ -1353,6 +1393,69 @@ mod tests {
         assert!(
             state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
             "duration mismatch (100ms vs 60s) must skip CUESHEET embed",
+        );
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_embeds_when_identity_matches_despite_duration_mismatch() {
+        // File is 100ms but carries MUSICBRAINZ_ALBUMID matching the
+        // release. Identity is positive evidence the file belongs to
+        // this release, so we embed even though duration check would
+        // otherwise refuse on the 60s/100ms divergence. (Realistic
+        // scenario: a corrupt or in-progress file that lofty can still
+        // tag-read but ffmpeg can't probe — though here the file is
+        // fine; we just construct a deliberate duration mismatch to
+        // prove the identity path overrides.)
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+        let (mut state, _td) = empty_editor_state(1);
+        install_silence_at(&state);
+        // Write MUSICBRAINZ_ALBUMID = "matching-rid" into the file.
+        let path = &state.paths[0];
+        {
+            let mut tagged = lofty::read_from_path(path).expect("read fixture copy");
+            if tagged.primary_tag().is_none() {
+                let tt = tagged.primary_tag_type();
+                tagged.insert_tag(lofty::tag::Tag::new(tt));
+            }
+            let tag = tagged.primary_tag_mut().expect("primary tag");
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::MusicBrainzReleaseId,
+                ItemValue::Text("matching-rid".to_string()),
+            ));
+            tagged.save_to_path(path, WriteOptions::default()).expect("save tag");
+        }
+
+        let mut release = rel("matching-rid", vec![
+            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(30_000); t },
+            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(30_000); t },
+        ]);
+        release.title = "Whole Album".into();
+        populate_editor_from_mb(&mut state, &release);
+
+        assert!(
+            state.entries.iter().any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")),
+            "matching MUSICBRAINZ_ALBUMID must override duration mismatch and embed CUESHEET",
+        );
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_skips_cuesheet_when_unverifiable() {
+        // No file installed (probe fails) AND no MUSICBRAINZ_ALBUMID
+        // tag (no identity anchor). Strict policy: refuse to embed.
+        // Previously this case embedded permissively; now it doesn't.
+        let (mut state, _td) = empty_editor_state(1);
+        let mut release = rel("rid", vec![
+            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(240_000); t },
+            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(180_000); t },
+        ]);
+        release.title = "Whole Album".into();
+        populate_editor_from_mb(&mut state, &release);
+        assert!(
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            "unverifiable file (no probe + no identity) must skip CUESHEET embed strictly",
         );
     }
 
