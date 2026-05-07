@@ -669,6 +669,34 @@ pub fn populate_editor_from_mb(
         recompute_and_stamp_mb_proposed(&mut state.entries[idx], n);
     }
 
+    // Single-image rip: also stamp a CUESHEET tag with the per-track
+    // listing (titles, artists, ISRCs, cumulative INDEX 01 timestamps)
+    // so players that read embedded cuesheets can navigate within the
+    // single file. Silently skipped if MB didn't return per-track
+    // lengths — without those the timestamps would be wrong.
+    if single_image {
+        if let Some(filename) = state.paths.first()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+        {
+            let ext = std::path::Path::new(filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("flac");
+            if let Ok(cue) = super::cue_generate::cue_from_mb_release(release, filename, ext) {
+                let cue_idx = find_or_create(
+                    &mut state.entries, "CUESHEET",
+                    ItemKey::Unknown("CUESHEET".to_string()), n,
+                );
+                state.entries[cue_idx].per_file_values[0] = cue.clone();
+                // is_binary keeps inline edit blocked; the value would
+                // be 1-2KB of multi-line content otherwise.
+                state.entries[cue_idx].is_binary = true;
+                recompute_and_stamp_mb_proposed(&mut state.entries[cue_idx], n);
+            }
+        }
+    }
+
     crate::tui::probe::sort_entries_standard_first(&mut state.entries);
     state.dirty = true;
 }
@@ -1113,6 +1141,86 @@ mod tests {
             "MUSICBRAINZ_TRACKID must not be written for single-image");
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_ARTISTID").is_none());
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_creates_cuesheet_when_lengths_present() {
+        // Single-image rip with MB providing track lengths → CUESHEET
+        // tag entry should be auto-created with the per-track listing
+        // baked into a multi-line CUE string.
+        let mut state = empty_editor_state(1);
+        let mut release = rel("rid", vec![
+            {
+                let mut t = trk(1, "First", "Artist", None);
+                t.length_ms = Some(240_000);
+                t
+            },
+            {
+                let mut t = trk(2, "Second", "Artist", None);
+                t.length_ms = Some(180_000);
+                t
+            },
+        ]);
+        release.title = "Whole Album".into();
+        release.artist = "Album Artist".into();
+        populate_editor_from_mb(&mut state, &release);
+
+        let cue_entry = state.entries.iter()
+            .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET entry should be auto-created on single-image populate");
+        assert!(cue_entry.is_binary, "CUESHEET row must block inline edit");
+        let cue = &cue_entry.per_file_values[0];
+        assert!(cue.contains("FILE \"01.flac\" FLAC"));
+        assert!(cue.contains("    INDEX 01 00:00:00"));
+        assert!(cue.contains("    INDEX 01 04:00:00"));
+        assert!(cue.contains("First"));
+        assert!(cue.contains("Second"));
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_skips_cuesheet_when_lengths_missing() {
+        // No MB lengths → CUESHEET must NOT be created (silent
+        // corruption is worse than a missing tag the user can request
+        // manually later).
+        let mut state = empty_editor_state(1);
+        let mut release = rel("rid", vec![
+            trk(1, "First", "Artist", None),
+            trk(2, "Second", "Artist", None),
+        ]);
+        release.title = "Whole Album".into();
+        release.artist = "Album Artist".into();
+        populate_editor_from_mb(&mut state, &release);
+
+        assert!(
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            "CUESHEET must not be created when track lengths are missing",
+        );
+    }
+
+    #[test]
+    fn populate_editor_from_mb_multi_file_does_not_create_cuesheet() {
+        // 2 files, 2 tracks → not single-image; CUESHEET shouldn't be
+        // generated (it only applies to single-image rips).
+        let mut state = empty_editor_state(2);
+        let mut release = rel("rid", vec![
+            {
+                let mut t = trk(1, "First", "Artist", None);
+                t.length_ms = Some(240_000);
+                t
+            },
+            {
+                let mut t = trk(2, "Second", "Artist", None);
+                t.length_ms = Some(180_000);
+                t
+            },
+        ]);
+        release.title = "Album".into();
+        populate_editor_from_mb(&mut state, &release);
+
+        assert!(
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            "CUESHEET should only fire on single-image rips",
+        );
     }
 
     #[test]

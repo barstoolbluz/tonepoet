@@ -1452,6 +1452,10 @@ fn draw_metadata_editor(
             entry.value.replace('\n', "↵").replace('\r', "")
         } else if is_deleted {
             format!("(deleted)")
+        } else if super::probe::is_synthetic_preview(entry) {
+            // Multi-KB structured tag (CUESHEET): show summary instead
+            // of raw multi-line content.
+            super::probe::cue_summary_string(&entry.value)
         } else if entry.is_binary {
             entry.value.clone()
         } else {

@@ -581,6 +581,33 @@ pub struct TagEntry {
     pub mb_proposed_per_file: Option<Vec<String>>,
 }
 
+/// True when this entry's value is too large or structured to render
+/// inline in the metadata editor and should display a synthesized
+/// summary string instead (currently: CUESHEET, which can carry
+/// kilobytes of multi-line CUE content for embedded-cuesheet single
+/// image rips).
+pub fn is_synthetic_preview(entry: &TagEntry) -> bool {
+    entry.display_key.eq_ignore_ascii_case("CUESHEET")
+}
+
+/// Build a one-line summary for a synthetic-preview tag value. Used
+/// in place of the raw value on the metadata-editor row so a 1-2KB
+/// CUESHEET doesn't fill the editor with noise.
+pub fn cue_summary_string(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "[CUE sheet · empty]".to_string();
+    }
+    let lines = trimmed.lines().count();
+    let bytes = trimmed.len();
+    let size_str = if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    };
+    format!("[CUE sheet · {} lines · {}]", lines, size_str)
+}
+
 /// True when at least one entry has been changed from its on-disk
 /// original value, or there are pending deletions queued. Used to
 /// refresh the editor's `dirty` flag after a revert toggle so the
