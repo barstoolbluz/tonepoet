@@ -1251,80 +1251,66 @@ mod tests {
     }
 
     #[test]
-    fn stack_rects_shift_left_when_cascade_overflows() {
-        // 100-col terminal, root anchored at x=20, 3 levels deep with
-        // narrower labels — the shift should fit everything.
-        let level1 = MenuLevel::new(vec![submenu("AAAA", vec![leaf("noop")])]);
-        let level2 = MenuLevel::new(vec![submenu("BBBB", vec![leaf("noop")])]);
-        let level3 = MenuLevel::new(vec![submenu("CCCC", vec![leaf("noop")])]);
-        let levels = vec![level1, level2, level3];
-        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
-            &levels, (75, 5), 100, 24,
-        );
-        // 3 levels + preview = 4 rects, all fit within 100 after shift.
-        let last = rects.last().unwrap();
-        let dump: Vec<(u16, u16, u16)> = rects.iter().map(|r| (r.x, r.width, r.x + r.width)).collect();
-        assert!(
-            last.x + last.width <= 100,
-            "deepest panel right edge ({}) exceeds 100 even after shift; rects = {:?}",
-            last.x + last.width, dump,
-        );
-        // The shift should have moved the root left of its origin (75).
-        assert!(rects[0].x < 75, "root must have shifted left from origin 75; got x={}", rects[0].x);
-    }
-
-    #[test]
-    fn stack_rects_no_shift_when_cascade_fits() {
-        // Wide terminal, narrow cascade — origin should be unchanged.
-        let level1 = MenuLevel::new(vec![submenu("AA", vec![leaf("noop")])]);
+    fn cascade_goes_right_when_origin_has_room() {
+        let level1 = MenuLevel::new(vec![submenu("AA", vec![leaf("end")])]);
         let level2 = MenuLevel::new(vec![leaf("end")]);
         let levels = vec![level1, level2];
         let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
             &levels, (5, 5), 200, 24,
         );
-        assert_eq!(rects[0].x, 5, "root should sit at its anchor when no shift needed");
+        assert_eq!(rects[0].x, 5, "root should sit at its anchor");
+        assert!(rects[1].x >= rects[0].x, "level 2 should cascade right of root");
     }
 
     #[test]
-    fn stack_rects_partial_shift_when_terminal_too_narrow() {
-        // Cascade is genuinely wider than the terminal even with full
-        // shift. Verify root goes to x=0 (max shift) and the function
-        // doesn't panic.
-        let level1 = MenuLevel::new(vec![
-            submenu("AAAAAAAAAAAAAAAAAAAA", vec![leaf("noop")]),
-        ]);
-        let level2 = MenuLevel::new(vec![
-            submenu("BBBBBBBBBBBBBBBBBBBB", vec![leaf("noop")]),
-        ]);
-        let level3 = MenuLevel::new(vec![
-            submenu("CCCCCCCCCCCCCCCCCCCC", vec![leaf("noop")]),
-        ]);
-        let levels = vec![level1, level2, level3];
+    fn cascade_flips_left_at_right_edge() {
+        // Root anchored near the right edge — its child has no room
+        // to cascade right and must flip leftward instead.
+        let level1 = MenuLevel::new(vec![submenu("AAAAAAAAAA", vec![leaf("end")])]);
+        let level2 = MenuLevel::new(vec![leaf("noop")]);
+        let levels = vec![level1, level2];
         let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
-            &levels, (10, 5), 80, 24,
+            &levels, (75, 5), 80, 24,
         );
-        // Root pinned at x=0 after max shift.
-        assert_eq!(rects[0].x, 0, "root should be flush left when terminal too narrow");
+        assert!(rects[0].x + rects[0].width <= 80, "root must fit on screen");
+        assert!(
+            rects[1].x + rects[1].width <= rects[0].x + 1,
+            "level 2 should be entirely left of root; got level2.right={}, root.x={}",
+            rects[1].x + rects[1].width, rects[0].x,
+        );
     }
 
     #[test]
-    fn stack_rects_shift_clamped_by_root_x() {
-        // Root anchored at x=0 — no headroom for the shift to work in.
-        // Cascade overflows but root stays at x=0.
-        let level1 = MenuLevel::new(vec![
-            submenu("AAAAAAAAAAAAAAAAAAAAAAAAAA", vec![leaf("noop")]), // wide
-        ]);
-        let level2 = MenuLevel::new(vec![
-            submenu("BBBBBBBBBBBBBBBBBBBBBBBBBB", vec![leaf("noop")]),
-        ]);
-        let level3 = MenuLevel::new(vec![
-            submenu("CCCCCCCCCCCCCCCCCCCCCCCCCC", vec![leaf("noop")]),
-        ]);
+    fn cascade_momentum_keeps_deeper_levels_left() {
+        let level1 = MenuLevel::new(vec![submenu("AAAAAAAAAA", vec![leaf("end")])]);
+        let level2 = MenuLevel::new(vec![submenu("BBBBBBBBBB", vec![leaf("end")])]);
+        let level3 = MenuLevel::new(vec![leaf("end")]);
         let levels = vec![level1, level2, level3];
         let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
-            &levels, (0, 5), 80, 24,
+            &levels, (75, 5), 80, 24,
         );
-        assert_eq!(rects[0].x, 0, "root must stay at x=0 when anchored there");
+        assert!(rects[1].x + rects[1].width <= rects[0].x + 1,
+            "level 2 should flip left at right edge");
+        assert!(rects[2].x + rects[2].width <= rects[1].x + 1,
+            "level 3 should inherit left direction (momentum); got level3.right={}, level2.x={}",
+            rects[2].x + rects[2].width, rects[1].x);
+    }
+
+    #[test]
+    fn cascade_falls_back_without_panic_on_extreme_narrow_terminal() {
+        // Pathological case: 30-col terminal with three 20-char
+        // labels (menu_w ≈ 26 each). Cascade can't fit either side
+        // for the deeper levels. Function must not panic and must
+        // return rects within u16 bounds.
+        let level1 = MenuLevel::new(vec![submenu("AAAAAAAAAAAAAAAAAAAA", vec![leaf("end")])]);
+        let level2 = MenuLevel::new(vec![submenu("BBBBBBBBBBBBBBBBBBBB", vec![leaf("end")])]);
+        let level3 = MenuLevel::new(vec![leaf("end")]);
+        let levels = vec![level1, level2, level3];
+        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
+            &levels, (5, 5), 30, 24,
+        );
+        // Sanity: function returned, rects are non-empty.
+        assert!(!rects.is_empty());
     }
 
     #[test]

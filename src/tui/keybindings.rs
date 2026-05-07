@@ -4601,8 +4601,50 @@ fn recalc_dirty(state: &mut super::app::MetadataEditorState) {
         );
 }
 
-/// Compute the screen rect for a context menu panel, matching
-/// `render_menu_panel` in draw_overlays.rs.
+/// Cascade direction for one level relative to its parent. Each level
+/// inherits its parent's direction (momentum); flips only when the
+/// inherited direction doesn't fit horizontally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CascadeDir {
+    Right,
+    Left,
+}
+
+/// Pick where a cascaded child panel should sit horizontally given its
+/// parent rect, the child's rendered width, the terminal width, and the
+/// parent's cascade direction (for momentum).
+///
+/// Try the inherited direction first; if blocked, flip; if both
+/// directions are blocked (cascade fundamentally too wide for the
+/// terminal), fall back to the inherited direction with overflow — the
+/// post-shift fallback in `context_menu_stack_rects` will pull the
+/// stack left as best it can.
+fn choose_cascade_origin(
+    parent: Rect,
+    child_w: u16,
+    area_w: u16,
+    parent_dir: CascadeDir,
+) -> (u16, CascadeDir) {
+    let right_x = parent.x.saturating_add(parent.width).saturating_sub(1);
+    let fits_right = right_x.saturating_add(child_w) <= area_w;
+    let fits_left = parent.x.saturating_add(1) >= child_w;
+    // Leftward origin: child.right = parent.x + 1, so child.x = parent.x + 1 - child_w.
+    let left_x = parent.x.saturating_add(1).saturating_sub(child_w);
+
+    match parent_dir {
+        CascadeDir::Right => {
+            if fits_right { (right_x, CascadeDir::Right) }
+            else if fits_left { (left_x, CascadeDir::Left) }
+            else { (right_x, CascadeDir::Right) }
+        }
+        CascadeDir::Left => {
+            if fits_left { (left_x, CascadeDir::Left) }
+            else if fits_right { (right_x, CascadeDir::Right) }
+            else { (left_x, CascadeDir::Left) }
+        }
+    }
+}
+
 /// Compute the cascade rects for a stack of menu levels plus an
 /// optional phantom "preview" level. The preview is the children of the
 /// focused level's selected entry when that entry is a Submenu — the
@@ -4630,15 +4672,23 @@ pub fn context_menu_stack_rects<'a>(
     // post-process the whole stack with a uniform left shift instead.
     let root = context_menu_panel_rect(&levels[0].entries, origin, area_w, area_h, true);
     rects.push(root);
+    // Direction tracked parallel to rects. Root is conventionally
+    // Right (it has no parent; the value only matters for inheritance
+    // by the next level).
+    let mut dirs: Vec<CascadeDir> = vec![CascadeDir::Right];
+
     for i in 1..levels.len() {
         let parent_rect = rects[i - 1];
+        let parent_dir = dirs[i - 1];
         let parent_entries = &levels[i - 1].entries;
         let parent_sel = levels[i - 1].selected;
         let sel_row = super::draw_overlays::selected_entry_row_pub(parent_entries, parent_sel);
-        let sub_x = parent_rect.x + parent_rect.width - 1;
+        let child_w = compute_menu_w(&levels[i].entries, area_w);
+        let (child_x, dir) = choose_cascade_origin(parent_rect, child_w, area_w, parent_dir);
         let sub_y = parent_rect.y + sel_row + 1;
-        let r = context_menu_panel_rect(&levels[i].entries, (sub_x, sub_y), area_w, area_h, false);
+        let r = context_menu_panel_rect(&levels[i].entries, (child_x, sub_y), area_w, area_h, false);
         rects.push(r);
+        dirs.push(dir);
     }
 
     // Preview: focused level's selected entry, if it's a Submenu and
@@ -4658,8 +4708,10 @@ pub fn context_menu_stack_rects<'a>(
         if let Some(&idx) = selectable.get(sel) {
             if let ContextMenuEntry::Submenu { children, .. } = &entries[idx] {
                 let parent_rect = *rects.last().unwrap();
+                let parent_dir = *dirs.last().unwrap();
                 let sel_row = super::draw_overlays::selected_entry_row_pub(entries, sel);
-                let pv_x = parent_rect.x + parent_rect.width - 1;
+                let child_w = compute_menu_w(children, area_w);
+                let (pv_x, _pv_dir) = choose_cascade_origin(parent_rect, child_w, area_w, parent_dir);
                 let pv_y = parent_rect.y + sel_row + 1;
                 let pv_rect = context_menu_panel_rect(children, (pv_x, pv_y), area_w, area_h, false);
                 rects.push(pv_rect);
@@ -4668,27 +4720,54 @@ pub fn context_menu_stack_rects<'a>(
         }
     }
 
-    // Width-overflow correction: if the deepest panel extends past the
-    // right edge, shift the whole stack left uniformly so the cascade
-    // visual is preserved. The shift is bounded by the root's x — we
-    // never push the root off-screen left. If even shifting fully isn't
-    // enough (extremely narrow terminal at depth 4), the deepest panels
-    // will be partially clipped on render; the cascade still navigates.
-    if let Some(last) = rects.last() {
-        let right = last.x.saturating_add(last.width);
-        if right > area_w {
-            let needed = right - area_w;
-            let max_shift = rects[0].x;
-            let shift = needed.min(max_shift);
-            if shift > 0 {
-                for r in &mut rects {
-                    r.x = r.x.saturating_sub(shift);
-                }
+    // Width-overflow correction: if any panel extends past the right
+    // edge, shift the whole stack left uniformly. With directional
+    // cascade, the rightmost panel may be a *middle* level (e.g. level
+    // 2 cascades right and overflows; level 3 cascades left and fits)
+    // — so the trigger looks at max(right) across all rects, not just
+    // the deepest. The shift is bounded by min(x) across all rects so
+    // no panel is pushed off-screen left.
+    let max_right = rects.iter()
+        .map(|r| r.x.saturating_add(r.width))
+        .max()
+        .unwrap_or(0);
+    if max_right > area_w {
+        let needed = max_right - area_w;
+        let max_shift = rects.iter().map(|r| r.x).min().unwrap_or(0);
+        let shift = needed.min(max_shift);
+        if shift > 0 {
+            for r in &mut rects {
+                r.x = r.x.saturating_sub(shift);
             }
         }
     }
 
     (rects, preview)
+}
+
+/// Compute the rendered width of a menu panel from its entries.
+/// Mirrors the calculation inside [`context_menu_panel_rect`]; lifted
+/// so the directional cascade can know `child_w` before choosing the
+/// cascade origin.
+fn compute_menu_w(
+    entries: &[super::context_menu::ContextMenuEntry],
+    area_w: u16,
+) -> u16 {
+    use super::context_menu::ContextMenuEntry;
+    let max_label_w: usize = entries
+        .iter()
+        .filter_map(|e| match e {
+            ContextMenuEntry::Item(item) => {
+                let shortcut_w = item.shortcut.as_ref()
+                    .map(|s| s.chars().count() + 3).unwrap_or(0);
+                Some(item.label.chars().count() + shortcut_w)
+            }
+            ContextMenuEntry::Submenu { label, .. } => Some(label.chars().count() + 2),
+            ContextMenuEntry::Separator => None,
+        })
+        .max()
+        .unwrap_or(10);
+    (max_label_w + 4).min(area_w as usize) as u16
 }
 
 /// Compute a menu panel's rect.
@@ -4704,21 +4783,7 @@ fn context_menu_panel_rect(
     area_h: u16,
     clamp_x: bool,
 ) -> Rect {
-    use super::context_menu::ContextMenuEntry;
-    let max_label_w: usize = entries
-        .iter()
-        .filter_map(|e| match e {
-            ContextMenuEntry::Item(item) => {
-                let shortcut_w = item.shortcut.as_ref()
-                    .map(|s| s.chars().count() + 3).unwrap_or(0);
-                Some(item.label.chars().count() + shortcut_w)
-            }
-            ContextMenuEntry::Submenu { label, .. } => Some(label.chars().count() + 2),
-            ContextMenuEntry::Separator => None,
-        })
-        .max()
-        .unwrap_or(10);
-    let menu_w = (max_label_w + 4).min(area_w as usize) as u16;
+    let menu_w = compute_menu_w(entries, area_w);
     let menu_h = (entries.len() + 2).min(area_h as usize) as u16;
     let x = if clamp_x {
         origin.0.min(area_w.saturating_sub(menu_w))
