@@ -689,6 +689,19 @@ pub fn populate_editor_from_mb(
             );
         } else if has_sidecar_cue(state.paths.first()) {
             log::info!(":tags-mb: skipping CUESHEET embed (sidecar .cue file exists)");
+        } else if let Some((file_ms, total_ms)) = state.paths.first()
+            .and_then(|p| check_file_duration_mismatch(p, release))
+        {
+            // File exists and is probable, but its duration disagrees
+            // with sum-of-MB-tracks beyond tolerance. Most common cause:
+            // the user has 1 track of an N-track release, and the
+            // count-only single_image heuristic mis-fired. Could also
+            // be HTOA-padded rip; either way, embedding would produce
+            // a CUE with wrong INDEX timestamps.
+            log::info!(
+                ":tags-mb: skipping CUESHEET embed (file {}ms vs MB total {}ms, > {}ms tolerance)",
+                file_ms, total_ms, DURATION_MISMATCH_TOLERANCE_MS,
+            );
         } else if let Some(filename) = state.paths.first()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
@@ -713,6 +726,57 @@ pub fn populate_editor_from_mb(
 
     crate::tui::probe::sort_entries_standard_first(&mut state.entries);
     state.dirty = true;
+}
+
+/// Tolerance (ms) for the file-duration vs MB-track-sum check used by
+/// the single-image CUESHEET-embed gate. Generous enough to absorb
+/// frame-rounding (75 frames/sec ≈ 13ms × N tracks), short pregaps,
+/// and small encoder padding; tight enough to catch the "user has 1
+/// track of 10" case (off by tens of minutes).
+const DURATION_MISMATCH_TOLERANCE_MS: u64 = 3000;
+
+/// Pure predicate: are the two durations within `tolerance_ms` of each
+/// other? Subtraction is order-safe (works whether file is shorter or
+/// longer than the release total).
+fn durations_consistent(file_ms: u64, release_total_ms: u64, tolerance_ms: u64) -> bool {
+    let diff = if file_ms > release_total_ms {
+        file_ms - release_total_ms
+    } else {
+        release_total_ms - file_ms
+    };
+    diff <= tolerance_ms
+}
+
+/// Compare the audio file's actual duration to the sum of MB track
+/// lengths. Returns `Some((file_ms, release_total_ms))` when the two
+/// disagree by more than `DURATION_MISMATCH_TOLERANCE_MS` (caller
+/// should skip the embed and log the values). Returns `None` when:
+/// - any track is missing `length_ms` (can't compute total — the
+///   downstream length-check guard will refuse for the same reason)
+/// - the file can't be probed (permissive: don't punish weird-but-
+///   readable files; we'd be no worse off than before this guard)
+/// - the probed duration is zero (probe couldn't determine it)
+/// - the durations are within tolerance
+fn check_file_duration_mismatch(
+    audio_path: &std::path::Path,
+    release: &MbRelease,
+) -> Option<(u64, u64)> {
+    let release_total_ms: u64 = release.tracks.iter()
+        .map(|t| t.length_ms.map(|n| n as u64))
+        .sum::<Option<u64>>()?;
+    let info = match super::probe::probe_audio(audio_path) {
+        Ok(i) => i,
+        Err(_) => return None,
+    };
+    if info.duration_secs <= 0.0 {
+        return None;
+    }
+    let file_ms = (info.duration_secs * 1000.0).round() as u64;
+    if durations_consistent(file_ms, release_total_ms, DURATION_MISMATCH_TOLERANCE_MS) {
+        None
+    } else {
+        Some((file_ms, release_total_ms))
+    }
 }
 
 /// True when the audio file's parent directory contains *any* `.cue`
@@ -828,6 +892,21 @@ mod tests {
     fn parse_mb_response_returns_none_on_empty() {
         assert!(parse_mb_response(r#"{"releases":[]}"#, 0).unwrap().is_none());
         assert!(parse_mb_response(r#"{"error":"not found"}"#, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn durations_consistent_within_tolerance() {
+        assert!(durations_consistent(100_000, 100_000, 3000), "exact match");
+        assert!(durations_consistent(100_500, 100_000, 3000), "file slightly longer");
+        assert!(durations_consistent(99_500, 100_000, 3000), "file slightly shorter");
+        assert!(durations_consistent(100_000, 103_000, 3000), "exactly at tolerance");
+    }
+
+    #[test]
+    fn durations_consistent_outside_tolerance() {
+        assert!(!durations_consistent(100_000, 60_000_000, 3000), "1 track of N: huge mismatch");
+        assert!(!durations_consistent(100_000, 103_001, 3000), "just past tolerance");
+        assert!(!durations_consistent(60_000_000, 100_000, 3000), "reversed direction also mismatches");
     }
 
     #[test]
@@ -1229,6 +1308,51 @@ mod tests {
         assert!(
             state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
             "CUESHEET must not be created when track lengths are missing",
+        );
+    }
+
+    /// Copy `tests/fixtures/silence.flac` into the test's tempdir at
+    /// the path `state.paths[0]` points to. The fixture is 100ms.
+    fn install_silence_at(state: &crate::tui::app::MetadataEditorState) {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/silence.flac");
+        let dst = &state.paths[0];
+        std::fs::copy(&fixture, dst).expect("install silence.flac fixture");
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_creates_cuesheet_when_durations_match() {
+        // File is 100ms (silence.flac). MB tracks summing to ~100ms
+        // (50ms + 50ms) → within ±3s tolerance → embed proceeds.
+        let (mut state, _td) = empty_editor_state(1);
+        install_silence_at(&state);
+        let mut release = rel("rid", vec![
+            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(50);  t },
+            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(50);  t },
+        ]);
+        release.title = "Whole Album".into();
+        populate_editor_from_mb(&mut state, &release);
+        assert!(
+            state.entries.iter().any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")),
+            "CUESHEET should be created when file duration matches MB total within tolerance",
+        );
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_skips_cuesheet_when_durations_mismatch() {
+        // File is 100ms (silence.flac). MB tracks summing to 60_000ms
+        // (60s) — far outside ±3s tolerance → skip.
+        let (mut state, _td) = empty_editor_state(1);
+        install_silence_at(&state);
+        let mut release = rel("rid", vec![
+            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(30_000); t },
+            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(30_000); t },
+        ]);
+        release.title = "Whole Album".into();
+        populate_editor_from_mb(&mut state, &release);
+        assert!(
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            "duration mismatch (100ms vs 60s) must skip CUESHEET embed",
         );
     }
 
