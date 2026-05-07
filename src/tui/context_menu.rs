@@ -313,14 +313,25 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
     }
 }
 
-/// Build the "Utilities" submenu. Compare items change based on whether
-/// a reference is currently stored.
+/// "Verify" submenu — generic file-level integrity check. Disk-specific
+/// verification (AccurateRip, CUETools DB) lives under the separate
+/// "Disk Tools" submenu since those only apply to redbook CD rips.
 fn build_verify_submenu() -> ContextMenuEntry {
     ContextMenuEntry::Submenu {
         label: "Verify".to_string(),
         children: vec![
             item("Verify integrity", ContextAction::Verify),
-            separator(),
+        ],
+    }
+}
+
+/// "Disk Tools" submenu — AccurateRip and CUETools DB lookups, both
+/// of which only return useful results for redbook CD rips (16-bit /
+/// 44.1 kHz with a known TOC).
+fn build_disk_tools_submenu() -> ContextMenuEntry {
+    ContextMenuEntry::Submenu {
+        label: "Disk Tools".to_string(),
+        children: vec![
             ContextMenuEntry::Submenu {
                 label: "AccurateRip".to_string(),
                 children: vec![
@@ -396,6 +407,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
             items.push(build_verify_submenu());
+            items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(true));
@@ -429,6 +441,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
             items.push(build_verify_submenu());
+            items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
@@ -1314,14 +1327,13 @@ mod tests {
     }
 
     #[test]
-    fn verify_submenu_is_three_levels() {
-        // The Verify submenu is now: Verify > {AccurateRip, CUETools DB} > leaves.
-        let v = build_verify_submenu();
+    fn disk_tools_submenu_is_three_levels() {
+        // Disk Tools > {AccurateRip, CUETools DB} > leaves.
+        let v = build_disk_tools_submenu();
         let ContextMenuEntry::Submenu { children, .. } = v else {
-            panic!("Verify must be a Submenu");
+            panic!("Disk Tools must be a Submenu");
         };
-        // At least one child should itself be a Submenu (AccurateRip).
         let has_nested = children.iter().any(|e| matches!(e, ContextMenuEntry::Submenu { .. }));
-        assert!(has_nested, "expected nested submenu inside Verify");
+        assert!(has_nested, "expected nested submenu inside Disk Tools (AccurateRip / CUETools DB)");
     }
 }
