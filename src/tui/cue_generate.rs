@@ -1016,6 +1016,7 @@ mod tests {
             country: None,
             catalog: Some("CAT-1".into()),
             barcode: None,
+            disc_count: 1,
             tracks: vec![
                 mb_track(1, "Track 1", Some(240_000), Some("USRC17607839")), // 4:00
                 mb_track(2, "Track 2", Some(180_000), None),                  // 3:00
@@ -1051,6 +1052,7 @@ mod tests {
             country: None,
             catalog: None,
             barcode: None,
+            disc_count: 1,
             tracks: vec![
                 mb_track(1, "Track 1", Some(240_000), None),
                 mb_track(2, "Track 2", None, None),
@@ -1074,6 +1076,7 @@ mod tests {
             country: None,
             catalog: None,
             barcode: None,
+            disc_count: 1,
             tracks: vec![],
         };
         assert!(cue_from_mb_release(&release, "image.flac", "flac").is_err());

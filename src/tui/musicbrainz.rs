@@ -27,6 +27,10 @@ pub struct MbRelease {
     pub country: Option<String>,
     pub catalog: Option<String>,
     pub barcode: Option<String>,
+    /// Number of media (discs) in the release. Used by the
+    /// single-image CUESHEET-embed gate to skip multi-disc releases
+    /// (which can't be unambiguously embedded into one file).
+    pub disc_count: usize,
     pub tracks: Vec<MbTrack>,
 }
 
@@ -286,6 +290,7 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
         country,
         catalog,
         barcode,
+        disc_count: media.len(),
         tracks,
     }
 }
@@ -672,10 +677,19 @@ pub fn populate_editor_from_mb(
     // Single-image rip: also stamp a CUESHEET tag with the per-track
     // listing (titles, artists, ISRCs, cumulative INDEX 01 timestamps)
     // so players that read embedded cuesheets can navigate within the
-    // single file. Silently skipped if MB didn't return per-track
-    // lengths — without those the timestamps would be wrong.
+    // single file. Multiple guards may skip the embed (cheapest first):
+    // multi-disc release; existing sidecar `.cue`; missing per-track
+    // lengths from MB. Skips are silent (log::info!) — the user sees
+    // no CUESHEET row, which is the correct outcome.
     if single_image {
-        if let Some(filename) = state.paths.first()
+        if release.disc_count > 1 {
+            log::info!(
+                ":tags-mb: skipping CUESHEET embed (multi-disc release: {} discs)",
+                release.disc_count,
+            );
+        } else if has_sidecar_cue(state.paths.first()) {
+            log::info!(":tags-mb: skipping CUESHEET embed (sidecar .cue file exists)");
+        } else if let Some(filename) = state.paths.first()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
         {
@@ -699,6 +713,23 @@ pub fn populate_editor_from_mb(
 
     crate::tui::probe::sort_entries_standard_first(&mut state.entries);
     state.dirty = true;
+}
+
+/// True when the audio file's parent directory contains *any* `.cue`
+/// file. Used to skip auto-embed of a CUESHEET tag when a sidecar CUE
+/// already exists alongside (don't duplicate the user's existing CUE).
+/// Permissive on read failures (treats unreadable directories as
+/// "no sidecar present", since we can't prove otherwise).
+fn has_sidecar_cue(audio_path: Option<&std::path::PathBuf>) -> bool {
+    let Some(path) = audio_path else { return false; };
+    let Some(parent) = path.parent() else { return false; };
+    let Ok(entries) = std::fs::read_dir(parent) else { return false; };
+    entries
+        .filter_map(|e| e.ok())
+        .any(|e| e.path()
+            .extension()
+            .map(|ext| ext.to_ascii_lowercase() == "cue")
+            .unwrap_or(false))
 }
 
 /// Render a MusicBrainz `artist-credit` array into a single performer
@@ -742,6 +773,7 @@ mod tests {
             country: None,
             catalog: None,
             barcode: None,
+            disc_count: 1,
             tracks,
         }
     }
@@ -931,12 +963,14 @@ mod tests {
         assert_eq!(r.tracks[0].recording_id.as_deref(), Some("rec1"));
     }
 
-    fn empty_editor_state(n: usize) -> crate::tui::app::MetadataEditorState {
+    fn empty_editor_state(n: usize) -> (crate::tui::app::MetadataEditorState, tempfile::TempDir) {
         use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
-        MetadataEditorState {
-            paths: (0..n)
-                .map(|i| std::path::PathBuf::from(format!("/tmp/{:02}.flac", i + 1)))
-                .collect(),
+        let td = tempfile::tempdir().expect("tempdir");
+        let paths: Vec<std::path::PathBuf> = (0..n)
+            .map(|i| td.path().join(format!("{:02}.flac", i + 1)))
+            .collect();
+        let state = MetadataEditorState {
+            paths,
             entries: Vec::new(),
             cursor: 0, scroll: 0, last_click: None,
             edit_input: None, add_key_input: None,
@@ -944,12 +978,13 @@ mod tests {
             dirty: false, deleted: Vec::new(),
             file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
-        }
+        };
+        (state, td)
     }
 
     #[test]
     fn populate_sorts_entries_with_mb_keys_in_logical_positions() {
-        let mut state = empty_editor_state(2);
+        let (mut state, _td) = empty_editor_state(2);
         let mut release = rel("rid", vec![
             trk(1, "T1", "A", Some("USRC1")),
             trk(2, "T2", "A", Some("USRC2")),
@@ -985,7 +1020,7 @@ mod tests {
 
     #[test]
     fn populate_supplemental_skips_entries_for_fields_mb_didnt_supply() {
-        let mut state = empty_editor_state(2);
+        let (mut state, _td) = empty_editor_state(2);
         // MB returns release_id only — no catalog/barcode/country/IDs/etc.
         let release = rel("rid", vec![
             trk(1, "T1", "A", None),
@@ -1011,7 +1046,7 @@ mod tests {
 
     #[test]
     fn populate_stamps_mb_proposed_for_changed_fields() {
-        let mut state = empty_editor_state(2);
+        let (mut state, _td) = empty_editor_state(2);
         let mut release = rel("rid", vec![
             trk(1, "Track 1", "Artist", Some("USRC1")),
             trk(2, "Track 2", "Artist", None),
@@ -1031,7 +1066,7 @@ mod tests {
 
     #[test]
     fn populate_supplemental_writes_isrc_catalog_and_mb_only_fields() {
-        let mut state = empty_editor_state(2);
+        let (mut state, _td) = empty_editor_state(2);
         let mut release = rel("rid", vec![
             trk(1, "T1", "A", Some("USRC1")),
             trk(2, "T2", "A", None),
@@ -1073,7 +1108,7 @@ mod tests {
 
     #[test]
     fn populate_editor_from_mb_fills_track_and_album_fields() {
-        let mut state = empty_editor_state(2);
+        let (mut state, _td) = empty_editor_state(2);
         let mut release = rel("x", vec![
             trk(1, "Track 1", "Artist", Some("USRC17607839")),
             trk(2, "Track 2", "Artist", None),
@@ -1107,7 +1142,7 @@ mod tests {
         // be the album title, NOT track 1's title (which is what the
         // pre-fix code did). Track-level IDs (ISRC, MUSICBRAINZ_TRACKID,
         // MUSICBRAINZ_ARTISTID) should not appear at all.
-        let mut state = empty_editor_state(1);
+        let (mut state, _td) = empty_editor_state(1);
         let mut release = rel("rid", vec![
             {
                 let mut t = trk(1, "Lead-off Track", "Artist A", Some("USRC17607839"));
@@ -1148,7 +1183,7 @@ mod tests {
         // Single-image rip with MB providing track lengths → CUESHEET
         // tag entry should be auto-created with the per-track listing
         // baked into a multi-line CUE string.
-        let mut state = empty_editor_state(1);
+        let (mut state, _td) = empty_editor_state(1);
         let mut release = rel("rid", vec![
             {
                 let mut t = trk(1, "First", "Artist", None);
@@ -1182,7 +1217,7 @@ mod tests {
         // No MB lengths → CUESHEET must NOT be created (silent
         // corruption is worse than a missing tag the user can request
         // manually later).
-        let mut state = empty_editor_state(1);
+        let (mut state, _td) = empty_editor_state(1);
         let mut release = rel("rid", vec![
             trk(1, "First", "Artist", None),
             trk(2, "Second", "Artist", None),
@@ -1198,10 +1233,67 @@ mod tests {
     }
 
     #[test]
+    fn populate_editor_from_mb_single_image_skips_cuesheet_when_multidisc() {
+        // disc_count > 1: don't embed (single file can't unambiguously
+        // represent a multi-disc release).
+        let (mut state, _td) = empty_editor_state(1);
+        let mut release = rel("rid", vec![
+            {
+                let mut t = trk(1, "First", "Artist", None);
+                t.length_ms = Some(240_000);
+                t
+            },
+            {
+                let mut t = trk(2, "Second", "Artist", None);
+                t.length_ms = Some(180_000);
+                t
+            },
+        ]);
+        release.title = "Whole Album".into();
+        release.disc_count = 2;
+        populate_editor_from_mb(&mut state, &release);
+
+        assert!(
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            "multi-disc release must not auto-embed CUESHEET",
+        );
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_skips_cuesheet_when_sidecar_present() {
+        // A `.cue` file alongside the audio → skip embed (don't
+        // duplicate what's already there).
+        let (mut state, td) = empty_editor_state(1);
+        let sidecar = td.path().join("album.cue");
+        std::fs::write(&sidecar, "REM dummy\nFILE \"x\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n")
+            .expect("write sidecar");
+
+        let mut release = rel("rid", vec![
+            {
+                let mut t = trk(1, "First", "Artist", None);
+                t.length_ms = Some(240_000);
+                t
+            },
+            {
+                let mut t = trk(2, "Second", "Artist", None);
+                t.length_ms = Some(180_000);
+                t
+            },
+        ]);
+        release.title = "Whole Album".into();
+        populate_editor_from_mb(&mut state, &release);
+
+        assert!(
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            "sidecar .cue present must skip CUESHEET embed",
+        );
+    }
+
+    #[test]
     fn populate_editor_from_mb_multi_file_does_not_create_cuesheet() {
         // 2 files, 2 tracks → not single-image; CUESHEET shouldn't be
         // generated (it only applies to single-image rips).
-        let mut state = empty_editor_state(2);
+        let (mut state, _td) = empty_editor_state(2);
         let mut release = rel("rid", vec![
             {
                 let mut t = trk(1, "First", "Artist", None);
