@@ -4815,10 +4815,22 @@ fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
     let visible = crossterm::terminal::size()
         .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
         .unwrap_or(20);
-    if state.cursor < state.scroll {
-        state.scroll = state.cursor;
-    } else if state.cursor >= state.scroll + visible {
-        state.scroll = state.cursor.saturating_sub(visible - 1);
+    // The "From sidecar CUE" separator inserted before the first
+    // cue-source row adds one to the visual line index relative to
+    // the entry index. `state.scroll` is consumed by the renderer as
+    // a lines-vec offset (matches `lines.into_iter().skip(scroll)`),
+    // so scroll math here must operate in visual-line units, not raw
+    // entry indices. Without this adjustment, a cue-row cursor at
+    // the bottom of the visible area would sit one row past the edge.
+    let separator_offset = state.entries.iter()
+        .position(|e| matches!(e.source, super::probe::TagSource::CueSidecar))
+        .map(|first_cue| if state.cursor >= first_cue { 1 } else { 0 })
+        .unwrap_or(0);
+    let visual_cursor = state.cursor + separator_offset;
+    if visual_cursor < state.scroll {
+        state.scroll = visual_cursor;
+    } else if visual_cursor >= state.scroll + visible {
+        state.scroll = visual_cursor.saturating_sub(visible - 1);
     }
 }
 
