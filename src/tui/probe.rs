@@ -961,6 +961,18 @@ pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
 /// instead of trailing.
 pub fn sort_entries_standard_first(entries: &mut Vec<TagEntry>) {
     entries.sort_by(|a, b| {
+        // Primary sort: source group. File entries always render
+        // before CueSidecar entries so the "From sidecar CUE"
+        // separator fires once at the boundary, with all virtual
+        // rows below it (rather than interleaved by priority).
+        let source_cmp = match (a.source, b.source) {
+            (TagSource::File, TagSource::CueSidecar) => std::cmp::Ordering::Less,
+            (TagSource::CueSidecar, TagSource::File) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        };
+        if source_cmp != std::cmp::Ordering::Equal { return source_cmp; }
+
+        // Secondary sort: STANDARD_KEY_ORDER priority within source group.
         let a_upper = a.display_key.to_ascii_uppercase();
         let b_upper = b.display_key.to_ascii_uppercase();
         let a_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
