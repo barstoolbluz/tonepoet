@@ -2411,8 +2411,30 @@ fn handle_metadata_editor_key(
                     }
                 }
                 KeyCode::Char('w') => {
-                    if !state.dirty {
+                    let cue_dirty = super::probe::cue_view_has_changes(&state);
+                    if !state.dirty && !cue_dirty {
                         app.set_status("No changes to save");
+                        return;
+                    }
+                    if cue_dirty {
+                        // Park editor; show confirmation dialog. On
+                        // confirm, dispatch routes to the combined
+                        // tag + CUE writer in handle_overlay_key /
+                        // ConfirmAction handler.
+                        let cue_name = state.cue_view.as_ref()
+                            .and_then(|cv| cv.cue_path.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("sidecar CUE")
+                            .to_string();
+                        let parked = state.clone();
+                        app.pending_metadata_editor = Some(parked);
+                        app.active_overlay = ActiveOverlay::Confirmation {
+                            message: format!(
+                                "Rewrite '{}'? Original backed up to .cue.bak. Tag edits saved together. Some custom REM lines may be lost.",
+                                cue_name,
+                            ),
+                            action: super::app::ConfirmAction::WriteCueFileAndTags,
+                        };
                         return;
                     }
                     // Build per-file change lists and spawn async writes.
@@ -6456,6 +6478,137 @@ fn execute_confirm_action(
         ConfirmAction::ClearQueue => {
             app.manager.clear_queue();
             app.set_status("Cleared queue");
+        }
+        ConfirmAction::WriteCueFileAndTags => {
+            // Restore parked editor and run combined save (CUE rewrite
+            // first with .bak backup, then tag writes).
+            let mut state = match app.pending_metadata_editor.take() {
+                Some(s) => s,
+                None => {
+                    app.set_status("Lost editor context; nothing saved");
+                    return;
+                }
+            };
+            // 1. Build the new CUE string from cue_view + cue-source entries.
+            let cue_view = match state.cue_view.as_ref() {
+                Some(cv) => cv,
+                None => {
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    app.set_status("No CUE view to write");
+                    return;
+                }
+            };
+            let n_tracks = cue_view.parsed.tracks.len();
+            let mut overrides: Vec<super::cue_generate::TrackOverride> =
+                (0..n_tracks).map(|_| super::cue_generate::TrackOverride {
+                    title: None, performer: None, isrc: None,
+                }).collect();
+            for entry in &state.entries {
+                if !matches!(entry.source, super::probe::TagSource::CueSidecar) { continue; }
+                for (i, val) in entry.per_file_values.iter().enumerate() {
+                    if i >= n_tracks { break; }
+                    let v = if val.is_empty() { None } else { Some(val.clone()) };
+                    match entry.display_key.to_ascii_uppercase().as_str() {
+                        "TITLE" => overrides[i].title = v,
+                        "PERFORMER" => overrides[i].performer = v,
+                        "ISRC" => overrides[i].isrc = v,
+                        _ => {}
+                    }
+                }
+            }
+            // Image filename + format tag from the audio file's basename.
+            let image_filename = state.paths.first()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("image.flac")
+                .to_string();
+            let image_ext = std::path::Path::new(&image_filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("flac");
+            let format_tag = super::cue_generate::cue_format_tag(image_ext);
+            let new_cue = super::cue_generate::regenerate_cue_with_overrides(
+                &cue_view.parsed,
+                &overrides,
+                &image_filename,
+                format_tag,
+            );
+
+            // 2. Backup original .cue → .cue.bak before rewriting.
+            let cue_path = cue_view.cue_path.clone();
+            let backup_path = cue_path.with_extension("cue.bak");
+            if let Err(e) = std::fs::write(&backup_path, &cue_view.original_text) {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                app.set_status(format!("Backup failed: {}", e));
+                return;
+            }
+            if let Err(e) = std::fs::write(&cue_path, &new_cue) {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                app.set_status(format!("CUE write failed: {}", e));
+                return;
+            }
+            // 3. Sync cue-source entries' originals to their new values
+            //    so dirty resets after a successful save.
+            for entry in &mut state.entries {
+                if matches!(entry.source, super::probe::TagSource::CueSidecar) {
+                    entry.original = entry.value.clone();
+                    entry.per_file_originals = entry.per_file_values.clone();
+                }
+            }
+            // Update cue_view's original_text + parsed to reflect the
+            // newly-written content (next edit cycle starts from here).
+            if let Some(cv) = state.cue_view.as_mut() {
+                cv.original_text = new_cue.clone();
+                cv.parsed = super::cue_parser::parse_cue(&new_cue);
+            }
+
+            // 4. Run the existing tag-save path if there are tag edits.
+            if state.dirty {
+                state.phase = super::app::MetadataEditorPhase::Saving;
+                let paths = state.paths.clone();
+                let deleted = state.deleted.clone();
+                let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>, super::probe::TagSource)> =
+                    state.entries.iter().map(|e| (
+                        e.item_key.clone(),
+                        e.per_file_values.clone(),
+                        e.per_file_originals.clone(),
+                        e.source,
+                    )).collect();
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    let mut results = Vec::new();
+                    for (file_idx, path) in paths.iter().enumerate() {
+                        let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
+                        for (entry_idx, (key, vals, origs, source)) in entries_snap.iter().enumerate() {
+                            // Only File-source entries write to tags.
+                            if !matches!(source, super::probe::TagSource::File) { continue; }
+                            if deleted.contains(&entry_idx) {
+                                changes.push((key.clone(), None));
+                            } else if file_idx < vals.len() && file_idx < origs.len() {
+                                if vals[file_idx] != origs[file_idx] {
+                                    changes.push((key.clone(), Some(vals[file_idx].clone())));
+                                }
+                            }
+                        }
+                        if !changes.is_empty() {
+                            let r = tokio::task::spawn_blocking({
+                                let path = path.clone();
+                                move || crate::tui::probe::write_all_tags(&path, &changes)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+                            results.push((path.clone(), r));
+                        }
+                    }
+                    let _ = tx_clone.send(AppMessage::MetadataEditorWriteComplete { results }).await;
+                });
+            } else {
+                // Only CUE was dirty — no tag writes; surface success.
+                state.dirty = false;
+            }
+
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            app.set_status("CUE rewritten (backup at .cue.bak); tag edits saved");
         }
         ConfirmAction::TrashSelection(paths) => {
             let mut trashed = 0usize;

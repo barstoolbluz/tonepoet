@@ -1422,6 +1422,11 @@ pub enum ConfirmAction {
     ClearCompleted,
     StopAll,
     ClearQueue,
+    /// Save the metadata editor's changes — both file tags AND a
+    /// rewrite of the sidecar `.cue` file (with a `.bak` backup).
+    /// Only fires when the editor has cue-source dirty entries; a
+    /// tag-only save bypasses confirmation.
+    WriteCueFileAndTags,
     /// Move the given paths to the system trash (XDG Trash / Finder Trash).
     TrashSelection(Vec<PathBuf>),
     /// Apply AccurateRip offset correction to a set of tracks.

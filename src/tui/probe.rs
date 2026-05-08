@@ -625,17 +625,33 @@ pub fn cue_summary_string(value: &str) -> String {
     format!("[CUE sheet · {} lines · {}]", lines, size_str)
 }
 
-/// True when at least one entry has been changed from its on-disk
-/// original value, or there are pending deletions queued. Used to
-/// refresh the editor's `dirty` flag after a revert toggle so the
-/// indicator accurately reflects whether anything would be written
-/// on save.
+/// True when at least one tag-source entry has been changed from its
+/// on-disk original value, or there are pending deletions queued.
+/// Used to refresh the editor's `dirty` flag after a revert toggle so
+/// the indicator accurately reflects whether tag bytes would be
+/// written on save.
+///
+/// Cue-sourced (sidecar) entries are intentionally NOT counted here —
+/// they have their own dirty flag (`cue_view_has_changes`) that gates
+/// a separate save path with a confirmation dialog.
 pub fn metadata_editor_has_changes(state: &super::app::MetadataEditorState) -> bool {
     !state.deleted.is_empty()
         || state.entries.iter().any(|e|
-            e.value != e.original
-            || e.per_file_values != e.per_file_originals
+            matches!(e.source, TagSource::File)
+            && (e.value != e.original
+                || e.per_file_values != e.per_file_originals)
         )
+}
+
+/// True when at least one cue-sourced (sidecar) entry has been
+/// changed from its on-disk original value. Triggers the
+/// confirmation dialog before rewriting the sidecar `.cue` file.
+pub fn cue_view_has_changes(state: &super::app::MetadataEditorState) -> bool {
+    state.entries.iter().any(|e|
+        matches!(e.source, TagSource::CueSidecar)
+        && (e.value != e.original
+            || e.per_file_values != e.per_file_originals)
+    )
 }
 
 /// State of the per-row revert toggle pill in the metadata editor.
@@ -1468,6 +1484,55 @@ mod tests {
             read_back.matches('\n').count() >= 5,
             "multi-line content (≥5 newlines) must round-trip"
         );
+    }
+
+    #[test]
+    fn dirty_helpers_partition_by_source() {
+        // metadata_editor_has_changes counts only File-source edits;
+        // cue_view_has_changes counts only CueSidecar-source edits.
+        // Symmetric — neither counts the other's dirt.
+        let file_entry_dirty = TagEntry {
+            display_key: "ALBUM".into(),
+            item_key: lofty::tag::ItemKey::AlbumTitle,
+            value: "edited".into(), original: "old".into(),
+            is_binary: false, is_mixed: false,
+            per_file_values: vec!["edited".into()],
+            per_file_originals: vec!["old".into()],
+            mb_proposed_value: None, mb_proposed_per_file: None,
+            source: TagSource::File,
+        };
+        let cue_entry_dirty = TagEntry {
+            display_key: "TITLE".into(),
+            item_key: lofty::tag::ItemKey::TrackTitle,
+            value: "<multiple values>".into(),
+            original: "<multiple values>".into(),
+            is_binary: false, is_mixed: true,
+            per_file_values: vec!["new t1".into(), "old t2".into()],
+            per_file_originals: vec!["old t1".into(), "old t2".into()],
+            mb_proposed_value: None, mb_proposed_per_file: None,
+            source: TagSource::CueSidecar,
+        };
+
+        let state_file_only = super::super::app::MetadataEditorState {
+            paths: vec![std::path::PathBuf::from("/tmp/01.flac")],
+            entries: vec![file_entry_dirty.clone()],
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: super::super::app::MetadataEditorPhase::Editing,
+            dirty: false, deleted: vec![],
+            file_labels: vec!["01".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            cue_view: None,
+        };
+        assert!(metadata_editor_has_changes(&state_file_only));
+        assert!(!cue_view_has_changes(&state_file_only));
+
+        let state_cue_only = super::super::app::MetadataEditorState {
+            entries: vec![cue_entry_dirty.clone()],
+            ..state_file_only.clone()
+        };
+        assert!(!metadata_editor_has_changes(&state_cue_only));
+        assert!(cue_view_has_changes(&state_cue_only));
     }
 
     #[test]

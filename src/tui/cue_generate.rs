@@ -187,6 +187,85 @@ pub fn cue_from_mb_release(
     Ok(generate_single_image_cue(&album, &cue_tracks, image_filename, format_tag))
 }
 
+/// Regenerate a CUE sheet from a parsed `CueSheet`, applying per-track
+/// field overrides (TITLE, PERFORMER, ISRC). Preserves original
+/// `index01_frames` / `index00_frames` so timestamps don't drift through
+/// a duration-recompute round-trip. Emits standard CUE syntax; LOSSY
+/// for any custom REM lines or comments not surfaced as parsed fields
+/// — caller should warn the user (and back up the original) before
+/// overwriting.
+///
+/// `track_overrides[i]` aligns with `parsed.tracks[i]` (assumed sorted
+/// by track number; the editor sorts at populate time).
+pub struct TrackOverride {
+    pub title: Option<String>,
+    pub performer: Option<String>,
+    pub isrc: Option<String>,
+}
+
+pub fn regenerate_cue_with_overrides(
+    parsed: &super::cue_parser::CueSheet,
+    track_overrides: &[TrackOverride],
+    image_filename: &str,
+    image_format_tag: &str,
+) -> String {
+    let mut cue = String::new();
+
+    // Album-level header — preserve what the parsed sheet had.
+    if let Some(genre) = parsed.genre.as_deref().filter(|s| !s.is_empty()) {
+        cue.push_str(&format!("REM GENRE \"{}\"\n", escape(genre)));
+    }
+    if let Some(date) = parsed.date.as_deref().filter(|s| !s.is_empty()) {
+        cue.push_str(&format!("REM DATE \"{}\"\n", escape(date)));
+    }
+    if let Some(catalog) = parsed.catalog.as_deref().filter(|s| !s.is_empty()) {
+        cue.push_str(&format!("CATALOG {}\n", escape(catalog)));
+    }
+    if let Some(title) = parsed.title.as_deref().filter(|s| !s.is_empty()) {
+        cue.push_str(&format!("TITLE \"{}\"\n", escape(title)));
+    }
+    if let Some(performer) = parsed.performer.as_deref().filter(|s| !s.is_empty()) {
+        cue.push_str(&format!("PERFORMER \"{}\"\n", escape(performer)));
+    }
+
+    cue.push_str(&format!(
+        "FILE \"{}\" {}\n",
+        escape(image_filename),
+        image_format_tag,
+    ));
+
+    for (i, track) in parsed.tracks.iter().enumerate() {
+        cue.push_str(&format!("  TRACK {:02} AUDIO\n", track.number));
+        // Title: override > parsed > nothing
+        let title = track_overrides.get(i).and_then(|o| o.title.as_deref())
+            .or(track.title.as_deref())
+            .filter(|s| !s.is_empty());
+        if let Some(t) = title {
+            cue.push_str(&format!("    TITLE \"{}\"\n", escape(t)));
+        }
+        let performer = track_overrides.get(i).and_then(|o| o.performer.as_deref())
+            .or(track.performer.as_deref())
+            .filter(|s| !s.is_empty());
+        if let Some(p) = performer {
+            cue.push_str(&format!("    PERFORMER \"{}\"\n", escape(p)));
+        }
+        let isrc = track_overrides.get(i).and_then(|o| o.isrc.as_deref())
+            .or(track.isrc.as_deref())
+            .filter(|s| !s.is_empty());
+        if let Some(c) = isrc {
+            cue.push_str(&format!("    ISRC {}\n", escape(c)));
+        }
+        if let Some(idx00) = track.index00_frames {
+            cue.push_str(&format!("    INDEX 00 {}\n", frames_to_cue_timestamp(idx00)));
+        }
+        if let Some(idx01) = track.index01_frames {
+            cue.push_str(&format!("    INDEX 01 {}\n", frames_to_cue_timestamp(idx01)));
+        }
+    }
+
+    cue
+}
+
 /// Map a file extension to the CUE FILE type keyword.
 pub fn cue_format_tag(ext: &str) -> &'static str {
     match ext.to_ascii_lowercase().as_str() {
@@ -1095,5 +1174,93 @@ mod tests {
 
         assert!(cue.contains("    INDEX 00 03:59:00"));
         assert!(cue.contains("    INDEX 01 04:00:00"));
+    }
+
+    #[test]
+    fn regenerate_with_overrides_preserves_index_and_applies_overrides() {
+        use super::super::cue_parser::{CueSheet, CueTrack};
+        let parsed = CueSheet {
+            title: Some("Old Album".into()),
+            performer: Some("Old Artist".into()),
+            date: Some("1977".into()),
+            genre: None,
+            catalog: None,
+            tracks: vec![
+                CueTrack {
+                    number: 1,
+                    title: Some("Old Track 1".into()),
+                    performer: Some("Old Artist".into()),
+                    file: Some("image.flac".into()),
+                    index01_frames: Some(0),
+                    index00_frames: None,
+                    isrc: Some("USRC0000001".into()),
+                },
+                CueTrack {
+                    number: 2,
+                    title: Some("Old Track 2".into()),
+                    performer: Some("Old Artist".into()),
+                    file: Some("image.flac".into()),
+                    index01_frames: Some(18000), // 4:00:00
+                    index00_frames: Some(17925), // 3:59:00 (75-frame pregap)
+                    isrc: None,
+                },
+            ],
+        };
+        let overrides = vec![
+            TrackOverride {
+                title: Some("New Track 1".to_string()),
+                performer: None,
+                isrc: None,
+            },
+            TrackOverride {
+                title: Some("New Track 2".to_string()),
+                performer: Some("New Performer".to_string()),
+                isrc: Some("USRC0000002".to_string()),
+            },
+        ];
+        let cue = regenerate_cue_with_overrides(&parsed, &overrides, "image.flac", "FLAC");
+        // Album-level preserved.
+        assert!(cue.contains("TITLE \"Old Album\""));
+        assert!(cue.contains("PERFORMER \"Old Artist\""));
+        assert!(cue.contains("REM DATE \"1977\""));
+        // FILE line.
+        assert!(cue.contains("FILE \"image.flac\" FLAC"));
+        // Track 1: title overridden, performer falls back to parsed, ISRC from parsed.
+        assert!(cue.contains("    TITLE \"New Track 1\""));
+        assert!(cue.contains("    ISRC USRC0000001"));
+        // Track 2: title + performer + ISRC all overridden.
+        assert!(cue.contains("    TITLE \"New Track 2\""));
+        assert!(cue.contains("    PERFORMER \"New Performer\""));
+        assert!(cue.contains("    ISRC USRC0000002"));
+        // INDEX timestamps preserved from parsed.
+        assert!(cue.contains("    INDEX 01 00:00:00"));
+        assert!(cue.contains("    INDEX 00 03:59:00"));
+        assert!(cue.contains("    INDEX 01 04:00:00"));
+    }
+
+    #[test]
+    fn regenerate_with_no_overrides_preserves_parsed_track_titles() {
+        use super::super::cue_parser::{CueSheet, CueTrack};
+        let parsed = CueSheet {
+            title: None,
+            performer: None,
+            date: None,
+            genre: None,
+            catalog: None,
+            tracks: vec![
+                CueTrack {
+                    number: 1,
+                    title: Some("Original Title".into()),
+                    performer: None,
+                    file: Some("a.flac".into()),
+                    index01_frames: Some(0),
+                    index00_frames: None,
+                    isrc: None,
+                },
+            ],
+        };
+        let overrides = vec![TrackOverride { title: None, performer: None, isrc: None }];
+        let cue = regenerate_cue_with_overrides(&parsed, &overrides, "a.flac", "FLAC");
+        assert!(cue.contains("    TITLE \"Original Title\""));
     }
 }
