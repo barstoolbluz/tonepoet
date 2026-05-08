@@ -400,6 +400,7 @@ pub fn populate_editor_mb_supplemental(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: crate::tui::probe::TagSource::File,
         });
         entries.len() - 1
     }
@@ -609,6 +610,7 @@ pub fn populate_editor_from_mb(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: crate::tui::probe::TagSource::File,
         });
         entries.len() - 1
     }
@@ -847,15 +849,9 @@ fn verify_single_image_matches_release(
 /// Permissive on read failures (treats unreadable directories as
 /// "no sidecar present", since we can't prove otherwise).
 fn has_sidecar_cue(audio_path: Option<&std::path::PathBuf>) -> bool {
-    let Some(path) = audio_path else { return false; };
-    let Some(parent) = path.parent() else { return false; };
-    let Ok(entries) = std::fs::read_dir(parent) else { return false; };
-    entries
-        .filter_map(|e| e.ok())
-        .any(|e| e.path()
-            .extension()
-            .map(|ext| ext.to_ascii_lowercase() == "cue")
-            .unwrap_or(false))
+    audio_path
+        .map(|p| super::cue_parser::find_sidecar_cue(p).is_some())
+        .unwrap_or(false)
 }
 
 /// Render a MusicBrainz `artist-credit` array into a single performer
@@ -1119,6 +1115,7 @@ mod tests {
             dirty: false, deleted: Vec::new(),
             file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            cue_view: None,
         };
         (state, td)
     }

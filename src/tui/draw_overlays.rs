@@ -1247,13 +1247,36 @@ fn draw_metadata_editor(
 
     let key_col_w = 22;
 
-    // Build content lines.
-    let total_rows = state.entries.len() + 1; // +1 for "+ Add field..."
+    // Build content lines. A "From sidecar CUE" separator may appear
+    // between the tag-source rows and the cue-source rows; that adds
+    // one row to the visual line count but not to the cursor space
+    // (cursor only navigates entries + the add-field row).
+    let has_cue_rows = state.entries.iter()
+        .any(|e| matches!(e.source, super::probe::TagSource::CueSidecar));
+    let separator_count = if has_cue_rows { 1 } else { 0 };
+    let total_rows = state.entries.len() + 1 + separator_count;
     let scroll = state.scroll.min(total_rows.saturating_sub(content_h));
 
     let mut lines: Vec<Line> = Vec::new();
+    let mut separator_emitted = false;
 
     for (i, entry) in state.entries.iter().enumerate() {
+        // Emit the source-transition separator before the first cue row.
+        if !separator_emitted
+            && matches!(entry.source, super::probe::TagSource::CueSidecar)
+        {
+            let sep_label = state.cue_view.as_ref()
+                .and_then(|cv| cv.cue_path.file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| format!(" ─── From sidecar CUE: {} ─── ", n))
+                .unwrap_or_else(|| " ─── From sidecar CUE ─── ".to_string());
+            let pad_w = inner_w.saturating_sub(sep_label.chars().count());
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", sep_label, "─".repeat(pad_w)),
+                theme::muted(),
+            )));
+            separator_emitted = true;
+        }
         let is_cursor = i == state.cursor;
         let is_deleted = state.deleted.contains(&i);
         let is_dirty = !is_deleted && (entry.value != entry.original
@@ -1267,10 +1290,16 @@ fn draw_metadata_editor(
             format!(" {:<width$}", entry.display_key, width = key_col_w - 2)
         };
 
+        let is_cue_source = matches!(entry.source, super::probe::TagSource::CueSidecar);
         let key_style = if is_deleted {
             Style::default().fg(theme::TEXT_DIM).add_modifier(Modifier::CROSSED_OUT)
         } else if is_cursor {
             Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+        } else if is_cue_source {
+            // Cue-sourced rows get a BLUE-tinted key as a non-clickable
+            // visual indicator that this data lives in the sidecar
+            // CUE, not the file's tags.
+            Style::default().fg(theme::BLUE)
         } else {
             theme::muted()
         };
@@ -1658,9 +1687,19 @@ fn draw_metadata_detail(
         None => return,
     };
 
+    // Choose labels based on entry source: file labels for tag rows,
+    // track labels for sidecar-CUE virtual rows. Source-agnostic
+    // detail-overlay rendering — same UX for either dimension.
+    let labels: &[String] = match entry.source {
+        super::probe::TagSource::CueSidecar => state.cue_view.as_ref()
+            .map(|cv| cv.track_labels.as_slice())
+            .unwrap_or(&[]),
+        super::probe::TagSource::File => &state.file_labels,
+    };
+
     // Header: field name.
     // Label column width: enough for "D99.99" (6) + padding, or filename fallback.
-    let max_label = state.file_labels.iter()
+    let max_label = labels.iter()
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(6);
@@ -1672,10 +1711,10 @@ fn draw_metadata_detail(
     )));
     lines.push(Line::from(""));
 
-    // Per-file rows.
+    // Per-row entries (per-file for tag rows, per-track for cue rows).
     for (i, val) in entry.per_file_values.iter().enumerate() {
         let is_cursor = i == state.detail_cursor;
-        let label = state.file_labels.get(i)
+        let label = labels.get(i)
             .map(|l| l.as_str())
             .unwrap_or("?");
         let label_display = format!("  {:<width$}  ", label, width = label_col_w - 4);

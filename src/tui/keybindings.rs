@@ -2345,7 +2345,11 @@ fn handle_metadata_editor_key(
                     if state.cursor < state.entries.len() {
                         let entry = &state.entries[state.cursor];
                         if !entry.is_binary && !state.deleted.contains(&state.cursor) {
-                            if entry.is_mixed && state.paths.len() > 1 {
+                            // Open detail overlay when there's more than one
+                            // value to display — for tag rows this means
+                            // multiple files; for cue-sourced virtual rows
+                            // this means multiple tracks. Source-agnostic.
+                            if entry.is_mixed && entry.per_file_values.len() > 1 {
                                 // Mixed field: open per-file detail overlay.
                                 state.detail_field_idx = state.cursor;
                                 state.detail_cursor = 0;
@@ -2641,6 +2645,7 @@ fn handle_metadata_editor_key(
                             per_file_originals: vec![String::new(); n],
                             mb_proposed_value: None,
                             mb_proposed_per_file: None,
+                            source: super::probe::TagSource::File,
                         });
                         state.cursor = state.entries.len() - 1;
                         state.add_key_input = None;
@@ -2834,6 +2839,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
                     per_file_originals: vec![String::new(); n],
                     mb_proposed_value: None,
                     mb_proposed_per_file: None,
+                    source: super::probe::TagSource::File,
                 });
                 entries.len() - 1
             }
@@ -2854,6 +2860,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
                     per_file_originals: vec![String::new(); n],
                     mb_proposed_value: None,
                     mb_proposed_per_file: None,
+                    source: super::probe::TagSource::File,
                 });
                 entries.len() - 1
             }
@@ -2951,6 +2958,88 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }).collect()
     };
 
+    // Sidecar CUE detection — only fires for single-file opens. If a
+    // `.cue` lives alongside, parse it and append virtual TagEntries
+    // (TITLE / PERFORMER / ISRC) with `source: TagSource::CueSidecar`
+    // so the user sees per-track data inline. Skip on multi-FILE CUEs
+    // (each track referencing a different FILE — uncommon for
+    // single-image but possible) where the per-track abstraction
+    // would be ambiguous.
+    let cue_view: Option<super::app::CueView> = if paths.len() == 1 {
+        let audio_path = &paths[0];
+        super::cue_parser::find_sidecar_cue(audio_path)
+            .and_then(|cue_path| {
+                let original_text = std::fs::read_to_string(&cue_path).ok()?;
+                let parsed = super::cue_parser::parse_cue(&original_text);
+                if parsed.tracks.is_empty() { return None; }
+                // Multi-FILE check: skip when tracks reference different files.
+                let first_file = parsed.tracks.first().and_then(|t| t.file.as_ref());
+                let same_file = parsed.tracks.iter()
+                    .all(|t| t.file.as_ref() == first_file);
+                if !same_file { return None; }
+
+                let track_labels: Vec<String> = parsed.tracks.iter()
+                    .map(|t| format!("Track {:02}", t.number))
+                    .collect();
+
+                // Append virtual TagEntries to `entries` for each
+                // CUE-derived track-level field that has any value.
+                let n_tracks = parsed.tracks.len();
+                let titles: Vec<String> = parsed.tracks.iter()
+                    .map(|t| t.title.clone().unwrap_or_default())
+                    .collect();
+                let performers: Vec<String> = parsed.tracks.iter()
+                    .map(|t| t.performer.clone().unwrap_or_default())
+                    .collect();
+                let isrcs: Vec<String> = parsed.tracks.iter()
+                    .map(|t| t.isrc.clone().unwrap_or_default())
+                    .collect();
+
+                let push_virtual = |entries: &mut Vec<super::probe::TagEntry>,
+                                    key: &str,
+                                    item_key: lofty::tag::ItemKey,
+                                    values: Vec<String>| {
+                    let any_nonempty = values.iter().any(|s| !s.is_empty());
+                    if !any_nonempty { return; }
+                    let all_same = values.windows(2).all(|w| w[0] == w[1]);
+                    let is_mixed = !all_same && n_tracks > 1;
+                    let display_value = if is_mixed {
+                        "<multiple values>".to_string()
+                    } else {
+                        values.first().cloned().unwrap_or_default()
+                    };
+                    entries.push(super::probe::TagEntry {
+                        display_key: key.to_string(),
+                        item_key,
+                        value: display_value.clone(),
+                        original: display_value,
+                        is_binary: false,
+                        is_mixed,
+                        per_file_values: values.clone(),
+                        per_file_originals: values,
+                        mb_proposed_value: None,
+                        mb_proposed_per_file: None,
+                        source: super::probe::TagSource::CueSidecar,
+                    });
+                };
+                push_virtual(&mut entries, "TITLE",
+                    lofty::tag::ItemKey::TrackTitle, titles);
+                push_virtual(&mut entries, "PERFORMER",
+                    lofty::tag::ItemKey::Performer, performers);
+                push_virtual(&mut entries, "ISRC",
+                    lofty::tag::ItemKey::Isrc, isrcs);
+
+                Some(super::app::CueView {
+                    cue_path,
+                    original_text,
+                    parsed,
+                    track_labels,
+                })
+            })
+    } else {
+        None
+    };
+
     app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
         super::app::MetadataEditorState {
             paths,
@@ -2968,6 +3057,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
             detail_cursor: 0,
             detail_scroll: 0,
             detail_edit: None,
+            cue_view,
         },
     ));
 }
@@ -4429,10 +4519,13 @@ fn handle_metadata_editor_mouse(
 
                 if is_double && row < state.entries.len() {
                     // Double-click: open detail for mixed fields, inline edit otherwise.
+                    // Source-agnostic gate: per_file_values.len() > 1
+                    // covers both multi-file tag rows AND multi-track
+                    // cue-source virtual rows.
                     state.cursor = row;
                     let entry = &state.entries[row];
                     if !entry.is_binary && !state.deleted.contains(&row) {
-                        if entry.is_mixed && state.paths.len() > 1 {
+                        if entry.is_mixed && entry.per_file_values.len() > 1 {
                             state.detail_field_idx = row;
                             state.detail_cursor = 0;
                             state.detail_scroll = 0;

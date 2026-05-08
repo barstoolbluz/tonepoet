@@ -552,6 +552,20 @@ pub fn write_metadata_field(
 
 // ── Full tag enumeration + batch write (metadata editor) ────────────
 
+/// Where a TagEntry's data lives. Determines save dispatch (lofty
+/// for `File`, sidecar CUE rewrite for `CueSidecar`) and rendering
+/// (the latter gets a `[cue]` source pill and is preceded by a
+/// "From sidecar CUE" separator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TagSource {
+    /// Standard tag stored in the audio file via lofty.
+    #[default]
+    File,
+    /// Virtual tag derived from a sidecar `.cue` file. Edits write
+    /// back to the CUE on save (with confirmation + .bak backup).
+    CueSidecar,
+}
+
 /// A single tag entry read from an audio file (or merged across files).
 #[derive(Debug, Clone)]
 pub struct TagEntry {
@@ -579,6 +593,9 @@ pub struct TagEntry {
     pub mb_proposed_value: Option<String>,
     /// Per-file MB-proposed values, paired with `mb_proposed_value`.
     pub mb_proposed_per_file: Option<Vec<String>>,
+    /// Where this entry's data lives — drives save dispatch and the
+    /// `[cue]` source pill in the renderer.
+    pub source: TagSource,
 }
 
 /// True when this entry's value is too large or structured to render
@@ -988,6 +1005,7 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
             per_file_originals: vec![value],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: TagSource::File,
         });
     }
 
@@ -1110,6 +1128,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             per_file_originals: data.values.clone(),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: TagSource::File,
         });
     }
 
@@ -1242,6 +1261,7 @@ mod tests {
             per_file_originals: vec![original.to_string(); per_file_count],
             mb_proposed_value: Some(proposed.to_string()),
             mb_proposed_per_file: Some(vec![proposed.to_string(); per_file_count]),
+            source: TagSource::File,
         }
     }
 
@@ -1278,6 +1298,7 @@ mod tests {
             per_file_originals: vec!["x".into()],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: TagSource::File,
         };
         assert_eq!(mb_pill_state(&e), MbRevertPill::None);
     }
@@ -1327,6 +1348,7 @@ mod tests {
                 per_file_originals: vec!["x".into()],
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
+                source: TagSource::File,
             }],
             cursor: 0, scroll: 0, last_click: None,
             edit_input: None, add_key_input: None,
@@ -1334,6 +1356,7 @@ mod tests {
             dirty: false, deleted: vec![0],
             file_labels: vec!["01".into()],
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            cue_view: None,
         };
         assert!(metadata_editor_has_changes(&state));
     }
@@ -1353,6 +1376,7 @@ mod tests {
             dirty: true, deleted: Vec::new(),
             file_labels: vec!["01".into()],
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            cue_view: None,
         };
         // Both entries currently show the MB value → has changes.
         assert!(metadata_editor_has_changes(&state));
@@ -1457,6 +1481,7 @@ mod tests {
             per_file_originals: vec!["y".into()],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: TagSource::File,
         };
         toggle_mb_revert(&mut e);
         assert_eq!(e.value, "x");

@@ -267,6 +267,7 @@ pub fn populate_editor_from_gnudb(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: super::probe::TagSource::File,
         });
         entries.len() - 1
     }
@@ -345,6 +346,7 @@ pub fn populate_editor_file(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: super::probe::TagSource::File,
         });
         entries.len() - 1
     }
@@ -515,6 +517,7 @@ pub fn populate_editor_from_review(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
+            source: super::probe::TagSource::File,
         });
         entries.len() - 1
     }

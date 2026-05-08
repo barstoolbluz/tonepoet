@@ -46,6 +46,20 @@ pub struct CueTrack {
     pub isrc: Option<String>,
 }
 
+/// Locate a sidecar `.cue` file in the same directory as `audio_path`.
+/// Returns the first `.cue` found (case-insensitive extension match);
+/// `None` if no sidecar exists or the parent dir is unreadable.
+pub fn find_sidecar_cue(audio_path: &Path) -> Option<std::path::PathBuf> {
+    let parent = audio_path.parent()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension()
+            .map(|ext| ext.to_ascii_lowercase() == "cue")
+            .unwrap_or(false))
+}
+
 /// Parse a CUE sheet from a file path.
 pub fn parse_cue_file(path: &Path) -> Result<CueSheet, String> {
     let raw = std::fs::read(path)

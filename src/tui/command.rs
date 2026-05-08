@@ -3548,6 +3548,7 @@ pub fn apply_cue_changes(
                     per_file_originals: vec![String::new(); n],
                     mb_proposed_value: None,
                     mb_proposed_per_file: None,
+                    source: super::probe::TagSource::File,
                 });
                 state.entries.len() - 1
             }
