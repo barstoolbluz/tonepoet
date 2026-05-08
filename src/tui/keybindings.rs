@@ -2383,8 +2383,16 @@ fn handle_metadata_editor_key(
                     ensure_cursor_visible(state);
                 }
                 KeyCode::Char('d') => {
+                    // Skip cue-source rows: "delete" has no meaning
+                    // for them (CUE serializer doesn't honor deletions
+                    // — would silently strike through the row without
+                    // changing the file).
                     if state.cursor < state.entries.len()
                         && !state.deleted.contains(&state.cursor)
+                        && matches!(
+                            state.entries[state.cursor].source,
+                            super::probe::TagSource::File,
+                        )
                     {
                         state.deleted.push(state.cursor);
                         recalc_dirty(state);
@@ -2687,8 +2695,12 @@ fn handle_metadata_editor_key(
             }
         }
         MetadataEditorPhase::DetailEdit => {
-            let n_files = state.paths.len();
             let field_idx = state.detail_field_idx;
+            // Source-agnostic row count: file count for tag rows,
+            // track count for cue-source virtual rows.
+            let n_files = state.entries.get(field_idx)
+                .map(|e| e.per_file_values.len())
+                .unwrap_or(0);
 
             // If an inline edit is active within the detail overlay:
             if let Some(ref mut input) = state.detail_edit {
@@ -3692,20 +3704,29 @@ pub(super) fn build_metadata_row_context_menu(
             enabled: true,
         }));
     }
-    if state.deleted.contains(&row) {
-        entries.push(ContextMenuEntry::Item(ContextMenuItem {
-            label: "Restore (cancel deletion)".to_string(),
-            action: ContextAction::MetadataRestoreEntry,
-            shortcut: None,
-            enabled: true,
-        }));
-    } else {
-        entries.push(ContextMenuEntry::Item(ContextMenuItem {
-            label: "Delete entry".to_string(),
-            action: ContextAction::MetadataDeleteEntry,
-            shortcut: None,
-            enabled: true,
-        }));
+    // Delete/Restore only meaningful for File-source rows. Cue-source
+    // virtual rows can't be "deleted" — the CUE serializer doesn't
+    // honor a deletion mark; striking a row through visually without
+    // changing the file would be confusing.
+    let is_cue_source = state.entries.get(row)
+        .map(|e| matches!(e.source, super::probe::TagSource::CueSidecar))
+        .unwrap_or(false);
+    if !is_cue_source {
+        if state.deleted.contains(&row) {
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Restore (cancel deletion)".to_string(),
+                action: ContextAction::MetadataRestoreEntry,
+                shortcut: None,
+                enabled: true,
+            }));
+        } else {
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Delete entry".to_string(),
+                action: ContextAction::MetadataDeleteEntry,
+                shortcut: None,
+                enabled: true,
+            }));
+        }
     }
     entries.push(ContextMenuEntry::Separator);
     entries.push(ContextMenuEntry::Item(ContextMenuItem {
@@ -4205,7 +4226,11 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
             MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::DetailEdit => {
-                let n = state.paths.len();
+                // Use the focused entry's per-row dimension (file count
+                // for tag rows, track count for cue-source virtual rows).
+                let n = state.entries.get(state.detail_field_idx)
+                    .map(|e| e.per_file_values.len())
+                    .unwrap_or(0);
                 if state.detail_cursor + 1 < n {
                     state.detail_cursor += 1;
                 }
@@ -4339,8 +4364,12 @@ fn handle_metadata_editor_mouse(
                     let header_offset = 2usize;
                     if detail_row >= header_offset {
                         let file_idx = detail_row - header_offset;
-                        let n_files = state.paths.len();
                         let field_idx = state.detail_field_idx;
+                        // Source-agnostic row count (see DetailEdit
+                        // keyboard handler for rationale).
+                        let n_files = state.entries.get(field_idx)
+                            .map(|e| e.per_file_values.len())
+                            .unwrap_or(0);
 
                         // Confirm inline edit if active.
                         if let Some(ref input) = state.detail_edit {
@@ -4809,13 +4838,13 @@ fn ensure_detail_visible(state: &mut super::app::MetadataEditorState) {
     }
 }
 
-/// Recalculate the dirty flag by checking per-file values for changes.
+/// Recalculate the tag-source dirty flag by checking per-file values
+/// for changes. Source-aware: only `TagSource::File` entries count
+/// here (cue-source entries have their own dirty path that goes
+/// through `cue_view_has_changes` and the confirmation dialog).
+/// Equivalent to `super::probe::metadata_editor_has_changes`.
 fn recalc_dirty(state: &mut super::app::MetadataEditorState) {
-    state.dirty = !state.deleted.is_empty()
-        || state.entries.iter().any(|e|
-            e.per_file_values.iter().zip(e.per_file_originals.iter())
-                .any(|(v, o)| v != o)
-        );
+    state.dirty = super::probe::metadata_editor_has_changes(state);
 }
 
 /// Cascade direction for one level relative to its parent. Each level
