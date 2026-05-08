@@ -253,7 +253,10 @@ pub fn populate_editor_from_gnudb(
         item_key: lofty::tag::ItemKey,
         n: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+        if let Some(i) = entries.iter().position(|e|
+            e.display_key.eq_ignore_ascii_case(key)
+            && matches!(e.source, super::probe::TagSource::File)
+        ) {
             return i;
         }
         entries.push(super::probe::TagEntry {
@@ -332,7 +335,10 @@ pub fn populate_editor_file(
         item_key: lofty::tag::ItemKey,
         n: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+        if let Some(i) = entries.iter().position(|e|
+            e.display_key.eq_ignore_ascii_case(key)
+            && matches!(e.source, super::probe::TagSource::File)
+        ) {
             return i;
         }
         entries.push(super::probe::TagEntry {
@@ -503,7 +509,10 @@ pub fn populate_editor_from_review(
         item_key: lofty::tag::ItemKey,
         n: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+        if let Some(i) = entries.iter().position(|e|
+            e.display_key.eq_ignore_ascii_case(key)
+            && matches!(e.source, super::probe::TagSource::File)
+        ) {
             return i;
         }
         entries.push(super::probe::TagEntry {
