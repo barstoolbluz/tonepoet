@@ -3162,9 +3162,7 @@ fn overlay_per_track_values(
     item_key: lofty::tag::ItemKey,
     values: Vec<String>,
 ) {
-    if values.iter().all(|s| s.is_empty()) {
-        return;
-    }
+    let all_empty = values.iter().all(|s| s.is_empty());
     let dim = values.len();
     let all_same = values.windows(2).all(|w| w[0] == w[1]);
     let is_mixed = !all_same && dim > 1;
@@ -3177,17 +3175,21 @@ fn overlay_per_track_values(
     if let Some(idx) = entries.iter().position(|e|
         e.display_key.eq_ignore_ascii_case(key))
     {
+        // Overlay existing entry — even when `values` is all-empty
+        // (sidecar deliberately cleared the field; user wants editor
+        // to reflect that). Originals resize to match `dim`: grow by
+        // replicating the existing first slot, shrink by truncation.
+        // Keeps len(values) == len(originals) invariant.
         let entry = &mut entries[idx];
-        // Pad originals if the new dim is larger than the existing
-        // dim — keeps revert mapping by-index sane.
-        if entry.per_file_originals.len() < dim {
-            let pad = entry.per_file_originals.first().cloned().unwrap_or_default();
-            entry.per_file_originals.resize(dim, pad);
-        }
+        let pad = entry.per_file_originals.first().cloned().unwrap_or_default();
+        entry.per_file_originals.resize(dim, pad);
         entry.per_file_values = values;
         entry.is_mixed = is_mixed;
         entry.value = display_value;
-    } else {
+    } else if !all_empty {
+        // Skip creating an entirely-empty no-op entry. (When the entry
+        // already exists, we DO overlay even with all-empty above —
+        // that's the user clearing values via sidecar.)
         entries.push(super::probe::TagEntry {
             display_key: key.to_string(),
             item_key,
@@ -8319,6 +8321,49 @@ mod phase4_tests {
             "CUESHEET value overridden with sidecar");
         assert_eq!(cue.per_file_originals[0], on_disk,
             "CUESHEET originals preserved (embedded on-disk value)");
+    }
+
+    #[test]
+    fn reload_sidecar_clears_existing_isrc_when_sidecar_has_none() {
+        // Bug 1 fix: existing ISRC entry with non-empty values; sidecar
+        // has no ISRC fields. After reload, ISRC must reflect sidecar
+        // (cleared), not stay at old values.
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
+        // SIDECAR_3_TRACK_SINGLE_IMAGE has no ISRC lines.
+        let mut state = state_for_sidecar_test(td.path(), vec![
+            entry("ISRC", ItemKey::Isrc,
+                &["USRC1", "USRC2", "USRC3"],
+                &["USRC1", "USRC2", "USRC3"]),
+        ]);
+        reload_from_sidecar_cue(&mut state).expect("ok");
+        let isrc = state.entries.iter().find(|e| e.display_key == "ISRC").unwrap();
+        assert_eq!(isrc.per_file_values, vec!["", "", ""],
+            "existing ISRC entry overlaid with sidecar's empties");
+        // Originals preserved → revert restores prior ISRCs.
+        assert_eq!(isrc.per_file_originals, vec!["USRC1", "USRC2", "USRC3"]);
+    }
+
+    #[test]
+    fn reload_sidecar_resizes_originals_when_sidecar_dim_differs() {
+        // Bug 2 fix: existing TITLE has dim 5 (e.g., from a prior CUE
+        // with 5 tracks); sidecar now has 3 tracks. After overlay,
+        // both per_file_values and per_file_originals must be dim 3
+        // (originals truncated). Otherwise the len-invariant breaks.
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
+        let mut state = state_for_sidecar_test(td.path(), vec![
+            entry("TITLE", ItemKey::TrackTitle,
+                &["A", "B", "C", "D", "E"],
+                &["A", "B", "C", "D", "E"]),
+        ]);
+        reload_from_sidecar_cue(&mut state).expect("ok");
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values.len(), 3,
+            "dim shrunk to sidecar's 3 tracks");
+        assert_eq!(title.per_file_originals.len(), 3,
+            "originals resized to match — len(values) == len(originals) invariant");
+        assert_eq!(title.per_file_values, vec!["T1", "T2", "T3"]);
     }
 
     #[test]
