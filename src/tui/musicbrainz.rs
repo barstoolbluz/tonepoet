@@ -646,11 +646,21 @@ pub(super) fn per_track_skip_reason(
 /// emits the skip reason to the log when true; the caller in
 /// event_loop.rs prefers `per_track_skip_reason` directly so the
 /// reason can be surfaced in TUI status as well.
+///
+/// `per_track_skip_reason` returns None for both "eligible" AND "not
+/// per-track-applicable" cases (multi-file, single-track release) —
+/// distinguishing those would just produce noisy status messages.
+/// This wrapper adds the not-applicable filter so the boolean stays
+/// faithful to its original semantics ("can per-track populate run?",
+/// not "is the situation eligible-or-irrelevant?").
 fn is_per_track_eligible(
     paths: &[std::path::PathBuf],
     release: &MbRelease,
     verbose: bool,
 ) -> bool {
+    if paths.len() != 1 || release.tracks.len() <= 1 {
+        return false;
+    }
     match per_track_skip_reason(paths, release) {
         None => true,
         Some(reason) => {
@@ -1484,6 +1494,30 @@ mod tests {
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_TRACKID").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_ARTISTID").is_none());
+    }
+
+    #[test]
+    fn is_per_track_eligible_returns_false_for_not_applicable_cases() {
+        // Regression for the 7c60aa1 refactor: the boolean wrapper
+        // must return false for multi-file and single-track-release
+        // cases. per_track_skip_reason returns None for those (no
+        // status message needed), but the boolean must NOT be true.
+        let release = rel("rid", vec![
+            { let mut t = trk(1, "T", "A", None); t.length_ms = Some(50); t },
+            { let mut t = trk(2, "T", "A", None); t.length_ms = Some(50); t },
+        ]);
+        let paths_multi = vec![
+            std::path::PathBuf::from("/tmp/a.flac"),
+            std::path::PathBuf::from("/tmp/b.flac"),
+        ];
+        assert!(!is_per_track_eligible(&paths_multi, &release, false),
+            "multi-file → not eligible");
+        let single_track = rel("rid", vec![
+            { let mut t = trk(1, "T", "A", None); t.length_ms = Some(100); t },
+        ]);
+        assert!(!is_per_track_eligible(&[std::path::PathBuf::from("/tmp/a.flac")],
+            &single_track, false),
+            "single-track release → not eligible");
     }
 
     #[test]
