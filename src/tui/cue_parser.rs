@@ -88,7 +88,13 @@ pub fn parse_cue(content: &str) -> CueSheet {
     // The most recent FILE line (used for both single-image and per-track).
     let mut current_file: Option<String> = None;
 
-    for line in content.lines() {
+    for (i, line) in content.lines().enumerate() {
+        // Strip a UTF-8 BOM (U+FEFF) if it appears on the first line —
+        // some Windows editors prefix it. Rust's `trim()` doesn't
+        // classify BOM as whitespace (post-Unicode-2018), so without
+        // this `strip_prefix("TITLE")` etc. would silently fail on
+        // the album-level header line.
+        let line = if i == 0 { line.trim_start_matches('\u{FEFF}') } else { line };
         let trimmed = line.trim();
 
         // FILE "filename.ext" WAVE
@@ -532,5 +538,20 @@ FILE \"03 - Wonderin.wav\" WAVE
         // 03:43:37 = 3*60*75 + 43*75 + 37 = 13500 + 3225 + 37 = 16762
         assert_eq!(sheet.tracks[1].index00_frames, Some(16762));
         assert_eq!(sheet.tracks[1].index01_frames, Some(0));
+    }
+
+    #[test]
+    fn parse_cue_strips_utf8_bom_on_first_line() {
+        // Some Windows editors prefix CUE files with a UTF-8 BOM
+        // (EF BB BF → U+FEFF). Without stripping, the first line's
+        // strip_prefix("TITLE") fails silently and album-level title
+        // gets dropped.
+        let mut content = String::new();
+        content.push('\u{FEFF}');
+        content.push_str("TITLE \"My Album\"\nFILE \"album.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
+        let sheet = parse_cue(&content);
+        assert_eq!(sheet.title.as_deref(), Some("My Album"),
+            "BOM-prefixed first line still yields album-level TITLE");
+        assert_eq!(sheet.tracks.len(), 1);
     }
 }

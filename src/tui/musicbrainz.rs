@@ -363,7 +363,7 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
 /// GnudbReview UI doesn't surface: ISRC, CATALOGNUMBER, MusicBrainz
 /// IDs, RELEASECOUNTRY, ORIGINALDATE.
 ///
-/// Called after `populate_editor_from_review` to supplement the
+/// Called from `populate_editor_from_mb` to supplement the
 /// user-reviewed Title/Artist/Album/Year/Genre with the rest of MB's
 /// data. Empty values are skipped (preserves whatever the file had).
 pub fn populate_editor_mb_supplemental(
