@@ -3150,26 +3150,33 @@ fn grow_or_create_per_track(
 }
 
 /// Result of a `:fix-caps` pass — counts so the status message can
-/// explain what happened (and what was skipped, with a hint).
+/// explain what happened.
 pub(super) struct FixCapsResult {
     pub changed_values: usize,
-    pub skipped_mixed: usize,
     pub skipped_deleted: usize,
 }
 
 /// Apply capitalization rules to TITLE / ARTIST / ALBUM / ALBUMARTIST
 /// / PERFORMER entries in `state`. When `focus` is `Some(idx)` (detail-
-/// overlay invocation), only that entry is processed regardless of
-/// is_mixed. When `None` (main-editor invocation), iterates all
-/// entries and skips those that are mixed (user can't see the values
-/// in the main view) or in `state.deleted`.
+/// overlay invocation), only that entry is processed. When `None`
+/// (main-editor invocation), iterates all entries.
+///
+/// **Mixed entries are NOT skipped.** Capitalization runs on every
+/// per-file value regardless of `is_mixed`; the post-cap recompute
+/// preserves `is_mixed=true` for entries whose per-track values still
+/// differ (which they do — capitalization is deterministic). The
+/// `<multiple values>` placeholder in `entry.value` stays intact, so
+/// the main-grid display doesn't change, but the per-track values
+/// (visible in the detail overlay) are now capitalized. User
+/// expectation: one `:fix-caps` invocation fixes everything; no need
+/// to re-invoke from detail.
+///
+/// Deleted entries (`state.deleted`) are still skipped — capitalizing
+/// a row marked for deletion is wasteful.
 ///
 /// is_mixed is recomputed against the entry's own `per_file_values
-/// .len()` (NOT `state.paths.len()`) — the prior implementation in
-/// `Command::FixCaps` had the same dim bug Phase 1c fixed in
-/// `recompute_and_stamp_mb_proposed`, causing per-track entries on
-/// single-image rips to lose their `<multiple values>` placeholder
-/// after fix-caps.
+/// .len()` (NOT `state.paths.len()`) — same dim invariant Phase 1c
+/// fixed in `recompute_and_stamp_mb_proposed`.
 pub(super) fn fix_caps_for_state(
     state: &mut super::app::MetadataEditorState,
     focus: Option<usize>,
@@ -3178,7 +3185,6 @@ pub(super) fn fix_caps_for_state(
 
     let mut result = FixCapsResult {
         changed_values: 0,
-        skipped_mixed: 0,
         skipped_deleted: 0,
     };
 
@@ -3189,17 +3195,11 @@ pub(super) fn fix_caps_for_state(
 
     for i in indices {
         if i >= state.entries.len() { continue; }
-        // Skip checks only apply to main-editor (None) invocations.
+        // Deleted-skip applies to main-editor invocations only.
         // Detail-overlay invocations honor the user's explicit focus.
-        if focus.is_none() {
-            if state.deleted.contains(&i) {
-                result.skipped_deleted += 1;
-                continue;
-            }
-            if state.entries[i].is_mixed {
-                result.skipped_mixed += 1;
-                continue;
-            }
+        if focus.is_none() && state.deleted.contains(&i) {
+            result.skipped_deleted += 1;
+            continue;
         }
 
         let entry = &mut state.entries[i];
@@ -8515,11 +8515,17 @@ mod phase4_tests {
     // -------- :fix-caps --------
 
     #[test]
-    fn fix_caps_main_editor_skips_mixed_entries() {
-        // Per-track TITLE on a single-image rip with diverging values
-        // (is_mixed=true). Main-editor :fix-caps must NOT touch it —
-        // the user sees `<multiple values>` and shouldn't have one
-        // track silently rewriting the placeholder.
+    fn fix_caps_main_editor_capitalizes_mixed_per_track_preserving_placeholder() {
+        // User runs :fix-caps from the main editor on a state where
+        // TITLE has per-track values (mixed). Expectation: per_file_values
+        // get capitalized so the detail overlay shows them already
+        // fixed; the main-grid display ("<multiple values>") stays
+        // intact since the values still differ post-cap.
+        //
+        // The dim-bug fix (recompute uses entry.per_file_values.len(),
+        // not paths.len()) is what keeps is_mixed=true post-cap; with
+        // that in place, mixed entries can be safely capitalized
+        // without leaking one track's value into the placeholder.
         let mut state = single_image_state(vec![
             entry("ALBUM", ItemKey::AlbumTitle,
                 &["the dark side of the moon"],
@@ -8528,25 +8534,24 @@ mod phase4_tests {
                 &["speak to me", "breathe", "on the run"],
                 &["speak to me", "breathe", "on the run"]),
         ]);
-        // entry() helper doesn't set is_mixed for v.len()==1 cases
-        // correctly for our purposes; explicitly mark TITLE mixed.
         let title_idx = state.entries.iter().position(|e| e.display_key == "TITLE").unwrap();
         state.entries[title_idx].is_mixed = true;
         state.entries[title_idx].value = "<multiple values>".to_string();
 
         let result = fix_caps_for_state(&mut state, None);
 
-        // ALBUM was capitalized.
         let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
         assert_eq!(album.per_file_values, vec!["The Dark Side of the Moon"]);
-        // TITLE per-track values UNTOUCHED.
+
+        // TITLE per_file_values capitalized (visible in detail overlay).
         let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
-        assert_eq!(title.per_file_values, vec!["speak to me", "breathe", "on the run"],
-            "main-editor fix-caps must skip mixed entries");
+        assert_eq!(title.per_file_values, vec!["Speak to Me", "Breathe", "On the Run"],
+            "main-editor fix-caps capitalizes per-track values too");
+        // Display stays "<multiple values>" since values still differ.
+        assert!(title.is_mixed, "is_mixed preserved (capitalization didn't merge)");
         assert_eq!(title.value, "<multiple values>",
-            "TITLE.value preserved (no track 1 leak into the placeholder)");
-        assert_eq!(result.skipped_mixed, 1);
-        assert!(result.changed_values >= 1);
+            "main-grid display unchanged");
+        assert!(result.changed_values >= 4, "ALBUM + 3 TITLE values capitalized");
     }
 
     #[test]
@@ -8587,8 +8592,6 @@ mod phase4_tests {
         // ALBUM untouched.
         let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
         assert_eq!(album.per_file_values, vec!["dark side"]);
-        assert_eq!(result.skipped_mixed, 0,
-            "detail overlay invocation honors focus regardless of mixed");
         assert_eq!(result.skipped_deleted, 0);
     }
 

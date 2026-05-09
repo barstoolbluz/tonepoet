@@ -2162,10 +2162,6 @@ pub fn execute_command(
                 }
                 let mut msg = format!("Capitalization applied ({} values changed",
                     result.changed_values);
-                if result.skipped_mixed > 0 {
-                    msg.push_str(&format!("; {} mixed entries skipped — open detail (`:D`) to fix per-track",
-                        result.skipped_mixed));
-                }
                 if result.skipped_deleted > 0 {
                     msg.push_str(&format!("; {} deleted entries skipped",
                         result.skipped_deleted));
