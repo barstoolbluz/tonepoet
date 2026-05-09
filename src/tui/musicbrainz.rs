@@ -384,7 +384,7 @@ pub fn populate_editor_mb_supplemental(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
         key: &str,
         item_key: ItemKey,
-        n: usize,
+        dim: usize,
     ) -> usize {
         if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
             return i;
@@ -396,8 +396,8 @@ pub fn populate_editor_mb_supplemental(
             original: String::new(),
             is_binary: false,
             is_mixed: false,
-            per_file_values: vec![String::new(); n],
-            per_file_originals: vec![String::new(); n],
+            per_file_values: vec![String::new(); dim],
+            per_file_originals: vec![String::new(); dim],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -406,11 +406,16 @@ pub fn populate_editor_mb_supplemental(
 
     // Per-track presence pre-pass: only create the entry when at least
     // one track in the release has data for that field. Tracks with no
-    // data leave their per-file value as the empty string (matching the
-    // pre-existing "MB silent on this track" behavior). For
-    // single-image rips, skip these entirely (track-level IDs are
-    // meaningless when the file is the whole album).
-    let any_isrc = !single_image && release.tracks.iter()
+    // data leave their per-track value as the empty string (matching
+    // the pre-existing "MB silent on this track" behavior).
+    //
+    // ISRC is the one per-track ID that has a home on a single-image
+    // rip — the embedded CUESHEET stores per-track ISRC. The other
+    // per-track MB IDs (MUSICBRAINZ_RECORDINGID / RELEASETRACKID /
+    // ARTISTID) have no CUESHEET field, and a file's tag system can
+    // only hold one of each, so they stay album-only and are gated on
+    // !single_image.
+    let any_isrc = release.tracks.iter()
         .any(|t| t.isrc.as_deref().is_some_and(|s| !s.is_empty()));
     let any_recording = !single_image && release.tracks.iter()
         .any(|t| t.recording_id.as_deref().is_some_and(|s| !s.is_empty()));
@@ -419,9 +424,19 @@ pub fn populate_editor_mb_supplemental(
     let any_track_artist = !single_image && release.tracks.iter()
         .any(|t| t.artist_id.as_deref().is_some_and(|s| !s.is_empty()));
 
+    // ISRC dim: per-track on single-image (one slot per CUE track),
+    // per-file otherwise.
+    let isrc_dim = if single_image { release.tracks.len() } else { n };
     let isrc_idx = if any_isrc {
-        Some(find_or_create(&mut state.entries, "ISRC", ItemKey::Isrc, n))
+        Some(find_or_create(&mut state.entries, "ISRC", ItemKey::Isrc, isrc_dim))
     } else { None };
+    // Pre-existing ISRC entry on a single-image rip (Phase 2 may have
+    // surfaced per-track ISRCs from the embedded CUESHEET): grow /
+    // shrink to MB's track count, replicating the first existing slot
+    // into padded positions so revert keeps the pre-populate state.
+    if single_image {
+        if let Some(idx) = isrc_idx { ensure_dim_replicate(&mut state.entries[idx], isrc_dim); }
+    }
     let recording_idx = if any_recording {
         Some(find_or_create(
             &mut state.entries, "MUSICBRAINZ_TRACKID", ItemKey::MusicBrainzRecordingId, n,
@@ -475,12 +490,29 @@ pub fn populate_editor_mb_supplemental(
         ))
     } else { None };
 
+    // Per-track ISRC writes for single_image: the CUESHEET-friendly
+    // dim != paths.len() case, so the per-file loop below can't
+    // address tracks 1..N. Done as a dedicated pass over MB tracks.
+    if single_image {
+        if let Some(idx) = isrc_idx {
+            for mt in release.tracks.iter() {
+                let i = (mt.position as usize).saturating_sub(1);
+                if i >= state.entries[idx].per_file_values.len() { continue; }
+                if let Some(s) = mt.isrc.as_deref().filter(|s| !s.is_empty()) {
+                    state.entries[idx].per_file_values[i] = s.to_string();
+                }
+            }
+        }
+    }
+
     for i in 0..n {
         if let Some(mt) = release.tracks.iter().find(|m| m.position as usize == i + 1) {
-            if let (Some(idx), Some(s)) = (
-                isrc_idx, mt.isrc.as_deref().filter(|s| !s.is_empty()),
-            ) {
-                state.entries[idx].per_file_values[i] = s.to_string();
+            if !single_image {
+                if let (Some(idx), Some(s)) = (
+                    isrc_idx, mt.isrc.as_deref().filter(|s| !s.is_empty()),
+                ) {
+                    state.entries[idx].per_file_values[i] = s.to_string();
+                }
             }
             if let (Some(idx), Some(s)) = (
                 recording_idx, mt.recording_id.as_deref().filter(|s| !s.is_empty()),
@@ -546,6 +578,22 @@ pub fn populate_editor_mb_supplemental(
 /// Stamps only when the resulting value actually differs from the
 /// pre-populate `original` — fields where MB happened to match what the
 /// file already had don't need a toggle.
+/// Resize `entry.per_file_values` and `per_file_originals` to
+/// `target_dim`, padding with the existing first-element value when
+/// growing. Replicating preserves revert semantics: pressing revert
+/// after a per-track populate restores the editor to whatever was on
+/// disk for the original (lower) dimension. Truncation is a plain
+/// `Vec::resize` and discards trailing values.
+fn ensure_dim_replicate(entry: &mut crate::tui::probe::TagEntry, target_dim: usize) {
+    if entry.per_file_values.len() == target_dim {
+        return;
+    }
+    let pad_v = entry.per_file_values.first().cloned().unwrap_or_default();
+    let pad_o = entry.per_file_originals.first().cloned().unwrap_or_default();
+    entry.per_file_values.resize(target_dim, pad_v);
+    entry.per_file_originals.resize(target_dim, pad_o);
+}
+
 fn recompute_and_stamp_mb_proposed(
     entry: &mut crate::tui::probe::TagEntry,
     _n: usize,
@@ -594,7 +642,7 @@ pub fn populate_editor_from_mb(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
         key: &str,
         item_key: ItemKey,
-        n: usize,
+        dim: usize,
     ) -> usize {
         if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
             return i;
@@ -606,13 +654,23 @@ pub fn populate_editor_from_mb(
             original: String::new(),
             is_binary: false,
             is_mixed: false,
-            per_file_values: vec![String::new(); n],
-            per_file_originals: vec![String::new(); n],
+            per_file_values: vec![String::new(); dim],
+            per_file_originals: vec![String::new(); dim],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
         entries.len() - 1
     }
+
+    // Single-image rip detection: one file, multi-track release. The
+    // file represents the whole album. Per-track fields (TITLE / ARTIST
+    // / ISRC) carry per-track values from MB; album-level fields (ALBUM
+    // / DATE) and TRACKNUMBER stay at file dimension. Edits to per-track
+    // fields are persisted at save time by regenerating the embedded
+    // CUESHEET tag (Phase 4); Phase 5 also creates the CUESHEET tag from
+    // scratch when the file lacks one.
+    let single_image = n == 1 && release.tracks.len() > 1;
+    let track_dim = if single_image { release.tracks.len() } else { n };
 
     // Per-track presence pre-pass: only create entries when at least
     // one track in the release has data for that field.
@@ -620,10 +678,10 @@ pub fn populate_editor_from_mb(
     let any_artist = release.tracks.iter().any(|t| !t.artist.is_empty());
 
     let title_idx = if any_title {
-        Some(find_or_create(&mut state.entries, "TITLE", ItemKey::TrackTitle, n))
+        Some(find_or_create(&mut state.entries, "TITLE", ItemKey::TrackTitle, track_dim))
     } else { None };
     let artist_idx = if any_artist {
-        Some(find_or_create(&mut state.entries, "ARTIST", ItemKey::TrackArtist, n))
+        Some(find_or_create(&mut state.entries, "ARTIST", ItemKey::TrackArtist, track_dim))
     } else { None };
     let album_idx = if !release.title.is_empty() {
         Some(find_or_create(&mut state.entries, "ALBUM", ItemKey::AlbumTitle, n))
@@ -635,37 +693,66 @@ pub fn populate_editor_from_mb(
         Some(find_or_create(&mut state.entries, "DATE", ItemKey::Year, n))
     } else { None };
 
-    // Single-image rip detection: one file, multi-track release. The
-    // file represents the whole album, so TITLE/ARTIST should carry
-    // the album-level values rather than track 1's. (Foobar2000 / EAC
-    // write the album title here for the same reason.)
-    let single_image = n == 1 && release.tracks.len() > 1;
+    // For pre-existing TITLE/ARTIST entries on a single-image rip
+    // (Phase 2 may have parsed them from an embedded CUESHEET, or the
+    // file may have a single TITLE tag carrying the album name), grow
+    // or shrink the entry to MB's track count. The first existing
+    // value is replicated to padded slots so a revert restores the
+    // pre-populate state cleanly. :tags-mb is an explicit user request
+    // to overwrite from MB; track-count divergence between Phase 2's
+    // CUESHEET dim and MB's track count is resolved in MB's favor.
+    if single_image {
+        if let Some(idx) = title_idx { ensure_dim_replicate(&mut state.entries[idx], track_dim); }
+        if let Some(idx) = artist_idx { ensure_dim_replicate(&mut state.entries[idx], track_dim); }
+    }
 
-    for i in 0..n {
-        let mt = release.tracks.iter().find(|m| m.position as usize == i + 1);
-        if single_image {
-            if let Some(idx) = title_idx {
-                state.entries[idx].per_file_values[i] = release.title.clone();
-            }
-            if let (Some(idx), false) = (artist_idx, release.artist.is_empty()) {
-                state.entries[idx].per_file_values[i] = release.artist.clone();
-            }
-        } else if let Some(mt) = mt {
-            if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
-                state.entries[idx].per_file_values[i] = mt.title.clone();
-            }
-            if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
-                state.entries[idx].per_file_values[i] = mt.artist.clone();
+    if single_image {
+        // Per-track populate: TITLE / ARTIST flow into per_file_values
+        // by track position. Album-level fields (ALBUM, DATE) and
+        // TRACKNUMBER stay at file dimension (one element).
+        for i in 0..track_dim {
+            let track_pos = (i + 1) as u32;
+            let mt = release.tracks.iter().find(|m| m.position == track_pos);
+            if let Some(mt) = mt {
+                if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
+                    state.entries[idx].per_file_values[i] = mt.title.clone();
+                }
+                if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
+                    state.entries[idx].per_file_values[i] = mt.artist.clone();
+                }
             }
         }
         if let Some(idx) = album_idx {
-            state.entries[idx].per_file_values[i] = release.title.clone();
+            state.entries[idx].per_file_values[0] = release.title.clone();
         }
-        state.entries[tn_idx].per_file_values[i] = (i + 1).to_string();
+        state.entries[tn_idx].per_file_values[0] = "1".to_string();
         if let (Some(idx), Some(year)) = (
             date_idx, release.year.as_deref().filter(|s| !s.is_empty()),
         ) {
-            state.entries[idx].per_file_values[i] = year.to_string();
+            state.entries[idx].per_file_values[0] = year.to_string();
+        }
+    } else {
+        // Per-file populate: tag-per-file with track position == file
+        // index + 1.
+        for i in 0..n {
+            let mt = release.tracks.iter().find(|m| m.position as usize == i + 1);
+            if let Some(mt) = mt {
+                if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
+                    state.entries[idx].per_file_values[i] = mt.title.clone();
+                }
+                if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
+                    state.entries[idx].per_file_values[i] = mt.artist.clone();
+                }
+            }
+            if let Some(idx) = album_idx {
+                state.entries[idx].per_file_values[i] = release.title.clone();
+            }
+            state.entries[tn_idx].per_file_values[i] = (i + 1).to_string();
+            if let (Some(idx), Some(year)) = (
+                date_idx, release.year.as_deref().filter(|s| !s.is_empty()),
+            ) {
+                state.entries[idx].per_file_values[i] = year.to_string();
+            }
         }
     }
 
@@ -1279,11 +1366,14 @@ mod tests {
     }
 
     #[test]
-    fn populate_editor_from_mb_single_image_uses_album_title() {
-        // Single-image rip: one file, multi-track release. TITLE should
-        // be the album title, NOT track 1's title (which is what the
-        // pre-fix code did). Track-level IDs (ISRC, MUSICBRAINZ_TRACKID,
-        // MUSICBRAINZ_ARTISTID) should not appear at all.
+    fn populate_editor_from_mb_single_image_per_track_titles_artists_isrc() {
+        // Single-image rip: one file, multi-track release. Per-track
+        // TITLE / ARTIST / ISRC populate to dim = release.tracks.len()
+        // (one slot per CUE track) — edits round-trip through the
+        // file's embedded CUESHEET tag at save time. Album-level
+        // entries (ALBUM, DATE) stay dim 1. Per-track MB-only IDs
+        // (MUSICBRAINZ_RECORDINGID / RELEASETRACKID / ARTISTID) stay
+        // album-only — no per-track CUESHEET field for them.
         let (mut state, _td) = empty_editor_state(1);
         let mut release = rel("rid", vec![
             {
@@ -1307,15 +1397,21 @@ mod tests {
                 .map(|e| e.per_file_values.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(lookup("TITLE"), vec!["Whole Album"], "TITLE must be album, not track 1");
-        assert_eq!(lookup("ARTIST"), vec!["Album Artist"], "ARTIST must be album-level");
-        assert_eq!(lookup("ALBUM"), vec!["Whole Album"]);
+        assert_eq!(lookup("TITLE"),
+            vec!["Lead-off Track", "Second Track", "Third Track"],
+            "TITLE must be per-track on single-image (Phase 1)");
+        assert_eq!(lookup("ARTIST"),
+            vec!["Artist A", "Artist B", "Artist C"],
+            "ARTIST must be per-track on single-image");
+        assert_eq!(lookup("ALBUM"), vec!["Whole Album"], "ALBUM stays album-level dim 1");
         assert_eq!(lookup("DATE"), vec!["1970"]);
-        // Track-level IDs must NOT have been created.
-        assert!(state.entries.iter().find(|e| e.display_key == "ISRC").is_none(),
-            "ISRC must not be written for single-image");
-        assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_TRACKID").is_none(),
-            "MUSICBRAINZ_TRACKID must not be written for single-image");
+        // ISRC: per-track on single-image (only track 1 had one in MB).
+        assert_eq!(lookup("ISRC"), vec!["USRC17607839", "", ""],
+            "ISRC must be per-track on single-image (Phase 1b)");
+        // The MB-only IDs (TRACKID / RECORDINGID / ARTISTID) have no
+        // per-track CUESHEET home and a file holds only one of each,
+        // so they are never created on single-image.
+        assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_TRACKID").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_ARTISTID").is_none());
     }
