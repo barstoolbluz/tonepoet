@@ -2345,7 +2345,10 @@ fn handle_metadata_editor_key(
                     if state.cursor < state.entries.len() {
                         let entry = &state.entries[state.cursor];
                         if !entry.is_binary && !state.deleted.contains(&state.cursor) {
-                            if entry.is_mixed && state.paths.len() > 1 {
+                            // Use the entry's own dimension: per-track entries
+                            // (e.g. TITLE on a single-image rip with embedded
+                            // CUESHEET) have per_file_values.len() != paths.len().
+                            if entry.is_mixed && entry.per_file_values.len() > 1 {
                                 // Mixed field: open per-file detail overlay.
                                 state.detail_field_idx = state.cursor;
                                 state.detail_cursor = 0;
@@ -2393,8 +2396,8 @@ fn handle_metadata_editor_key(
                 }
                 // D = force-open detail overlay (even for non-mixed fields).
                 KeyCode::Char('D') => {
-                    if state.paths.len() > 1
-                        && state.cursor < state.entries.len()
+                    if state.cursor < state.entries.len()
+                        && state.entries[state.cursor].per_file_values.len() > 1
                         && !state.entries[state.cursor].is_binary
                         && !state.deleted.contains(&state.cursor)
                     {
@@ -2660,8 +2663,14 @@ fn handle_metadata_editor_key(
             }
         }
         MetadataEditorPhase::DetailEdit => {
-            let n_files = state.paths.len();
+            // n_files is the focused entry's per-row dimension, not
+            // paths.len(). For per-track entries on a single-image rip
+            // (paths.len() == 1, per_file_values.len() == n_tracks)
+            // these diverge.
             let field_idx = state.detail_field_idx;
+            let n_files = state.entries.get(field_idx)
+                .map(|e| e.per_file_values.len())
+                .unwrap_or(state.paths.len());
 
             // If an inline edit is active within the detail overlay:
             if let Some(ref mut input) = state.detail_edit {
@@ -2732,6 +2741,95 @@ fn handle_metadata_editor_key(
 }
 
 /// Open the metadata editor for the currently selected audio file(s).
+/// Read an embedded CUESHEET tag from `entries`, parse it, and grow
+/// or create TITLE / ARTIST / ISRC entries to per-track dimension.
+/// Caller must ensure this is only invoked on single-image (paths.len()
+/// == 1); for multi-file selections per-track CUESHEET semantics don't
+/// apply.
+///
+/// Silently returns when:
+/// - no CUESHEET entry exists or its value is empty
+/// - the CUESHEET parses to fewer than two tracks
+/// - all per-track values for a given field are empty (no data to show)
+fn apply_embedded_cuesheet_per_track(entries: &mut Vec<super::probe::TagEntry>) {
+    use lofty::tag::ItemKey;
+
+    let cue_text = match entries.iter()
+        .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+        .and_then(|e| e.per_file_values.first())
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s.clone(),
+        None => return,
+    };
+
+    let parsed = super::cue_parser::parse_cue(&cue_text);
+    if parsed.tracks.len() < 2 {
+        return;
+    }
+
+    let titles: Vec<String> = parsed.tracks.iter()
+        .map(|t| t.title.clone().unwrap_or_default())
+        .collect();
+    let artists: Vec<String> = parsed.tracks.iter()
+        .map(|t| t.performer.clone().unwrap_or_default())
+        .collect();
+    let isrcs: Vec<String> = parsed.tracks.iter()
+        .map(|t| t.isrc.clone().unwrap_or_default())
+        .collect();
+
+    grow_or_create_per_track(entries, "TITLE", ItemKey::TrackTitle, titles);
+    grow_or_create_per_track(entries, "ARTIST", ItemKey::TrackArtist, artists);
+    grow_or_create_per_track(entries, "ISRC", ItemKey::Isrc, isrcs);
+}
+
+/// Replace `entries[key].per_file_values` (and originals) with `values`,
+/// or create the entry if absent. Skips when all values are empty so we
+/// don't add a no-op row. Sets `is_mixed` and the display `value`
+/// against the new dimension.
+fn grow_or_create_per_track(
+    entries: &mut Vec<super::probe::TagEntry>,
+    key: &str,
+    item_key: lofty::tag::ItemKey,
+    values: Vec<String>,
+) {
+    if values.iter().all(|s| s.is_empty()) {
+        return;
+    }
+    let dim = values.len();
+    let all_same = values.windows(2).all(|w| w[0] == w[1]);
+    let is_mixed = !all_same && dim > 1;
+    let display_value = if is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        values.first().cloned().unwrap_or_default()
+    };
+
+    if let Some(idx) = entries.iter().position(|e|
+        e.display_key.eq_ignore_ascii_case(key))
+    {
+        let entry = &mut entries[idx];
+        entry.per_file_values = values.clone();
+        entry.per_file_originals = values;
+        entry.is_mixed = is_mixed;
+        entry.value = display_value.clone();
+        entry.original = display_value;
+    } else {
+        entries.push(super::probe::TagEntry {
+            display_key: key.to_string(),
+            item_key,
+            value: display_value.clone(),
+            original: display_value,
+            is_binary: false,
+            is_mixed,
+            per_file_values: values.clone(),
+            per_file_originals: values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    }
+}
+
 pub fn open_metadata_editor(app: &mut AppState) {
     // Collect paths — expand directories recursively to find nested
     // audio files (e.g., disc 01/disc 02 folders).
@@ -2757,6 +2855,16 @@ pub fn open_metadata_editor(app: &mut AppState) {
             return;
         }
     };
+
+    // Phase 2: single-image embedded-CUESHEET per-track surfacing.
+    // When the editor opens on a single audio file that already carries
+    // an embedded CUESHEET tag, parse the cue and grow TITLE / ARTIST /
+    // ISRC entries to per-track dimension so each track's value is
+    // visible and editable in the detail overlay. Save-time CUESHEET
+    // regeneration (Phase 4) persists edits back to the tag.
+    if paths.len() == 1 {
+        apply_embedded_cuesheet_per_track(&mut entries);
+    }
 
     // Sort files by (disc, track, filename) for logical display order.
     if paths.len() > 1 {
@@ -4093,7 +4201,9 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
             MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::DetailEdit => {
-                let n = state.paths.len();
+                let n = state.entries.get(state.detail_field_idx)
+                    .map(|e| e.per_file_values.len())
+                    .unwrap_or(state.paths.len());
                 if state.detail_cursor + 1 < n {
                     state.detail_cursor += 1;
                 }
@@ -4227,8 +4337,10 @@ fn handle_metadata_editor_mouse(
                     let header_offset = 2usize;
                     if detail_row >= header_offset {
                         let file_idx = detail_row - header_offset;
-                        let n_files = state.paths.len();
                         let field_idx = state.detail_field_idx;
+                        let n_files = state.entries.get(field_idx)
+                            .map(|e| e.per_file_values.len())
+                            .unwrap_or(state.paths.len());
 
                         // Confirm inline edit if active.
                         if let Some(ref input) = state.detail_edit {

@@ -1658,12 +1658,32 @@ fn draw_metadata_detail(
         None => return,
     };
 
+    // Per-track entries (e.g. TITLE on a single-image rip with embedded
+    // CUESHEET) carry more values than `state.file_labels` has labels
+    // for. Synthesize "Track NN" labels in that case so the detail
+    // overlay numbers each row instead of falling through to "?".
+    let synthesize_track_labels =
+        entry.per_file_values.len() != state.file_labels.len();
+    let label_for = |i: usize| -> String {
+        if synthesize_track_labels {
+            format!("Track {:>02}", i + 1)
+        } else {
+            state.file_labels.get(i).cloned().unwrap_or_else(|| "?".to_string())
+        }
+    };
+
     // Header: field name.
-    // Label column width: enough for "D99.99" (6) + padding, or filename fallback.
-    let max_label = state.file_labels.iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(6);
+    // Label column width: enough for "D99.99" (6) + padding, or filename fallback,
+    // or the "Track NN" synthesis (8) when surfacing per-track CUESHEET rows.
+    let max_label = if synthesize_track_labels {
+        // "Track NN" is 8 chars; cap by the largest synthesized index.
+        format!("Track {:>02}", entry.per_file_values.len()).chars().count()
+    } else {
+        state.file_labels.iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(6)
+    };
     let label_col_w = (max_label + 4).min(inner_w / 3).max(10);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -1675,9 +1695,7 @@ fn draw_metadata_detail(
     // Per-file rows.
     for (i, val) in entry.per_file_values.iter().enumerate() {
         let is_cursor = i == state.detail_cursor;
-        let label = state.file_labels.get(i)
-            .map(|l| l.as_str())
-            .unwrap_or("?");
+        let label = label_for(i);
         let label_display = format!("  {:<width$}  ", label, width = label_col_w - 4);
 
         let label_style = if is_cursor {
