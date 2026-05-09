@@ -4544,7 +4544,10 @@ fn handle_metadata_editor_mouse(
                     state.cursor = row;
                     let entry = &state.entries[row];
                     if !entry.is_binary && !state.deleted.contains(&row) {
-                        if entry.is_mixed && state.paths.len() > 1 {
+                        // Mirrors the keyboard-Enter gate: use the entry's
+                        // own dimension so per-track CUESHEET rows on a
+                        // single-image rip can open detail.
+                        if entry.is_mixed && entry.per_file_values.len() > 1 {
                             state.detail_field_idx = row;
                             state.detail_cursor = 0;
                             state.detail_scroll = 0;
