@@ -2301,6 +2301,34 @@ pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
 }
 
 /// Handle key events inside the metadata editor overlay.
+/// Dispatch a metadata-editor action by character into the existing
+/// keyboard handler. Used by colon commands (`:add`, `:d`, `:u`,
+/// `:detail`, `:w`) and footer-pill / context-menu mouse paths.
+///
+/// Editor state may live in either `app.active_overlay`
+/// (`ActiveOverlay::MetadataEditor(...)`) for direct keypress dispatch
+/// or in `app.pending_metadata_editor` when the command bar parked it
+/// during user typing. We pull from whichever is set, run the handler,
+/// then restore to `active_overlay` unless the handler opened a
+/// different overlay.
+pub(super) fn dispatch_metadata_editor_keychar(
+    app: &mut AppState,
+    ch: char,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let mut state = if let Some(s) = app.pending_metadata_editor.take() {
+        s
+    } else {
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        if let ActiveOverlay::MetadataEditor(s) = overlay { s } else { return; }
+    };
+    let fake = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+    handle_metadata_editor_key(app, fake, &mut state, tx);
+    if matches!(app.active_overlay, ActiveOverlay::None) {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+    }
+}
+
 fn handle_metadata_editor_key(
     app: &mut AppState,
     key: KeyEvent,

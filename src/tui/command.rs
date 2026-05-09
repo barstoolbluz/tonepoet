@@ -284,6 +284,17 @@ pub enum Command {
     /// edited away from both endpoints.
     MbRevert,
     MbRestore,
+    /// Metadata editor: open the "add new field" prompt. Colon-form
+    /// of the `a` bare-char key.
+    MetaAdd,
+    /// Metadata editor: mark the cursor row for deletion (visible as
+    /// strikethrough until save). Colon-form of `d`.
+    MetaDelete,
+    /// Metadata editor: un-delete the cursor row. Colon-form of `u`.
+    MetaUndelete,
+    /// Metadata editor: force-open the per-file detail overlay (even
+    /// for non-mixed entries with multi-track dim). Colon-form of `D`.
+    MetaDetail,
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -339,6 +350,19 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "wq" => Command::WriteQuit,
+        // Metadata-editor actions. These are the colon-form mirrors of
+        // bare-char keys that still exist in the editor's keyboard
+        // handler — both paths share dispatch via
+        // `dispatch_metadata_editor_keychar`. The editor's `:w` save
+        // is handled by `Command::Write` (overlay-aware).
+        // `delete` (without short alias) is taken by browse trash;
+        // editor delete is `:d` only. `add` overlaps with bookmarks
+        // sub-args but bookmarks parses its own `add` inside the
+        // execute_bookmarks helper (top-level `:add` here is safe).
+        "a" | "add" => Command::MetaAdd,
+        "d" => Command::MetaDelete,
+        "u" | "undelete" => Command::MetaUndelete,
+        "D" | "detail" => Command::MetaDetail,
         "e" | "edit" => {
             // `:e <N>` (positive integer) targets a line in the parked
             // CUE preview overlay. Anything else falls through to the
@@ -491,6 +515,17 @@ pub fn execute_command(
             app.should_quit = true;
         }
         Command::Write => {
+            // If the metadata editor is parked or active, :w saves
+            // tags (Phase 4 regen + per-file lofty write). Routes
+            // through the editor's existing keyboard handler via
+            // dispatch_metadata_editor_keychar so the save logic
+            // doesn't fork.
+            if app.pending_metadata_editor.is_some()
+                || matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_))
+            {
+                super::keybindings::dispatch_metadata_editor_keychar(app, 'w', tx);
+                return;
+            }
             // If a CUE preview is parked, :w writes the previewed CUE.
             if let Some(state) = app.pending_cue_preview.take() {
                 if let Err(reason) = super::cue_generate::validate_cue_content(&state.content) {
@@ -1433,6 +1468,18 @@ pub fn execute_command(
                 }
             }
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+        }
+        Command::MetaAdd => {
+            super::keybindings::dispatch_metadata_editor_keychar(app, 'a', tx);
+        }
+        Command::MetaDelete => {
+            super::keybindings::dispatch_metadata_editor_keychar(app, 'd', tx);
+        }
+        Command::MetaUndelete => {
+            super::keybindings::dispatch_metadata_editor_keychar(app, 'u', tx);
+        }
+        Command::MetaDetail => {
+            super::keybindings::dispatch_metadata_editor_keychar(app, 'D', tx);
         }
         Command::CueView => {
             let Some(state) = app.pending_metadata_editor.take() else {
@@ -3736,3 +3783,4 @@ mod completion_tests {
         assert_eq!(input.text, "a");
     }
 }
+
