@@ -982,6 +982,148 @@ mod gnudb_per_track_tests {
         assert_eq!(artist.per_file_values, vec!["Album Artist", "Album Artist", "Album Artist"]);
     }
 
+    // ---- populate_editor_from_review (production path) ----
+
+    fn track(num: u32, title: &str, artist: &str, file_index: usize)
+        -> crate::tui::app::GnudbReviewTrack
+    {
+        crate::tui::app::GnudbReviewTrack {
+            title: title.to_string(),
+            artist: artist.to_string(),
+            track_number: num,
+            file_index,
+        }
+    }
+
+    fn page(album: &str, year: &str, genre: &str,
+        tracks: Vec<crate::tui::app::GnudbReviewTrack>)
+        -> crate::tui::app::GnudbReviewPage
+    {
+        crate::tui::app::GnudbReviewPage {
+            label: String::new(),
+            album: album.to_string(),
+            year: year.to_string(),
+            genre: genre.to_string(),
+            tracks,
+            rows: Vec::new(),
+        }
+    }
+
+    fn review(pages: Vec<crate::tui::app::GnudbReviewPage>,
+        paths: Vec<std::path::PathBuf>)
+        -> crate::tui::app::GnudbReviewState
+    {
+        crate::tui::app::GnudbReviewState {
+            pages,
+            active_page: 0,
+            cursor: 0,
+            scroll: 0,
+            edit_input: None,
+            last_click: None,
+            paths,
+            origin_matches: None,
+        }
+    }
+
+    #[test]
+    fn review_per_track_populates_when_single_image_with_cuesheet() {
+        let (mut state, _td) = empty_state(1);
+        state.entries.push(cuesheet_entry(
+            "FILE \"a.flac\" FLAC\n  TRACK 01 AUDIO\nINDEX 01 00:00:00\n  TRACK 02 AUDIO\nINDEX 01 00:01:00\n  TRACK 03 AUDIO\nINDEX 01 00:02:00\n",
+        ));
+        // Compilation case: per-track artists differ.
+        let r = review(
+            vec![page("Disc Album", "1995", "Rock", vec![
+                track(1, "T1", "Artist A", 0),
+                track(2, "T2", "Artist B", 0),
+                track(3, "T3", "Artist C", 0),
+            ])],
+            state.paths.clone(),
+        );
+        populate_editor_from_review(&mut state, &r);
+
+        let lookup = |k: &str| -> Vec<String> {
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case(k))
+                .map(|e| e.per_file_values.clone()).unwrap_or_default()
+        };
+        assert_eq!(lookup("TITLE"), vec!["T1", "T2", "T3"]);
+        assert_eq!(lookup("ARTIST"),
+            vec!["Artist A", "Artist B", "Artist C"],
+            "review path honors per-track ARTIST (compilation)");
+        assert_eq!(lookup("ALBUM"), vec!["Disc Album"]);
+        assert_eq!(lookup("DATE"), vec!["1995"]);
+        assert_eq!(lookup("TRACKNUMBER"), vec!["1"]);
+    }
+
+    #[test]
+    fn review_album_fallback_when_single_image_without_cuesheet() {
+        let (mut state, _td) = empty_state(1);
+        let r = review(
+            vec![page("Disc Album", "1995", "Rock", vec![
+                track(1, "T1", "Artist A", 0),
+                track(2, "T2", "Artist B", 0),
+            ])],
+            state.paths.clone(),
+        );
+        populate_editor_from_review(&mut state, &r);
+
+        let lookup = |k: &str| -> Vec<String> {
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case(k))
+                .map(|e| e.per_file_values.clone()).unwrap_or_default()
+        };
+        assert_eq!(lookup("TITLE"), vec!["Disc Album"]);
+        // First track's artist as a representative.
+        assert_eq!(lookup("ARTIST"), vec!["Artist A"]);
+        assert_eq!(lookup("ALBUM"), vec!["Disc Album"]);
+    }
+
+    #[test]
+    fn review_multi_disc_keeps_per_file_index_population() {
+        // 4 files split into 2 discs (2 files each). file_index maps
+        // tracks to files. Validates the multi-disc fall-through path.
+        let (mut state, _td) = empty_state(4);
+        let r = review(
+            vec![
+                page("Disc 1", "", "", vec![
+                    track(1, "D1T1", "Art", 0),
+                    track(2, "D1T2", "Art", 1),
+                ]),
+                page("Disc 2", "", "", vec![
+                    track(1, "D2T1", "Art", 2),
+                    track(2, "D2T2", "Art", 3),
+                ]),
+            ],
+            state.paths.clone(),
+        );
+        populate_editor_from_review(&mut state, &r);
+
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values, vec!["D1T1", "D1T2", "D2T1", "D2T2"]);
+        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
+        assert_eq!(album.per_file_values, vec!["Disc 1", "Disc 1", "Disc 2", "Disc 2"]);
+    }
+
+    #[test]
+    fn review_falls_through_when_multi_disc_with_one_file() {
+        // n=1, pages.len()=2 → single_image guard fails (multi-disc on
+        // one file is the user-error case). Falls through to per-file
+        // index path. Last disc's last track wins for slot 0.
+        let (mut state, _td) = empty_state(1);
+        state.entries.push(cuesheet_entry("FILE \"x\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n"));
+        let r = review(
+            vec![
+                page("Disc 1", "", "", vec![track(1, "D1T1", "A", 0)]),
+                page("Disc 2", "", "", vec![track(1, "D2T1", "A", 0)]),
+            ],
+            state.paths.clone(),
+        );
+        populate_editor_from_review(&mut state, &r);
+
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        // Last write wins (per-file behavior).
+        assert_eq!(title.per_file_values, vec!["D2T1"]);
+    }
+
     #[test]
     fn gnudb_per_track_grows_existing_entries_via_ensure_dim_replicate() {
         // File has TITLE="Whole Album" + ARTIST="X" pre-populate (e.g.
