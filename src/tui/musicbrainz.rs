@@ -386,10 +386,7 @@ pub fn populate_editor_mb_supplemental(
         item_key: ItemKey,
         n: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e|
-            e.display_key.eq_ignore_ascii_case(key)
-            && matches!(e.source, crate::tui::probe::TagSource::File)
-        ) {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
             return i;
         }
         entries.push(crate::tui::probe::TagEntry {
@@ -403,7 +400,6 @@ pub fn populate_editor_mb_supplemental(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
-            source: crate::tui::probe::TagSource::File,
         });
         entries.len() - 1
     }
@@ -599,10 +595,7 @@ pub fn populate_editor_from_mb(
         item_key: ItemKey,
         n: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e|
-            e.display_key.eq_ignore_ascii_case(key)
-            && matches!(e.source, crate::tui::probe::TagSource::File)
-        ) {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
             return i;
         }
         entries.push(crate::tui::probe::TagEntry {
@@ -616,7 +609,6 @@ pub fn populate_editor_from_mb(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
-            source: crate::tui::probe::TagSource::File,
         });
         entries.len() - 1
     }
@@ -855,9 +847,15 @@ fn verify_single_image_matches_release(
 /// Permissive on read failures (treats unreadable directories as
 /// "no sidecar present", since we can't prove otherwise).
 fn has_sidecar_cue(audio_path: Option<&std::path::PathBuf>) -> bool {
-    audio_path
-        .map(|p| super::cue_parser::find_sidecar_cue(p).is_some())
-        .unwrap_or(false)
+    let Some(path) = audio_path else { return false; };
+    let Some(parent) = path.parent() else { return false; };
+    let Ok(entries) = std::fs::read_dir(parent) else { return false; };
+    entries
+        .filter_map(|e| e.ok())
+        .any(|e| e.path()
+            .extension()
+            .map(|ext| ext.to_ascii_lowercase() == "cue")
+            .unwrap_or(false))
 }
 
 /// Render a MusicBrainz `artist-credit` array into a single performer
@@ -1121,7 +1119,6 @@ mod tests {
             dirty: false, deleted: Vec::new(),
             file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
-            cue_view: None,
         };
         (state, td)
     }
@@ -1320,71 +1317,6 @@ mod tests {
             "MUSICBRAINZ_TRACKID must not be written for single-image");
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_ARTISTID").is_none());
-    }
-
-    #[test]
-    fn populate_editor_from_mb_does_not_clobber_cue_source_entries() {
-        // Regression: find_or_create previously matched display_key
-        // unfiltered, so a cue-source TITLE row would be aliased and
-        // overwritten with single album-level data — corrupting the
-        // per-track virtual values. Source filter now ensures cue
-        // entries stay untouched; populate creates a fresh File-source
-        // entry instead.
-        let (mut state, _td) = empty_editor_state(1);
-        // Pre-seed the editor with a cue-source virtual TITLE entry
-        // (3 per-track values).
-        state.entries.push(crate::tui::probe::TagEntry {
-            display_key: "TITLE".into(),
-            item_key: lofty::tag::ItemKey::TrackTitle,
-            value: "<multiple values>".into(),
-            original: "<multiple values>".into(),
-            is_binary: false,
-            is_mixed: true,
-            per_file_values: vec![
-                "Cue Track 1".into(),
-                "Cue Track 2".into(),
-                "Cue Track 3".into(),
-            ],
-            per_file_originals: vec![
-                "Cue Track 1".into(),
-                "Cue Track 2".into(),
-                "Cue Track 3".into(),
-            ],
-            mb_proposed_value: None,
-            mb_proposed_per_file: None,
-            source: crate::tui::probe::TagSource::CueSidecar,
-        });
-
-        let mut release = rel("rid", vec![
-            { let mut t = trk(1, "MB Title", "Artist", None); t.length_ms = Some(50); t },
-            { let mut t = trk(2, "MB Title 2", "Artist", None); t.length_ms = Some(50); t },
-        ]);
-        release.title = "Album".into();
-        release.artist = "Album Artist".into();
-        populate_editor_from_mb(&mut state, &release);
-
-        // Cue-source TITLE must be untouched.
-        let cue_title = state.entries.iter()
-            .find(|e| e.display_key.eq_ignore_ascii_case("TITLE")
-                && matches!(e.source, crate::tui::probe::TagSource::CueSidecar))
-            .expect("cue-source TITLE entry must still exist");
-        assert_eq!(
-            cue_title.per_file_values,
-            vec!["Cue Track 1", "Cue Track 2", "Cue Track 3"],
-            "cue-source per-track values must not be overwritten by MB populate",
-        );
-
-        // A separate File-source TITLE must have been created with
-        // the album-level value (single-image semantics).
-        let file_title = state.entries.iter()
-            .find(|e| e.display_key.eq_ignore_ascii_case("TITLE")
-                && matches!(e.source, crate::tui::probe::TagSource::File))
-            .expect("File-source TITLE must be created by MB populate");
-        assert_eq!(
-            file_title.per_file_values,
-            vec!["Album".to_string()],
-            "File-source TITLE should hold the MB album title for single-image",
-        );
     }
 
     #[test]

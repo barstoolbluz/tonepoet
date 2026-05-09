@@ -2345,11 +2345,7 @@ fn handle_metadata_editor_key(
                     if state.cursor < state.entries.len() {
                         let entry = &state.entries[state.cursor];
                         if !entry.is_binary && !state.deleted.contains(&state.cursor) {
-                            // Open detail overlay when there's more than one
-                            // value to display — for tag rows this means
-                            // multiple files; for cue-sourced virtual rows
-                            // this means multiple tracks. Source-agnostic.
-                            if entry.is_mixed && entry.per_file_values.len() > 1 {
+                            if entry.is_mixed && state.paths.len() > 1 {
                                 // Mixed field: open per-file detail overlay.
                                 state.detail_field_idx = state.cursor;
                                 state.detail_cursor = 0;
@@ -2383,16 +2379,8 @@ fn handle_metadata_editor_key(
                     ensure_cursor_visible(state);
                 }
                 KeyCode::Char('d') => {
-                    // Skip cue-source rows: "delete" has no meaning
-                    // for them (CUE serializer doesn't honor deletions
-                    // — would silently strike through the row without
-                    // changing the file).
                     if state.cursor < state.entries.len()
                         && !state.deleted.contains(&state.cursor)
-                        && matches!(
-                            state.entries[state.cursor].source,
-                            super::probe::TagSource::File,
-                        )
                     {
                         state.deleted.push(state.cursor);
                         recalc_dirty(state);
@@ -2419,30 +2407,8 @@ fn handle_metadata_editor_key(
                     }
                 }
                 KeyCode::Char('w') => {
-                    let cue_dirty = super::probe::cue_view_has_changes(&state);
-                    if !state.dirty && !cue_dirty {
+                    if !state.dirty {
                         app.set_status("No changes to save");
-                        return;
-                    }
-                    if cue_dirty {
-                        // Park editor; show confirmation dialog. On
-                        // confirm, dispatch routes to the combined
-                        // tag + CUE writer in handle_overlay_key /
-                        // ConfirmAction handler.
-                        let cue_name = state.cue_view.as_ref()
-                            .and_then(|cv| cv.cue_path.file_name())
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("sidecar CUE")
-                            .to_string();
-                        let parked = state.clone();
-                        app.pending_metadata_editor = Some(parked);
-                        app.active_overlay = ActiveOverlay::Confirmation {
-                            message: format!(
-                                "Rewrite '{}'? Original backed up to .cue.bak. Tag edits saved together. Some custom REM lines may be lost.",
-                                cue_name,
-                            ),
-                            action: super::app::ConfirmAction::WriteCueFileAndTags,
-                        };
                         return;
                     }
                     // Build per-file change lists and spawn async writes.
@@ -2675,7 +2641,6 @@ fn handle_metadata_editor_key(
                             per_file_originals: vec![String::new(); n],
                             mb_proposed_value: None,
                             mb_proposed_per_file: None,
-                            source: super::probe::TagSource::File,
                         });
                         state.cursor = state.entries.len() - 1;
                         state.add_key_input = None;
@@ -2695,12 +2660,8 @@ fn handle_metadata_editor_key(
             }
         }
         MetadataEditorPhase::DetailEdit => {
+            let n_files = state.paths.len();
             let field_idx = state.detail_field_idx;
-            // Source-agnostic row count: file count for tag rows,
-            // track count for cue-source virtual rows.
-            let n_files = state.entries.get(field_idx)
-                .map(|e| e.per_file_values.len())
-                .unwrap_or(0);
 
             // If an inline edit is active within the detail overlay:
             if let Some(ref mut input) = state.detail_edit {
@@ -2873,7 +2834,6 @@ pub fn open_metadata_editor(app: &mut AppState) {
                     per_file_originals: vec![String::new(); n],
                     mb_proposed_value: None,
                     mb_proposed_per_file: None,
-                    source: super::probe::TagSource::File,
                 });
                 entries.len() - 1
             }
@@ -2894,7 +2854,6 @@ pub fn open_metadata_editor(app: &mut AppState) {
                     per_file_originals: vec![String::new(); n],
                     mb_proposed_value: None,
                     mb_proposed_per_file: None,
-                    source: super::probe::TagSource::File,
                 });
                 entries.len() - 1
             }
@@ -2992,88 +2951,6 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }).collect()
     };
 
-    // Sidecar CUE detection — only fires for single-file opens. If a
-    // `.cue` lives alongside, parse it and append virtual TagEntries
-    // (TITLE / PERFORMER / ISRC) with `source: TagSource::CueSidecar`
-    // so the user sees per-track data inline. Skip on multi-FILE CUEs
-    // (each track referencing a different FILE — uncommon for
-    // single-image but possible) where the per-track abstraction
-    // would be ambiguous.
-    let cue_view: Option<super::app::CueView> = if paths.len() == 1 {
-        let audio_path = &paths[0];
-        super::cue_parser::find_sidecar_cue(audio_path)
-            .and_then(|cue_path| {
-                let original_text = std::fs::read_to_string(&cue_path).ok()?;
-                let parsed = super::cue_parser::parse_cue(&original_text);
-                if parsed.tracks.is_empty() { return None; }
-                // Multi-FILE check: skip when tracks reference different files.
-                let first_file = parsed.tracks.first().and_then(|t| t.file.as_ref());
-                let same_file = parsed.tracks.iter()
-                    .all(|t| t.file.as_ref() == first_file);
-                if !same_file { return None; }
-
-                let track_labels: Vec<String> = parsed.tracks.iter()
-                    .map(|t| format!("Track {:02}", t.number))
-                    .collect();
-
-                // Append virtual TagEntries to `entries` for each
-                // CUE-derived track-level field that has any value.
-                let n_tracks = parsed.tracks.len();
-                let titles: Vec<String> = parsed.tracks.iter()
-                    .map(|t| t.title.clone().unwrap_or_default())
-                    .collect();
-                let performers: Vec<String> = parsed.tracks.iter()
-                    .map(|t| t.performer.clone().unwrap_or_default())
-                    .collect();
-                let isrcs: Vec<String> = parsed.tracks.iter()
-                    .map(|t| t.isrc.clone().unwrap_or_default())
-                    .collect();
-
-                let push_virtual = |entries: &mut Vec<super::probe::TagEntry>,
-                                    key: &str,
-                                    item_key: lofty::tag::ItemKey,
-                                    values: Vec<String>| {
-                    let any_nonempty = values.iter().any(|s| !s.is_empty());
-                    if !any_nonempty { return; }
-                    let all_same = values.windows(2).all(|w| w[0] == w[1]);
-                    let is_mixed = !all_same && n_tracks > 1;
-                    let display_value = if is_mixed {
-                        "<multiple values>".to_string()
-                    } else {
-                        values.first().cloned().unwrap_or_default()
-                    };
-                    entries.push(super::probe::TagEntry {
-                        display_key: key.to_string(),
-                        item_key,
-                        value: display_value.clone(),
-                        original: display_value,
-                        is_binary: false,
-                        is_mixed,
-                        per_file_values: values.clone(),
-                        per_file_originals: values,
-                        mb_proposed_value: None,
-                        mb_proposed_per_file: None,
-                        source: super::probe::TagSource::CueSidecar,
-                    });
-                };
-                push_virtual(&mut entries, "TITLE",
-                    lofty::tag::ItemKey::TrackTitle, titles);
-                push_virtual(&mut entries, "PERFORMER",
-                    lofty::tag::ItemKey::Performer, performers);
-                push_virtual(&mut entries, "ISRC",
-                    lofty::tag::ItemKey::Isrc, isrcs);
-
-                Some(super::app::CueView {
-                    cue_path,
-                    original_text,
-                    parsed,
-                    track_labels,
-                })
-            })
-    } else {
-        None
-    };
-
     app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
         super::app::MetadataEditorState {
             paths,
@@ -3091,7 +2968,6 @@ pub fn open_metadata_editor(app: &mut AppState) {
             detail_cursor: 0,
             detail_scroll: 0,
             detail_edit: None,
-            cue_view,
         },
     ));
 }
@@ -3704,29 +3580,20 @@ pub(super) fn build_metadata_row_context_menu(
             enabled: true,
         }));
     }
-    // Delete/Restore only meaningful for File-source rows. Cue-source
-    // virtual rows can't be "deleted" — the CUE serializer doesn't
-    // honor a deletion mark; striking a row through visually without
-    // changing the file would be confusing.
-    let is_cue_source = state.entries.get(row)
-        .map(|e| matches!(e.source, super::probe::TagSource::CueSidecar))
-        .unwrap_or(false);
-    if !is_cue_source {
-        if state.deleted.contains(&row) {
-            entries.push(ContextMenuEntry::Item(ContextMenuItem {
-                label: "Restore (cancel deletion)".to_string(),
-                action: ContextAction::MetadataRestoreEntry,
-                shortcut: None,
-                enabled: true,
-            }));
-        } else {
-            entries.push(ContextMenuEntry::Item(ContextMenuItem {
-                label: "Delete entry".to_string(),
-                action: ContextAction::MetadataDeleteEntry,
-                shortcut: None,
-                enabled: true,
-            }));
-        }
+    if state.deleted.contains(&row) {
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Restore (cancel deletion)".to_string(),
+            action: ContextAction::MetadataRestoreEntry,
+            shortcut: None,
+            enabled: true,
+        }));
+    } else {
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Delete entry".to_string(),
+            action: ContextAction::MetadataDeleteEntry,
+            shortcut: None,
+            enabled: true,
+        }));
     }
     entries.push(ContextMenuEntry::Separator);
     entries.push(ContextMenuEntry::Item(ContextMenuItem {
@@ -4226,11 +4093,7 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
             MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::DetailEdit => {
-                // Use the focused entry's per-row dimension (file count
-                // for tag rows, track count for cue-source virtual rows).
-                let n = state.entries.get(state.detail_field_idx)
-                    .map(|e| e.per_file_values.len())
-                    .unwrap_or(0);
+                let n = state.paths.len();
                 if state.detail_cursor + 1 < n {
                     state.detail_cursor += 1;
                 }
@@ -4364,12 +4227,8 @@ fn handle_metadata_editor_mouse(
                     let header_offset = 2usize;
                     if detail_row >= header_offset {
                         let file_idx = detail_row - header_offset;
+                        let n_files = state.paths.len();
                         let field_idx = state.detail_field_idx;
-                        // Source-agnostic row count (see DetailEdit
-                        // keyboard handler for rationale).
-                        let n_files = state.entries.get(field_idx)
-                            .map(|e| e.per_file_values.len())
-                            .unwrap_or(0);
 
                         // Confirm inline edit if active.
                         if let Some(ref input) = state.detail_edit {
@@ -4570,13 +4429,10 @@ fn handle_metadata_editor_mouse(
 
                 if is_double && row < state.entries.len() {
                     // Double-click: open detail for mixed fields, inline edit otherwise.
-                    // Source-agnostic gate: per_file_values.len() > 1
-                    // covers both multi-file tag rows AND multi-track
-                    // cue-source virtual rows.
                     state.cursor = row;
                     let entry = &state.entries[row];
                     if !entry.is_binary && !state.deleted.contains(&row) {
-                        if entry.is_mixed && entry.per_file_values.len() > 1 {
+                        if entry.is_mixed && state.paths.len() > 1 {
                             state.detail_field_idx = row;
                             state.detail_cursor = 0;
                             state.detail_scroll = 0;
@@ -4815,22 +4671,10 @@ fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
     let visible = crossterm::terminal::size()
         .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
         .unwrap_or(20);
-    // The "From sidecar CUE" separator inserted before the first
-    // cue-source row adds one to the visual line index relative to
-    // the entry index. `state.scroll` is consumed by the renderer as
-    // a lines-vec offset (matches `lines.into_iter().skip(scroll)`),
-    // so scroll math here must operate in visual-line units, not raw
-    // entry indices. Without this adjustment, a cue-row cursor at
-    // the bottom of the visible area would sit one row past the edge.
-    let separator_offset = state.entries.iter()
-        .position(|e| matches!(e.source, super::probe::TagSource::CueSidecar))
-        .map(|first_cue| if state.cursor >= first_cue { 1 } else { 0 })
-        .unwrap_or(0);
-    let visual_cursor = state.cursor + separator_offset;
-    if visual_cursor < state.scroll {
-        state.scroll = visual_cursor;
-    } else if visual_cursor >= state.scroll + visible {
-        state.scroll = visual_cursor.saturating_sub(visible - 1);
+    if state.cursor < state.scroll {
+        state.scroll = state.cursor;
+    } else if state.cursor >= state.scroll + visible {
+        state.scroll = state.cursor.saturating_sub(visible - 1);
     }
 }
 
@@ -4850,13 +4694,13 @@ fn ensure_detail_visible(state: &mut super::app::MetadataEditorState) {
     }
 }
 
-/// Recalculate the tag-source dirty flag by checking per-file values
-/// for changes. Source-aware: only `TagSource::File` entries count
-/// here (cue-source entries have their own dirty path that goes
-/// through `cue_view_has_changes` and the confirmation dialog).
-/// Equivalent to `super::probe::metadata_editor_has_changes`.
+/// Recalculate the dirty flag by checking per-file values for changes.
 fn recalc_dirty(state: &mut super::app::MetadataEditorState) {
-    state.dirty = super::probe::metadata_editor_has_changes(state);
+    state.dirty = !state.deleted.is_empty()
+        || state.entries.iter().any(|e|
+            e.per_file_values.iter().zip(e.per_file_originals.iter())
+                .any(|(v, o)| v != o)
+        );
 }
 
 /// Cascade direction for one level relative to its parent. Each level
@@ -6519,137 +6363,6 @@ fn execute_confirm_action(
         ConfirmAction::ClearQueue => {
             app.manager.clear_queue();
             app.set_status("Cleared queue");
-        }
-        ConfirmAction::WriteCueFileAndTags => {
-            // Restore parked editor and run combined save (CUE rewrite
-            // first with .bak backup, then tag writes).
-            let mut state = match app.pending_metadata_editor.take() {
-                Some(s) => s,
-                None => {
-                    app.set_status("Lost editor context; nothing saved");
-                    return;
-                }
-            };
-            // 1. Build the new CUE string from cue_view + cue-source entries.
-            let cue_view = match state.cue_view.as_ref() {
-                Some(cv) => cv,
-                None => {
-                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                    app.set_status("No CUE view to write");
-                    return;
-                }
-            };
-            let n_tracks = cue_view.parsed.tracks.len();
-            let mut overrides: Vec<super::cue_generate::TrackOverride> =
-                (0..n_tracks).map(|_| super::cue_generate::TrackOverride {
-                    title: None, performer: None, isrc: None,
-                }).collect();
-            for entry in &state.entries {
-                if !matches!(entry.source, super::probe::TagSource::CueSidecar) { continue; }
-                for (i, val) in entry.per_file_values.iter().enumerate() {
-                    if i >= n_tracks { break; }
-                    let v = if val.is_empty() { None } else { Some(val.clone()) };
-                    match entry.display_key.to_ascii_uppercase().as_str() {
-                        "TITLE" => overrides[i].title = v,
-                        "PERFORMER" => overrides[i].performer = v,
-                        "ISRC" => overrides[i].isrc = v,
-                        _ => {}
-                    }
-                }
-            }
-            // Image filename + format tag from the audio file's basename.
-            let image_filename = state.paths.first()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .unwrap_or("image.flac")
-                .to_string();
-            let image_ext = std::path::Path::new(&image_filename)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("flac");
-            let format_tag = super::cue_generate::cue_format_tag(image_ext);
-            let new_cue = super::cue_generate::regenerate_cue_with_overrides(
-                &cue_view.parsed,
-                &overrides,
-                &image_filename,
-                format_tag,
-            );
-
-            // 2. Backup original .cue → .cue.bak before rewriting.
-            let cue_path = cue_view.cue_path.clone();
-            let backup_path = cue_path.with_extension("cue.bak");
-            if let Err(e) = std::fs::write(&backup_path, &cue_view.original_text) {
-                app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                app.set_status(format!("Backup failed: {}", e));
-                return;
-            }
-            if let Err(e) = std::fs::write(&cue_path, &new_cue) {
-                app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                app.set_status(format!("CUE write failed: {}", e));
-                return;
-            }
-            // 3. Sync cue-source entries' originals to their new values
-            //    so dirty resets after a successful save.
-            for entry in &mut state.entries {
-                if matches!(entry.source, super::probe::TagSource::CueSidecar) {
-                    entry.original = entry.value.clone();
-                    entry.per_file_originals = entry.per_file_values.clone();
-                }
-            }
-            // Update cue_view's original_text + parsed to reflect the
-            // newly-written content (next edit cycle starts from here).
-            if let Some(cv) = state.cue_view.as_mut() {
-                cv.original_text = new_cue.clone();
-                cv.parsed = super::cue_parser::parse_cue(&new_cue);
-            }
-
-            // 4. Run the existing tag-save path if there are tag edits.
-            if state.dirty {
-                state.phase = super::app::MetadataEditorPhase::Saving;
-                let paths = state.paths.clone();
-                let deleted = state.deleted.clone();
-                let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>, super::probe::TagSource)> =
-                    state.entries.iter().map(|e| (
-                        e.item_key.clone(),
-                        e.per_file_values.clone(),
-                        e.per_file_originals.clone(),
-                        e.source,
-                    )).collect();
-                let tx_clone = tx.clone();
-                tokio::spawn(async move {
-                    let mut results = Vec::new();
-                    for (file_idx, path) in paths.iter().enumerate() {
-                        let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
-                        for (entry_idx, (key, vals, origs, source)) in entries_snap.iter().enumerate() {
-                            // Only File-source entries write to tags.
-                            if !matches!(source, super::probe::TagSource::File) { continue; }
-                            if deleted.contains(&entry_idx) {
-                                changes.push((key.clone(), None));
-                            } else if file_idx < vals.len() && file_idx < origs.len() {
-                                if vals[file_idx] != origs[file_idx] {
-                                    changes.push((key.clone(), Some(vals[file_idx].clone())));
-                                }
-                            }
-                        }
-                        if !changes.is_empty() {
-                            let r = tokio::task::spawn_blocking({
-                                let path = path.clone();
-                                move || crate::tui::probe::write_all_tags(&path, &changes)
-                            })
-                            .await
-                            .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
-                            results.push((path.clone(), r));
-                        }
-                    }
-                    let _ = tx_clone.send(AppMessage::MetadataEditorWriteComplete { results }).await;
-                });
-            } else {
-                // Only CUE was dirty — no tag writes; surface success.
-                state.dirty = false;
-            }
-
-            app.active_overlay = ActiveOverlay::MetadataEditor(state);
-            app.set_status("CUE rewritten (backup at .cue.bak); tag edits saved");
         }
         ConfirmAction::TrashSelection(paths) => {
             let mut trashed = 0usize;

@@ -1022,31 +1022,6 @@ pub struct MetadataEditorState {
     pub detail_scroll: usize,
     /// Inline edit within the detail overlay.
     pub detail_edit: Option<crate::tui::text_input::TextInputState>,
-    /// Sidecar CUE view, populated when the editor opens on a single
-    /// audio file and a `.cue` lives alongside. Carries the parsed CUE
-    /// (for backup + serialization) and the per-track labels used by
-    /// the detail overlay when navigating virtual `CueSidecar`-source
-    /// entries.
-    pub cue_view: Option<CueView>,
-}
-
-/// Sidecar CUE companion data on `MetadataEditorState`. Track-level
-/// values themselves live as virtual `TagEntry`s with
-/// `source: TagSource::CueSidecar` interleaved into `state.entries`;
-/// this struct holds the cross-cutting pieces (file path, parsed
-/// sheet, per-track labels) that aren't per-entry.
-#[derive(Debug, Clone)]
-pub struct CueView {
-    /// Path to the sidecar `.cue` file.
-    pub cue_path: std::path::PathBuf,
-    /// Original on-disk text for backup before rewrite.
-    pub original_text: String,
-    /// Parsed CUE structure (for read-back of unmodified fields and
-    /// for the minimal-edit serializer).
-    pub parsed: crate::tui::cue_parser::CueSheet,
-    /// Per-track labels for the detail overlay (e.g., "Track 01",
-    /// "Track 02", ...). Length equals `parsed.tracks.len()`.
-    pub track_labels: Vec<String>,
 }
 
 /// State for the MusicBrainz release-selection overlay shown when MB
@@ -1422,11 +1397,6 @@ pub enum ConfirmAction {
     ClearCompleted,
     StopAll,
     ClearQueue,
-    /// Save the metadata editor's changes — both file tags AND a
-    /// rewrite of the sidecar `.cue` file (with a `.bak` backup).
-    /// Only fires when the editor has cue-source dirty entries; a
-    /// tag-only save bypasses confirmation.
-    WriteCueFileAndTags,
     /// Move the given paths to the system trash (XDG Trash / Finder Trash).
     TrashSelection(Vec<PathBuf>),
     /// Apply AccurateRip offset correction to a set of tracks.

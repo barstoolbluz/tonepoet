@@ -1359,7 +1359,6 @@ mod tests {
                 per_file_originals: vec!["x".into()],
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
-                source: super::super::probe::TagSource::File,
             },
             TagEntry {
                 display_key: "CUESHEET".into(),
@@ -1371,7 +1370,6 @@ mod tests {
                 per_file_originals: vec!["".into()],
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
-                source: super::super::probe::TagSource::File,
             },
         ];
         let state = MetadataEditorState {
@@ -1383,7 +1381,6 @@ mod tests {
             dirty: false, deleted: Vec::new(),
             file_labels: vec!["01".into()],
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
-            cue_view: None,
         };
 
         // Row 0 = TITLE: no View entry.

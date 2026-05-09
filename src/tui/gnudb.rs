@@ -253,10 +253,7 @@ pub fn populate_editor_from_gnudb(
         item_key: lofty::tag::ItemKey,
         n: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e|
-            e.display_key.eq_ignore_ascii_case(key)
-            && matches!(e.source, super::probe::TagSource::File)
-        ) {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
             return i;
         }
         entries.push(super::probe::TagEntry {
@@ -270,7 +267,6 @@ pub fn populate_editor_from_gnudb(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
-            source: super::probe::TagSource::File,
         });
         entries.len() - 1
     }
@@ -335,10 +331,7 @@ pub fn populate_editor_file(
         item_key: lofty::tag::ItemKey,
         n: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e|
-            e.display_key.eq_ignore_ascii_case(key)
-            && matches!(e.source, super::probe::TagSource::File)
-        ) {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
             return i;
         }
         entries.push(super::probe::TagEntry {
@@ -352,7 +345,6 @@ pub fn populate_editor_file(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
-            source: super::probe::TagSource::File,
         });
         entries.len() - 1
     }
@@ -509,10 +501,7 @@ pub fn populate_editor_from_review(
         item_key: lofty::tag::ItemKey,
         n: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e|
-            e.display_key.eq_ignore_ascii_case(key)
-            && matches!(e.source, super::probe::TagSource::File)
-        ) {
+        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
             return i;
         }
         entries.push(super::probe::TagEntry {
@@ -526,7 +515,6 @@ pub fn populate_editor_from_review(
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
-            source: super::probe::TagSource::File,
         });
         entries.len() - 1
     }
