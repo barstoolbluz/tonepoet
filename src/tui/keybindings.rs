@@ -1297,6 +1297,18 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     app.active_overlay = ActiveOverlay::None;
+                    // Restore any parked overlay the colon command
+                    // stashed before opening the confirmation. Today
+                    // only ConfirmAction::MbBack parks the editor;
+                    // future actions that park overlays get this
+                    // restore for free. Pending fields are left
+                    // untouched if active_overlay was already set
+                    // to something else by a future dispatch.
+                    if let Some(parked) = app.pending_metadata_editor.take() {
+                        if matches!(app.active_overlay, ActiveOverlay::None) {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1335,15 +1347,19 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         super::command::execute_command(app, cmd, tx);
                     }
                     // If a parked metadata editor wasn't consumed by the
-                    // command, restore it now.
-                    if let Some(parked) = app.pending_metadata_editor.take() {
-                        if matches!(app.active_overlay, ActiveOverlay::None) {
+                    // command, restore it now. Only `take()` when we
+                    // intend to restore — otherwise a colon command
+                    // that parks editor + opens a new overlay (e.g.
+                    // :mb-back's Confirmation flow) would have its
+                    // parked state drained-and-dropped here.
+                    if matches!(app.active_overlay, ActiveOverlay::None) {
+                        if let Some(parked) = app.pending_metadata_editor.take() {
                             app.active_overlay = ActiveOverlay::MetadataEditor(parked);
                         }
                     }
                     // Same for parked CUE preview.
-                    if let Some(parked) = app.pending_cue_preview.take() {
-                        if matches!(app.active_overlay, ActiveOverlay::None) {
+                    if matches!(app.active_overlay, ActiveOverlay::None) {
+                        if let Some(parked) = app.pending_cue_preview.take() {
                             app.active_overlay = ActiveOverlay::CuePreview(parked);
                         }
                     }
