@@ -2998,7 +2998,15 @@ fn inject_sidecar_cuesheet_if_present(
         return;
     }
     let Some(sidecar) = super::cue_parser::find_sidecar_cue(audio_path) else { return; };
-    let Ok(text) = std::fs::read_to_string(&sidecar) else { return; };
+    // Read raw bytes + lossy-decode UTF-8: many real-world `.cue` files
+    // are Shift_JIS / Windows-1252 (Japanese rips, foreign-character
+    // titles). String::from_utf8_lossy replaces invalid bytes with
+    // U+FFFD so we still surface track structure even when encoding
+    // is wrong; CUE keywords (TITLE/PERFORMER/INDEX/etc.) are pure
+    // ASCII so they parse correctly regardless. Mirrors the strategy
+    // in cue_parser::parse_cue_file.
+    let Ok(raw) = std::fs::read(&sidecar) else { return; };
+    let text = String::from_utf8_lossy(&raw).into_owned();
     let parsed = super::cue_parser::parse_cue(&text);
     if parsed.tracks.len() < 2 {
         return;
@@ -8026,6 +8034,30 @@ mod phase4_tests {
         let mut entries: Vec<TagEntry> = vec![];
         inject_sidecar_cuesheet_if_present(&mut entries, &audio);
         assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
+    }
+
+    #[test]
+    fn inject_sidecar_cuesheet_handles_non_utf8_sidecar() {
+        // Japanese rips ship Shift_JIS-encoded .cue files. read_to_string
+        // would have refused them; lossy-decode accepts and CUE keywords
+        // (TITLE/PERFORMER/INDEX/etc.) are pure ASCII so structure parses.
+        let td = tempfile::tempdir().expect("tempdir");
+        // Build a CUE with a Shift_JIS-encoded title byte sequence.
+        // 0x82 0xA0 = 'あ' in Shift_JIS, invalid as UTF-8.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"TITLE \"");
+        bytes.extend_from_slice(&[0x82, 0xA0]);
+        bytes.extend_from_slice(b"\"\nFILE \"album.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"T1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"T2\"\n    INDEX 01 00:01:00\n");
+        let cue_path = td.path().join("album.cue");
+        std::fs::write(&cue_path, &bytes).expect("write");
+        let audio = td.path().join("album.flac");
+
+        let mut entries: Vec<TagEntry> = vec![];
+        inject_sidecar_cuesheet_if_present(&mut entries, &audio);
+        // Inject succeeded — Shift_JIS bytes lossy-decoded; CUE keywords
+        // intact.
+        assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_some(),
+            "non-UTF-8 sidecar must still inject (lossy decode)");
     }
 
     #[test]
