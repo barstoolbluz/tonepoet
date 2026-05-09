@@ -3149,6 +3149,148 @@ fn grow_or_create_per_track(
     }
 }
 
+/// Overlay per-track `values` onto an entry's `per_file_values`,
+/// preserving `per_file_originals` so a revert can restore the
+/// pre-overlay state. If the entry is absent, create it with the
+/// supplied values and empty originals (revert restores empties).
+/// Used by `:tags-cue-sidecar` to refresh per-track titles/artists/
+/// ISRCs from a sidecar `.cue` without losing the user's prior
+/// editor state.
+fn overlay_per_track_values(
+    entries: &mut Vec<super::probe::TagEntry>,
+    key: &str,
+    item_key: lofty::tag::ItemKey,
+    values: Vec<String>,
+) {
+    if values.iter().all(|s| s.is_empty()) {
+        return;
+    }
+    let dim = values.len();
+    let all_same = values.windows(2).all(|w| w[0] == w[1]);
+    let is_mixed = !all_same && dim > 1;
+    let display_value = if is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        values.first().cloned().unwrap_or_default()
+    };
+
+    if let Some(idx) = entries.iter().position(|e|
+        e.display_key.eq_ignore_ascii_case(key))
+    {
+        let entry = &mut entries[idx];
+        // Pad originals if the new dim is larger than the existing
+        // dim — keeps revert mapping by-index sane.
+        if entry.per_file_originals.len() < dim {
+            let pad = entry.per_file_originals.first().cloned().unwrap_or_default();
+            entry.per_file_originals.resize(dim, pad);
+        }
+        entry.per_file_values = values;
+        entry.is_mixed = is_mixed;
+        entry.value = display_value;
+    } else {
+        entries.push(super::probe::TagEntry {
+            display_key: key.to_string(),
+            item_key,
+            value: display_value,
+            original: String::new(),
+            is_binary: false,
+            is_mixed,
+            per_file_values: values,
+            per_file_originals: vec![String::new(); dim],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    }
+}
+
+/// Reload per-track values from a sidecar `.cue` file alongside the
+/// audio. Used by `:tags-cue-sidecar`.
+///
+/// Behavior: parses the sidecar, then overlays per-track TITLE /
+/// ARTIST / ISRC values onto the existing editor entries (preserving
+/// originals so the user can revert). The CUESHEET entry's
+/// `per_file_values[0]` is also updated so save-time regen uses the
+/// fresh sidecar text as its structural template.
+///
+/// Returns Err with a user-facing message on:
+/// - non-single-image (paths.len() != 1)
+/// - no sidecar `.cue` in audio's parent directory
+/// - sidecar unreadable / parses to <2 tracks / track-by-track
+///   structure
+pub(super) fn reload_from_sidecar_cue(
+    state: &mut super::app::MetadataEditorState,
+) -> Result<String, String> {
+    if state.paths.len() != 1 {
+        return Err(":tags-cue-sidecar requires a single-image rip (one file)".to_string());
+    }
+    let audio = &state.paths[0];
+    let sidecar = super::cue_parser::find_sidecar_cue(audio)
+        .ok_or_else(|| ":tags-cue-sidecar: no .cue file found alongside audio".to_string())?;
+    let raw = std::fs::read(&sidecar)
+        .map_err(|e| format!(":tags-cue-sidecar: failed to read {}: {}",
+            sidecar.display(), e))?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let parsed = super::cue_parser::parse_cue(&text);
+    if parsed.tracks.len() < 2 {
+        return Err(format!(
+            ":tags-cue-sidecar: {} parses to {} tracks (need >= 2)",
+            sidecar.file_name().map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| sidecar.display().to_string()),
+            parsed.tracks.len(),
+        ));
+    }
+    let first_file = parsed.tracks.first().and_then(|t| t.file.as_deref());
+    if parsed.tracks.iter().any(|t| t.file.as_deref() != first_file) {
+        return Err(":tags-cue-sidecar: sidecar is track-by-track (multiple FILE refs); not safe to embed against a single image".to_string());
+    }
+
+    // Update or create the CUESHEET entry's per_file_values[0]
+    // (preserving originals so revert restores the prior state).
+    use lofty::tag::ItemKey;
+    if let Some(idx) = state.entries.iter().position(|e|
+        e.display_key.eq_ignore_ascii_case("CUESHEET"))
+    {
+        let entry = &mut state.entries[idx];
+        if entry.per_file_values.is_empty() {
+            entry.per_file_values.push(text.clone());
+        } else {
+            entry.per_file_values[0] = text.clone();
+        }
+        entry.value = super::probe::cue_summary_string(&text);
+    } else {
+        state.entries.push(super::probe::TagEntry {
+            display_key: "CUESHEET".to_string(),
+            item_key: ItemKey::Unknown("CUESHEET".to_string()),
+            value: super::probe::cue_summary_string(&text),
+            original: String::new(),
+            is_binary: true,
+            is_mixed: false,
+            per_file_values: vec![text.clone()],
+            per_file_originals: vec![String::new()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    }
+
+    // Overlay per-track values, preserving originals.
+    let titles: Vec<String> = parsed.tracks.iter()
+        .map(|t| t.title.clone().unwrap_or_default()).collect();
+    let artists: Vec<String> = parsed.tracks.iter()
+        .map(|t| t.performer.clone().unwrap_or_default()).collect();
+    let isrcs: Vec<String> = parsed.tracks.iter()
+        .map(|t| t.isrc.clone().unwrap_or_default()).collect();
+    overlay_per_track_values(&mut state.entries, "TITLE", ItemKey::TrackTitle, titles);
+    overlay_per_track_values(&mut state.entries, "ARTIST", ItemKey::TrackArtist, artists);
+    overlay_per_track_values(&mut state.entries, "ISRC", ItemKey::Isrc, isrcs);
+
+    state.dirty = super::probe::metadata_editor_has_changes(state);
+
+    let n_tracks = parsed.tracks.len();
+    let name = sidecar.file_name().map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| sidecar.display().to_string());
+    Ok(format!(":tags-cue-sidecar: loaded {} tracks from {}", n_tracks, name))
+}
+
 pub fn open_metadata_editor(app: &mut AppState) {
     // Collect paths — expand directories recursively to find nested
     // audio files (e.g., disc 01/disc 02 folders).
@@ -8086,6 +8228,143 @@ mod phase4_tests {
         // intact.
         assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_some(),
             "non-UTF-8 sidecar must still inject (lossy decode)");
+    }
+
+    // -------- :tags-cue-sidecar (reload_from_sidecar_cue) --------
+
+    fn write_sidecar_at(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        write_sidecar(dir, "album.cue", body)
+    }
+
+    /// Build a single-image MetadataEditorState whose paths[0] points
+    /// at `dir/album.flac` (file doesn't have to exist on disk —
+    /// reload_from_sidecar_cue only reads the sidecar).
+    fn state_for_sidecar_test(dir: &std::path::Path,
+        existing_entries: Vec<TagEntry>) -> MetadataEditorState
+    {
+        MetadataEditorState {
+            paths: vec![dir.join("album.flac")],
+            entries: existing_entries,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false,
+            deleted: vec![],
+            file_labels: vec!["01".to_string()],
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+        }
+    }
+
+    #[test]
+    fn reload_sidecar_overlays_per_track_values_preserving_originals() {
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
+        // Existing TITLE entry with prior values (e.g. from Phase 2
+        // sidecar inject before the user edited the sidecar externally).
+        let mut state = state_for_sidecar_test(td.path(), vec![
+            entry("TITLE", ItemKey::TrackTitle,
+                &["Old1", "Old2", "Old3"], &["Old1", "Old2", "Old3"]),
+        ]);
+        let result = reload_from_sidecar_cue(&mut state);
+        assert!(result.is_ok(), "reload should succeed: {:?}", result);
+
+        let title = state.entries.iter()
+            .find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values, vec!["T1", "T2", "T3"],
+            "values overwritten with sidecar's");
+        assert_eq!(title.per_file_originals, vec!["Old1", "Old2", "Old3"],
+            "originals preserved (revert restores prior state)");
+        assert!(state.dirty, "values diverged from originals → dirty=true");
+    }
+
+    #[test]
+    fn reload_sidecar_creates_synthetic_cuesheet_entry() {
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
+        let mut state = state_for_sidecar_test(td.path(), vec![]);
+        let result = reload_from_sidecar_cue(&mut state);
+        assert!(result.is_ok());
+
+        let cue = state.entries.iter()
+            .find(|e| e.display_key == "CUESHEET").unwrap();
+        assert_eq!(cue.per_file_values[0], SIDECAR_3_TRACK_SINGLE_IMAGE);
+        assert_eq!(cue.per_file_originals[0], "",
+            "originals=\"\" so save writes a fresh embedded CUESHEET tag");
+        assert!(cue.is_binary);
+    }
+
+    #[test]
+    fn reload_sidecar_overrides_existing_embedded_cuesheet() {
+        // File has embedded CUESHEET (originals=on-disk value); sidecar
+        // is different. After reload, values come from sidecar but
+        // originals are preserved (the on-disk embedded CUE).
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
+        let on_disk = "TITLE \"Old\"\nFILE \"x.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"OE1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"OE2\"\n    INDEX 01 00:00:50\n";
+        let mut state = state_for_sidecar_test(td.path(), vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[on_disk], &[on_disk]),
+        ]);
+        let result = reload_from_sidecar_cue(&mut state);
+        assert!(result.is_ok());
+
+        let cue = state.entries.iter()
+            .find(|e| e.display_key == "CUESHEET").unwrap();
+        assert_eq!(cue.per_file_values[0], SIDECAR_3_TRACK_SINGLE_IMAGE,
+            "CUESHEET value overridden with sidecar");
+        assert_eq!(cue.per_file_originals[0], on_disk,
+            "CUESHEET originals preserved (embedded on-disk value)");
+    }
+
+    #[test]
+    fn reload_sidecar_refuses_when_no_sidecar() {
+        let td = tempfile::tempdir().expect("tempdir");
+        // No .cue written.
+        let mut state = state_for_sidecar_test(td.path(), vec![]);
+        let result = reload_from_sidecar_cue(&mut state);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no .cue"));
+    }
+
+    #[test]
+    fn reload_sidecar_refuses_track_by_track() {
+        let track_by_track =
+            "TITLE \"Album\"\n\
+             FILE \"track01.flac\" WAVE\n  TRACK 01 AUDIO\nINDEX 01 00:00:00\n\
+             FILE \"track02.flac\" WAVE\n  TRACK 02 AUDIO\nINDEX 01 00:00:00\n";
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar_at(td.path(), track_by_track);
+        let mut state = state_for_sidecar_test(td.path(), vec![]);
+        let result = reload_from_sidecar_cue(&mut state);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("track-by-track"));
+    }
+
+    #[test]
+    fn reload_sidecar_refuses_multi_file() {
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
+        let mut state = MetadataEditorState {
+            paths: vec![
+                td.path().join("a.flac"),
+                td.path().join("b.flac"),
+            ],
+            entries: vec![],
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false, deleted: vec![],
+            file_labels: vec!["01".into(), "02".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+        };
+        let result = reload_from_sidecar_cue(&mut state);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("single-image"));
     }
 
     #[test]

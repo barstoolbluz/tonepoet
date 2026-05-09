@@ -295,6 +295,12 @@ pub enum Command {
     /// Metadata editor: force-open the per-file detail overlay (even
     /// for non-mixed entries with multi-track dim). Colon-form of `D`.
     MetaDetail,
+    /// Metadata editor: re-load per-track TITLE / ARTIST / ISRC from
+    /// the sidecar `.cue` file alongside the audio. Useful when the
+    /// user has edited the sidecar externally OR when the file has
+    /// both an embedded CUESHEET and a sidecar and the user wants
+    /// the sidecar's values to win.
+    TagsCueSidecar,
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -363,6 +369,7 @@ pub fn parse_command(input: &str) -> Command {
         "d" => Command::MetaDelete,
         "u" | "undelete" => Command::MetaUndelete,
         "D" | "detail" => Command::MetaDetail,
+        "tags-cue-sidecar" | "tags-cue" => Command::TagsCueSidecar,
         "e" | "edit" => {
             // `:e <N>` (positive integer) targets a line in the parked
             // CUE preview overlay. Anything else falls through to the
@@ -1480,6 +1487,17 @@ pub fn execute_command(
         }
         Command::MetaDetail => {
             super::keybindings::dispatch_metadata_editor_keychar(app, 'D', tx);
+        }
+        Command::TagsCueSidecar => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status(":tags-cue-sidecar only works in the metadata editor");
+                return;
+            };
+            match super::keybindings::reload_from_sidecar_cue(&mut state) {
+                Ok(msg) => app.set_status(msg),
+                Err(reason) => app.set_status(reason),
+            }
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
         Command::CueView => {
             let Some(state) = app.pending_metadata_editor.take() else {
