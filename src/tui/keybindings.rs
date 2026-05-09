@@ -2761,7 +2761,6 @@ fn handle_metadata_editor_key(
     }
 }
 
-/// Open the metadata editor for the currently selected audio file(s).
 /// Save-time CUESHEET regeneration (Phase 4).
 ///
 /// Detects per-track-dirty entries (entries with per_file_values.len()
@@ -2820,18 +2819,66 @@ fn regenerate_cuesheet_for_save(
     }
 
     // 2. Locate CUESHEET anchor.
-    let cue_idx = entry_idx("CUESHEET").ok_or_else(||
-        "save aborted: per-track edits without an embedded CUESHEET. \
-         Re-run :tags-mb on a per-track-eligible single-image rip to \
-         create one, or revert per-track changes."
-            .to_string()
-    )?;
+    //    - per_track_dirty without a CUESHEET entry is unrecoverable
+    //      (the user's edits have no place to land). Refuse with a
+    //      status. Catches the identity-match-without-track-lengths
+    //      edge case from Phase 5: per-track entries got created but
+    //      cue_from_mb_release returned Err so no CUESHEET embed.
+    //    - !per_track_dirty (album-only dirt) without a CUESHEET is
+    //      a no-op — the album-level tag writes through normally;
+    //      no CUE to regenerate. Fall through to the regular save.
+    //    - !per_track_dirty (album-only dirt) with a CUESHEET still
+    //      regens so the CUE's album title / date / etc. stay in
+    //      sync with the edited file tags (useful on multi-file
+    //      selections where one file happens to carry a CUESHEET).
+    let cue_idx = match entry_idx("CUESHEET") {
+        Some(i) => i,
+        None => {
+            if per_track_dirty {
+                return Err(
+                    "save aborted: per-track edits without an embedded CUESHEET. \
+                     Re-run :tags-mb on a per-track-eligible single-image rip to \
+                     create one, or revert per-track changes."
+                        .to_string()
+                );
+            }
+            return Ok(false);
+        }
+    };
 
-    let cue_text_original = state.entries[cue_idx].per_file_originals
+    // Refuse when the user marked CUESHEET deleted but also has
+    // per-track edits — the regen output would land in an entry that
+    // the save loop is about to remove. Per-track edits would be lost.
+    if state.deleted.contains(&cue_idx) && per_track_dirty {
+        return Err(
+            "save aborted: per-track edits with CUESHEET marked deleted. \
+             Undelete the CUESHEET row or revert per-track changes."
+                .to_string()
+        );
+    }
+
+    // Parse the CURRENT in-state CUESHEET (per_file_values[0]) — not
+    // the on-disk originals[0]. When Phase 5 just created the entry
+    // from MB, originals[0]=="" but values[0] holds the generated CUE
+    // we want as the structural template. When the file already had
+    // an embedded CUESHEET, values[0] == originals[0] (no inline edit
+    // — CUESHEET rows are is_binary), so parsing either yields the
+    // same result.
+    let cue_text_template = state.entries[cue_idx].per_file_values
         .first().cloned().unwrap_or_default();
-    let mut parsed = super::cue_parser::parse_cue(&cue_text_original);
+    let mut parsed = super::cue_parser::parse_cue(&cue_text_template);
     if parsed.tracks.is_empty() {
-        return Err("save aborted: embedded CUESHEET parsed to zero tracks".to_string());
+        // No parsable tracks — malformed CUE or empty value. Per-track
+        // edits have no structural anchor; album-only dirt is a no-op
+        // (let the regular save handle normal tag writes).
+        if per_track_dirty {
+            return Err(
+                "save aborted: CUESHEET anchor parses to zero tracks; \
+                 re-run :tags-mb to rebuild it from scratch."
+                    .to_string()
+            );
+        }
+        return Ok(false);
     }
 
     // 3. β album-level re-derive — mutate parsed CueSheet fields from
@@ -2853,6 +2900,34 @@ fn regenerate_cuesheet_for_save(
     //    title/performer/isrc from the matching per-track entry slot
     //    when the entry is per-track-dim; otherwise None (preserves
     //    parsed value).
+    //
+    //    Refuse when any per-track entry's dim != parsed.tracks.len().
+    //    This happens after :tags-mb-on-existing-CUE when MB's track
+    //    count diverges from the file's CUESHEET track count: Phase 1
+    //    grew per-track entries to MB's count (canonical for :tags-mb),
+    //    but Phase 5 leaves the existing CUESHEET alone so the parsed
+    //    structure stays at its original count. Truncating silently
+    //    would drop user data; extending would invent timestamp-less
+    //    tracks. User must manually delete the CUESHEET row first to
+    //    re-bootstrap from MB.
+    let n_parsed = parsed.tracks.len();
+    for (key, idx_opt) in [
+        ("TITLE", entry_idx("TITLE")),
+        ("ARTIST", entry_idx("ARTIST")),
+        ("ISRC", entry_idx("ISRC")),
+    ] {
+        if let Some(i) = idx_opt {
+            let dim = state.entries[i].per_file_values.len();
+            if dim != n_paths && dim != n_parsed {
+                return Err(format!(
+                    "save aborted: {} has {} per-track values but \
+                     CUESHEET has {} tracks; delete the CUESHEET row \
+                     and re-run :tags-mb to re-bootstrap.",
+                    key, dim, n_parsed,
+                ));
+            }
+        }
+    }
     let title_idx_pt = entry_idx("TITLE").filter(|&i| is_per_track(i));
     let artist_idx_pt = entry_idx("ARTIST").filter(|&i| is_per_track(i));
     let isrc_idx_pt = entry_idx("ISRC").filter(|&i| is_per_track(i));
