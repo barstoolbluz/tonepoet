@@ -3149,6 +3149,98 @@ fn grow_or_create_per_track(
     }
 }
 
+/// Result of a `:fix-caps` pass — counts so the status message can
+/// explain what happened (and what was skipped, with a hint).
+pub(super) struct FixCapsResult {
+    pub changed_values: usize,
+    pub skipped_mixed: usize,
+    pub skipped_deleted: usize,
+}
+
+/// Apply capitalization rules to TITLE / ARTIST / ALBUM / ALBUMARTIST
+/// / PERFORMER entries in `state`. When `focus` is `Some(idx)` (detail-
+/// overlay invocation), only that entry is processed regardless of
+/// is_mixed. When `None` (main-editor invocation), iterates all
+/// entries and skips those that are mixed (user can't see the values
+/// in the main view) or in `state.deleted`.
+///
+/// is_mixed is recomputed against the entry's own `per_file_values
+/// .len()` (NOT `state.paths.len()`) — the prior implementation in
+/// `Command::FixCaps` had the same dim bug Phase 1c fixed in
+/// `recompute_and_stamp_mb_proposed`, causing per-track entries on
+/// single-image rips to lose their `<multiple values>` placeholder
+/// after fix-caps.
+pub(super) fn fix_caps_for_state(
+    state: &mut super::app::MetadataEditorState,
+    focus: Option<usize>,
+) -> FixCapsResult {
+    use crate::convert::renaming::{capitalize_title, capitalize_section};
+
+    let mut result = FixCapsResult {
+        changed_values: 0,
+        skipped_mixed: 0,
+        skipped_deleted: 0,
+    };
+
+    let indices: Vec<usize> = match focus {
+        Some(i) => vec![i],
+        None => (0..state.entries.len()).collect(),
+    };
+
+    for i in indices {
+        if i >= state.entries.len() { continue; }
+        // Skip checks only apply to main-editor (None) invocations.
+        // Detail-overlay invocations honor the user's explicit focus.
+        if focus.is_none() {
+            if state.deleted.contains(&i) {
+                result.skipped_deleted += 1;
+                continue;
+            }
+            if state.entries[i].is_mixed {
+                result.skipped_mixed += 1;
+                continue;
+            }
+        }
+
+        let entry = &mut state.entries[i];
+        let key_upper = entry.display_key.to_ascii_uppercase();
+        let cap_fn: fn(&str) -> String = match key_upper.as_str() {
+            "TITLE" => capitalize_title,
+            "ARTIST" | "ALBUM" | "ALBUMARTIST" | "PERFORMER" => capitalize_section,
+            _ => continue,
+        };
+        for v in &mut entry.per_file_values {
+            if !v.is_empty() {
+                let new_val = cap_fn(v);
+                if new_val != *v {
+                    *v = new_val;
+                    result.changed_values += 1;
+                }
+            }
+        }
+        // Recompute is_mixed using the entry's OWN dim, not paths.len().
+        let dim = entry.per_file_values.len();
+        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+        entry.is_mixed = !all_same && dim > 1;
+        entry.value = if entry.is_mixed {
+            "<multiple values>".to_string()
+        } else {
+            entry.per_file_values.first().cloned().unwrap_or_default()
+        };
+    }
+
+    result
+}
+
+/// True when a tag's display_key is one we apply capitalization rules
+/// to. Used to gate `:fix-caps` footer pill visibility on the detail
+/// overlay (only show for fields where fix-caps would actually do
+/// something).
+pub(super) fn is_fix_caps_applicable(display_key: &str) -> bool {
+    matches!(display_key.to_ascii_uppercase().as_str(),
+        "TITLE" | "ARTIST" | "ALBUM" | "ALBUMARTIST" | "PERFORMER")
+}
+
 /// Overlay per-track `values` onto an entry's `per_file_values`,
 /// preserving `per_file_originals` so a revert can restore the
 /// pre-overlay state. If the entry is absent, create it with the
@@ -5135,7 +5227,10 @@ fn handle_metadata_editor_mouse(
                             _ => {}
                         }
                     }
-                    // Dynamic pills: [:import-cue (FIELD)] if CUE-compatible, Enter, Esc.
+                    // Dynamic pills: [:import-cue (FIELD)] if CUE-compatible,
+                    // [:fix-caps] if the field is a capitalize-applicable
+                    // text key, Enter, Esc. Pills are only added in
+                    // browsing mode (not while inline-editing a value).
                     let cue_label: String;
                     let mut pills: Vec<(&str, &str)> = Vec::new();
                     if let Some(entry) = state.entries.get(state.detail_field_idx) {
@@ -5149,6 +5244,11 @@ fn handle_metadata_editor_mouse(
                             ("Enter confirm", "enter"), ("Esc cancel", "esc"),
                         ]);
                     } else {
+                        if let Some(entry) = state.entries.get(state.detail_field_idx) {
+                            if is_fix_caps_applicable(&entry.display_key) {
+                                pills.push((":fix-caps", ":fix-caps"));
+                            }
+                        }
                         pills.extend_from_slice(&[
                             ("Enter edit", "enter"), ("Esc back", "esc"),
                         ]);
@@ -8410,6 +8510,110 @@ mod phase4_tests {
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("single-image"));
+    }
+
+    // -------- :fix-caps --------
+
+    #[test]
+    fn fix_caps_main_editor_skips_mixed_entries() {
+        // Per-track TITLE on a single-image rip with diverging values
+        // (is_mixed=true). Main-editor :fix-caps must NOT touch it —
+        // the user sees `<multiple values>` and shouldn't have one
+        // track silently rewriting the placeholder.
+        let mut state = single_image_state(vec![
+            entry("ALBUM", ItemKey::AlbumTitle,
+                &["the dark side of the moon"],
+                &["the dark side of the moon"]),
+            entry("TITLE", ItemKey::TrackTitle,
+                &["speak to me", "breathe", "on the run"],
+                &["speak to me", "breathe", "on the run"]),
+        ]);
+        // entry() helper doesn't set is_mixed for v.len()==1 cases
+        // correctly for our purposes; explicitly mark TITLE mixed.
+        let title_idx = state.entries.iter().position(|e| e.display_key == "TITLE").unwrap();
+        state.entries[title_idx].is_mixed = true;
+        state.entries[title_idx].value = "<multiple values>".to_string();
+
+        let result = fix_caps_for_state(&mut state, None);
+
+        // ALBUM was capitalized.
+        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
+        assert_eq!(album.per_file_values, vec!["The Dark Side of the Moon"]);
+        // TITLE per-track values UNTOUCHED.
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values, vec!["speak to me", "breathe", "on the run"],
+            "main-editor fix-caps must skip mixed entries");
+        assert_eq!(title.value, "<multiple values>",
+            "TITLE.value preserved (no track 1 leak into the placeholder)");
+        assert_eq!(result.skipped_mixed, 1);
+        assert!(result.changed_values >= 1);
+    }
+
+    #[test]
+    fn fix_caps_main_editor_skips_deleted_entries() {
+        let mut state = single_image_state(vec![
+            entry("ALBUM", ItemKey::AlbumTitle, &["dark side"], &["dark side"]),
+            entry("TITLE", ItemKey::TrackTitle, &["money"], &["money"]),
+        ]);
+        // Mark ALBUM (idx 0) deleted.
+        state.deleted.push(0);
+        let result = fix_caps_for_state(&mut state, None);
+        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
+        assert_eq!(album.per_file_values, vec!["dark side"],
+            "deleted entries must be skipped — no point capitalizing a row about to be removed");
+        assert_eq!(result.skipped_deleted, 1);
+        // TITLE still got capitalized.
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values, vec!["Money"]);
+    }
+
+    #[test]
+    fn fix_caps_detail_overlay_targets_focused_only() {
+        let mut state = single_image_state(vec![
+            entry("ALBUM", ItemKey::AlbumTitle, &["dark side"], &["dark side"]),
+            entry("TITLE", ItemKey::TrackTitle,
+                &["speak to me", "breathe", "on the run"],
+                &["speak to me", "breathe", "on the run"]),
+        ]);
+        let title_idx = state.entries.iter().position(|e| e.display_key == "TITLE").unwrap();
+        state.entries[title_idx].is_mixed = true;
+
+        // Detail overlay focused on TITLE.
+        let result = fix_caps_for_state(&mut state, Some(title_idx));
+
+        // TITLE's per-track values capitalized.
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values, vec!["Speak to Me", "Breathe", "On the Run"]);
+        // ALBUM untouched.
+        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
+        assert_eq!(album.per_file_values, vec!["dark side"]);
+        assert_eq!(result.skipped_mixed, 0,
+            "detail overlay invocation honors focus regardless of mixed");
+        assert_eq!(result.skipped_deleted, 0);
+    }
+
+    #[test]
+    fn fix_caps_recomputes_is_mixed_using_entry_dim() {
+        // Per-track TITLE entry with all-same lowercase values on a
+        // single-image rip (paths.len()=1, dim=3). After fix-caps:
+        // - per_file_values capitalized (still all-same)
+        // - is_mixed must STAY false (matches the dim==3, all_same=true case)
+        // - value must be the capitalized title, NOT "<multiple values>"
+        // The pre-fix code at command.rs:2168 used `n = paths.len() = 1`
+        // and would set is_mixed = !all_same && n > 1 = false; that
+        // happened to be correct here only because all_same was true.
+        // The dim-bug would have surfaced if values diverged but
+        // paths.len() == 1.
+        let mut state = single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle,
+                &["foo", "foo", "foo"],
+                &["foo", "foo", "foo"]),
+        ]);
+        let _ = fix_caps_for_state(&mut state, None);
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values, vec!["Foo", "Foo", "Foo"]);
+        assert_eq!(title.is_mixed, false);
+        assert_eq!(title.value, "Foo");
     }
 
     #[test]

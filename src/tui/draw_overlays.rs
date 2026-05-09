@@ -1798,6 +1798,10 @@ fn draw_metadata_detail(
                 ));
                 pills.push(pill_gap());
             }
+            if super::keybindings::is_fix_caps_applicable(&entry.display_key) {
+                pills.push(footer_pill(":fix-caps", theme::BLUE));
+                pills.push(pill_gap());
+            }
         }
         pills.extend_from_slice(&[
             footer_pill("Enter edit", theme::GREEN),

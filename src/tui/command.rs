@@ -2141,39 +2141,37 @@ pub fn execute_command(
             if let Some(parked) = app.pending_metadata_editor.take() {
                 app.active_overlay = ActiveOverlay::MetadataEditor(parked);
             }
-            if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
-                use crate::convert::renaming::{capitalize_title, capitalize_section};
-
-                let mut changed = 0usize;
-                for entry in &mut state.entries {
-                    let key_upper = entry.display_key.to_ascii_uppercase();
-                    let cap_fn: fn(&str) -> String = match key_upper.as_str() {
-                        "TITLE" => capitalize_title,
-                        "ARTIST" | "ALBUM" | "ALBUMARTIST" | "PERFORMER" => capitalize_section,
-                        _ => continue,
-                    };
-                    for v in &mut entry.per_file_values {
-                        if !v.is_empty() {
-                            let new_val = cap_fn(v);
-                            if new_val != *v {
-                                *v = new_val;
-                                changed += 1;
-                            }
-                        }
+            if let super::app::ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
+                use super::app::MetadataEditorPhase;
+                // Phase-scoped: main editor skips mixed (user can't
+                // see them and the placeholder shouldn't get rewritten);
+                // detail overlay capitalizes only the focused entry's
+                // per-track values; other phases (InlineEdit / AddingKey
+                // / Saving) refuse cleanly.
+                let focus = match state.phase {
+                    MetadataEditorPhase::Editing => None,
+                    MetadataEditorPhase::DetailEdit => Some(state.detail_field_idx),
+                    _ => {
+                        app.set_status(":fix-caps not available in this phase");
+                        return;
                     }
-                    // Update merged display value and mixed state.
-                    let n = state.paths.len();
-                    let all_same = entry.per_file_values.windows(2)
-                        .all(|w| w[0] == w[1]);
-                    entry.is_mixed = !all_same && n > 1;
-                    entry.value = if entry.is_mixed {
-                        "<multiple values>".to_string()
-                    } else {
-                        entry.per_file_values.first().cloned().unwrap_or_default()
-                    };
+                };
+                let result = super::keybindings::fix_caps_for_state(state, focus);
+                if result.changed_values > 0 {
+                    state.dirty = true;
                 }
-                state.dirty = true;
-                app.set_status(format!("Capitalization applied ({} values changed)", changed));
+                let mut msg = format!("Capitalization applied ({} values changed",
+                    result.changed_values);
+                if result.skipped_mixed > 0 {
+                    msg.push_str(&format!("; {} mixed entries skipped — open detail (`:D`) to fix per-track",
+                        result.skipped_mixed));
+                }
+                if result.skipped_deleted > 0 {
+                    msg.push_str(&format!("; {} deleted entries skipped",
+                        result.skipped_deleted));
+                }
+                msg.push(')');
+                app.set_status(msg);
             } else {
                 app.set_status(":fix-caps only works in the metadata editor");
             }
