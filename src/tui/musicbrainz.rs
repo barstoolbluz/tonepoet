@@ -442,7 +442,7 @@ pub fn populate_editor_mb_supplemental(
     // first existing slot into padded positions so revert keeps the
     // pre-populate state.
     if per_track_populate {
-        if let Some(idx) = isrc_idx { ensure_dim_replicate(&mut state.entries[idx], isrc_dim); }
+        if let Some(idx) = isrc_idx { crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], isrc_dim); }
     }
     let recording_idx = if any_recording {
         Some(find_or_create(
@@ -634,21 +634,7 @@ fn is_per_track_eligible(
     true
 }
 
-/// Resize `entry.per_file_values` and `per_file_originals` to
-/// `target_dim`, padding with the existing first-element value when
-/// growing. Replicating preserves revert semantics: pressing revert
-/// after a per-track populate restores the editor to whatever was on
-/// disk for the original (lower) dimension. Truncation is a plain
-/// `Vec::resize` and discards trailing values.
-fn ensure_dim_replicate(entry: &mut crate::tui::probe::TagEntry, target_dim: usize) {
-    if entry.per_file_values.len() == target_dim {
-        return;
-    }
-    let pad_v = entry.per_file_values.first().cloned().unwrap_or_default();
-    let pad_o = entry.per_file_originals.first().cloned().unwrap_or_default();
-    entry.per_file_values.resize(target_dim, pad_v);
-    entry.per_file_originals.resize(target_dim, pad_o);
-}
+// `ensure_dim_replicate` moved to probe.rs so gnudb can share it.
 
 fn recompute_and_stamp_mb_proposed(
     entry: &mut crate::tui::probe::TagEntry,
@@ -758,8 +744,8 @@ pub fn populate_editor_from_mb(
     // Phase 2's CUESHEET dim and MB's track count is resolved in MB's
     // favor.
     if per_track_populate {
-        if let Some(idx) = title_idx { ensure_dim_replicate(&mut state.entries[idx], track_dim); }
-        if let Some(idx) = artist_idx { ensure_dim_replicate(&mut state.entries[idx], track_dim); }
+        if let Some(idx) = title_idx { crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], track_dim); }
+        if let Some(idx) = artist_idx { crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], track_dim); }
     }
 
     if per_track_populate {

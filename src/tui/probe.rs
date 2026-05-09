@@ -613,6 +613,25 @@ pub fn cue_summary_string(value: &str) -> String {
 /// refresh the editor's `dirty` flag after a revert toggle so the
 /// indicator accurately reflects whether anything would be written
 /// on save.
+/// Resize `entry.per_file_values` and `per_file_originals` to
+/// `target_dim`, padding with the existing first-element value when
+/// growing. Replicating preserves revert semantics: pressing revert
+/// after a per-track populate restores the editor to whatever was on
+/// disk for the original (lower) dimension. Truncation is a plain
+/// `Vec::resize` and discards trailing values.
+///
+/// Used by both MB and gnudb populate paths to grow tag entries to
+/// per-track dimension on single-image rips.
+pub fn ensure_dim_replicate(entry: &mut TagEntry, target_dim: usize) {
+    if entry.per_file_values.len() == target_dim {
+        return;
+    }
+    let pad_v = entry.per_file_values.first().cloned().unwrap_or_default();
+    let pad_o = entry.per_file_originals.first().cloned().unwrap_or_default();
+    entry.per_file_values.resize(target_dim, pad_v);
+    entry.per_file_originals.resize(target_dim, pad_o);
+}
+
 pub fn metadata_editor_has_changes(state: &super::app::MetadataEditorState) -> bool {
     !state.deleted.is_empty()
         || state.entries.iter().any(|e|
