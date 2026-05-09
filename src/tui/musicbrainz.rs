@@ -548,10 +548,11 @@ pub fn populate_editor_mb_supplemental(
 /// file already had don't need a toggle.
 fn recompute_and_stamp_mb_proposed(
     entry: &mut crate::tui::probe::TagEntry,
-    n: usize,
+    _n: usize,
 ) {
     let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
-    entry.is_mixed = !all_same && n > 1;
+    let dim = entry.per_file_values.len();
+    entry.is_mixed = !all_same && dim > 1;
     entry.value = if entry.is_mixed {
         "<multiple values>".to_string()
     } else {
