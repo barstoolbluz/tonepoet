@@ -7607,3 +7607,276 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     }
 }
 
+#[cfg(test)]
+mod phase4_tests {
+    //! Phase 4 + Phase 2 unit tests for the metadata editor's per-track
+    //! CUESHEET round-trip. The functions under test are private to
+    //! this module, so the tests live inline.
+
+    use super::*;
+    use super::super::probe::TagEntry;
+    use super::super::app::{MetadataEditorState, MetadataEditorPhase};
+    use lofty::tag::ItemKey;
+
+    fn entry(key: &str, item_key: ItemKey, vals: &[&str], origs: &[&str]) -> TagEntry {
+        let v: Vec<String> = vals.iter().map(|s| s.to_string()).collect();
+        let o: Vec<String> = origs.iter().map(|s| s.to_string()).collect();
+        let all_same = v.windows(2).all(|w| w[0] == w[1]);
+        let value = if v.len() > 1 && !all_same {
+            "<multiple values>".to_string()
+        } else { v.first().cloned().unwrap_or_default() };
+        let original = if o.len() > 1 {
+            o.first().cloned().unwrap_or_default()
+        } else { o.first().cloned().unwrap_or_default() };
+        TagEntry {
+            display_key: key.to_string(),
+            item_key,
+            value,
+            original,
+            is_binary: key.eq_ignore_ascii_case("CUESHEET"),
+            is_mixed: v.len() > 1 && !all_same,
+            per_file_values: v,
+            per_file_originals: o,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    /// Build a minimal MetadataEditorState with paths.len() == 1.
+    fn single_image_state(entries: Vec<TagEntry>) -> MetadataEditorState {
+        MetadataEditorState {
+            paths: vec![std::path::PathBuf::from("/tmp/album.flac")],
+            entries,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: true,
+            deleted: vec![],
+            file_labels: vec!["01".to_string()],
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+        }
+    }
+
+    /// CUE template for a 3-track image used across regen tests.
+    const CUE_TEMPLATE: &str =
+        "TITLE \"Old Album\"\n\
+         PERFORMER \"Old Artist\"\n\
+         REM DATE \"1977\"\n\
+         FILE \"album.flac\" FLAC\n\
+           TRACK 01 AUDIO\n\
+             TITLE \"Track 1\"\n\
+             PERFORMER \"Old Artist\"\n\
+             INDEX 01 00:00:00\n\
+           TRACK 02 AUDIO\n\
+             TITLE \"Track 2\"\n\
+             PERFORMER \"Old Artist\"\n\
+             INDEX 01 03:00:00\n\
+           TRACK 03 AUDIO\n\
+             TITLE \"Track 3\"\n\
+             PERFORMER \"Old Artist\"\n\
+             INDEX 01 06:30:00\n";
+
+    // ------------------------- Phase 2 -------------------------
+
+    #[test]
+    fn apply_embedded_cuesheet_grows_title_to_per_track_dim() {
+        let mut entries = vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
+        ];
+        apply_embedded_cuesheet_per_track(&mut entries);
+        let t = entries.iter().find(|e| e.display_key == "TITLE").expect("TITLE created");
+        assert_eq!(t.per_file_values, vec!["Track 1", "Track 2", "Track 3"]);
+        assert_eq!(t.per_file_originals, vec!["Track 1", "Track 2", "Track 3"]);
+        assert!(t.is_mixed, "three differing per-track titles must mark mixed");
+        let a = entries.iter().find(|e| e.display_key == "ARTIST").expect("ARTIST created");
+        assert_eq!(a.per_file_values, vec!["Old Artist", "Old Artist", "Old Artist"]);
+        assert!(!a.is_mixed, "uniform per-track artists not mixed");
+    }
+
+    #[test]
+    fn apply_embedded_cuesheet_skips_when_no_cuesheet_entry() {
+        let mut entries = vec![
+            entry("ALBUM", ItemKey::AlbumTitle, &["X"], &["X"]),
+        ];
+        apply_embedded_cuesheet_per_track(&mut entries);
+        // No TITLE / ARTIST / ISRC entries created.
+        assert!(entries.iter().all(|e| e.display_key == "ALBUM"));
+    }
+
+    #[test]
+    fn apply_embedded_cuesheet_skips_single_track_cue() {
+        let single_track = "TITLE \"X\"\nFILE \"a.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"X\"\n    INDEX 01 00:00:00\n";
+        let mut entries = vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[single_track], &[single_track]),
+        ];
+        apply_embedded_cuesheet_per_track(&mut entries);
+        // Single-track CUE: no point growing TITLE per-track.
+        assert!(entries.iter().find(|e| e.display_key == "TITLE").is_none());
+    }
+
+    // ------------------------- Phase 4 -------------------------
+
+    #[test]
+    fn regen_skips_when_nothing_dirty() {
+        // CUESHEET present, TITLE per-track but values match originals.
+        let mut state = single_image_state(vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
+            entry("TITLE", ItemKey::TrackTitle,
+                &["Track 1", "Track 2", "Track 3"],
+                &["Track 1", "Track 2", "Track 3"]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
+        assert!(!result, "Nothing dirty → no regen");
+    }
+
+    #[test]
+    fn regen_per_track_edit_writes_new_cue() {
+        let mut state = single_image_state(vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
+            entry("TITLE", ItemKey::TrackTitle,
+                &["Track 1", "EDITED", "Track 3"],
+                &["Track 1", "Track 2", "Track 3"]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
+        assert!(result, "per-track edit → regen ran");
+        let cue_idx = state.entries.iter().position(|e| e.display_key == "CUESHEET").unwrap();
+        let new_cue = &state.entries[cue_idx].per_file_values[0];
+        assert!(new_cue.contains("TITLE \"EDITED\""), "regenerated CUE must include the edited title");
+        assert!(new_cue.contains("TITLE \"Track 1\""));
+        assert!(new_cue.contains("TITLE \"Track 3\""));
+        // INDEX timestamps must be preserved from the parsed template.
+        assert!(new_cue.contains("INDEX 01 00:00:00"));
+        assert!(new_cue.contains("INDEX 01 03:00:00"));
+        assert!(new_cue.contains("INDEX 01 06:30:00"));
+    }
+
+    #[test]
+    fn regen_beta_album_rederive_picks_up_album_edits() {
+        // CUESHEET present (3-track template); ALBUM dirty (changed
+        // from "Old Album" to "New Album"); no per-track dirt.
+        let mut state = single_image_state(vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
+            entry("ALBUM", ItemKey::AlbumTitle, &["New Album"], &["Old Album"]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
+        assert!(result, "album-level dirt with CUESHEET → regen ran");
+        let cue_idx = state.entries.iter().position(|e| e.display_key == "CUESHEET").unwrap();
+        let new_cue = &state.entries[cue_idx].per_file_values[0];
+        assert!(new_cue.contains("TITLE \"New Album\""), "β re-derive must update CUE album title");
+        // Track titles preserved (no per-track override).
+        assert!(new_cue.contains("TITLE \"Track 1\""));
+        assert!(new_cue.contains("TITLE \"Track 2\""));
+    }
+
+    #[test]
+    fn regen_refuses_per_track_dirty_without_cuesheet() {
+        // Per-track TITLE differs from originals, but no CUESHEET
+        // anchor exists. Must refuse with status.
+        let mut state = single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle,
+                &["a", "EDITED", "c"],
+                &["a", "b", "c"]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state);
+        assert!(result.is_err(), "per-track dirt + no CUESHEET → Err");
+        assert!(result.unwrap_err().contains("without an embedded CUESHEET"));
+    }
+
+    #[test]
+    fn regen_album_only_dirty_without_cuesheet_is_noop() {
+        // No CUESHEET; only ALBUM dirty. Multi-file or single-file
+        // editor without an embedded CUE — normal save path applies.
+        let mut state = single_image_state(vec![
+            entry("ALBUM", ItemKey::AlbumTitle, &["New"], &["Old"]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
+        assert!(!result, "album-only dirt without CUESHEET → Ok(false), normal save");
+    }
+
+    #[test]
+    fn regen_refuses_track_count_divergence() {
+        // CUESHEET has 3 tracks, TITLE has dim 5 → divergence.
+        let mut state = single_image_state(vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
+            entry("TITLE", ItemKey::TrackTitle,
+                &["t1", "t2", "t3", "t4", "t5"],
+                &["", "", "", "", ""]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("TITLE has 5 per-track values"));
+        assert!(msg.contains("CUESHEET has 3 tracks"));
+    }
+
+    #[test]
+    fn regen_refuses_when_cuesheet_marked_deleted_with_per_track_dirty() {
+        let mut state = single_image_state(vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
+            entry("TITLE", ItemKey::TrackTitle,
+                &["Track 1", "EDITED", "Track 3"],
+                &["Track 1", "Track 2", "Track 3"]),
+        ]);
+        state.deleted.push(0); // CUESHEET marked deleted
+        let result = regenerate_cuesheet_for_save(&mut state);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("CUESHEET marked deleted"));
+    }
+
+    #[test]
+    fn regen_refuses_empty_parsed_cuesheet_with_per_track_dirty() {
+        // CUESHEET value parses to no tracks (e.g. empty string after
+        // a Phase-5-failure; user shouldn't normally see this state
+        // but defensive check guards against silent data loss).
+        let mut state = single_image_state(vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[""], &[""]),
+            entry("TITLE", ItemKey::TrackTitle,
+                &["a", "EDITED"],
+                &["a", "b"]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("zero tracks"));
+    }
+
+    #[test]
+    fn regen_uses_per_file_values_not_originals_as_template() {
+        // Phase-5-just-created scenario: per_file_originals[0]="", but
+        // per_file_values[0] holds the freshly-generated CUE. The
+        // function must parse VALUES, not ORIGINALS, otherwise it'd
+        // see empty tracks and refuse on per-track dirt.
+        let mut state = single_image_state(vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[""]),
+            entry("TITLE", ItemKey::TrackTitle,
+                &["Track 1", "EDITED", "Track 3"],
+                &["", "", ""]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
+        assert!(result, "freshly-created CUESHEET (originals empty) → regen succeeds via values[0]");
+    }
+
+    #[test]
+    fn regen_isrc_per_track_override_lands_in_cue() {
+        let mut state = single_image_state(vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
+            entry("ISRC", ItemKey::Isrc,
+                &["USRC0000001", "USRC0000002", "USRC0000003"],
+                &["", "", ""]),
+        ]);
+        let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
+        assert!(result);
+        let new_cue = &state.entries.iter()
+            .find(|e| e.display_key == "CUESHEET").unwrap()
+            .per_file_values[0];
+        assert!(new_cue.contains("ISRC USRC0000001"));
+        assert!(new_cue.contains("ISRC USRC0000002"));
+        assert!(new_cue.contains("ISRC USRC0000003"));
+    }
+}
+
