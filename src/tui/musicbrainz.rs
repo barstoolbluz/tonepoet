@@ -631,6 +631,18 @@ fn is_per_track_eligible(
         }
         return false;
     }
+    // Even with identity (MUSICBRAINZ_ALBUMID match) or duration
+    // verification passing, we need MB track lengths to generate a
+    // meaningful CUESHEET — Phase 5's `cue_from_mb_release` fails
+    // without them, leaving per-track entries with no anchor and
+    // forcing Phase 4 to refuse saves. Tighten here so the user
+    // gets the album-level fallback in this corner instead.
+    if release.tracks.iter().any(|t| t.length_ms.is_none()) {
+        if verbose {
+            log::info!(":tags-mb: per-track populate skipped (MB release missing track lengths)");
+        }
+        return false;
+    }
     true
 }
 
@@ -1613,6 +1625,52 @@ mod tests {
             state.entries.iter().any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")),
             "matching MUSICBRAINZ_ALBUMID must override duration mismatch and embed CUESHEET",
         );
+    }
+
+    #[test]
+    fn populate_editor_from_mb_single_image_album_fallback_when_identity_matches_but_no_lengths() {
+        // Phase B: even when identity verifies (matching MUSICBRAINZ_
+        // ALBUMID), if MB hasn't supplied per-track lengths we can't
+        // generate a CUESHEET. Eligibility tightened to refuse this
+        // corner — user gets the album-level fallback (TITLE = album
+        // name) instead of per-track entries with no anchor that
+        // Phase 4 would refuse to save.
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+        let (mut state, _td) = empty_editor_state(1);
+        install_silence_at(&state);
+        let path = &state.paths[0];
+        {
+            let mut tagged = lofty::read_from_path(path).expect("read fixture");
+            if tagged.primary_tag().is_none() {
+                let tt = tagged.primary_tag_type();
+                tagged.insert_tag(lofty::tag::Tag::new(tt));
+            }
+            let tag = tagged.primary_tag_mut().expect("primary tag");
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::MusicBrainzReleaseId,
+                ItemValue::Text("matching-rid".into()),
+            ));
+            tagged.save_to_path(path, WriteOptions::default()).expect("save tag");
+        }
+        // Identity matches BUT no track lengths.
+        let mut release = rel("matching-rid", vec![
+            trk(1, "First", "Artist", None),
+            trk(2, "Second", "Artist", None),
+        ]);
+        release.title = "Whole Album".into();
+        populate_editor_from_mb(&mut state, &release);
+
+        assert!(
+            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            "no track lengths → no CUESHEET even with identity match",
+        );
+        let title = state.entries.iter()
+            .find(|e| e.display_key.eq_ignore_ascii_case("TITLE")).unwrap();
+        assert_eq!(title.per_file_values, vec!["Whole Album"],
+            "album-level fallback: TITLE = album name, dim 1");
     }
 
     #[test]
