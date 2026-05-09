@@ -2414,6 +2414,17 @@ fn handle_metadata_editor_key(
                         app.set_status("No changes to save");
                         return;
                     }
+                    // Phase 4 Step A: regenerate the embedded CUESHEET
+                    // from per-track edits + β album-level re-derive
+                    // before snapshotting. State is mutated in place;
+                    // the snapshot below picks up the new CUESHEET tag
+                    // value as a normal dirty entry. Refuses save when
+                    // per-track edits exist but no CUESHEET anchor is
+                    // present.
+                    if let Err(reason) = regenerate_cuesheet_for_save(state) {
+                        app.set_status(reason);
+                        return;
+                    }
                     // Build per-file change lists and spawn async writes.
                     state.phase = MetadataEditorPhase::Saving;
                     let paths = state.paths.clone();
@@ -2431,6 +2442,16 @@ fn handle_metadata_editor_key(
                         for (file_idx, path) in paths.iter().enumerate() {
                             let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
                             for (entry_idx, (key, vals, origs)) in entries_snap.iter().enumerate() {
+                                // Phase 4 Step B: per-track entries
+                                // (vals.len() != paths.len()) round-
+                                // trip through the regenerated CUESHEET
+                                // tag — they have no per-file lofty
+                                // home, and writing vals[0] would
+                                // clobber the file's album-level tag
+                                // with track 0's value. Skip.
+                                if vals.len() != paths.len() {
+                                    continue;
+                                }
                                 if deleted.contains(&entry_idx) {
                                     changes.push((key.clone(), None));
                                 } else if file_idx < vals.len() && file_idx < origs.len() {
@@ -2741,6 +2762,142 @@ fn handle_metadata_editor_key(
 }
 
 /// Open the metadata editor for the currently selected audio file(s).
+/// Save-time CUESHEET regeneration (Phase 4).
+///
+/// Detects per-track-dirty entries (entries with per_file_values.len()
+/// > paths.len() whose values diverge from originals) AND album-level
+/// dirty entries that the CUE serializer surfaces (ALBUM / ARTIST
+/// [when dim 1] / DATE / GENRE / CATALOGNUMBER). If anything matches,
+/// parses the on-disk CUESHEET (per_file_originals[0]) as the
+/// structural template, β-mutates album-level fields from
+/// state.entries, builds TrackOverride list from per-track entries,
+/// regenerates the CUE text, and mutates state.entries[cue_idx]'s
+/// value and per_file_values[0] in place. The caller's existing
+/// snapshot+write_all_tags pipeline then sees the CUESHEET diff and
+/// writes it through lofty.
+///
+/// Returns:
+///   Ok(true)  — regen happened; caller should proceed with save
+///   Ok(false) — no regen needed (no per-track edits, no relevant
+///               album-level edits); caller proceeds normally
+///   Err(reason) — refuse save (no CUESHEET anchor for per-track
+///               edits, or CUESHEET parses to no tracks); caller
+///               surfaces status and aborts
+fn regenerate_cuesheet_for_save(
+    state: &mut super::app::MetadataEditorState,
+) -> Result<bool, String> {
+    let n_paths = state.paths.len();
+
+    // Helpers indexed-by-display-key.
+    let entry_idx = |key: &str| -> Option<usize> {
+        state.entries.iter().position(|e|
+            e.display_key.eq_ignore_ascii_case(key))
+    };
+    let dirty_at = |idx: usize| -> bool {
+        let e = &state.entries[idx];
+        e.per_file_values != e.per_file_originals
+    };
+    let is_per_track = |idx: usize| -> bool {
+        state.entries[idx].per_file_values.len() != n_paths
+    };
+
+    // 1. Detect any per-track dirt or relevant album-level dirt.
+    let per_track_dirty = state.entries.iter().enumerate()
+        .any(|(i, _)| is_per_track(i) && dirty_at(i));
+    let album_keys_dirty = ["ALBUM", "DATE", "GENRE", "CATALOGNUMBER"]
+        .iter()
+        .filter_map(|k| entry_idx(k))
+        .any(dirty_at);
+    // ARTIST: only as album-level (dim 1). When per-track, it's
+    // already covered by per_track_dirty.
+    let artist_album_dirty = entry_idx("ARTIST")
+        .filter(|&i| !is_per_track(i))
+        .map(dirty_at)
+        .unwrap_or(false);
+
+    if !per_track_dirty && !album_keys_dirty && !artist_album_dirty {
+        return Ok(false);
+    }
+
+    // 2. Locate CUESHEET anchor.
+    let cue_idx = entry_idx("CUESHEET").ok_or_else(||
+        "save aborted: per-track edits without an embedded CUESHEET. \
+         Re-run :tags-mb on a per-track-eligible single-image rip to \
+         create one, or revert per-track changes."
+            .to_string()
+    )?;
+
+    let cue_text_original = state.entries[cue_idx].per_file_originals
+        .first().cloned().unwrap_or_default();
+    let mut parsed = super::cue_parser::parse_cue(&cue_text_original);
+    if parsed.tracks.is_empty() {
+        return Err("save aborted: embedded CUESHEET parsed to zero tracks".to_string());
+    }
+
+    // 3. β album-level re-derive — mutate parsed CueSheet fields from
+    //    current state.entries (only when the source entry is dim-1
+    //    album-level; per-track entries are handled in step 4).
+    let derive_album = |key: &str| -> Option<String> {
+        entry_idx(key)
+            .filter(|&i| !is_per_track(i))
+            .and_then(|i| state.entries[i].per_file_values.first().cloned())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(s) = derive_album("ALBUM")        { parsed.title = Some(s); }
+    if let Some(s) = derive_album("ARTIST")       { parsed.performer = Some(s); }
+    if let Some(s) = derive_album("DATE")         { parsed.date = Some(s); }
+    if let Some(s) = derive_album("GENRE")        { parsed.genre = Some(s); }
+    if let Some(s) = derive_album("CATALOGNUMBER"){ parsed.catalog = Some(s); }
+
+    // 4. Build TrackOverride list. For each parsed track, pull
+    //    title/performer/isrc from the matching per-track entry slot
+    //    when the entry is per-track-dim; otherwise None (preserves
+    //    parsed value).
+    let title_idx_pt = entry_idx("TITLE").filter(|&i| is_per_track(i));
+    let artist_idx_pt = entry_idx("ARTIST").filter(|&i| is_per_track(i));
+    let isrc_idx_pt = entry_idx("ISRC").filter(|&i| is_per_track(i));
+    let pt_get = |idx: Option<usize>, i: usize| -> Option<String> {
+        idx.and_then(|j| state.entries[j].per_file_values.get(i).cloned())
+            .filter(|s| !s.is_empty())
+    };
+    let overrides: Vec<super::cue_generate::TrackOverride> = (0..parsed.tracks.len())
+        .map(|i| super::cue_generate::TrackOverride {
+            title: pt_get(title_idx_pt, i),
+            performer: pt_get(artist_idx_pt, i),
+            isrc: pt_get(isrc_idx_pt, i),
+        })
+        .collect();
+
+    // 5. Regenerate. image_filename / format_tag come from the
+    //    single-image audio file at paths[0].
+    let path = state.paths.first().ok_or_else(||
+        "save aborted: editor has no audio path".to_string())?;
+    let filename = path.file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "save aborted: audio path has no filename".to_string())?;
+    let ext = path.extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("flac");
+    let format_tag = super::cue_generate::cue_format_tag(ext);
+    let new_cue = super::cue_generate::regenerate_cue_with_overrides(
+        &parsed, &overrides, filename, format_tag,
+    );
+
+    // 6. Mutate the CUESHEET entry. The existing snapshot+write_all_tags
+    //    loop will pick up the diff (vals[0] != origs[0]) and write
+    //    through lofty. is_binary stays true so display in the editor
+    //    grid keeps showing the read-only summary.
+    let entry = &mut state.entries[cue_idx];
+    if entry.per_file_values.is_empty() {
+        entry.per_file_values.push(new_cue.clone());
+    } else {
+        entry.per_file_values[0] = new_cue.clone();
+    }
+    entry.value = new_cue;
+
+    Ok(true)
+}
+
 /// Read an embedded CUESHEET tag from `entries`, parse it, and grow
 /// or create TITLE / ARTIST / ISRC entries to per-track dimension.
 /// Caller must ensure this is only invoked on single-image (paths.len()
