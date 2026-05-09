@@ -1303,12 +1303,17 @@ pub(super) fn open_editor_with_mb_release(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
                 return;
             }
+            // Compute the skip reason BEFORE populate so we can surface
+            // it on the status line — populate itself runs the same
+            // checks internally for the gate but only logs to env_logger.
+            let skip_reason = super::musicbrainz::per_track_skip_reason(&state.paths, release);
             super::musicbrainz::populate_editor_from_mb(&mut state, release);
             let label = if release.title.is_empty() { "(untitled)" } else { &release.title };
-            app.set_status(format!(
-                ":tags-mb: applied \"{}\" — review then save",
-                label,
-            ));
+            let mut msg = format!(":tags-mb: applied \"{}\" — review then save", label);
+            if let Some(reason) = skip_reason {
+                msg.push_str(&format!(" [{}]", reason));
+            }
+            app.set_status(msg);
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
         }
         other => {

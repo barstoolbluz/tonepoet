@@ -597,25 +597,27 @@ pub fn populate_editor_mb_supplemental(
 ///   within ±3s; missing tag + failed probe + duration mismatch all
 ///   skip)
 ///
-/// The `verbose` flag controls whether skip reasons are logged. Only
-/// the public-facing populate logs; supplemental calls silently to
-/// avoid duplicate log lines for one user action.
-fn is_per_track_eligible(
+/// Returns `Some(reason)` describing why per-track populate would be
+/// skipped, or `None` when eligibility checks pass. Callers branch on
+/// `is_none()` for the boolean decision; the public-facing event-loop
+/// caller also surfaces the reason in `app.set_status` so users
+/// understand why no CUESHEET row appeared.
+///
+/// Returns None on the not-applicable case (multi-file or single-track
+/// release) — no per-track expectation in those cases, no message
+/// needed.
+pub(super) fn per_track_skip_reason(
     paths: &[std::path::PathBuf],
     release: &MbRelease,
-    verbose: bool,
-) -> bool {
+) -> Option<String> {
     if paths.len() != 1 || release.tracks.len() <= 1 {
-        return false;
+        return None;
     }
     if release.disc_count > 1 {
-        if verbose {
-            log::info!(
-                ":tags-mb: per-track populate skipped (multi-disc release: {} discs)",
-                release.disc_count,
-            );
-        }
-        return false;
+        return Some(format!(
+            "multi-disc release ({} discs) — album-level tags only",
+            release.disc_count,
+        ));
     }
     // Note: a sidecar .cue is no longer a guard. The editor's
     // open-time inject_sidecar_cuesheet_if_present surfaces the
@@ -623,13 +625,10 @@ fn is_per_track_eligible(
     // entry, so :tags-mb can populate per-track on top and Phase 4
     // can persist edits as an embedded CUESHEET tag. The sidecar on
     // disk is left untouched.
-    if let Some(skip_reason) = paths.first()
+    if let Some(reason) = paths.first()
         .and_then(|p| verify_single_image_matches_release(p, release))
     {
-        if verbose {
-            log::info!(":tags-mb: per-track populate skipped ({})", skip_reason);
-        }
-        return false;
+        return Some(format!("{} — album-level tags only", reason));
     }
     // Even with identity (MUSICBRAINZ_ALBUMID match) or duration
     // verification passing, we need MB track lengths to generate a
@@ -638,12 +637,29 @@ fn is_per_track_eligible(
     // forcing Phase 4 to refuse saves. Tighten here so the user
     // gets the album-level fallback in this corner instead.
     if release.tracks.iter().any(|t| t.length_ms.is_none()) {
-        if verbose {
-            log::info!(":tags-mb: per-track populate skipped (MB release missing track lengths)");
-        }
-        return false;
+        return Some("MB release missing track lengths — album-level tags only".to_string());
     }
-    true
+    None
+}
+
+/// Boolean wrapper around `per_track_skip_reason`. The `verbose` flag
+/// emits the skip reason to the log when true; the caller in
+/// event_loop.rs prefers `per_track_skip_reason` directly so the
+/// reason can be surfaced in TUI status as well.
+fn is_per_track_eligible(
+    paths: &[std::path::PathBuf],
+    release: &MbRelease,
+    verbose: bool,
+) -> bool {
+    match per_track_skip_reason(paths, release) {
+        None => true,
+        Some(reason) => {
+            if verbose {
+                log::info!(":tags-mb: per-track populate skipped ({})", reason);
+            }
+            false
+        }
+    }
 }
 
 // `ensure_dim_replicate` moved to probe.rs so gnudb can share it.
@@ -1468,6 +1484,44 @@ mod tests {
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_TRACKID").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID").is_none());
         assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_ARTISTID").is_none());
+    }
+
+    #[test]
+    fn per_track_skip_reason_returns_messages_for_each_skip_path() {
+        // None-cases: not single-image, single-track release.
+        let paths_multi = vec![
+            std::path::PathBuf::from("/tmp/a.flac"),
+            std::path::PathBuf::from("/tmp/b.flac"),
+        ];
+        let release = rel("rid", vec![
+            { let mut t = trk(1, "T", "A", None); t.length_ms = Some(50); t },
+            { let mut t = trk(2, "T", "A", None); t.length_ms = Some(50); t },
+        ]);
+        assert!(per_track_skip_reason(&paths_multi, &release).is_none(),
+            "multi-file: no per-track expectation, no skip message");
+
+        let single_track_release = rel("rid", vec![trk(1, "T", "A", None)]);
+        assert!(per_track_skip_reason(&[std::path::PathBuf::from("/tmp/a.flac")],
+            &single_track_release).is_none(),
+            "single-track release: not a per-track-applicable case");
+
+        // Multi-disc skip.
+        let mut multi_disc = release.clone();
+        multi_disc.disc_count = 2;
+        let r = per_track_skip_reason(
+            &[std::path::PathBuf::from("/tmp/a.flac")], &multi_disc).unwrap();
+        assert!(r.contains("multi-disc"));
+        assert!(r.contains("2 discs"));
+
+        // Unverifiable skip (no fixture installed → probe fails).
+        let r = per_track_skip_reason(
+            &[std::path::PathBuf::from("/tmp/nonexistent.flac")], &release).unwrap();
+        assert!(r.contains("can't verify") || r.contains("album-level"));
+
+        // Missing-lengths skip (need a fixture for identity verification
+        // to pass; quick manual test of the lengths-missing branch:
+        // unverifiable beats lengths-missing in the order; covered by
+        // the existing _identity_matches_but_no_lengths integration test).
     }
 
     #[test]
