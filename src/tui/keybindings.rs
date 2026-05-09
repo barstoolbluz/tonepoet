@@ -7625,9 +7625,7 @@ mod phase4_tests {
         let value = if v.len() > 1 && !all_same {
             "<multiple values>".to_string()
         } else { v.first().cloned().unwrap_or_default() };
-        let original = if o.len() > 1 {
-            o.first().cloned().unwrap_or_default()
-        } else { o.first().cloned().unwrap_or_default() };
+        let original = o.first().cloned().unwrap_or_default();
         TagEntry {
             display_key: key.to_string(),
             item_key,
