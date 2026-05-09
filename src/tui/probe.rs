@@ -1352,7 +1352,7 @@ mod tests {
             phase: MetadataEditorPhase::Editing,
             dirty: false, deleted: vec![0],
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None,
         };
         assert!(metadata_editor_has_changes(&state));
     }
@@ -1371,7 +1371,7 @@ mod tests {
             phase: MetadataEditorPhase::Editing,
             dirty: true, deleted: Vec::new(),
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None,
         };
         // Both entries currently show the MB value → has changes.
         assert!(metadata_editor_has_changes(&state));

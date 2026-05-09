@@ -1022,6 +1022,24 @@ pub struct MetadataEditorState {
     pub detail_scroll: usize,
     /// Inline edit within the detail overlay.
     pub detail_edit: Option<crate::tui::text_input::TextInputState>,
+    /// Cached MusicBrainz lookup result + paths so the user can run
+    /// `:mb-back` to pick a different release without re-querying.
+    /// `None` when the editor wasn't reached through MB picker (or
+    /// the lookup had a single match and the picker was skipped).
+    pub mb_back: Option<MbBackCache>,
+}
+
+/// State cached on `MetadataEditorState::mb_back` to support the
+/// `:mb-back` colon command. After the user picks a release in
+/// `MbSelect` and lands in the metadata editor, the full release
+/// list + paths are stashed here. `:mb-back` re-constructs the
+/// `MbSelectState` from this cache (preserving the prior selection)
+/// and transitions the overlay back, no MB requery needed.
+#[derive(Debug, Clone)]
+pub struct MbBackCache {
+    pub releases: Vec<crate::tui::musicbrainz::MbRelease>,
+    pub paths: Vec<std::path::PathBuf>,
+    pub selected: usize,
 }
 
 /// State for the MusicBrainz release-selection overlay shown when MB
@@ -1393,6 +1411,10 @@ impl KeychainState {
 /// What action a confirmation dialog will perform
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
+    /// Return from the metadata editor to the MbSelect picker,
+    /// discarding any edits. Carries the cached release list + paths
+    /// so the picker can be reconstructed.
+    MbBack(MbBackCache),
     RemoveSelected,
     ClearCompleted,
     StopAll,

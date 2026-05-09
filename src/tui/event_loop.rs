@@ -1268,8 +1268,9 @@ fn handle_tags_from_mb_complete(
         }
         1 => {
             // Single match: skip the picker, go straight to editor.
-            let release = outcome.releases.into_iter().next().expect("len == 1");
-            open_editor_with_mb_release(app, &release, &paths);
+            // Pass releases as a 1-element vec; cache won't be set
+            // (open_editor_with_mb_release skips caching when len <= 1).
+            open_editor_with_mb_release(app, outcome.releases, 0, paths);
         }
         n => {
             app.set_status(format!(
@@ -1284,16 +1285,28 @@ fn handle_tags_from_mb_complete(
 }
 
 /// Open the metadata editor on the supplied `paths`, populated with the
-/// chosen MusicBrainz release. Skips the GnudbReview "preview" step since
-/// the editor surfaces the same fields plus more (and now supports
-/// per-row revert via the proposed-value tracking on TagEntry).
+/// chosen MusicBrainz release (`releases[selected]`). Skips the
+/// GnudbReview "preview" step since the editor surfaces the same
+/// fields plus more (and now supports per-row revert via the
+/// proposed-value tracking on TagEntry).
 ///
-/// Used by both single-match `:tags-mb` and the post-MbSelect commit path.
+/// When `releases.len() > 1`, the full list + paths + selected index
+/// are cached on `MetadataEditorState::mb_back` so the user can run
+/// `:mb-back` to return to the picker without re-querying MB.
+///
+/// Used by both single-match `:tags-mb` (releases.len() == 1) and
+/// the post-MbSelect commit path (releases.len() >= 1, with selected
+/// being whatever the user picked).
 pub(super) fn open_editor_with_mb_release(
     app: &mut AppState,
-    release: &super::musicbrainz::MbRelease,
-    paths: &[std::path::PathBuf],
+    releases: Vec<super::musicbrainz::MbRelease>,
+    selected: usize,
+    paths: Vec<std::path::PathBuf>,
 ) {
+    let Some(release) = releases.get(selected) else {
+        app.set_status(":tags-mb: invalid release index".to_string());
+        return;
+    };
     super::keybindings::open_metadata_editor(app);
     let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
     match prior {
@@ -1314,6 +1327,16 @@ pub(super) fn open_editor_with_mb_release(
                 msg.push_str(&format!(" [{}]", reason));
             }
             app.set_status(msg);
+            // Cache release list for :mb-back when there's more than
+            // one to choose from. Single-match has nothing to go back
+            // to (re-opening the picker with one entry is pointless).
+            if releases.len() > 1 {
+                state.mb_back = Some(super::app::MbBackCache {
+                    releases,
+                    paths,
+                    selected,
+                });
+            }
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
         }
         other => {

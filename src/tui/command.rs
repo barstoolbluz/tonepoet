@@ -301,6 +301,11 @@ pub enum Command {
     /// both an embedded CUESHEET and a sidecar and the user wants
     /// the sidecar's values to win.
     TagsCueSidecar,
+    /// Return from the metadata editor to the MbSelect picker
+    /// (cached release list — no MB requery). Confirmation if the
+    /// editor is dirty (any edits / proposed-from-MB values not yet
+    /// reverted). No-op when the editor wasn't reached through MB.
+    MbBack,
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -370,6 +375,7 @@ pub fn parse_command(input: &str) -> Command {
         "u" | "undelete" => Command::MetaUndelete,
         "D" | "detail" => Command::MetaDetail,
         "tags-cue-sidecar" | "tags-cue" => Command::TagsCueSidecar,
+        "mb-back" | "tags-mb-back" => Command::MbBack,
         "e" | "edit" => {
             // `:e <N>` (positive integer) targets a line in the parked
             // CUE preview overlay. Anything else falls through to the
@@ -1487,6 +1493,39 @@ pub fn execute_command(
         }
         Command::MetaDetail => {
             super::keybindings::dispatch_metadata_editor_keychar(app, 'D', tx);
+        }
+        Command::MbBack => {
+            let Some(state) = app.pending_metadata_editor.take() else {
+                app.set_status(":mb-back only works in the metadata editor");
+                return;
+            };
+            let Some(cache) = state.mb_back.clone() else {
+                app.set_status(":mb-back: no MB lookup to return to (run :tags-mb first)".to_string());
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            };
+            if state.dirty {
+                // Park the editor on pending so the user can cancel
+                // and come back. ConfirmAction::MbBack carries the
+                // cached release list for the post-confirm transition.
+                app.pending_metadata_editor = Some(state);
+                app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                    action: super::app::ConfirmAction::MbBack(cache),
+                    message: "Discard editor changes and return to MB picker?".to_string(),
+                };
+                return;
+            }
+            // Not dirty — go directly back, no confirmation.
+            drop(state);
+            let mb_state = super::app::MbSelectState {
+                releases: cache.releases,
+                selected: cache.selected,
+                scroll: 0,
+                paths: cache.paths,
+                last_click: None,
+            };
+            app.active_overlay = super::app::ActiveOverlay::MbSelect(Box::new(mb_state));
+            app.set_status(":mb-back: pick a different release".to_string());
         }
         Command::TagsCueSidecar => {
             let Some(mut state) = app.pending_metadata_editor.take() else {

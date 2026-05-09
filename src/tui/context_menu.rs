@@ -863,9 +863,9 @@ pub fn execute_context_action(
             if let Some(mut state) = app.pending_mb_select.take() {
                 let idx = state.selected;
                 if idx < state.releases.len() {
-                    let release = state.releases.swap_remove(idx);
+                    let releases = std::mem::take(&mut state.releases);
                     let paths = std::mem::take(&mut state.paths);
-                    super::event_loop::open_editor_with_mb_release(app, &release, &paths);
+                    super::event_loop::open_editor_with_mb_release(app, releases, idx, paths);
                 } else {
                     // Out-of-range — restore the picker.
                     app.active_overlay = super::app::ActiveOverlay::MbSelect(state);
@@ -1380,7 +1380,7 @@ mod tests {
             phase: MetadataEditorPhase::Editing,
             dirty: false, deleted: Vec::new(),
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None,
         };
 
         // Row 0 = TITLE: no View entry.

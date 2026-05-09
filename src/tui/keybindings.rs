@@ -1761,9 +1761,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 KeyCode::Enter => {
                     let idx = state.selected;
                     if idx < state.releases.len() {
-                        let release = state.releases.swap_remove(idx);
+                        let releases = std::mem::take(&mut state.releases);
                         let paths = std::mem::take(&mut state.paths);
-                        super::event_loop::open_editor_with_mb_release(app, &release, &paths);
+                        super::event_loop::open_editor_with_mb_release(app, releases, idx, paths);
                     }
                 }
                 KeyCode::Up => {
@@ -3636,6 +3636,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
             detail_cursor: 0,
             detail_scroll: 0,
             detail_edit: None,
+            mb_back: None,
         },
     ));
 }
@@ -4633,9 +4634,9 @@ fn handle_mb_select_mouse(
                 Some(super::button_map::TuiButton::MbSelectAccept) => {
                     let idx = state.selected;
                     if idx < state.releases.len() {
-                        let release = state.releases.swap_remove(idx);
+                        let releases = std::mem::take(&mut state.releases);
                         let paths = std::mem::take(&mut state.paths);
-                        super::event_loop::open_editor_with_mb_release(app, &release, &paths);
+                        super::event_loop::open_editor_with_mb_release(app, releases, idx, paths);
                     }
                     return;
                 }
@@ -4656,9 +4657,9 @@ fn handle_mb_select_mouse(
                             .unwrap_or(false);
                         state.selected = idx;
                         if is_double {
-                            let release = state.releases.swap_remove(idx);
+                            let releases = std::mem::take(&mut state.releases);
                             let paths = std::mem::take(&mut state.paths);
-                            super::event_loop::open_editor_with_mb_release(app, &release, &paths);
+                            super::event_loop::open_editor_with_mb_release(app, releases, idx, paths);
                             return;
                         }
                         state.last_click = Some((idx, now));
@@ -7028,6 +7029,20 @@ fn execute_confirm_action(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     match action {
+        ConfirmAction::MbBack(cache) => {
+            // Discard parked editor (and its edits); transition back
+            // to MbSelect with the cached release list + paths.
+            app.pending_metadata_editor = None;
+            let mb_state = super::app::MbSelectState {
+                releases: cache.releases.clone(),
+                selected: cache.selected,
+                scroll: 0,
+                paths: cache.paths.clone(),
+                last_click: None,
+            };
+            app.active_overlay = ActiveOverlay::MbSelect(Box::new(mb_state));
+            app.set_status(":mb-back: pick a different release".to_string());
+        }
         ConfirmAction::RemoveSelected => {
             let removed = app.manager.remove_selected();
             app.save_queue();
@@ -7994,6 +8009,7 @@ mod phase4_tests {
             detail_cursor: 0,
             detail_scroll: 0,
             detail_edit: None,
+            mb_back: None,
         }
     }
 
@@ -8360,6 +8376,7 @@ mod phase4_tests {
             detail_cursor: 0,
             detail_scroll: 0,
             detail_edit: None,
+            mb_back: None,
         }
     }
 
@@ -8505,7 +8522,7 @@ mod phase4_tests {
             phase: MetadataEditorPhase::Editing,
             dirty: false, deleted: vec![],
             file_labels: vec!["01".into(), "02".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None,
         };
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());
