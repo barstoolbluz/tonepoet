@@ -2973,6 +2973,57 @@ fn regenerate_cuesheet_for_save(
     Ok(true)
 }
 
+/// When the editor opens on a single audio file with no embedded
+/// CUESHEET tag but a sidecar `.cue` file alongside, parse the sidecar
+/// and inject a synthetic CUESHEET entry into `entries`. The synthetic
+/// entry has `per_file_originals[0]=""` (signalling "not yet on the
+/// file"), so the save loop will write a fresh embedded CUESHEET tag
+/// to the file at first save while leaving the sidecar `.cue` on disk
+/// untouched.
+///
+/// Skips silently when:
+/// - `entries` already contains a CUESHEET entry (embedded wins)
+/// - no sidecar `.cue` exists in the audio file's parent directory
+/// - the sidecar can't be read or parses to fewer than 2 tracks
+/// - the sidecar is track-by-track structured (different FILE per
+///   TRACK) — those CUE timestamps reset per file and don't make
+///   sense as a single-image embedded CUESHEET
+fn inject_sidecar_cuesheet_if_present(
+    entries: &mut Vec<super::probe::TagEntry>,
+    audio_path: &std::path::Path,
+) {
+    let already_has_cue = entries.iter()
+        .any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"));
+    if already_has_cue {
+        return;
+    }
+    let Some(sidecar) = super::cue_parser::find_sidecar_cue(audio_path) else { return; };
+    let Ok(text) = std::fs::read_to_string(&sidecar) else { return; };
+    let parsed = super::cue_parser::parse_cue(&text);
+    if parsed.tracks.len() < 2 {
+        return;
+    }
+    // Track-by-track CUEs (different FILE per TRACK) are not safe to
+    // re-embed against a single audio file — INDEX timestamps in those
+    // sheets reset to 00:00:00 per file. Skip.
+    let first_file = parsed.tracks.first().and_then(|t| t.file.as_deref());
+    if parsed.tracks.iter().any(|t| t.file.as_deref() != first_file) {
+        return;
+    }
+    entries.push(super::probe::TagEntry {
+        display_key: "CUESHEET".to_string(),
+        item_key: lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+        value: super::probe::cue_summary_string(&text),
+        original: String::new(),
+        is_binary: true,
+        is_mixed: false,
+        per_file_values: vec![text],
+        per_file_originals: vec![String::new()],
+        mb_proposed_value: None,
+        mb_proposed_per_file: None,
+    });
+}
+
 /// Read an embedded CUESHEET tag from `entries`, parse it, and grow
 /// or create TITLE / ARTIST / ISRC entries to per-track dimension.
 /// Caller must ensure this is only invoked on single-image (paths.len()
@@ -3088,13 +3139,18 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     };
 
-    // Phase 2: single-image embedded-CUESHEET per-track surfacing.
-    // When the editor opens on a single audio file that already carries
-    // an embedded CUESHEET tag, parse the cue and grow TITLE / ARTIST /
-    // ISRC entries to per-track dimension so each track's value is
-    // visible and editable in the detail overlay. Save-time CUESHEET
-    // regeneration (Phase 4) persists edits back to the tag.
+    // Phase 2: single-image per-track surfacing.
+    // When the editor opens on a single audio file, surface per-track
+    // structure (TITLE / ARTIST / ISRC) into the editor whether the
+    // truth lives in an embedded CUESHEET tag or in a sidecar `.cue`
+    // alongside. inject_sidecar_cuesheet_if_present synthesizes a
+    // CUESHEET entry from the sidecar when there's no embedded one;
+    // apply_embedded_cuesheet_per_track then grows TITLE / ARTIST /
+    // ISRC entries to per-track dim from whichever CUESHEET source
+    // is present. Save-time regen (Phase 4) writes user edits back to
+    // the embedded CUESHEET tag.
     if paths.len() == 1 {
+        inject_sidecar_cuesheet_if_present(&mut entries, &paths[0]);
         apply_embedded_cuesheet_per_track(&mut entries);
     }
 
@@ -7875,6 +7931,111 @@ mod phase4_tests {
         assert!(new_cue.contains("ISRC USRC0000001"));
         assert!(new_cue.contains("ISRC USRC0000002"));
         assert!(new_cue.contains("ISRC USRC0000003"));
+    }
+
+    // -------- inject_sidecar_cuesheet_if_present --------
+
+    fn write_sidecar(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).expect("write sidecar");
+        p
+    }
+
+    /// Multi-track single-image CUE used as the well-formed input.
+    const SIDECAR_3_TRACK_SINGLE_IMAGE: &str =
+        "TITLE \"Album\"\n\
+         FILE \"image.flac\" FLAC\n\
+           TRACK 01 AUDIO\n\
+             TITLE \"T1\"\n\
+             INDEX 01 00:00:00\n\
+           TRACK 02 AUDIO\n\
+             TITLE \"T2\"\n\
+             INDEX 01 03:00:00\n\
+           TRACK 03 AUDIO\n\
+             TITLE \"T3\"\n\
+             INDEX 01 06:30:00\n";
+
+    #[test]
+    fn inject_sidecar_cuesheet_creates_synthetic_entry_when_no_embedded() {
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar(td.path(), "album.cue", SIDECAR_3_TRACK_SINGLE_IMAGE);
+        let audio = td.path().join("album.flac");
+
+        let mut entries: Vec<TagEntry> = vec![
+            entry("ALBUM", ItemKey::AlbumTitle, &["Album"], &["Album"]),
+        ];
+        inject_sidecar_cuesheet_if_present(&mut entries, &audio);
+
+        let cue = entries.iter().find(|e| e.display_key == "CUESHEET")
+            .expect("synthetic CUESHEET injected");
+        assert_eq!(cue.per_file_values, vec![SIDECAR_3_TRACK_SINGLE_IMAGE.to_string()]);
+        // originals=="" → save loop will write a fresh embedded tag.
+        assert_eq!(cue.per_file_originals, vec!["".to_string()]);
+        assert!(cue.is_binary);
+        assert!(!cue.is_mixed);
+    }
+
+    #[test]
+    fn inject_sidecar_cuesheet_noop_when_embedded_present() {
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar(td.path(), "album.cue", SIDECAR_3_TRACK_SINGLE_IMAGE);
+        let audio = td.path().join("album.flac");
+
+        let existing_embedded = "TITLE \"Embedded\"\nFILE \"x\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"E1\"\n    INDEX 01 00:00:00\n";
+        let mut entries: Vec<TagEntry> = vec![
+            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()),
+                &[existing_embedded], &[existing_embedded]),
+        ];
+        let before_len = entries.len();
+        inject_sidecar_cuesheet_if_present(&mut entries, &audio);
+        assert_eq!(entries.len(), before_len, "no entry added");
+        // Existing CUESHEET unchanged.
+        let cue = entries.iter().find(|e| e.display_key == "CUESHEET").unwrap();
+        assert_eq!(cue.per_file_values, vec![existing_embedded.to_string()]);
+    }
+
+    #[test]
+    fn inject_sidecar_cuesheet_skips_track_by_track_cue() {
+        // Track-by-track structure: each TRACK has its own FILE,
+        // INDEX 01 resets per file. Not safe to embed against a
+        // single-image audio.
+        let track_by_track =
+            "TITLE \"Album\"\n\
+             FILE \"track01.flac\" WAVE\n\
+               TRACK 01 AUDIO\n\
+                 INDEX 01 00:00:00\n\
+             FILE \"track02.flac\" WAVE\n\
+               TRACK 02 AUDIO\n\
+                 INDEX 01 00:00:00\n";
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar(td.path(), "album.cue", track_by_track);
+        let audio = td.path().join("album.flac");
+
+        let mut entries: Vec<TagEntry> = vec![];
+        inject_sidecar_cuesheet_if_present(&mut entries, &audio);
+        assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
+    }
+
+    #[test]
+    fn inject_sidecar_cuesheet_skips_single_track_cue() {
+        let single = "TITLE \"X\"\nFILE \"x.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"X\"\n    INDEX 01 00:00:00\n";
+        let td = tempfile::tempdir().expect("tempdir");
+        write_sidecar(td.path(), "album.cue", single);
+        let audio = td.path().join("album.flac");
+
+        let mut entries: Vec<TagEntry> = vec![];
+        inject_sidecar_cuesheet_if_present(&mut entries, &audio);
+        assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
+    }
+
+    #[test]
+    fn inject_sidecar_cuesheet_skips_when_no_sidecar() {
+        let td = tempfile::tempdir().expect("tempdir");
+        // No .cue written.
+        let audio = td.path().join("album.flac");
+        let mut entries: Vec<TagEntry> = vec![];
+        inject_sidecar_cuesheet_if_present(&mut entries, &audio);
+        assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
     }
 }
 

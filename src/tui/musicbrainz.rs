@@ -617,12 +617,12 @@ fn is_per_track_eligible(
         }
         return false;
     }
-    if has_sidecar_cue(paths.first()) {
-        if verbose {
-            log::info!(":tags-mb: per-track populate skipped (sidecar .cue file exists)");
-        }
-        return false;
-    }
+    // Note: a sidecar .cue is no longer a guard. The editor's
+    // open-time inject_sidecar_cuesheet_if_present surfaces the
+    // sidecar's per-track structure as a synthetic embedded CUESHEET
+    // entry, so :tags-mb can populate per-track on top and Phase 4
+    // can persist edits as an embedded CUESHEET tag. The sidecar on
+    // disk is left untouched.
     if let Some(skip_reason) = paths.first()
         .and_then(|p| verify_single_image_matches_release(p, release))
     {
@@ -1001,22 +1001,6 @@ fn verify_single_image_matches_release(
     }
 }
 
-/// True when the audio file's parent directory contains *any* `.cue`
-/// file. Used to skip auto-embed of a CUESHEET tag when a sidecar CUE
-/// already exists alongside (don't duplicate the user's existing CUE).
-/// Permissive on read failures (treats unreadable directories as
-/// "no sidecar present", since we can't prove otherwise).
-fn has_sidecar_cue(audio_path: Option<&std::path::PathBuf>) -> bool {
-    let Some(path) = audio_path else { return false; };
-    let Some(parent) = path.parent() else { return false; };
-    let Ok(entries) = std::fs::read_dir(parent) else { return false; };
-    entries
-        .filter_map(|e| e.ok())
-        .any(|e| e.path()
-            .extension()
-            .map(|ext| ext.to_ascii_lowercase() == "cue")
-            .unwrap_or(false))
-}
 
 /// Render a MusicBrainz `artist-credit` array into a single performer
 /// string with `joinphrase` separators preserved.
@@ -1691,33 +1675,55 @@ mod tests {
     }
 
     #[test]
-    fn populate_editor_from_mb_single_image_skips_cuesheet_when_sidecar_present() {
-        // A `.cue` file alongside the audio → skip embed (don't
-        // duplicate what's already there).
-        let (mut state, td) = empty_editor_state(1);
-        let sidecar = td.path().join("album.cue");
-        std::fs::write(&sidecar, "REM dummy\nFILE \"x\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n")
-            .expect("write sidecar");
+    fn populate_editor_from_mb_single_image_preserves_existing_cuesheet() {
+        // Phase 5 guard: when state.entries already contains a CUESHEET
+        // (whether parsed from an embedded tag at open or injected from
+        // a sidecar by Phase 2's editor-open flow), populate must NOT
+        // rebuild it from MB. Phase 4 will mutate the existing entry
+        // in place at save time using user edits + β album re-derive.
+        //
+        // Replaces the older `_skips_cuesheet_when_sidecar_present`
+        // test: with the sidecar guard dropped, sidecar presence no
+        // longer affects populate directly. The semantically equivalent
+        // assertion is now "existing CUESHEET in state isn't overwritten."
+        let (mut state, _td) = empty_editor_state(1);
+        install_silence_at(&state);
+        let pre_existing = "TITLE \"Pre-existing\"\n\
+                            FILE \"x.flac\" FLAC\n\
+                            TRACK 01 AUDIO\nTITLE \"Pre T1\"\nINDEX 01 00:00:00\n\
+                            TRACK 02 AUDIO\nTITLE \"Pre T2\"\nINDEX 01 00:00:50\n";
+        state.entries.push(crate::tui::probe::TagEntry {
+            display_key: "CUESHEET".to_string(),
+            item_key: lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+            value: "<cue summary>".to_string(),
+            original: String::new(),
+            is_binary: true,
+            is_mixed: false,
+            per_file_values: vec![pre_existing.to_string()],
+            per_file_originals: vec![String::new()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
 
         let mut release = rel("rid", vec![
-            {
-                let mut t = trk(1, "First", "Artist", None);
-                t.length_ms = Some(240_000);
-                t
-            },
-            {
-                let mut t = trk(2, "Second", "Artist", None);
-                t.length_ms = Some(180_000);
-                t
-            },
+            { let mut t = trk(1, "MB Track 1", "Artist", None); t.length_ms = Some(50); t },
+            { let mut t = trk(2, "MB Track 2", "Artist", None); t.length_ms = Some(50); t },
         ]);
         release.title = "Whole Album".into();
         populate_editor_from_mb(&mut state, &release);
 
-        assert!(
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
-            "sidecar .cue present must skip CUESHEET embed",
-        );
+        // CUESHEET preserved verbatim — populate did NOT rebuild it.
+        let cue = state.entries.iter()
+            .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET still in state");
+        assert_eq!(cue.per_file_values[0], pre_existing,
+            "existing CUESHEET preserved by populate (not regenerated from MB)");
+        // Per-track populate from MB still ran on TITLE.
+        let title = state.entries.iter()
+            .find(|e| e.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("TITLE created");
+        assert_eq!(title.per_file_values, vec!["MB Track 1", "MB Track 2"],
+            "per-track populate fired despite an existing CUESHEET");
     }
 
     #[test]

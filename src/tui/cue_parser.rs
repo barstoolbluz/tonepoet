@@ -54,6 +54,31 @@ pub fn parse_cue_file(path: &Path) -> Result<CueSheet, String> {
     Ok(parse_cue(&content))
 }
 
+/// Locate a sidecar `.cue` file in the same directory as `audio_path`.
+/// Returns the lexicographically first match (case-insensitive
+/// extension check), or None when:
+/// - `audio_path` has no parent directory
+/// - the parent can't be read (permissions, etc.)
+/// - no `.cue` file exists in the parent
+///
+/// Used by the metadata editor to surface a sidecar's per-track
+/// structure as a synthetic embedded-CUESHEET entry — letting `:tags-mb`
+/// and per-track save flows operate uniformly whether the truth lives
+/// in the file's tag or alongside on disk.
+pub fn find_sidecar_cue(audio_path: &Path) -> Option<PathBuf> {
+    let parent = audio_path.parent()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    let mut cues: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension()
+            .map(|ext| ext.to_ascii_lowercase() == "cue")
+            .unwrap_or(false))
+        .collect();
+    cues.sort();
+    cues.into_iter().next()
+}
+
 /// Parse CUE sheet content from a string.
 pub fn parse_cue(content: &str) -> CueSheet {
     let mut sheet = CueSheet::default();
