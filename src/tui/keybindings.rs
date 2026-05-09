@@ -2881,27 +2881,7 @@ fn regenerate_cuesheet_for_save(
         return Ok(false);
     }
 
-    // 3. β album-level re-derive — mutate parsed CueSheet fields from
-    //    current state.entries (only when the source entry is dim-1
-    //    album-level; per-track entries are handled in step 4).
-    let derive_album = |key: &str| -> Option<String> {
-        entry_idx(key)
-            .filter(|&i| !is_per_track(i))
-            .and_then(|i| state.entries[i].per_file_values.first().cloned())
-            .filter(|s| !s.is_empty())
-    };
-    if let Some(s) = derive_album("ALBUM")        { parsed.title = Some(s); }
-    if let Some(s) = derive_album("ARTIST")       { parsed.performer = Some(s); }
-    if let Some(s) = derive_album("DATE")         { parsed.date = Some(s); }
-    if let Some(s) = derive_album("GENRE")        { parsed.genre = Some(s); }
-    if let Some(s) = derive_album("CATALOGNUMBER"){ parsed.catalog = Some(s); }
-
-    // 4. Build TrackOverride list. For each parsed track, pull
-    //    title/performer/isrc from the matching per-track entry slot
-    //    when the entry is per-track-dim; otherwise None (preserves
-    //    parsed value).
-    //
-    //    Refuse when any per-track entry's dim != parsed.tracks.len().
+    // 3. Refuse on track-count divergence BEFORE mutating `parsed`.
     //    This happens after :tags-mb-on-existing-CUE when MB's track
     //    count diverges from the file's CUESHEET track count: Phase 1
     //    grew per-track entries to MB's count (canonical for :tags-mb),
@@ -2928,6 +2908,26 @@ fn regenerate_cuesheet_for_save(
             }
         }
     }
+
+    // 4. β album-level re-derive — mutate parsed CueSheet fields from
+    //    current state.entries (only when the source entry is dim-1
+    //    album-level; per-track entries are handled in step 5).
+    let derive_album = |key: &str| -> Option<String> {
+        entry_idx(key)
+            .filter(|&i| !is_per_track(i))
+            .and_then(|i| state.entries[i].per_file_values.first().cloned())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(s) = derive_album("ALBUM")        { parsed.title = Some(s); }
+    if let Some(s) = derive_album("ARTIST")       { parsed.performer = Some(s); }
+    if let Some(s) = derive_album("DATE")         { parsed.date = Some(s); }
+    if let Some(s) = derive_album("GENRE")        { parsed.genre = Some(s); }
+    if let Some(s) = derive_album("CATALOGNUMBER"){ parsed.catalog = Some(s); }
+
+    // 5. Build TrackOverride list. For each parsed track, pull
+    //    title/performer/isrc from the matching per-track entry slot
+    //    when the entry is per-track-dim; otherwise None (preserves
+    //    parsed value).
     let title_idx_pt = entry_idx("TITLE").filter(|&i| is_per_track(i));
     let artist_idx_pt = entry_idx("ARTIST").filter(|&i| is_per_track(i));
     let isrc_idx_pt = entry_idx("ISRC").filter(|&i| is_per_track(i));

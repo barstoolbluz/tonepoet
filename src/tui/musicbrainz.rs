@@ -790,14 +790,18 @@ pub fn populate_editor_from_mb(
     } else if single_image {
         // Single-image rip with a guard failure (multi-disc release,
         // sidecar `.cue` present, or unverifiable identity / duration).
-        // Album-level fallback: TITLE / ARTIST get the album values
-        // rather than track 1's. Mirrors the pre-Phase-1 semantics —
-        // safe when we can't trust per-track CUESHEET regeneration on
-        // save (Phase 4 would have nothing to anchor edits to).
-        if let Some(idx) = title_idx {
+        // Album-level fallback: write the album title / artist to
+        // dim-1 entries; SKIP entries already grown to per-track dim
+        // by Phase 2 (e.g. file has both an embedded CUESHEET and a
+        // sidecar — Phase 2 still parses the embedded one on open).
+        // Writing the album title to slot [0] of a per-track TITLE
+        // entry would contaminate track 0 with the album name.
+        let title_dim_one = title_idx.filter(|&i| state.entries[i].per_file_values.len() == 1);
+        let artist_dim_one = artist_idx.filter(|&i| state.entries[i].per_file_values.len() == 1);
+        if let Some(idx) = title_dim_one {
             state.entries[idx].per_file_values[0] = release.title.clone();
         }
-        if let (Some(idx), false) = (artist_idx, release.artist.is_empty()) {
+        if let (Some(idx), false) = (artist_dim_one, release.artist.is_empty()) {
             state.entries[idx].per_file_values[0] = release.artist.clone();
         }
         if let Some(idx) = album_idx {
