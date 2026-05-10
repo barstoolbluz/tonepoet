@@ -300,11 +300,20 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
     }
 }
 
-/// Build the "Tagging" submenu (GNUDB lookup, CUE import).
+/// Build the "Tagging" submenu (MusicBrainz lookup, CUE import).
 /// `has_cue` controls whether the CUE import option is shown.
+///
+/// Note: "Get tags from gnudb.org" was hidden 2026-05-10 because
+/// gnudb's HTTP/80 endpoint (which the client uses) stopped accepting
+/// connections; their CDDBP/8880 port still works but tonepoet's
+/// reqwest-based client can't speak that protocol. The full gnudb
+/// code path (ContextAction::QueryGnudb dispatch, GnudbSelect/
+/// GnudbReview overlays, populate_editor_from_review, query_gnudb /
+/// read_gnudb HTTP clients) is preserved intact — restore the menu
+/// entry below if the HTTP endpoint comes back, or migrate the
+/// client to CDDBP if a longer-term fix is wanted.
 fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
     let mut children = vec![
-        item("Get tags from gnudb.org", ContextAction::QueryGnudb),
         item("Get tags from MusicBrainz", ContextAction::TagsFromMb),
     ];
     if has_cue {
