@@ -44,6 +44,7 @@ pub mod presets_overlay;
 pub mod probe;
 pub mod recent_files;
 pub mod sacd;
+pub mod sacd_sidecar;
 pub mod rename_plan;
 pub mod rename_presets;
 pub mod rename_template;

@@ -3676,8 +3676,10 @@ pub fn open_metadata_editor(app: &mut AppState) {
 }
 
 /// Open the metadata editor against a SACD ISO. Parses the ISO,
-/// hands the parsed metadata off to `build_sacd_editor_state` to
-/// construct the editor state, and installs it on the app.
+/// discovers + reads the sidecar `.xml` if present (sacd-extract
+/// metabase format), hands both to `build_sacd_editor_state` to
+/// construct the editor state, and installs it on the app. Sidecar
+/// data wins on every field it provides; ScarletBook fills gaps.
 fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBuf) {
     let md = match super::sacd::parse_sacd_iso(&iso_path) {
         Ok(m) => m,
@@ -3686,11 +3688,25 @@ fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBu
             return;
         }
     };
-    match build_sacd_editor_state(&iso_path, &md) {
+
+    // Sidecar discovery: same-stem rule (`disc.iso` ↔ `disc.xml`).
+    // Parse failures don't abort the open — we fall back to ScarletBook
+    // only and surface a status hint.
+    let sidecar = super::sacd_sidecar::find_sidecar_for_iso(&iso_path)
+        .and_then(|p| match super::sacd_sidecar::parse_sidecar(&p) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                app.set_status(format!("SACD sidecar parse failed: {}", e));
+                None
+            }
+        });
+
+    match build_sacd_editor_state(&iso_path, &md, sidecar.as_ref()) {
         Ok((state, area_label, n_tracks)) => {
+            let src = if sidecar.is_some() { "sidecar+ScarletBook" } else { "ScarletBook" };
             app.set_status(format!(
-                "SACD editor opened ({}, {} tracks) — read-only",
-                area_label, n_tracks
+                "SACD editor opened ({}, {} tracks, {}) — read-only",
+                area_label, n_tracks, src,
             ));
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(Box::new(state));
         }
@@ -3700,9 +3716,13 @@ fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBu
 
 /// Pure builder: turn parsed SACD metadata into a `MetadataEditorState`.
 /// Stereo area is preferred when both are present; multi-channel is
-/// the fallback. The resulting editor is `read_only = true` because
-/// writing back into a ScarletBook layout requires an audio
-/// extraction + re-mux pipeline that v1 doesn't ship.
+/// the fallback. Sidecar (sacd-extract metabase XML, when present)
+/// wins on every field it provides; ScarletBook (in-ISO TOC + text)
+/// fills gaps only where the sidecar is silent.
+///
+/// The resulting editor is currently always `read_only = true`. C5c
+/// flips this when the sidecar (or its parent dir) is writable, so
+/// edits can land as XML sidecar writes.
 ///
 /// Returns (state, area_label, n_tracks) on success so the caller
 /// can compose a status message; returns Err with a short reason
@@ -3710,6 +3730,7 @@ fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBu
 pub(super) fn build_sacd_editor_state(
     iso_path: &std::path::Path,
     md: &super::sacd::SacdMetadata,
+    sidecar: Option<&super::sacd_sidecar::SidecarMetadata>,
 ) -> Result<(super::app::MetadataEditorState, &'static str, usize), String> {
     use lofty::tag::ItemKey;
     use super::probe::TagEntry;
@@ -3729,6 +3750,45 @@ pub(super) fn build_sacd_editor_state(
         super::sacd::AreaKind::Stereo => "stereo",
         super::sacd::AreaKind::MultiChannel => "MCH",
     };
+    let sidecar_area_idx: u8 = match area.header.kind {
+        super::sacd::AreaKind::Stereo => 1,
+        super::sacd::AreaKind::MultiChannel => 2,
+    };
+
+    // Sidecar tracks for the selected area, sorted by TRACKNUMBER.
+    // Length may differ from n_tracks (a sidecar from a partial rip
+    // or a different area-count assumption could mismatch); we
+    // index defensively below.
+    let sidecar_tracks: Vec<&super::sacd_sidecar::SidecarTrack> = sidecar
+        .map(|s| s.tracks_for_area(sidecar_area_idx))
+        .unwrap_or_default();
+
+    // Pull a per-track sidecar value by index, falling back to a
+    // closure-supplied ScarletBook value when the sidecar lacks it.
+    // Empty-string sidecar values are treated as "not provided" so
+    // they don't override richer ScarletBook data.
+    let resolve_per_track = |key: &str, fallback: &dyn Fn(usize) -> String| -> Vec<String> {
+        (0..n_tracks)
+            .map(|i| {
+                let from_sidecar = sidecar_tracks
+                    .get(i)
+                    .and_then(|t| t.meta.get(key))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                from_sidecar.unwrap_or_else(|| fallback(i))
+            })
+            .collect()
+    };
+
+    // Pick the first non-empty sidecar value for an album-level key
+    // (sidecars replicate the album-level value on every track).
+    let sidecar_album_value = |key: &str| -> Option<String> {
+        sidecar_tracks
+            .iter()
+            .find_map(|t| t.meta.get(key))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
 
     // The editor models per-track values via paths: Vec<PathBuf>. For
     // an SACD we have one file but many virtual tracks; repeat the ISO
@@ -3736,8 +3796,6 @@ pub(super) fn build_sacd_editor_state(
     // write attempt that would otherwise hit the same file N times.
     let paths = vec![iso_path.to_path_buf(); n_tracks];
 
-    // Build entries: album-level fields share one value across all
-    // tracks; per-track fields hold a value per track.
     let mut entries: Vec<TagEntry> = Vec::new();
 
     // Album-level (single value replicated across all tracks).
@@ -3760,34 +3818,56 @@ pub(super) fn build_sacd_editor_state(
         });
     };
 
-    if let Some(t) = md.master_text.as_ref() {
-        if let Some(s) = t.album_title.clone() {
-            push_album(&mut entries, "ALBUM", ItemKey::AlbumTitle, s);
-        }
-        if let Some(s) = t.album_artist.clone() {
-            push_album(&mut entries, "ALBUMARTIST", ItemKey::AlbumArtist, s);
-        }
+    // ALBUM: sidecar wins, fallback to master_text.album_title.
+    let album = sidecar_album_value("ALBUM").or_else(|| {
+        md.master_text.as_ref().and_then(|t| t.album_title.clone())
+    });
+    if let Some(s) = album {
+        push_album(&mut entries, "ALBUM", ItemKey::AlbumTitle, s);
     }
-    if let Some(date) = md.master_toc.disc_date {
-        push_album(&mut entries, "DATE", ItemKey::Year, date.year.to_string());
+    // ALBUMARTIST: sidecar key may be "ALBUMARTIST" or "ALBUM ARTIST";
+    // fall back to ScarletBook album_artist.
+    let album_artist = sidecar_album_value("ALBUMARTIST")
+        .or_else(|| sidecar_album_value("ALBUM ARTIST"))
+        .or_else(|| md.master_text.as_ref().and_then(|t| t.album_artist.clone()));
+    if let Some(s) = album_artist {
+        push_album(&mut entries, "ALBUMARTIST", ItemKey::AlbumArtist, s);
     }
-    if !md.master_toc.album_catalog_number.is_empty() {
-        push_album(
-            &mut entries,
-            "CATALOGNUMBER",
-            ItemKey::CatalogNumber,
-            md.master_toc.album_catalog_number.clone(),
-        );
+    // DATE: sidecar wins, fallback to disc_date.year.
+    let date = sidecar_album_value("DATE")
+        .or_else(|| md.master_toc.disc_date.map(|d| d.year.to_string()));
+    if let Some(s) = date {
+        push_album(&mut entries, "DATE", ItemKey::Year, s);
     }
-    let genre_label = md
-        .master_toc
-        .disc_genres
-        .first()
-        .or_else(|| md.master_toc.album_genres.first())
-        .map(|g| g.name())
-        .filter(|n| *n != "Not used" && *n != "Not defined");
-    if let Some(g) = genre_label {
-        push_album(&mut entries, "GENRE", ItemKey::Genre, g.to_string());
+    // CATALOGNUMBER: sidecar key may be "CATALOGNUMBER" or
+    // "DISCOGS_CATALOG"; fallback to ScarletBook album_catalog_number.
+    let catalog = sidecar_album_value("CATALOGNUMBER")
+        .or_else(|| sidecar_album_value("DISCOGS_CATALOG"))
+        .or_else(|| {
+            let c = md.master_toc.album_catalog_number.trim().to_string();
+            if c.is_empty() { None } else { Some(c) }
+        });
+    if let Some(s) = catalog {
+        push_album(&mut entries, "CATALOGNUMBER", ItemKey::CatalogNumber, s);
+    }
+    // GENRE: sidecar wins; fallback to first non-zero ScarletBook genre.
+    let genre = sidecar_album_value("GENRE").or_else(|| {
+        md.master_toc
+            .disc_genres
+            .first()
+            .or_else(|| md.master_toc.album_genres.first())
+            .map(|g| g.name())
+            .filter(|n| *n != "Not used" && *n != "Not defined")
+            .map(|s| s.to_string())
+    });
+    if let Some(s) = genre {
+        push_album(&mut entries, "GENRE", ItemKey::Genre, s);
+    }
+    // PUBLISHER: sidecar-only field (ScarletBook has no publisher
+    // concept). Surfaces when the sidecar has carried one over from
+    // Discogs or a similar source.
+    if let Some(s) = sidecar_album_value("PUBLISHER") {
+        push_album(&mut entries, "PUBLISHER", ItemKey::Publisher, s);
     }
 
     // Per-track entries.
@@ -3818,7 +3898,9 @@ pub(super) fn build_sacd_editor_state(
         });
     };
 
-    let track_numbers: Vec<String> = (1..=n_tracks).map(|i| i.to_string()).collect();
+    // TRACKNUMBER: prefer sidecar's recorded TRACKNUMBER (may be
+    // zero-padded like "01"); fallback to 1..N enumeration.
+    let track_numbers: Vec<String> = resolve_per_track("TRACKNUMBER", &|i| (i + 1).to_string());
     push_per_track(
         &mut entries,
         "TRACKNUMBER",
@@ -3826,46 +3908,64 @@ pub(super) fn build_sacd_editor_state(
         track_numbers,
     );
 
-    let titles: Vec<String> = area
-        .tracks
-        .iter()
-        .map(|t| t.text.title.clone().unwrap_or_default())
-        .collect();
+    // TITLE: sidecar wins, fallback to SACDTTxt.title.
+    let titles: Vec<String> = resolve_per_track("TITLE", &|i| {
+        area.tracks
+            .get(i)
+            .and_then(|t| t.text.title.clone())
+            .unwrap_or_default()
+    });
     push_per_track(&mut entries, "TITLE", ItemKey::TrackTitle, titles);
 
-    let performers: Vec<String> = area
-        .tracks
-        .iter()
-        .map(|t| t.text.performer.clone().unwrap_or_default())
-        .collect();
+    // ARTIST: sidecar wins (key "ARTIST"); fallback to SACDTTxt.performer.
+    let performers: Vec<String> = resolve_per_track("ARTIST", &|i| {
+        area.tracks
+            .get(i)
+            .and_then(|t| t.text.performer.clone())
+            .unwrap_or_default()
+    });
     push_per_track(&mut entries, "ARTIST", ItemKey::TrackArtist, performers);
 
-    let composers: Vec<String> = area
-        .tracks
-        .iter()
-        .map(|t| t.text.composer.clone().unwrap_or_default())
+    // PERFORMER: sidecar-only secondary field (some metabases store
+    // soloist as PERFORMER alongside the band-level ARTIST).
+    let perf_secondary: Vec<String> = (0..n_tracks)
+        .map(|i| {
+            sidecar_tracks
+                .get(i)
+                .and_then(|t| t.meta.get("PERFORMER"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        })
         .collect();
+    push_per_track(&mut entries, "PERFORMER", ItemKey::Performer, perf_secondary);
+
+    let composers: Vec<String> = resolve_per_track("COMPOSER", &|i| {
+        area.tracks
+            .get(i)
+            .and_then(|t| t.text.composer.clone())
+            .unwrap_or_default()
+    });
     push_per_track(&mut entries, "COMPOSER", ItemKey::Composer, composers);
 
-    let songwriters: Vec<String> = area
-        .tracks
-        .iter()
-        .map(|t| t.text.songwriter.clone().unwrap_or_default())
-        .collect();
+    let songwriters: Vec<String> = resolve_per_track("LYRICIST", &|i| {
+        area.tracks
+            .get(i)
+            .and_then(|t| t.text.songwriter.clone())
+            .unwrap_or_default()
+    });
     push_per_track(&mut entries, "LYRICIST", ItemKey::Lyricist, songwriters);
 
-    let arrangers: Vec<String> = area
-        .tracks
-        .iter()
-        .map(|t| t.text.arranger.clone().unwrap_or_default())
-        .collect();
+    let arrangers: Vec<String> = resolve_per_track("ARRANGER", &|i| {
+        area.tracks
+            .get(i)
+            .and_then(|t| t.text.arranger.clone())
+            .unwrap_or_default()
+    });
     push_per_track(&mut entries, "ARRANGER", ItemKey::Arranger, arrangers);
 
-    let isrcs: Vec<String> = area
-        .tracks
-        .iter()
-        .map(|t| t.isrc.clone().unwrap_or_default())
-        .collect();
+    let isrcs: Vec<String> = resolve_per_track("ISRC", &|i| {
+        area.tracks.get(i).and_then(|t| t.isrc.clone()).unwrap_or_default()
+    });
     push_per_track(&mut entries, "ISRC", ItemKey::Isrc, isrcs);
 
     let file_labels: Vec<String> = (1..=n_tracks).map(|i| format!("{:>02}", i)).collect();
@@ -9063,7 +9163,7 @@ mod phase4_tests {
             &[None, None],
         );
         let path = std::path::PathBuf::from("/tmp/test.iso");
-        let (state, label, n) = build_sacd_editor_state(&path, &md).expect("build");
+        let (state, label, n) = build_sacd_editor_state(&path, &md, None).expect("build");
         assert_eq!(label, "stereo");
         assert_eq!(n, 2);
         assert!(state.read_only);
@@ -9096,7 +9196,7 @@ mod phase4_tests {
             &[Some("USAA10800001"), Some("USAA10800002"), None],
         );
         let path = std::path::PathBuf::from("/tmp/synthetic.iso");
-        let (state, _, _) = build_sacd_editor_state(&path, &md).expect("build");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
 
         let title = state.entries.iter().find(|e| e.display_key == "TITLE").expect("TITLE");
         assert_eq!(title.per_file_values, vec!["Track A", "Track B", "Track C"]);
@@ -9118,7 +9218,7 @@ mod phase4_tests {
             &["T1", "T2"], &["", ""], &[None, None],
         );
         let path = std::path::PathBuf::from("/tmp/x.iso");
-        let (state, _, _) = build_sacd_editor_state(&path, &md).expect("build");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
         assert!(state.entries.iter().all(|e| e.display_key != "ARTIST"));
         assert!(state.entries.iter().all(|e| e.display_key != "ISRC"));
     }
@@ -9130,7 +9230,7 @@ mod phase4_tests {
             &["t1", "t2", "t3"], &["", "", ""], &[None, None, None],
         );
         let path = std::path::PathBuf::from("/tmp/x.iso");
-        let (state, _, _) = build_sacd_editor_state(&path, &md).expect("build");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
         let tn = state.entries.iter().find(|e| e.display_key == "TRACKNUMBER").expect("TRACKNUMBER");
         assert_eq!(tn.per_file_values, vec!["1", "2", "3"]);
         assert!(tn.is_mixed);
@@ -9140,7 +9240,7 @@ mod phase4_tests {
     fn build_sacd_editor_state_rejects_zero_track_area() {
         let md = synth_sacd_metadata(None, None, 0, None, &[], &[], &[]);
         let path = std::path::PathBuf::from("/tmp/x.iso");
-        let res = build_sacd_editor_state(&path, &md);
+        let res = build_sacd_editor_state(&path, &md, None);
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("zero tracks"));
     }
@@ -9151,7 +9251,7 @@ mod phase4_tests {
         let mut md = synth_sacd_metadata(None, None, 0, None, &["x"], &[""], &[None]);
         md.stereo = None;
         let path = std::path::PathBuf::from("/tmp/x.iso");
-        let res = build_sacd_editor_state(&path, &md);
+        let res = build_sacd_editor_state(&path, &md, None);
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("no readable area"));
     }
@@ -9170,8 +9270,123 @@ mod phase4_tests {
         md.multi_channel = Some(info);
 
         let path = std::path::PathBuf::from("/tmp/x.iso");
-        let (_, label, _) = build_sacd_editor_state(&path, &md).expect("build");
+        let (_, label, _) = build_sacd_editor_state(&path, &md, None).expect("build");
         assert_eq!(label, "MCH");
+    }
+
+    // ---------- C5b tests: sidecar merge ----------
+
+    fn parse_sidecar_for_test(xml: &str) -> crate::tui::sacd_sidecar::SidecarMetadata {
+        crate::tui::sacd_sidecar::parse_sidecar_str(xml).expect("parse_sidecar_str")
+    }
+
+    #[test]
+    fn sidecar_overrides_scarletbook_album_title() {
+        let md = synth_sacd_metadata(
+            Some("ScarletBook Title"),
+            Some("ScarletBook Artist"),
+            1959,
+            None,
+            &["sb-t1", "sb-t2"],
+            &["sb-perf-1", "sb-perf-2"],
+            &[None, None],
+        );
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="ALBUM" value="Sidecar Album"/><meta name="ARTIST" value="Sidecar Artist"/><meta name="TITLE" value="Sidecar T1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="2"><meta name="ALBUM" value="Sidecar Album"/><meta name="ARTIST" value="Sidecar Artist"/><meta name="TITLE" value="Sidecar T2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+
+        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        assert_eq!(by_key("ALBUM").map(|e| e.value.as_str()), Some("Sidecar Album"));
+        let title = by_key("TITLE").expect("TITLE");
+        assert_eq!(title.per_file_values, vec!["Sidecar T1", "Sidecar T2"]);
+        let artist = by_key("ARTIST").expect("ARTIST");
+        assert_eq!(artist.per_file_values, vec!["Sidecar Artist", "Sidecar Artist"]);
+    }
+
+    #[test]
+    fn sidecar_empty_fields_fall_back_to_scarletbook() {
+        let md = synth_sacd_metadata(
+            Some("SB Album"),
+            None,
+            0,
+            None,
+            &["sb-track-1"],
+            &["sb-performer-1"],
+            &[Some("USAA10800001")],
+        );
+        // Sidecar provides ALBUM (wins) but no TITLE / ARTIST / ISRC.
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="ALBUM" value="Sidecar Album"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="1"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+
+        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        // ALBUM from sidecar
+        assert_eq!(by_key("ALBUM").map(|e| e.value.as_str()), Some("Sidecar Album"));
+        // TITLE/ARTIST/ISRC from ScarletBook fallback
+        assert_eq!(by_key("TITLE").map(|e| e.value.as_str()), Some("sb-track-1"));
+        assert_eq!(by_key("ARTIST").map(|e| e.value.as_str()), Some("sb-performer-1"));
+        assert_eq!(by_key("ISRC").map(|e| e.value.as_str()), Some("USAA10800001"));
+    }
+
+    #[test]
+    fn sidecar_publisher_surfaces_even_without_scarletbook() {
+        // PUBLISHER has no ScarletBook home; only sidecar can provide it.
+        let md = synth_sacd_metadata(None, None, 0, None, &["t"], &[""], &[None]);
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="PUBLISHER" value="Sony Music Japan International Inc."/><meta name="TITLE" value="t"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="1"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+        let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
+        assert_eq!(pub_entry.map(|e| e.value.as_str()), Some("Sony Music Japan International Inc."));
+    }
+
+    #[test]
+    fn sidecar_alt_keys_album_artist_and_discogs_catalog() {
+        // Some sidecars use "ALBUM ARTIST" (with space) and DISCOGS_CATALOG.
+        let md = synth_sacd_metadata(None, None, 0, None, &["t"], &[""], &[None]);
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="ALBUM ARTIST" value="Composite Artist"/><meta name="DISCOGS_CATALOG" value="SICP 10083"/><meta name="TITLE" value="t"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="1"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        assert_eq!(by_key("ALBUMARTIST").map(|e| e.value.as_str()), Some("Composite Artist"));
+        assert_eq!(by_key("CATALOGNUMBER").map(|e| e.value.as_str()), Some("SICP 10083"));
+    }
+
+    #[test]
+    fn sidecar_hybrid_disc_routes_mch_tracks_when_mch_area_selected() {
+        // Stereo absent, MCH present. Sidecar has tracks for both areas
+        // but we should pull from area 2 (tracks 3-4 by ID with
+        // TOTALTRACKS=2).
+        let mut md = synth_sacd_metadata(None, None, 0, None, &["mcsb1", "mcsb2"], &["", ""], &[None, None]);
+        let mut info = md.stereo.take().unwrap();
+        info.header.kind = crate::tui::sacd::AreaKind::MultiChannel;
+        info.header.channel_count = 6;
+        md.multi_channel = Some(info);
+
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="StereoT1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="2"><meta name="TITLE" value="StereoT2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="3"><meta name="TITLE" value="MCH T1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="4"><meta name="TITLE" value="MCH T2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, label, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+        assert_eq!(label, "MCH");
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").expect("TITLE");
+        assert_eq!(title.per_file_values, vec!["MCH T1", "MCH T2"]);
     }
 }
 
