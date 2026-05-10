@@ -5167,7 +5167,7 @@ fn handle_metadata_editor_mouse(
                     // cache to return to.
                     let mut pills: Vec<(&str, &str)> = Vec::new();
                     if state.mb_back.is_some() {
-                        pills.push(("← MB", ":mb-back"));
+                        pills.push(("← back", ":mb-back"));
                     }
                     pills.extend_from_slice(&[
                         (":fix-caps", ":fix-caps"),

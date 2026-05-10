@@ -1615,7 +1615,7 @@ fn draw_metadata_editor(
             // :tags-mb). Dispatches :mb-back, which reconstructs the
             // picker from the cached release list — no MB requery.
             if state.mb_back.is_some() {
-                spans.push(footer_pill("← MB", theme::AMBER));
+                spans.push(footer_pill("← back", theme::AMBER));
                 spans.push(pill_gap());
             }
             spans.extend_from_slice(&[
