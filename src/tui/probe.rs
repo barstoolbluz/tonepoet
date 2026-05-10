@@ -223,6 +223,16 @@ fn friendly_codec_name(name: &str) -> String {
 
 /// Probe an audio file using ffmpeg-next (in-process, no subprocess)
 pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
+    // SACD ISOs are ScarletBook-format DSD streams that ffmpeg can't open
+    // (it'll either error out on the unrecognised container or mis-detect
+    // the leading bytes as ISO9660). Branch up-front: if magic bytes are
+    // present, synthesize SourceInfo from the parsed Master TOC + Area TOC
+    // so the source pane shows DSD64 / channels / duration without the
+    // broken ffmpeg fallback.
+    if super::sacd::is_sacd_iso(path) {
+        return probe_sacd(path);
+    }
+
     ensure_ffmpeg_init();
 
     let file_size = std::fs::metadata(path)
@@ -324,10 +334,84 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     })
 }
 
+/// Synthesize a `SourceInfo` for a SACD ISO. Defaults to surfacing
+/// the **stereo** area when both stereo and multi-channel are
+/// present; falls back to multi-channel if only that exists. The
+/// area can be overridden later (C6) once the source pane gains a
+/// stereo/MCH toggle pill.
+///
+/// Sample rate is fixed at SACD's canonical 64×44.1 kHz (DSD64);
+/// bit depth = 1 (DSD); duration is taken from the area's
+/// `total_playtime` (m/s/f@75 → seconds). Format name surfaces
+/// "SACD ISO (DST)" or "SACD ISO" depending on whether DST
+/// compression is in use, since the user usually wants to know
+/// before attempting any export.
+fn probe_sacd(path: &Path) -> Result<SourceInfo, String> {
+    let md = super::sacd::parse_sacd_iso(path)
+        .map_err(|e| format!("SACD parse failed for '{}': {}", path.display(), e))?;
+
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    // Pick the area to surface. Stereo wins if present.
+    let (area, area_label) = if let Some(stereo) = md.stereo.as_ref() {
+        (stereo, "stereo")
+    } else if let Some(mch) = md.multi_channel.as_ref() {
+        (mch, "MCH")
+    } else {
+        // parse_sacd_iso already rejects no-area discs via the
+        // master TOC validation, but defensive belt-and-braces:
+        return Err(format!(
+            "SACD '{}' has no readable areas",
+            path.display(),
+        ));
+    };
+
+    let channels = area.header.channel_count as u32;
+    let channel_layout = match (channels, area.header.loudspeaker_config) {
+        (2, _) => "stereo".to_string(),
+        (5, _) => "5.0".to_string(),
+        (6, 5) => "5.1".to_string(),
+        (6, _) => "5.1".to_string(),
+        (n, _) => format!("{} ch", n),
+    };
+
+    let duration_secs = area.header.total_playtime.total_seconds();
+
+    let format_name = if area.header.frame_format.is_dst_encoded() {
+        format!("SACD ISO (DST, {})", area_label)
+    } else {
+        format!("SACD ISO ({})", area_label)
+    };
+
+    // Codec label tracks the DSD rate (always DSD64 for SACD discs
+    // per the spec — no other sample_frequency value has shipped).
+    let codec = "DSD64".to_string();
+
+    Ok(SourceInfo {
+        format_name,
+        codec,
+        bit_depth: Some(1),
+        sample_rate: super::sacd::SACD_SAMPLE_RATE_HZ,
+        channels,
+        channel_layout,
+        duration_secs,
+        file_size,
+    })
+}
+
 /// Read metadata tags from an audio file using lofty
 pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
     use lofty::file::TaggedFileExt;
     use lofty::tag::{Accessor, ItemKey};
+
+    // SACD ISOs aren't tagged files in lofty's sense — pull the
+    // album-level fields out of the ScarletBook Master TOC + SACDText
+    // sector instead. Per-track text (titles per track) lives on the
+    // editor's per-track populate path (C5+), not the source-level
+    // SourceMetadata.
+    if super::sacd::is_sacd_iso(path) {
+        return read_metadata_sacd(path);
+    }
 
     let tagged_file = lofty::read_from_path(path)
         .map_err(|e| format!("Failed to read tags from '{}': {}", path.display(), e))?;
@@ -414,6 +498,58 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
 
     // Quick pre-emphasis metadata check (tags + CUE/log + catalog).
     meta.preemphasis_metadata = preemphasis_metadata_check(path);
+
+    Ok(meta)
+}
+
+/// Synthesize source-level metadata for a SACD ISO from the Master
+/// TOC + SACDText. Maps:
+///   - master_text.album_title  → meta.album   (album of the ISO)
+///   - master_text.album_artist → meta.artist
+///   - disc_genres[0].name()    → meta.genre
+///   - master_toc.disc_date.year → meta.year
+///   - master_toc.album_catalog_number → meta.catalog_number
+///
+/// Title is intentionally left empty at the source level — SACDs
+/// don't have a single "track title"; per-track titles surface
+/// through the editor (C5) by pulling area.tracks[i].text.title.
+///
+/// Pre-emphasis is not applicable to DSD audio (the SACD spec
+/// doesn't define pre-emphasis), so that field stays None.
+fn read_metadata_sacd(path: &Path) -> Result<SourceMetadata, String> {
+    let md = super::sacd::parse_sacd_iso(path)
+        .map_err(|e| format!("SACD parse failed for '{}': {}", path.display(), e))?;
+
+    let mut meta = SourceMetadata::default();
+
+    if let Some(t) = md.master_text.as_ref() {
+        meta.album = t.album_title.clone();
+        meta.artist = t.album_artist.clone();
+    }
+
+    // First non-empty disc genre, falling back to the first album
+    // genre if disc has none.
+    let genre_code = md
+        .master_toc
+        .disc_genres
+        .first()
+        .or_else(|| md.master_toc.album_genres.first())
+        .map(|g| g.name());
+    if let Some(g) = genre_code {
+        if g != "Not used" && g != "Not defined" {
+            meta.genre = Some(g.to_string());
+        }
+    }
+
+    if let Some(date) = md.master_toc.disc_date {
+        if date.year > 0 {
+            meta.year = Some(date.year.to_string());
+        }
+    }
+
+    if !md.master_toc.album_catalog_number.is_empty() {
+        meta.catalog_number = Some(md.master_toc.album_catalog_number.clone());
+    }
 
     Ok(meta)
 }
@@ -1479,5 +1615,194 @@ mod tests {
         };
         toggle_mb_revert(&mut e);
         assert_eq!(e.value, "x");
+    }
+
+    // ---------- SACD probe path (C4) ----------
+
+    /// Build a synthetic SACD ISO at `path` with stereo + (optionally)
+    /// multi-channel areas, plus master TOC text. Mirrors the helper
+    /// in sacd.rs tests but lives here so we can drive probe_sacd
+    /// without a public re-export.
+    fn write_sacd_iso(
+        path: &std::path::Path,
+        stereo: bool,
+        multi: bool,
+        dst_encoded: bool,
+        album_title: Option<&str>,
+        album_artist: Option<&str>,
+        disc_year: u16,
+        catalog: Option<&str>,
+        playtime_minutes: u8,
+    ) {
+        use std::io::{Seek, SeekFrom, Write};
+        use crate::tui::sacd::*;
+
+        let total_sectors = 700u64;
+        let f = std::fs::File::create(path).unwrap();
+        f.set_len(total_sectors * SECTOR_SIZE).unwrap();
+        drop(f);
+        let mut f = std::fs::File::options().write(true).open(path).unwrap();
+
+        // Master TOC
+        let mut mtoc = vec![0u8; 0xa8];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
+        if let Some(c) = catalog {
+            let bytes = c.as_bytes();
+            let n = bytes.len().min(16);
+            mtoc[0x18..0x18 + n].copy_from_slice(&bytes[..n]);
+        }
+        if stereo {
+            mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+            mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());
+        }
+        if multi {
+            mtoc[0x48..0x4c].copy_from_slice(&600u32.to_be_bytes());
+            mtoc[0x56..0x58].copy_from_slice(&3u16.to_be_bytes());
+        }
+        if disc_year > 0 {
+            mtoc[0x78..0x7a].copy_from_slice(&disc_year.to_be_bytes());
+            mtoc[0x7a] = 6;  mtoc[0x7b] = 15;
+        }
+        // disc_genre[0] = JAZZ for the test
+        mtoc[0x68] = 1; mtoc[0x6b] = 14;
+        mtoc[0x80] = 1;
+        mtoc[0x88] = b'e'; mtoc[0x89] = b'n'; mtoc[0x8a] = 2;
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        // SACDText at LSN 511
+        if album_title.is_some() || album_artist.is_some() {
+            let mut tbuf = vec![0u8; SECTOR_SIZE as usize];
+            tbuf[0..8].copy_from_slice(SACD_TEXT_MAGIC);
+            let mut data_pos = 0x100u16;
+            if let Some(t) = album_title {
+                tbuf[0x10..0x12].copy_from_slice(&data_pos.to_be_bytes());
+                let bytes = t.as_bytes();
+                tbuf[data_pos as usize..data_pos as usize + bytes.len()].copy_from_slice(bytes);
+                data_pos += bytes.len() as u16 + 1;
+            }
+            if let Some(a) = album_artist {
+                tbuf[0x12..0x14].copy_from_slice(&data_pos.to_be_bytes());
+                let bytes = a.as_bytes();
+                tbuf[data_pos as usize..data_pos as usize + bytes.len()].copy_from_slice(bytes);
+            }
+            f.seek(SeekFrom::Start(511 * SECTOR_SIZE)).unwrap();
+            f.write_all(&tbuf).unwrap();
+        }
+
+        // Helper: build an area-TOC sector with the requested format,
+        // channel count, and total playtime.
+        let mut build_area = |magic: &[u8; 8], channels: u8, lou: u8| {
+            let mut a = vec![0u8; SECTOR_SIZE as usize];
+            a[0..8].copy_from_slice(magic);
+            a[0x08] = 1; a[0x09] = 20;
+            a[0x0a..0x0c].copy_from_slice(&3u16.to_be_bytes()); // size
+            a[0x14] = 0x04;
+            a[0x15] = if dst_encoded { 0 } else { 2 };
+            a[0x20] = channels;
+            a[0x21] = (lou << 3) | 0;
+            a[0x22] = channels;
+            a[0x40] = playtime_minutes;
+            a[0x41] = 30;
+            a[0x42] = 0;
+            a[0x44] = 0;
+            a[0x45] = 1; // 1 track for simplicity
+            a[0x48..0x4c].copy_from_slice(&650u32.to_be_bytes());
+            a[0x4c..0x50].copy_from_slice(&100_000u32.to_be_bytes());
+            a[0x50] = 1;
+            a[0x58] = b'e'; a[0x59] = b'n'; a[0x5a] = 2;
+            a
+        };
+
+        if stereo {
+            f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+            f.write_all(&build_area(TWOCH_TOC_MAGIC, 2, 0)).unwrap();
+        }
+        if multi {
+            f.seek(SeekFrom::Start(600 * SECTOR_SIZE)).unwrap();
+            f.write_all(&build_area(MULCH_TOC_MAGIC, 6, 5)).unwrap();
+        }
+    }
+
+    #[test]
+    fn probe_sacd_returns_dsd64_stereo_when_both_areas_present() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("disc.iso");
+        write_sacd_iso(&path, true, true, false, None, None, 2003, None, 50);
+        let info = probe_audio(&path).expect("probe");
+        assert!(info.format_name.starts_with("SACD ISO"));
+        assert!(info.format_name.contains("stereo"));
+        assert_eq!(info.codec, "DSD64");
+        assert_eq!(info.bit_depth, Some(1));
+        assert_eq!(info.sample_rate, 2_822_400);
+        assert_eq!(info.channels, 2);
+        assert_eq!(info.channel_layout, "stereo");
+        assert!((info.duration_secs - 50.0 * 60.0 - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn probe_sacd_falls_back_to_multi_channel_when_no_stereo() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("mc_only.iso");
+        write_sacd_iso(&path, false, true, false, None, None, 0, None, 30);
+        let info = probe_audio(&path).expect("probe");
+        assert!(info.format_name.contains("MCH"));
+        assert_eq!(info.channels, 6);
+        assert_eq!(info.channel_layout, "5.1");
+    }
+
+    #[test]
+    fn probe_sacd_marks_dst_encoded() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("dst.iso");
+        write_sacd_iso(&path, true, false, true, None, None, 0, None, 60);
+        let info = probe_audio(&path).expect("probe");
+        assert!(info.format_name.contains("DST"), "got {}", info.format_name);
+    }
+
+    #[test]
+    fn read_metadata_sacd_pulls_text_and_year_and_catalog() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("titled.iso");
+        write_sacd_iso(
+            &path, true, false, false,
+            Some("Kind of Blue"),
+            Some("Miles Davis"),
+            1959,
+            Some("PROC-001"),
+            45,
+        );
+        let m = read_metadata(&path).expect("read_metadata");
+        assert_eq!(m.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(m.artist.as_deref(), Some("Miles Davis"));
+        assert_eq!(m.year.as_deref(), Some("1959"));
+        assert_eq!(m.catalog_number.as_deref(), Some("PROC-001"));
+        assert_eq!(m.genre.as_deref(), Some("Jazz"));
+        // Source-level title intentionally empty for SACDs.
+        assert!(m.title.is_none());
+        // Pre-emphasis not applicable to DSD.
+        assert!(m.preemphasis_metadata.is_none());
+    }
+
+    #[test]
+    fn probe_audio_passes_through_non_sacd_path() {
+        // No SACD magic → the SACD branch must not intercept; we
+        // expect the ffmpeg branch to error on the non-existent
+        // empty file (proves we reached it). This is a regression
+        // guard against a false-positive sacd::is_sacd_iso.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("not.iso");
+        std::fs::write(&path, b"\x00\x00\x00\x00").unwrap();
+        let res = probe_audio(&path);
+        // Either ffmpeg errored (most likely) or it returned info —
+        // both are acceptable. What we want to confirm is that we
+        // did NOT short-circuit through probe_sacd (which would
+        // return a SACD parse error message containing "SACD").
+        if let Err(e) = &res {
+            assert!(!e.contains("SACD"), "should not have hit SACD branch: {}", e);
+        }
     }
 }
