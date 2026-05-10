@@ -1496,9 +1496,28 @@ fn parse_area_with_strictness(
 /// SACD_IGL (ISRC + per-track genre). SACD_ACC sectors are skipped
 /// (32-sector span). Only the *first* SACDTTxt sector is parsed
 /// (primary locale), matching sacd-extract behaviour.
+///
+/// Redundancy: if `ptr.toc_1_start` is unreadable or the parsed
+/// header is malformed, falls back to `ptr.toc_2_start` (the backup
+/// copy of the area TOC) when present. This mirrors what
+/// sacd-extract does in `scarletbook_read.c` and is what real
+/// players do when reading scratched discs.
 pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> {
-    let header_buf = read_sector(path, ptr.toc_1_start as u64)?;
-    let header = parse_area_toc_header(&header_buf)?;
+    // Try toc_1 first; on failure, fall back to toc_2 when set.
+    let (header, header_start_lsn) = match try_area_header_at(path, ptr.toc_1_start as u64) {
+        Ok(h) => (h, ptr.toc_1_start as u64),
+        Err(primary_err) => {
+            if ptr.toc_2_start == 0 {
+                return Err(primary_err);
+            }
+            match try_area_header_at(path, ptr.toc_2_start as u64) {
+                Ok(h) => (h, ptr.toc_2_start as u64),
+                // Both copies failed — surface the *primary* error
+                // since it's the one the user expected to work.
+                Err(_) => return Err(primary_err),
+            }
+        }
+    };
     let area_charset = header.locales.first().map(|l| l.character_set).unwrap_or(0);
 
     let mut starts: Option<Vec<(u32, u32)>> = None;
@@ -1515,7 +1534,7 @@ pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> 
     let max_scan = (header.size_sectors as u64).min(96);
     let mut i: u64 = 1;
     while i < max_scan {
-        let lsn = ptr.toc_1_start as u64 + i;
+        let lsn = header_start_lsn + i;
         let buf = match read_sector(path, lsn) {
             Ok(b) => b,
             Err(_) => break,
@@ -1590,6 +1609,14 @@ pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> 
 
 /// Read a single 2048-byte sector at `lsn` from `path` into a fresh
 /// Vec.
+/// Read and parse an area TOC header from the given LSN. Returns
+/// Err if the read fails or the magic / structure is malformed.
+/// Used by `parse_area` with toc_1 then (on failure) toc_2.
+fn try_area_header_at(path: &Path, lsn: u64) -> Result<AreaTocHeader, SacdError> {
+    let buf = read_sector(path, lsn)?;
+    parse_area_toc_header(&buf)
+}
+
 fn read_sector(path: &Path, lsn: u64) -> Result<Vec<u8>, SacdError> {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
@@ -2448,5 +2475,140 @@ mod tests {
         assert_eq!(stereo.tracks[1].text.performer.as_deref(), Some("Artist B"));
         assert_eq!(stereo.tracks[1].isrc.as_deref(), Some("USAA10800002"));
         assert_eq!(stereo.tracks[1].duration.total_seconds(), 3.0 * 60.0 + 30.0);
+    }
+
+    // ---------- C7 tests: redundancy fallback, malformed paths, real-ISO ----------
+
+    #[test]
+    fn parse_area_falls_back_to_toc_2_when_toc_1_corrupt() {
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("redundant_area.iso");
+        let total_sectors = 700u64;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total_sectors * SECTOR_SIZE).unwrap();
+        drop(f);
+
+        // Master TOC at LSN 510: area_1 toc_1 at 540 (corrupt), toc_2 at 550 (good).
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes()); // toc_1
+        mtoc[0x44..0x48].copy_from_slice(&550u32.to_be_bytes()); // toc_2
+        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());   // size
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        // Sector 540 stays zero (corrupt: no TWOCHTOC magic).
+        // Sector 550: write a valid TWOCHTOC.
+        let mut area_buf = vec![0u8; SECTOR_SIZE as usize];
+        area_buf[0..8].copy_from_slice(TWOCH_TOC_MAGIC);
+        area_buf[0x08] = 1; area_buf[0x09] = 20;
+        area_buf[0x0a..0x0c].copy_from_slice(&1u16.to_be_bytes());
+        area_buf[0x14] = 0x04;
+        area_buf[0x15] = 2; // DSD3in14
+        area_buf[0x20] = 2; // channels
+        area_buf[0x40] = 30; // playtime
+        area_buf[0x45] = 1;  // track_count = 1
+        f.seek(SeekFrom::Start(550 * SECTOR_SIZE)).unwrap();
+        f.write_all(&area_buf).unwrap();
+        drop(f);
+
+        let md = parse_sacd_iso(&path).expect("parse should succeed via toc_2 fallback");
+        let stereo = md.stereo.as_ref().expect("stereo via toc_2");
+        assert_eq!(stereo.header.channel_count, 2);
+        assert_eq!(stereo.header.track_count, 1);
+    }
+
+    #[test]
+    fn parse_area_returns_primary_error_when_both_copies_fail() {
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("both_bad.iso");
+        let total = 700u64;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total * SECTOR_SIZE).unwrap();
+        drop(f);
+
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+        mtoc[0x44..0x48].copy_from_slice(&550u32.to_be_bytes());
+        mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+        // Leave sectors 540 AND 550 as zeros (no magic).
+        drop(f);
+
+        // Non-strict parse_sacd_iso → stereo = None, no error at top level.
+        let md = parse_sacd_iso(&path).expect("non-strict swallows per-area errors");
+        assert!(md.stereo.is_none());
+        // Strict path → propagates the per-area error.
+        let strict = parse_sacd_iso_with_strictness(&path, true);
+        assert!(strict.is_err());
+    }
+
+    #[test]
+    fn parse_area_no_toc_2_returns_primary_error() {
+        // When ptr.toc_2_start is 0 we mustn't try sector 0 (which
+        // contains the file system area).
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("no_backup.iso");
+        let total = 700u64;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total * SECTOR_SIZE).unwrap();
+        drop(f);
+
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+        // toc_2_start = 0
+        mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+        drop(f);
+
+        // Sector 540 has no magic; toc_2=0 means no fallback.
+        let strict = parse_sacd_iso_with_strictness(&path, true);
+        assert!(strict.is_err(), "should error when toc_1 fails and no toc_2");
+    }
+
+    /// Real-world ISO fixture: only runs when
+    /// `TONEPOET_SACD_FIXTURE_ISO` points at an existing SACD ISO.
+    /// Exercises `parse_sacd_iso` end-to-end and asserts the basic
+    /// shape invariants (spec version 1.x, at least one area present,
+    /// non-zero track count, DSD64 sample frequency byte). CI leaves
+    /// this unset; developers point it at their own library to
+    /// validate parser correctness against real-world pressings.
+    #[test]
+    fn parse_real_sacd_iso_when_env_var_set() {
+        let Ok(path) = std::env::var("TONEPOET_SACD_FIXTURE_ISO") else { return; };
+        let p = std::path::Path::new(&path);
+        if !p.exists() {
+            eprintln!("TONEPOET_SACD_FIXTURE_ISO='{}' not found — skipping", path);
+            return;
+        }
+        let md = parse_sacd_iso(p).unwrap_or_else(|e| {
+            panic!("real ISO '{}' failed to parse: {}", path, e);
+        });
+
+        assert_eq!(md.master_toc.spec_version.0, 1, "spec major should be 1");
+        assert!(
+            md.stereo.is_some() || md.multi_channel.is_some(),
+            "at least one area must parse",
+        );
+        if let Some(area) = md.stereo.as_ref().or(md.multi_channel.as_ref()) {
+            assert!(area.header.track_count > 0, "track_count must be > 0");
+            assert_eq!(area.header.sample_frequency, 0x04, "must be DSD64");
+            assert_eq!(area.tracks.len(), area.header.track_count as usize);
+        }
     }
 }
