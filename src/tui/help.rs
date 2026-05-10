@@ -56,7 +56,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     ("Ctrl+V", "Visual range select (move cursor to extend)"),
                     ("Esc", "Exit type-ahead / visual mode / clear selection"),
                     ("Ctrl+E", "Edit metadata for selected file(s)"),
-                    ("D", "Per-file detail view (in metadata editor)"),
+                    (":D / :detail", "Per-file detail view (in metadata editor)"),
                 ],
             },
             HelpSection {
