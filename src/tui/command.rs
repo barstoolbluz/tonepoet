@@ -1495,7 +1495,16 @@ pub fn execute_command(
             super::keybindings::dispatch_metadata_editor_keychar(app, 'D', tx);
         }
         Command::MbBack => {
-            let Some(state) = app.pending_metadata_editor.take() else {
+            // Editor state may be in pending (colon command from
+            // command-bar) or active_overlay (mouse-pill click that
+            // restored before dispatching). Take from either.
+            let state = if let Some(parked) = app.pending_metadata_editor.take() {
+                parked
+            } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
+                let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+                if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
+                else { unreachable!() }
+            } else {
                 app.set_status(":mb-back only works in the metadata editor");
                 return;
             };

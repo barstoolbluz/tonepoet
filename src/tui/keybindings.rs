@@ -5161,14 +5161,22 @@ fn handle_metadata_editor_mouse(
             // Left click on footer: pill button hit-testing.
             MouseEventKind::Down(MouseButton::Left) if in_footer => {
                 if state.phase == MetadataEditorPhase::Editing {
-                    let pills: &[(&str, &str)] = &[
+                    // Mirror the renderer: prepend ← MB pill when state
+                    // was reached via the MbSelect picker (mb_back cache
+                    // populated). Stays off the row when there's no
+                    // cache to return to.
+                    let mut pills: Vec<(&str, &str)> = Vec::new();
+                    if state.mb_back.is_some() {
+                        pills.push(("← MB", ":mb-back"));
+                    }
+                    pills.extend_from_slice(&[
                         (":fix-caps", ":fix-caps"),
                         ("d delete", "d"),
                         ("u undo", "u"),
                         ("a add", "a"),
                         ("w save", "w"),
                         ("Esc close", "esc"),
-                    ];
+                    ]);
                     if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);

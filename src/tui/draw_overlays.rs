@@ -1608,19 +1608,31 @@ fn draw_metadata_editor(
 
     // Footer: clickable pill-style buttons with key hints.
     let footer = match state.phase {
-        MetadataEditorPhase::Editing => Line::from(vec![
-            footer_pill(":fix-caps", theme::BLUE),
-            pill_gap(),
-            footer_pill("d delete", theme::RED),
-            pill_gap(),
-            footer_pill("u undo", theme::AMBER),
-            pill_gap(),
-            footer_pill("a add", theme::CYAN),
-            pill_gap(),
-            footer_pill("w save", theme::GREEN),
-            pill_gap(),
-            footer_pill("Esc close", theme::PURPLE),
-        ]),
+        MetadataEditorPhase::Editing => {
+            let mut spans = Vec::new();
+            // ← MB pill: surfaced when the editor was reached via the
+            // MbSelect picker (state.mb_back is Some, i.e. multi-match
+            // :tags-mb). Dispatches :mb-back, which reconstructs the
+            // picker from the cached release list — no MB requery.
+            if state.mb_back.is_some() {
+                spans.push(footer_pill("← MB", theme::AMBER));
+                spans.push(pill_gap());
+            }
+            spans.extend_from_slice(&[
+                footer_pill(":fix-caps", theme::BLUE),
+                pill_gap(),
+                footer_pill("d delete", theme::RED),
+                pill_gap(),
+                footer_pill("u undo", theme::AMBER),
+                pill_gap(),
+                footer_pill("a add", theme::CYAN),
+                pill_gap(),
+                footer_pill("w save", theme::GREEN),
+                pill_gap(),
+                footer_pill("Esc close", theme::PURPLE),
+            ]);
+            Line::from(spans)
+        }
         MetadataEditorPhase::InlineEdit => Line::from(vec![
             footer_pill("Enter confirm", theme::GREEN),
             pill_gap(),
