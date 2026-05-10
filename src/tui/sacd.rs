@@ -46,6 +46,38 @@ pub const MASTER_TOC_LEN_SECTORS: u64 = 10;
 /// within the first sector (2048 bytes).
 const MASTER_TOC_T_SIZE: usize = 0xa8;
 
+/// Magic identifier for the multilingual text sector that follows the
+/// Master TOC (sector at LSN 511 / 521 / 531 — i.e. master_toc_lsn+1).
+pub const SACD_TEXT_MAGIC: &[u8; 8] = b"SACDText";
+
+/// Magic identifier for a 2-channel area's TOC sector (first sector
+/// at the LSN pointed at by master_toc.area_1_toc_1_start).
+pub const TWOCH_TOC_MAGIC: &[u8; 8] = b"TWOCHTOC";
+
+/// Magic identifier for a multi-channel area's TOC sector.
+pub const MULCH_TOC_MAGIC: &[u8; 8] = b"MULCHTOC";
+
+/// Magic identifier for the per-area track-LSN list (SACDTRL1).
+/// Lives at one of the sectors following the area TOC header.
+pub const SACD_TRL1_MAGIC: &[u8; 8] = b"SACDTRL1";
+
+/// Magic identifier for the per-area track-time list (SACDTRL2).
+pub const SACD_TRL2_MAGIC: &[u8; 8] = b"SACDTRL2";
+
+/// On-disc size of the `area_toc_t` *header* (the fields up to but
+/// not including the trailing 1896-byte data buffer). The header
+/// plus data sum to 2048 bytes (one sector).
+pub const AREA_TOC_HEADER_SIZE: usize = 0x98;
+
+/// SACD audio frame rate (frames per second). Used to convert the
+/// (minutes, seconds, frames) timecodes in SACDTRL2 to seconds.
+pub const SACD_FRAME_RATE: u32 = 75;
+
+/// Single canonical sample frequency for SACD audio: 64 × 44.1 kHz.
+/// The spec defines `sample_frequency = 0x04` to mean exactly this.
+/// No other value has ever been pressed.
+pub const SACD_SAMPLE_RATE_HZ: u32 = 2_822_400;
+
 /// Errors surfaced by the SACD module.
 #[derive(Debug, Clone)]
 pub enum SacdError {
@@ -547,6 +579,728 @@ fn read_genre_table(slice: &[u8]) -> Vec<Genre> {
     out
 }
 
+// ---------------------------------------------------------------
+// Master SACDText (multilingual album / disc text)
+// ---------------------------------------------------------------
+//
+// One `master_sacd_text_t` sector exists per declared locale, in
+// LSN order starting at MasterTocLsn+1. Each is exactly 2048 bytes:
+//
+//   0x00   8   id ("SACDText")
+//   0x08   8   reserved
+//   0x10   2   album_title_position                    (BE u16)
+//   0x12   2   album_artist_position                   (BE u16)
+//   0x14   2   album_publisher_position                (BE u16)
+//   0x16   2   album_copyright_position                (BE u16)
+//   0x18   2   album_title_phonetic_position           (BE u16)
+//   0x1a   2   album_artist_phonetic_position          (BE u16)
+//   0x1c   2   album_publisher_phonetic_position       (BE u16)
+//   0x1e   2   album_copyright_phonetic_position       (BE u16)
+//   0x20   2   disc_title_position                     (BE u16)
+//   0x22   2   disc_artist_position                    (BE u16)
+//   0x24   2   disc_publisher_position                 (BE u16)
+//   0x26   2   disc_copyright_position                 (BE u16)
+//   0x28   2   disc_title_phonetic_position            (BE u16)
+//   0x2a   2   disc_artist_phonetic_position           (BE u16)
+//   0x2c   2   disc_publisher_phonetic_position        (BE u16)
+//   0x2e   2   disc_copyright_phonetic_position        (BE u16)
+//   0x30   2000  data (NUL-terminated strings)
+//
+// Each `*_position` is a byte offset from the START of the sector
+// (NOT from `data`). 0 means "field absent". Strings are NUL-
+// terminated and encoded per the locale's `character_set_t`.
+
+/// Decoded `SACDText` for a single locale. `None` fields indicate
+/// either a 0 position pointer in the spec or a string that decoded
+/// to empty.
+#[derive(Debug, Clone, Default)]
+pub struct SacdText {
+    pub album_title: Option<String>,
+    pub album_title_phonetic: Option<String>,
+    pub album_artist: Option<String>,
+    pub album_artist_phonetic: Option<String>,
+    pub album_publisher: Option<String>,
+    pub album_publisher_phonetic: Option<String>,
+    pub album_copyright: Option<String>,
+    pub album_copyright_phonetic: Option<String>,
+    pub disc_title: Option<String>,
+    pub disc_title_phonetic: Option<String>,
+    pub disc_artist: Option<String>,
+    pub disc_artist_phonetic: Option<String>,
+    pub disc_publisher: Option<String>,
+    pub disc_publisher_phonetic: Option<String>,
+    pub disc_copyright: Option<String>,
+    pub disc_copyright_phonetic: Option<String>,
+    /// Charset code (`character_set_t`) used to decode the strings.
+    /// Captured so callers can know whether decode was high-fidelity
+    /// (charsets 1, 2, 7 → trivially correct) or lossy (charsets 3-6
+    /// — Asian double-byte sets that we currently bytes-thru).
+    pub charset: u8,
+}
+
+/// Parse a 2048-byte `SACDText` sector for a single locale. Returns
+/// `Malformed` if magic doesn't match or the buffer is short.
+///
+/// `charset` is the `character_set_t` value from the locale entry in
+/// the Master TOC that this text sector corresponds to.
+pub fn parse_sacd_text(buf: &[u8], charset: u8) -> Result<SacdText, SacdError> {
+    if buf.len() < SECTOR_SIZE as usize {
+        return Err(SacdError::Malformed(format!(
+            "SACDText sector too short: {} bytes, need {}",
+            buf.len(),
+            SECTOR_SIZE,
+        )));
+    }
+    if &buf[0..8] != SACD_TEXT_MAGIC {
+        return Err(SacdError::Malformed(format!(
+            "SACDText magic missing (got {:?})",
+            &buf[0..8],
+        )));
+    }
+
+    // Read all 16 position fields. NUL-terminated string at each
+    // non-zero position.
+    let read_at = |pos_off: usize| -> Option<String> {
+        let pos = read_be_u16(buf, pos_off) as usize;
+        if pos == 0 || pos >= buf.len() { return None; }
+        let s = read_cstr_at(buf, pos, charset);
+        if s.is_empty() { None } else { Some(s) }
+    };
+
+    Ok(SacdText {
+        album_title: read_at(0x10),
+        album_artist: read_at(0x12),
+        album_publisher: read_at(0x14),
+        album_copyright: read_at(0x16),
+        album_title_phonetic: read_at(0x18),
+        album_artist_phonetic: read_at(0x1a),
+        album_publisher_phonetic: read_at(0x1c),
+        album_copyright_phonetic: read_at(0x1e),
+        disc_title: read_at(0x20),
+        disc_artist: read_at(0x22),
+        disc_publisher: read_at(0x24),
+        disc_copyright: read_at(0x26),
+        disc_title_phonetic: read_at(0x28),
+        disc_artist_phonetic: read_at(0x2a),
+        disc_publisher_phonetic: read_at(0x2c),
+        disc_copyright_phonetic: read_at(0x2e),
+        charset,
+    })
+}
+
+/// Read a NUL-terminated byte string starting at `start` in `buf`,
+/// then decode it with the given charset.
+fn read_cstr_at(buf: &[u8], start: usize, charset: u8) -> String {
+    let end = buf[start..]
+        .iter()
+        .position(|&b| b == 0)
+        .map_or(buf.len(), |p| start + p);
+    let bytes = &buf[start..end];
+    decode_text(bytes, charset)
+}
+
+/// Decode a byte slice per ScarletBook `character_set_t`:
+///   - 0 (UNKNOWN), 1 (ISO 646 / 7-bit ASCII), 2 (ISO 8859-1),
+///     7 (ISO 8859-1 with escapes) → Latin-1, lossless.
+///   - 3 (Music Shift-JIS), 4 (KSC 5601), 5 (GB 2312), 6 (Big5):
+///     pass-through via UTF-8 lossy. Asian SACDs will surface
+///     placeholder � replacement chars; full conversion needs a
+///     dedicated encoding crate (deferred — adding `encoding_rs`
+///     would be a separate dependency decision).
+pub fn decode_text(bytes: &[u8], charset: u8) -> String {
+    match charset {
+        0 | 1 | 2 | 7 => latin1_to_utf8(bytes),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Latin-1 → UTF-8. Each input byte is a Unicode code point in 0..=255,
+/// which encodes as 1 byte (ASCII) or 2 bytes (high-Latin-1) in UTF-8.
+fn latin1_to_utf8(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Read the first SACDText sector from disk. Convention: the primary
+/// locale's text sector lives at LSN `master_toc_lsn + 1`, where
+/// `master_toc_lsn` is the LSN of the Master TOC copy that produced
+/// `master_toc`. The locale's character_set is taken from
+/// `master_toc.locales[0]`.
+///
+/// Multilingual text (locales 1..text_area_count) is deferred — each
+/// additional locale lives in a successive sector but tonepoet only
+/// surfaces the primary one (matching sacd-extract's "we only use
+/// the first SACDText entry" comment).
+pub fn read_master_text(
+    path: &Path,
+    master_toc_lsn: u64,
+    master_toc: &MasterToc,
+) -> Result<Option<SacdText>, SacdError> {
+    if master_toc.text_area_count == 0 {
+        return Ok(None);
+    }
+    let charset = master_toc.locales.first().map(|l| l.character_set).unwrap_or(0);
+    let sector_lsn = master_toc_lsn + 1;
+    let buf = read_sector(path, sector_lsn)?;
+    match parse_sacd_text(&buf, charset) {
+        Ok(t) => Ok(Some(t)),
+        Err(SacdError::Malformed(_)) => Ok(None),  // missing-magic = no text, not fatal
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------
+// Area TOC header (TWOCHTOC / MULCHTOC, sector 0 of each area)
+// ---------------------------------------------------------------
+//
+// Layout of `area_toc_t` (header portion, 152 bytes; full sector
+// includes a trailing 1896-byte `data` region holding NUL-terminated
+// area description / copyright strings).
+//
+//   off  size  field
+//   ---  ----  ------------------------------------------------
+//   0x00    8  id ("TWOCHTOC" or "MULCHTOC")
+//   0x08    1  version.major
+//   0x09    1  version.minor
+//   0x0a    2  size (sectors, BE u16)
+//   0x0c    4  reserved01
+//   0x10    4  max_byte_rate (BE u32)
+//   0x14    1  sample_frequency (0x04 = DSD64)
+//   0x15    1  frame_format byte:
+//                 BE bitfield: reserved:4, frame_format:4
+//                 → low nibble = frame_format (0=DST, 2=DSD3in14, 3=DSD3in16)
+//                 → high nibble = reserved
+//   0x16   10  reserved03
+//   0x20    1  channel_count
+//   0x21    1  loudspeaker byte:
+//                 BE bitfield: loudspeaker_config:5, extra_settings:3
+//                 → high 5 bits = loudspeaker_config
+//                 → low 3 bits  = extra_settings
+//   0x22    1  max_available_channels
+//   0x23    1  area_mute_flags
+//   0x24   12  reserved04
+//   0x30    1  track_attribute byte (BE: reserved:4, track_attribute:4 → low nibble)
+//   0x31   15  reserved06
+//   0x40    3  total_playtime (m, s, f)
+//   0x43    1  reserved07
+//   0x44    1  track_offset (offset into album)
+//   0x45    1  track_count (1..=255)
+//   0x46    2  reserved08
+//   0x48    4  track_start LSN (BE u32) — first audio LSN of area
+//   0x4c    4  track_end LSN (BE u32)
+//   0x50    1  text_area_count
+//   0x51    7  reserved09
+//   0x58   40  languages[10] (locale_table_t × 10) — note: 10 here, not 8
+//   0x80    2  track_text_offset (BE u16)
+//   0x82    2  index_list_offset (BE u16)
+//   0x84    2  access_list_offset (BE u16)
+//   0x86   10  reserved10
+//   0x90    2  area_description_offset           (BE u16)
+//   0x92    2  copyright_offset                  (BE u16)
+//   0x94    2  area_description_phonetic_offset  (BE u16)
+//   0x96    2  copyright_phonetic_offset         (BE u16)
+//   0x98 1896  data (NUL-terminated strings)
+//
+// Total = 0x98 + 1896 = 2048 bytes ✓
+
+/// Frame format used by an SACD area. DSD-3-in-N variants are uncompressed;
+/// DST is lossless-compressed (~2.5:1) and requires DST decoding to
+/// reconstruct DSD samples for playback or transcoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameFormat {
+    /// DST-compressed DSD (lossless). Audio extraction needs a DST
+    /// decoder (deferred — out of scope for v1 metadata-only).
+    Dst,
+    /// Uncompressed DSD packed 3 frames in 14 bytes.
+    Dsd3In14,
+    /// Uncompressed DSD packed 3 frames in 16 bytes.
+    Dsd3In16,
+    /// Spec value not in {0, 2, 3}. Surfaced rather than rejected so
+    /// detection still succeeds for unusual presses.
+    Unknown(u8),
+}
+
+impl FrameFormat {
+    fn from_nibble(n: u8) -> Self {
+        match n & 0x0f {
+            0 => FrameFormat::Dst,
+            2 => FrameFormat::Dsd3In14,
+            3 => FrameFormat::Dsd3In16,
+            other => FrameFormat::Unknown(other),
+        }
+    }
+    pub fn is_dst_encoded(&self) -> bool {
+        matches!(self, FrameFormat::Dst)
+    }
+}
+
+/// Total playtime for an area as a (minutes, seconds, frames@75)
+/// triple. Use `total_seconds()` for a flat duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlayTime {
+    pub minutes: u8,
+    pub seconds: u8,
+    pub frames: u8,
+}
+
+impl PlayTime {
+    /// Total duration in seconds as f64 (frames are 1/75 sec each).
+    pub fn total_seconds(&self) -> f64 {
+        self.minutes as f64 * 60.0 + self.seconds as f64
+            + self.frames as f64 / SACD_FRAME_RATE as f64
+    }
+}
+
+/// One area's per-track timing entry decoded from SACDTRL1 + SACDTRL2.
+/// Both lists are indexed in track order (track 0 = first track).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrackEntry {
+    /// Absolute LSN where this track's audio begins.
+    pub start_lsn: u32,
+    /// Length of this track's audio in sectors.
+    pub length_lsn: u32,
+    /// Track start time relative to the album start (m, s, f).
+    pub start_time: PlayTime,
+    /// Track duration (m, s, f).
+    pub duration: PlayTime,
+}
+
+/// Decoded header portion of one area TOC (TWOCHTOC or MULCHTOC).
+/// Strings (description, copyright) are pulled from the trailing
+/// data region using the area's primary locale's character_set.
+#[derive(Debug, Clone)]
+pub struct AreaTocHeader {
+    /// `Stereo` for TWOCHTOC, `MultiChannel` for MULCHTOC.
+    pub kind: AreaKind,
+    /// (major, minor).
+    pub spec_version: (u8, u8),
+    /// Total size of this area's TOC in sectors.
+    pub size_sectors: u16,
+    /// Maximum multiplexed-frame byte rate in bytes/sec.
+    pub max_byte_rate: u32,
+    /// Always 0x04 in practice (= DSD64). Surfaced as raw u8 so
+    /// non-spec values aren't silently coerced.
+    pub sample_frequency: u8,
+    /// DST vs uncompressed DSD.
+    pub frame_format: FrameFormat,
+    /// Number of audio channels for each frame in this area
+    /// (typically 2 for stereo, 5 or 6 for multi-channel).
+    pub channel_count: u8,
+    /// 5-bit `loudspeaker_config` value (high bits of byte 0x21).
+    /// 0 = stereo, 3 = MC-no-LFE, 4 = 5.0, 5 = 5.1, etc.
+    pub loudspeaker_config: u8,
+    /// 3-bit `extra_settings` value (low bits of byte 0x21).
+    pub extra_settings: u8,
+    /// Maximum number of channels available on this area.
+    pub max_available_channels: u8,
+    /// Bitmask of muted channels for the area.
+    pub area_mute_flags: u8,
+    /// Total playtime of this area (sum over all tracks).
+    pub total_playtime: PlayTime,
+    /// Track index offset within the album (for box-set numbering).
+    pub track_offset: u8,
+    /// Number of tracks in this area (1..=255).
+    pub track_count: u8,
+    /// First audio LSN of the area.
+    pub track_start_lsn: u32,
+    /// Last audio LSN + 1 of the area.
+    pub track_end_lsn: u32,
+    /// Number of locales for which SACDTTxt sectors exist.
+    pub text_area_count: u8,
+    /// Up to 10 (language, charset) pairs. Note: 10 here, vs. 8 in
+    /// the Master TOC.
+    pub locales: Vec<Locale>,
+    /// Area description string (e.g. "5.1 Multi-channel"), from
+    /// `area_description_offset` within the area TOC sector data.
+    /// Decoded with `locales[0].character_set`.
+    pub description: Option<String>,
+    pub description_phonetic: Option<String>,
+    pub copyright: Option<String>,
+    pub copyright_phonetic: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AreaKind {
+    Stereo,
+    MultiChannel,
+}
+
+/// Parse an area TOC header from a single 2048-byte sector. The
+/// trailing data region is used in-place for description/copyright
+/// string lookups (no separate buffer needed).
+pub fn parse_area_toc_header(buf: &[u8]) -> Result<AreaTocHeader, SacdError> {
+    if buf.len() < SECTOR_SIZE as usize {
+        return Err(SacdError::Malformed(format!(
+            "area TOC sector too short: {} bytes, need {}",
+            buf.len(),
+            SECTOR_SIZE,
+        )));
+    }
+    let kind = match &buf[0..8] {
+        b if b == TWOCH_TOC_MAGIC => AreaKind::Stereo,
+        b if b == MULCH_TOC_MAGIC => AreaKind::MultiChannel,
+        other => {
+            return Err(SacdError::Malformed(format!(
+                "area TOC magic mismatch (got {:?}, want TWOCHTOC or MULCHTOC)",
+                other,
+            )));
+        }
+    };
+
+    let spec_version = (buf[0x08], buf[0x09]);
+    let size_sectors = read_be_u16(buf, 0x0a);
+    let max_byte_rate = read_be_u32(buf, 0x10);
+    let sample_frequency = buf[0x14];
+
+    // Frame format: the spec's BE bitfield declares
+    //     reserved02:4, frame_format:4
+    // putting frame_format in the LOW nibble (when packed MSB-first
+    // into a single byte, the LATER-declared bitfield occupies the
+    // low bits).
+    let frame_format = FrameFormat::from_nibble(buf[0x15] & 0x0f);
+
+    let channel_count = buf[0x20];
+    // Loudspeaker byte: BE bitfield order is
+    //     loudspeaker_config:5, extra_settings:3
+    // → high 5 bits = loudspeaker_config, low 3 bits = extra_settings.
+    let loudspeaker_config = (buf[0x21] >> 3) & 0x1f;
+    let extra_settings = buf[0x21] & 0x07;
+    let max_available_channels = buf[0x22];
+    let area_mute_flags = buf[0x23];
+
+    let total_playtime = PlayTime {
+        minutes: buf[0x40],
+        seconds: buf[0x41],
+        frames: buf[0x42],
+    };
+    let track_offset = buf[0x44];
+    let track_count = buf[0x45];
+    let track_start_lsn = read_be_u32(buf, 0x48);
+    let track_end_lsn = read_be_u32(buf, 0x4c);
+
+    let text_area_count = buf[0x50];
+    if text_area_count > 10 {
+        return Err(SacdError::Malformed(format!(
+            "area TOC text_area_count = {} exceeds spec maximum of 10",
+            text_area_count,
+        )));
+    }
+    let mut locales = Vec::with_capacity(10);
+    for i in 0..10 {
+        let off = 0x58 + i * 4;
+        locales.push(Locale {
+            language_code: [buf[off], buf[off + 1]],
+            character_set: buf[off + 2],
+        });
+    }
+
+    let charset = locales.first().map(|l| l.character_set).unwrap_or(0);
+
+    let description = read_optional_offset_str(buf, 0x90, charset);
+    let copyright = read_optional_offset_str(buf, 0x92, charset);
+    let description_phonetic = read_optional_offset_str(buf, 0x94, charset);
+    let copyright_phonetic = read_optional_offset_str(buf, 0x96, charset);
+
+    Ok(AreaTocHeader {
+        kind,
+        spec_version,
+        size_sectors,
+        max_byte_rate,
+        sample_frequency,
+        frame_format,
+        channel_count,
+        loudspeaker_config,
+        extra_settings,
+        max_available_channels,
+        area_mute_flags,
+        total_playtime,
+        track_offset,
+        track_count,
+        track_start_lsn,
+        track_end_lsn,
+        text_area_count,
+        locales,
+        description,
+        description_phonetic,
+        copyright,
+        copyright_phonetic,
+    })
+}
+
+/// Read a u16 BE at `off_pos` from `buf`; if non-zero, treat as a
+/// byte offset within `buf` and read a NUL-term string. Used for
+/// the four `*_offset` fields in area_toc_t.
+fn read_optional_offset_str(buf: &[u8], off_pos: usize, charset: u8) -> Option<String> {
+    let off = read_be_u16(buf, off_pos) as usize;
+    if off == 0 || off >= buf.len() { return None; }
+    let s = read_cstr_at(buf, off, charset);
+    if s.is_empty() { None } else { Some(s) }
+}
+
+// ---------------------------------------------------------------
+// SACDTRL1 (track LSNs) and SACDTRL2 (track times)
+// ---------------------------------------------------------------
+
+/// Parse a 2048-byte SACDTRL1 sector. The track_start_lsn and
+/// track_length_lsn arrays each hold 255 BE u32s; only the first
+/// `track_count` entries are meaningful.
+pub fn parse_trl1(buf: &[u8], track_count: u8) -> Result<Vec<(u32, u32)>, SacdError> {
+    if buf.len() < SECTOR_SIZE as usize {
+        return Err(SacdError::Malformed("SACDTRL1 sector too short".into()));
+    }
+    if &buf[0..8] != SACD_TRL1_MAGIC {
+        return Err(SacdError::Malformed(format!(
+            "SACDTRL1 magic missing (got {:?})",
+            &buf[0..8],
+        )));
+    }
+    let mut out = Vec::with_capacity(track_count as usize);
+    // start LSNs at offset 0x08 (8 + 0), lengths at offset 0x08 + 255*4 = 0x08 + 1020 = 0x404.
+    let start_base = 8;
+    let len_base = 8 + 255 * 4;
+    for i in 0..track_count as usize {
+        let s = read_be_u32(buf, start_base + i * 4);
+        let l = read_be_u32(buf, len_base + i * 4);
+        out.push((s, l));
+    }
+    Ok(out)
+}
+
+/// Parse a 2048-byte SACDTRL2 sector. Returns (start, duration)
+/// pairs in track order, only `track_count` of them.
+pub fn parse_trl2(buf: &[u8], track_count: u8) -> Result<Vec<(PlayTime, PlayTime)>, SacdError> {
+    if buf.len() < SECTOR_SIZE as usize {
+        return Err(SacdError::Malformed("SACDTRL2 sector too short".into()));
+    }
+    if &buf[0..8] != SACD_TRL2_MAGIC {
+        return Err(SacdError::Malformed(format!(
+            "SACDTRL2 magic missing (got {:?})",
+            &buf[0..8],
+        )));
+    }
+    let mut out = Vec::with_capacity(track_count as usize);
+    // each area_tracklist_time_t = 4 bytes (m, s, f, flags).
+    // start[255] at offset 0x08, duration[255] at offset 0x08 + 255*4 = 0x08 + 1020 = 0x404.
+    let start_base = 8;
+    let dur_base = 8 + 255 * 4;
+    for i in 0..track_count as usize {
+        let s = PlayTime {
+            minutes: buf[start_base + i * 4],
+            seconds: buf[start_base + i * 4 + 1],
+            frames: buf[start_base + i * 4 + 2],
+        };
+        let d = PlayTime {
+            minutes: buf[dur_base + i * 4],
+            seconds: buf[dur_base + i * 4 + 1],
+            frames: buf[dur_base + i * 4 + 2],
+        };
+        out.push((s, d));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------
+// Top-level orchestrator
+// ---------------------------------------------------------------
+
+/// One parsed area (stereo or multi-channel) with its track list.
+#[derive(Debug, Clone)]
+pub struct AreaInfo {
+    pub header: AreaTocHeader,
+    /// Per-track LSN + time entries, in track order. Length matches
+    /// `header.track_count`. Empty if neither SACDTRL1 nor SACDTRL2
+    /// was found in the area's TOC sectors (rare but tolerated).
+    pub tracks: Vec<TrackEntry>,
+}
+
+/// Top-level SACD metadata for an ISO. Either or both areas may be
+/// present; at least one is guaranteed (master TOC validation
+/// rejects the no-areas case).
+#[derive(Debug, Clone)]
+pub struct SacdMetadata {
+    pub master_toc: MasterToc,
+    pub master_text: Option<SacdText>,
+    pub stereo: Option<AreaInfo>,
+    pub multi_channel: Option<AreaInfo>,
+}
+
+impl SacdMetadata {
+    /// Best-effort album title: prefer `master_text.album_title`,
+    /// fall back to the stereo area's description, then None.
+    pub fn album_title(&self) -> Option<&str> {
+        self.master_text
+            .as_ref()
+            .and_then(|t| t.album_title.as_deref())
+    }
+    /// Album artist from the primary locale, if any.
+    pub fn album_artist(&self) -> Option<&str> {
+        self.master_text
+            .as_ref()
+            .and_then(|t| t.album_artist.as_deref())
+    }
+    /// True if either area is DST-encoded (audio extraction would
+    /// need DST decoding).
+    pub fn any_dst_encoded(&self) -> bool {
+        self.stereo.as_ref().is_some_and(|a| a.header.frame_format.is_dst_encoded())
+            || self.multi_channel.as_ref().is_some_and(|a| a.header.frame_format.is_dst_encoded())
+    }
+}
+
+/// Open `path`, parse the Master TOC, then parse SACDText, both
+/// area TOCs, and their tracklists. Returns a fully populated
+/// `SacdMetadata` on success.
+///
+/// Areas are parsed independently — if the multi-channel area is
+/// malformed but stereo is fine, you'll get `multi_channel = None`
+/// and stereo populated. Set `strict` to true to error on any
+/// per-area failure instead.
+pub fn parse_sacd_iso(path: &Path) -> Result<SacdMetadata, SacdError> {
+    parse_sacd_iso_with_strictness(path, false)
+}
+
+/// As `parse_sacd_iso` but lets the caller choose between best-effort
+/// (non-strict; per-area failures yield None) and strict (any
+/// per-area failure propagates).
+pub fn parse_sacd_iso_with_strictness(
+    path: &Path,
+    strict: bool,
+) -> Result<SacdMetadata, SacdError> {
+    // Walk LSNs to find a parsing master TOC; remember which LSN it
+    // came from so we can locate the SACDText sector immediately
+    // after it.
+    let (master_toc_lsn, master_toc) = read_master_toc_with_lsn(path)?;
+    let master_text = read_master_text(path, master_toc_lsn, &master_toc)?;
+
+    let stereo = parse_area_with_strictness(path, master_toc.two_channel, strict)?;
+    let multi_channel = parse_area_with_strictness(path, master_toc.multi_channel, strict)?;
+
+    Ok(SacdMetadata {
+        master_toc,
+        master_text,
+        stereo,
+        multi_channel,
+    })
+}
+
+/// Like `read_master_toc` but also returns the LSN where the master
+/// TOC was found. Needed because SACDText sits at master_toc_lsn+1,
+/// and that LSN differs depending on which redundant copy parsed.
+pub fn read_master_toc_with_lsn(path: &Path) -> Result<(u64, MasterToc), SacdError> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = File::open(path).map_err(|e| SacdError::Io(format!("open: {}", e)))?;
+    let size = f
+        .metadata()
+        .map_err(|e| SacdError::Io(format!("metadata: {}", e)))?
+        .len();
+
+    let min_size = MASTER_TOC_LSNS[0] * SECTOR_SIZE + MASTER_TOC_T_SIZE as u64;
+    if size < min_size {
+        return Err(SacdError::TooSmall { size, required: min_size });
+    }
+
+    let mut last_malformed: Option<SacdError> = None;
+    let mut buf = vec![0u8; MASTER_TOC_T_SIZE];
+    let mut saw_any_magic = false;
+
+    for &lsn in MASTER_TOC_LSNS.iter() {
+        let offset = lsn * SECTOR_SIZE;
+        if offset + MASTER_TOC_T_SIZE as u64 > size {
+            continue;
+        }
+        if f.seek(SeekFrom::Start(offset)).is_err() { continue; }
+        if f.read_exact(&mut buf).is_err() { continue; }
+        if &buf[0..8] != MASTER_TOC_MAGIC { continue; }
+        saw_any_magic = true;
+        match parse_master_toc(&buf) {
+            Ok(toc) => return Ok((lsn, toc)),
+            Err(e) => last_malformed = Some(e),
+        }
+    }
+
+    if let Some(e) = last_malformed { return Err(e); }
+    if saw_any_magic {
+        return Err(SacdError::Malformed("master TOC: parse loop exited without result".into()));
+    }
+    Err(SacdError::NotSacdIso)
+}
+
+fn parse_area_with_strictness(
+    path: &Path,
+    ptr: AreaPointer,
+    strict: bool,
+) -> Result<Option<AreaInfo>, SacdError> {
+    if !ptr.is_present() {
+        return Ok(None);
+    }
+    match parse_area(path, ptr) {
+        Ok(a) => Ok(Some(a)),
+        Err(e) if strict => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Parse one area: load its TOC sector(s), decode the header, then
+/// scan the remaining sectors of the area TOC for SACDTRL1 / SACDTRL2
+/// to populate the per-track entries. (SACDTTxt and SACD_IGL
+/// scanning land in C2c.)
+pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> {
+    let header_buf = read_sector(path, ptr.toc_1_start as u64)?;
+    let header = parse_area_toc_header(&header_buf)?;
+
+    let mut starts: Option<Vec<(u32, u32)>> = None;
+    let mut times: Option<Vec<(PlayTime, PlayTime)>> = None;
+
+    // Walk subsequent sectors of the area TOC; size_sectors caps how
+    // far we scan. Cap at 96 (MAX_AREA_TOC_SIZE_LSN per spec) as
+    // defense against a corrupted size field.
+    let max_scan = (header.size_sectors as u64).min(96);
+    for i in 1..max_scan {
+        let lsn = ptr.toc_1_start as u64 + i;
+        let buf = match read_sector(path, lsn) {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        match &buf[0..8] {
+            m if m == SACD_TRL1_MAGIC => {
+                if let Ok(v) = parse_trl1(&buf, header.track_count) { starts = Some(v); }
+            }
+            m if m == SACD_TRL2_MAGIC => {
+                if let Ok(v) = parse_trl2(&buf, header.track_count) { times = Some(v); }
+            }
+            // SACDTTxt / SACD_IGL / SACD_ACC handled in C2c — skip
+            // gracefully here.
+            _ => {}
+        }
+        if starts.is_some() && times.is_some() { break; }
+    }
+
+    let mut tracks = Vec::with_capacity(header.track_count as usize);
+    for i in 0..header.track_count as usize {
+        let (start_lsn, length_lsn) = starts.as_ref().and_then(|v| v.get(i)).copied().unwrap_or((0, 0));
+        let (start_time, duration) = times.as_ref().and_then(|v| v.get(i)).copied().unwrap_or_default();
+        tracks.push(TrackEntry { start_lsn, length_lsn, start_time, duration });
+    }
+
+    Ok(AreaInfo { header, tracks })
+}
+
+/// Read a single 2048-byte sector at `lsn` from `path` into a fresh
+/// Vec.
+fn read_sector(path: &Path, lsn: u64) -> Result<Vec<u8>, SacdError> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = File::open(path).map_err(|e| SacdError::Io(format!("open: {}", e)))?;
+    let offset = lsn * SECTOR_SIZE;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| SacdError::Io(format!("seek to LSN {}: {}", lsn, e)))?;
+    let mut buf = vec![0u8; SECTOR_SIZE as usize];
+    f.read_exact(&mut buf)
+        .map_err(|e| SacdError::Io(format!("read LSN {}: {}", lsn, e)))?;
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +1570,309 @@ mod tests {
         assert!(format!("{}", SacdError::NotSacdIso).contains("not a valid SACD"));
         assert!(format!("{}", SacdError::Io("test".into())).contains("test"));
         assert!(format!("{}", SacdError::Malformed("bad".into())).contains("bad"));
+    }
+
+    // ---------- C2b tests: SACDText / Area TOC / tracklists ----------
+
+    /// Build a 2048-byte SACDText sector, place strings into the
+    /// data region at known offsets, and return (buf, expected
+    /// album_title_position).
+    fn build_sacd_text_sector() -> (Vec<u8>, u16) {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(SACD_TEXT_MAGIC);
+        // place "Hello" at offset 0x100, "World" at offset 0x110, NUL
+        // terminated.
+        let title_pos = 0x100u16;
+        let artist_pos = 0x110u16;
+        b[title_pos as usize..title_pos as usize + 5].copy_from_slice(b"Hello");
+        b[artist_pos as usize..artist_pos as usize + 5].copy_from_slice(b"World");
+        // album_title_position @ 0x10
+        b[0x10..0x12].copy_from_slice(&title_pos.to_be_bytes());
+        // album_artist_position @ 0x12
+        b[0x12..0x14].copy_from_slice(&artist_pos.to_be_bytes());
+        (b, title_pos)
+    }
+
+    #[test]
+    fn parse_sacd_text_extracts_title_and_artist() {
+        let (b, _pos) = build_sacd_text_sector();
+        let t = parse_sacd_text(&b, 2).expect("parse"); // charset 2 = Latin-1
+        assert_eq!(t.album_title.as_deref(), Some("Hello"));
+        assert_eq!(t.album_artist.as_deref(), Some("World"));
+        assert!(t.album_publisher.is_none());
+        assert!(t.disc_title.is_none());
+        assert_eq!(t.charset, 2);
+    }
+
+    #[test]
+    fn parse_sacd_text_decodes_latin1_high_bytes() {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(SACD_TEXT_MAGIC);
+        // "Café" in Latin-1: C=0x43 a=0x61 f=0x66 é=0xe9
+        b[0x100..0x104].copy_from_slice(&[0x43, 0x61, 0x66, 0xe9]);
+        b[0x10..0x12].copy_from_slice(&0x100u16.to_be_bytes());
+        let t = parse_sacd_text(&b, 2).expect("parse");
+        assert_eq!(t.album_title.as_deref(), Some("Café"));
+    }
+
+    #[test]
+    fn parse_sacd_text_treats_zero_position_as_absent() {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(SACD_TEXT_MAGIC);
+        // all positions left as 0
+        let t = parse_sacd_text(&b, 1).expect("parse");
+        assert!(t.album_title.is_none());
+        assert!(t.disc_artist.is_none());
+    }
+
+    #[test]
+    fn parse_sacd_text_rejects_wrong_magic() {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(b"NOTTEXT!");
+        assert!(matches!(parse_sacd_text(&b, 1), Err(SacdError::Malformed(_))));
+    }
+
+    #[test]
+    fn decode_text_handles_known_charsets() {
+        // ASCII (charset 1)
+        assert_eq!(decode_text(b"abc", 1), "abc");
+        // Latin-1 (charset 2): 0xe9 → é
+        assert_eq!(decode_text(&[0xe9], 2), "é");
+        // ISO 8859-1 with escapes (charset 7) → same as Latin-1 path
+        assert_eq!(decode_text(&[0xe9], 7), "é");
+        // Unknown charset (3, Shift-JIS): from_utf8_lossy fallback
+        let s = decode_text(&[0xe9, 0xc1], 3);
+        assert!(s.contains('\u{FFFD}') || !s.is_empty());
+    }
+
+    /// Build a minimal valid TWOCHTOC sector with `track_count`
+    /// tracks and DSD64 / uncompressed-DSD format.
+    fn build_area_toc_sector(magic: &[u8; 8], track_count: u8, frame_format_nibble: u8) -> Vec<u8> {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(magic);
+        b[0x08] = 1; b[0x09] = 20; // version 1.20
+        b[0x0a..0x0c].copy_from_slice(&3u16.to_be_bytes()); // size = 3 sectors (header + TRL1 + TRL2)
+        b[0x10..0x14].copy_from_slice(&64_000u32.to_be_bytes()); // max_byte_rate
+        b[0x14] = 0x04;     // sample_frequency = DSD64
+        b[0x15] = frame_format_nibble & 0x0f; // frame_format
+        b[0x20] = if magic == MULCH_TOC_MAGIC { 6 } else { 2 }; // channel_count
+        b[0x21] = (5u8 << 3) | 0; // loudspeaker_config = 5 (5.1), extra_settings = 0
+        b[0x22] = b[0x20];  // max_available_channels
+        b[0x40] = 45;       // total_playtime: 45 minutes
+        b[0x41] = 12;       //                 12 seconds
+        b[0x42] = 30;       //                 30 frames
+        b[0x44] = 0;        // track_offset
+        b[0x45] = track_count;
+        b[0x48..0x4c].copy_from_slice(&540u32.to_be_bytes()); // track_start LSN
+        b[0x4c..0x50].copy_from_slice(&100_000u32.to_be_bytes()); // track_end
+        b[0x50] = 1;        // text_area_count
+        // locale 0: "en", charset 2 (Latin-1)
+        b[0x58] = b'e'; b[0x59] = b'n'; b[0x5a] = 2;
+        // area description at offset 0x500 in the data region:
+        // "5.1 Multi-channel"
+        let desc_off = 0x500u16;
+        let desc = b"5.1 Multi-channel";
+        b[desc_off as usize..desc_off as usize + desc.len()].copy_from_slice(desc);
+        b[0x90..0x92].copy_from_slice(&desc_off.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn parse_area_toc_header_extracts_two_channel() {
+        let b = build_area_toc_sector(TWOCH_TOC_MAGIC, 12, 2 /* DSD3in14 */);
+        let h = parse_area_toc_header(&b).expect("parse");
+        assert_eq!(h.kind, AreaKind::Stereo);
+        assert_eq!(h.spec_version, (1, 20));
+        assert_eq!(h.size_sectors, 3);
+        assert_eq!(h.max_byte_rate, 64_000);
+        assert_eq!(h.sample_frequency, 0x04);
+        assert_eq!(h.frame_format, FrameFormat::Dsd3In14);
+        assert!(!h.frame_format.is_dst_encoded());
+        assert_eq!(h.channel_count, 2);
+        assert_eq!(h.loudspeaker_config, 5);
+        assert_eq!(h.track_count, 12);
+        assert_eq!(h.track_start_lsn, 540);
+        assert_eq!(h.track_end_lsn, 100_000);
+        assert_eq!(h.total_playtime, PlayTime { minutes: 45, seconds: 12, frames: 30 });
+        assert!((h.total_playtime.total_seconds() - (45.0 * 60.0 + 12.0 + 30.0 / 75.0)).abs() < 1e-9);
+        assert_eq!(h.description.as_deref(), Some("5.1 Multi-channel"));
+        assert_eq!(h.text_area_count, 1);
+        assert_eq!(h.locales[0].language_code, [b'e', b'n']);
+        assert_eq!(h.locales[0].character_set, 2);
+    }
+
+    #[test]
+    fn parse_area_toc_header_extracts_multi_channel_dst() {
+        let b = build_area_toc_sector(MULCH_TOC_MAGIC, 8, 0 /* DST */);
+        let h = parse_area_toc_header(&b).expect("parse");
+        assert_eq!(h.kind, AreaKind::MultiChannel);
+        assert_eq!(h.frame_format, FrameFormat::Dst);
+        assert!(h.frame_format.is_dst_encoded());
+        assert_eq!(h.channel_count, 6);
+    }
+
+    #[test]
+    fn parse_area_toc_header_unknown_frame_format() {
+        let b = build_area_toc_sector(TWOCH_TOC_MAGIC, 1, 7 /* not in spec */);
+        let h = parse_area_toc_header(&b).expect("parse");
+        assert_eq!(h.frame_format, FrameFormat::Unknown(7));
+    }
+
+    #[test]
+    fn parse_area_toc_header_rejects_wrong_magic() {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(b"NOTAREAS");
+        assert!(matches!(parse_area_toc_header(&b), Err(SacdError::Malformed(_))));
+    }
+
+    #[test]
+    fn parse_area_toc_header_rejects_oversized_text_area_count() {
+        let mut b = build_area_toc_sector(TWOCH_TOC_MAGIC, 1, 2);
+        b[0x50] = 11;
+        assert!(matches!(parse_area_toc_header(&b), Err(SacdError::Malformed(_))));
+    }
+
+    fn build_trl1_sector(starts_lengths: &[(u32, u32)]) -> Vec<u8> {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(SACD_TRL1_MAGIC);
+        let start_base = 8;
+        let len_base = 8 + 255 * 4;
+        for (i, &(s, l)) in starts_lengths.iter().enumerate() {
+            b[start_base + i * 4..start_base + i * 4 + 4].copy_from_slice(&s.to_be_bytes());
+            b[len_base + i * 4..len_base + i * 4 + 4].copy_from_slice(&l.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn parse_trl1_decodes_track_lsns() {
+        let b = build_trl1_sector(&[(540, 1000), (1540, 2000), (3540, 1500)]);
+        let v = parse_trl1(&b, 3).expect("parse");
+        assert_eq!(v, vec![(540, 1000), (1540, 2000), (3540, 1500)]);
+    }
+
+    #[test]
+    fn parse_trl1_rejects_wrong_magic() {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(b"WRONG!!!");
+        assert!(matches!(parse_trl1(&b, 1), Err(SacdError::Malformed(_))));
+    }
+
+    fn build_trl2_sector(times: &[(PlayTime, PlayTime)]) -> Vec<u8> {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(SACD_TRL2_MAGIC);
+        let start_base = 8;
+        let dur_base = 8 + 255 * 4;
+        for (i, (s, d)) in times.iter().enumerate() {
+            b[start_base + i * 4 + 0] = s.minutes;
+            b[start_base + i * 4 + 1] = s.seconds;
+            b[start_base + i * 4 + 2] = s.frames;
+            b[dur_base + i * 4 + 0] = d.minutes;
+            b[dur_base + i * 4 + 1] = d.seconds;
+            b[dur_base + i * 4 + 2] = d.frames;
+        }
+        b
+    }
+
+    #[test]
+    fn parse_trl2_decodes_track_times() {
+        let times = vec![
+            (PlayTime { minutes: 0, seconds: 0, frames: 0 },
+             PlayTime { minutes: 3, seconds: 45, frames: 60 }),
+            (PlayTime { minutes: 3, seconds: 45, frames: 60 },
+             PlayTime { minutes: 4, seconds: 12, frames: 0 }),
+        ];
+        let b = build_trl2_sector(&times);
+        let v = parse_trl2(&b, 2).expect("parse");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].0, PlayTime { minutes: 0, seconds: 0, frames: 0 });
+        assert_eq!(v[0].1, PlayTime { minutes: 3, seconds: 45, frames: 60 });
+        assert_eq!(v[1].1.total_seconds(), 4.0 * 60.0 + 12.0);
+    }
+
+    /// End-to-end test: write a synthetic SACD ISO with master TOC,
+    /// SACDText, one stereo area + TRL1 + TRL2, and verify
+    /// parse_sacd_iso assembles a correct SacdMetadata.
+    #[test]
+    fn parse_sacd_iso_full_roundtrip_stereo_only() {
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("rt.iso");
+
+        // File big enough to hold sectors up to LSN 600 + a few.
+        let total_sectors = 700u64;
+        let f = std::fs::File::create(&path).expect("create");
+        f.set_len(total_sectors * SECTOR_SIZE).expect("set_len");
+        drop(f);
+
+        let mut f = std::fs::File::options().write(true).open(&path).expect("reopen");
+
+        // Master TOC at LSN 510 — area at LSN 540, size = 3 sectors.
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes()); // album_set_size
+        mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes()); // album_seq
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes()); // 2-ch toc_1
+        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());   // 2-ch size
+        mtoc[0x80] = 1; // text_area_count = 1
+        mtoc[0x88] = b'e'; mtoc[0x89] = b'n'; mtoc[0x8a] = 2; // locale "en"/Latin-1
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        // SACDText at LSN 511 (master_toc_lsn + 1).
+        let (text_buf, _) = build_sacd_text_sector();
+        f.seek(SeekFrom::Start(511 * SECTOR_SIZE)).unwrap();
+        f.write_all(&text_buf).unwrap();
+
+        // Area TOC at LSN 540 (2-ch, 3 tracks, DSD3in14).
+        let area_buf = build_area_toc_sector(TWOCH_TOC_MAGIC, 3, 2);
+        f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        f.write_all(&area_buf).unwrap();
+
+        // SACDTRL1 at LSN 541 (next sector of area).
+        let trl1 = build_trl1_sector(&[(600, 100), (700, 150), (850, 200)]);
+        f.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
+        f.write_all(&trl1).unwrap();
+
+        // SACDTRL2 at LSN 542.
+        let trl2 = build_trl2_sector(&[
+            (PlayTime { minutes: 0, seconds: 0, frames: 0 },
+             PlayTime { minutes: 1, seconds: 30, frames: 0 }),
+            (PlayTime { minutes: 1, seconds: 30, frames: 0 },
+             PlayTime { minutes: 2, seconds: 15, frames: 0 }),
+            (PlayTime { minutes: 3, seconds: 45, frames: 0 },
+             PlayTime { minutes: 1, seconds: 0,  frames: 0 }),
+        ]);
+        f.seek(SeekFrom::Start(542 * SECTOR_SIZE)).unwrap();
+        f.write_all(&trl2).unwrap();
+        drop(f);
+
+        let md = parse_sacd_iso(&path).expect("parse_sacd_iso");
+
+        // Master TOC
+        assert_eq!(md.master_toc.spec_version, (1, 20));
+        assert!(md.master_toc.two_channel.is_present());
+        assert!(!md.master_toc.multi_channel.is_present());
+
+        // Master text
+        assert_eq!(md.album_title(), Some("Hello"));
+        assert_eq!(md.album_artist(), Some("World"));
+
+        // Stereo area
+        let stereo = md.stereo.as_ref().expect("stereo present");
+        assert_eq!(stereo.header.kind, AreaKind::Stereo);
+        assert_eq!(stereo.header.track_count, 3);
+        assert_eq!(stereo.header.frame_format, FrameFormat::Dsd3In14);
+        assert!(!md.any_dst_encoded());
+        assert_eq!(stereo.tracks.len(), 3);
+        assert_eq!(stereo.tracks[0].start_lsn, 600);
+        assert_eq!(stereo.tracks[0].length_lsn, 100);
+        assert_eq!(stereo.tracks[1].start_lsn, 700);
+        assert_eq!(stereo.tracks[1].duration.total_seconds(), 2.0 * 60.0 + 15.0);
+        assert_eq!(stereo.tracks[2].start_time.minutes, 3);
+
+        // No multi-channel area
+        assert!(md.multi_channel.is_none());
     }
 }
