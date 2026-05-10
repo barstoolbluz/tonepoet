@@ -1621,13 +1621,13 @@ fn draw_metadata_editor(
             spans.extend_from_slice(&[
                 footer_pill(":fix-caps", theme::BLUE),
                 pill_gap(),
-                footer_pill("d delete", theme::RED),
+                footer_pill(":d delete", theme::RED),
                 pill_gap(),
-                footer_pill("u undo", theme::AMBER),
+                footer_pill(":u undo", theme::AMBER),
                 pill_gap(),
-                footer_pill("a add", theme::CYAN),
+                footer_pill(":a add", theme::CYAN),
                 pill_gap(),
-                footer_pill("w save", theme::GREEN),
+                footer_pill(":w save", theme::GREEN),
                 pill_gap(),
                 footer_pill("Esc close", theme::PURPLE),
             ]);

@@ -2317,39 +2317,119 @@ pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
 }
 
 /// Handle key events inside the metadata editor overlay.
-/// Dispatch a metadata-editor action by character into the existing
-/// keyboard handler. Used by colon commands (`:add`, `:d`, `:u`,
-/// `:detail`, `:w`) and footer-pill / context-menu mouse paths.
-///
-/// Editor state may live in either `app.active_overlay`
-/// (`ActiveOverlay::MetadataEditor(...)`) for direct keypress dispatch
-/// or in `app.pending_metadata_editor` when the command bar parked it
-/// during user typing. We pull from whichever is set, run the handler,
-/// then restore to `active_overlay` unless the handler opened a
-/// different overlay.
-pub(super) fn dispatch_metadata_editor_keychar(
+/// Open the "add new field" prompt (sets cursor to the add row,
+/// initializes add_key_input, transitions to AddingKey phase).
+pub(super) fn metadata_editor_open_add(state: &mut super::app::MetadataEditorState) {
+    state.cursor = state.entries.len();
+    state.add_key_input = Some(super::text_input::TextInputState::empty());
+    state.phase = super::app::MetadataEditorPhase::AddingKey;
+    ensure_cursor_visible(state);
+}
+
+/// Mark the cursor row for deletion (renders strikethrough until save).
+pub(super) fn metadata_editor_delete_cursor(state: &mut super::app::MetadataEditorState) {
+    if state.cursor < state.entries.len()
+        && !state.deleted.contains(&state.cursor)
+    {
+        state.deleted.push(state.cursor);
+        recalc_dirty(state);
+    }
+}
+
+/// Un-delete the cursor row (removes it from the deleted set).
+pub(super) fn metadata_editor_undelete_cursor(state: &mut super::app::MetadataEditorState) {
+    state.deleted.retain(|&i| i != state.cursor);
+    recalc_dirty(state);
+}
+
+/// Force-open the per-file detail overlay on the cursor entry. Gated
+/// on per_file_values.len() > 1 (so per-track entries on single-image
+/// rips qualify even when paths.len() == 1).
+pub(super) fn metadata_editor_open_detail(state: &mut super::app::MetadataEditorState) {
+    if state.cursor < state.entries.len()
+        && state.entries[state.cursor].per_file_values.len() > 1
+        && !state.entries[state.cursor].is_binary
+        && !state.deleted.contains(&state.cursor)
+    {
+        state.detail_field_idx = state.cursor;
+        state.detail_cursor = 0;
+        state.detail_scroll = 0;
+        state.detail_edit = None;
+        state.last_click = None;
+        state.phase = super::app::MetadataEditorPhase::DetailEdit;
+    }
+}
+
+/// Save tags to disk. Runs Phase 4's CUESHEET regen (β album re-derive
+/// + per-track-edit overrides) before snapshotting; refuses save on a
+/// dirty per-track entry without a CUESHEET anchor. Skips per-track
+/// entries from lofty's per-file write loop (their truth is the
+/// regenerated CUESHEET tag).
+pub(super) fn metadata_editor_save(
     app: &mut AppState,
-    ch: char,
+    state: &mut super::app::MetadataEditorState,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    let mut state = if let Some(s) = app.pending_metadata_editor.take() {
-        s
-    } else {
-        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
-        if let ActiveOverlay::MetadataEditor(s) = overlay { s } else { return; }
-    };
-    let fake = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
-    handle_metadata_editor_key(app, fake, &mut state, tx);
-    if matches!(app.active_overlay, ActiveOverlay::None) {
-        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+    if !state.dirty {
+        app.set_status("No changes to save");
+        return;
     }
+    if let Err(reason) = regenerate_cuesheet_for_save(state) {
+        app.set_status(reason);
+        return;
+    }
+    state.phase = super::app::MetadataEditorPhase::Saving;
+    let paths = state.paths.clone();
+    let deleted = state.deleted.clone();
+    let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> =
+        state.entries.iter().map(|e| (
+            e.item_key.clone(),
+            e.per_file_values.clone(),
+            e.per_file_originals.clone(),
+        )).collect();
+
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut results = Vec::new();
+        for (file_idx, path) in paths.iter().enumerate() {
+            let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
+            for (entry_idx, (key, vals, origs)) in entries_snap.iter().enumerate() {
+                // Phase 4 Step B: per-track entries (vals.len() !=
+                // paths.len()) round-trip through the regenerated
+                // CUESHEET tag — no per-file lofty home.
+                if vals.len() != paths.len() {
+                    continue;
+                }
+                if deleted.contains(&entry_idx) {
+                    changes.push((key.clone(), None));
+                } else if file_idx < vals.len() && file_idx < origs.len() {
+                    if vals[file_idx] != origs[file_idx] {
+                        changes.push((
+                            key.clone(),
+                            Some(vals[file_idx].clone()),
+                        ));
+                    }
+                }
+            }
+            if !changes.is_empty() {
+                let r = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || crate::tui::probe::write_all_tags(&path, &changes)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+                results.push((path.clone(), r));
+            }
+        }
+        let _ = tx.send(AppMessage::MetadataEditorWriteComplete { results }).await;
+    });
 }
 
 fn handle_metadata_editor_key(
     app: &mut AppState,
     key: KeyEvent,
     state: &mut Box<super::app::MetadataEditorState>,
-    tx: &mpsc::Sender<AppMessage>,
+    _tx: &mpsc::Sender<AppMessage>,
 ) {
     use super::app::MetadataEditorPhase;
 
@@ -2416,109 +2496,12 @@ fn handle_metadata_editor_key(
                         state.phase = MetadataEditorPhase::AddingKey;
                     }
                 }
-                KeyCode::Char('a') => {
-                    // Jump to "Add field" and start adding.
-                    state.cursor = state.entries.len();
-                    state.add_key_input = Some(
-                        super::text_input::TextInputState::empty(),
-                    );
-                    state.phase = MetadataEditorPhase::AddingKey;
-                    ensure_cursor_visible(state);
-                }
-                KeyCode::Char('d') => {
-                    if state.cursor < state.entries.len()
-                        && !state.deleted.contains(&state.cursor)
-                    {
-                        state.deleted.push(state.cursor);
-                        recalc_dirty(state);
-                    }
-                }
-                KeyCode::Char('u') => {
-                    // Undo delete for the focused entry.
-                    state.deleted.retain(|&i| i != state.cursor);
-                    recalc_dirty(state);
-                }
-                // D = force-open detail overlay (even for non-mixed fields).
-                KeyCode::Char('D') => {
-                    if state.cursor < state.entries.len()
-                        && state.entries[state.cursor].per_file_values.len() > 1
-                        && !state.entries[state.cursor].is_binary
-                        && !state.deleted.contains(&state.cursor)
-                    {
-                        state.detail_field_idx = state.cursor;
-                        state.detail_cursor = 0;
-                        state.detail_scroll = 0;
-                        state.detail_edit = None;
-                        state.last_click = None;
-                        state.phase = MetadataEditorPhase::DetailEdit;
-                    }
-                }
-                KeyCode::Char('w') => {
-                    if !state.dirty {
-                        app.set_status("No changes to save");
-                        return;
-                    }
-                    // Phase 4 Step A: regenerate the embedded CUESHEET
-                    // from per-track edits + β album-level re-derive
-                    // before snapshotting. State is mutated in place;
-                    // the snapshot below picks up the new CUESHEET tag
-                    // value as a normal dirty entry. Refuses save when
-                    // per-track edits exist but no CUESHEET anchor is
-                    // present.
-                    if let Err(reason) = regenerate_cuesheet_for_save(state) {
-                        app.set_status(reason);
-                        return;
-                    }
-                    // Build per-file change lists and spawn async writes.
-                    state.phase = MetadataEditorPhase::Saving;
-                    let paths = state.paths.clone();
-                    let deleted = state.deleted.clone();
-                    let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> =
-                        state.entries.iter().map(|e| (
-                            e.item_key.clone(),
-                            e.per_file_values.clone(),
-                            e.per_file_originals.clone(),
-                        )).collect();
-
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let mut results = Vec::new();
-                        for (file_idx, path) in paths.iter().enumerate() {
-                            let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
-                            for (entry_idx, (key, vals, origs)) in entries_snap.iter().enumerate() {
-                                // Phase 4 Step B: per-track entries
-                                // (vals.len() != paths.len()) round-
-                                // trip through the regenerated CUESHEET
-                                // tag — they have no per-file lofty
-                                // home, and writing vals[0] would
-                                // clobber the file's album-level tag
-                                // with track 0's value. Skip.
-                                if vals.len() != paths.len() {
-                                    continue;
-                                }
-                                if deleted.contains(&entry_idx) {
-                                    changes.push((key.clone(), None));
-                                } else if file_idx < vals.len() && file_idx < origs.len() {
-                                    if vals[file_idx] != origs[file_idx] {
-                                        changes.push((
-                                            key.clone(),
-                                            Some(vals[file_idx].clone()),
-                                        ));
-                                    }
-                                }
-                            }
-                            if !changes.is_empty() {
-                                let r = tokio::task::spawn_blocking({
-                                    let path = path.clone();
-                                    move || crate::tui::probe::write_all_tags(&path, &changes)
-                                })
-                                .await
-                                .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
-                                results.push((path.clone(), r));
-                            }
-                        }
-                        let _ = tx.send(AppMessage::MetadataEditorWriteComplete { results }).await;
-                    });
+                // Delete-key convenience: same action as :d. The
+                // bare-char `a`/`d`/`D`/`u`/`w` bindings have been
+                // removed (no-bare-char-keys rule); user invokes them
+                // via colon commands or footer-pill clicks.
+                KeyCode::Delete => {
+                    metadata_editor_delete_cursor(state);
                 }
                 _ => {}
             }
@@ -5171,10 +5154,10 @@ fn handle_metadata_editor_mouse(
                     }
                     pills.extend_from_slice(&[
                         (":fix-caps", ":fix-caps"),
-                        ("d delete", "d"),
-                        ("u undo", "u"),
-                        ("a add", "a"),
-                        ("w save", "w"),
+                        (":d delete", ":d"),
+                        (":u undo", ":u"),
+                        (":a add", ":a"),
+                        (":w save", ":w"),
                         ("Esc close", "esc"),
                     ]);
                     if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
@@ -5185,38 +5168,6 @@ fn handle_metadata_editor_mouse(
                             return;
                         }
                         match action {
-                            "d" => {
-                                let fake_key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
-                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
-                                if !matches!(app.active_overlay, ActiveOverlay::None) {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                }
-                                return;
-                            }
-                            "u" => {
-                                let fake_key = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
-                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
-                                if !matches!(app.active_overlay, ActiveOverlay::None) {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                }
-                                return;
-                            }
-                            "a" => {
-                                let fake_key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
-                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
-                                if !matches!(app.active_overlay, ActiveOverlay::None) {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                }
-                                return;
-                            }
-                            "w" => {
-                                let fake_key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
-                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
-                                if !matches!(app.active_overlay, ActiveOverlay::None) {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                }
-                                return;
-                            }
                             "esc" => {
                                 app.active_overlay = ActiveOverlay::None;
                                 return;

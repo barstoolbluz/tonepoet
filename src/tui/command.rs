@@ -512,6 +512,57 @@ pub fn parse_command(input: &str) -> Command {
 }
 
 /// Execute a parsed command against app state
+/// Run `f` on the active metadata editor state. State may be parked
+/// in `pending_metadata_editor` (colon command from the command bar)
+/// or live in `active_overlay` (mouse-pill click that restored before
+/// dispatching). Restores state to active_overlay after `f` runs,
+/// unless `f` (or something it called) set a different overlay.
+fn with_editor_state<F>(app: &mut AppState, mut f: F)
+where
+    F: FnMut(&mut super::app::MetadataEditorState),
+{
+    let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
+        parked
+    } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
+        let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+        if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
+        else { unreachable!() }
+    } else {
+        app.set_status("metadata-editor command requires the editor to be active");
+        return;
+    };
+    f(&mut state);
+    if matches!(app.active_overlay, super::app::ActiveOverlay::None) {
+        app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+    }
+}
+
+/// Like `with_editor_state` but also threads `app` and `tx` into the
+/// closure. Used by `:w` save which needs both.
+fn with_editor_state_and_tx<F>(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    mut f: F,
+)
+where
+    F: FnMut(&mut AppState, &mut super::app::MetadataEditorState, &mpsc::Sender<AppMessage>),
+{
+    let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
+        parked
+    } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
+        let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+        if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
+        else { unreachable!() }
+    } else {
+        app.set_status("metadata-editor command requires the editor to be active");
+        return;
+    };
+    f(app, &mut state, tx);
+    if matches!(app.active_overlay, super::app::ActiveOverlay::None) {
+        app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+    }
+}
+
 pub fn execute_command(
     app: &mut AppState,
     cmd: Command,
@@ -536,7 +587,8 @@ pub fn execute_command(
             if app.pending_metadata_editor.is_some()
                 || matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_))
             {
-                super::keybindings::dispatch_metadata_editor_keychar(app, 'w', tx);
+                with_editor_state_and_tx(app, tx, |app, state, tx|
+                    super::keybindings::metadata_editor_save(app, state, tx));
                 return;
             }
             // If a CUE preview is parked, :w writes the previewed CUE.
@@ -1483,16 +1535,16 @@ pub fn execute_command(
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
         Command::MetaAdd => {
-            super::keybindings::dispatch_metadata_editor_keychar(app, 'a', tx);
+            with_editor_state(app, |state| super::keybindings::metadata_editor_open_add(state));
         }
         Command::MetaDelete => {
-            super::keybindings::dispatch_metadata_editor_keychar(app, 'd', tx);
+            with_editor_state(app, |state| super::keybindings::metadata_editor_delete_cursor(state));
         }
         Command::MetaUndelete => {
-            super::keybindings::dispatch_metadata_editor_keychar(app, 'u', tx);
+            with_editor_state(app, |state| super::keybindings::metadata_editor_undelete_cursor(state));
         }
         Command::MetaDetail => {
-            super::keybindings::dispatch_metadata_editor_keychar(app, 'D', tx);
+            with_editor_state(app, |state| super::keybindings::metadata_editor_open_detail(state));
         }
         Command::MbBack => {
             // Editor state may be in pending (colon command from
