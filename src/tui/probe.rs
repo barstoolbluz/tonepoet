@@ -358,21 +358,28 @@ fn probe_sacd(path: &Path) -> Result<SourceInfo, String> {
     } else if let Some(mch) = md.multi_channel.as_ref() {
         (mch, "MCH")
     } else {
-        // parse_sacd_iso already rejects no-area discs via the
-        // master TOC validation, but defensive belt-and-braces:
+        // Triggered when the master TOC pointed at one or both areas
+        // but every area parse failed (parse_sacd_iso runs in
+        // best-effort mode by default — per-area errors yield None).
+        // The all-areas-zero case is rejected earlier by
+        // parse_master_toc, so this Err means "areas declared but
+        // unreadable", not "no areas declared".
         return Err(format!(
-            "SACD '{}' has no readable areas",
+            "SACD '{}': declared areas all failed to parse",
             path.display(),
         ));
     };
 
     let channels = area.header.channel_count as u32;
-    let channel_layout = match (channels, area.header.loudspeaker_config) {
-        (2, _) => "stereo".to_string(),
-        (5, _) => "5.0".to_string(),
-        (6, 5) => "5.1".to_string(),
-        (6, _) => "5.1".to_string(),
-        (n, _) => format!("{} ch", n),
+    // SACD multi-channel discs are essentially always 5.1 (loudspeaker
+    // config 5 in the spec), and 5-channel-only is "5.0". We don't try
+    // to enumerate every loudspeaker_config nibble — those uncommon
+    // configs render as "N ch" via the catch-all.
+    let channel_layout = match channels {
+        2 => "stereo".to_string(),
+        5 => "5.0".to_string(),
+        6 => "5.1".to_string(),
+        n => format!("{} ch", n),
     };
 
     let duration_secs = area.header.total_playtime.total_seconds();
@@ -541,10 +548,9 @@ fn read_metadata_sacd(path: &Path) -> Result<SourceMetadata, String> {
         }
     }
 
+    // disc_date is None when year was 0; no extra year-validity check needed.
     if let Some(date) = md.master_toc.disc_date {
-        if date.year > 0 {
-            meta.year = Some(date.year.to_string());
-        }
+        meta.year = Some(date.year.to_string());
     }
 
     if !md.master_toc.album_catalog_number.is_empty() {
@@ -1788,21 +1794,85 @@ mod tests {
     }
 
     #[test]
-    fn probe_audio_passes_through_non_sacd_path() {
-        // No SACD magic → the SACD branch must not intercept; we
-        // expect the ffmpeg branch to error on the non-existent
-        // empty file (proves we reached it). This is a regression
-        // guard against a false-positive sacd::is_sacd_iso.
+    fn probe_audio_passes_through_non_sacd_iso_with_no_magic() {
+        // Build a 2 MB ISO (large enough to clear is_sacd_iso's
+        // size threshold of 1,044,488 bytes) but with NO ScarletBook
+        // magic anywhere. is_sacd_iso must reject it via the magic
+        // check (not the size shortcut), so probe_audio must drop
+        // through to ffmpeg.
         let td = tempfile::tempdir().unwrap();
-        let path = td.path().join("not.iso");
-        std::fs::write(&path, b"\x00\x00\x00\x00").unwrap();
-        let res = probe_audio(&path);
-        // Either ffmpeg errored (most likely) or it returned info —
-        // both are acceptable. What we want to confirm is that we
-        // did NOT short-circuit through probe_sacd (which would
-        // return a SACD parse error message containing "SACD").
-        if let Err(e) = &res {
-            assert!(!e.contains("SACD"), "should not have hit SACD branch: {}", e);
+        let path = td.path().join("plain_data.iso");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(2 * 1024 * 1024).unwrap(); // 2 MB of zeros
+        drop(f);
+
+        // Confirm the SACD detector says no.
+        assert!(!crate::tui::sacd::is_sacd_iso(&path),
+            "synthetic ISO should not match SACD magic");
+
+        // probe_audio should error from ffmpeg (zeros aren't a valid
+        // audio container) — and the error must not be the SACD
+        // parser's fingerprint.
+        match probe_audio(&path) {
+            Ok(_) => panic!("ffmpeg should not synthesize info from zeros"),
+            Err(e) => {
+                assert!(!e.contains("SACD parse failed"),
+                    "should have reached ffmpeg, not SACD branch: {}", e);
+            }
         }
+    }
+
+    #[test]
+    fn probe_sacd_returns_err_on_magic_but_malformed_master_toc() {
+        // File has SACDMTOC magic at LSN 510 but the rest of the
+        // master_toc_t is all zeros — parse_master_toc rejects this
+        // because both area pointers are 0 ("no playable areas").
+        // is_sacd_iso passes the cheap magic-byte check; probe_sacd
+        // must therefore propagate the parser's Err rather than
+        // silently fall through.
+        use std::io::{Seek, SeekFrom, Write};
+        use crate::tui::sacd::*;
+
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("magic_only.iso");
+        let total_sectors = 700u64;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total_sectors * SECTOR_SIZE).unwrap();
+        drop(f);
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(MASTER_TOC_LSNS[0] * SECTOR_SIZE)).unwrap();
+        f.write_all(MASTER_TOC_MAGIC).unwrap();
+        // The remaining 160 bytes of the master_toc_t stay zero,
+        // which means area_1_toc_1_start = 0 AND area_2_toc_1_start = 0,
+        // tripping parse_master_toc's no-playable-areas guard.
+        drop(f);
+
+        assert!(is_sacd_iso(&path), "magic should be detected");
+        let res = probe_audio(&path);
+        match res {
+            Err(e) => assert!(
+                e.contains("SACD parse failed") && e.contains("no playable areas"),
+                "unexpected error message: {}", e,
+            ),
+            Ok(_) => panic!("probe_sacd should reject malformed master TOC"),
+        }
+    }
+
+    #[test]
+    fn probe_sacd_dst_multi_channel_format_name() {
+        // High-bit-rate 5.1 SACDs nearly always use DST. The
+        // format_name marker should call out both DST encoding
+        // and the MCH area selection.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("dst_mch.iso");
+        // Stereo absent, multi-channel present, DST-encoded.
+        write_sacd_iso(&path, false, true, true, None, None, 0, None, 75);
+        let info = probe_audio(&path).expect("probe");
+        assert!(info.format_name.contains("DST"),
+            "format_name should mark DST: got {}", info.format_name);
+        assert!(info.format_name.contains("MCH"),
+            "format_name should mark MCH: got {}", info.format_name);
+        assert_eq!(info.channels, 6);
+        assert_eq!(info.channel_layout, "5.1");
     }
 }
