@@ -571,6 +571,7 @@ fn render_entry_line(
                 }
             }
             EntryKind::Archive => Style::default().fg(theme::AMBER),
+            EntryKind::SacdIso => Style::default().fg(theme::PURPLE),
             EntryKind::OtherFile => Style::default().fg(theme::TEXT_DIM),
         }
     };
@@ -1162,6 +1163,16 @@ fn entry_info_lines(
             lines.push(vec![
                 Span::styled("   kind    ", theme::muted()),
                 Span::styled("archive (7z)", theme::text()),
+            ]);
+            lines.push(vec![
+                Span::styled("   size    ", theme::muted()),
+                Span::styled(size_str(entry.size), theme::text()),
+            ]);
+        }
+        EntryKind::SacdIso => {
+            lines.push(vec![
+                Span::styled("   kind    ", theme::muted()),
+                Span::styled("SACD ISO (ScarletBook)", theme::text()),
             ]);
             lines.push(vec![
                 Span::styled("   size    ", theme::muted()),

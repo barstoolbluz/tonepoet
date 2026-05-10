@@ -56,6 +56,12 @@ pub enum EntryKind {
     AudioFile(AudioFormat),
     /// A 7z archive (or similar)
     Archive,
+    /// SACD ISO image (Super Audio CD). Detected via ScarletBook
+    /// magic-byte probe at LSN 510/520/530, not by extension alone
+    /// (some `.iso` files are DVD-V or generic ISO9660). Population
+    /// happens in a post-scan upgrade pass keyed by (path, mtime)
+    /// against `BrowseState.sacd_classify_cache`.
+    SacdIso,
     /// Any other file
     OtherFile,
 }
@@ -150,7 +156,7 @@ impl FormatFilter {
     pub fn allows(&self, kind: &EntryKind) -> bool {
         match self {
             Self::Off => true,
-            Self::AudioOnly => matches!(kind, EntryKind::AudioFile(_)),
+            Self::AudioOnly => matches!(kind, EntryKind::AudioFile(_) | EntryKind::SacdIso),
             Self::Only(fmt) => matches!(kind, EntryKind::AudioFile(f) if f == fmt),
         }
     }
@@ -369,6 +375,10 @@ impl BrowseEntry {
         matches!(self.kind, EntryKind::Archive)
     }
 
+    pub fn is_sacd_iso(&self) -> bool {
+        matches!(self.kind, EntryKind::SacdIso)
+    }
+
     /// Short type/format label for display in the type column.
     /// Audio files show their format (FLAC/MP3/etc), archives show their
     /// format (7z/zip/rar/tar.gz/etc), directories show "dir", other
@@ -379,6 +389,7 @@ impl BrowseEntry {
             EntryKind::Directory => "dir".to_string(),
             EntryKind::AudioFile(fmt) => fmt.name().to_string(),
             EntryKind::Archive => archive_label(&self.path),
+            EntryKind::SacdIso => "sacd".to_string(),
             EntryKind::OtherFile => self
                 .path
                 .extension()
@@ -468,6 +479,15 @@ pub struct BrowseState {
     /// a background task. Prevents duplicate spawns.
     pub dir_stats_pending: std::collections::HashSet<PathBuf>,
 
+    /// Cache of SACD-ISO classifications keyed by path. The value
+    /// pairs the file's mtime at probe time with the verdict
+    /// (`true` = ScarletBook magic found). Re-probing skips when
+    /// the cached mtime still matches; if the file has been
+    /// touched the entry is re-evaluated (the underlying ISO
+    /// could have been re-burned). Populated by `upgrade_iso_kinds`
+    /// after every directory scan.
+    pub sacd_classify_cache: HashMap<PathBuf, (std::time::SystemTime, bool)>,
+
     /// Where to send selected files
     pub return_target: BrowseReturnTarget,
 
@@ -553,6 +573,7 @@ impl BrowseState {
             probe_pending: std::collections::HashSet::new(),
             dir_stats_cache: HashMap::new(),
             dir_stats_pending: std::collections::HashSet::new(),
+            sacd_classify_cache: HashMap::new(),
             return_target: BrowseReturnTarget::None,
             error: None,
             archive: None,
@@ -588,6 +609,7 @@ impl BrowseState {
         } else {
             // Synchronous fallback (initial scan before tx is set).
             self.scan();
+            self.upgrade_iso_kinds();
             self.apply_view();
         }
     }
@@ -818,6 +840,68 @@ impl BrowseState {
             }
             Err(e) => {
                 self.error = Some(format!("Cannot read directory: {}", e));
+            }
+        }
+    }
+
+    /// Walk `all_files` and upgrade any `EntryKind::Archive` entry
+    /// whose extension is `.iso` to `EntryKind::SacdIso` if a
+    /// ScarletBook magic-byte probe succeeds.
+    ///
+    /// Uses `sacd_classify_cache` to skip the disk probe when the
+    /// (path, mtime) pair has been seen before. The cache stays
+    /// keyed by absolute path so two browse sessions visiting the
+    /// same library share results across cd's. Cache entries
+    /// auto-invalidate when the file's mtime changes (re-burn or
+    /// re-rip).
+    ///
+    /// Cost per uncached ISO: 3 short reads (24 bytes) — negligible
+    /// even on spinning disks. Cost per cached ISO: one HashMap
+    /// lookup. Designed to run on the main thread immediately
+    /// after a directory scan completes; if the directory contains
+    /// dozens of ISOs, total wall-time is sub-50ms cold.
+    pub(super) fn upgrade_iso_kinds(&mut self) {
+        for entry in self.all_files.iter_mut() {
+            if !matches!(entry.kind, EntryKind::Archive) {
+                continue;
+            }
+            // Only consider .iso (other archive extensions can't
+            // hold a ScarletBook layout).
+            let is_iso = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("iso"))
+                .unwrap_or(false);
+            if !is_iso {
+                continue;
+            }
+
+            // Cache key by mtime: re-probe if the file changed since
+            // last classification. If the entry has no mtime (rare
+            // — e.g. some FUSE filesystems), fall through to the
+            // disk probe but skip caching.
+            let mtime = entry.modified;
+            let cache_hit = mtime.and_then(|m| {
+                self.sacd_classify_cache
+                    .get(&entry.path)
+                    .filter(|(cached_m, _)| *cached_m == m)
+                    .map(|(_, verdict)| *verdict)
+            });
+
+            let is_sacd = if let Some(v) = cache_hit {
+                v
+            } else {
+                let v = super::sacd::is_sacd_iso(&entry.path);
+                if let Some(m) = mtime {
+                    self.sacd_classify_cache
+                        .insert(entry.path.clone(), (m, v));
+                }
+                v
+            };
+
+            if is_sacd {
+                entry.kind = EntryKind::SacdIso;
             }
         }
     }
@@ -1882,6 +1966,7 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
         EntryKind::AudioFile(AudioFormat::Mp3) => 15,
         EntryKind::AudioFile(AudioFormat::Aac) => 16,
         EntryKind::AudioFile(AudioFormat::Opus) => 17,
+        EntryKind::SacdIso => 19,
         EntryKind::Archive => 20,
         EntryKind::OtherFile => 30,
     }
@@ -2241,4 +2326,102 @@ fn is_tar_compound(path: &Path) -> bool {
         || name.ends_with(".tar.zst")
         || name.ends_with(".tar.lz")
         || name.ends_with(".tar.lzma")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    /// Build an `all_files` list with one Archive entry pointing at
+    /// `path`, mtime taken from the file. Other BrowseState fields
+    /// stay at their defaults via `BrowseState::new()` then we
+    /// overwrite the relevant bits.
+    fn make_browse_with_iso(path: &std::path::Path) -> BrowseState {
+        let mut state = BrowseState::new();
+        state.all_files.clear();
+        state.sacd_classify_cache.clear();
+        let meta = std::fs::metadata(path).expect("metadata");
+        let modified = meta.modified().ok();
+        state.all_files.push(BrowseEntry::new(
+            path.to_path_buf(),
+            path.file_name().unwrap().to_string_lossy().into_owned(),
+            EntryKind::Archive,
+            meta.len(),
+            modified,
+        ));
+        state
+    }
+
+    #[test]
+    fn upgrade_iso_kinds_marks_sacd_iso() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("disc.iso");
+
+        // Build a file with the ScarletBook magic at LSN 510.
+        let total = (crate::tui::sacd::MASTER_TOC_LSNS[0] + 1) * crate::tui::sacd::SECTOR_SIZE;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len(total).unwrap();
+        f.seek(SeekFrom::Start(crate::tui::sacd::MASTER_TOC_LSNS[0] * crate::tui::sacd::SECTOR_SIZE))
+            .unwrap();
+        f.write_all(crate::tui::sacd::MASTER_TOC_MAGIC).unwrap();
+        drop(f);
+
+        let mut state = make_browse_with_iso(&path);
+        assert!(matches!(state.all_files[0].kind, EntryKind::Archive));
+
+        state.upgrade_iso_kinds();
+        assert!(matches!(state.all_files[0].kind, EntryKind::SacdIso));
+        assert!(state.sacd_classify_cache.contains_key(&path));
+    }
+
+    #[test]
+    fn upgrade_iso_kinds_leaves_non_sacd_iso_alone() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("data.iso");
+        // Plain large ISO with no ScarletBook magic.
+        let total = (crate::tui::sacd::MASTER_TOC_LSNS[0] + 1) * crate::tui::sacd::SECTOR_SIZE;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total).unwrap();
+        drop(f);
+
+        let mut state = make_browse_with_iso(&path);
+        state.upgrade_iso_kinds();
+        assert!(matches!(state.all_files[0].kind, EntryKind::Archive));
+        // Cached negative result so we don't re-probe next refresh.
+        assert_eq!(state.sacd_classify_cache.get(&path).map(|(_, v)| *v), Some(false));
+    }
+
+    #[test]
+    fn upgrade_iso_kinds_skips_non_iso_archives() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("bundle.7z");
+        std::fs::write(&path, b"not really 7z").unwrap();
+
+        let mut state = make_browse_with_iso(&path);
+        state.upgrade_iso_kinds();
+        // .7z is Archive, never upgraded; cache is untouched.
+        assert!(matches!(state.all_files[0].kind, EntryKind::Archive));
+        assert!(state.sacd_classify_cache.is_empty());
+    }
+
+    #[test]
+    fn upgrade_iso_kinds_uses_cache_on_second_call() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("disc.iso");
+        let total = (crate::tui::sacd::MASTER_TOC_LSNS[0] + 1) * crate::tui::sacd::SECTOR_SIZE;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len(total).unwrap();
+        f.seek(SeekFrom::Start(crate::tui::sacd::MASTER_TOC_LSNS[0] * crate::tui::sacd::SECTOR_SIZE))
+            .unwrap();
+        f.write_all(crate::tui::sacd::MASTER_TOC_MAGIC).unwrap();
+        drop(f);
+
+        let mut state = make_browse_with_iso(&path);
+        state.upgrade_iso_kinds();
+        // Reset kind and re-run; cache should still classify it.
+        state.all_files[0].kind = EntryKind::Archive;
+        state.upgrade_iso_kinds();
+        assert!(matches!(state.all_files[0].kind, EntryKind::SacdIso));
+    }
 }

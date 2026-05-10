@@ -678,7 +678,8 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                             }
                         }
                     }
-                    EntryKind::AudioFile(_) | EntryKind::Archive | EntryKind::OtherFile => {
+                    EntryKind::AudioFile(_) | EntryKind::Archive | EntryKind::SacdIso
+                    | EntryKind::OtherFile => {
                         // Toggle selection — converting is via context menu or :queue.
                         app.browse.toggle_selection();
                     }

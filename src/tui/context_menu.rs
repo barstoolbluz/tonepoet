@@ -426,6 +426,18 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_file_ops_submenu(false));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
+        EntryKind::SacdIso => {
+            // C3 ships the classification only; metadata-edit / convert
+            // wiring lands in C5 / C7. Keep the menu minimal for now
+            // so the variant is at least a first-class browse citizen.
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(separator());
+            items.push(build_file_ops_submenu(false));
+            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+        }
         EntryKind::Directory => {
             items.push(build_convert_submenu(app));
             items.push(separator());

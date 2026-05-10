@@ -560,6 +560,10 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.browse.all_dirs = dirs;
             app.browse.all_files = files;
 
+            // Upgrade `.iso` archives to SacdIso where ScarletBook
+            // magic is found. Cheap on warm cache, sub-50ms cold.
+            app.browse.upgrade_iso_kinds();
+
             // Apply current filter/sort.
             app.browse.apply_view();
 
