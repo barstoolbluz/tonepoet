@@ -1610,11 +1610,12 @@ fn draw_metadata_editor(
     let footer = match state.phase {
         MetadataEditorPhase::Editing => {
             let mut spans = Vec::new();
-            // ← back pill: surfaced when the editor was reached via the
-            // MbSelect picker (state.mb_back is Some, i.e. multi-match
-            // :tags-mb). Dispatches :mb-back, which reconstructs the
-            // picker from the cached release list — no MB requery.
-            if state.mb_back.is_some() {
+            // ← back pill: surfaced when the editor was reached via
+            // either the MbSelect picker (mb_back set) OR the
+            // GnudbReview surface (gnudb_back set). Click dispatches
+            // the appropriate :mb-back / :gnudb-back command —
+            // reconstructs the prior overlay from cache, no requery.
+            if state.mb_back.is_some() || state.gnudb_back.is_some() {
                 spans.push(footer_pill("← back", theme::AMBER));
                 spans.push(pill_gap());
             }

@@ -1719,6 +1719,11 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         super::keybindings::open_metadata_editor(app);
                         if let ActiveOverlay::MetadataEditor(ref mut editor_state) = app.active_overlay {
                             super::gnudb::populate_editor_from_review(editor_state, &state);
+                            // Cache the review state for `:gnudb-back`
+                            // — user can return to the per-track edit
+                            // surface preserving their edits, no
+                            // gnudb requery.
+                            editor_state.gnudb_back = Some(state.clone());
                             let first_page = &state.pages[0];
                             let artist = first_page.tracks.first()
                                 .map(|t| t.artist.as_str())
@@ -3636,6 +3641,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
             detail_scroll: 0,
             detail_edit: None,
             mb_back: None,
+            gnudb_back: None,
         },
     ));
 }
@@ -5149,7 +5155,14 @@ fn handle_metadata_editor_mouse(
                     // populated). Stays off the row when there's no
                     // cache to return to.
                     let mut pills: Vec<(&str, &str)> = Vec::new();
-                    if state.mb_back.is_some() {
+                    // Mirror render: pill action picks the right
+                    // colon command based on which back-cache is set.
+                    // Only one is ever populated at a time (MB vs
+                    // gnudb flows are mutually exclusive on a single
+                    // editor session).
+                    if state.gnudb_back.is_some() {
+                        pills.push(("← back", ":gnudb-back"));
+                    } else if state.mb_back.is_some() {
                         pills.push(("← back", ":mb-back"));
                     }
                     pills.extend_from_slice(&[
@@ -7065,6 +7078,14 @@ fn execute_confirm_action(
             app.active_overlay = ActiveOverlay::MbSelect(Box::new(mb_state));
             app.set_status(":mb-back: pick a different release".to_string());
         }
+        ConfirmAction::GnudbBack(review) => {
+            // Discard parked editor; restore the cached GnudbReviewState
+            // (preserves the user's per-track review edits) and
+            // transition back.
+            app.pending_metadata_editor = None;
+            app.active_overlay = ActiveOverlay::GnudbReview(review.clone());
+            app.set_status(":gnudb-back: review per-track values".to_string());
+        }
         ConfirmAction::RemoveSelected => {
             let removed = app.manager.remove_selected();
             app.save_queue();
@@ -8032,6 +8053,7 @@ mod phase4_tests {
             detail_scroll: 0,
             detail_edit: None,
             mb_back: None,
+            gnudb_back: None,
         }
     }
 
@@ -8399,6 +8421,7 @@ mod phase4_tests {
             detail_scroll: 0,
             detail_edit: None,
             mb_back: None,
+            gnudb_back: None,
         }
     }
 
@@ -8544,7 +8567,7 @@ mod phase4_tests {
             phase: MetadataEditorPhase::Editing,
             dirty: false, deleted: vec![],
             file_labels: vec!["01".into(), "02".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None,
         };
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());

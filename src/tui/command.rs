@@ -306,6 +306,11 @@ pub enum Command {
     /// editor is dirty (any edits / proposed-from-MB values not yet
     /// reverted). No-op when the editor wasn't reached through MB.
     MbBack,
+    /// Return from the metadata editor to the GnudbReview surface
+    /// (cached review state — no gnudb requery). Mirror of MbBack
+    /// for the gnudb flow. No-op when the editor wasn't reached
+    /// through gnudb.
+    GnudbBack,
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -377,6 +382,7 @@ pub fn parse_command(input: &str) -> Command {
         "D" | "detail" => Command::MetaDetail,
         "tags-cue-sidecar" | "tags-cue" => Command::TagsCueSidecar,
         "mb-back" | "tags-mb-back" => Command::MbBack,
+        "gnudb-back" | "tags-gnudb-back" => Command::GnudbBack,
         "e" | "edit" => {
             // `:e <N>` (positive integer) targets a line in the parked
             // CUE preview overlay. Anything else falls through to the
@@ -1586,6 +1592,35 @@ pub fn execute_command(
             };
             app.active_overlay = super::app::ActiveOverlay::MbSelect(Box::new(mb_state));
             app.set_status(":mb-back: pick a different release".to_string());
+        }
+        Command::GnudbBack => {
+            // Mirror of Command::MbBack for the gnudb flow.
+            let state = if let Some(parked) = app.pending_metadata_editor.take() {
+                parked
+            } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
+                let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+                if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
+                else { unreachable!() }
+            } else {
+                app.set_status(":gnudb-back only works in the metadata editor");
+                return;
+            };
+            let Some(review) = state.gnudb_back.clone() else {
+                app.set_status(":gnudb-back: no gnudb review to return to (run :tags-gnudb first)".to_string());
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            };
+            if state.dirty {
+                app.pending_metadata_editor = Some(state);
+                app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                    action: super::app::ConfirmAction::GnudbBack(review),
+                    message: "Discard editor changes and return to gnudb review?".to_string(),
+                };
+                return;
+            }
+            drop(state);
+            app.active_overlay = super::app::ActiveOverlay::GnudbReview(review);
+            app.set_status(":gnudb-back: review per-track values".to_string());
         }
         Command::TagsCueSidecar => {
             let Some(mut state) = app.pending_metadata_editor.take() else {

@@ -1043,6 +1043,11 @@ pub struct MetadataEditorState {
     /// `None` when the editor wasn't reached through MB picker (or
     /// the lookup had a single match and the picker was skipped).
     pub mb_back: Option<MbBackCache>,
+    /// Cached GnudbReviewState so the user can run `:gnudb-back`
+    /// to return from the populated editor to the per-track review
+    /// surface without re-querying gnudb. `None` when the editor
+    /// wasn't reached via the gnudb flow.
+    pub gnudb_back: Option<Box<GnudbReviewState>>,
 }
 
 /// State cached on `MetadataEditorState::mb_back` to support the
@@ -1431,6 +1436,10 @@ pub enum ConfirmAction {
     /// discarding any edits. Carries the cached release list + paths
     /// so the picker can be reconstructed.
     MbBack(MbBackCache),
+    /// Return from the metadata editor to the GnudbReview surface,
+    /// discarding any edits. Carries the cached review state so the
+    /// per-track edits are preserved on re-entry.
+    GnudbBack(Box<GnudbReviewState>),
     RemoveSelected,
     ClearCompleted,
     StopAll,
