@@ -1610,7 +1610,7 @@ fn draw_metadata_editor(
     let footer = match state.phase {
         MetadataEditorPhase::Editing => {
             let mut spans = Vec::new();
-            // ← MB pill: surfaced when the editor was reached via the
+            // ← back pill: surfaced when the editor was reached via the
             // MbSelect picker (state.mb_back is Some, i.e. multi-match
             // :tags-mb). Dispatches :mb-back, which reconstructs the
             // picker from the cached release list — no MB requery.

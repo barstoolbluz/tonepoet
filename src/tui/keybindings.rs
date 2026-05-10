@@ -5400,7 +5400,7 @@ fn footer_pill_hit_with_extra<'a>(
 ) -> Option<&'a str> {
     // Total width matches what the renderer centers against.
     let pills_w: usize = pills.iter()
-        .map(|(label, _)| label.len() + 2)
+        .map(|(label, _)| label.chars().count() + 2)
         .sum::<usize>()
         + pills.len().saturating_sub(1);
     let total_w = pills_w + extra_width;
@@ -5408,7 +5408,11 @@ fn footer_pill_hit_with_extra<'a>(
 
     let mut x = start_x;
     for (label, action) in pills {
-        let pill_w = label.len() + 2;
+        // Char count, not byte length — labels can contain non-ASCII
+        // (e.g. "← back" is 6 chars / 8 bytes). The renderer uses
+        // chars().count() for centering; mismatch here would shift
+        // hit-rects.
+        let pill_w = label.chars().count() + 2;
         if (mx as usize) >= x && (mx as usize) < x + pill_w {
             return Some(action);
         }
