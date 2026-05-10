@@ -3690,20 +3690,36 @@ fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBu
     };
 
     // Sidecar discovery: same-stem rule (`disc.iso` ↔ `disc.xml`).
-    // Parse failures don't abort the open — we fall back to ScarletBook
-    // only and surface a status hint.
-    let sidecar = super::sacd_sidecar::find_sidecar_for_iso(&iso_path)
-        .and_then(|p| match super::sacd_sidecar::parse_sidecar(&p) {
+    // Parse failures don't abort the open — we fall back to
+    // ScarletBook only and remember the failure so the final status
+    // message can surface it (rather than getting stomped by the
+    // success status).
+    let sidecar_path = super::sacd_sidecar::find_sidecar_for_iso(&iso_path);
+    let mut sidecar_parse_error: Option<String> = None;
+    let sidecar = sidecar_path.as_ref().and_then(|p| {
+        match super::sacd_sidecar::parse_sidecar(p) {
             Ok(s) => Some(s),
             Err(e) => {
-                app.set_status(format!("SACD sidecar parse failed: {}", e));
+                sidecar_parse_error = Some(format!("{}", e));
+                log::warn!(
+                    "SACD sidecar parse failed for '{}': {}",
+                    p.display(),
+                    e,
+                );
                 None
             }
-        });
+        }
+    });
 
     match build_sacd_editor_state(&iso_path, &md, sidecar.as_ref()) {
         Ok((state, area_label, n_tracks)) => {
-            let src = if sidecar.is_some() { "sidecar+ScarletBook" } else { "ScarletBook" };
+            let src = if sidecar.is_some() {
+                "sidecar+ScarletBook"
+            } else if sidecar_parse_error.is_some() {
+                "ScarletBook (sidecar malformed)"
+            } else {
+                "ScarletBook"
+            };
             app.set_status(format!(
                 "SACD editor opened ({}, {} tracks, {}) — read-only",
                 area_label, n_tracks, src,
@@ -3780,14 +3796,15 @@ pub(super) fn build_sacd_editor_state(
             .collect()
     };
 
-    // Pick the first non-empty sidecar value for an album-level key
-    // (sidecars replicate the album-level value on every track).
+    // Pick the first **non-empty** sidecar value for an album-level
+    // key. The filter must live INSIDE find_map so we don't lock in
+    // an early empty value and miss a later non-empty one (e.g., a
+    // partial-rip sidecar where the first track lost a tag).
     let sidecar_album_value = |key: &str| -> Option<String> {
         sidecar_tracks
             .iter()
-            .find_map(|t| t.meta.get(key))
+            .find_map(|t| t.meta.get(key).filter(|s| !s.trim().is_empty()))
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
     };
 
     // The editor models per-track values via paths: Vec<PathBuf>. For
@@ -3863,10 +3880,15 @@ pub(super) fn build_sacd_editor_state(
     if let Some(s) = genre {
         push_album(&mut entries, "GENRE", ItemKey::Genre, s);
     }
-    // PUBLISHER: sidecar-only field (ScarletBook has no publisher
-    // concept). Surfaces when the sidecar has carried one over from
-    // Discogs or a similar source.
-    if let Some(s) = sidecar_album_value("PUBLISHER") {
+    // PUBLISHER: sidecar wins, with fallback to the ScarletBook
+    // SACDText album_publisher field (which is rarely populated on
+    // real discs but exists in the spec).
+    let publisher = sidecar_album_value("PUBLISHER").or_else(|| {
+        md.master_text
+            .as_ref()
+            .and_then(|t| t.album_publisher.clone())
+    });
+    if let Some(s) = publisher {
         push_album(&mut entries, "PUBLISHER", ItemKey::Publisher, s);
     }
 
@@ -9362,6 +9384,77 @@ mod phase4_tests {
         let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
         assert_eq!(by_key("ALBUMARTIST").map(|e| e.value.as_str()), Some("Composite Artist"));
         assert_eq!(by_key("CATALOGNUMBER").map(|e| e.value.as_str()), Some("SICP 10083"));
+    }
+
+    #[test]
+    fn sidecar_album_value_skips_first_empty_picks_later_nonempty() {
+        // Regression for the find_map-before-filter bug: a sidecar
+        // where the first track lost its ALBUM tag (empty string)
+        // but a later track still has it must NOT lock in the empty
+        // value. The fix moves the non-empty filter inside find_map.
+        let md = synth_sacd_metadata(
+            Some("SB Album"),  // ScarletBook fallback if sidecar misses everything
+            None, 0, None,
+            &["t1", "t2", "t3"],
+            &["", "", ""],
+            &[None, None, None],
+        );
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="ALBUM" value=""/><meta name="TITLE" value="t1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="2"><meta name="ALBUM" value="The Real Album"/><meta name="TITLE" value="t2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="3"><meta name="ALBUM" value="The Real Album"/><meta name="TITLE" value="t3"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").expect("ALBUM");
+        // Should pick the non-empty later value, not lock onto track 1's empty.
+        assert_eq!(album.value, "The Real Album");
+    }
+
+    #[test]
+    fn publisher_falls_back_to_scarletbook_master_text() {
+        // Sidecar absent or silent on PUBLISHER; ScarletBook
+        // SACDText.album_publisher should be surfaced.
+        use crate::tui::sacd::*;
+        let mut md = synth_sacd_metadata(
+            Some("Album"), None, 0, None,
+            &["t"], &[""], &[None],
+        );
+        md.master_text = Some(SacdText {
+            album_title: Some("Album".into()),
+            album_publisher: Some("ScarletBook Publisher".into()),
+            charset: 2,
+            ..Default::default()
+        });
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
+        let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
+        assert_eq!(pub_entry.map(|e| e.value.as_str()), Some("ScarletBook Publisher"));
+    }
+
+    #[test]
+    fn publisher_prefers_sidecar_over_scarletbook() {
+        // Both have PUBLISHER — sidecar wins.
+        use crate::tui::sacd::*;
+        let mut md = synth_sacd_metadata(
+            Some("Album"), None, 0, None,
+            &["t"], &[""], &[None],
+        );
+        md.master_text = Some(SacdText {
+            album_title: Some("Album".into()),
+            album_publisher: Some("ScarletBook Publisher".into()),
+            charset: 2,
+            ..Default::default()
+        });
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="PUBLISHER" value="Sidecar Publisher"/><meta name="TITLE" value="t"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="1"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+        let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
+        assert_eq!(pub_entry.map(|e| e.value.as_str()), Some("Sidecar Publisher"));
     }
 
     #[test]
