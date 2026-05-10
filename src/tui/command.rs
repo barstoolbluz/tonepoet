@@ -361,11 +361,12 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "wq" => Command::WriteQuit,
-        // Metadata-editor actions. These are the colon-form mirrors of
-        // bare-char keys that still exist in the editor's keyboard
-        // handler — both paths share dispatch via
-        // `dispatch_metadata_editor_keychar`. The editor's `:w` save
-        // is handled by `Command::Write` (overlay-aware).
+        // Metadata-editor actions. Route via execute_command's
+        // with_editor_state helper to the corresponding helper in
+        // keybindings.rs. Bare-char a/d/D/u/w keys these commands
+        // replaced have been removed (no-bare-char-keys rule);
+        // KeyCode::Delete remains as a convenience shortcut for :d.
+        // Editor `:w` save lives in Command::Write (overlay-aware).
         // `delete` (without short alias) is taken by browse trash;
         // editor delete is `:d` only. `add` overlaps with bookmarks
         // sub-args but bookmarks parses its own `add` inside the
@@ -580,10 +581,8 @@ pub fn execute_command(
         }
         Command::Write => {
             // If the metadata editor is parked or active, :w saves
-            // tags (Phase 4 regen + per-file lofty write). Routes
-            // through the editor's existing keyboard handler via
-            // dispatch_metadata_editor_keychar so the save logic
-            // doesn't fork.
+            // tags (Phase 4 regen + per-file lofty write) via
+            // metadata_editor_save (extracted helper in keybindings.rs).
             if app.pending_metadata_editor.is_some()
                 || matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_))
             {
