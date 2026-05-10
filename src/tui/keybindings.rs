@@ -10143,11 +10143,17 @@ mod phase4_tests {
     }
 
     #[test]
-    fn switch_area_clamps_cursor_when_new_area_has_fewer_entries() {
-        // Construct a hybrid where MCH has fewer tracks than stereo;
-        // cursor sitting on a stereo-only row must clamp into the
-        // new (shorter) entry list. This exercises the
-        // min(prev_cursor, entries.len().saturating_sub(1)) clamp.
+    fn switch_area_clamps_out_of_bounds_cursor() {
+        // Exercises the
+        //   state.cursor = prev_cursor.min(entries.len().saturating_sub(1))
+        // clamp by manually setting cursor to an OOB value before the
+        // switch, then asserting it's been brought back into bounds.
+        // The fixture here uses size=1 area TOCs (header only, no
+        // SACDTTxt), so both areas produce a single TRACKNUMBER
+        // entry — the clamp triggers because the test sets
+        // cursor=3 OOB, not because of an entry-count change across
+        // areas. Either way, broken clamp logic (e.g. forgetting
+        // the min) would leave cursor=3 and fail the assertion.
         use std::io::{Seek, SeekFrom, Write};
         use crate::tui::sacd::*;
 
