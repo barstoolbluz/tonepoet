@@ -896,6 +896,18 @@ pub struct CtdbVerifyPage {
     pub result: crate::tui::ctdb::CtdbVerifyResult,
 }
 
+/// Origin of a `GnudbReviewState` instance — drives the overlay
+/// title so the user can tell whether they're reviewing a gnudb
+/// query result vs. a CUE-imported metadata set, even though both
+/// land in the same review surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSource {
+    /// State built from a gnudb HTTP query (`:tags-gnudb`).
+    Gnudb,
+    /// State built from a sidecar CUE file (`:import-cue`).
+    CueImport,
+}
+
 /// State for the GNUDB review overlay.
 #[derive(Debug, Clone)]
 pub struct GnudbReviewState {
@@ -915,6 +927,10 @@ pub struct GnudbReviewState {
     pub paths: Vec<std::path::PathBuf>,
     /// Original match list for "back" navigation (None for single-match queries).
     pub origin_matches: Option<Vec<crate::tui::gnudb::GnudbMatch>>,
+    /// Where this review came from. Drives the overlay title prefix
+    /// ("GNUDB Review" vs. "CUE Import Review") so the user can
+    /// disambiguate post-:import-cue from a real gnudb match.
+    pub source: ReviewSource,
 }
 
 /// A single page (disc) in the GNUDB review overlay.

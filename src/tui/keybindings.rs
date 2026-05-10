@@ -5270,7 +5270,31 @@ fn handle_metadata_editor_mouse(
                             ("Enter edit", "enter"), ("Esc back", "esc"),
                         ]);
                     }
-                    if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
+                    // The renderer appends extra pills (revert/restore +
+                    // a 4-char gap) after the dynamic pills when the
+                    // focused entry has MB-proposed values. Width-match
+                    // here so the click hit-test centers identically.
+                    // Without this, clicks on (e.g.) :fix-caps would
+                    // land in :import-cue's range due to the misaligned
+                    // start_x. revert/restore themselves are click-
+                    // handled via button_map (above), not via this
+                    // hit-test.
+                    let extra_width = if state.detail_edit.is_none() {
+                        if let Some(entry) = state.entries.get(state.detail_field_idx) {
+                            if super::probe::entry_has_mb_proposed(entry) {
+                                let pill_state = super::probe::mb_pill_state_field(entry);
+                                let revert_chunk = match pill_state {
+                                    // " revert " or " use MB " (8 chars) + 1-char gap
+                                    super::probe::MbRevertPill::Revert
+                                    | super::probe::MbRevertPill::UseMb => 8 + 1,
+                                    super::probe::MbRevertPill::None => 0,
+                                };
+                                // 4-char gap before the MB-action group + revert chunk + restore pill (" restore " = 9 chars)
+                                4 + revert_chunk + 9
+                            } else { 0 }
+                        } else { 0 }
+                    } else { 0 };
+                    if let Some(action) = footer_pill_hit_with_extra(&pills, extra_width, mx, inner_x, inner_w) {
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                             let cmd = super::command::parse_command(&action[1..]);
@@ -5347,12 +5371,31 @@ fn footer_pill_hit<'a>(
     row_x: u16,
     row_w: u16,
 ) -> Option<&'a str> {
-    // Total width of all pills + gaps.
-    let total_w: usize = pills.iter()
-        .map(|(label, _)| label.len() + 2) // " label "
+    footer_pill_hit_with_extra(pills, 0, mx, row_x, row_w)
+}
+
+/// Like `footer_pill_hit`, but accepts an `extra_width` representing
+/// pills the renderer adds AFTER the click-handler's `pills` slice
+/// (e.g., revert/restore action pills appended by the detail overlay
+/// when an entry has MB-proposed values). The render centers based
+/// on TOTAL width including those extras; without accounting for
+/// them here, the click hit-rects would shift left of where the
+/// rendered pills are, mis-routing clicks. Extras are NOT click-
+/// tested by this function — they're handled separately by
+/// `button_map`.
+fn footer_pill_hit_with_extra<'a>(
+    pills: &'a [(&'a str, &'a str)],
+    extra_width: usize,
+    mx: u16,
+    row_x: u16,
+    row_w: u16,
+) -> Option<&'a str> {
+    // Total width matches what the renderer centers against.
+    let pills_w: usize = pills.iter()
+        .map(|(label, _)| label.len() + 2)
         .sum::<usize>()
-        + pills.len().saturating_sub(1); // 1-char gaps
-    // Center offset.
+        + pills.len().saturating_sub(1);
+    let total_w = pills_w + extra_width;
     let start_x = row_x as usize + (row_w as usize).saturating_sub(total_w) / 2;
 
     let mut x = start_x;

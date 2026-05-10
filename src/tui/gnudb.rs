@@ -485,6 +485,7 @@ pub fn build_review_state(
         last_click: None,
         origin_matches: None,
         paths,
+        source: super::app::ReviewSource::Gnudb,
     }
 }
 
@@ -531,6 +532,7 @@ pub fn build_multi_disc_review_state(
         last_click: None,
         origin_matches: None,
         paths: all_paths,
+        source: super::app::ReviewSource::Gnudb,
     }
 }
 
@@ -777,6 +779,7 @@ pub fn build_review_state_from_cue(
         last_click: None,
         origin_matches: None,
         paths,
+        source: super::app::ReviewSource::CueImport,
     }
 }
 
@@ -824,6 +827,7 @@ pub fn build_multi_disc_review_state_from_cue(
         last_click: None,
         origin_matches: None,
         paths: all_paths,
+        source: super::app::ReviewSource::CueImport,
     }
 }
 
@@ -1022,6 +1026,7 @@ mod gnudb_per_track_tests {
             last_click: None,
             paths,
             origin_matches: None,
+            source: crate::tui::app::ReviewSource::Gnudb,
         }
     }
 
