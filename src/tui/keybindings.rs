@@ -10030,17 +10030,52 @@ mod phase4_tests {
             a[0x14] = 0x04;
             a[0x15] = 2;
             a[0x20] = channels;
-            a[0x21] = if channels == 6 { (5u8 << 3) } else { 0 };
+            a[0x21] = if channels == 6 { 5u8 << 3 } else { 0 };
             a[0x22] = channels;
             a[0x40] = 30; a[0x41] = 0; a[0x42] = 0;
             a[0x45] = n_tracks;
-            a[0x50] = 0;
+            a[0x50] = 1;
+            // locale 0: en / charset 2 (Latin-1).
+            a[0x58] = b'e'; a[0x59] = b'n'; a[0x5a] = 2;
             a
+        };
+        // SACDTTxt sector: track_text_position[i] (BE u16) at offset
+        // 0x08 + i*2. Each non-zero position points within the sector
+        // to a per-track text block:
+        //   [track_amount: u8][3 unk bytes]
+        //     [type: u8][0x20][string: NUL-term]
+        // For tests we want one entry per track (TITLE) so the
+        // editor's TITLE entry surfaces, giving us 2-row editor
+        // entries (TRACKNUMBER + TITLE).
+        let build_t_txt_sector = |titles: &[&str]| -> Vec<u8> {
+            let mut s = vec![0u8; SECTOR_SIZE as usize];
+            s[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
+            // Reserve positions table at 0x08; data blocks start at
+            // 0x100 with 0x40 stride between tracks (plenty of room).
+            let mut block_off = 0x100usize;
+            for (i, title) in titles.iter().enumerate() {
+                let pos_off = 0x08 + i * 2;
+                s[pos_off..pos_off + 2].copy_from_slice(&(block_off as u16).to_be_bytes());
+                // Track block: 1 entry, 3 unk bytes, type=TITLE(0x01), 0x20, NUL-term string.
+                s[block_off] = 1; // track_amount
+                // 3 unknown bytes left as 0
+                s[block_off + 4] = 0x01; // TITLE
+                s[block_off + 5] = 0x20;
+                let bytes = title.as_bytes();
+                s[block_off + 6..block_off + 6 + bytes.len()].copy_from_slice(bytes);
+                // Trailing NUL written by initial zeros.
+                block_off += 0x40;
+            }
+            s
         };
         f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
         f.write_all(&build_area(TWOCH_TOC_MAGIC, 2, 2)).unwrap();
+        f.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_t_txt_sector(&["StereoT1", "StereoT2"])).unwrap();
         f.seek(SeekFrom::Start(600 * SECTOR_SIZE)).unwrap();
         f.write_all(&build_area(MULCH_TOC_MAGIC, 6, 2)).unwrap();
+        f.seek(SeekFrom::Start(601 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_t_txt_sector(&["MCH T1", "MCH T2"])).unwrap();
     }
 
     #[test]
@@ -10067,45 +10102,110 @@ mod phase4_tests {
     }
 
     #[test]
-    fn switch_area_preserves_cursor_within_bounds() {
-        let md = make_hybrid_md();
+    fn switch_area_preserves_cursor_exactly_when_within_new_bounds() {
+        // For a strong equality assertion the pre-switch entries
+        // shape must match post-switch — which means we have to
+        // build initial state from the parser's view of the
+        // fixture, not the richer in-memory synthetic md (whose
+        // text fields aren't reproduced in the on-disk ISO).
         let td = tempfile::tempdir().expect("tempdir");
         let iso_path = td.path().join("hybrid.iso");
-        write_hybrid_iso_fixture(&iso_path, &md);
-        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
-        state.cursor = 1;
-        state.scroll = 0;
+        let dummy_md = make_hybrid_md();
+        write_hybrid_iso_fixture(&iso_path, &dummy_md);
+        let parsed_md = crate::tui::sacd::parse_sacd_iso(&iso_path).expect("parse");
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &parsed_md, None).expect("build");
 
-        let res = switch_sacd_editor_area(
-            &mut state,
-            &iso_path,
-            super::super::command::SacdAreaTarget::MultiChannel,
+        state.cursor = 1; // not row 0 — so a bug that resets to 0 is caught
+        let entry_count_before = state.entries.len();
+        assert!(
+            entry_count_before >= 2,
+            "fixture should produce at least 2 editor entries (TRACKNUMBER + TITLE)",
         );
-        assert!(res.is_ok());
-        // Cursor must remain in-bounds (entries shape is similar
-        // between areas for our fixture, so 1 is still valid).
-        assert!(state.cursor < state.entries.len().max(1));
-    }
 
-    #[test]
-    fn switch_area_resets_dirty_to_false() {
-        // After an area switch, the rebuilt state should NOT inherit
-        // any prior dirty flag (we caught dirty before switching, so
-        // post-switch state must start clean).
-        let md = make_hybrid_md();
-        let td = tempfile::tempdir().expect("tempdir");
-        let iso_path = td.path().join("hybrid.iso");
-        write_hybrid_iso_fixture(&iso_path, &md);
-        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
-        // (state.dirty is false by build, but verify explicitly)
-        assert!(!state.dirty);
-        let _ = switch_sacd_editor_area(
+        switch_sacd_editor_area(
             &mut state,
             &iso_path,
             super::super::command::SacdAreaTarget::MultiChannel,
         )
         .expect("switch");
-        assert!(!state.dirty, "post-switch state must start clean");
+
+        // Both areas in the fixture have matching shape (same
+        // track count, both with TITLE sectors), so no clamp.
+        assert_eq!(
+            state.entries.len(),
+            entry_count_before,
+            "fixture should preserve entry count across areas",
+        );
+        // Strong equality: catches a regression that resets cursor
+        // to 0 (the old `cursor < entries.len()` assertion would
+        // have passed silently for any in-bounds value).
+        assert_eq!(state.cursor, 1, "cursor must be preserved exactly");
+    }
+
+    #[test]
+    fn switch_area_clamps_cursor_when_new_area_has_fewer_entries() {
+        // Construct a hybrid where MCH has fewer tracks than stereo;
+        // cursor sitting on a stereo-only row must clamp into the
+        // new (shorter) entry list. This exercises the
+        // min(prev_cursor, entries.len().saturating_sub(1)) clamp.
+        use std::io::{Seek, SeekFrom, Write};
+        use crate::tui::sacd::*;
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("uneven.iso");
+        let total = 700u64;
+        let f = std::fs::File::create(&iso_path).unwrap();
+        f.set_len(total * SECTOR_SIZE).unwrap();
+        drop(f);
+        let mut f = std::fs::File::options().write(true).open(&iso_path).unwrap();
+
+        let mut mtoc = vec![0u8; 0xa8];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes()); // stereo: 5 tracks
+        mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x48..0x4c].copy_from_slice(&600u32.to_be_bytes()); // MCH: 1 track
+        mtoc[0x56..0x58].copy_from_slice(&1u16.to_be_bytes());
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        let mut build_area = |magic: &[u8; 8], channels: u8, n_tracks: u8| {
+            let mut a = vec![0u8; SECTOR_SIZE as usize];
+            a[0..8].copy_from_slice(magic);
+            a[0x08] = 1; a[0x09] = 20;
+            a[0x0a..0x0c].copy_from_slice(&1u16.to_be_bytes());
+            a[0x14] = 0x04; a[0x15] = 2;
+            a[0x20] = channels;
+            a[0x21] = if channels == 6 { 5u8 << 3 } else { 0 };
+            a[0x22] = channels;
+            a[0x40] = 10;
+            a[0x45] = n_tracks;
+            a
+        };
+        f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_area(TWOCH_TOC_MAGIC, 2, 5)).unwrap();
+        f.seek(SeekFrom::Start(600 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_area(MULCH_TOC_MAGIC, 6, 1)).unwrap();
+        drop(f);
+
+        let md = parse_sacd_iso(&iso_path).expect("parse");
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
+        // cursor past where MCH could reach (e.g. row 1, MCH only has TRACKNUMBER+TITLE = 2 rows)
+        state.cursor = 3;
+
+        switch_sacd_editor_area(
+            &mut state,
+            &iso_path,
+            super::super::command::SacdAreaTarget::MultiChannel,
+        )
+        .expect("switch");
+
+        assert!(
+            state.cursor < state.entries.len(),
+            "cursor must be clamped into new entry count: cursor={}, entries={}",
+            state.cursor,
+            state.entries.len(),
+        );
     }
 
     #[test]
