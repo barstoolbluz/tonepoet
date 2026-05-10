@@ -64,6 +64,28 @@ pub const SACD_TRL1_MAGIC: &[u8; 8] = b"SACDTRL1";
 /// Magic identifier for the per-area track-time list (SACDTRL2).
 pub const SACD_TRL2_MAGIC: &[u8; 8] = b"SACDTRL2";
 
+/// Magic identifier for the per-area, per-track text sector
+/// (track titles, performers, composers, ISRC-adjacent metadata).
+/// One sector per locale; tonepoet only parses the primary one
+/// (locale 0).
+pub const SACD_T_TXT_MAGIC: &[u8; 8] = b"SACDTTxt";
+
+/// Magic identifier for the per-area ISRC + per-track genre list.
+/// Spans **two** consecutive sectors (4096 bytes total, 4092 used).
+pub const SACD_IGL_MAGIC: &[u8; 8] = b"SACD_IGL";
+
+/// Magic identifier for the access list. Spans 32 consecutive
+/// sectors (64 KB) and contains data we don't currently surface;
+/// the scan loop must skip past it lest 8-byte windows of access-
+/// list data accidentally collide with another magic value.
+pub const SACD_ACC_MAGIC: &[u8; 8] = b"SACD_ACC";
+
+/// Sector span of the SACD_ACC access list. Per spec.
+const SACD_ACC_SECTOR_SPAN: u64 = 32;
+
+/// Sector span of the SACD_IGL ISRC/genre list (two sectors).
+const SACD_IGL_SECTOR_SPAN: u64 = 2;
+
 /// On-disc size of the `area_toc_t` *header* (the fields up to but
 /// not including the trailing 1896-byte data buffer). The header
 /// plus data sum to 2048 bytes (one sector).
@@ -850,9 +872,12 @@ impl PlayTime {
     }
 }
 
-/// One area's per-track timing entry decoded from SACDTRL1 + SACDTRL2.
-/// Both lists are indexed in track order (track 0 = first track).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// One area's per-track entry: timing from SACDTRL1+SACDTRL2, text
+/// from SACDTTxt, ISRC + genre from SACD_IGL. All non-timing fields
+/// are best-effort — a disc may carry only timing, only timing+title,
+/// the full set, or any subset in between. (Copy is intentionally
+/// not derived because TrackText holds owned Strings.)
+#[derive(Debug, Clone, Default)]
 pub struct TrackEntry {
     /// Absolute LSN where this track's audio begins.
     pub start_lsn: u32,
@@ -862,6 +887,14 @@ pub struct TrackEntry {
     pub start_time: PlayTime,
     /// Track duration (m, s, f).
     pub duration: PlayTime,
+    /// Per-track text (title, performer, composer, ...). All fields
+    /// optional; on a disc with no SACDTTxt sector, all are None.
+    pub text: TrackText,
+    /// 12-character ISRC if the disc has SACD_IGL with a non-empty
+    /// ISRC for this track.
+    pub isrc: Option<String>,
+    /// Per-track genre from SACD_IGL.
+    pub genre: Option<Genre>,
 }
 
 /// Decoded header portion of one area TOC (TWOCHTOC or MULCHTOC).
@@ -1099,6 +1132,223 @@ pub fn parse_trl2(buf: &[u8], track_count: u8) -> Result<Vec<(PlayTime, PlayTime
 }
 
 // ---------------------------------------------------------------
+// SACDTTxt (per-track multilingual text)
+// ---------------------------------------------------------------
+//
+// Layout of an SACDTTxt sector (2048 bytes, one per locale):
+//
+//   off  size  field
+//   ---  ----  ------------------------------------------------
+//   0x00    8  id ("SACDTTxt")
+//   0x08    2*track_count  track_text_position[i] (BE u16 each)
+//   ... rest: NUL-terminated text blocks pointed at by positions
+//
+// Each non-zero `track_text_position[i]` points within the same
+// 2048-byte sector to a per-track text block:
+//
+//   [track_amount: u8][unknown: 3 bytes]
+//     [track_type: u8][0x20: u8][string: NUL-term][NUL pad...]
+//     [track_type: u8][0x20: u8][string: NUL-term][NUL pad...]
+//     ...track_amount entries...
+//
+// `track_type` values (from `track_type_t` in the spec):
+//   0x01 TITLE          0x81 TITLE_PHONETIC
+//   0x02 PERFORMER      0x82 PERFORMER_PHONETIC
+//   0x03 SONGWRITER     0x83 SONGWRITER_PHONETIC
+//   0x04 COMPOSER       0x84 COMPOSER_PHONETIC
+//   0x05 ARRANGER       0x85 ARRANGER_PHONETIC
+//   0x06 MESSAGE        0x86 MESSAGE_PHONETIC
+//   0x07 EXTRA_MESSAGE  0x87 EXTRA_MESSAGE_PHONETIC
+//
+// The 0x20 byte after each type byte is documented in sacd-extract
+// only as "unknown 0x20" — it appears to be a separator.
+
+/// Per-track text fields for a single track in a single area, all
+/// optional (a track may carry just title, or title+performer, or
+/// every field). Phonetic variants are stored separately for discs
+/// that ship Latin-script romanizations (common on JP imports).
+#[derive(Debug, Clone, Default)]
+pub struct TrackText {
+    pub title: Option<String>,
+    pub performer: Option<String>,
+    pub songwriter: Option<String>,
+    pub composer: Option<String>,
+    pub arranger: Option<String>,
+    pub message: Option<String>,
+    pub extra_message: Option<String>,
+    pub title_phonetic: Option<String>,
+    pub performer_phonetic: Option<String>,
+    pub songwriter_phonetic: Option<String>,
+    pub composer_phonetic: Option<String>,
+    pub arranger_phonetic: Option<String>,
+    pub message_phonetic: Option<String>,
+    pub extra_message_phonetic: Option<String>,
+}
+
+/// Parse one SACDTTxt sector for the *primary* locale into a vector
+/// of `TrackText`, one per track (zero-indexed). Tracks with all
+/// position pointers set to 0 yield default (all-None) entries.
+pub fn parse_sacd_t_txt(buf: &[u8], track_count: u8, charset: u8) -> Result<Vec<TrackText>, SacdError> {
+    if buf.len() < SECTOR_SIZE as usize {
+        return Err(SacdError::Malformed("SACDTTxt sector too short".into()));
+    }
+    if &buf[0..8] != SACD_T_TXT_MAGIC {
+        return Err(SacdError::Malformed(format!(
+            "SACDTTxt magic missing (got {:?})",
+            &buf[0..8],
+        )));
+    }
+
+    let mut out = vec![TrackText::default(); track_count as usize];
+    for i in 0..track_count as usize {
+        let pos_off = 8 + i * 2;
+        if pos_off + 2 > buf.len() {
+            break;
+        }
+        let pos = read_be_u16(buf, pos_off) as usize;
+        // Position 0 = absent. Need at least 4 bytes (track_amount +
+        // 3 unknown) at the pointed-at location.
+        if pos == 0 || pos + 4 > buf.len() {
+            continue;
+        }
+
+        let track_amount = buf[pos] as usize;
+        // Skip track_amount byte + 3 unknown.
+        let mut p = pos + 4;
+
+        for j in 0..track_amount {
+            // Need at least 2 more bytes (type + 0x20 separator).
+            if p + 2 > buf.len() {
+                break;
+            }
+            let track_type = buf[p];
+            // Past type byte and the documented-but-mystery 0x20.
+            p += 2;
+            if p >= buf.len() {
+                break;
+            }
+
+            // String at p; possibly empty (first byte is 0).
+            if buf[p] != 0 {
+                let str_end = buf[p..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map_or(buf.len(), |e| p + e);
+                let bytes = &buf[p..str_end];
+                let s = decode_text(bytes, charset);
+                if !s.is_empty() {
+                    set_track_text_field(&mut out[i], track_type, s);
+                }
+            }
+
+            // Advance to next entry's type byte (only between entries).
+            if j < track_amount.saturating_sub(1) {
+                while p < buf.len() && buf[p] != 0 {
+                    p += 1;
+                }
+                while p < buf.len() && buf[p] == 0 {
+                    p += 1;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn set_track_text_field(tt: &mut TrackText, ttype: u8, s: String) {
+    match ttype {
+        0x01 => tt.title = Some(s),
+        0x02 => tt.performer = Some(s),
+        0x03 => tt.songwriter = Some(s),
+        0x04 => tt.composer = Some(s),
+        0x05 => tt.arranger = Some(s),
+        0x06 => tt.message = Some(s),
+        0x07 => tt.extra_message = Some(s),
+        0x81 => tt.title_phonetic = Some(s),
+        0x82 => tt.performer_phonetic = Some(s),
+        0x83 => tt.songwriter_phonetic = Some(s),
+        0x84 => tt.composer_phonetic = Some(s),
+        0x85 => tt.arranger_phonetic = Some(s),
+        0x86 => tt.message_phonetic = Some(s),
+        0x87 => tt.extra_message_phonetic = Some(s),
+        // Unknown / future track types: silently skip rather than
+        // refuse to parse (matches sacd-extract behaviour).
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------
+// SACD_IGL (per-track ISRC + per-track genre)
+// ---------------------------------------------------------------
+//
+// Layout (4092 bytes, spans 2 sectors = 4096 bytes available):
+//
+//   off    size  field
+//   ----  ----   ------------------------------------------------
+//   0x000    8   id ("SACD_IGL")
+//   0x008 3060   isrc[255]   (12 bytes each = 255 × 12)
+//   0xc04    4   reserved (u32)
+//   0xc08 1020   track_genre[255]  (4 bytes each = 255 × 4)
+//
+// ISRC layout per `isrc_t` (12 bytes): country[2] + owner[3] +
+// year[2] + designation[5] = 12 ASCII characters. All 0x00 means
+// "no ISRC". Some discs pad with spaces instead.
+
+/// One row of SACD_IGL data for a single track.
+#[derive(Debug, Clone, Default)]
+pub struct TrackIsrcGenre {
+    /// 12-character ISRC if non-empty, else None.
+    pub isrc: Option<String>,
+    /// Per-track genre if `category != 0`, else None.
+    pub genre: Option<Genre>,
+}
+
+/// Parse a SACD_IGL block (must be at least 4092 bytes — i.e. you
+/// need to have read both sectors and concatenated them before
+/// calling). Returns one `TrackIsrcGenre` per track in disc order.
+pub fn parse_sacd_igl(buf: &[u8], track_count: u8) -> Result<Vec<TrackIsrcGenre>, SacdError> {
+    let need = 8 + 12 * 255 + 4 + 4 * 255; // = 4092
+    if buf.len() < need {
+        return Err(SacdError::Malformed(format!(
+            "SACD_IGL buffer too short: {} bytes, need {}",
+            buf.len(),
+            need,
+        )));
+    }
+    if &buf[0..8] != SACD_IGL_MAGIC {
+        return Err(SacdError::Malformed(format!(
+            "SACD_IGL magic missing (got {:?})",
+            &buf[0..8],
+        )));
+    }
+
+    let isrc_base = 8;
+    let genre_base = 8 + 12 * 255 + 4;
+
+    let mut out = Vec::with_capacity(track_count as usize);
+    for i in 0..track_count as usize {
+        // ISRC: 12 ASCII bytes. Some discs use NUL pad, some space.
+        let isrc_off = isrc_base + i * 12;
+        let isrc_str = read_fixed_ascii(&buf[isrc_off..isrc_off + 12]);
+        let isrc = if isrc_str.is_empty() { None } else { Some(isrc_str) };
+
+        // Genre: 4 bytes (category, reserved u16, genre_code).
+        let g_off = genre_base + i * 4;
+        let category = buf[g_off];
+        let genre_code = buf[g_off + 3];
+        let genre = if category != 0 {
+            Some(Genre { category, genre: genre_code })
+        } else {
+            None
+        };
+
+        out.push(TrackIsrcGenre { isrc, genre });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------
 // Top-level orchestrator
 // ---------------------------------------------------------------
 
@@ -1241,21 +1491,30 @@ fn parse_area_with_strictness(
 }
 
 /// Parse one area: load its TOC sector(s), decode the header, then
-/// scan the remaining sectors of the area TOC for SACDTRL1 / SACDTRL2
-/// to populate the per-track entries. (SACDTTxt and SACD_IGL
-/// scanning land in C2c.)
+/// scan the remaining sectors of the area TOC for SACDTRL1 (track
+/// LSNs), SACDTRL2 (track times), SACDTTxt (per-track text), and
+/// SACD_IGL (ISRC + per-track genre). SACD_ACC sectors are skipped
+/// (32-sector span). Only the *first* SACDTTxt sector is parsed
+/// (primary locale), matching sacd-extract behaviour.
 pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> {
     let header_buf = read_sector(path, ptr.toc_1_start as u64)?;
     let header = parse_area_toc_header(&header_buf)?;
+    let area_charset = header.locales.first().map(|l| l.character_set).unwrap_or(0);
 
     let mut starts: Option<Vec<(u32, u32)>> = None;
     let mut times: Option<Vec<(PlayTime, PlayTime)>> = None;
+    let mut text_per_track: Vec<TrackText> =
+        vec![TrackText::default(); header.track_count as usize];
+    let mut isrc_genre: Vec<TrackIsrcGenre> =
+        vec![TrackIsrcGenre::default(); header.track_count as usize];
+    let mut got_text = false;
 
-    // Walk subsequent sectors of the area TOC; size_sectors caps how
-    // far we scan. Cap at 96 (MAX_AREA_TOC_SIZE_LSN per spec) as
-    // defense against a corrupted size field.
+    // Walk sectors after the header. Cap at 96 (MAX_AREA_TOC_SIZE_LSN
+    // per spec). `i` advances by 1, 2, or 32 depending on the magic
+    // we just consumed (SACD_IGL spans 2 sectors; SACD_ACC spans 32).
     let max_scan = (header.size_sectors as u64).min(96);
-    for i in 1..max_scan {
+    let mut i: u64 = 1;
+    while i < max_scan {
         let lsn = ptr.toc_1_start as u64 + i;
         let buf = match read_sector(path, lsn) {
             Ok(b) => b,
@@ -1264,22 +1523,66 @@ pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> 
         match &buf[0..8] {
             m if m == SACD_TRL1_MAGIC => {
                 if let Ok(v) = parse_trl1(&buf, header.track_count) { starts = Some(v); }
+                i += 1;
             }
             m if m == SACD_TRL2_MAGIC => {
                 if let Ok(v) = parse_trl2(&buf, header.track_count) { times = Some(v); }
+                i += 1;
             }
-            // SACDTTxt / SACD_IGL / SACD_ACC handled in C2c — skip
-            // gracefully here.
-            _ => {}
+            m if m == SACD_T_TXT_MAGIC => {
+                if !got_text {
+                    if let Ok(v) = parse_sacd_t_txt(&buf, header.track_count, area_charset) {
+                        text_per_track = v;
+                        got_text = true;
+                    }
+                }
+                i += 1;
+            }
+            m if m == SACD_IGL_MAGIC => {
+                // SACD_IGL spans 2 sectors. Concatenate before parse.
+                let next_lsn = lsn + 1;
+                if let Ok(buf2) = read_sector(path, next_lsn) {
+                    let mut full = Vec::with_capacity(2 * SECTOR_SIZE as usize);
+                    full.extend_from_slice(&buf);
+                    full.extend_from_slice(&buf2);
+                    if let Ok(v) = parse_sacd_igl(&full, header.track_count) {
+                        isrc_genre = v;
+                    }
+                }
+                i += SACD_IGL_SECTOR_SPAN;
+            }
+            m if m == SACD_ACC_MAGIC => {
+                // 32-sector span; skip past so subsequent sectors
+                // are interpreted by magic, not as access-list data.
+                i += SACD_ACC_SECTOR_SPAN;
+            }
+            _ => i += 1,
         }
-        if starts.is_some() && times.is_some() { break; }
     }
 
     let mut tracks = Vec::with_capacity(header.track_count as usize);
     for i in 0..header.track_count as usize {
-        let (start_lsn, length_lsn) = starts.as_ref().and_then(|v| v.get(i)).copied().unwrap_or((0, 0));
-        let (start_time, duration) = times.as_ref().and_then(|v| v.get(i)).copied().unwrap_or_default();
-        tracks.push(TrackEntry { start_lsn, length_lsn, start_time, duration });
+        let (start_lsn, length_lsn) = starts
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .copied()
+            .unwrap_or((0, 0));
+        let (start_time, duration) = times
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .copied()
+            .unwrap_or_default();
+        let text = text_per_track.get(i).cloned().unwrap_or_default();
+        let ig = isrc_genre.get(i).cloned().unwrap_or_default();
+        tracks.push(TrackEntry {
+            start_lsn,
+            length_lsn,
+            start_time,
+            duration,
+            text,
+            isrc: ig.isrc,
+            genre: ig.genre,
+        });
     }
 
     Ok(AreaInfo { header, tracks })
@@ -1874,5 +2177,276 @@ mod tests {
 
         // No multi-channel area
         assert!(md.multi_channel.is_none());
+    }
+
+    // ---------- C2c tests: SACDTTxt + SACD_IGL + integrated parse_area ----------
+
+    /// Build a single per-track text block in the format SACDTTxt
+    /// uses inside its sector. `entries` is a slice of (track_type,
+    /// optional string). Each entry is laid out as:
+    ///   [type:u8][0x20:u8][string-bytes-or-nothing][NUL]
+    /// A trailing NUL terminates the last string. Between entries
+    /// sacd-extract walks through extra NULs as padding; we emit
+    /// exactly one NUL between entries which is the minimum legal
+    /// shape (the spec doesn't define a fixed inter-entry padding).
+    fn build_track_text_block(entries: &[(u8, Option<&[u8]>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // track_amount byte + 3 unknown
+        out.push(entries.len() as u8);
+        out.extend_from_slice(&[0u8; 3]);
+        for &(ttype, s) in entries {
+            out.push(ttype);
+            out.push(0x20);
+            if let Some(bytes) = s {
+                out.extend_from_slice(bytes);
+            }
+            out.push(0); // NUL terminator (or marker for empty string)
+        }
+        out
+    }
+
+    #[test]
+    fn parse_sacd_t_txt_extracts_title_and_performer() {
+        let mut buf = vec![0u8; SECTOR_SIZE as usize];
+        buf[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
+        // 2 tracks; positions at 0x100, 0x200.
+        buf[0x08..0x0a].copy_from_slice(&0x100u16.to_be_bytes());
+        buf[0x0a..0x0c].copy_from_slice(&0x200u16.to_be_bytes());
+        // Track 0: TITLE="Hello", PERFORMER="World"
+        let block0 = build_track_text_block(&[
+            (0x01, Some(b"Hello")),
+            (0x02, Some(b"World")),
+        ]);
+        buf[0x100..0x100 + block0.len()].copy_from_slice(&block0);
+        // Track 1: TITLE="Solo"
+        let block1 = build_track_text_block(&[(0x01, Some(b"Solo"))]);
+        buf[0x200..0x200 + block1.len()].copy_from_slice(&block1);
+
+        let v = parse_sacd_t_txt(&buf, 2, 2 /* Latin-1 */).expect("parse");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].title.as_deref(), Some("Hello"));
+        assert_eq!(v[0].performer.as_deref(), Some("World"));
+        assert!(v[0].composer.is_none());
+        assert_eq!(v[1].title.as_deref(), Some("Solo"));
+        assert!(v[1].performer.is_none());
+    }
+
+    #[test]
+    fn parse_sacd_t_txt_extracts_phonetic_variants() {
+        let mut buf = vec![0u8; SECTOR_SIZE as usize];
+        buf[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
+        buf[0x08..0x0a].copy_from_slice(&0x100u16.to_be_bytes());
+        // Title + phonetic-title + performer + phonetic-performer
+        let block = build_track_text_block(&[
+            (0x01, Some(b"Title")),
+            (0x81, Some(b"TitlePhon")),
+            (0x02, Some(b"Performer")),
+            (0x82, Some(b"PerfPhon")),
+        ]);
+        buf[0x100..0x100 + block.len()].copy_from_slice(&block);
+
+        let v = parse_sacd_t_txt(&buf, 1, 2).expect("parse");
+        assert_eq!(v[0].title.as_deref(), Some("Title"));
+        assert_eq!(v[0].title_phonetic.as_deref(), Some("TitlePhon"));
+        assert_eq!(v[0].performer.as_deref(), Some("Performer"));
+        assert_eq!(v[0].performer_phonetic.as_deref(), Some("PerfPhon"));
+    }
+
+    #[test]
+    fn parse_sacd_t_txt_skips_unknown_track_types() {
+        let mut buf = vec![0u8; SECTOR_SIZE as usize];
+        buf[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
+        buf[0x08..0x0a].copy_from_slice(&0x100u16.to_be_bytes());
+        let block = build_track_text_block(&[
+            (0x01, Some(b"Title")),
+            (0x55, Some(b"GarbageType")), // unknown — must be ignored, not panic
+            (0x02, Some(b"Perf")),
+        ]);
+        buf[0x100..0x100 + block.len()].copy_from_slice(&block);
+        let v = parse_sacd_t_txt(&buf, 1, 2).expect("parse");
+        assert_eq!(v[0].title.as_deref(), Some("Title"));
+        assert_eq!(v[0].performer.as_deref(), Some("Perf"));
+    }
+
+    #[test]
+    fn parse_sacd_t_txt_handles_zero_position() {
+        let mut buf = vec![0u8; SECTOR_SIZE as usize];
+        buf[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
+        // Both positions 0 — both tracks should yield default TrackText.
+        let v = parse_sacd_t_txt(&buf, 2, 2).expect("parse");
+        assert_eq!(v.len(), 2);
+        assert!(v[0].title.is_none());
+        assert!(v[1].title.is_none());
+    }
+
+    #[test]
+    fn parse_sacd_t_txt_rejects_wrong_magic() {
+        let mut buf = vec![0u8; SECTOR_SIZE as usize];
+        buf[0..8].copy_from_slice(b"WRONGTXT");
+        assert!(matches!(parse_sacd_t_txt(&buf, 1, 2), Err(SacdError::Malformed(_))));
+    }
+
+    #[test]
+    fn parse_sacd_t_txt_decodes_latin1() {
+        let mut buf = vec![0u8; SECTOR_SIZE as usize];
+        buf[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
+        buf[0x08..0x0a].copy_from_slice(&0x100u16.to_be_bytes());
+        // "Beyoncé" = B(0x42) e(0x65) y(0x79) o(0x6f) n(0x6e) c(0x63) é(0xe9)
+        let block = build_track_text_block(&[
+            (0x02, Some(&[0x42, 0x65, 0x79, 0x6f, 0x6e, 0x63, 0xe9])),
+        ]);
+        buf[0x100..0x100 + block.len()].copy_from_slice(&block);
+        let v = parse_sacd_t_txt(&buf, 1, 2).expect("parse");
+        assert_eq!(v[0].performer.as_deref(), Some("Beyoncé"));
+    }
+
+    /// Build a 4096-byte SACD_IGL buffer (two sectors concatenated)
+    /// with given (isrc, optional genre) pairs per track.
+    fn build_sacd_igl_buf(rows: &[(Option<&str>, Option<(u8, u8)>)]) -> Vec<u8> {
+        let mut buf = vec![0u8; 2 * SECTOR_SIZE as usize];
+        buf[0..8].copy_from_slice(SACD_IGL_MAGIC);
+        let isrc_base = 8;
+        let genre_base = 8 + 12 * 255 + 4;
+        for (i, (isrc, genre)) in rows.iter().enumerate() {
+            if let Some(s) = isrc {
+                let bytes = s.as_bytes();
+                let n = bytes.len().min(12);
+                buf[isrc_base + i * 12..isrc_base + i * 12 + n].copy_from_slice(&bytes[..n]);
+            }
+            if let Some((category, code)) = genre {
+                buf[genre_base + i * 4] = *category;
+                buf[genre_base + i * 4 + 3] = *code;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn parse_sacd_igl_extracts_isrc_and_genre() {
+        let buf = build_sacd_igl_buf(&[
+            (Some("USAA10800001"), Some((1, 14 /* JAZZ */))),
+            (None, Some((1, 23 /* ROCK */))),
+            (Some("GBABC2200042"), None),
+        ]);
+        let v = parse_sacd_igl(&buf, 3).expect("parse");
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].isrc.as_deref(), Some("USAA10800001"));
+        assert_eq!(v[0].genre.unwrap().name(), "Jazz");
+        assert!(v[1].isrc.is_none());
+        assert_eq!(v[1].genre.unwrap().name(), "Rock");
+        assert_eq!(v[2].isrc.as_deref(), Some("GBABC2200042"));
+        assert!(v[2].genre.is_none());
+    }
+
+    #[test]
+    fn parse_sacd_igl_rejects_short_buffer() {
+        let buf = vec![0u8; 100];
+        assert!(matches!(parse_sacd_igl(&buf, 1), Err(SacdError::Malformed(_))));
+    }
+
+    #[test]
+    fn parse_sacd_igl_rejects_wrong_magic() {
+        let mut buf = vec![0u8; 2 * SECTOR_SIZE as usize];
+        buf[0..8].copy_from_slice(b"NOTIGL!!");
+        assert!(matches!(parse_sacd_igl(&buf, 1), Err(SacdError::Malformed(_))));
+    }
+
+    /// End-to-end test: ISO with master TOC + SACDText + area TOC +
+    /// TRL1 + TRL2 + SACDTTxt + SACD_IGL all wired up. Verifies
+    /// per-track titles, performers, ISRCs, and genres are surfaced.
+    #[test]
+    fn parse_sacd_iso_full_roundtrip_with_per_track_text_and_isrc() {
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("rt2.iso");
+
+        let total_sectors = 700u64;
+        let f = std::fs::File::create(&path).expect("create");
+        f.set_len(total_sectors * SECTOR_SIZE).expect("set_len");
+        drop(f);
+
+        let mut f = std::fs::File::options().write(true).open(&path).expect("reopen");
+
+        // Master TOC at LSN 510 — 2-ch area at LSN 540, size = 5 sectors
+        // (header, TRL1, TRL2, TTxt, IGL[0]; IGL spans 2 so total 6 used,
+        // but we set size to 6 and ensure scan covers all).
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+        mtoc[0x54..0x56].copy_from_slice(&7u16.to_be_bytes()); // 7 sectors
+        mtoc[0x80] = 1;
+        mtoc[0x88] = b'e'; mtoc[0x89] = b'n'; mtoc[0x8a] = 2;
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        let (text_buf, _) = build_sacd_text_sector();
+        f.seek(SeekFrom::Start(511 * SECTOR_SIZE)).unwrap();
+        f.write_all(&text_buf).unwrap();
+
+        // Area TOC at LSN 540 (override size_sectors=7).
+        let mut area_buf = build_area_toc_sector(TWOCH_TOC_MAGIC, 2, 2);
+        area_buf[0x0a..0x0c].copy_from_slice(&7u16.to_be_bytes());
+        f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        f.write_all(&area_buf).unwrap();
+
+        // SACDTRL1 at 541, SACDTRL2 at 542 (2 tracks).
+        f.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_trl1_sector(&[(600, 100), (700, 200)])).unwrap();
+        f.seek(SeekFrom::Start(542 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_trl2_sector(&[
+            (PlayTime { minutes: 0, seconds: 0, frames: 0 },
+             PlayTime { minutes: 2, seconds: 0, frames: 0 }),
+            (PlayTime { minutes: 2, seconds: 0, frames: 0 },
+             PlayTime { minutes: 3, seconds: 30, frames: 0 }),
+        ])).unwrap();
+
+        // SACDTTxt at 543 — track 0: "Track One"/"Artist A",
+        // track 1: "Track Two"/"Artist B".
+        let mut ttxt_buf = vec![0u8; SECTOR_SIZE as usize];
+        ttxt_buf[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
+        ttxt_buf[0x08..0x0a].copy_from_slice(&0x100u16.to_be_bytes());
+        ttxt_buf[0x0a..0x0c].copy_from_slice(&0x200u16.to_be_bytes());
+        let b0 = build_track_text_block(&[
+            (0x01, Some(b"Track One")),
+            (0x02, Some(b"Artist A")),
+        ]);
+        ttxt_buf[0x100..0x100 + b0.len()].copy_from_slice(&b0);
+        let b1 = build_track_text_block(&[
+            (0x01, Some(b"Track Two")),
+            (0x02, Some(b"Artist B")),
+        ]);
+        ttxt_buf[0x200..0x200 + b1.len()].copy_from_slice(&b1);
+        f.seek(SeekFrom::Start(543 * SECTOR_SIZE)).unwrap();
+        f.write_all(&ttxt_buf).unwrap();
+
+        // SACD_IGL at 544 + 545 (2 sectors).
+        let igl = build_sacd_igl_buf(&[
+            (Some("USAA10800001"), Some((1, 14))),
+            (Some("USAA10800002"), Some((1, 14))),
+        ]);
+        f.seek(SeekFrom::Start(544 * SECTOR_SIZE)).unwrap();
+        f.write_all(&igl).unwrap(); // writes 4096 bytes spanning 544+545
+        drop(f);
+
+        let md = parse_sacd_iso(&path).expect("parse_sacd_iso");
+        let stereo = md.stereo.as_ref().expect("stereo present");
+        assert_eq!(stereo.tracks.len(), 2);
+
+        // Track 0: timing + text + ISRC + genre
+        assert_eq!(stereo.tracks[0].start_lsn, 600);
+        assert_eq!(stereo.tracks[0].text.title.as_deref(), Some("Track One"));
+        assert_eq!(stereo.tracks[0].text.performer.as_deref(), Some("Artist A"));
+        assert_eq!(stereo.tracks[0].isrc.as_deref(), Some("USAA10800001"));
+        assert_eq!(stereo.tracks[0].genre.as_ref().map(|g| g.name()), Some("Jazz"));
+
+        // Track 1
+        assert_eq!(stereo.tracks[1].start_lsn, 700);
+        assert_eq!(stereo.tracks[1].text.title.as_deref(), Some("Track Two"));
+        assert_eq!(stereo.tracks[1].text.performer.as_deref(), Some("Artist B"));
+        assert_eq!(stereo.tracks[1].isrc.as_deref(), Some("USAA10800002"));
+        assert_eq!(stereo.tracks[1].duration.total_seconds(), 3.0 * 60.0 + 30.0);
     }
 }
