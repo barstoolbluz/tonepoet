@@ -1218,6 +1218,18 @@ fn draw_metadata_editor(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         format!(" Metadata: {} ", name)
+    } else if let Some(area) = state.sacd_area_kind {
+        // SACD editor: paths are the ISO repeated per virtual track;
+        // surface the disc name + which area is being edited.
+        let iso_name = state.paths[0].file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let area_label = match area {
+            crate::tui::sacd::AreaKind::Stereo => "stereo",
+            crate::tui::sacd::AreaKind::MultiChannel => "MCH",
+        };
+        let ro = if state.read_only { " · read-only" } else { "" };
+        format!(" SACD: {}  [{}{}] ", iso_name, area_label, ro)
     } else {
         format!(" Metadata: {} files ", state.paths.len())
     };

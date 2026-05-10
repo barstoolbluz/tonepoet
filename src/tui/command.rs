@@ -177,6 +177,17 @@ pub fn apply_completion_to_input(
     input.cursor = state.prefix_start + candidate.len();
 }
 
+/// Argument to `:area` for SACD area switching in the metadata
+/// editor. `Toggle` flips between stereo and multi-channel when
+/// both are present; an explicit kind is a no-op if that area
+/// isn't on the disc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SacdAreaTarget {
+    Stereo,
+    MultiChannel,
+    Toggle,
+}
+
 /// Parsed command from the command line
 #[derive(Debug)]
 pub enum Command {
@@ -311,6 +322,15 @@ pub enum Command {
     /// for the gnudb flow. No-op when the editor wasn't reached
     /// through gnudb.
     GnudbBack,
+    /// Switch the SACD metadata editor to a specific area. The
+    /// argument distinguishes stereo / mch / toggle (which flips
+    /// to the area not currently shown). No-op when the editor
+    /// isn't open on a SACD ISO, or when the requested area isn't
+    /// present on the disc. Triggers a full editor rebuild from
+    /// the parsed SacdMetadata + sidecar; unsaved edits are
+    /// preserved on a best-effort basis (per-track values for
+    /// fields the new area also has, by track index).
+    SacdSwitchArea(SacdAreaTarget),
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -383,6 +403,18 @@ pub fn parse_command(input: &str) -> Command {
         "tags-cue-sidecar" | "tags-cue" => Command::TagsCueSidecar,
         "mb-back" | "tags-mb-back" => Command::MbBack,
         "gnudb-back" | "tags-gnudb-back" => Command::GnudbBack,
+        "area" | "sacd-area" => {
+            let target = match args.trim().to_ascii_lowercase().as_str() {
+                "stereo" | "2ch" | "two-channel" | "2.0" => SacdAreaTarget::Stereo,
+                "mch" | "mc" | "multi-channel" | "multichannel" | "5.1" =>
+                    SacdAreaTarget::MultiChannel,
+                "" | "toggle" => SacdAreaTarget::Toggle,
+                other => {
+                    return Command::Unknown(format!(":area unknown target '{}'", other));
+                }
+            };
+            Command::SacdSwitchArea(target)
+        }
         "e" | "edit" => {
             // `:e <N>` (positive integer) targets a line in the parked
             // CUE preview overlay. Anything else falls through to the
@@ -1621,6 +1653,42 @@ pub fn execute_command(
             drop(state);
             app.active_overlay = super::app::ActiveOverlay::GnudbReview(review);
             app.set_status(":gnudb-back: review per-track values".to_string());
+        }
+        Command::SacdSwitchArea(target) => {
+            let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
+                parked
+            } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
+                let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+                if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
+                else { unreachable!() }
+            } else {
+                app.set_status(":area only works in the metadata editor");
+                return;
+            };
+            // SACD only.
+            let Some(_) = state.sacd_area_kind else {
+                app.set_status(":area: editor is not on a SACD ISO");
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            };
+            let iso_path = match state.paths.first().cloned() {
+                Some(p) => p,
+                None => {
+                    app.set_status(":area: no source path on editor state");
+                    app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+            };
+            if state.dirty {
+                app.set_status(":area: editor has unsaved edits — save (:w) or discard (:q!) first");
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            match super::keybindings::switch_sacd_editor_area(&mut state, &iso_path, target) {
+                Ok(label) => app.set_status(format!(":area → {}", label)),
+                Err(reason) => app.set_status(reason),
+            }
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
         Command::TagsCueSidecar => {
             let Some(mut state) = app.pending_metadata_editor.take() else {

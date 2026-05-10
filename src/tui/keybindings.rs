@@ -4064,6 +4064,91 @@ pub(super) fn build_sacd_editor_state(
 /// the file for append. Avoids actually appending by using
 /// `OpenOptions::write(true)` without truncate — `create(false)` is
 /// implicit since we don't pass `create(true)`.
+/// Switch the SACD metadata editor between stereo and multi-channel
+/// areas. Re-parses the ISO + sidecar and rebuilds editor entries
+/// for the target area, preserving cursor/scroll within bounds.
+/// Returns the human-readable label of the new area on success, or
+/// a status reason on failure. Caller must guarantee:
+///   - `state.sacd_area_kind` is Some (i.e. the editor was opened
+///     on a SACD ISO)
+///   - `state.dirty` is false (we don't try to merge edits across
+///     area switches in v1)
+///
+/// No-ops gracefully when the requested area isn't present on the
+/// disc.
+pub(super) fn switch_sacd_editor_area(
+    state: &mut super::app::MetadataEditorState,
+    iso_path: &std::path::Path,
+    target: super::command::SacdAreaTarget,
+) -> Result<&'static str, String> {
+    use super::command::SacdAreaTarget;
+    use super::sacd::AreaKind;
+
+    let md = super::sacd::parse_sacd_iso(iso_path)
+        .map_err(|e| format!(":area: SACD parse failed: {}", e))?;
+
+    // Resolve target → AreaKind. Toggle inverts the current area;
+    // explicit kinds are honored if present.
+    let want_kind = match target {
+        SacdAreaTarget::Stereo => AreaKind::Stereo,
+        SacdAreaTarget::MultiChannel => AreaKind::MultiChannel,
+        SacdAreaTarget::Toggle => match state.sacd_area_kind {
+            Some(AreaKind::Stereo) => AreaKind::MultiChannel,
+            Some(AreaKind::MultiChannel) => AreaKind::Stereo,
+            None => return Err(":area toggle: editor has no area kind".to_string()),
+        },
+    };
+
+    // Verify the requested area exists on this disc.
+    let target_present = match want_kind {
+        AreaKind::Stereo => md.stereo.is_some(),
+        AreaKind::MultiChannel => md.multi_channel.is_some(),
+    };
+    if !target_present {
+        let label = match want_kind {
+            AreaKind::Stereo => "stereo",
+            AreaKind::MultiChannel => "multi-channel",
+        };
+        return Err(format!(":area: this disc has no {} area", label));
+    }
+    if Some(want_kind) == state.sacd_area_kind {
+        let label = match want_kind {
+            AreaKind::Stereo => "stereo",
+            AreaKind::MultiChannel => "multi-channel",
+        };
+        return Err(format!(":area: already on {}", label));
+    }
+
+    // Sidecar read for the merge — same as initial open.
+    let sidecar = super::sacd_sidecar::find_sidecar_for_iso(iso_path)
+        .and_then(|p| super::sacd_sidecar::parse_sidecar(&p).ok());
+
+    // Build a synthetic SacdMetadata that forces the parser's
+    // area-selection (which prefers stereo) to pick the requested
+    // area. Easiest way: when the user wants MCH, hide the stereo
+    // area by replacing md.stereo with None before passing to the
+    // builder; vice versa for stereo.
+    let mut md_view = md.clone();
+    match want_kind {
+        AreaKind::Stereo => md_view.multi_channel = None,
+        AreaKind::MultiChannel => md_view.stereo = None,
+    }
+
+    let (new_state, area_label, _n) =
+        build_sacd_editor_state(iso_path, &md_view, sidecar.as_ref())?;
+
+    // Preserve cursor position within bounds (best-effort — entries
+    // may have different counts if e.g. an MCH area has tracks the
+    // stereo doesn't, but typical hybrid SACDs have matching counts).
+    let prev_cursor = state.cursor;
+    let prev_scroll = state.scroll;
+    *state = new_state;
+    state.cursor = prev_cursor.min(state.entries.len().saturating_sub(1));
+    state.scroll = prev_scroll.min(state.cursor);
+
+    Ok(area_label)
+}
+
 fn is_path_writable(path: &std::path::Path) -> bool {
     std::fs::OpenOptions::new()
         .write(true)
@@ -9832,6 +9917,172 @@ mod phase4_tests {
         let res = save_sacd_sidecar(&state, &xml_path);
         assert!(res.is_err(), "should refuse on mismatch");
         assert!(res.unwrap_err().contains("refusing to map"));
+    }
+
+    // ---------- C6 tests: area switching ----------
+
+    fn make_hybrid_md() -> crate::tui::sacd::SacdMetadata {
+        // Synthetic hybrid with 2 tracks in stereo and 2 in MCH.
+        let mut md = synth_sacd_metadata(
+            Some("Hybrid Album"),
+            None,
+            0,
+            None,
+            &["StereoT1", "StereoT2"],
+            &["", ""],
+            &[None, None],
+        );
+        // Duplicate the stereo area shape as MCH with renamed tracks.
+        let mut mch = md.stereo.as_ref().unwrap().clone();
+        mch.header.kind = crate::tui::sacd::AreaKind::MultiChannel;
+        mch.header.channel_count = 6;
+        for (i, t) in mch.tracks.iter_mut().enumerate() {
+            t.text.title = Some(format!("MCHT{}", i + 1));
+        }
+        md.multi_channel = Some(mch);
+        md
+    }
+
+    /// Simulate the :area target plumbing by calling
+    /// switch_sacd_editor_area against an editor built from
+    /// hybrid synthetic metadata.
+    fn switch_helper(target: super::super::command::SacdAreaTarget) -> (
+        super::super::app::MetadataEditorState,
+        Result<&'static str, String>,
+    ) {
+        let md = make_hybrid_md();
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("hybrid.iso");
+        // Write a minimal real SACD ISO so parse_sacd_iso (called by
+        // switch_sacd_editor_area) returns the same hybrid layout.
+        write_hybrid_iso_fixture(&iso_path, &md);
+
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
+        // The fixture mirrors the synthetic md, so the editor lands
+        // on the stereo area by default. Verify before switching.
+        assert_eq!(state.sacd_area_kind, Some(crate::tui::sacd::AreaKind::Stereo));
+
+        let res = switch_sacd_editor_area(&mut state, &iso_path, target);
+        (state, res)
+    }
+
+    /// Write a synthetic SACD ISO at `path` that, when re-parsed by
+    /// parse_sacd_iso, produces a hybrid disc with 2 tracks each in
+    /// stereo and MCH areas. The fixture is the minimum needed for
+    /// switch_sacd_editor_area's parse step to succeed and yield the
+    /// area-kind asserted in tests.
+    fn write_hybrid_iso_fixture(
+        path: &std::path::Path,
+        _md: &crate::tui::sacd::SacdMetadata,
+    ) {
+        use std::io::{Seek, SeekFrom, Write};
+        use crate::tui::sacd::*;
+
+        let total_sectors = 700u64;
+        let f = std::fs::File::create(path).unwrap();
+        f.set_len(total_sectors * SECTOR_SIZE).unwrap();
+        drop(f);
+        let mut f = std::fs::File::options().write(true).open(path).unwrap();
+
+        // Master TOC with BOTH areas declared.
+        let mut mtoc = vec![0u8; 0xa8];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes()); // 2ch toc_1
+        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());   // 2ch size
+        mtoc[0x48..0x4c].copy_from_slice(&600u32.to_be_bytes()); // MC toc_1
+        mtoc[0x56..0x58].copy_from_slice(&3u16.to_be_bytes());   // MC size
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        let build_area = |magic: &[u8; 8], channels: u8, n_tracks: u8| -> Vec<u8> {
+            let mut a = vec![0u8; SECTOR_SIZE as usize];
+            a[0..8].copy_from_slice(magic);
+            a[0x08] = 1; a[0x09] = 20;
+            a[0x0a..0x0c].copy_from_slice(&3u16.to_be_bytes());
+            a[0x14] = 0x04;
+            a[0x15] = 2;
+            a[0x20] = channels;
+            a[0x21] = if channels == 6 { (5u8 << 3) } else { 0 };
+            a[0x22] = channels;
+            a[0x40] = 30; a[0x41] = 0; a[0x42] = 0;
+            a[0x45] = n_tracks;
+            a[0x50] = 0;
+            a
+        };
+        f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_area(TWOCH_TOC_MAGIC, 2, 2)).unwrap();
+        f.seek(SeekFrom::Start(600 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_area(MULCH_TOC_MAGIC, 6, 2)).unwrap();
+    }
+
+    #[test]
+    fn switch_area_to_mch_lands_on_mch_area() {
+        let (state, res) = switch_helper(super::super::command::SacdAreaTarget::MultiChannel);
+        assert_eq!(res.unwrap(), "MCH");
+        assert_eq!(state.sacd_area_kind, Some(crate::tui::sacd::AreaKind::MultiChannel));
+    }
+
+    #[test]
+    fn switch_area_toggle_inverts_current() {
+        let (state, res) = switch_helper(super::super::command::SacdAreaTarget::Toggle);
+        // Starting on stereo → toggle → MCH.
+        assert_eq!(res.unwrap(), "MCH");
+        assert_eq!(state.sacd_area_kind, Some(crate::tui::sacd::AreaKind::MultiChannel));
+    }
+
+    #[test]
+    fn switch_area_to_same_area_returns_err() {
+        let (_, res) = switch_helper(super::super::command::SacdAreaTarget::Stereo);
+        // Starting state IS stereo, so switching to stereo is a no-op.
+        let err = res.unwrap_err();
+        assert!(err.contains("already on stereo"), "got {}", err);
+    }
+
+    #[test]
+    fn switch_area_to_missing_area_returns_err() {
+        // Build a stereo-only fixture; ask to switch to MCH.
+        let md = synth_sacd_metadata(None, None, 0, None, &["s1"], &[""], &[None]);
+        // Single-area stereo.
+        let td = tempfile::tempdir().unwrap();
+        let iso_path = td.path().join("stereo_only.iso");
+        use std::io::{Seek, SeekFrom, Write};
+        use crate::tui::sacd::*;
+        let f = std::fs::File::create(&iso_path).unwrap();
+        f.set_len(700 * SECTOR_SIZE).unwrap();
+        drop(f);
+        let mut f = std::fs::File::options().write(true).open(&iso_path).unwrap();
+
+        let mut mtoc = vec![0u8; 0xa8];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+        mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        let mut area = vec![0u8; SECTOR_SIZE as usize];
+        area[0..8].copy_from_slice(TWOCH_TOC_MAGIC);
+        area[0x08] = 1; area[0x09] = 20;
+        area[0x0a..0x0c].copy_from_slice(&1u16.to_be_bytes());
+        area[0x14] = 0x04; area[0x15] = 2;
+        area[0x20] = 2; area[0x22] = 2;
+        area[0x40] = 5;
+        area[0x45] = 1;
+        f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        f.write_all(&area).unwrap();
+        drop(f);
+
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
+        let res = switch_sacd_editor_area(
+            &mut state,
+            &iso_path,
+            super::super::command::SacdAreaTarget::MultiChannel,
+        );
+        let err = res.unwrap_err();
+        assert!(err.contains("no multi-channel area"), "got {}", err);
     }
 
     #[test]
