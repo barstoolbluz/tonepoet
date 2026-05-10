@@ -1196,6 +1196,40 @@ fn draw_analysis(
     );
 }
 
+/// Compose the editor's title bar string. Three mutually exclusive
+/// branches in priority order:
+///   1. SACD case (any `sacd_area_kind`): `" SACD: <iso> [<area>[· read-only]] "`.
+///      Wins regardless of path count so single-track SACDs aren't
+///      misclassified as plain single-file edits.
+///   2. Single non-SACD file: `" Metadata: <name> "`.
+///   3. Multi-file non-SACD edit: `" Metadata: <N> files "`.
+pub(super) fn editor_title(state: &super::app::MetadataEditorState) -> String {
+    if let Some(area) = state.sacd_area_kind {
+        // SACD editor: paths are the ISO repeated per virtual track;
+        // surface the disc name + which area is being edited.
+        let iso_name = state
+            .paths
+            .first()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let area_label = match area {
+            crate::tui::sacd::AreaKind::Stereo => "stereo",
+            crate::tui::sacd::AreaKind::MultiChannel => "MCH",
+        };
+        let ro = if state.read_only { " · read-only" } else { "" };
+        format!(" SACD: {}  [{}{}] ", iso_name, area_label, ro)
+    } else if state.paths.len() == 1 {
+        let name = state.paths[0]
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        format!(" Metadata: {} ", name)
+    } else {
+        format!(" Metadata: {} files ", state.paths.len())
+    }
+}
+
 /// Draw the full metadata editor overlay.
 fn draw_metadata_editor(
     f: &mut Frame,
@@ -1213,26 +1247,7 @@ fn draw_metadata_editor(
 
     f.render_widget(Clear, popup);
 
-    let title = if state.paths.len() == 1 {
-        let name = state.paths[0].file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        format!(" Metadata: {} ", name)
-    } else if let Some(area) = state.sacd_area_kind {
-        // SACD editor: paths are the ISO repeated per virtual track;
-        // surface the disc name + which area is being edited.
-        let iso_name = state.paths[0].file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let area_label = match area {
-            crate::tui::sacd::AreaKind::Stereo => "stereo",
-            crate::tui::sacd::AreaKind::MultiChannel => "MCH",
-        };
-        let ro = if state.read_only { " · read-only" } else { "" };
-        format!(" SACD: {}  [{}{}] ", iso_name, area_label, ro)
-    } else {
-        format!(" Metadata: {} files ", state.paths.len())
-    };
+    let title = editor_title(state);
     let border_color = if state.dirty { theme::AMBER } else { theme::CYAN };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3414,3 +3429,100 @@ fn draw_mb_select(
     );
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::app::{MetadataEditorPhase, MetadataEditorState};
+    use std::path::PathBuf;
+
+    /// Minimal MetadataEditorState fixture for title tests. Caller
+    /// overrides only the fields they care about.
+    fn fixture() -> MetadataEditorState {
+        MetadataEditorState {
+            paths: vec![PathBuf::from("/tmp/track.flac")],
+            entries: vec![],
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false,
+            deleted: vec![],
+            file_labels: vec!["01".into()],
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+        }
+    }
+
+    #[test]
+    fn editor_title_single_file_non_sacd() {
+        let mut s = fixture();
+        s.paths = vec![PathBuf::from("/music/song.flac")];
+        assert_eq!(editor_title(&s), " Metadata: song.flac ");
+    }
+
+    #[test]
+    fn editor_title_multi_file_non_sacd() {
+        let mut s = fixture();
+        s.paths = vec![
+            PathBuf::from("/m/a.flac"),
+            PathBuf::from("/m/b.flac"),
+            PathBuf::from("/m/c.flac"),
+        ];
+        s.file_labels = vec!["01".into(), "02".into(), "03".into()];
+        assert_eq!(editor_title(&s), " Metadata: 3 files ");
+    }
+
+    #[test]
+    fn editor_title_sacd_stereo_multitrack() {
+        let mut s = fixture();
+        let iso = PathBuf::from("/lib/kind_of_blue.iso");
+        s.paths = vec![iso; 5];
+        s.file_labels = (1..=5).map(|i| format!("{:>02}", i)).collect();
+        s.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        s.read_only = false;
+        let t = editor_title(&s);
+        assert!(t.contains("SACD"), "{}", t);
+        assert!(t.contains("kind_of_blue.iso"), "{}", t);
+        assert!(t.contains("[stereo]"), "{}", t);
+        assert!(!t.contains("read-only"), "{}", t);
+    }
+
+    #[test]
+    fn editor_title_sacd_mch_read_only() {
+        let mut s = fixture();
+        let iso = PathBuf::from("/lib/x.iso");
+        s.paths = vec![iso; 4];
+        s.file_labels = (1..=4).map(|i| format!("{:>02}", i)).collect();
+        s.sacd_area_kind = Some(crate::tui::sacd::AreaKind::MultiChannel);
+        s.read_only = true;
+        let t = editor_title(&s);
+        assert!(t.contains("[MCH · read-only]"), "{}", t);
+    }
+
+    /// Regression guard: the C6 audit found that a single-track SACD
+    /// (paths.len() == 1) would fall into the non-SACD single-file
+    /// branch and miss the area marker. Title must show area for
+    /// any SACD regardless of track count.
+    #[test]
+    fn editor_title_single_track_sacd_shows_area() {
+        let mut s = fixture();
+        let iso = PathBuf::from("/lib/single_track.iso");
+        s.paths = vec![iso]; // ← length 1 — the bug case
+        s.file_labels = vec!["01".into()];
+        s.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        let t = editor_title(&s);
+        assert!(t.contains("SACD"), "single-track SACD must show SACD marker: {}", t);
+        assert!(t.contains("[stereo]"), "single-track SACD must show area: {}", t);
+        assert!(!t.starts_with(" Metadata:"), "must not fall into non-SACD branch: {}", t);
+    }
+}

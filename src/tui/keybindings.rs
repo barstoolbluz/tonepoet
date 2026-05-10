@@ -4068,14 +4068,15 @@ pub(super) fn build_sacd_editor_state(
 /// areas. Re-parses the ISO + sidecar and rebuilds editor entries
 /// for the target area, preserving cursor/scroll within bounds.
 /// Returns the human-readable label of the new area on success, or
-/// a status reason on failure. Caller must guarantee:
-///   - `state.sacd_area_kind` is Some (i.e. the editor was opened
-///     on a SACD ISO)
-///   - `state.dirty` is false (we don't try to merge edits across
-///     area switches in v1)
+/// a status reason on failure. Refuses internally if:
+///   - the editor isn't on a SACD ISO (`sacd_area_kind = None`),
+///   - the editor has unsaved edits (`dirty = true`),
+///   - the requested area isn't present on the disc, or
+///   - the user is already on the requested area.
 ///
-/// No-ops gracefully when the requested area isn't present on the
-/// disc.
+/// Callers that already pre-check dirty (e.g. the colon-dispatch
+/// path) still benefit from defense-in-depth here so a future
+/// mouse-pill or context-menu handler can call this safely.
 pub(super) fn switch_sacd_editor_area(
     state: &mut super::app::MetadataEditorState,
     iso_path: &std::path::Path,
@@ -4083,6 +4084,15 @@ pub(super) fn switch_sacd_editor_area(
 ) -> Result<&'static str, String> {
     use super::command::SacdAreaTarget;
     use super::sacd::AreaKind;
+
+    // Internal guards (defense in depth — callers may already
+    // enforce these but we don't rely on it).
+    if state.sacd_area_kind.is_none() {
+        return Err(":area: editor is not on a SACD ISO".to_string());
+    }
+    if state.dirty {
+        return Err(":area: editor has unsaved edits — save or discard first".to_string());
+    }
 
     let md = super::sacd::parse_sacd_iso(iso_path)
         .map_err(|e| format!(":area: SACD parse failed: {}", e))?;
@@ -4119,9 +4129,24 @@ pub(super) fn switch_sacd_editor_area(
         return Err(format!(":area: already on {}", label));
     }
 
-    // Sidecar read for the merge — same as initial open.
-    let sidecar = super::sacd_sidecar::find_sidecar_for_iso(iso_path)
-        .and_then(|p| super::sacd_sidecar::parse_sidecar(&p).ok());
+    // Sidecar read for the merge. Symmetric with the initial-open
+    // path in open_metadata_editor_for_sacd: parse failures are
+    // logged but don't abort the switch (editor rebuilds against
+    // ScarletBook only).
+    let sidecar_path = super::sacd_sidecar::find_sidecar_for_iso(iso_path);
+    let sidecar = sidecar_path.as_ref().and_then(|p| {
+        match super::sacd_sidecar::parse_sidecar(p) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!(
+                    "SACD sidecar parse failed during :area switch for '{}': {}",
+                    p.display(),
+                    e,
+                );
+                None
+            }
+        }
+    });
 
     // Build a synthetic SacdMetadata that forces the parser's
     // area-selection (which prefers stereo) to pick the requested
@@ -10039,6 +10064,70 @@ mod phase4_tests {
         // Starting state IS stereo, so switching to stereo is a no-op.
         let err = res.unwrap_err();
         assert!(err.contains("already on stereo"), "got {}", err);
+    }
+
+    #[test]
+    fn switch_area_preserves_cursor_within_bounds() {
+        let md = make_hybrid_md();
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("hybrid.iso");
+        write_hybrid_iso_fixture(&iso_path, &md);
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
+        state.cursor = 1;
+        state.scroll = 0;
+
+        let res = switch_sacd_editor_area(
+            &mut state,
+            &iso_path,
+            super::super::command::SacdAreaTarget::MultiChannel,
+        );
+        assert!(res.is_ok());
+        // Cursor must remain in-bounds (entries shape is similar
+        // between areas for our fixture, so 1 is still valid).
+        assert!(state.cursor < state.entries.len().max(1));
+    }
+
+    #[test]
+    fn switch_area_resets_dirty_to_false() {
+        // After an area switch, the rebuilt state should NOT inherit
+        // any prior dirty flag (we caught dirty before switching, so
+        // post-switch state must start clean).
+        let md = make_hybrid_md();
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("hybrid.iso");
+        write_hybrid_iso_fixture(&iso_path, &md);
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
+        // (state.dirty is false by build, but verify explicitly)
+        assert!(!state.dirty);
+        let _ = switch_sacd_editor_area(
+            &mut state,
+            &iso_path,
+            super::super::command::SacdAreaTarget::MultiChannel,
+        )
+        .expect("switch");
+        assert!(!state.dirty, "post-switch state must start clean");
+    }
+
+    #[test]
+    fn switch_area_refuses_when_dirty_internal_check() {
+        // Internal guard: even if a caller forgets to check dirty,
+        // the function refuses. Regression guard for the C6 audit's
+        // function-vs-caller-contract concern.
+        let md = make_hybrid_md();
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("hybrid.iso");
+        write_hybrid_iso_fixture(&iso_path, &md);
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
+        state.dirty = true; // simulate unsaved edits
+        let res = switch_sacd_editor_area(
+            &mut state,
+            &iso_path,
+            super::super::command::SacdAreaTarget::MultiChannel,
+        );
+        assert!(res.is_err(), "function-level guard should refuse");
+        assert!(res.unwrap_err().contains("unsaved edits"));
+        // State unchanged.
+        assert_eq!(state.sacd_area_kind, Some(crate::tui::sacd::AreaKind::Stereo));
     }
 
     #[test]
