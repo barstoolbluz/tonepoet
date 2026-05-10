@@ -1048,6 +1048,13 @@ pub struct MetadataEditorState {
     /// surface without re-querying gnudb. `None` when the editor
     /// wasn't reached via the gnudb flow.
     pub gnudb_back: Option<Box<GnudbReviewState>>,
+    /// When true, the editor is opened in display-only mode: edits,
+    /// deletions, additions, and saves are all refused with a status
+    /// message. Set for SACD ISOs, which we surface via the
+    /// ScarletBook parser but cannot write back to without an audio
+    /// extraction + re-mux pipeline (deferred — out of scope for v1
+    /// metadata-only support).
+    pub read_only: bool,
 }
 
 /// State cached on `MetadataEditorState::mb_back` to support the

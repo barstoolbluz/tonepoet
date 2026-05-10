@@ -427,9 +427,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::SacdIso => {
-            // C3 ships the classification only; metadata-edit / convert
-            // wiring lands in C5 / C7. Keep the menu minimal for now
-            // so the variant is at least a first-class browse citizen.
+            // C5 surfaces ScarletBook metadata in a read-only editor;
+            // convert/export wiring lands in C7 (needs audio extraction).
+            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
+            items.push(separator());
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
             items.push(item("Select Inverse", ContextAction::SelectInverse));
@@ -1401,7 +1402,7 @@ mod tests {
             phase: MetadataEditorPhase::Editing,
             dirty: false, deleted: Vec::new(),
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false,
         };
 
         // Row 0 = TITLE: no View entry.

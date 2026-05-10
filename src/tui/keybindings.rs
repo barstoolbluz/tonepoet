@@ -2376,6 +2376,10 @@ pub(super) fn metadata_editor_save(
     state: &mut super::app::MetadataEditorState,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    if state.read_only {
+        app.set_status("read-only editor — cannot save (SACD ISO)");
+        return;
+    }
     if !state.dirty {
         app.set_status("No changes to save");
         return;
@@ -2479,13 +2483,17 @@ fn handle_metadata_editor_key(
                             // (e.g. TITLE on a single-image rip with embedded
                             // CUESHEET) have per_file_values.len() != paths.len().
                             if entry.is_mixed && entry.per_file_values.len() > 1 {
-                                // Mixed field: open per-file detail overlay.
+                                // Per-track detail view is allowed even in
+                                // read-only mode (the per-track editing inside
+                                // is gated separately in handle_detail_edit).
                                 state.detail_field_idx = state.cursor;
                                 state.detail_cursor = 0;
                                 state.detail_scroll = 0;
                                 state.detail_edit = None;
                                 state.last_click = None;
                                 state.phase = MetadataEditorPhase::DetailEdit;
+                            } else if state.read_only {
+                                app.set_status("read-only editor (SACD ISO)");
                             } else {
                                 // Single value: inline edit.
                                 state.edit_input = Some(
@@ -2494,6 +2502,8 @@ fn handle_metadata_editor_key(
                                 state.phase = MetadataEditorPhase::InlineEdit;
                             }
                         }
+                    } else if state.read_only {
+                        app.set_status("read-only editor (SACD ISO)");
                     } else {
                         // "Add field" row — start adding a new key.
                         state.add_key_input = Some(
@@ -2507,7 +2517,11 @@ fn handle_metadata_editor_key(
                 // removed (no-bare-char-keys rule); user invokes them
                 // via colon commands or footer-pill clicks.
                 KeyCode::Delete => {
-                    metadata_editor_delete_cursor(state);
+                    if state.read_only {
+                        app.set_status("read-only editor (SACD ISO)");
+                    } else {
+                        metadata_editor_delete_cursor(state);
+                    }
                 }
                 _ => {}
             }
@@ -2774,8 +2788,9 @@ fn handle_metadata_editor_key(
                     ensure_detail_visible(state);
                 }
                 KeyCode::Enter => {
-                    // Open inline edit for this file's value.
-                    if field_idx < state.entries.len() && state.detail_cursor < n_files {
+                    if state.read_only {
+                        app.set_status("read-only editor (SACD ISO)");
+                    } else if field_idx < state.entries.len() && state.detail_cursor < n_files {
                         let val = state.entries[field_idx].per_file_values[state.detail_cursor].clone();
                         state.detail_edit = Some(
                             super::text_input::TextInputState::new(val),
@@ -3394,6 +3409,18 @@ pub fn open_metadata_editor(app: &mut AppState) {
     // Collect paths — expand directories recursively to find nested
     // audio files (e.g., disc 01/disc 02 folders).
     let sel = super::command::collect_selection_for_file_ops(app);
+
+    // SACD ISO short-circuit: if the selection is exactly one SACD ISO
+    // file, surface ScarletBook metadata (album-level + per-track
+    // titles/artists/composers/ISRC) via parse_sacd_iso, bypassing the
+    // lofty/tag pipeline entirely. Read-only — write-back is gated by
+    // state.read_only at save time. See open_metadata_editor_for_sacd
+    // for the surfacing rules.
+    if sel.len() == 1 && super::sacd::is_sacd_iso(&sel[0]) {
+        open_metadata_editor_for_sacd(app, sel[0].clone());
+        return;
+    }
+
     let mut paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
         .into_iter()
         .filter(|p| matches!(
@@ -3643,8 +3670,228 @@ pub fn open_metadata_editor(app: &mut AppState) {
             detail_edit: None,
             mb_back: None,
             gnudb_back: None,
+            read_only: false,
         },
     ));
+}
+
+/// Open the metadata editor against a SACD ISO. Parses the ISO,
+/// hands the parsed metadata off to `build_sacd_editor_state` to
+/// construct the editor state, and installs it on the app.
+fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBuf) {
+    let md = match super::sacd::parse_sacd_iso(&iso_path) {
+        Ok(m) => m,
+        Err(e) => {
+            app.set_status(format!("Failed to parse SACD: {}", e));
+            return;
+        }
+    };
+    match build_sacd_editor_state(&iso_path, &md) {
+        Ok((state, area_label, n_tracks)) => {
+            app.set_status(format!(
+                "SACD editor opened ({}, {} tracks) — read-only",
+                area_label, n_tracks
+            ));
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(Box::new(state));
+        }
+        Err(msg) => app.set_status(msg),
+    }
+}
+
+/// Pure builder: turn parsed SACD metadata into a `MetadataEditorState`.
+/// Stereo area is preferred when both are present; multi-channel is
+/// the fallback. The resulting editor is `read_only = true` because
+/// writing back into a ScarletBook layout requires an audio
+/// extraction + re-mux pipeline that v1 doesn't ship.
+///
+/// Returns (state, area_label, n_tracks) on success so the caller
+/// can compose a status message; returns Err with a short reason
+/// string when no readable area exists or the area is empty.
+pub(super) fn build_sacd_editor_state(
+    iso_path: &std::path::Path,
+    md: &super::sacd::SacdMetadata,
+) -> Result<(super::app::MetadataEditorState, &'static str, usize), String> {
+    use lofty::tag::ItemKey;
+    use super::probe::TagEntry;
+
+    let area = md
+        .stereo
+        .as_ref()
+        .or(md.multi_channel.as_ref())
+        .ok_or_else(|| "SACD: no readable area".to_string())?;
+
+    let n_tracks = area.tracks.len();
+    if n_tracks == 0 {
+        return Err("SACD area has zero tracks".to_string());
+    }
+
+    let area_label = match area.header.kind {
+        super::sacd::AreaKind::Stereo => "stereo",
+        super::sacd::AreaKind::MultiChannel => "MCH",
+    };
+
+    // The editor models per-track values via paths: Vec<PathBuf>. For
+    // an SACD we have one file but many virtual tracks; repeat the ISO
+    // path N times so per-track indexing works. read_only blocks any
+    // write attempt that would otherwise hit the same file N times.
+    let paths = vec![iso_path.to_path_buf(); n_tracks];
+
+    // Build entries: album-level fields share one value across all
+    // tracks; per-track fields hold a value per track.
+    let mut entries: Vec<TagEntry> = Vec::new();
+
+    // Album-level (single value replicated across all tracks).
+    let push_album = |entries: &mut Vec<TagEntry>,
+                      display_key: &str,
+                      item_key: ItemKey,
+                      value: String| {
+        let vals = vec![value.clone(); n_tracks];
+        entries.push(TagEntry {
+            display_key: display_key.to_string(),
+            item_key,
+            value,
+            original: String::new(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vals.clone(),
+            per_file_originals: vals,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    };
+
+    if let Some(t) = md.master_text.as_ref() {
+        if let Some(s) = t.album_title.clone() {
+            push_album(&mut entries, "ALBUM", ItemKey::AlbumTitle, s);
+        }
+        if let Some(s) = t.album_artist.clone() {
+            push_album(&mut entries, "ALBUMARTIST", ItemKey::AlbumArtist, s);
+        }
+    }
+    if let Some(date) = md.master_toc.disc_date {
+        push_album(&mut entries, "DATE", ItemKey::Year, date.year.to_string());
+    }
+    if !md.master_toc.album_catalog_number.is_empty() {
+        push_album(
+            &mut entries,
+            "CATALOGNUMBER",
+            ItemKey::CatalogNumber,
+            md.master_toc.album_catalog_number.clone(),
+        );
+    }
+    let genre_label = md
+        .master_toc
+        .disc_genres
+        .first()
+        .or_else(|| md.master_toc.album_genres.first())
+        .map(|g| g.name())
+        .filter(|n| *n != "Not used" && *n != "Not defined");
+    if let Some(g) = genre_label {
+        push_album(&mut entries, "GENRE", ItemKey::Genre, g.to_string());
+    }
+
+    // Per-track entries.
+    let push_per_track = |entries: &mut Vec<TagEntry>,
+                          display_key: &str,
+                          item_key: ItemKey,
+                          values: Vec<String>| {
+        if values.iter().all(|s| s.is_empty()) {
+            return;
+        }
+        let all_same = values.windows(2).all(|w| w[0] == w[1]);
+        let value = if all_same {
+            values.first().cloned().unwrap_or_default()
+        } else {
+            "<multiple values>".to_string()
+        };
+        entries.push(TagEntry {
+            display_key: display_key.to_string(),
+            item_key,
+            value,
+            original: String::new(),
+            is_binary: false,
+            is_mixed: !all_same,
+            per_file_originals: values.clone(),
+            per_file_values: values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    };
+
+    let track_numbers: Vec<String> = (1..=n_tracks).map(|i| i.to_string()).collect();
+    push_per_track(
+        &mut entries,
+        "TRACKNUMBER",
+        ItemKey::TrackNumber,
+        track_numbers,
+    );
+
+    let titles: Vec<String> = area
+        .tracks
+        .iter()
+        .map(|t| t.text.title.clone().unwrap_or_default())
+        .collect();
+    push_per_track(&mut entries, "TITLE", ItemKey::TrackTitle, titles);
+
+    let performers: Vec<String> = area
+        .tracks
+        .iter()
+        .map(|t| t.text.performer.clone().unwrap_or_default())
+        .collect();
+    push_per_track(&mut entries, "ARTIST", ItemKey::TrackArtist, performers);
+
+    let composers: Vec<String> = area
+        .tracks
+        .iter()
+        .map(|t| t.text.composer.clone().unwrap_or_default())
+        .collect();
+    push_per_track(&mut entries, "COMPOSER", ItemKey::Composer, composers);
+
+    let songwriters: Vec<String> = area
+        .tracks
+        .iter()
+        .map(|t| t.text.songwriter.clone().unwrap_or_default())
+        .collect();
+    push_per_track(&mut entries, "LYRICIST", ItemKey::Lyricist, songwriters);
+
+    let arrangers: Vec<String> = area
+        .tracks
+        .iter()
+        .map(|t| t.text.arranger.clone().unwrap_or_default())
+        .collect();
+    push_per_track(&mut entries, "ARRANGER", ItemKey::Arranger, arrangers);
+
+    let isrcs: Vec<String> = area
+        .tracks
+        .iter()
+        .map(|t| t.isrc.clone().unwrap_or_default())
+        .collect();
+    push_per_track(&mut entries, "ISRC", ItemKey::Isrc, isrcs);
+
+    let file_labels: Vec<String> = (1..=n_tracks).map(|i| format!("{:>02}", i)).collect();
+
+    let state = super::app::MetadataEditorState {
+        paths,
+        entries,
+        cursor: 0,
+        scroll: 0,
+        last_click: None,
+        edit_input: None,
+        add_key_input: None,
+        phase: super::app::MetadataEditorPhase::Editing,
+        dirty: false,
+        deleted: Vec::new(),
+        file_labels,
+        detail_field_idx: 0,
+        detail_cursor: 0,
+        detail_scroll: 0,
+        detail_edit: None,
+        mb_back: None,
+        gnudb_back: None,
+        read_only: true,
+    };
+
+    Ok((state, area_label, n_tracks))
 }
 
 /// Handle mouse events for generic overlays: click-outside-to-close,
@@ -4935,12 +5182,16 @@ fn handle_metadata_editor_mouse(
                                 .map(|(prev, t)| prev == file_idx && now.duration_since(t).as_millis() < 400)
                                 .unwrap_or(false);
 
-                            if is_double && field_idx < state.entries.len() {
+                            if is_double && field_idx < state.entries.len() && !state.read_only {
                                 // Open inline edit for this file's value.
                                 let val = state.entries[field_idx].per_file_values[file_idx].clone();
                                 state.detail_edit = Some(
                                     super::text_input::TextInputState::new(val),
                                 );
+                                state.detail_cursor = file_idx;
+                                state.last_click = None;
+                            } else if is_double && state.read_only {
+                                app.set_status("read-only editor (SACD ISO)");
                                 state.detail_cursor = file_idx;
                                 state.last_click = None;
                             } else {
@@ -5121,6 +5372,8 @@ fn handle_metadata_editor_mouse(
                             state.detail_edit = None;
                             state.last_click = None;
                             state.phase = MetadataEditorPhase::DetailEdit;
+                        } else if state.read_only {
+                            app.set_status("read-only editor (SACD ISO)");
                         } else {
                             state.edit_input = Some(
                                 super::text_input::TextInputState::new(entry.value.clone()),
@@ -5130,12 +5383,16 @@ fn handle_metadata_editor_mouse(
                     }
                     state.last_click = None;
                 } else if is_double && row == state.entries.len() {
-                    // Double-click on "+ Add field..."
-                    state.cursor = state.entries.len();
-                    state.add_key_input = Some(
-                        super::text_input::TextInputState::empty(),
-                    );
-                    state.phase = MetadataEditorPhase::AddingKey;
+                    if state.read_only {
+                        app.set_status("read-only editor (SACD ISO)");
+                    } else {
+                        // Double-click on "+ Add field..."
+                        state.cursor = state.entries.len();
+                        state.add_key_input = Some(
+                            super::text_input::TextInputState::empty(),
+                        );
+                        state.phase = MetadataEditorPhase::AddingKey;
+                    }
                     state.last_click = None;
                 } else {
                     // Single click: move cursor.
@@ -8055,6 +8312,7 @@ mod phase4_tests {
             detail_edit: None,
             mb_back: None,
             gnudb_back: None,
+            read_only: false,
         }
     }
 
@@ -8423,6 +8681,7 @@ mod phase4_tests {
             detail_edit: None,
             mb_back: None,
             gnudb_back: None,
+            read_only: false,
         }
     }
 
@@ -8568,7 +8827,7 @@ mod phase4_tests {
             phase: MetadataEditorPhase::Editing,
             dirty: false, deleted: vec![],
             file_labels: vec!["01".into(), "02".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false,
         };
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());
@@ -8690,6 +8949,229 @@ mod phase4_tests {
         let mut entries: Vec<TagEntry> = vec![];
         inject_sidecar_cuesheet_if_present(&mut entries, &audio);
         assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
+    }
+
+    // ---------- C5 tests: SACD editor surfacing ----------
+
+    /// Build a minimal SacdMetadata with the supplied album+track text
+    /// and one stereo area. Used to test `build_sacd_editor_state`
+    /// without re-running the full parser.
+    fn synth_sacd_metadata(
+        album_title: Option<&str>,
+        album_artist: Option<&str>,
+        disc_year: u16,
+        catalog: Option<&str>,
+        track_titles: &[&str],
+        track_performers: &[&str],
+        track_isrcs: &[Option<&str>],
+    ) -> crate::tui::sacd::SacdMetadata {
+        use crate::tui::sacd::*;
+
+        let master_toc = MasterToc {
+            spec_version: (1, 20),
+            album_set_size: 1,
+            album_sequence_number: 1,
+            album_catalog_number: catalog.unwrap_or("").to_string(),
+            album_genres: vec![],
+            two_channel: AreaPointer { toc_1_start: 540, toc_2_start: 541, toc_size_sectors: 3 },
+            multi_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
+            disc_type_hybrid: false,
+            disc_catalog_number: String::new(),
+            disc_genres: vec![Genre { category: 1, genre: 14 /* JAZZ */ }],
+            disc_date: if disc_year > 0 {
+                Some(DiscDate { year: disc_year, month: 0, day: 0 })
+            } else {
+                None
+            },
+            text_area_count: 1,
+            locales: vec![],
+        };
+
+        let master_text = if album_title.is_some() || album_artist.is_some() {
+            Some(SacdText {
+                album_title: album_title.map(|s| s.to_string()),
+                album_artist: album_artist.map(|s| s.to_string()),
+                charset: 2,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
+        let n = track_titles.len();
+        let mut tracks: Vec<TrackEntry> = Vec::with_capacity(n);
+        for i in 0..n {
+            tracks.push(TrackEntry {
+                start_lsn: 600 + i as u32 * 100,
+                length_lsn: 100,
+                start_time: PlayTime::default(),
+                duration: PlayTime { minutes: 3, seconds: 0, frames: 0 },
+                text: TrackText {
+                    title: if track_titles[i].is_empty() { None } else { Some(track_titles[i].to_string()) },
+                    performer: track_performers.get(i)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                    ..Default::default()
+                },
+                isrc: track_isrcs.get(i).and_then(|o| o.map(|s| s.to_string())),
+                genre: None,
+            });
+        }
+
+        let stereo_header = AreaTocHeader {
+            kind: AreaKind::Stereo,
+            spec_version: (1, 20),
+            size_sectors: 3,
+            max_byte_rate: 64_000,
+            sample_frequency: 0x04,
+            frame_format: FrameFormat::Dsd3In14,
+            channel_count: 2,
+            loudspeaker_config: 0,
+            extra_settings: 0,
+            max_available_channels: 2,
+            area_mute_flags: 0,
+            total_playtime: PlayTime { minutes: 30, seconds: 0, frames: 0 },
+            track_offset: 0,
+            track_count: n as u8,
+            track_start_lsn: 600,
+            track_end_lsn: 10_000,
+            text_area_count: 1,
+            locales: vec![Locale { language_code: [b'e', b'n'], character_set: 2 }],
+            description: None,
+            description_phonetic: None,
+            copyright: None,
+            copyright_phonetic: None,
+        };
+
+        SacdMetadata {
+            master_toc,
+            master_text,
+            stereo: Some(AreaInfo { header: stereo_header, tracks }),
+            multi_channel: None,
+        }
+    }
+
+    #[test]
+    fn build_sacd_editor_state_album_level_fields_extracted() {
+        let md = synth_sacd_metadata(
+            Some("Kind of Blue"),
+            Some("Miles Davis"),
+            1959,
+            Some("PROC-001"),
+            &["So What", "Freddie Freeloader"],
+            &["Miles Davis Sextet", "Miles Davis Sextet"],
+            &[None, None],
+        );
+        let path = std::path::PathBuf::from("/tmp/test.iso");
+        let (state, label, n) = build_sacd_editor_state(&path, &md).expect("build");
+        assert_eq!(label, "stereo");
+        assert_eq!(n, 2);
+        assert!(state.read_only);
+        assert_eq!(state.paths.len(), 2);
+        assert!(state.paths.iter().all(|p| p == &path));
+
+        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        assert_eq!(by_key("ALBUM").map(|e| e.value.as_str()), Some("Kind of Blue"));
+        assert_eq!(by_key("ALBUMARTIST").map(|e| e.value.as_str()), Some("Miles Davis"));
+        assert_eq!(by_key("DATE").map(|e| e.value.as_str()), Some("1959"));
+        assert_eq!(by_key("CATALOGNUMBER").map(|e| e.value.as_str()), Some("PROC-001"));
+        assert_eq!(by_key("GENRE").map(|e| e.value.as_str()), Some("Jazz"));
+        // Album-level entries share one value across all tracks.
+        for k in &["ALBUM", "ALBUMARTIST", "DATE", "CATALOGNUMBER", "GENRE"] {
+            let e = by_key(k).expect(k);
+            assert_eq!(e.per_file_values.len(), 2);
+            assert!(!e.is_mixed);
+        }
+    }
+
+    #[test]
+    fn build_sacd_editor_state_per_track_titles_and_artists() {
+        let md = synth_sacd_metadata(
+            Some("Album"),
+            None,
+            0,
+            None,
+            &["Track A", "Track B", "Track C"],
+            &["Artist X", "Artist X", "Artist Y"],
+            &[Some("USAA10800001"), Some("USAA10800002"), None],
+        );
+        let path = std::path::PathBuf::from("/tmp/synthetic.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md).expect("build");
+
+        let title = state.entries.iter().find(|e| e.display_key == "TITLE").expect("TITLE");
+        assert_eq!(title.per_file_values, vec!["Track A", "Track B", "Track C"]);
+        assert!(title.is_mixed);
+
+        let artist = state.entries.iter().find(|e| e.display_key == "ARTIST").expect("ARTIST");
+        assert_eq!(artist.per_file_values, vec!["Artist X", "Artist X", "Artist Y"]);
+        assert!(artist.is_mixed);
+
+        let isrc = state.entries.iter().find(|e| e.display_key == "ISRC").expect("ISRC");
+        assert_eq!(isrc.per_file_values, vec!["USAA10800001", "USAA10800002", ""]);
+    }
+
+    #[test]
+    fn build_sacd_editor_state_skips_per_track_field_when_all_empty() {
+        // No performers anywhere → ARTIST entry should not be emitted.
+        let md = synth_sacd_metadata(
+            Some("Album"), None, 0, None,
+            &["T1", "T2"], &["", ""], &[None, None],
+        );
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md).expect("build");
+        assert!(state.entries.iter().all(|e| e.display_key != "ARTIST"));
+        assert!(state.entries.iter().all(|e| e.display_key != "ISRC"));
+    }
+
+    #[test]
+    fn build_sacd_editor_state_includes_tracknumber_always() {
+        let md = synth_sacd_metadata(
+            None, None, 0, None,
+            &["t1", "t2", "t3"], &["", "", ""], &[None, None, None],
+        );
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md).expect("build");
+        let tn = state.entries.iter().find(|e| e.display_key == "TRACKNUMBER").expect("TRACKNUMBER");
+        assert_eq!(tn.per_file_values, vec!["1", "2", "3"]);
+        assert!(tn.is_mixed);
+    }
+
+    #[test]
+    fn build_sacd_editor_state_rejects_zero_track_area() {
+        let md = synth_sacd_metadata(None, None, 0, None, &[], &[], &[]);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let res = build_sacd_editor_state(&path, &md);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("zero tracks"));
+    }
+
+    #[test]
+    fn build_sacd_editor_state_rejects_no_areas() {
+        // No stereo, no multi_channel.
+        let mut md = synth_sacd_metadata(None, None, 0, None, &["x"], &[""], &[None]);
+        md.stereo = None;
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let res = build_sacd_editor_state(&path, &md);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("no readable area"));
+    }
+
+    #[test]
+    fn build_sacd_editor_state_falls_back_to_multi_channel_when_no_stereo() {
+        use crate::tui::sacd::*;
+        let mut md = synth_sacd_metadata(
+            Some("MC Album"), None, 0, None,
+            &["t1"], &[""], &[None],
+        );
+        // Move the stereo area into multi_channel slot and clear stereo.
+        let mut info = md.stereo.take().unwrap();
+        info.header.kind = AreaKind::MultiChannel;
+        info.header.channel_count = 6;
+        md.multi_channel = Some(info);
+
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (_, label, _) = build_sacd_editor_state(&path, &md).expect("build");
+        assert_eq!(label, "MCH");
     }
 }
 

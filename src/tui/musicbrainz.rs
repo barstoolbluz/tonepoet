@@ -1287,7 +1287,7 @@ mod tests {
             phase: MetadataEditorPhase::Editing,
             dirty: false, deleted: Vec::new(),
             file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false,
         };
         (state, td)
     }
