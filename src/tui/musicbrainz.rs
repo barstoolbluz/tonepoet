@@ -707,7 +707,8 @@ fn recompute_and_stamp_mb_proposed(
 /// writes the review-equivalent fields (TITLE/ARTIST/ALBUM/TRACKNUMBER/
 /// DATE) on top.
 ///
-/// Mirrors `super::gnudb::populate_editor_from_gnudb`.
+/// Mirrors `super::gnudb::populate_editor_from_review` (the production
+/// gnudb populate path).
 pub fn populate_editor_from_mb(
     state: &mut crate::tui::app::MetadataEditorState,
     release: &MbRelease,
