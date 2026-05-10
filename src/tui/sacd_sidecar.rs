@@ -423,6 +423,145 @@ impl SidecarMetadata {
     }
 }
 
+// ---------------------------------------------------------------
+// Serialization (write)
+// ---------------------------------------------------------------
+
+/// Serialize a `SidecarMetadata` to XML in a shape compatible with
+/// sacd-extract / foobar2000's Super Audio CD Decoder. Track order
+/// in the output matches the order in `metadata.tracks` (call-site
+/// concern; the parser preserves in-file order). Within each track,
+/// `<meta>` entries are emitted in BTreeMap iteration order
+/// (alphabetical by key) — this is a tolerable departure from
+/// strictly preserving the original key order, since the format
+/// doesn't constrain key order. `<replaygain>` entries follow the
+/// `<meta>` block.
+///
+/// Bytes are UTF-8; XML predefined entities (`& < > " '`) are
+/// escaped. Numeric character references aren't used (we don't
+/// emit them and the parser doesn't decode them — neither side
+/// trips on the inverse operation).
+pub fn serialize_sidecar(metadata: &SidecarMetadata) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+    out.push_str("<!--SACD metabase file-->");
+    out.push_str("<root>");
+    out.push_str("<store id=\"");
+    out.push_str(&escape_xml(&metadata.store_id));
+    out.push_str("\" type=\"SACD\" version=\"");
+    out.push_str(&escape_xml(if metadata.version.is_empty() { "1.1" } else { &metadata.version }));
+    out.push_str("\">");
+
+    for track in &metadata.tracks {
+        out.push('\n');
+        out.push_str("<track id=\"");
+        out.push_str(&track.id.to_string());
+        out.push_str("\">");
+        for (k, v) in &track.meta {
+            out.push_str("<meta name=\"");
+            out.push_str(&escape_xml(k));
+            out.push_str("\" value=\"");
+            out.push_str(&escape_xml(v));
+            out.push_str("\"/>");
+        }
+        for (k, v) in &track.replaygain {
+            out.push_str("<replaygain name=\"");
+            out.push_str(&escape_xml(k));
+            out.push_str("\" value=\"");
+            out.push_str(&escape_xml(v));
+            out.push_str("\"/>");
+        }
+        out.push_str("</track>");
+    }
+
+    out.push('\n');
+    out.push_str("</store>");
+    out.push_str("</root>");
+    out.push('\n');
+    out
+}
+
+/// Atomic write: serialize, write to a sibling `.tmp` file, fsync,
+/// then rename over the target. On rename failure the temp file is
+/// removed. This avoids torn writes if the process is killed mid-
+/// write, and is consistent with how the rest of tonepoet writes
+/// CUE files / metadata journal entries.
+pub fn write_sidecar(path: &Path, metadata: &SidecarMetadata) -> Result<(), SidecarError> {
+    use std::io::Write;
+    let bytes = serialize_sidecar(metadata).into_bytes();
+    let parent = path
+        .parent()
+        .ok_or_else(|| SidecarError::Io(format!("no parent dir for '{}'", path.display())))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "sidecar".to_string()),
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| SidecarError::Io(format!("create tmp '{}': {}", tmp.display(), e)))?;
+        f.write_all(&bytes)
+            .map_err(|e| SidecarError::Io(format!("write tmp: {}", e)))?;
+        f.sync_all()
+            .map_err(|e| SidecarError::Io(format!("fsync tmp: {}", e)))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SidecarError::Io(format!(
+            "rename '{}' → '{}': {}",
+            tmp.display(),
+            path.display(),
+            e,
+        )));
+    }
+    Ok(())
+}
+
+/// Encode XML predefined entities for inclusion in attribute values.
+/// Only `& < > " '` are translated — numeric character references
+/// aren't emitted because the parser doesn't decode them.
+fn escape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Mint a disc id for a new sidecar from the raw master TOC bytes.
+/// **Provisional**: this isn't (yet) the same algorithm sacd-extract
+/// uses, so existing-sidecar discovery will still match by filename
+/// rule and tools that look up by id won't find tonepoet-minted
+/// sidecars. Reverse-engineering the canonical algorithm is on the
+/// roadmap. For now we produce an MD5-shaped 32-hex-char fingerprint
+/// over the first 168 bytes of the master TOC (the full
+/// `master_toc_t` struct), so the id is at least stable across
+/// invocations on the same disc.
+pub fn mint_disc_id_provisional(master_toc_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    // We use SHA-256 truncated to 16 bytes (32 hex chars) — gives the
+    // same shape as sacd-extract's MD5-style id without pulling in an
+    // MD5 crate. Once the canonical algorithm is reverse-engineered
+    // this function will swap to it.
+    let mut h = Sha256::new();
+    h.update(master_toc_bytes);
+    let digest = h.finalize();
+    let mut hex = String::with_capacity(32);
+    for &b in digest.iter().take(16) {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{:02X}", b);
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +676,130 @@ mod tests {
         let iso = td.path().join("disc.iso");
         std::fs::write(&iso, b"\0\0\0\0").unwrap();
         assert!(find_sidecar_for_iso(&iso).is_none());
+    }
+
+    #[test]
+    fn serialize_then_parse_roundtrips_a_track() {
+        let mut m = SidecarMetadata {
+            store_id: "DEADBEEF0123456789ABCDEF01234567".to_string(),
+            version: "1.1".to_string(),
+            tracks: Vec::new(),
+        };
+        let mut t = SidecarTrack::default();
+        t.id = 3;
+        t.meta.insert("TITLE".to_string(), "My Track".to_string());
+        t.meta.insert("ARTIST".to_string(), "An Artist".to_string());
+        t.meta.insert("TRACKNUMBER".to_string(), "03".to_string());
+        t.replaygain
+            .insert("replaygain_track_gain".to_string(), "+5.00 dB".to_string());
+        m.tracks.push(t);
+
+        let xml = serialize_sidecar(&m);
+        let parsed = parse_sidecar_str(&xml).expect("parse roundtrip");
+        assert_eq!(parsed.store_id, m.store_id);
+        assert_eq!(parsed.tracks.len(), 1);
+        assert_eq!(parsed.tracks[0].id, 3);
+        assert_eq!(parsed.tracks[0].meta.get("TITLE").map(String::as_str), Some("My Track"));
+        assert_eq!(
+            parsed.tracks[0].replaygain.get("replaygain_track_gain").map(String::as_str),
+            Some("+5.00 dB"),
+        );
+    }
+
+    #[test]
+    fn serialize_escapes_xml_entities_in_values() {
+        let mut m = SidecarMetadata {
+            store_id: "A".into(),
+            version: "1.1".into(),
+            tracks: Vec::new(),
+        };
+        let mut t = SidecarTrack::default();
+        t.id = 1;
+        t.meta.insert("TITLE".into(), "Foo & <Bar> \"Baz\"".into());
+        m.tracks.push(t);
+        let xml = serialize_sidecar(&m);
+        assert!(xml.contains("&amp;"), "{}", xml);
+        assert!(xml.contains("&lt;Bar&gt;"), "{}", xml);
+        assert!(xml.contains("&quot;Baz&quot;"), "{}", xml);
+        // Roundtrip restores original characters.
+        let parsed = parse_sidecar_str(&xml).expect("parse");
+        assert_eq!(
+            parsed.tracks[0].meta.get("TITLE").map(String::as_str),
+            Some("Foo & <Bar> \"Baz\""),
+        );
+    }
+
+    #[test]
+    fn serialize_preserves_foreign_meta_keys() {
+        // Foreign keys (DISCOGS_*, DYNAMIC RANGE, etc.) must round-trip
+        // — that's the entire point of read-modify-write writes
+        // preserving fields tonepoet doesn't surface.
+        let mut m = SidecarMetadata {
+            store_id: "X".into(),
+            version: "1.1".into(),
+            tracks: Vec::new(),
+        };
+        let mut t = SidecarTrack::default();
+        t.id = 1;
+        t.meta.insert("TITLE".into(), "T".into());
+        t.meta.insert("DISCOGS_RELEASE_ID".into(), "12345".into());
+        t.meta.insert("DYNAMIC RANGE".into(), "15".into());
+        t.meta.insert("PUBLISHER".into(), "Pub Co".into());
+        m.tracks.push(t);
+
+        let xml = serialize_sidecar(&m);
+        let parsed = parse_sidecar_str(&xml).expect("parse");
+        let pt = &parsed.tracks[0];
+        assert_eq!(pt.meta.get("TITLE").map(String::as_str), Some("T"));
+        assert_eq!(pt.meta.get("DISCOGS_RELEASE_ID").map(String::as_str), Some("12345"));
+        assert_eq!(pt.meta.get("DYNAMIC RANGE").map(String::as_str), Some("15"));
+        assert_eq!(pt.meta.get("PUBLISHER").map(String::as_str), Some("Pub Co"));
+    }
+
+    #[test]
+    fn write_sidecar_atomic_replaces_existing_file() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("disc.xml");
+        std::fs::write(&path, b"<old>data</old>").unwrap();
+
+        let m = SidecarMetadata {
+            store_id: "NEW0000000000000000000000000000A".into(),
+            version: "1.1".into(),
+            tracks: vec![SidecarTrack {
+                id: 1,
+                meta: std::iter::once(("TITLE".to_string(), "Hi".to_string())).collect(),
+                replaygain: Default::default(),
+            }],
+        };
+        write_sidecar(&path, &m).expect("write");
+
+        let parsed = parse_sidecar(&path).expect("parse what we wrote");
+        assert_eq!(parsed.store_id, "NEW0000000000000000000000000000A");
+        assert_eq!(parsed.tracks.len(), 1);
+        assert_eq!(parsed.tracks[0].meta.get("TITLE").map(String::as_str), Some("Hi"));
+
+        // Tmp file must have been cleaned up.
+        let leftovers: Vec<_> = std::fs::read_dir(td.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with('.')
+                    && e.file_name().to_string_lossy().ends_with(".tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "tmp file left behind: {:?}", leftovers);
+    }
+
+    #[test]
+    fn mint_disc_id_is_deterministic_and_32_hex_chars() {
+        let bytes = b"some master TOC bytes for testing fingerprint stability";
+        let a = mint_disc_id_provisional(bytes);
+        let b = mint_disc_id_provisional(bytes);
+        assert_eq!(a, b, "must be deterministic");
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "got {}", a);
+        // Different input → different id.
+        let c = mint_disc_id_provisional(b"different bytes");
+        assert_ne!(a, c);
     }
 
     /// Real-world sidecar fixture: only runs when

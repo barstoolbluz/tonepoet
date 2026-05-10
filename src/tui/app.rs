@@ -1050,11 +1050,16 @@ pub struct MetadataEditorState {
     pub gnudb_back: Option<Box<GnudbReviewState>>,
     /// When true, the editor is opened in display-only mode: edits,
     /// deletions, additions, and saves are all refused with a status
-    /// message. Set for SACD ISOs, which we surface via the
-    /// ScarletBook parser but cannot write back to without an audio
-    /// extraction + re-mux pipeline (deferred — out of scope for v1
-    /// metadata-only support).
+    /// message. Set for SACD ISOs without a writable sidecar; once
+    /// C5c discovered a sidecar to write to, this flips to false.
     pub read_only: bool,
+    /// SACD-only: the sidecar XML path that `:w` will read-modify-
+    /// write into. `None` for normal lofty-backed editors.
+    pub sacd_sidecar_path: Option<std::path::PathBuf>,
+    /// SACD-only: which area's tracks the editor is currently
+    /// surfacing, so the save path knows which sidecar track IDs
+    /// to update (`Stereo` → area 1, `MultiChannel` → area 2).
+    pub sacd_area_kind: Option<crate::tui::sacd::AreaKind>,
 }
 
 /// State cached on `MetadataEditorState::mb_back` to support the

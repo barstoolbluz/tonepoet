@@ -2384,6 +2384,34 @@ pub(super) fn metadata_editor_save(
         app.set_status("No changes to save");
         return;
     }
+    // SACD save: route to the XML sidecar writer instead of the
+    // normal lofty / per-file path. The sidecar path was captured
+    // on editor open; the area kind tells us which tracks within
+    // the sidecar to update.
+    if let Some(sidecar_path) = state.sacd_sidecar_path.clone() {
+        match save_sacd_sidecar(state, &sidecar_path) {
+            Ok(()) => {
+                state.dirty = false;
+                // Sync `original` snapshots so the next save shows
+                // no changes (matches lofty path's post-save state).
+                for e in state.entries.iter_mut() {
+                    e.per_file_originals = e.per_file_values.clone();
+                    e.original = e.value.clone();
+                }
+                app.set_status(format!(
+                    "SACD sidecar written: {}",
+                    sidecar_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| sidecar_path.display().to_string()),
+                ));
+            }
+            Err(reason) => {
+                app.set_status(format!("SACD sidecar save failed: {}", reason));
+            }
+        }
+        return;
+    }
     if let Err(reason) = regenerate_cuesheet_for_save(state) {
         app.set_status(reason);
         return;
@@ -3671,6 +3699,8 @@ pub fn open_metadata_editor(app: &mut AppState) {
             mb_back: None,
             gnudb_back: None,
             read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
         },
     ));
 }
@@ -3992,6 +4022,18 @@ pub(super) fn build_sacd_editor_state(
 
     let file_labels: Vec<String> = (1..=n_tracks).map(|i| format!("{:>02}", i)).collect();
 
+    // Writability: editor unlocks for save when a sidecar already
+    // exists at the same-stem path AND is writable. Synthesizing a
+    // brand-new sidecar for an ISO that doesn't have one is gated
+    // behind a separate :sidecar-create step (deferred to C5c.5),
+    // so first-time SACDs stay read-only until the user explicitly
+    // opts in to creating a sidecar.
+    let sidecar_path_opt = super::sacd_sidecar::find_sidecar_for_iso(iso_path);
+    let writable = sidecar_path_opt
+        .as_ref()
+        .map(|p| is_path_writable(p))
+        .unwrap_or(false);
+
     let state = super::app::MetadataEditorState {
         paths,
         entries,
@@ -4010,10 +4052,152 @@ pub(super) fn build_sacd_editor_state(
         detail_edit: None,
         mb_back: None,
         gnudb_back: None,
-        read_only: true,
+        read_only: !writable,
+        sacd_sidecar_path: if writable { sidecar_path_opt } else { None },
+        sacd_area_kind: Some(area.header.kind),
     };
 
     Ok((state, area_label, n_tracks))
+}
+
+/// Cheaply test whether `path` is writable: succeeds if we can open
+/// the file for append. Avoids actually appending by using
+/// `OpenOptions::write(true)` without truncate — `create(false)` is
+/// implicit since we don't pass `create(true)`.
+fn is_path_writable(path: &std::path::Path) -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .is_ok()
+}
+
+/// Map an editor `TagEntry.display_key` to the metabase XML `<meta>`
+/// `name` attribute. Returns None for keys we don't write (e.g.
+/// derived/internal fields). Inverse of the merge step in
+/// `build_sacd_editor_state`: ARTIST → "ARTIST", LYRICIST →
+/// "LYRICIST", etc. ALBUM ARTIST normalises to the spaceless
+/// canonical "ALBUMARTIST" because that's what most sidecars use.
+fn editor_key_to_sidecar_key(display_key: &str) -> Option<&'static str> {
+    match display_key {
+        "ALBUM" => Some("ALBUM"),
+        "ALBUMARTIST" => Some("ALBUMARTIST"),
+        "DATE" => Some("DATE"),
+        "CATALOGNUMBER" => Some("CATALOGNUMBER"),
+        "GENRE" => Some("GENRE"),
+        "PUBLISHER" => Some("PUBLISHER"),
+        "TRACKNUMBER" => Some("TRACKNUMBER"),
+        "TITLE" => Some("TITLE"),
+        "ARTIST" => Some("ARTIST"),
+        "PERFORMER" => Some("PERFORMER"),
+        "COMPOSER" => Some("COMPOSER"),
+        "LYRICIST" => Some("LYRICIST"),
+        "ARRANGER" => Some("ARRANGER"),
+        "ISRC" => Some("ISRC"),
+        _ => None,
+    }
+}
+
+/// Album-level keys are replicated across every track in the area's
+/// sidecar block. Per-track keys land on a single track. This is
+/// the inverse of the merge logic in `build_sacd_editor_state` where
+/// per-track values have `per_file_values.len() == n_tracks` but
+/// album-level values are also replicated to that length — both
+/// dims look the same, so we tag-name-discriminate.
+fn is_album_level_sidecar_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ALBUM" | "ALBUMARTIST" | "DATE" | "CATALOGNUMBER" | "GENRE" | "PUBLISHER"
+    )
+}
+
+/// Read the existing sidecar, apply the editor's per-track and
+/// album-level edits to it (preserving any foreign keys we don't
+/// surface — DISCOGS_*, DYNAMIC RANGE, replaygain, etc.), and
+/// atomic-write it back. Returns Err with a short reason if the
+/// sidecar can't be parsed or written. The editor state isn't
+/// mutated; the caller resets `dirty` and snapshots `originals`
+/// after a successful write.
+fn save_sacd_sidecar(
+    state: &super::app::MetadataEditorState,
+    sidecar_path: &std::path::Path,
+) -> Result<(), String> {
+    let mut sidecar = super::sacd_sidecar::parse_sidecar(sidecar_path)
+        .map_err(|e| format!("re-read sidecar: {}", e))?;
+
+    // Which 1-based area is the editor surfacing? Stereo → 1, MCH → 2.
+    let area_idx = match state.sacd_area_kind {
+        Some(super::sacd::AreaKind::Stereo) => 1u8,
+        Some(super::sacd::AreaKind::MultiChannel) => 2u8,
+        None => return Err("editor has no SACD area kind".into()),
+    };
+
+    // Collect the track IDs in the relevant area, in disc-order. We
+    // need owned IDs (not references) because we'll iterate
+    // `sidecar.tracks` mutably below.
+    let area_track_ids: Vec<u32> = sidecar
+        .tracks_for_area(area_idx)
+        .iter()
+        .map(|t| t.id)
+        .collect();
+
+    if area_track_ids.len() != state.paths.len() {
+        return Err(format!(
+            "sidecar area {} has {} track(s) but editor has {}; refusing to map",
+            area_idx,
+            area_track_ids.len(),
+            state.paths.len(),
+        ));
+    }
+
+    // Apply edits.
+    for entry in &state.entries {
+        let Some(sidecar_key) = editor_key_to_sidecar_key(&entry.display_key) else {
+            continue;
+        };
+        if is_album_level_sidecar_key(sidecar_key) {
+            // Replicate to every track in the area. We use
+            // entry.value (the displayed single value) when it's not
+            // <multiple values>; otherwise we'd lose information by
+            // collapsing — but album-level entries shouldn't be
+            // mixed in practice, so refuse to save in that case.
+            if entry.is_mixed {
+                return Err(format!(
+                    "album-level field {} has mixed values; cannot save",
+                    entry.display_key
+                ));
+            }
+            let new_val = entry.value.clone();
+            for tid in &area_track_ids {
+                if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *tid) {
+                    if new_val.is_empty() {
+                        track.meta.remove(sidecar_key);
+                    } else {
+                        track.meta.insert(sidecar_key.to_string(), new_val.clone());
+                    }
+                }
+            }
+        } else {
+            // Per-track: editor index i → sidecar id area_track_ids[i].
+            for (i, tid) in area_track_ids.iter().enumerate() {
+                let new_val = entry
+                    .per_file_values
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *tid) {
+                    if new_val.is_empty() {
+                        track.meta.remove(sidecar_key);
+                    } else {
+                        track.meta.insert(sidecar_key.to_string(), new_val);
+                    }
+                }
+            }
+        }
+    }
+
+    super::sacd_sidecar::write_sidecar(sidecar_path, &sidecar)
+        .map_err(|e| format!("write: {}", e))?;
+    Ok(())
 }
 
 /// Handle mouse events for generic overlays: click-outside-to-close,
@@ -8435,6 +8619,8 @@ mod phase4_tests {
             mb_back: None,
             gnudb_back: None,
             read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
         }
     }
 
@@ -8804,6 +8990,8 @@ mod phase4_tests {
             mb_back: None,
             gnudb_back: None,
             read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
         }
     }
 
@@ -8950,6 +9138,8 @@ mod phase4_tests {
             dirty: false, deleted: vec![],
             file_labels: vec!["01".into(), "02".into()],
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
         };
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());
@@ -9455,6 +9645,193 @@ mod phase4_tests {
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
         assert_eq!(pub_entry.map(|e| e.value.as_str()), Some("Sidecar Publisher"));
+    }
+
+    /// Helper for the save tests: write a sidecar XML to a tempfile
+    /// and return its path. Build a MetadataEditorState seeded from
+    /// a synthetic ScarletBook + that sidecar, then call save and
+    /// re-parse the written file to make assertions.
+    fn round_trip_save(
+        sidecar_xml: &str,
+        mutate: impl FnOnce(&mut super::super::app::MetadataEditorState),
+    ) -> (tempfile::TempDir, crate::tui::sacd_sidecar::SidecarMetadata) {
+        use crate::tui::sacd_sidecar::*;
+        let td = tempfile::tempdir().expect("tempdir");
+        let xml_path = td.path().join("disc.xml");
+        std::fs::write(&xml_path, sidecar_xml).unwrap();
+
+        // ScarletBook with stereo area + 3 tracks (the XML fixtures
+        // below use TOTALTRACKS=3).
+        let md = synth_sacd_metadata(
+            Some("SB Album"),
+            None,
+            0,
+            None,
+            &["sb1", "sb2", "sb3"],
+            &["", "", ""],
+            &[None, None, None],
+        );
+        let sidecar = parse_sidecar(&xml_path).expect("parse");
+
+        let iso_path = td.path().join("disc.iso");
+        std::fs::write(&iso_path, b"\0").unwrap();
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, Some(&sidecar))
+            .expect("build");
+        // Force writability so the save path is reachable in tests.
+        state.read_only = false;
+        state.sacd_sidecar_path = Some(xml_path.clone());
+        state.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+
+        mutate(&mut state);
+
+        save_sacd_sidecar(&state, &xml_path).expect("save");
+        let reparsed = parse_sidecar(&xml_path).expect("re-parse");
+        (td, reparsed)
+    }
+
+    #[test]
+    fn save_sacd_sidecar_preserves_foreign_meta() {
+        // Sidecar has DISCOGS_RELEASE_ID + DYNAMIC RANGE that
+        // tonepoet doesn't surface. Edit ARTIST and save. Foreign
+        // keys must survive.
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="T1"/><meta name="ARTIST" value="Old"/><meta name="DISCOGS_RELEASE_ID" value="12345"/><meta name="DYNAMIC RANGE" value="14"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="2"><meta name="TITLE" value="T2"/><meta name="ARTIST" value="Old"/><meta name="DISCOGS_RELEASE_ID" value="12345"/><meta name="DYNAMIC RANGE" value="15"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="3"><meta name="TITLE" value="T3"/><meta name="ARTIST" value="Old"/><meta name="DISCOGS_RELEASE_ID" value="12345"/><meta name="DYNAMIC RANGE" value="13"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/></track>
+</store></root>"#;
+        let (_td, reparsed) = round_trip_save(xml, |state| {
+            // Change the ARTIST values to "New". ARTIST is per-track
+            // in the editor (built via push_per_track), so update each.
+            for entry in state.entries.iter_mut() {
+                if entry.display_key == "ARTIST" {
+                    entry.per_file_values = vec!["New".into(); 3];
+                    entry.value = "New".into();
+                    entry.is_mixed = false;
+                }
+            }
+        });
+
+        for tid in 1..=3 {
+            let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
+            assert_eq!(t.meta.get("ARTIST").map(String::as_str), Some("New"),
+                "tid={} ARTIST", tid);
+            assert_eq!(t.meta.get("DISCOGS_RELEASE_ID").map(String::as_str), Some("12345"),
+                "tid={} DISCOGS_RELEASE_ID must survive", tid);
+            assert!(t.meta.contains_key("DYNAMIC RANGE"),
+                "tid={} DYNAMIC RANGE must survive", tid);
+        }
+    }
+
+    #[test]
+    fn save_sacd_sidecar_replicates_album_level_edits_to_all_tracks() {
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="T1"/><meta name="ALBUM" value="Old Album"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="2"><meta name="TITLE" value="T2"/><meta name="ALBUM" value="Old Album"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="3"><meta name="TITLE" value="T3"/><meta name="ALBUM" value="Old Album"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/></track>
+</store></root>"#;
+        let (_td, reparsed) = round_trip_save(xml, |state| {
+            for entry in state.entries.iter_mut() {
+                if entry.display_key == "ALBUM" {
+                    entry.per_file_values = vec!["New Album".into(); 3];
+                    entry.value = "New Album".into();
+                    entry.is_mixed = false;
+                }
+            }
+        });
+        for tid in 1..=3 {
+            let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
+            assert_eq!(t.meta.get("ALBUM").map(String::as_str), Some("New Album"));
+        }
+    }
+
+    #[test]
+    fn save_sacd_sidecar_per_track_edits_land_on_correct_track() {
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="A"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="2"><meta name="TITLE" value="B"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="3"><meta name="TITLE" value="C"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/></track>
+</store></root>"#;
+        let (_td, reparsed) = round_trip_save(xml, |state| {
+            for entry in state.entries.iter_mut() {
+                if entry.display_key == "TITLE" {
+                    entry.per_file_values = vec!["Alpha".into(), "Beta".into(), "Gamma".into()];
+                    entry.value = "<multiple values>".into();
+                    entry.is_mixed = true;
+                }
+            }
+        });
+        let by_tid = |tid: u32| {
+            reparsed
+                .tracks
+                .iter()
+                .find(|t| t.id == tid)
+                .and_then(|t| t.meta.get("TITLE"))
+                .map(|s| s.as_str())
+        };
+        assert_eq!(by_tid(1), Some("Alpha"));
+        assert_eq!(by_tid(2), Some("Beta"));
+        assert_eq!(by_tid(3), Some("Gamma"));
+    }
+
+    #[test]
+    fn save_sacd_sidecar_empty_value_removes_meta_key() {
+        // Clearing a tag in the editor should remove the meta entry
+        // from the sidecar entirely, not leave value="" sitting there.
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="A"/><meta name="ARTIST" value="X"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="1"/></track>
+</store></root>"#;
+        let td = tempfile::tempdir().unwrap();
+        let xml_path = td.path().join("disc.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+        let md = synth_sacd_metadata(None, None, 0, None, &["sb1"], &["sb-perf"], &[None]);
+        let sidecar = crate::tui::sacd_sidecar::parse_sidecar(&xml_path).unwrap();
+        let iso_path = td.path().join("disc.iso");
+        std::fs::write(&iso_path, b"\0").unwrap();
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, Some(&sidecar)).unwrap();
+        state.read_only = false;
+        state.sacd_sidecar_path = Some(xml_path.clone());
+        state.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+
+        for entry in state.entries.iter_mut() {
+            if entry.display_key == "ARTIST" {
+                entry.per_file_values = vec!["".into()];
+                entry.value = "".into();
+                entry.is_mixed = false;
+            }
+        }
+
+        save_sacd_sidecar(&state, &xml_path).expect("save");
+        let reparsed = crate::tui::sacd_sidecar::parse_sidecar(&xml_path).unwrap();
+        let t1 = reparsed.tracks.iter().find(|t| t.id == 1).unwrap();
+        assert!(!t1.meta.contains_key("ARTIST"), "ARTIST should be removed");
+        assert_eq!(t1.meta.get("TITLE").map(String::as_str), Some("A"),
+            "TITLE should still be present");
+    }
+
+    #[test]
+    fn save_sacd_sidecar_refuses_when_track_count_mismatches() {
+        // Sidecar declares 2 tracks (TOTALTRACKS=2) but editor was
+        // built from a ScarletBook with 3 tracks. save_sacd_sidecar
+        // must refuse rather than silently misalign.
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="A"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="2"><meta name="TITLE" value="B"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+</store></root>"#;
+        let td = tempfile::tempdir().unwrap();
+        let xml_path = td.path().join("disc.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+        let md = synth_sacd_metadata(None, None, 0, None, &["a", "b", "c"], &["", "", ""], &[None, None, None]);
+        let sidecar = crate::tui::sacd_sidecar::parse_sidecar(&xml_path).unwrap();
+        let iso_path = td.path().join("disc.iso");
+        std::fs::write(&iso_path, b"\0").unwrap();
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, Some(&sidecar)).unwrap();
+        state.sacd_sidecar_path = Some(xml_path.clone());
+        state.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        state.read_only = false;
+
+        let res = save_sacd_sidecar(&state, &xml_path);
+        assert!(res.is_err(), "should refuse on mismatch");
+        assert!(res.unwrap_err().contains("refusing to map"));
     }
 
     #[test]
