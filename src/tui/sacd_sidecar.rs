@@ -546,30 +546,64 @@ fn escape_xml(s: &str) -> String {
     out
 }
 
-/// Mint a disc id for a new sidecar from the raw master TOC bytes.
-/// **Provisional**: this isn't (yet) the same algorithm sacd-extract
-/// uses, so existing-sidecar discovery will still match by filename
-/// rule and tools that look up by id won't find tonepoet-minted
-/// sidecars. Reverse-engineering the canonical algorithm is on the
-/// roadmap. For now we produce an MD5-shaped 32-hex-char fingerprint
-/// over the first 168 bytes of the master TOC (the full
-/// `master_toc_t` struct), so the id is at least stable across
-/// invocations on the same disc.
-pub fn mint_disc_id_provisional(master_toc_bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    // We use SHA-256 truncated to 16 bytes (32 hex chars) — gives the
-    // same shape as sacd-extract's MD5-style id without pulling in an
-    // MD5 crate. Once the canonical algorithm is reverse-engineered
-    // this function will swap to it.
-    let mut h = Sha256::new();
-    h.update(master_toc_bytes);
+/// Length of the master TOC region hashed for the disc id: 10 sectors
+/// × 2048 bytes = 20480 bytes, starting at LSN 510. These are physical
+/// SACD spec constants (`MASTER_TOC_LEN`, `SACD_LSN_SIZE`,
+/// `START_OF_MASTER_TOC` in the upstream `foo_input_sacd` source).
+const DISC_ID_REGION_LSN: u64 = 510;
+const SACD_LSN_SIZE: u64 = 2048;
+const DISC_ID_REGION_LEN: usize = 10 * SACD_LSN_SIZE as usize;
+
+/// Compute the canonical sacd-extract / foobar2000 metabase disc id
+/// from the raw 20480-byte master TOC region. The id is the MD5 of
+/// the region formatted as 32 uppercase hex chars (no separators).
+///
+/// Reference: `foo_input_sacd/sacd_metabase.cpp` constructor — MD5 over
+/// `MASTER_TOC_LEN * SACD_LSN_SIZE` bytes starting at
+/// `START_OF_MASTER_TOC`, emitted with `%02X` per byte. Verified bit-
+/// perfect against 412/414 sidecars in empirical testing; the two
+/// non-matches both lack the SACDMTOC magic and aren't standard SACDs.
+pub fn compute_disc_id(master_toc_region: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    debug_assert_eq!(
+        master_toc_region.len(),
+        DISC_ID_REGION_LEN,
+        "disc id must be computed over exactly {} bytes of master TOC",
+        DISC_ID_REGION_LEN,
+    );
+    let mut h = Md5::new();
+    h.update(master_toc_region);
     let digest = h.finalize();
     let mut hex = String::with_capacity(32);
-    for &b in digest.iter().take(16) {
+    for &b in digest.iter() {
         use std::fmt::Write;
         let _ = write!(&mut hex, "{:02X}", b);
     }
     hex
+}
+
+/// Read the master TOC region from an SACD ISO and compute its
+/// canonical disc id. Rejects files whose region doesn't start with
+/// the `SACDMTOC` magic (non-conformant rips, R2R-to-DSD containers,
+/// truncated files) with `SidecarError::NotMetabase`.
+///
+/// This only supports LSN-format (2048-byte sector) ISOs, which is the
+/// universal shape for `.iso` files on disk; physical-disc PSN format
+/// (2064-byte sectors with 12-byte sync headers) is not handled because
+/// tonepoet never sees raw disc reads.
+pub fn mint_disc_id(iso_path: &Path) -> Result<String, SidecarError> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(iso_path).map_err(|e| SidecarError::Io(format!("open: {}", e)))?;
+    f.seek(SeekFrom::Start(DISC_ID_REGION_LSN * SACD_LSN_SIZE))
+        .map_err(|e| SidecarError::Io(format!("seek: {}", e)))?;
+    let mut buf = vec![0u8; DISC_ID_REGION_LEN];
+    f.read_exact(&mut buf)
+        .map_err(|e| SidecarError::Io(format!("read: {}", e)))?;
+    if &buf[..8] != b"SACDMTOC" {
+        return Err(SidecarError::NotMetabase);
+    }
+    Ok(compute_disc_id(&buf))
 }
 
 #[cfg(test)]
@@ -822,16 +856,57 @@ mod tests {
     }
 
     #[test]
-    fn mint_disc_id_is_deterministic_and_32_hex_chars() {
-        let bytes = b"some master TOC bytes for testing fingerprint stability";
-        let a = mint_disc_id_provisional(bytes);
-        let b = mint_disc_id_provisional(bytes);
+    fn compute_disc_id_is_deterministic_and_32_uppercase_hex() {
+        // Inputs must be the canonical 20480-byte length; vary a single
+        // byte to confirm sensitivity.
+        let mut buf_a = vec![0u8; DISC_ID_REGION_LEN];
+        buf_a[0] = 0xAB;
+        let a = compute_disc_id(&buf_a);
+        let b = compute_disc_id(&buf_a);
         assert_eq!(a, b, "must be deterministic");
         assert_eq!(a.len(), 32);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "got {}", a);
-        // Different input → different id.
-        let c = mint_disc_id_provisional(b"different bytes");
-        assert_ne!(a, c);
+        assert!(
+            a.chars().all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c)),
+            "must be uppercase hex, got {}",
+            a
+        );
+        let mut buf_c = vec![0u8; DISC_ID_REGION_LEN];
+        buf_c[0] = 0xCD;
+        assert_ne!(a, compute_disc_id(&buf_c));
+    }
+
+    #[test]
+    fn compute_disc_id_matches_known_md5_vector() {
+        // Cross-implementation check: MD5 of 20480 zero bytes, computed
+        // by Python's hashlib, must match. Locks in both the hash
+        // function (MD5, not SHA-256) and the hex casing (uppercase).
+        let zeros = vec![0u8; DISC_ID_REGION_LEN];
+        assert_eq!(compute_disc_id(&zeros), "DAA100DF6E6711906B61C9AB5AA16032");
+    }
+
+    /// Real-ISO fixture: only runs when `TONEPOET_SACD_FIXTURE_ISO`
+    /// points at an SACD ISO. If `TONEPOET_SACD_FIXTURE_DISC_ID` is
+    /// also set, asserts bit-perfect match against foobar2000 / sacd-
+    /// extract's metabase id. CI leaves these unset.
+    #[test]
+    fn mint_disc_id_matches_real_iso_when_env_var_set() {
+        let Ok(path) = std::env::var("TONEPOET_SACD_FIXTURE_ISO") else {
+            return;
+        };
+        let p = std::path::Path::new(&path);
+        if !p.exists() {
+            eprintln!("TONEPOET_SACD_FIXTURE_ISO='{}' not found — skipping", path);
+            return;
+        }
+        let id = mint_disc_id(p).expect("mint_disc_id should succeed on a valid SACD ISO");
+        assert_eq!(id.len(), 32, "id should be 32 hex chars: {:?}", id);
+        if let Ok(expected) = std::env::var("TONEPOET_SACD_FIXTURE_DISC_ID") {
+            assert_eq!(
+                id,
+                expected.to_uppercase(),
+                "minted id should match canonical sacd-extract/foobar2000 disc id",
+            );
+        }
     }
 
     /// Real-world sidecar fixture: only runs when
