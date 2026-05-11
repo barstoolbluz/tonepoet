@@ -50,3 +50,9 @@ base64 = "0.22"
 rayon = "1"
 sha2 = "0.10"
 md-5 = "0.10"
+
+[dev-dependencies]
+# Tokio's virtual-clock helpers (`time::pause`, `time::advance`) live
+# behind the `test-util` feature and aren't in `features = ["full"]`.
+# Used by the MB rate limiter sequencing test.
+tokio = { version = "1", features = ["test-util"] }

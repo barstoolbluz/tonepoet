@@ -1,15 +1,22 @@
-//! MusicBrainz disc-TOC lookup. Used by `:cue-mb` (overwrite) and
-//! `:cue-fill` (enrich) to populate per-track titles, performers, ISRCs,
-//! and album-level catalog/barcode data when the local rip is sparsely
-//! tagged.
+//! MusicBrainz integration. Two query paths today:
 //!
-//! Endpoint: `GET https://musicbrainz.org/ws/2/discid/-?toc=...&fmt=json`
+//! - **Disc-TOC lookup** (`/ws/2/discid/-?toc=...`): used by `:cue-mb`
+//!   (overwrite) and `:cue-fill` (enrich) on CD-rip editors.
+//! - **Text/release search** (`/ws/2/release/?query=...`): used by
+//!   `:tags-mb` on SACD editors (Phase C). Built on top of the Lucene
+//!   escape helper and a two-step search → release-detail fetch.
+//!
 //! TOC values are 1-based: `first+last+leadout+offset_1+...+offset_N`,
 //! all in absolute sectors (with the standard 150-frame leadin).
 //!
-//! MusicBrainz rate-limit policy: 1 request/sec per IP, with a User-Agent.
-//! We respect by setting a UA and relying on the SQLite cache to coalesce
-//! repeated lookups. Single-shot calls never need an explicit sleep.
+//! MusicBrainz rate-limit policy: 1 request/sec per IP, identified by a
+//! meaningful User-Agent. We comply via:
+//! 1. A version-encoded UA string (`USER_AGENT` below).
+//! 2. A **shared global rate limiter** (`mb_acquire`) that every
+//!    `/ws/2/*` call passes through. Single global token, not per
+//!    endpoint — MB's quota is per-IP across the whole namespace.
+//! 3. An SQLite cache table for TOC lookups (and, Phase B, search
+//!    results) so repeated queries don't hit the network at all.
 
 /// Parsed MusicBrainz release matching a disc TOC.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,6 +85,102 @@ const USER_AGENT: &str = concat!(
     " (https://github.com/barstoolbluz/tonepoet)"
 );
 
+/// MusicBrainz rate-limit interval per the public policy: 1 request
+/// per second per IP across the whole `/ws/2/*` namespace.
+const MB_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Shared global rate limiter for every `/ws/2/*` call. Stores the
+/// `tokio::time::Instant` at which the next request is allowed to
+/// fire; acquires hold the lock across `sleep` so concurrent callers
+/// queue behind each other deterministically rather than racing the
+/// clock.
+///
+/// This must be one token, not per-endpoint — MB's quota is per-IP
+/// across the whole namespace. Sharing across `lookup_release_by_toc`,
+/// `search_releases_by_query`, and the per-release detail fetch is
+/// the whole point.
+///
+/// Uses `tokio::time::Instant` (not `std::time::Instant`) so that
+/// `tokio::test(start_paused = true)` runtime can drive virtual time
+/// in tests without real-time sleeping.
+///
+/// **Test isolation:** this static persists across the process, so
+/// tests that exercise `mb_acquire` under paused time must reset
+/// `*MB_NEXT_ALLOWED.lock().await = tokio::time::Instant::now()`
+/// at the top of the test, or a stale future-dated value from a
+/// prior test will skew the timing. See
+/// `mb_rate_limiter_serializes_five_calls_across_four_seconds` for
+/// the pattern.
+static MB_NEXT_ALLOWED: once_cell::sync::Lazy<tokio::sync::Mutex<tokio::time::Instant>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
+/// Acquire the right to fire a single MB request. Awaits until the
+/// shared rate-limit window opens, then writes the next-allowed
+/// instant before returning. Holds the lock across the sleep so
+/// concurrent callers serialize through the same gate.
+///
+/// Cancel safety: if the future is dropped mid-sleep, the lock is
+/// released without updating `MB_NEXT_ALLOWED` — the cancelled caller
+/// hadn't yet committed to a slot, so the next caller sees the
+/// previous occupant's deadline. Correct behavior.
+pub(super) async fn mb_acquire() {
+    let mut next = MB_NEXT_ALLOWED.lock().await;
+    let now = tokio::time::Instant::now();
+    if let Some(wait) = next.checked_duration_since(now) {
+        tokio::time::sleep(wait).await;
+    }
+    *next = tokio::time::Instant::now() + MB_MIN_INTERVAL;
+}
+
+/// Backslash-escape Lucene metacharacters for use inside MusicBrainz's
+/// `/ws/2/release/?query=` parameter (Phase B text search).
+///
+/// Lucene's reserved set per the query-parser grammar is:
+/// `+ - && || ! ( ) { } [ ] ^ " ~ * ? : \ /`
+///
+/// Single-character operators get a single backslash prefix. The
+/// boolean operators `&&` and `||` are doubled-character and need
+/// **both** characters escaped (`\&\&`, `\|\|`) — lone `&` and `|` are
+/// NOT reserved and pass through. Apostrophe is also NOT reserved.
+///
+/// The helper conservatively escapes the **full** reserved set,
+/// suitable for both quoted-value contexts and bare-term contexts.
+/// Most callers will wrap the result in quotes
+/// (`format!("artist:\"{}\"", lucene_escape(s))`); inside quotes,
+/// Lucene treats characters like `(`, `[`, `:` as literal anyway, so
+/// the extra backslashes are harmless. Empirically verified against
+/// MB's parser: `release:"...(remix)..."` and
+/// `release:"...\(remix\)..."` return identical result sets.
+pub(super) fn lucene_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 8);
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Two-char boolean operators.
+        let next = chars.get(i + 1).copied();
+        if (c == '&' && next == Some('&')) || (c == '|' && next == Some('|')) {
+            out.push('\\');
+            out.push(c);
+            out.push('\\');
+            out.push(c);
+            i += 2;
+            continue;
+        }
+        // Single-char reserved set.
+        if matches!(
+            c,
+            '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']'
+                | '^' | '"' | '~' | '*' | '?' | ':' | '\\' | '/'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Result of a TOC lookup: all matching releases sorted by descending
 /// score, plus the raw JSON body the caller should write to the cache.
 /// `cache_response` is `None` when the lookup was satisfied from a
@@ -133,6 +236,11 @@ pub async fn lookup_release_by_toc(
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    // Pass through the shared rate limiter before issuing the network
+    // call. MB's 1 req/sec/IP policy applies across the whole `/ws/2/*`
+    // namespace, so this gate is one global token (see `mb_acquire`).
+    mb_acquire().await;
 
     let resp = client.get(&url).send().await
         .map_err(|e| format!("MusicBrainz query failed: {}", e))?;
@@ -1054,6 +1162,120 @@ fn artist_credit_string(value: Option<&serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lucene_escape_passes_through_safe_characters() {
+        assert_eq!(lucene_escape(""), "");
+        assert_eq!(lucene_escape("plain text"), "plain text");
+        assert_eq!(lucene_escape("Thelonious Monk"), "Thelonious Monk");
+        // Apostrophes NOT special — pass through unchanged.
+        assert_eq!(lucene_escape("I'm Confessin'"), "I'm Confessin'");
+        // Lone & and | NOT special — only the doubled operators are.
+        assert_eq!(lucene_escape("Rock & Roll"), "Rock & Roll");
+        assert_eq!(lucene_escape("A|B"), "A|B");
+        // Digits, periods, commas, spaces all pass through.
+        assert_eq!(lucene_escape("Vol. 2, 1965"), "Vol. 2, 1965");
+    }
+
+    #[test]
+    fn lucene_escape_handles_all_single_char_reserved() {
+        // Reserved set: + - ! ( ) { } [ ] ^ " ~ * ? : \ /
+        assert_eq!(lucene_escape("a+b"), "a\\+b");
+        assert_eq!(lucene_escape("a-b"), "a\\-b");
+        assert_eq!(lucene_escape("a!b"), "a\\!b");
+        assert_eq!(lucene_escape("a(b)c"), "a\\(b\\)c");
+        assert_eq!(lucene_escape("a{b}c"), "a\\{b\\}c");
+        assert_eq!(lucene_escape("a[b]c"), "a\\[b\\]c");
+        assert_eq!(lucene_escape("a^b"), "a\\^b");
+        assert_eq!(lucene_escape("a\"b"), "a\\\"b");
+        assert_eq!(lucene_escape("a~b"), "a\\~b");
+        assert_eq!(lucene_escape("a*b"), "a\\*b");
+        assert_eq!(lucene_escape("a?b"), "a\\?b");
+        assert_eq!(lucene_escape("a:b"), "a\\:b");
+        assert_eq!(lucene_escape("a\\b"), "a\\\\b");
+        assert_eq!(lucene_escape("a/b"), "a\\/b");
+    }
+
+    #[test]
+    fn lucene_escape_handles_doubled_boolean_operators() {
+        // && and || are operators; escape both characters.
+        assert_eq!(lucene_escape("a && b"), "a \\&\\& b");
+        assert_eq!(lucene_escape("a || b"), "a \\|\\| b");
+        // Triple & — first two are an operator, third is lone.
+        assert_eq!(lucene_escape("a&&&b"), "a\\&\\&&b");
+    }
+
+    #[test]
+    fn lucene_escape_realistic_track_title_round_trips_safely() {
+        // Real titles from the user's library: parens, apostrophes,
+        // colons, commas, hyphens.
+        let titles = [
+            "These Foolish Things (Remind Me of You)",
+            "I'm Confessin' (That I Love You)",
+            "I Surrender, Dear",
+            "Monk's Point",
+            "Bitches Brew: Disc 2",
+        ];
+        for t in titles {
+            let escaped = lucene_escape(t);
+            // No bare metacharacters left after escape, except inside
+            // already-escaped sequences. Spot-check: every `(` is
+            // preceded by `\`.
+            for (i, c) in escaped.char_indices() {
+                if matches!(c, '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']'
+                              | '^' | '"' | '~' | '*' | '?' | ':' | '/')
+                {
+                    let prev = escaped[..i].chars().last();
+                    assert_eq!(prev, Some('\\'),
+                        "unescaped {} in {:?} (from {:?})", c, escaped, t);
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mb_rate_limiter_serializes_five_calls_across_four_seconds() {
+        use std::time::Duration;
+        // Reset limiter state to "ready now" under the paused clock.
+        // Without this, tests run in series could leave a stale
+        // future-dated `next` from a prior test, skewing this run.
+        {
+            let mut guard = MB_NEXT_ALLOWED.lock().await;
+            *guard = tokio::time::Instant::now();
+        }
+        let start = tokio::time::Instant::now();
+        // Sequential acquires: under a paused runtime with no other
+        // tasks pending, tokio auto-advances virtual time to the
+        // next sleep deadline, so each `mb_acquire().await` after the
+        // first costs exactly MB_MIN_INTERVAL of virtual time.
+        let mut stamps = Vec::with_capacity(5);
+        for _ in 0..5 {
+            mb_acquire().await;
+            stamps.push(tokio::time::Instant::now());
+        }
+        // Stamps must be strictly increasing by ≥1s each (after the
+        // first, which fires immediately).
+        for w in stamps.windows(2) {
+            let gap = w[1].duration_since(w[0]);
+            assert_eq!(
+                gap,
+                MB_MIN_INTERVAL,
+                "expected exactly {:?} gap between consecutive MB calls; got {:?}",
+                MB_MIN_INTERVAL,
+                gap,
+            );
+        }
+        // Total span across 5 calls = 4 * MB_MIN_INTERVAL.
+        let span = stamps.last().unwrap().duration_since(start);
+        assert_eq!(
+            span,
+            MB_MIN_INTERVAL * 4,
+            "expected exactly 4s span for 5 serialized calls; got {:?}",
+            span,
+        );
+        // Smoke: total elapsed virtual time should be ≥4s.
+        assert!(span >= Duration::from_secs(4));
+    }
 
     /// Build a minimal MbRelease with sane defaults for testing.
     fn rel(id: &str, tracks: Vec<MbTrack>) -> MbRelease {
