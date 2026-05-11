@@ -796,6 +796,11 @@ fn entry_info_lines(
 
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let mut meta_field_rows: Vec<(MetadataField, usize)> = Vec::new();
+    // Pill rows set by branches that emit them after their content.
+    // SacdIso is the only branch using this besides AudioFile (which
+    // returns early), but the pattern generalises if more arms grow
+    // pill rendering.
+    let mut sacd_edit_tags_row: Option<usize> = None;
 
     // Blank
     lines.push(vec![]);
@@ -1251,6 +1256,28 @@ fn entry_info_lines(
                         ]);
                     }
                 }
+
+                // Edit-tags pill — parity with the AudioFile arm so
+                // SACD ISOs have a clickable mouse path to the
+                // metadata editor (keyboard via :tags, context menu
+                // via right-click already exist).
+                lines.push(vec![]);
+                let edit_tags_row = lines.len();
+                let et_label = " edit tags ";
+                let et_w = et_label.chars().count();
+                let et_pad = content_width.saturating_sub(et_w + 3);
+                let et_bg = if edit_tags_hovered { theme::BLUE } else { theme::PURPLE };
+                lines.push(vec![
+                    Span::raw(" ".repeat(et_pad)),
+                    Span::styled(
+                        et_label,
+                        Style::default()
+                            .fg(theme::PILL_ACTIVE_FG)
+                            .bg(et_bg)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                ]);
+                sacd_edit_tags_row = Some(edit_tags_row);
             } else {
                 // Not yet probed (async probe pending) — fall back to size only.
                 lines.push(vec![
@@ -1289,7 +1316,7 @@ fn entry_info_lines(
         lines,
         meta_field_rows,
         analyze_pill_row: None,
-        edit_tags_pill_row: None,
+        edit_tags_pill_row: sacd_edit_tags_row,
     }
 }
 
