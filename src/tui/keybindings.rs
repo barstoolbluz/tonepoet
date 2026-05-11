@@ -2390,7 +2390,7 @@ pub(super) fn metadata_editor_save(
     // the sidecar to update.
     if let Some(sidecar_path) = state.sacd_sidecar_path.clone() {
         match save_sacd_sidecar(state, &sidecar_path) {
-            Ok(()) => {
+            Ok(outcome) => {
                 state.dirty = false;
                 // Sync `original` snapshots so the next save shows
                 // no changes (matches lofty path's post-save state).
@@ -2398,8 +2398,13 @@ pub(super) fn metadata_editor_save(
                     e.per_file_originals = e.per_file_values.clone();
                     e.original = e.value.clone();
                 }
+                let verb = match outcome {
+                    SacdSaveOutcome::Created => "created",
+                    SacdSaveOutcome::Updated => "updated",
+                };
                 app.set_status(format!(
-                    "SACD sidecar written: {}",
+                    "SACD sidecar {}: {}",
+                    verb,
                     sidecar_path
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
@@ -4038,17 +4043,31 @@ pub(super) fn build_sacd_editor_state(
 
     let file_labels: Vec<String> = (1..=n_tracks).map(|i| format!("{:>02}", i)).collect();
 
-    // Writability: editor unlocks for save when a sidecar already
-    // exists at the same-stem path AND is writable. Synthesizing a
-    // brand-new sidecar for an ISO that doesn't have one is gated
-    // behind a separate :sidecar-create step (deferred to C5c.5),
-    // so first-time SACDs stay read-only until the user explicitly
-    // opts in to creating a sidecar.
-    let sidecar_path_opt = super::sacd_sidecar::find_sidecar_for_iso(iso_path);
-    let writable = sidecar_path_opt
-        .as_ref()
-        .map(|p| is_path_writable(p))
-        .unwrap_or(false);
+    // Writability: editor unlocks for save when either
+    //   (a) a sidecar already exists at the same-stem path AND is
+    //       writable (existing-update path), or
+    //   (b) no sidecar exists yet but the parent directory is
+    //       writable (mint-on-save path — `save_sacd_sidecar`
+    //       seeds from ScarletBook, mints `<store id>` via
+    //       `mint_disc_id`, and atomic-writes a fresh `.xml`).
+    // `sacd_sidecar_path` is set to the expected target in both
+    // cases so the save path knows where to write.
+    let (writable, sidecar_target) = match super::sacd_sidecar::find_sidecar_for_iso(iso_path) {
+        Some(p) => {
+            let w = is_path_writable(&p);
+            (w, if w { Some(p) } else { None })
+        }
+        None => {
+            let candidate = super::sacd_sidecar::expected_sidecar_path_for_iso(iso_path);
+            let parent_writable = candidate
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(is_dir_writable)
+                .unwrap_or(false);
+            (parent_writable, if parent_writable { candidate } else { None })
+        }
+    };
+    let sidecar_path_opt = sidecar_target;
 
     let state = super::app::MetadataEditorState {
         paths,
@@ -4223,6 +4242,31 @@ fn is_path_writable(path: &std::path::Path) -> bool {
         .is_ok()
 }
 
+/// Probe whether a directory accepts new files. Used by the mint-on-
+/// save path: when an SACD ISO has no sidecar yet, we still need to
+/// know whether we'd be able to write one. `is_path_writable` is
+/// file-oriented (opens the path for write) and fails for non-
+/// existent files; this is the directory-oriented complement.
+///
+/// Implementation: try to create a uniquely-named temp file in the
+/// directory, then immediately remove it. Both calls succeeding is
+/// the writability signal.
+fn is_dir_writable(dir: &std::path::Path) -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(".tonepoet-write-probe-{}.tmp", nanos));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Map an editor `TagEntry.display_key` to the metabase XML `<meta>`
 /// `name` attribute. Returns None for keys we don't write (e.g.
 /// derived/internal fields). Inverse of the merge step in
@@ -4262,19 +4306,55 @@ fn is_album_level_sidecar_key(key: &str) -> bool {
     )
 }
 
-/// Read the existing sidecar, apply the editor's per-track and
-/// album-level edits to it (preserving any foreign keys we don't
-/// surface — DISCOGS_*, DYNAMIC RANGE, replaygain, etc.), and
-/// atomic-write it back. Returns Err with a short reason if the
-/// sidecar can't be parsed or written. The editor state isn't
-/// mutated; the caller resets `dirty` and snapshots `originals`
+/// Outcome of a save: distinguishes a brand-new sidecar (mint-on-
+/// save path; `<store id>` freshly computed) from updates to an
+/// existing one (id preserved verbatim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SacdSaveOutcome {
+    Created,
+    Updated,
+}
+
+/// Apply the editor's per-track and album-level edits to a sidecar
+/// (preserving foreign keys we don't surface — DISCOGS_*, DYNAMIC
+/// RANGE, replaygain, etc.) and atomic-write it. When the target
+/// file already exists, the sidecar is parsed and updated in place
+/// (`<store id>` preserved verbatim). When it doesn't, the ISO is
+/// re-probed, an in-memory sidecar is seeded from ScarletBook, and
+/// the canonical `<store id>` is minted via `mint_disc_id` — the
+/// mint-on-save path.
+///
+/// Returns `Created` or `Updated` on success so the caller can
+/// differentiate status messages. Returns Err with a short reason on
+/// any failure (parse, re-probe, mint, or write). The editor state
+/// isn't mutated; the caller resets `dirty` and snapshots `originals`
 /// after a successful write.
 fn save_sacd_sidecar(
     state: &super::app::MetadataEditorState,
     sidecar_path: &std::path::Path,
-) -> Result<(), String> {
-    let mut sidecar = super::sacd_sidecar::parse_sidecar(sidecar_path)
-        .map_err(|e| format!("re-read sidecar: {}", e))?;
+) -> Result<SacdSaveOutcome, String> {
+    let (mut sidecar, outcome) = if sidecar_path.exists() {
+        let s = super::sacd_sidecar::parse_sidecar(sidecar_path)
+            .map_err(|e| format!("re-read sidecar: {}", e))?;
+        (s, SacdSaveOutcome::Updated)
+    } else {
+        // Mint path: no XML yet. Re-probe the ISO for ScarletBook
+        // data, seed an in-memory sidecar, and mint the canonical
+        // `<store id>` via MD5 of the master TOC region. The
+        // editor's per-track edits get applied below exactly as on
+        // the update path.
+        let iso_path = state
+            .paths
+            .first()
+            .ok_or_else(|| "editor has no ISO path for mint".to_string())?
+            .clone();
+        let md = super::sacd::parse_sacd_iso(&iso_path)
+            .map_err(|e| format!("re-probe SACD ISO for mint: {}", e))?;
+        let mut s = super::sacd_sidecar::seed_sidecar_from_scarletbook(&md);
+        s.store_id = super::sacd_sidecar::mint_disc_id(&iso_path)
+            .map_err(|e| format!("mint disc id: {}", e))?;
+        (s, SacdSaveOutcome::Created)
+    };
 
     // Which 1-based area is the editor surfacing? Stereo → 1, MCH → 2.
     let area_idx = match state.sacd_area_kind {
@@ -4349,7 +4429,7 @@ fn save_sacd_sidecar(
 
     super::sacd_sidecar::write_sidecar(sidecar_path, &sidecar)
         .map_err(|e| format!("write: {}", e))?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Handle mouse events for generic overlays: click-outside-to-close,
@@ -9530,7 +9610,15 @@ mod phase4_tests {
         let (state, label, n) = build_sacd_editor_state(&path, &md, None).expect("build");
         assert_eq!(label, "stereo");
         assert_eq!(n, 2);
-        assert!(state.read_only);
+        // Phase A: with no sidecar present but a writable parent dir,
+        // the editor unlocks for the mint-on-save path. `/tmp` is
+        // writable in the test environment, so `read_only` flips off
+        // and `sacd_sidecar_path` points at the expected target file.
+        assert!(!state.read_only);
+        assert_eq!(
+            state.sacd_sidecar_path.as_deref(),
+            Some(std::path::Path::new("/tmp/test.xml")),
+        );
         assert_eq!(state.paths.len(), 2);
         assert!(state.paths.iter().all(|p| p == &path));
 

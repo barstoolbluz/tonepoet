@@ -86,14 +86,17 @@ impl std::error::Error for SidecarError {}
 /// input; output stem keeps the original case). Returns the path
 /// if the file exists, else None.
 pub fn find_sidecar_for_iso(iso: &Path) -> Option<PathBuf> {
+    expected_sidecar_path_for_iso(iso).filter(|p| p.exists())
+}
+
+/// Compute the expected sidecar path for an SACD ISO via the same-
+/// stem rule, **without** requiring the file to exist. Used by the
+/// mint-on-save flow when an ISO has no sidecar yet — we still need
+/// to know where to write the freshly-minted XML.
+pub fn expected_sidecar_path_for_iso(iso: &Path) -> Option<PathBuf> {
     let stem = iso.file_stem()?;
     let dir = iso.parent()?;
-    let candidate = dir.join(stem).with_extension("xml");
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
-    }
+    Some(dir.join(stem).with_extension("xml"))
 }
 
 /// Parse an SACD metabase sidecar XML file. Tolerant of out-of-order
@@ -546,6 +549,118 @@ fn escape_xml(s: &str) -> String {
     out
 }
 
+/// Synthesize an in-memory `SidecarMetadata` from a parsed
+/// `SacdMetadata` (Master TOC + SACDText + per-area tracks + per-track
+/// text and ISRC). Used by the mint-on-save path when an SACD ISO has
+/// no existing sidecar XML.
+///
+/// Both areas (stereo + multi-channel) are populated when present;
+/// track IDs follow the ScarletBook convention `1..=N1` for stereo and
+/// `(N1+1)..=(N1+N2)` for multi-channel. Album-level fields
+/// (`ALBUM` / `ALBUMARTIST` / `DATE` / `CATALOGNUMBER` / `GENRE`) are
+/// replicated per-track to match the metabase XML shape foobar2000 /
+/// JRiver expect. Per-track fields (`TITLE` / `ARTIST` / `COMPOSER` /
+/// `LYRICIST` / `ARRANGER` / `ISRC`) come from the area's per-track
+/// text and ISRC tables when present; absent values are simply omitted
+/// rather than emitted as empty strings.
+///
+/// The returned sidecar has `store_id` **empty** — callers must fill
+/// it before writing (typically via [`mint_disc_id`]). `version` is
+/// `"1.1"`, matching every metabase sidecar observed in the wild.
+pub fn seed_sidecar_from_scarletbook(md: &super::sacd::SacdMetadata) -> SidecarMetadata {
+    let album = md.album_title().unwrap_or("").trim().to_string();
+    let album_artist = md.album_artist().unwrap_or("").trim().to_string();
+    let date = md
+        .master_toc
+        .disc_date
+        .map(|d| d.year.to_string())
+        .unwrap_or_default();
+    let catalog = md.master_toc.album_catalog_number.trim().to_string();
+    let genre = md
+        .master_toc
+        .album_genres
+        .first()
+        .map(|g| g.name().to_string())
+        .unwrap_or_default();
+
+    let album_proto: Vec<(&'static str, String)> = [
+        ("ALBUM", album.clone()),
+        ("ALBUMARTIST", album_artist.clone()),
+        ("DATE", date),
+        ("CATALOGNUMBER", catalog),
+        ("GENRE", genre),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_empty())
+    .collect();
+
+    let stereo_n = md.stereo.as_ref().map(|a| a.tracks.len()).unwrap_or(0);
+
+    let build_track = |id: u32, idx_in_area: usize, area_n: usize, t: &super::sacd::TrackEntry|
+        -> SidecarTrack
+    {
+        let mut meta: BTreeMap<String, String> = album_proto
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+
+        meta.insert("TRACKNUMBER".to_string(), (idx_in_area + 1).to_string());
+        meta.insert("TOTALTRACKS".to_string(), area_n.to_string());
+
+        if let Some(title) = t.text.title.as_deref().filter(|s| !s.is_empty()) {
+            meta.insert("TITLE".to_string(), title.to_string());
+        }
+        let track_artist = t
+            .text
+            .performer
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| album_artist.clone());
+        if !track_artist.is_empty() {
+            meta.insert("ARTIST".to_string(), track_artist);
+        }
+        if let Some(c) = t.text.composer.as_deref().filter(|s| !s.is_empty()) {
+            meta.insert("COMPOSER".to_string(), c.to_string());
+        }
+        if let Some(sw) = t.text.songwriter.as_deref().filter(|s| !s.is_empty()) {
+            meta.insert("LYRICIST".to_string(), sw.to_string());
+        }
+        if let Some(arr) = t.text.arranger.as_deref().filter(|s| !s.is_empty()) {
+            meta.insert("ARRANGER".to_string(), arr.to_string());
+        }
+        if let Some(isrc) = t.isrc.as_deref().filter(|s| !s.is_empty()) {
+            meta.insert("ISRC".to_string(), isrc.to_string());
+        }
+
+        SidecarTrack {
+            id,
+            meta,
+            replaygain: BTreeMap::new(),
+        }
+    };
+
+    let mut tracks: Vec<SidecarTrack> = Vec::new();
+
+    if let Some(area) = md.stereo.as_ref() {
+        for (i, t) in area.tracks.iter().enumerate() {
+            tracks.push(build_track((i + 1) as u32, i, area.tracks.len(), t));
+        }
+    }
+    if let Some(area) = md.multi_channel.as_ref() {
+        for (i, t) in area.tracks.iter().enumerate() {
+            let id = (stereo_n + i + 1) as u32;
+            tracks.push(build_track(id, i, area.tracks.len(), t));
+        }
+    }
+
+    SidecarMetadata {
+        store_id: String::new(),
+        version: "1.1".to_string(),
+        tracks,
+    }
+}
+
 /// Length of the master TOC region hashed for the disc id: 10 sectors
 /// × 2048 bytes = 20480 bytes, starting at LSN 510. These are physical
 /// SACD spec constants (`MASTER_TOC_LEN`, `SACD_LSN_SIZE`,
@@ -855,6 +970,199 @@ mod tests {
         assert!(leftovers.is_empty(), "tmp file left behind: {:?}", leftovers);
     }
 
+    fn make_track(title: Option<&str>, performer: Option<&str>, isrc: Option<&str>)
+        -> super::super::sacd::TrackEntry
+    {
+        use super::super::sacd::{PlayTime, TrackEntry, TrackText};
+        TrackEntry {
+            start_lsn: 0,
+            length_lsn: 0,
+            start_time: PlayTime { minutes: 0, seconds: 0, frames: 0 },
+            duration: PlayTime { minutes: 3, seconds: 30, frames: 0 },
+            text: TrackText {
+                title: title.map(String::from),
+                performer: performer.map(String::from),
+                ..Default::default()
+            },
+            isrc: isrc.map(String::from),
+            genre: None,
+        }
+    }
+
+    fn make_area(kind: super::super::sacd::AreaKind, n_tracks: usize)
+        -> super::super::sacd::AreaInfo
+    {
+        use super::super::sacd::{AreaInfo, AreaTocHeader, FrameFormat, PlayTime};
+        let tracks = (0..n_tracks)
+            .map(|i| make_track(
+                Some(&format!("Track {}", i + 1)),
+                Some("Track Artist"),
+                None,
+            ))
+            .collect();
+        AreaInfo {
+            header: AreaTocHeader {
+                kind,
+                spec_version: (1, 20),
+                size_sectors: 0,
+                max_byte_rate: 0,
+                sample_frequency: 4,
+                frame_format: FrameFormat::Dsd3In14,
+                channel_count: if matches!(kind, super::super::sacd::AreaKind::Stereo) { 2 } else { 6 },
+                loudspeaker_config: 0,
+                extra_settings: 0,
+                max_available_channels: 2,
+                area_mute_flags: 0,
+                total_playtime: PlayTime { minutes: 30, seconds: 0, frames: 0 },
+                track_offset: 0,
+                track_count: n_tracks as u8,
+                track_start_lsn: 0,
+                track_end_lsn: 0,
+                text_area_count: 0,
+                locales: vec![],
+                description: None,
+                description_phonetic: None,
+                copyright: None,
+                copyright_phonetic: None,
+            },
+            tracks,
+        }
+    }
+
+    fn make_md(stereo_n: Option<usize>, mch_n: Option<usize>) -> super::super::sacd::SacdMetadata {
+        use super::super::sacd::{
+            AreaKind, AreaPointer, DiscDate, Genre, MasterToc, SacdMetadata, SacdText,
+        };
+        SacdMetadata {
+            master_toc: MasterToc {
+                spec_version: (1, 20),
+                album_set_size: 1,
+                album_sequence_number: 1,
+                album_catalog_number: "TEST-123".to_string(),
+                album_genres: vec![Genre { category: 1, genre: 14 }], // Jazz
+                two_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
+                multi_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
+                disc_type_hybrid: stereo_n.is_some() && mch_n.is_some(),
+                disc_catalog_number: String::new(),
+                disc_genres: vec![],
+                disc_date: Some(DiscDate { year: 1965, month: 3, day: 1 }),
+                text_area_count: 1,
+                locales: vec![],
+            },
+            master_text: Some(SacdText {
+                album_title: Some("Test Album".to_string()),
+                album_artist: Some("Test Artist".to_string()),
+                album_publisher: None,
+                album_copyright: None,
+                album_title_phonetic: None,
+                album_artist_phonetic: None,
+                album_publisher_phonetic: None,
+                album_copyright_phonetic: None,
+                disc_title: None,
+                disc_artist: None,
+                disc_publisher: None,
+                disc_copyright: None,
+                disc_title_phonetic: None,
+                disc_artist_phonetic: None,
+                disc_publisher_phonetic: None,
+                disc_copyright_phonetic: None,
+                charset: 2,
+            }),
+            stereo: stereo_n.map(|n| make_area(AreaKind::Stereo, n)),
+            multi_channel: mch_n.map(|n| make_area(AreaKind::MultiChannel, n)),
+        }
+    }
+
+    #[test]
+    fn seed_stereo_only_disc_emits_one_track_per_area_entry() {
+        let md = make_md(Some(3), None);
+        let s = seed_sidecar_from_scarletbook(&md);
+        assert_eq!(s.tracks.len(), 3);
+        assert_eq!(s.tracks[0].id, 1);
+        assert_eq!(s.tracks[2].id, 3);
+        assert_eq!(s.tracks[0].meta.get("ALBUM").map(String::as_str), Some("Test Album"));
+        assert_eq!(s.tracks[0].meta.get("ALBUMARTIST").map(String::as_str), Some("Test Artist"));
+        assert_eq!(s.tracks[0].meta.get("DATE").map(String::as_str), Some("1965"));
+        assert_eq!(s.tracks[0].meta.get("CATALOGNUMBER").map(String::as_str), Some("TEST-123"));
+        assert_eq!(s.tracks[0].meta.get("GENRE").map(String::as_str), Some("Jazz"));
+        assert_eq!(s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
+        assert_eq!(s.tracks[0].meta.get("TOTALTRACKS").map(String::as_str), Some("3"));
+        assert_eq!(s.tracks[0].meta.get("TITLE").map(String::as_str), Some("Track 1"));
+        assert_eq!(s.tracks[2].meta.get("TITLE").map(String::as_str), Some("Track 3"));
+        assert!(s.store_id.is_empty(), "store_id is filled by caller, not seed");
+        assert_eq!(s.version, "1.1");
+    }
+
+    #[test]
+    fn seed_hybrid_disc_populates_both_areas_with_continuous_ids() {
+        let md = make_md(Some(2), Some(3));
+        let s = seed_sidecar_from_scarletbook(&md);
+        // stereo: ids 1, 2; mch: ids 3, 4, 5
+        assert_eq!(s.tracks.len(), 5);
+        assert_eq!(s.tracks.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        // TOTALTRACKS is per-area
+        assert_eq!(s.tracks[0].meta.get("TOTALTRACKS").map(String::as_str), Some("2"));
+        assert_eq!(s.tracks[2].meta.get("TOTALTRACKS").map(String::as_str), Some("3"));
+        // TRACKNUMBER restarts per area
+        assert_eq!(s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
+        assert_eq!(s.tracks[2].meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn seed_omits_album_keys_when_scarletbook_provides_no_value() {
+        use super::super::sacd::{AreaPointer, MasterToc, SacdMetadata};
+        // Master TOC with no date / no catalog / no genres; no SACDText.
+        let md = SacdMetadata {
+            master_toc: MasterToc {
+                spec_version: (1, 20),
+                album_set_size: 1,
+                album_sequence_number: 1,
+                album_catalog_number: String::new(),
+                album_genres: vec![],
+                two_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
+                multi_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
+                disc_type_hybrid: false,
+                disc_catalog_number: String::new(),
+                disc_genres: vec![],
+                disc_date: None,
+                text_area_count: 0,
+                locales: vec![],
+            },
+            master_text: None,
+            stereo: Some(make_area(super::super::sacd::AreaKind::Stereo, 1)),
+            multi_channel: None,
+        };
+        let s = seed_sidecar_from_scarletbook(&md);
+        assert_eq!(s.tracks.len(), 1);
+        assert!(s.tracks[0].meta.get("ALBUM").is_none());
+        assert!(s.tracks[0].meta.get("ALBUMARTIST").is_none());
+        assert!(s.tracks[0].meta.get("DATE").is_none());
+        assert!(s.tracks[0].meta.get("CATALOGNUMBER").is_none());
+        assert!(s.tracks[0].meta.get("GENRE").is_none());
+        // Per-track defaults still emitted
+        assert_eq!(s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
+        assert_eq!(s.tracks[0].meta.get("TITLE").map(String::as_str), Some("Track 1"));
+    }
+
+    #[test]
+    fn seed_then_serialize_then_parse_roundtrips_structure() {
+        let mut s = seed_sidecar_from_scarletbook(&make_md(Some(2), None));
+        // Caller fills store_id before writing — simulate that here.
+        s.store_id = "0123456789ABCDEF0123456789ABCDEF".to_string();
+        let xml = serialize_sidecar(&s);
+        let parsed = parse_sidecar_str(&xml).expect("seeded sidecar should round-trip");
+        assert_eq!(parsed.store_id, s.store_id);
+        assert_eq!(parsed.tracks.len(), 2);
+        assert_eq!(parsed.tracks[0].meta.get("TITLE").map(String::as_str), Some("Track 1"));
+    }
+
+    #[test]
+    fn expected_sidecar_path_for_iso_returns_same_stem_without_existence_check() {
+        let p = std::path::Path::new("/tmp/no/such/dir/Foo Bar.iso");
+        let got = expected_sidecar_path_for_iso(p).expect("non-empty parent + stem");
+        assert_eq!(got, std::path::Path::new("/tmp/no/such/dir/Foo Bar.xml"));
+    }
+
     #[test]
     fn compute_disc_id_is_deterministic_and_32_uppercase_hex() {
         // Inputs must be the canonical 20480-byte length; vary a single
@@ -882,6 +1190,36 @@ mod tests {
         // function (MD5, not SHA-256) and the hex casing (uppercase).
         let zeros = vec![0u8; DISC_ID_REGION_LEN];
         assert_eq!(compute_disc_id(&zeros), "DAA100DF6E6711906B61C9AB5AA16032");
+    }
+
+    /// End-to-end seed + mint + serialize + reparse against a real
+    /// SACD ISO. Verifies the full Phase A mint-on-save data flow.
+    /// Only runs when `TONEPOET_SACD_FIXTURE_ISO` is set; if a
+    /// foobar2000-emitted sidecar already exists alongside the ISO,
+    /// also asserts the canonical disc id matches.
+    #[test]
+    fn seed_mint_serialize_reparse_against_real_iso_when_env_var_set() {
+        let Ok(path) = std::env::var("TONEPOET_SACD_FIXTURE_ISO") else { return };
+        let p = std::path::Path::new(&path);
+        if !p.exists() { return; }
+        let md = super::super::sacd::parse_sacd_iso(p)
+            .expect("real SACD ISO should parse");
+        let mut s = seed_sidecar_from_scarletbook(&md);
+        s.store_id = mint_disc_id(p).expect("mint canonical disc id");
+        let xml = serialize_sidecar(&s);
+        let reparsed = parse_sidecar_str(&xml)
+            .expect("seeded+minted XML should round-trip through parse_sidecar_str");
+        assert_eq!(reparsed.store_id.len(), 32);
+        assert_eq!(reparsed.store_id, s.store_id);
+        assert!(!reparsed.tracks.is_empty(), "seed should produce at least one track");
+        if let Some(real_sc_path) = find_sidecar_for_iso(p) {
+            let real = parse_sidecar(&real_sc_path)
+                .expect("real sidecar alongside ISO should parse");
+            assert_eq!(
+                reparsed.store_id, real.store_id,
+                "Phase A minted id must match foobar2000's existing <store id>",
+            );
+        }
     }
 
     /// Real-ISO fixture: only runs when `TONEPOET_SACD_FIXTURE_ISO`
