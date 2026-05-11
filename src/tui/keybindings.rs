@@ -3444,9 +3444,25 @@ pub fn open_metadata_editor(app: &mut AppState) {
     // lofty/tag pipeline entirely. Read-only — write-back is gated by
     // state.read_only at save time. See open_metadata_editor_for_sacd
     // for the surfacing rules.
-    if sel.len() == 1 && super::sacd::is_sacd_iso(&sel[0]) {
-        open_metadata_editor_for_sacd(app, sel[0].clone());
-        return;
+    //
+    // Also handles the "folder containing one SACD ISO" case (common
+    // for SME / MFSL Japanese reissues that ship the disc as a
+    // single .iso inside a folder named for the album): a right-click
+    // on the folder lands the editor on its enclosed ISO. We scan only
+    // the directory's immediate children — not recursively — to keep
+    // the cost bounded and to avoid surprising the user with deep
+    // descents into archive trees.
+    if sel.len() == 1 {
+        if super::sacd::is_sacd_iso(&sel[0]) {
+            open_metadata_editor_for_sacd(app, sel[0].clone());
+            return;
+        }
+        if sel[0].is_dir() {
+            if let Some(iso) = find_single_sacd_in_dir(&sel[0]) {
+                open_metadata_editor_for_sacd(app, iso);
+                return;
+            }
+        }
     }
 
     let mut paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
@@ -4172,6 +4188,32 @@ pub(super) fn switch_sacd_editor_area(
     state.scroll = prev_scroll.min(state.cursor);
 
     Ok(area_label)
+}
+
+/// Scan an immediate directory for `.iso` files whose ScarletBook
+/// magic-byte probe succeeds. Returns `Some(path)` only when exactly
+/// one such ISO is found — ambiguous (0 or 2+) cases yield None and
+/// let the caller fall through to whatever default behaviour applies.
+fn find_single_sacd_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut found: Option<std::path::PathBuf> = None;
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let is_iso = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("iso"))
+            .unwrap_or(false);
+        if !is_iso { continue; }
+        if !super::sacd::is_sacd_iso(&path) { continue; }
+        if found.is_some() {
+            // 2+ SACD ISOs in this directory — ambiguous selection.
+            return None;
+        }
+        found = Some(path);
+    }
+    found
 }
 
 fn is_path_writable(path: &std::path::Path) -> bool {

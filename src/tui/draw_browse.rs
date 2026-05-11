@@ -1174,10 +1174,90 @@ fn entry_info_lines(
                 Span::styled("   kind    ", theme::muted()),
                 Span::styled("SACD ISO (ScarletBook)", theme::text()),
             ]);
-            lines.push(vec![
-                Span::styled("   size    ", theme::muted()),
-                Span::styled(size_str(entry.size), theme::text()),
-            ]);
+            if let Some(cached) = browse.current_cached_info() {
+                let info = &cached.source;
+                lines.push(vec![
+                    Span::styled("   format  ", theme::muted()),
+                    Span::styled(info.format_name.clone(), theme::bold(theme::PURPLE)),
+                ]);
+                lines.push(vec![
+                    Span::styled("   codec   ", theme::muted()),
+                    Span::styled(info.codec_display(), theme::text()),
+                ]);
+                if info.sample_rate > 0 {
+                    lines.push(vec![
+                        Span::styled("   rate    ", theme::muted()),
+                        Span::styled(info.sample_rate_display(), theme::text()),
+                    ]);
+                }
+                if info.channels > 0 {
+                    lines.push(vec![
+                        Span::styled("   channels", theme::muted()),
+                        Span::raw(" "),
+                        Span::styled(info.channels_display(), theme::text()),
+                    ]);
+                }
+                if info.duration_secs > 0.0 {
+                    lines.push(vec![
+                        Span::styled("   duration", theme::muted()),
+                        Span::raw(" "),
+                        Span::styled(info.duration_display(), theme::text()),
+                    ]);
+                }
+                lines.push(vec![
+                    Span::styled("   size    ", theme::muted()),
+                    Span::styled(info.size_display(), theme::text()),
+                ]);
+
+                // Album-level metadata block (from sidecar overlay
+                // when present, ScarletBook fallback otherwise).
+                let meta = &cached.metadata;
+                let inline_max = max_value_chars.saturating_sub(11);
+                let has_any = meta.album.is_some()
+                    || meta.artist.is_some()
+                    || meta.genre.is_some()
+                    || meta.year.is_some()
+                    || meta.catalog_number.is_some();
+                if has_any {
+                    lines.push(vec![]);
+                    if let Some(s) = &meta.artist {
+                        lines.push(vec![
+                            Span::styled("   artist  ", theme::muted()),
+                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(s) = &meta.album {
+                        lines.push(vec![
+                            Span::styled("   album   ", theme::muted()),
+                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(s) = &meta.genre {
+                        lines.push(vec![
+                            Span::styled("   genre   ", theme::muted()),
+                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(s) = &meta.year {
+                        lines.push(vec![
+                            Span::styled("   year    ", theme::muted()),
+                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                        ]);
+                    }
+                    if let Some(s) = &meta.catalog_number {
+                        lines.push(vec![
+                            Span::styled("   catalog ", theme::muted()),
+                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                        ]);
+                    }
+                }
+            } else {
+                // Not yet probed (async probe pending) — fall back to size only.
+                lines.push(vec![
+                    Span::styled("   size    ", theme::muted()),
+                    Span::styled(size_str(entry.size), theme::text()),
+                ]);
+            }
         }
         EntryKind::OtherFile => {
             lines.push(vec![

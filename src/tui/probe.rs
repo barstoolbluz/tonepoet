@@ -527,35 +527,53 @@ fn read_metadata_sacd(path: &Path) -> Result<SourceMetadata, String> {
     let md = super::sacd::parse_sacd_iso(path)
         .map_err(|e| format!("SACD parse failed for '{}': {}", path.display(), e))?;
 
+    // Sidecar wins on every field it provides; ScarletBook fills the
+    // gaps. Same precedence rule the editor uses
+    // (build_sacd_editor_state). Reading the sidecar twice (here +
+    // editor open) is a minor inefficiency but keeps the surfaces
+    // independent — the browse info pane works whether or not the
+    // user has opened the editor.
+    let sidecar = super::sacd_sidecar::find_sidecar_for_iso(path)
+        .and_then(|p| super::sacd_sidecar::parse_sidecar(&p).ok());
+
+    // First non-empty value across all sidecar tracks for a given
+    // (already uppercased) meta key. Returns None when the sidecar
+    // is absent or the key is missing/empty everywhere.
+    let from_sidecar = |key: &str| -> Option<String> {
+        sidecar
+            .as_ref()?
+            .tracks
+            .iter()
+            .find_map(|t| t.meta.get(key).filter(|s| !s.trim().is_empty()))
+            .map(|s| s.trim().to_string())
+    };
+
     let mut meta = SourceMetadata::default();
 
-    if let Some(t) = md.master_text.as_ref() {
-        meta.album = t.album_title.clone();
-        meta.artist = t.album_artist.clone();
-    }
-
-    // First non-empty disc genre, falling back to the first album
-    // genre if disc has none.
-    let genre_code = md
-        .master_toc
-        .disc_genres
-        .first()
-        .or_else(|| md.master_toc.album_genres.first())
-        .map(|g| g.name());
-    if let Some(g) = genre_code {
-        if g != "Not used" && g != "Not defined" {
-            meta.genre = Some(g.to_string());
-        }
-    }
-
-    // disc_date is None when year was 0; no extra year-validity check needed.
-    if let Some(date) = md.master_toc.disc_date {
-        meta.year = Some(date.year.to_string());
-    }
-
-    if !md.master_toc.album_catalog_number.is_empty() {
-        meta.catalog_number = Some(md.master_toc.album_catalog_number.clone());
-    }
+    meta.album = from_sidecar("ALBUM").or_else(|| {
+        md.master_text.as_ref().and_then(|t| t.album_title.clone())
+    });
+    meta.artist = from_sidecar("ARTIST")
+        .or_else(|| from_sidecar("ALBUMARTIST"))
+        .or_else(|| from_sidecar("ALBUM ARTIST"))
+        .or_else(|| md.master_text.as_ref().and_then(|t| t.album_artist.clone()));
+    meta.year = from_sidecar("DATE")
+        .or_else(|| md.master_toc.disc_date.map(|d| d.year.to_string()));
+    meta.catalog_number = from_sidecar("CATALOGNUMBER")
+        .or_else(|| from_sidecar("DISCOGS_CATALOG"))
+        .or_else(|| {
+            let c = md.master_toc.album_catalog_number.trim().to_string();
+            if c.is_empty() { None } else { Some(c) }
+        });
+    meta.genre = from_sidecar("GENRE").or_else(|| {
+        md.master_toc
+            .disc_genres
+            .first()
+            .or_else(|| md.master_toc.album_genres.first())
+            .map(|g| g.name())
+            .filter(|n| *n != "Not used" && *n != "Not defined")
+            .map(|s| s.to_string())
+    });
 
     Ok(meta)
 }
