@@ -145,7 +145,17 @@ pub fn parse_sidecar_str(text: &str) -> Result<SidecarMetadata, SidecarError> {
             Tag::SelfClose { name, attrs } if name == "meta" => {
                 if let Some(t) = cur.as_mut() {
                     if let (Some(k), Some(v)) = (attrs.get("name"), attrs.get("value")) {
-                        t.meta.insert(k.clone(), v.clone());
+                        // Normalise meta keys to uppercase. In-the-wild
+                        // metabase XML files inconsistently use upper
+                        // (sacd-extract default), lower (some foobar2000
+                        // pressings — e.g. SME JSACD SRGS 4504), or
+                        // mixed case. Downstream merge code looks up
+                        // canonical uppercase keys (ALBUM/TITLE/etc.),
+                        // so normalising at parse time keeps everything
+                        // consistent. Write path emits uppercase too,
+                        // which standardises file shape on save (a
+                        // mild but defensible reformat).
+                        t.meta.insert(k.to_ascii_uppercase(), v.clone());
                     }
                 }
             }
@@ -636,6 +646,28 @@ mod tests {
     fn parse_sidecar_rejects_non_metabase_xml() {
         let xml = r#"<root><nothing/></root>"#;
         assert!(matches!(parse_sidecar_str(xml), Err(SidecarError::NotMetabase)));
+    }
+
+    #[test]
+    fn parse_sidecar_normalises_meta_keys_to_uppercase() {
+        // Regression: SME JSACD SRGS 4504 (A Tribute to Jack Johnson)
+        // and similar foobar2000-emitted sidecars use lowercase meta
+        // key names (`album`, `title`, `artist`, `tracknumber`).
+        // Downstream merge code looks up canonical uppercase keys,
+        // so the parser must normalise.
+        let xml = r#"<root><store id="A" type="SACD" version="1.1">
+<track id="1"><meta name="album" value="My Album"/><meta name="title" value="t"/><meta name="artist" value="An Artist"/><meta name="tracknumber" value="1"/><meta name="totaltracks" value="1"/></track>
+</store></root>"#;
+        let m = parse_sidecar_str(xml).expect("parse");
+        let t = &m.tracks[0];
+        assert_eq!(t.meta.get("ALBUM").map(String::as_str), Some("My Album"));
+        assert_eq!(t.meta.get("TITLE").map(String::as_str), Some("t"));
+        assert_eq!(t.meta.get("ARTIST").map(String::as_str), Some("An Artist"));
+        assert_eq!(t.meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
+        // Original lowercase keys must NOT be present (single
+        // canonical form).
+        assert!(!t.meta.contains_key("album"));
+        assert!(!t.meta.contains_key("title"));
     }
 
     #[test]
