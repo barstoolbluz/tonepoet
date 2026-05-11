@@ -1279,11 +1279,31 @@ fn entry_info_lines(
                 ]);
                 sacd_edit_tags_row = Some(edit_tags_row);
             } else {
-                // Not yet probed (async probe pending) — fall back to size only.
+                // Not yet probed (async probe pending) — fall back to
+                // size only, but still emit the edit-tags pill so
+                // the mouse path stays available during the probe
+                // window (matches AudioFile arm's behaviour).
                 lines.push(vec![
                     Span::styled("   size    ", theme::muted()),
                     Span::styled(size_str(entry.size), theme::text()),
                 ]);
+                lines.push(vec![]);
+                let edit_tags_row = lines.len();
+                let et_label = " edit tags ";
+                let et_w = et_label.chars().count();
+                let et_pad = content_width.saturating_sub(et_w + 3);
+                let et_bg = if edit_tags_hovered { theme::BLUE } else { theme::PURPLE };
+                lines.push(vec![
+                    Span::raw(" ".repeat(et_pad)),
+                    Span::styled(
+                        et_label,
+                        Style::default()
+                            .fg(theme::PILL_ACTIVE_FG)
+                            .bg(et_bg)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                ]);
+                sacd_edit_tags_row = Some(edit_tags_row);
             }
         }
         EntryKind::OtherFile => {
