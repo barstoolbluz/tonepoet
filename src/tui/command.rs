@@ -288,7 +288,18 @@ pub enum Command {
     CueEditLine(usize),
     /// Open the metadata editor pre-populated with track-level + album-level
     /// values from a MusicBrainz disc-TOC lookup.
-    TagsFromMb,
+    ///
+    /// All fields `None` (the bare `:tags-mb` form) keeps today's
+    /// behavior: TOC-primary with seed-from-editor text fallback.
+    /// Any field `Some` switches to **direct text search** (TOC is
+    /// skipped) using the supplied values as the seed. Free-form text
+    /// goes to the album field; `--catno` and `--year` flags fill
+    /// `catalog` and `year` directly.
+    TagsFromMb {
+        query: Option<String>,
+        catno: Option<String>,
+        year: Option<String>,
+    },
     /// Toggle the cursor row of the metadata editor between its
     /// MB-proposed value and the file's original (pre-MB) value.
     /// No-op when the row wasn't touched by MB or has been manually
@@ -487,7 +498,7 @@ pub fn parse_command(input: &str) -> Command {
         "cue-mb!" => Command::GenerateCueMb { single_image: true },
         "cue-fill" | "cue-enrich" => Command::CueFill,
         "cue-view" => Command::CueView,
-        "tags-mb" | "mb-tags" | "musicbrainz-tags" => Command::TagsFromMb,
+        "tags-mb" | "mb-tags" | "musicbrainz-tags" => parse_tags_mb_args(args),
         "revert" => Command::MbRevert,
         "restore" => Command::MbRestore,
         "g" | "top" => Command::CueScrollTop,
@@ -548,6 +559,128 @@ pub fn parse_command(input: &str) -> Command {
         "edit-file" | "ef" => Command::EditFile(std::path::PathBuf::from(args)),
         _ => Command::Unknown(input.to_string()),
     }
+}
+
+const TAGS_MB_USAGE: &str =
+    "usage: :tags-mb [--catno VALUE] [--year YYYY] [text query]";
+
+/// Tokenize a `:tags-mb` arg string into whitespace-separated tokens,
+/// respecting double-quoted strings (no escapes). Catalog numbers
+/// commonly contain spaces (`SRGS 4520`, `ESGA 509`) so `--catno
+/// "SRGS 4520"` must be a single token.
+fn tokenize_tags_mb_args(input: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if in_quote {
+                    out.push(std::mem::take(&mut cur));
+                    in_quote = false;
+                } else {
+                    in_quote = true;
+                }
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if in_quote {
+        return Err("unterminated quoted string".to_string());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+/// Parse the arg string for the `:tags-mb` family of commands.
+/// Bare (empty args) form maps to `Command::TagsFromMb { None, None, None }`,
+/// preserving today's TOC-primary-with-seed-fallback behavior.
+/// Any non-empty arg returns the struct populated for direct text
+/// search (TOC will be skipped at dispatch). Errors land as
+/// `Command::Unknown(usage_or_specific_error)`.
+fn parse_tags_mb_args(args: &str) -> Command {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Command::TagsFromMb { query: None, catno: None, year: None };
+    }
+    let tokens = match tokenize_tags_mb_args(trimmed) {
+        Ok(t) => t,
+        Err(e) => return Command::Unknown(format!(":tags-mb: {} — {}", e, TAGS_MB_USAGE)),
+    };
+
+    let mut catno: Option<String> = None;
+    let mut year: Option<String> = None;
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut iter = tokens.into_iter();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            "--catno" => {
+                let Some(val) = iter.next() else {
+                    return Command::Unknown(
+                        format!(":tags-mb: --catno requires a value — {}", TAGS_MB_USAGE),
+                    );
+                };
+                if val.is_empty() {
+                    return Command::Unknown(
+                        format!(":tags-mb: --catno value must be non-empty — {}", TAGS_MB_USAGE),
+                    );
+                }
+                if catno.is_some() {
+                    return Command::Unknown(
+                        format!(":tags-mb: --catno specified twice — {}", TAGS_MB_USAGE),
+                    );
+                }
+                catno = Some(val);
+            }
+            "--year" => {
+                let Some(val) = iter.next() else {
+                    return Command::Unknown(
+                        format!(":tags-mb: --year requires a value — {}", TAGS_MB_USAGE),
+                    );
+                };
+                if val.is_empty() {
+                    return Command::Unknown(
+                        format!(":tags-mb: --year value must be non-empty — {}", TAGS_MB_USAGE),
+                    );
+                }
+                if year.is_some() {
+                    return Command::Unknown(
+                        format!(":tags-mb: --year specified twice — {}", TAGS_MB_USAGE),
+                    );
+                }
+                year = Some(val);
+            }
+            s if s.starts_with("--") => {
+                return Command::Unknown(
+                    format!(":tags-mb: unknown flag '{}' — {}", s, TAGS_MB_USAGE),
+                );
+            }
+            _ => text_parts.push(tok),
+        }
+    }
+
+    let query = if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join(" "))
+    };
+
+    if query.is_none() && catno.is_none() && year.is_none() {
+        // Tokenization consumed everything (e.g. just whitespace
+        // inside a quoted block). Surface as a usage error rather
+        // than dispatching an empty search.
+        return Command::Unknown(format!(":tags-mb: empty query — {}", TAGS_MB_USAGE));
+    }
+
+    Command::TagsFromMb { query, catno, year }
 }
 
 /// Execute a parsed command against app state
@@ -1729,11 +1862,28 @@ pub fn execute_command(
                 super::app::CuePreviewState::new_readonly(content, summary),
             ));
         }
-        Command::TagsFromMb => {
+        Command::TagsFromMb { query, catno, year } => {
+            let explicit_args = query.is_some() || catno.is_some() || year.is_some();
+            let direct_seed = if explicit_args {
+                Some(SacdMbSeed {
+                    artist: String::new(),
+                    album: query.clone().unwrap_or_default(),
+                    catalog: catno.clone(),
+                    year: year.clone(),
+                })
+            } else {
+                None
+            };
+
             // In-editor dispatch (SACD or regular file). Returns Some
             // when an editor was in scope; the Browse-path fall-through
-            // below runs only when no editor is open.
-            if let Some(dispatched) = try_dispatch_in_editor_tags_mb(app, tx) {
+            // below runs only when no editor is open. `direct_seed` is
+            // `Some` when the user supplied explicit args — the
+            // in-editor dispatch then skips TOC and goes straight to
+            // text search.
+            if let Some(dispatched) =
+                try_dispatch_in_editor_tags_mb(app, tx, direct_seed.clone())
+            {
                 if dispatched {
                     return;
                 }
@@ -1779,6 +1929,25 @@ pub fn execute_command(
                 return;
             }
             super::probe::sort_paths_by_track(&mut paths);
+
+            // Explicit args from the user override the TOC primary
+            // path: fire a direct text search instead.
+            if let Some(seed) = direct_seed {
+                let ctx = super::message::TagsMbContext {
+                    paths,
+                    editor_park: false,
+                    fallback_seed: None,
+                };
+                super::event_loop::spawn_tags_mb_text_search(
+                    app,
+                    tx,
+                    seed,
+                    ctx,
+                    super::event_loop::TextSearchMode::DirectRequest,
+                );
+                return;
+            }
+
             let dir = paths[0].parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
@@ -3541,6 +3710,12 @@ pub(super) fn spawn_tags_mb_toc_lookup(
 /// `None` when no editor is in scope (caller falls through to the
 /// Browse path).
 ///
+/// `direct_seed = Some(...)` means the user supplied explicit args
+/// (`:tags-mb --catno X miles davis`); the dispatch then skips TOC
+/// entirely and spawns a text search using the supplied seed. The
+/// editor still gets parked and populated in place as for any
+/// in-editor dispatch.
+///
 /// **Parking-slot invariant:** the editor must be left in
 /// `active_overlay`, never in `pending_metadata_editor`, before this
 /// returns. The CommandInput Enter and ContextMenu wrappers
@@ -3550,6 +3725,7 @@ pub(super) fn spawn_tags_mb_toc_lookup(
 fn try_dispatch_in_editor_tags_mb(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    direct_seed: Option<SacdMbSeed>,
 ) -> Option<bool> {
     use super::app::ActiveOverlay;
 
@@ -3566,6 +3742,28 @@ fn try_dispatch_in_editor_tags_mb(
         } else {
             return None;
         };
+
+    // Direct-args path: skip TOC, fire a text search using the
+    // user-supplied seed. Editor goes into `active_overlay` so the
+    // result handler can populate it in place (same parking-slot
+    // invariant as the TOC path).
+    if let Some(seed) = direct_seed {
+        let paths = state_owned.paths.clone();
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        let ctx = super::message::TagsMbContext {
+            paths,
+            editor_park: true,
+            fallback_seed: None,
+        };
+        super::event_loop::spawn_tags_mb_text_search(
+            app,
+            tx,
+            seed,
+            ctx,
+            super::event_loop::TextSearchMode::DirectRequest,
+        );
+        return Some(true);
+    }
 
     // Compute sectors + fallback eligibility per editor kind. SACD
     // editors derive geometry from their stashed per-area durations
@@ -4455,6 +4653,177 @@ mod sacd_toc_tests {
         // Final leadout = 150 + 100 * 14:24 in frames.
         let expected_leadout = 150 + 100 * ((dur * 75.0).round() as u32);
         assert_eq!(*sectors.last().unwrap(), expected_leadout);
+    }
+}
+
+#[cfg(test)]
+mod tags_mb_args_tests {
+    use super::*;
+
+    fn parse(s: &str) -> Command {
+        super::parse_tags_mb_args(s)
+    }
+
+    fn tokenize(s: &str) -> Result<Vec<String>, String> {
+        super::tokenize_tags_mb_args(s)
+    }
+
+    // ── tokenizer ──────────────────────────────────────────────
+
+    #[test]
+    fn tokenize_plain_whitespace_split() {
+        assert_eq!(tokenize("a b c").unwrap(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn tokenize_double_quoted_preserves_internal_spaces() {
+        assert_eq!(
+            tokenize(r#"--catno "SRGS 4520" miles davis"#).unwrap(),
+            vec!["--catno", "SRGS 4520", "miles", "davis"],
+        );
+    }
+
+    #[test]
+    fn tokenize_unterminated_quote_errors() {
+        assert!(tokenize(r#"--catno "SRGS 4520"#).is_err());
+    }
+
+    #[test]
+    fn tokenize_empty_input_is_empty_vec() {
+        assert!(tokenize("").unwrap().is_empty());
+        assert!(tokenize("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tokenize_multiple_consecutive_spaces_collapse() {
+        assert_eq!(tokenize("a   b").unwrap(), vec!["a", "b"]);
+    }
+
+    // ── parser: bare form ─────────────────────────────────────
+
+    #[test]
+    fn empty_args_parses_to_all_none() {
+        match parse("") {
+            Command::TagsFromMb { query, catno, year } => {
+                assert_eq!(query, None);
+                assert_eq!(catno, None);
+                assert_eq!(year, None);
+            }
+            c => panic!("expected TagsFromMb, got {:?}", c),
+        }
+    }
+
+    #[test]
+    fn whitespace_only_args_parses_to_all_none() {
+        match parse("   ") {
+            Command::TagsFromMb { query, catno, year } => {
+                assert!(query.is_none() && catno.is_none() && year.is_none());
+            }
+            c => panic!("expected TagsFromMb, got {:?}", c),
+        }
+    }
+
+    // ── parser: free-form text ─────────────────────────────────
+
+    #[test]
+    fn free_form_text_only() {
+        match parse("miles davis kind of blue") {
+            Command::TagsFromMb { query, catno, year } => {
+                assert_eq!(query.as_deref(), Some("miles davis kind of blue"));
+                assert_eq!(catno, None);
+                assert_eq!(year, None);
+            }
+            c => panic!("expected TagsFromMb, got {:?}", c),
+        }
+    }
+
+    // ── parser: --catno ────────────────────────────────────────
+
+    #[test]
+    fn catno_only_with_quoted_value() {
+        match parse(r#"--catno "SRGS 4520""#) {
+            Command::TagsFromMb { query, catno, year } => {
+                assert_eq!(catno.as_deref(), Some("SRGS 4520"));
+                assert_eq!(query, None);
+                assert_eq!(year, None);
+            }
+            c => panic!("expected TagsFromMb, got {:?}", c),
+        }
+    }
+
+    #[test]
+    fn catno_with_bare_value_no_quotes() {
+        match parse("--catno SRGS-4520") {
+            Command::TagsFromMb { catno, .. } => {
+                assert_eq!(catno.as_deref(), Some("SRGS-4520"));
+            }
+            c => panic!("expected TagsFromMb, got {:?}", c),
+        }
+    }
+
+    #[test]
+    fn catno_missing_value_errors() {
+        assert!(matches!(parse("--catno"), Command::Unknown(_)));
+    }
+
+    #[test]
+    fn catno_duplicate_errors() {
+        assert!(matches!(parse("--catno X --catno Y"), Command::Unknown(_)));
+    }
+
+    // ── parser: --year ─────────────────────────────────────────
+
+    #[test]
+    fn year_only() {
+        match parse("--year 1971") {
+            Command::TagsFromMb { year, .. } => {
+                assert_eq!(year.as_deref(), Some("1971"));
+            }
+            c => panic!("expected TagsFromMb, got {:?}", c),
+        }
+    }
+
+    #[test]
+    fn year_missing_value_errors() {
+        assert!(matches!(parse("--year"), Command::Unknown(_)));
+    }
+
+    // ── parser: combined / interleaved ────────────────────────
+
+    #[test]
+    fn all_three_in_canonical_order() {
+        match parse(r#"--catno "ESGA 509" --year 1971 carole king tapestry"#) {
+            Command::TagsFromMb { query, catno, year } => {
+                assert_eq!(catno.as_deref(), Some("ESGA 509"));
+                assert_eq!(year.as_deref(), Some("1971"));
+                assert_eq!(query.as_deref(), Some("carole king tapestry"));
+            }
+            c => panic!("expected TagsFromMb, got {:?}", c),
+        }
+    }
+
+    #[test]
+    fn flags_after_free_text() {
+        match parse("miles davis --year 1959 --catno CL-1355") {
+            Command::TagsFromMb { query, catno, year } => {
+                assert_eq!(query.as_deref(), Some("miles davis"));
+                assert_eq!(catno.as_deref(), Some("CL-1355"));
+                assert_eq!(year.as_deref(), Some("1959"));
+            }
+            c => panic!("expected TagsFromMb, got {:?}", c),
+        }
+    }
+
+    // ── parser: error cases ────────────────────────────────────
+
+    #[test]
+    fn unknown_flag_errors() {
+        assert!(matches!(parse("--frobnicate X"), Command::Unknown(_)));
+    }
+
+    #[test]
+    fn unterminated_quote_errors() {
+        assert!(matches!(parse(r#"--catno "SRGS 4520"#), Command::Unknown(_)));
     }
 }
 

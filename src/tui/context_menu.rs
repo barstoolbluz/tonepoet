@@ -772,7 +772,14 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::TagsFromMb => {
-            let cmd = super::command::Command::TagsFromMb;
+            // Context menu item maps to the bare `:tags-mb` form
+            // (TOC-primary with seed-fallback). Free-form-args variants
+            // are colon-only since the menu can't take user input.
+            let cmd = super::command::Command::TagsFromMb {
+                query: None,
+                catno: None,
+                year: None,
+            };
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::MetadataRevertMb => {

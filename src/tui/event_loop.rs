@@ -1320,7 +1320,7 @@ fn handle_mb_toc_outcome(
 
     match outcome.releases.len() {
         0 => match ctx.fallback_seed.clone() {
-            Some(seed) => spawn_text_fallback(app, tx, seed, ctx),
+            Some(seed) => spawn_tags_mb_text_search(app, tx, seed, ctx, TextSearchMode::TocFallback),
             None => {
                 app.set_status(
                     ":tags-mb: no MusicBrainz release matched this disc TOC"
@@ -1378,15 +1378,37 @@ fn handle_mb_search_outcome(
     }
 }
 
-/// Spawn the C-2b text-search fallback from a TOC zero-match. Sets
-/// the pre-spawn status, builds the in-memory cache lookup for both
-/// candidate query forms (with-catno + without-catno), and fires the
-/// search; the result re-enters this handler as `MbOutcome::Search`.
-fn spawn_text_fallback(
+/// Why a `spawn_tags_mb_text_search` was fired. Drives the pre-spawn
+/// status text: `TocFallback` keeps the "TOC missed" breadcrumb,
+/// `DirectRequest` just names the search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TextSearchMode {
+    /// User typed `:tags-mb …` with explicit args (Phase C item 2a).
+    /// No prior TOC attempt; status just names the search.
+    DirectRequest,
+    /// Spawned by the TOC handler's zero-match branch (C-2b). Status
+    /// keeps the "TOC missed" breadcrumb so the user sees the chain.
+    TocFallback,
+}
+
+/// Spawn the `:tags-mb` text/release search. Two callers:
+///
+/// 1. The TOC handler's zero-match branch (`mode = TocFallback`),
+///    using a seed extracted from the editor's ARTIST/ALBUM/etc. rows.
+/// 2. The command dispatch in `command.rs` (`mode = DirectRequest`),
+///    using a seed the user supplied via `:tags-mb` flags + text.
+///
+/// Builds the in-memory cache lookup for both candidate query forms
+/// (with-catno + without-catno fallback inside
+/// `search_releases_by_query`), sets the pre-spawn status, and fires
+/// the async search. Result re-enters the unified handler as
+/// `MbOutcome::Search`.
+pub(super) fn spawn_tags_mb_text_search(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     seed: super::command::SacdMbSeed,
     ctx: super::message::TagsMbContext,
+    mode: TextSearchMode,
 ) {
     let super::command::SacdMbSeed { artist, album, catalog, year } = seed;
     let n_tracks = ctx.paths.len();
@@ -1416,11 +1438,19 @@ fn spawn_text_fallback(
             .clone()
             .unwrap_or_else(|| year.clone().unwrap_or_default()),
     };
-    app.set_status(format!(
-        ":tags-mb: TOC missed, {} text search for \"{}\"…",
-        if cache_hit { "cached" } else { "trying" },
-        label,
-    ));
+    let status = match mode {
+        TextSearchMode::DirectRequest => format!(
+            ":tags-mb: {} search for \"{}\"…",
+            if cache_hit { "cached" } else { "running" },
+            label,
+        ),
+        TextSearchMode::TocFallback => format!(
+            ":tags-mb: TOC missed, {} text search for \"{}\"…",
+            if cache_hit { "cached" } else { "trying" },
+            label,
+        ),
+    };
+    app.set_status(status);
 
     let tx_inner = tx.clone();
     let label_for_msg = label;
