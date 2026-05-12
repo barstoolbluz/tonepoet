@@ -79,6 +79,7 @@ pub fn build_mb_toc(sectors: &[u32]) -> Option<String> {
 }
 
 const MB_BASE: &str = "https://musicbrainz.org/ws/2/discid/-";
+const MB_SEARCH_BASE: &str = "https://musicbrainz.org/ws/2/release/";
 const USER_AGENT: &str = concat!(
     "tonepoet/",
     env!("CARGO_PKG_VERSION"),
@@ -310,6 +311,112 @@ pub fn parse_mb_response(
     n_tracks: usize,
 ) -> Result<Option<MbRelease>, String> {
     Ok(parse_mb_response_all(body, n_tracks)?.into_iter().next())
+}
+
+/// Search MusicBrainz for releases by free-form metadata (Phase B-2).
+///
+/// Hits `/ws/2/release/?query=…` with a Lucene query AND-joining the
+/// supplied non-empty fields. When `catalog` is supplied, the first
+/// attempt includes `catno:"…"`; if that returns zero results the
+/// function transparently retries without the catalog clause (each
+/// attempt consumes its own rate-limit token).
+///
+/// `year` is conventionally `"YYYY"` but hyphenated `"YYYY-MM-DD"` also
+/// works — `lucene_escape` backslash-escapes the hyphens and MB's query
+/// parser accepts the result.
+///
+/// `n_tracks` is the disc's track count; it's threaded through to
+/// `release_from_json` so multi-medium `pick_medium` stays consistent
+/// once B-3's detail fetch populates `media[].tracks[]`. Search-endpoint
+/// responses are shallow — most callers should follow up with the
+/// detail endpoint (B-3) to get per-track titles / IDs / ISRCs.
+///
+/// Returns `Ok(vec![])` when MB has no match. `Err(_)` is a transport
+/// or parse failure the caller should surface.
+pub async fn search_releases_by_query(
+    artist: &str,
+    album: &str,
+    catalog: Option<&str>,
+    year: Option<&str>,
+    n_tracks: usize,
+) -> Result<Vec<MbRelease>, String> {
+    let with_catno = build_search_query(artist, album, catalog, year);
+    if with_catno.is_empty() {
+        return Err("search requires at least one of artist/album/catalog/year".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let first = fire_search(&client, &with_catno, n_tracks).await?;
+    if !first.is_empty() || catalog.is_none() {
+        return Ok(first);
+    }
+
+    // Catalog-first miss: retry without the catno clause. Covers
+    // pressings where MB has a stripped or differently-formatted
+    // catalog number. Verified 2026-05-11 against Solo Monk's SRGS
+    // pressing — see project_mb_on_sacd_plan.md.
+    let without_catno = build_search_query(artist, album, None, year);
+    if without_catno == with_catno {
+        return Ok(first);
+    }
+    fire_search(&client, &without_catno, n_tracks).await
+}
+
+fn build_search_query(
+    artist: &str,
+    album: &str,
+    catalog: Option<&str>,
+    year: Option<&str>,
+) -> String {
+    let mut clauses: Vec<String> = Vec::with_capacity(4);
+    if !artist.is_empty() {
+        clauses.push(format!("artist:\"{}\"", lucene_escape(artist)));
+    }
+    if !album.is_empty() {
+        clauses.push(format!("release:\"{}\"", lucene_escape(album)));
+    }
+    if let Some(c) = catalog.filter(|s| !s.is_empty()) {
+        clauses.push(format!("catno:\"{}\"", lucene_escape(c)));
+    }
+    if let Some(y) = year.filter(|s| !s.is_empty()) {
+        clauses.push(format!("date:{}", lucene_escape(y)));
+    }
+    clauses.join(" AND ")
+}
+
+async fn fire_search(
+    client: &reqwest::Client,
+    query: &str,
+    n_tracks: usize,
+) -> Result<Vec<MbRelease>, String> {
+    mb_acquire().await;
+
+    let resp = client
+        .get(MB_SEARCH_BASE)
+        .query(&[("query", query), ("fmt", "json"), ("limit", "25")])
+        .send()
+        .await
+        .map_err(|e| format!("MusicBrainz query failed: {}", e))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("MusicBrainz response error: {}", e))?;
+
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    if !status.is_success() {
+        return Err(format!("MusicBrainz returned HTTP {}", status));
+    }
+
+    parse_mb_response_all(&body, n_tracks)
 }
 
 fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
