@@ -861,25 +861,18 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         AppMessage::TagsFromMbComplete { outcome, paths, toc_string } => {
             handle_tags_from_mb_complete(app, tx, outcome, paths, toc_string);
         }
-        AppMessage::MbDetailPrefetchComplete { release_id, generation, result } => {
-            // Drop the result if the picker has since closed or the
-            // user moved cursor past the snapshot. The atomic check
-            // inside the spawn task already filters most stale
-            // deliveries; this handler-side check covers the close
-            // race (overlay swapped after task fired HTTP).
+        AppMessage::MbDetailPrefetchComplete { release_id, generation: _, result } => {
+            // Stamp the cache if the picker is still open. The
+            // pre-HTTP atomic check (in spawn_mb_detail_prefetch) is
+            // what prevents wasted MB tokens during rapid navigation;
+            // by the time a response reaches this handler we've
+            // already paid for it, so cache it regardless of whether
+            // the user has since moved cursor — the cache is keyed by
+            // MBID and will be useful if they navigate back. Errors
+            // and `Ok(None)` are silent (best-effort prefetch).
             if let ActiveOverlay::MbSelect(ref mut state) = app.active_overlay {
-                let current = state.generation.load(std::sync::atomic::Ordering::Relaxed);
-                if current == generation {
-                    if let Ok(Some(release)) = result {
-                        state.prefetch.insert(release_id, release);
-                    }
-                    // Errors are silent — the prefetch is best-effort,
-                    // a network blip shouldn't surface a status flash
-                    // while the user is just navigating the picker.
-                    // The empty `releases` body case (`Ok(None)`) is
-                    // also silent: detail-by-MBID shouldn't 404 on an
-                    // MBID we got from search, but if it does the
-                    // tracks pane just stays in "fetching" state.
+                if let Ok(Some(release)) = result {
+                    state.prefetch.insert(release_id, release);
                 }
             }
         }
