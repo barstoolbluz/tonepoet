@@ -1,18 +1,55 @@
 //! Message types for async communication in the TUI event loop
 
-/// Where a `TagsFromMbSearchComplete` was spawned from. Used by the
-/// shared handler to format the zero-match status line: a `Direct`
-/// search reports only the failed query, while a `SacdFallback`
-/// fired by `handle_tags_from_mb_toc_sacd_complete` after a TOC
-/// miss reports both failure modes so the user sees the full
-/// breadcrumb in one message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TagsMbSearchOrigin {
-    /// Spawned directly by `:tags-mb` (no preceding TOC attempt).
-    /// Reserved for future C-3 use; not wired today.
-    Direct,
-    /// Spawned by the SACD TOC handler's zero-match branch.
-    SacdFallback,
+/// Outcome envelope for the unified `:tags-mb` flow. The handler
+/// switches on this to apply TOC-specific (cache by `toc_string`)
+/// vs. search-specific (cache by `cache_writes`) persistence and to
+/// pick the right zero-match status text; the downstream 0/1/N
+/// branching is the same shape for both.
+#[derive(Debug)]
+pub enum MbOutcome {
+    /// Result of a `/ws/2/discid/-?toc=…` lookup. `toc_string` is
+    /// the cache key under which the handler persists
+    /// `outcome.cache_response`.
+    Toc {
+        outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
+        toc_string: String,
+    },
+    /// Result of a `/ws/2/release/?query=…` search, spawned by the
+    /// handler as a zero-match fallback from `Toc`. Entering this
+    /// variant means a TOC attempt already missed; the zero-match
+    /// status reflects that breadcrumb. `query_label` is a short
+    /// human rendering of the seed for the status line.
+    Search {
+        outcome: Result<crate::tui::musicbrainz::MbSearchOutcome, String>,
+        query_label: String,
+    },
+}
+
+/// Per-dispatch context for the unified `:tags-mb` flow. Three entry
+/// points build one of these:
+///
+/// 1. **Browse audio-file selection** (no editor open):
+///    `editor_park = false`, `fallback_seed = None`.
+/// 2. **SACD editor in-place**: `editor_park = true`,
+///    `fallback_seed = Some(…)` because TOC misses are common for
+///    SACD-only releases that lack a same-geometry CD reissue in MB.
+/// 3. **Regular file editor in-place**: `editor_park = true`,
+///    `fallback_seed = None` because audio-file TOCs are sample-exact
+///    so the fallback rarely helps and adds an unhelpful second hop.
+///
+/// `fallback_seed` is captured at dispatch time (NOT re-read at
+/// handler time) so a search reflects what the user saw when they
+/// triggered `:tags-mb`, even if they edit values during the wait.
+#[derive(Debug, Clone)]
+pub struct TagsMbContext {
+    pub paths: Vec<std::path::PathBuf>,
+    /// `true` = the dispatch left a metadata editor in
+    /// `active_overlay` that should be populated in place; the
+    /// handler manages parking for the multi-match case.
+    /// `false` = no editor in scope; the handler opens a fresh
+    /// editor on single-match / pick.
+    pub editor_park: bool,
+    pub fallback_seed: Option<crate::tui::command::SacdMbSeed>,
 }
 
 /// Messages sent to the TUI event loop via mpsc channel
@@ -175,39 +212,15 @@ pub enum AppMessage {
         layout: CueFillLayout,
         toc_string: String,
     },
-    /// Result of an async MusicBrainz lookup driving `:tags-mb`. Carries
-    /// the audio paths so the metadata editor can be opened on the same
-    /// selection that triggered the lookup.
+    /// Result of an async MusicBrainz lookup driving `:tags-mb`.
+    /// Unified across three entry points (Browse audio-file selection,
+    /// SACD editor in-place, regular file editor in-place) via the
+    /// `MbOutcome` envelope + `TagsMbContext`. The same handler
+    /// drives all of them; populate-vs-open-fresh and fallback
+    /// eligibility ride on `ctx`.
     TagsFromMbComplete {
-        outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
-        paths: Vec<std::path::PathBuf>,
-        toc_string: String,
-    },
-    /// Result of a Phase C-2a SACD `:tags-mb` **TOC** lookup. Mirrors
-    /// the audio-file `TagsFromMbComplete` shape but routes through
-    /// the SACD-specific handler, which adds editor parking and a
-    /// zero-match text-search fallback (C-2b) on top of the standard
-    /// 0/1/N branching.
-    TagsFromMbTocSacdComplete {
-        outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
-        paths: Vec<std::path::PathBuf>,
-        toc_string: String,
-    },
-    /// Result of a Phase C-2b SACD `:tags-mb` **text/release search**
-    /// fallback. Fired by the TOC handler when the primary lookup
-    /// returns zero releases. Carries the `MbSearchOutcome` so the
-    /// handler persists fresh response bodies into
-    /// `musicbrainz_search_cache` (B-5) before the standard
-    /// zero/single/multi branching. `query_label` is a short human
-    /// rendering of the seed query for the status line. `origin`
-    /// distinguishes the spawn site so the zero-match status can
-    /// include the "TOC missed first" breadcrumb without losing it
-    /// to the second `set_status` call.
-    TagsFromMbSearchComplete {
-        outcome: Result<crate::tui::musicbrainz::MbSearchOutcome, String>,
-        paths: Vec<std::path::PathBuf>,
-        query_label: String,
-        origin: TagsMbSearchOrigin,
+        outcome: MbOutcome,
+        ctx: TagsMbContext,
     },
     /// Result of an MbSelect prefetch: the detail fetch
     /// (`/ws/2/release/{mbid}?inc=…`) for a candidate currently visible

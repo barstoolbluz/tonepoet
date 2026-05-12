@@ -1730,13 +1730,10 @@ pub fn execute_command(
             ));
         }
         Command::TagsFromMb => {
-            // Phase C-2: SACD editor dispatch. If the user is currently
-            // in a SACD metadata editor (either active or parked from
-            // a prior overlay step), seed a text/release search from the
-            // editor's ARTIST/ALBUM/CATALOGNUMBER/DATE rather than
-            // running the TOC-based audio-file path. Falls through to
-            // the existing file path when no SACD editor is in scope.
-            if let Some(dispatched) = try_dispatch_sacd_tags_mb(app, tx) {
+            // In-editor dispatch (SACD or regular file). Returns Some
+            // when an editor was in scope; the Browse-path fall-through
+            // below runs only when no editor is open.
+            if let Some(dispatched) = try_dispatch_in_editor_tags_mb(app, tx) {
                 if dispatched {
                     return;
                 }
@@ -1813,26 +1810,15 @@ pub fn execute_command(
                     return;
                 }
             };
-            let cached = app.db.get_cached_mb_response(&toc_string);
-            let n_cached = if cached.is_some() { "cached" } else { "fetching" };
-            app.set_status(format!(
-                ":tags-mb: {} disc TOC ({} tracks)…",
-                n_cached, sectors.len() - 1,
-            ));
-
-            let tx = tx.clone();
-            let toc_for_msg = toc_string.clone();
-            let paths_for_msg = paths.clone();
-            tokio::spawn(async move {
-                let outcome = super::musicbrainz::lookup_release_by_toc(
-                    &sectors, cached,
-                ).await;
-                let _ = tx.send(AppMessage::TagsFromMbComplete {
-                    outcome,
-                    paths: paths_for_msg,
-                    toc_string: toc_for_msg,
-                }).await;
-            });
+            spawn_tags_mb_toc_lookup(
+                app,
+                tx,
+                sectors,
+                toc_string,
+                paths,
+                /* editor_park */ false,
+                /* fallback_seed */ None,
+            );
         }
         Command::CueFill => {
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
@@ -3435,7 +3421,7 @@ pub(super) fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
 /// canonical album-level row and is preferred over `ARTIST` when
 /// both are present.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SacdMbSeed {
+pub struct SacdMbSeed {
     pub artist: String,
     pub album: String,
     pub catalog: Option<String>,
@@ -3497,34 +3483,71 @@ pub(super) fn sacd_durations_to_sectors(durations: &[f64]) -> Vec<u32> {
     sectors
 }
 
-/// Phase C-2a: dispatch `:tags-mb` to the **TOC** path when the
-/// active or parked metadata editor is editing a SACD ISO. Returns
-/// `Some(true)` when the dispatch fired (caller short-circuits),
-/// `None` when no editor is in scope at all (caller falls through
-/// to the Browse path).
+/// Common spawn point for the unified `:tags-mb` TOC flow. All three
+/// entry points (Browse audio-file selection, SACD editor in-place,
+/// regular file editor in-place) compute their own sectors and
+/// `toc_string`, then call this to do the cache check, status, and
+/// async fire. The result re-enters via `MbOutcome::Toc` and routes
+/// through the shared handler.
 ///
-/// Builds a CD-equivalent TOC string from the active area's per-track
-/// durations (stashed on the editor at open time) and hands it to
-/// `lookup_release_by_toc` — same endpoint and parser the audio-file
-/// `:tags-mb` flow already uses. The TOC path matches releases by
-/// disc geometry (track count + offsets within fuzzy tolerance), so
-/// ScarletBook metadata junk (`[ISO]`, `(SME JSACD …)`, etc.) doesn't
-/// matter — we never read ARTIST/ALBUM/CATNO/DATE for the primary
-/// lookup.
+/// `paths` is the audio paths (or ISO replicated per-track for SACD).
+/// `editor_park` is true when an editor is sitting in
+/// `active_overlay` and should be populated in place. `fallback_seed`
+/// is `Some(...)` only for SACD editors where TOC misses are common
+/// enough to justify the text-search fallback hop.
+pub(super) fn spawn_tags_mb_toc_lookup(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    sectors: Vec<u32>,
+    toc_string: String,
+    paths: Vec<std::path::PathBuf>,
+    editor_park: bool,
+    fallback_seed: Option<SacdMbSeed>,
+) {
+    let cached = app.db.get_cached_mb_response(&toc_string);
+    let n_cached = if cached.is_some() { "cached" } else { "fetching" };
+    let n_tracks = sectors.len().saturating_sub(1);
+    app.set_status(format!(
+        ":tags-mb: {} disc TOC ({} tracks)…",
+        n_cached, n_tracks,
+    ));
+
+    let tx = tx.clone();
+    let toc_for_msg = toc_string;
+    let ctx = super::message::TagsMbContext {
+        paths,
+        editor_park,
+        fallback_seed,
+    };
+
+    tokio::spawn(async move {
+        let outcome = super::musicbrainz::lookup_release_by_toc(
+            &sectors, cached,
+        ).await;
+        let _ = tx.send(AppMessage::TagsFromMbComplete {
+            outcome: super::message::MbOutcome::Toc {
+                outcome,
+                toc_string: toc_for_msg,
+            },
+            ctx,
+        }).await;
+    });
+}
+
+/// Dispatch `:tags-mb` when a metadata editor is open. Handles both
+/// SACD ISOs (TOC from per-area durations) and regular file editors
+/// (TOC from accuraterip helpers on `state.paths`). Returns
+/// `Some(true)` when the dispatch fired (caller short-circuits) or
+/// `None` when no editor is in scope (caller falls through to the
+/// Browse path).
 ///
-/// **Zero-match fallback** (C-2b) is handled in the result handler
-/// (`handle_tags_from_mb_toc_sacd_complete`), not here: when the TOC
-/// returns no releases, that handler spawns a text-search via
-/// `seed_sacd_mb_query` + `search_releases_by_query`. Network errors
-/// do NOT trigger fallback — they surface so the user can retry.
-///
-/// **Parking-slot invariant** (unchanged from the prior text-only
-/// version): the editor must be left in `active_overlay`, never in
-/// `pending_metadata_editor`, before this returns. The CommandInput
-/// Enter and ContextMenu wrappers auto-restore `pending → active`
-/// only when `active == None`, so leaving the editor parked would
-/// cause it to be drained before our async result arrives.
-fn try_dispatch_sacd_tags_mb(
+/// **Parking-slot invariant:** the editor must be left in
+/// `active_overlay`, never in `pending_metadata_editor`, before this
+/// returns. The CommandInput Enter and ContextMenu wrappers
+/// auto-restore `pending → active` only when `active == None`, so
+/// leaving the editor parked would cause it to be drained before
+/// our async result arrives.
+fn try_dispatch_in_editor_tags_mb(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
 ) -> Option<bool> {
@@ -3541,80 +3564,93 @@ fn try_dispatch_sacd_tags_mb(
                 unreachable!()
             }
         } else {
-            // No editor in scope — fall through to the Browse path.
             return None;
         };
 
-    let Some(area_kind) = state_owned.sacd_area_kind else {
-        // Editor is open on a file, not a SACD ISO. The Browse-path
-        // audio-file `:tags-mb` flow needs a selection of audio files;
-        // we're inside an open editor instead. Surface a clear message
-        // rather than letting the Browse fall-through report "no
-        // audio files in selection," which is misleading here.
-        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
-        app.set_status(
-            ":tags-mb: from inside a file editor — close it and run from Browse, \
-             or open a SACD ISO".to_string(),
-        );
-        return Some(true);
+    // Compute sectors + fallback eligibility per editor kind. SACD
+    // editors derive geometry from their stashed per-area durations
+    // and enable the text-search fallback (TOC misses are common for
+    // SACD-only releases). Regular file editors derive geometry from
+    // the audio files via the same accuraterip helpers the Browse
+    // path uses, and disable the fallback (file-level TOCs are
+    // sample-exact; fallback rarely helps).
+    let (sectors, fallback_seed) = if let Some(area_kind) = state_owned.sacd_area_kind {
+        let durations = match area_kind {
+            super::sacd::AreaKind::Stereo => state_owned.sacd_stereo_durations.as_deref(),
+            super::sacd::AreaKind::MultiChannel => {
+                state_owned.sacd_multi_channel_durations.as_deref()
+            }
+        };
+        let Some(durations) = durations.filter(|d| !d.is_empty()) else {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(
+                ":tags-mb: no per-track durations for this SACD area — \
+                 ISO TRL sectors may be malformed".to_string(),
+            );
+            return Some(true);
+        };
+        let sectors = sacd_durations_to_sectors(durations);
+        let seed = seed_sacd_mb_query(&state_owned);
+        (sectors, seed)
+    } else {
+        // File editor: state.paths is the audio file set. Use the
+        // same TOC derivation the Browse path uses — first try
+        // AccurateRip-style offsets in the parent dir, fall back to
+        // per-file sample counts.
+        if state_owned.paths.is_empty() {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(":tags-mb: editor has no paths".to_string());
+            return Some(true);
+        }
+        let dir = state_owned.paths[0]
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let sectors = match super::accuraterip::find_toc_offsets(&dir) {
+            Some(s) => s,
+            None => match super::accuraterip::collect_sample_counts(&state_owned.paths) {
+                Ok((sample_counts, sample_rate)) => {
+                    let samples_per_frame = (sample_rate / 75) as u64;
+                    let mut sectors = Vec::with_capacity(sample_counts.len() + 1);
+                    let mut frame: u64 = 150;
+                    for &count in &sample_counts {
+                        sectors.push(frame as u32);
+                        frame += count / samples_per_frame;
+                    }
+                    sectors.push(frame as u32);
+                    sectors
+                }
+                Err(e) => {
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+                    app.set_status(format!(":tags-mb: {}", e));
+                    return Some(true);
+                }
+            },
+        };
+        (sectors, None)
     };
 
-    // Pick the active area's durations. `build_sacd_editor_state`
-    // populates both `sacd_stereo_durations` and
-    // `sacd_multi_channel_durations` whenever the source ISO has
-    // those areas with parseable track tables, regardless of which
-    // one the editor is surfacing.
-    let durations = match area_kind {
-        super::sacd::AreaKind::Stereo => state_owned.sacd_stereo_durations.as_deref(),
-        super::sacd::AreaKind::MultiChannel => state_owned.sacd_multi_channel_durations.as_deref(),
-    };
-    let Some(durations) = durations.filter(|d| !d.is_empty()) else {
-        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
-        app.set_status(
-            ":tags-mb: no per-track durations for this SACD area — \
-             ISO TRL sectors may be malformed".to_string(),
-        );
-        return Some(true);
-    };
-
-    let sectors = sacd_durations_to_sectors(durations);
     let Some(toc_string) = super::musicbrainz::build_mb_toc(&sectors) else {
-        // Unreachable in practice (durations non-empty above → sectors
-        // has at least 2 entries → build_mb_toc returns Some), but
-        // surface gracefully rather than panicking.
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
-        app.set_status(":tags-mb: failed to build TOC from durations".to_string());
+        app.set_status(":tags-mb: TOC too short".to_string());
         return Some(true);
     };
-    let n_tracks = durations.len();
     let paths = state_owned.paths.clone();
 
-    let cached = app.db.get_cached_mb_response(&toc_string);
-    let cache_hit = cached.is_some();
-
-    // Put the editor in `active_overlay`, NOT `pending_metadata_editor`.
+    // Editor MUST go back into active_overlay (not pending) before
+    // the spawn — see the parking-slot invariant in this function's
+    // docstring.
     app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
 
-    app.set_status(format!(
-        ":tags-mb: {} TOC ({} tracks)…",
-        if cache_hit { "cached" } else { "looking up" },
-        n_tracks,
-    ));
-
-    let tx = tx.clone();
-    let toc_for_msg = toc_string;
-    let paths_for_msg = paths;
-
-    tokio::spawn(async move {
-        let outcome = super::musicbrainz::lookup_release_by_toc(
-            &sectors, cached,
-        ).await;
-        let _ = tx.send(AppMessage::TagsFromMbTocSacdComplete {
-            outcome,
-            paths: paths_for_msg,
-            toc_string: toc_for_msg,
-        }).await;
-    });
+    spawn_tags_mb_toc_lookup(
+        app,
+        tx,
+        sectors,
+        toc_string,
+        paths,
+        /* editor_park */ true,
+        fallback_seed,
+    );
 
     Some(true)
 }
