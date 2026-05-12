@@ -861,18 +861,24 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         AppMessage::TagsFromMbComplete { outcome, paths, toc_string } => {
             handle_tags_from_mb_complete(app, tx, outcome, paths, toc_string);
         }
-        AppMessage::MbDetailPrefetchComplete { release_id, generation: _, result } => {
-            // Stamp the cache if the picker is still open. The
-            // pre-HTTP atomic check (in spawn_mb_detail_prefetch) is
-            // what prevents wasted MB tokens during rapid navigation;
-            // by the time a response reaches this handler we've
-            // already paid for it, so cache it regardless of whether
-            // the user has since moved cursor — the cache is keyed by
-            // MBID and will be useful if they navigate back. Errors
-            // and `Ok(None)` are silent (best-effort prefetch).
-            if let ActiveOverlay::MbSelect(ref mut state) = app.active_overlay {
-                if let Ok(Some(release)) = result {
-                    state.prefetch.insert(release_id, release);
+        AppMessage::MbDetailPrefetchComplete { release_id, result } => {
+            // Stamp the in-memory cache if the picker is still open,
+            // and persist the raw body to SQLite (Phase B-5) so future
+            // sessions skip the HTTP call. Cache-writes happen even
+            // when the picker has been dismissed — the response was
+            // already paid for and a re-open will benefit. Errors and
+            // `release: None` (HTTP 404) are silent (best-effort
+            // prefetch).
+            if let Ok(outcome) = result {
+                if let Some((key, body)) = outcome.cache_write {
+                    if let Err(e) = app.db.store_mb_search(&key, &body) {
+                        log::warn!("mb search cache store failed: {}", e);
+                    }
+                }
+                if let Some(release) = outcome.release {
+                    if let ActiveOverlay::MbSelect(ref mut state) = app.active_overlay {
+                        state.prefetch.insert(release_id, release);
+                    }
                 }
             }
         }
@@ -1303,12 +1309,16 @@ fn handle_tags_from_mb_complete(
             // the spawned task sees a match unless the user has already
             // moved before the 150 ms debounce elapses.
             if let Some(top) = state.releases.first() {
+                let cached_body = app.db.get_cached_mb_search(
+                    &super::musicbrainz::detail_cache_key(&top.release_id),
+                );
                 spawn_mb_detail_prefetch(
                     tx.clone(),
                     top.release_id.clone(),
                     state.paths.len(),
                     std::sync::Arc::clone(&state.generation),
                     state.generation.load(std::sync::atomic::Ordering::Relaxed),
+                    cached_body,
                 );
             }
             app.active_overlay = ActiveOverlay::MbSelect(Box::new(state));
@@ -1320,9 +1330,17 @@ fn handle_tags_from_mb_complete(
 /// sleeps for the debounce window (150 ms), re-checks the picker's
 /// generation atomic — bailing out if the user has moved cursor — and
 /// only then fires `fetch_release_detail` and the rate-limited MB
-/// request. Result is delivered via `AppMessage::MbDetailPrefetchComplete`
-/// which the event-loop handler stamps onto `MbSelectState.prefetch` if
-/// the generation still matches at delivery time.
+/// request. Result is delivered via `AppMessage::MbDetailPrefetchComplete`;
+/// the handler stamps onto `MbSelectState.prefetch` and persists the
+/// raw response to SQLite (Phase B-5).
+///
+/// When `cached_body` is `Some`, the SQLite cache (Phase B-5) already
+/// has this MBID and we skip both the debounce sleep and any HTTP
+/// call — the parse happens immediately and the message fires on the
+/// next runtime tick. The generation check is skipped on the cached
+/// path too: a "stale" cache hit can't waste an MB token, and the
+/// handler always stamps `state.prefetch` regardless, so a hit that
+/// lands after the user moved still benefits a later re-cursor.
 ///
 /// Pass `release_id` empty to skip — callers shouldn't generally do
 /// this but the guard is cheap.
@@ -1332,22 +1350,27 @@ pub(super) fn spawn_mb_detail_prefetch(
     n_tracks: usize,
     generation_arc: std::sync::Arc<std::sync::atomic::AtomicU64>,
     snapshot: u64,
+    cached_body: Option<String>,
 ) {
     if release_id.is_empty() {
         return;
     }
+    let has_cache = cached_body.is_some();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        if generation_arc.load(std::sync::atomic::Ordering::Relaxed) != snapshot {
-            // User moved cursor during the debounce window. Drop the
-            // request before consuming an MB rate-limit token.
-            return;
+        if !has_cache {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            if generation_arc.load(std::sync::atomic::Ordering::Relaxed) != snapshot {
+                // User moved cursor during the debounce window. Drop the
+                // request before consuming an MB rate-limit token.
+                return;
+            }
         }
-        let result = super::musicbrainz::fetch_release_detail(&release_id, n_tracks).await;
+        let result = super::musicbrainz::fetch_release_detail(
+            &release_id, n_tracks, cached_body,
+        ).await;
         let _ = tx
             .send(crate::tui::message::AppMessage::MbDetailPrefetchComplete {
                 release_id,
-                generation: snapshot,
                 result,
             })
             .await;

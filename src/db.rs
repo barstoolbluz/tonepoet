@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 18;
+const CURRENT_VERSION: u32 = 19;
 
 // ── CTDB parity matrix cache tunables ─────────────────────────────────
 //
@@ -30,6 +30,14 @@ const MB_CACHE_MAX_ROWS: usize = 5000;
 const MB_CACHE_EVICT_THRESHOLD: usize = (MB_CACHE_MAX_ROWS * 110) / 100;
 const MB_CACHE_EVICT_TARGET: usize = (MB_CACHE_MAX_ROWS * 90) / 100;
 const MB_CACHE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
+// MusicBrainz text-search + release-detail cache (Phase B-5). Keys are
+// canonical query strings produced by the musicbrainz module
+// (`search_cache_key` / `detail_cache_key`). Same shape and TTL as the
+// TOC cache; separate table so eviction policies stay independent.
+const MB_SEARCH_CACHE_MAX_ROWS: usize = 5000;
+const MB_SEARCH_CACHE_EVICT_THRESHOLD: usize = (MB_SEARCH_CACHE_MAX_ROWS * 110) / 100;
+const MB_SEARCH_CACHE_EVICT_TARGET: usize = (MB_SEARCH_CACHE_MAX_ROWS * 90) / 100;
 
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
@@ -139,6 +147,9 @@ impl Database {
         }
         if version < 18 {
             self.migrate_v18()?;
+        }
+        if version < 19 {
+            self.migrate_v19()?;
         }
 
         self.conn
@@ -549,6 +560,24 @@ impl Database {
         Ok(())
     }
 
+    /// v19 (Phase B-5): MusicBrainz text-search + release-detail cache.
+    /// Distinct from the TOC cache so the two namespaces evict independently
+    /// — text search rows churn faster than TOC rows since the same disc
+    /// can produce many search-query keys but only one TOC.
+    fn migrate_v19(&mut self) -> Result<(), String> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS musicbrainz_search_cache (
+                cache_key TEXT PRIMARY KEY,
+                response_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                accessed_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mb_search_accessed
+                ON musicbrainz_search_cache (accessed_at);
+        ").map_err(|e| format!("v19 migration failed: {}", e))?;
+        Ok(())
+    }
+
     // ── AccurateRip cache ───────────────────────────────────────
 
     /// Look up cached AR results for a file. Returns None if not cached
@@ -789,6 +818,78 @@ impl Database {
                  )",
                 params![to_remove as i64],
             ).map_err(|e| format!("mb cache evict: {}", e))?;
+        }
+        Ok(())
+    }
+
+    // ── MusicBrainz search + release-detail cache (Phase B-5) ────
+
+    /// Look up a cached MusicBrainz body by canonical query key. Returns
+    /// the raw JSON on hit. Returns `None` on miss or when the entry is
+    /// older than the 30-day TTL (shared with the TOC cache). Touches
+    /// `accessed_at` on hit (LRU).
+    ///
+    /// Keys are produced by `musicbrainz::search_cache_key` (text search)
+    /// or `musicbrainz::detail_cache_key` (release detail); both share
+    /// this table to keep eviction simple.
+    pub fn get_cached_mb_search(&self, cache_key: &str) -> Option<String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT response_json, fetched_at FROM musicbrainz_search_cache
+             WHERE cache_key = ?1"
+        ).ok()?;
+
+        let row: Option<(String, String)> = stmt.query_row(
+            params![cache_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).ok();
+        let (json, fetched_at) = row?;
+
+        // TTL check shared with TOC cache (30 days). Drop stale rows.
+        if let Ok(fetched) = chrono::DateTime::parse_from_rfc3339(&fetched_at) {
+            let age = chrono::Utc::now().signed_duration_since(fetched.with_timezone(&chrono::Utc));
+            if age.num_seconds() > MB_CACHE_TTL_SECS {
+                return None;
+            }
+        } else {
+            return None;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE musicbrainz_search_cache SET accessed_at = ?1 WHERE cache_key = ?2",
+            params![now, cache_key],
+        );
+        Some(json)
+    }
+
+    /// Store a MusicBrainz response under the canonical query key.
+    /// Triggers LRU eviction when row count exceeds the threshold.
+    pub fn store_mb_search(&self, cache_key: &str, response_json: &str) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO musicbrainz_search_cache
+                 (cache_key, response_json, fetched_at, accessed_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![cache_key, response_json, now],
+        ).map_err(|e| format!("mb search cache store: {}", e))?;
+
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM musicbrainz_search_cache",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| format!("mb search cache count: {}", e))?;
+
+        if (count as usize) > MB_SEARCH_CACHE_EVICT_THRESHOLD {
+            let to_remove = (count as usize) - MB_SEARCH_CACHE_EVICT_TARGET;
+            self.conn.execute(
+                "DELETE FROM musicbrainz_search_cache
+                 WHERE rowid IN (
+                     SELECT rowid FROM musicbrainz_search_cache
+                     ORDER BY accessed_at ASC
+                     LIMIT ?1
+                 )",
+                params![to_remove as i64],
+            ).map_err(|e| format!("mb search cache evict: {}", e))?;
         }
         Ok(())
     }

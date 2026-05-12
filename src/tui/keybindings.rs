@@ -1790,22 +1790,22 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
                 KeyCode::Up => {
                     state.selected = state.selected.saturating_sub(1);
-                    prefetch_current_mb_row(tx, &state);
+                    prefetch_current_mb_row(tx, &state, &app.db);
                     app.active_overlay = ActiveOverlay::MbSelect(state);
                 }
                 KeyCode::Down => {
                     state.selected = (state.selected + 1).min(n.saturating_sub(1));
-                    prefetch_current_mb_row(tx, &state);
+                    prefetch_current_mb_row(tx, &state, &app.db);
                     app.active_overlay = ActiveOverlay::MbSelect(state);
                 }
                 KeyCode::PageUp => {
                     state.selected = state.selected.saturating_sub(10);
-                    prefetch_current_mb_row(tx, &state);
+                    prefetch_current_mb_row(tx, &state, &app.db);
                     app.active_overlay = ActiveOverlay::MbSelect(state);
                 }
                 KeyCode::PageDown => {
                     state.selected = (state.selected + 10).min(n.saturating_sub(1));
-                    prefetch_current_mb_row(tx, &state);
+                    prefetch_current_mb_row(tx, &state, &app.db);
                     app.active_overlay = ActiveOverlay::MbSelect(state);
                 }
                 _ => {
@@ -2113,6 +2113,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
 fn prefetch_current_mb_row(
     tx: &mpsc::Sender<AppMessage>,
     state: &crate::tui::app::MbSelectState,
+    db: &crate::db::Database,
 ) {
     // Always bump generation on navigation so any in-flight prefetch
     // for a no-longer-current row sees the mismatch and exits. The
@@ -2126,12 +2127,16 @@ fn prefetch_current_mb_row(
     if row.release_id.is_empty() || state.prefetch.contains_key(&row.release_id) {
         return;
     }
+    let cached_body = db.get_cached_mb_search(
+        &super::musicbrainz::detail_cache_key(&row.release_id),
+    );
     super::event_loop::spawn_mb_detail_prefetch(
         tx.clone(),
         row.release_id.clone(),
         state.paths.len(),
         std::sync::Arc::clone(&state.generation),
         snapshot,
+        cached_body,
     );
 }
 
@@ -5449,13 +5454,13 @@ fn handle_mb_select_mouse(
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             state.selected = state.selected.saturating_sub(1);
-            prefetch_current_mb_row(tx, &state);
+            prefetch_current_mb_row(tx, &state, &app.db);
             app.active_overlay = ActiveOverlay::MbSelect(state);
         }
         MouseEventKind::ScrollDown => {
             let n = state.releases.len();
             state.selected = (state.selected + 1).min(n.saturating_sub(1));
-            prefetch_current_mb_row(tx, &state);
+            prefetch_current_mb_row(tx, &state, &app.db);
             app.active_overlay = ActiveOverlay::MbSelect(state);
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -5493,7 +5498,7 @@ fn handle_mb_select_mouse(
                             return;
                         }
                         state.last_click = Some((idx, now));
-                        prefetch_current_mb_row(tx, &state);
+                        prefetch_current_mb_row(tx, &state, &app.db);
                         app.active_overlay = ActiveOverlay::MbSelect(state);
                     } else {
                         app.active_overlay = ActiveOverlay::MbSelect(state);
@@ -5518,7 +5523,7 @@ fn handle_mb_select_mouse(
                     // Fire a prefetch for the just-selected row so the
                     // tracks pane is ready if the user closes the
                     // context menu and lands back on the picker.
-                    prefetch_current_mb_row(tx, &state);
+                    prefetch_current_mb_row(tx, &state, &app.db);
                 }
             }
             if in_popup {

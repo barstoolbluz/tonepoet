@@ -339,7 +339,8 @@ pub async fn search_releases_by_query(
     catalog: Option<&str>,
     year: Option<&str>,
     n_tracks: usize,
-) -> Result<Vec<MbRelease>, String> {
+    cached: std::collections::HashMap<String, String>,
+) -> Result<MbSearchOutcome, String> {
     let with_catno = build_search_query(artist, album, catalog, year);
     if with_catno.is_empty() {
         return Err("search requires at least one of artist/album/catalog/year".to_string());
@@ -351,9 +352,10 @@ pub async fn search_releases_by_query(
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let first = fire_search(&client, &with_catno, n_tracks).await?;
+    let mut writes: Vec<(String, String)> = Vec::new();
+    let first = fire_search_cached(&client, &with_catno, n_tracks, &cached, &mut writes).await?;
     if !first.is_empty() || catalog.is_none() {
-        return Ok(first);
+        return Ok(MbSearchOutcome { releases: first, cache_writes: writes });
     }
 
     // Catalog-first miss: retry without the catno clause. Covers
@@ -362,9 +364,50 @@ pub async fn search_releases_by_query(
     // pressing — see project_mb_on_sacd_plan.md.
     let without_catno = build_search_query(artist, album, None, year);
     if without_catno == with_catno {
-        return Ok(first);
+        return Ok(MbSearchOutcome { releases: first, cache_writes: writes });
     }
-    fire_search(&client, &without_catno, n_tracks).await
+    let second = fire_search_cached(&client, &without_catno, n_tracks, &cached, &mut writes).await?;
+    Ok(MbSearchOutcome { releases: second, cache_writes: writes })
+}
+
+/// Outcome of a Phase B-2 text/release search. `releases` is the parsed
+/// shallow result list (use `fetch_release_detail` for per-track data).
+/// `cache_writes` contains `(cache_key, response_json)` pairs the caller
+/// should persist via `Database::store_mb_search`. May be empty when all
+/// branches hit the in-memory `cached` map.
+#[derive(Debug, Clone)]
+pub struct MbSearchOutcome {
+    pub releases: Vec<MbRelease>,
+    pub cache_writes: Vec<(String, String)>,
+}
+
+/// Canonical cache key for a text/release search. Mirrors
+/// `build_search_query` so two callers building the same query share
+/// the cache row. Versioned (`search:v1:`) so future schema tweaks can
+/// invalidate cleanly.
+pub fn search_cache_key(
+    artist: &str,
+    album: &str,
+    catalog: Option<&str>,
+    year: Option<&str>,
+) -> String {
+    format!("search:v1:{}", build_search_query(artist, album, catalog, year))
+}
+
+async fn fire_search_cached(
+    client: &reqwest::Client,
+    query: &str,
+    n_tracks: usize,
+    cached: &std::collections::HashMap<String, String>,
+    writes: &mut Vec<(String, String)>,
+) -> Result<Vec<MbRelease>, String> {
+    let key = format!("search:v1:{}", query);
+    if let Some(body) = cached.get(&key) {
+        return parse_mb_response_all(body, n_tracks);
+    }
+    let (releases, body) = fire_search(client, query, n_tracks).await?;
+    writes.push((key, body));
+    Ok(releases)
 }
 
 fn build_search_query(
@@ -393,7 +436,7 @@ async fn fire_search(
     client: &reqwest::Client,
     query: &str,
     n_tracks: usize,
-) -> Result<Vec<MbRelease>, String> {
+) -> Result<(Vec<MbRelease>, String), String> {
     mb_acquire().await;
 
     let resp = client
@@ -410,13 +453,14 @@ async fn fire_search(
         .map_err(|e| format!("MusicBrainz response error: {}", e))?;
 
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), body));
     }
     if !status.is_success() {
         return Err(format!("MusicBrainz returned HTTP {}", status));
     }
 
-    parse_mb_response_all(&body, n_tracks)
+    let releases = parse_mb_response_all(&body, n_tracks)?;
+    Ok((releases, body))
 }
 
 /// Fetch a single MusicBrainz release by MBID with full sub-entity
@@ -441,9 +485,18 @@ async fn fire_search(
 pub async fn fetch_release_detail(
     mbid: &str,
     n_tracks: usize,
-) -> Result<Option<MbRelease>, String> {
+    cached_body: Option<String>,
+) -> Result<MbDetailOutcome, String> {
     if mbid.is_empty() {
         return Err("fetch_release_detail requires a non-empty MBID".to_string());
+    }
+
+    if let Some(body) = cached_body {
+        // Cache hit: skip the rate-limited HTTP call entirely.
+        return Ok(MbDetailOutcome {
+            release: Some(parse_mb_detail_response(&body, n_tracks)?),
+            cache_write: None,
+        });
     }
 
     let client = reqwest::Client::builder()
@@ -476,13 +529,36 @@ pub async fn fetch_release_detail(
         .map_err(|e| format!("MusicBrainz response error: {}", e))?;
 
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+        return Ok(MbDetailOutcome { release: None, cache_write: None });
     }
     if !status.is_success() {
         return Err(format!("MusicBrainz returned HTTP {}", status));
     }
 
-    parse_mb_detail_response(&body, n_tracks).map(Some)
+    let release = parse_mb_detail_response(&body, n_tracks)?;
+    let key = detail_cache_key(mbid);
+    Ok(MbDetailOutcome {
+        release: Some(release),
+        cache_write: Some((key, body)),
+    })
+}
+
+/// Outcome of a Phase B-3 release-detail fetch. `release` is `None`
+/// when MB returned 404 for the MBID. `cache_write` carries the
+/// `(cache_key, response_json)` the caller should persist via
+/// `Database::store_mb_search`; `None` when the call was served from
+/// the in-memory cache or returned 404.
+#[derive(Debug, Clone)]
+pub struct MbDetailOutcome {
+    pub release: Option<MbRelease>,
+    pub cache_write: Option<(String, String)>,
+}
+
+/// Canonical cache key for a release-detail body. Shares the
+/// `musicbrainz_search_cache` table with text-search bodies; the
+/// `detail:v1:` prefix prevents collision with `search:v1:` rows.
+pub fn detail_cache_key(mbid: &str) -> String {
+    format!("detail:v1:{}", mbid)
 }
 
 /// Parse a top-level MusicBrainz release object (detail endpoint).
@@ -1700,6 +1776,82 @@ mod tests {
         assert!(db.get_cached_mb_response(toc).is_none());
         db.store_mb_response(toc, body).unwrap();
         assert_eq!(db.get_cached_mb_response(toc).as_deref(), Some(body));
+    }
+
+    #[test]
+    fn mb_search_cache_round_trip() {
+        let db = crate::db::Database::open_memory().expect("open memory db");
+        let key = search_cache_key("Thelonious Monk", "Solo Monk", Some("SRGS 4520"), None);
+        let body = r#"{"releases":[{"id":"x","title":"Solo Monk","media":[]}]}"#;
+        assert!(db.get_cached_mb_search(&key).is_none());
+        db.store_mb_search(&key, body).unwrap();
+        assert_eq!(db.get_cached_mb_search(&key).as_deref(), Some(body));
+    }
+
+    #[test]
+    fn mb_search_cache_namespaced_from_toc() {
+        // Same string used as both a TOC entry and a search-cache entry
+        // must not collide — the tables are separate.
+        let db = crate::db::Database::open_memory().expect("open memory db");
+        let s = "shared-string";
+        db.store_mb_response(s, "toc-body").unwrap();
+        assert!(db.get_cached_mb_search(s).is_none());
+        db.store_mb_search(s, "search-body").unwrap();
+        assert_eq!(db.get_cached_mb_response(s).as_deref(), Some("toc-body"));
+        assert_eq!(db.get_cached_mb_search(s).as_deref(), Some("search-body"));
+    }
+
+    #[test]
+    fn search_cache_key_is_canonical() {
+        // Identical inputs collide on key (cache hit); differing
+        // catalog produces a distinct key.
+        let a = search_cache_key("Miles Davis", "Kind of Blue", None, Some("1959"));
+        let b = search_cache_key("Miles Davis", "Kind of Blue", None, Some("1959"));
+        assert_eq!(a, b);
+        let with_catno = search_cache_key("Miles Davis", "Kind of Blue", Some("CL 1355"), Some("1959"));
+        assert_ne!(a, with_catno);
+        assert!(a.starts_with("search:v1:"));
+    }
+
+    #[test]
+    fn detail_cache_key_namespaced() {
+        // Detail keys must not collide with search keys even if the
+        // search-query string happens to equal the MBID.
+        let mbid = "abc-123";
+        let detail = detail_cache_key(mbid);
+        let search = search_cache_key(mbid, "", None, None);
+        assert_ne!(detail, search);
+        assert!(detail.starts_with("detail:v1:"));
+    }
+
+    #[tokio::test]
+    async fn fetch_release_detail_short_circuits_on_cached_body() {
+        // Pass a cached body — no HTTP / rate limiter touched.
+        // (If the function were to fall through to the network path,
+        // this test would either hang on the rate limiter or fail on
+        // DNS depending on the environment.)
+        let body = r#"{
+            "id": "abc-123", "title": "Album",
+            "artist-credit": [{ "artist": { "id": "art-1", "name": "Artist" } }],
+            "media": [{
+                "track-count": 1,
+                "tracks": [{ "position": 1, "title": "T1", "length": 200000 }]
+            }]
+        }"#;
+        let out = fetch_release_detail("abc-123", 1, Some(body.to_string()))
+            .await
+            .expect("cached body should parse");
+        let r = out.release.expect("release present on cache hit");
+        assert_eq!(r.release_id, "abc-123");
+        assert_eq!(r.tracks.len(), 1);
+        // Cache hit produces no cache_write (we already had it).
+        assert!(out.cache_write.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_release_detail_empty_mbid_errors() {
+        // Sanity: empty MBID rejected before any cache check.
+        assert!(fetch_release_detail("", 0, None).await.is_err());
     }
 
     #[test]

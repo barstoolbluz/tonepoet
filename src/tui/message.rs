@@ -170,13 +170,15 @@ pub enum AppMessage {
     },
     /// Result of an MbSelect prefetch: the detail fetch
     /// (`/ws/2/release/{mbid}?inc=…`) for a candidate currently visible
-    /// in the picker. `generation` matches the value of
-    /// `MbSelectState.generation` at spawn time; the handler discards
-    /// the result when generation has advanced (user moved cursor).
+    /// in the picker. Generation-based cancellation happens *before*
+    /// HTTP fire in `spawn_mb_detail_prefetch`; by the time a response
+    /// reaches this handler we've already paid for it, so the handler
+    /// always stamps the in-memory `prefetch` map (cache benefits a
+    /// later re-open) and persists the raw body into the SQLite
+    /// `musicbrainz_search_cache` (Phase B-5).
     MbDetailPrefetchComplete {
         release_id: String,
-        generation: u64,
-        result: Result<Option<crate::tui::musicbrainz::MbRelease>, String>,
+        result: Result<crate::tui::musicbrainz::MbDetailOutcome, String>,
     },
 }
 
