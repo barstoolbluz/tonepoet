@@ -3528,6 +3528,8 @@ mod tests {
             read_only: false,
             sacd_sidecar_path: None,
             sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         }
     }
 

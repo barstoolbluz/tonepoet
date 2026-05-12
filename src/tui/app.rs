@@ -1060,6 +1060,18 @@ pub struct MetadataEditorState {
     /// surfacing, so the save path knows which sidecar track IDs
     /// to update (`Stereo` → area 1, `MultiChannel` → area 2).
     pub sacd_area_kind: Option<crate::tui::sacd::AreaKind>,
+    /// SACD-only: per-track durations (seconds) for the stereo area,
+    /// stashed at editor-open time so `:tags-mb` can synthesize a
+    /// CD-equivalent TOC for MusicBrainz disc-id lookup without
+    /// re-reading the ISO. `None` when the disc has no stereo area
+    /// or its TRL1/TRL2 sectors failed to parse.
+    pub sacd_stereo_durations: Option<Vec<f64>>,
+    /// SACD-only: same as `sacd_stereo_durations` for the
+    /// multi-channel area. `None` when absent or unparseable.
+    /// Both fields are populated regardless of which area the
+    /// editor is currently surfacing — the sibling-area mirror
+    /// (future C-2c) needs both available.
+    pub sacd_multi_channel_durations: Option<Vec<f64>>,
 }
 
 /// State cached on `MetadataEditorState::mb_back` to support the

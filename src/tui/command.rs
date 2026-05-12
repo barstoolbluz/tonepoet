@@ -1730,6 +1730,18 @@ pub fn execute_command(
             ));
         }
         Command::TagsFromMb => {
+            // Phase C-2: SACD editor dispatch. If the user is currently
+            // in a SACD metadata editor (either active or parked from
+            // a prior overlay step), seed a text/release search from the
+            // editor's ARTIST/ALBUM/CATALOGNUMBER/DATE rather than
+            // running the TOC-based audio-file path. Falls through to
+            // the existing file path when no SACD editor is in scope.
+            if let Some(dispatched) = try_dispatch_sacd_tags_mb(app, tx) {
+                if dispatched {
+                    return;
+                }
+            }
+
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
                 AppScreen::Browse => {
                     let sel = collect_selection_for_file_ops(app);
@@ -1744,7 +1756,29 @@ pub fn execute_command(
                 _ => Vec::new(),
             };
             if paths.is_empty() {
-                app.set_status(":tags-mb: no audio files in selection");
+                // SACD ISOs are stripped by the AudioFile filter
+                // (they're not classified as audio files). When the
+                // user lands here with a `.iso` in their selection,
+                // they're almost certainly trying to MB-tag a SACD —
+                // surface the editor-first workflow hint rather than
+                // the generic "no audio files" message.
+                //
+                // Pre-existing Browse → SACD-ISO direct dispatch is
+                // a future phase (C-2d); for now the hint sends the
+                // user to the correct entry point.
+                let sel = collect_selection_for_file_ops(app);
+                let has_iso = sel.iter().any(|p| {
+                    p.extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
+                });
+                if has_iso {
+                    app.set_status(
+                        ":tags-mb: SACD ISO selected — open it in the metadata \
+                         editor first (Enter / right-click → Edit Metadata)",
+                    );
+                } else {
+                    app.set_status(":tags-mb: no audio files in selection");
+                }
                 return;
             }
             super::probe::sort_paths_by_track(&mut paths);
@@ -3393,6 +3427,198 @@ pub(super) fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Phase C-2 seed values for `search_releases_by_query` extracted
+/// from a SACD metadata editor's current state. Per-track rows
+/// with mixed values are skipped — MB's Lucene query has no notion
+/// of "or these track-level values", so a divergent ARTIST column
+/// can't seed a useful album-level search. `ALBUMARTIST` is the
+/// canonical album-level row and is preferred over `ARTIST` when
+/// both are present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SacdMbSeed {
+    pub artist: String,
+    pub album: String,
+    pub catalog: Option<String>,
+    pub year: Option<String>,
+}
+
+/// Extract a search-query seed from the editor's current entries.
+/// Returns `None` when none of ARTIST/ALBUMARTIST/ALBUM/CATALOGNUMBER/
+/// DATE yields a usable value (all empty or all mixed). MB's text
+/// search can be partial — having only an album title still produces
+/// results — so any single non-empty term is enough.
+pub(super) fn seed_sacd_mb_query(
+    state: &super::app::MetadataEditorState,
+) -> Option<SacdMbSeed> {
+    let entry_value = |k: &str| -> Option<String> {
+        state
+            .entries
+            .iter()
+            .find(|e| e.display_key == k)
+            .map(|e| e.value.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "<multiple values>")
+    };
+    let artist = entry_value("ALBUMARTIST")
+        .or_else(|| entry_value("ARTIST"))
+        .unwrap_or_default();
+    let album = entry_value("ALBUM").unwrap_or_default();
+    let catalog = entry_value("CATALOGNUMBER");
+    // DATE on SACDs is a year string like "1959"; MB's `date:`
+    // Lucene term accepts that form directly so no further parsing.
+    let year = entry_value("DATE");
+
+    if artist.is_empty() && album.is_empty() && catalog.is_none() && year.is_none() {
+        return None;
+    }
+    Some(SacdMbSeed { artist, album, catalog, year })
+}
+
+/// Convert per-track SACD durations (seconds) to a sector vector
+/// in the shape `lookup_release_by_toc` and `build_mb_toc` expect:
+/// `[off1, off2, …, offN, leadout]`, where `off1 = 150` (the standard
+/// 2-second CD pre-gap) and each subsequent offset is the prior plus
+/// the prior track's length in CD frames (75 fps).
+///
+/// SACD `PlayTime` uses CD-style 75 fps natively, so the conversion
+/// `(seconds * 75.0).round() as u32` matches MB's expected geometry
+/// directly — no DSD-frame complication. `saturating_add` guards
+/// against arithmetic overflow on pathological inputs (a 24-hour
+/// compilation is ~6.5M frames, well within u32, so this is purely
+/// defensive).
+pub(super) fn sacd_durations_to_sectors(durations: &[f64]) -> Vec<u32> {
+    let mut sectors = Vec::with_capacity(durations.len() + 1);
+    let mut cur: u32 = 150;
+    sectors.push(cur);
+    for &d in durations {
+        let frames = (d * 75.0).round().max(0.0) as u32;
+        cur = cur.saturating_add(frames);
+        sectors.push(cur);
+    }
+    sectors
+}
+
+/// Phase C-2a: dispatch `:tags-mb` to the **TOC** path when the
+/// active or parked metadata editor is editing a SACD ISO. Returns
+/// `Some(true)` when the dispatch fired (caller short-circuits),
+/// `None` when no editor is in scope at all (caller falls through
+/// to the Browse path).
+///
+/// Builds a CD-equivalent TOC string from the active area's per-track
+/// durations (stashed on the editor at open time) and hands it to
+/// `lookup_release_by_toc` — same endpoint and parser the audio-file
+/// `:tags-mb` flow already uses. The TOC path matches releases by
+/// disc geometry (track count + offsets within fuzzy tolerance), so
+/// ScarletBook metadata junk (`[ISO]`, `(SME JSACD …)`, etc.) doesn't
+/// matter — we never read ARTIST/ALBUM/CATNO/DATE for the primary
+/// lookup.
+///
+/// **Zero-match fallback** (C-2b) is handled in the result handler
+/// (`handle_tags_from_mb_toc_sacd_complete`), not here: when the TOC
+/// returns no releases, that handler spawns a text-search via
+/// `seed_sacd_mb_query` + `search_releases_by_query`. Network errors
+/// do NOT trigger fallback — they surface so the user can retry.
+///
+/// **Parking-slot invariant** (unchanged from the prior text-only
+/// version): the editor must be left in `active_overlay`, never in
+/// `pending_metadata_editor`, before this returns. The CommandInput
+/// Enter and ContextMenu wrappers auto-restore `pending → active`
+/// only when `active == None`, so leaving the editor parked would
+/// cause it to be drained before our async result arrives.
+fn try_dispatch_sacd_tags_mb(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+) -> Option<bool> {
+    use super::app::ActiveOverlay;
+
+    let state_owned: Box<super::app::MetadataEditorState> =
+        if let Some(parked) = app.pending_metadata_editor.take() {
+            parked
+        } else if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
+            let prev = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            if let ActiveOverlay::MetadataEditor(s) = prev {
+                s
+            } else {
+                unreachable!()
+            }
+        } else {
+            // No editor in scope — fall through to the Browse path.
+            return None;
+        };
+
+    let Some(area_kind) = state_owned.sacd_area_kind else {
+        // Editor is open on a file, not a SACD ISO. The Browse-path
+        // audio-file `:tags-mb` flow needs a selection of audio files;
+        // we're inside an open editor instead. Surface a clear message
+        // rather than letting the Browse fall-through report "no
+        // audio files in selection," which is misleading here.
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        app.set_status(
+            ":tags-mb: from inside a file editor — close it and run from Browse, \
+             or open a SACD ISO".to_string(),
+        );
+        return Some(true);
+    };
+
+    // Pick the active area's durations. `build_sacd_editor_state`
+    // populates both `sacd_stereo_durations` and
+    // `sacd_multi_channel_durations` whenever the source ISO has
+    // those areas with parseable track tables, regardless of which
+    // one the editor is surfacing.
+    let durations = match area_kind {
+        super::sacd::AreaKind::Stereo => state_owned.sacd_stereo_durations.as_deref(),
+        super::sacd::AreaKind::MultiChannel => state_owned.sacd_multi_channel_durations.as_deref(),
+    };
+    let Some(durations) = durations.filter(|d| !d.is_empty()) else {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        app.set_status(
+            ":tags-mb: no per-track durations for this SACD area — \
+             ISO TRL sectors may be malformed".to_string(),
+        );
+        return Some(true);
+    };
+
+    let sectors = sacd_durations_to_sectors(durations);
+    let Some(toc_string) = super::musicbrainz::build_mb_toc(&sectors) else {
+        // Unreachable in practice (durations non-empty above → sectors
+        // has at least 2 entries → build_mb_toc returns Some), but
+        // surface gracefully rather than panicking.
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        app.set_status(":tags-mb: failed to build TOC from durations".to_string());
+        return Some(true);
+    };
+    let n_tracks = durations.len();
+    let paths = state_owned.paths.clone();
+
+    let cached = app.db.get_cached_mb_response(&toc_string);
+    let cache_hit = cached.is_some();
+
+    // Put the editor in `active_overlay`, NOT `pending_metadata_editor`.
+    app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+
+    app.set_status(format!(
+        ":tags-mb: {} TOC ({} tracks)…",
+        if cache_hit { "cached" } else { "looking up" },
+        n_tracks,
+    ));
+
+    let tx = tx.clone();
+    let toc_for_msg = toc_string;
+    let paths_for_msg = paths;
+
+    tokio::spawn(async move {
+        let outcome = super::musicbrainz::lookup_release_by_toc(
+            &sectors, cached,
+        ).await;
+        let _ = tx.send(AppMessage::TagsFromMbTocSacdComplete {
+            outcome,
+            paths: paths_for_msg,
+            toc_string: toc_for_msg,
+        }).await;
+    });
+
+    Some(true)
+}
+
 /// Public entry point for metadata editing from context_menu.rs.
 pub fn execute_edit_metadata_pub(app: &mut AppState, field: crate::tui::probe::MetadataField) {
     execute_edit_metadata(app, field);
@@ -3990,6 +4216,209 @@ mod completion_tests {
 
         cycle_completion(&mut input, &mut state, -1);
         assert_eq!(input.text, "a");
+    }
+}
+
+#[cfg(test)]
+mod sacd_seed_tests {
+    use super::*;
+    use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+    use crate::tui::probe::TagEntry;
+
+    fn editor_with(entries: Vec<(&str, &str, bool)>) -> MetadataEditorState {
+        // Each entry: (display_key, value, is_mixed). per_file_values
+        // shape doesn't matter for seed extraction — it only reads
+        // `value` and `is_mixed`/empty checks via `value`.
+        use lofty::tag::ItemKey;
+        let entries: Vec<TagEntry> = entries.into_iter().map(|(k, v, mixed)| TagEntry {
+            display_key: k.to_string(),
+            item_key: ItemKey::Unknown(k.to_string()),
+            value: v.to_string(),
+            original: String::new(),
+            is_binary: false,
+            is_mixed: mixed,
+            per_file_values: vec![v.to_string()],
+            per_file_originals: vec![v.to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }).collect();
+        MetadataEditorState {
+            paths: vec![std::path::PathBuf::from("/tmp/x.iso")],
+            entries,
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false, deleted: Vec::new(),
+            file_labels: vec!["01".to_string()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
+            mb_back: None, gnudb_back: None, read_only: false,
+            sacd_sidecar_path: None, sacd_area_kind: None,
+            sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+        }
+    }
+
+    #[test]
+    fn seed_returns_none_when_all_fields_empty() {
+        let state = editor_with(vec![]);
+        assert!(seed_sacd_mb_query(&state).is_none());
+    }
+
+    #[test]
+    fn seed_returns_none_when_only_other_keys_present() {
+        // TITLE / TRACKNUMBER aren't seed candidates.
+        let state = editor_with(vec![
+            ("TITLE", "Some Title", false),
+            ("TRACKNUMBER", "01", false),
+        ]);
+        assert!(seed_sacd_mb_query(&state).is_none());
+    }
+
+    #[test]
+    fn seed_prefers_albumartist_over_artist() {
+        let state = editor_with(vec![
+            ("ALBUMARTIST", "Miles Davis", false),
+            ("ARTIST", "Miles Davis Sextet", false),
+            ("ALBUM", "Kind of Blue", false),
+        ]);
+        let seed = seed_sacd_mb_query(&state).expect("seed");
+        assert_eq!(seed.artist, "Miles Davis");
+        assert_eq!(seed.album, "Kind of Blue");
+        assert_eq!(seed.catalog, None);
+        assert_eq!(seed.year, None);
+    }
+
+    #[test]
+    fn seed_falls_back_to_artist_when_albumartist_missing() {
+        let state = editor_with(vec![
+            ("ARTIST", "Thelonious Monk", false),
+            ("ALBUM", "Solo Monk", false),
+        ]);
+        let seed = seed_sacd_mb_query(&state).expect("seed");
+        assert_eq!(seed.artist, "Thelonious Monk");
+    }
+
+    #[test]
+    fn seed_skips_mixed_per_track_artist() {
+        // ARTIST is per-track and divergent → can't seed an
+        // album-level query; ALBUMARTIST missing → artist empty.
+        let state = editor_with(vec![
+            ("ARTIST", "<multiple values>", true),
+            ("ALBUM", "Various Compilation", false),
+        ]);
+        let seed = seed_sacd_mb_query(&state).expect("seed");
+        assert_eq!(seed.artist, "");
+        assert_eq!(seed.album, "Various Compilation");
+    }
+
+    #[test]
+    fn seed_passes_catalog_and_year_when_present() {
+        let state = editor_with(vec![
+            ("ALBUMARTIST", "Thelonious Monk", false),
+            ("ALBUM", "Solo Monk", false),
+            ("CATALOGNUMBER", "SRGS 4520", false),
+            ("DATE", "1965", false),
+        ]);
+        let seed = seed_sacd_mb_query(&state).expect("seed");
+        assert_eq!(seed.catalog.as_deref(), Some("SRGS 4520"));
+        assert_eq!(seed.year.as_deref(), Some("1965"));
+    }
+
+    #[test]
+    fn seed_trims_whitespace_in_field_values() {
+        // ScarletBook strings sometimes carry trailing whitespace
+        // from padding in the binary header; the seed should strip
+        // those before they reach Lucene escape.
+        let state = editor_with(vec![
+            ("ALBUM", "  Padded Album  ", false),
+        ]);
+        let seed = seed_sacd_mb_query(&state).expect("seed");
+        assert_eq!(seed.album, "Padded Album");
+    }
+
+    #[test]
+    fn seed_treats_only_catalog_as_sufficient() {
+        // MB search with only `catno:` is valid and useful (some
+        // pressings have nothing else reliable).
+        let state = editor_with(vec![
+            ("CATALOGNUMBER", "SRGS 4520", false),
+        ]);
+        let seed = seed_sacd_mb_query(&state).expect("seed");
+        assert_eq!(seed.artist, "");
+        assert_eq!(seed.album, "");
+        assert_eq!(seed.catalog.as_deref(), Some("SRGS 4520"));
+    }
+
+    #[test]
+    fn seed_empty_value_is_treated_as_absent() {
+        // An entry that exists but has empty value (e.g., user
+        // cleared the row) shouldn't make catalog Some("").
+        let state = editor_with(vec![
+            ("ALBUM", "X", false),
+            ("CATALOGNUMBER", "", false),
+        ]);
+        let seed = seed_sacd_mb_query(&state).expect("seed");
+        assert_eq!(seed.catalog, None);
+    }
+}
+
+#[cfg(test)]
+mod sacd_toc_tests {
+    use super::sacd_durations_to_sectors;
+
+    #[test]
+    fn three_track_disc_offsets_and_leadout() {
+        // 4:00, 3:30, 5:00 = 240s / 210s / 300s at 75 fps.
+        // 240*75 = 18000, 210*75 = 15750, 300*75 = 22500.
+        // offsets: 150, 18150, 33900;  leadout: 56400.
+        let sectors = sacd_durations_to_sectors(&[240.0, 210.0, 300.0]);
+        assert_eq!(sectors, vec![150, 18150, 33900, 56400]);
+    }
+
+    #[test]
+    fn single_track_disc() {
+        let sectors = sacd_durations_to_sectors(&[60.0]);
+        // offsets: [150], leadout: 150 + 60*75 = 4650.
+        assert_eq!(sectors, vec![150, 4650]);
+    }
+
+    #[test]
+    fn empty_input_yields_pre_gap_only() {
+        // Defensive: zero tracks produces only the pre-gap entry.
+        // The dispatch path refuses this case before calling, but
+        // we don't want to panic if it slips through.
+        let sectors = sacd_durations_to_sectors(&[]);
+        assert_eq!(sectors, vec![150]);
+    }
+
+    #[test]
+    fn fractional_seconds_round_to_nearest_frame() {
+        // 4:00.74 frame = 240 + 74/75 sec → 18074 frames exact.
+        // Verify rounding handles sub-frame fractions cleanly.
+        let sectors = sacd_durations_to_sectors(&[240.0 + 74.0 / 75.0]);
+        assert_eq!(sectors, vec![150, 150 + 18074]);
+    }
+
+    #[test]
+    fn build_mb_toc_consumes_the_sector_form() {
+        // Round-trip with the existing `build_mb_toc` to confirm the
+        // output shape is the one MB expects: "1 N leadout off1 off2 …"
+        // ("+"-joined, since the helper is also used to build URLs).
+        let sectors = sacd_durations_to_sectors(&[240.0, 210.0, 300.0]);
+        let toc = crate::tui::musicbrainz::build_mb_toc(&sectors).expect("toc");
+        assert_eq!(toc, "1+3+56400+150+18150+33900");
+    }
+
+    #[test]
+    fn long_compilation_does_not_overflow() {
+        // 24 hours of audio = ~6.5M frames, well within u32.
+        // 100 tracks of 14:24 each = 86400 seconds total.
+        let dur = 864.0; // 14:24 each
+        let durs = vec![dur; 100];
+        let sectors = sacd_durations_to_sectors(&durs);
+        assert_eq!(sectors.len(), 101);
+        // Final leadout = 150 + 100 * 14:24 in frames.
+        let expected_leadout = 150 + 100 * ((dur * 75.0).round() as u32);
+        assert_eq!(*sectors.last().unwrap(), expected_leadout);
     }
 }
 

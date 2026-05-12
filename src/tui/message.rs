@@ -1,5 +1,20 @@
 //! Message types for async communication in the TUI event loop
 
+/// Where a `TagsFromMbSearchComplete` was spawned from. Used by the
+/// shared handler to format the zero-match status line: a `Direct`
+/// search reports only the failed query, while a `SacdFallback`
+/// fired by `handle_tags_from_mb_toc_sacd_complete` after a TOC
+/// miss reports both failure modes so the user sees the full
+/// breadcrumb in one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagsMbSearchOrigin {
+    /// Spawned directly by `:tags-mb` (no preceding TOC attempt).
+    /// Reserved for future C-3 use; not wired today.
+    Direct,
+    /// Spawned by the SACD TOC handler's zero-match branch.
+    SacdFallback,
+}
+
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
@@ -167,6 +182,32 @@ pub enum AppMessage {
         outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
         paths: Vec<std::path::PathBuf>,
         toc_string: String,
+    },
+    /// Result of a Phase C-2a SACD `:tags-mb` **TOC** lookup. Mirrors
+    /// the audio-file `TagsFromMbComplete` shape but routes through
+    /// the SACD-specific handler, which adds editor parking and a
+    /// zero-match text-search fallback (C-2b) on top of the standard
+    /// 0/1/N branching.
+    TagsFromMbTocSacdComplete {
+        outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
+        paths: Vec<std::path::PathBuf>,
+        toc_string: String,
+    },
+    /// Result of a Phase C-2b SACD `:tags-mb` **text/release search**
+    /// fallback. Fired by the TOC handler when the primary lookup
+    /// returns zero releases. Carries the `MbSearchOutcome` so the
+    /// handler persists fresh response bodies into
+    /// `musicbrainz_search_cache` (B-5) before the standard
+    /// zero/single/multi branching. `query_label` is a short human
+    /// rendering of the seed query for the status line. `origin`
+    /// distinguishes the spawn site so the zero-match status can
+    /// include the "TOC missed first" breadcrumb without losing it
+    /// to the second `set_status` call.
+    TagsFromMbSearchComplete {
+        outcome: Result<crate::tui::musicbrainz::MbSearchOutcome, String>,
+        paths: Vec<std::path::PathBuf>,
+        query_label: String,
+        origin: TagsMbSearchOrigin,
     },
     /// Result of an MbSelect prefetch: the detail fetch
     /// (`/ws/2/release/{mbid}?inc=…`) for a candidate currently visible

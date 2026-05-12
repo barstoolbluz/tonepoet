@@ -895,8 +895,11 @@ pub fn execute_context_action(
             }
         }
         ContextAction::MbSelectCancelPicker => {
-            // Discard parked state; close to no overlay.
+            // Discard parked picker state; restore any parked editor
+            // (Phase C-2 SACD path) so the user lands back on the
+            // editor they came from rather than a blank screen.
             app.pending_mb_select = None;
+            super::event_loop::restore_parked_editor(app);
             app.set_status("MusicBrainz picker cancelled".to_string());
         }
         ContextAction::CuePreviewSave => {
@@ -1402,7 +1405,7 @@ mod tests {
             phase: MetadataEditorPhase::Editing,
             dirty: false, deleted: Vec::new(),
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false, sacd_sidecar_path: None, sacd_area_kind: None,
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false, sacd_sidecar_path: None, sacd_area_kind: None, sacd_stereo_durations: None, sacd_multi_channel_durations: None,
         };
 
         // Row 0 = TITLE: no View entry.

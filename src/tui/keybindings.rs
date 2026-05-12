@@ -1778,6 +1778,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             match key.code {
                 KeyCode::Esc => {
                     app.active_overlay = ActiveOverlay::None;
+                    super::event_loop::restore_parked_editor(app);
                     app.set_status("MusicBrainz picker cancelled".to_string());
                 }
                 KeyCode::Enter => {
@@ -2149,17 +2150,24 @@ fn prefetch_current_mb_row(
 /// the originating overlay. Mirrors the `pending_*.take()` pattern used
 /// by the CommandInput Enter/Esc handlers.
 fn close_context_menu_restoring_parked(app: &mut AppState) {
+    // Restoration order is innermost-parked-first: when SACD
+    // `:tags-mb` parks the editor and a subsequent right-click on
+    // MbSelect parks the picker, both slots are `Some` at once.
+    // The user's mental nesting is editor → MbSelect → ContextMenu,
+    // so Esc on the context menu must return to MbSelect, not all
+    // the way back to the editor. cue_preview slots between the
+    // two for the same reason.
     app.active_overlay = ActiveOverlay::None;
-    if let Some(parked) = app.pending_metadata_editor.take() {
-        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+    if let Some(parked) = app.pending_mb_select.take() {
+        app.active_overlay = ActiveOverlay::MbSelect(parked);
         return;
     }
     if let Some(parked) = app.pending_cue_preview.take() {
         app.active_overlay = ActiveOverlay::CuePreview(parked);
         return;
     }
-    if let Some(parked) = app.pending_mb_select.take() {
-        app.active_overlay = ActiveOverlay::MbSelect(parked);
+    if let Some(parked) = app.pending_metadata_editor.take() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
     }
 }
 
@@ -2188,16 +2196,19 @@ fn run_context_action_restoring_parked(
     app.active_overlay = ActiveOverlay::None;
     super::context_menu::execute_context_action(app, action, tx, invert);
     if matches!(app.active_overlay, ActiveOverlay::None) {
-        if let Some(parked) = app.pending_metadata_editor.take() {
-            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+        // Same innermost-first restoration order as
+        // `close_context_menu_restoring_parked`. See that function's
+        // comment for why the SACD `:tags-mb` flow demands it.
+        if let Some(parked) = app.pending_mb_select.take() {
+            app.active_overlay = ActiveOverlay::MbSelect(parked);
             return;
         }
         if let Some(parked) = app.pending_cue_preview.take() {
             app.active_overlay = ActiveOverlay::CuePreview(parked);
             return;
         }
-        if let Some(parked) = app.pending_mb_select.take() {
-            app.active_overlay = ActiveOverlay::MbSelect(parked);
+        if let Some(parked) = app.pending_metadata_editor.take() {
+            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
         }
     } else {
         // Action set its own overlay → drop any parked state (action
@@ -3764,6 +3775,8 @@ pub fn open_metadata_editor(app: &mut AppState) {
             read_only: false,
             sacd_sidecar_path: None,
             sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         },
     ));
 }
@@ -4176,6 +4189,22 @@ pub(super) fn build_sacd_editor_state(
     };
     let sidecar_path_opt = sidecar_target;
 
+    // Per-area track durations, stashed for `:tags-mb` TOC synthesis
+    // (C-2a). Both areas captured — even though the editor only
+    // surfaces one — so the sibling-mirror flow (future C-2c) has
+    // them ready without re-reading the ISO. `None` for an absent
+    // area, or for one whose TRL1/TRL2 sectors failed to parse
+    // (leaving `tracks` empty per `sacd.rs` semantics).
+    let area_durations = |a: &super::sacd::AreaInfo| -> Option<Vec<f64>> {
+        if a.tracks.is_empty() {
+            None
+        } else {
+            Some(a.tracks.iter().map(|t| t.duration.total_seconds()).collect())
+        }
+    };
+    let sacd_stereo_durations = md.stereo.as_ref().and_then(&area_durations);
+    let sacd_multi_channel_durations = md.multi_channel.as_ref().and_then(&area_durations);
+
     let state = super::app::MetadataEditorState {
         paths,
         entries,
@@ -4197,6 +4226,8 @@ pub(super) fn build_sacd_editor_state(
         read_only: !writable,
         sacd_sidecar_path: if writable { sidecar_path_opt } else { None },
         sacd_area_kind: Some(area.header.kind),
+        sacd_stereo_durations,
+        sacd_multi_channel_durations,
     };
 
     Ok((state, area_label, n_tracks))
@@ -5562,6 +5593,7 @@ fn handle_mb_select_mouse(
                     return;
                 }
                 Some(super::button_map::TuiButton::MbSelectCancel) => {
+                    super::event_loop::restore_parked_editor(app);
                     app.set_status("MusicBrainz picker cancelled".to_string());
                     return;
                 }
@@ -5593,6 +5625,7 @@ fn handle_mb_select_mouse(
                 _ => {
                     if !in_popup {
                         // Click outside popup → cancel.
+                        super::event_loop::restore_parked_editor(app);
                         app.set_status("MusicBrainz picker cancelled".to_string());
                     } else {
                         app.active_overlay = ActiveOverlay::MbSelect(state);
@@ -5620,6 +5653,7 @@ fn handle_mb_select_mouse(
                     origin: (mx, my),
                 };
             } else {
+                super::event_loop::restore_parked_editor(app);
                 app.set_status("MusicBrainz picker cancelled".to_string());
             }
         }
@@ -8986,6 +9020,8 @@ mod phase4_tests {
             read_only: false,
             sacd_sidecar_path: None,
             sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         }
     }
 
@@ -9357,6 +9393,8 @@ mod phase4_tests {
             read_only: false,
             sacd_sidecar_path: None,
             sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         }
     }
 
@@ -9505,6 +9543,8 @@ mod phase4_tests {
             detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false,
             sacd_sidecar_path: None,
             sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());

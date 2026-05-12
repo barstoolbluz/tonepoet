@@ -861,6 +861,12 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         AppMessage::TagsFromMbComplete { outcome, paths, toc_string } => {
             handle_tags_from_mb_complete(app, tx, outcome, paths, toc_string);
         }
+        AppMessage::TagsFromMbTocSacdComplete { outcome, paths, toc_string } => {
+            handle_tags_from_mb_toc_sacd_complete(app, tx, outcome, paths, toc_string);
+        }
+        AppMessage::TagsFromMbSearchComplete { outcome, paths, query_label, origin } => {
+            handle_tags_from_mb_search_complete(app, tx, outcome, paths, query_label, origin);
+        }
         AppMessage::MbDetailPrefetchComplete { release_id, result } => {
             // Stamp the in-memory cache if the picker is still open,
             // and persist the raw body to SQLite (Phase B-5) so future
@@ -1326,6 +1332,318 @@ fn handle_tags_from_mb_complete(
     }
 }
 
+/// Handle the result of a Phase C-2 SACD `:tags-mb` text search.
+/// Persists any fresh response bodies into `musicbrainz_search_cache`,
+/// then routes to one of three outcomes.
+///
+/// **Invariant at entry:** the source editor is sitting in
+/// `active_overlay` — the dispatch put it there explicitly to keep
+/// the command-input / context-menu auto-restore wrappers from
+/// draining the parking slot before this handler ran. (The user may
+/// have closed the editor during the async wait; we handle that.)
+///
+/// - **Zero matches / error** → status only; the editor stays in
+///   `active_overlay` where the user left it.
+/// - **Single match** → `open_editor_with_mb_release` takes the
+///   editor from `active_overlay` via `take_metadata_editor`,
+///   populates, and puts it back as the active overlay.
+/// - **Multiple matches** → move editor from `active_overlay` into
+///   `pending_metadata_editor` and open `MbSelect`. Pick or cancel
+///   paths restore the parked editor.
+fn handle_tags_from_mb_search_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    outcome: Result<super::musicbrainz::MbSearchOutcome, String>,
+    paths: Vec<std::path::PathBuf>,
+    query_label: String,
+    origin: super::message::TagsMbSearchOrigin,
+) {
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            // Editor stays in active_overlay; just surface the error.
+            app.set_status(format!(":tags-mb: search failed: {}", e));
+            return;
+        }
+    };
+
+    // Persist every cache_write (zero or more) before deciding what
+    // to do with the releases. Errors are non-fatal — the in-memory
+    // outcome is still valid.
+    for (key, body) in &outcome.cache_writes {
+        if let Err(e) = app.db.store_mb_search(key, body) {
+            log::warn!("mb search cache store failed: {}", e);
+        }
+    }
+
+    match outcome.releases.len() {
+        0 => {
+            // Origin-aware status so the SACD fallback preserves the
+            // "TOC missed first" breadcrumb instead of overwriting it
+            // with the bare text-search miss message.
+            let msg = match origin {
+                super::message::TagsMbSearchOrigin::Direct => {
+                    format!(":tags-mb: no MB release matched \"{}\"", query_label)
+                }
+                super::message::TagsMbSearchOrigin::SacdFallback => {
+                    format!(
+                        ":tags-mb: no MB release matched the disc TOC or text \
+                         search for \"{}\"",
+                        query_label,
+                    )
+                }
+            };
+            app.set_status(msg);
+            // Editor stays in active_overlay (where the dispatch
+            // left it). No overlay change.
+        }
+        1 => {
+            // Auto-populate. open_editor_with_mb_release's
+            // take_metadata_editor handles the editor-in-active case
+            // by mem::replace-ing it out and putting it back after
+            // populate.
+            open_editor_with_mb_release(app, outcome.releases, 0, paths);
+        }
+        n => {
+            // Park editor in pending, open MbSelect. The
+            // editor-closed-during-wait case is rare but real
+            // (e.g., user hit `:q` while the search was in flight).
+            let Some(state_owned) = take_metadata_editor(app) else {
+                app.set_status(format!(
+                    ":tags-mb: editor closed during search; rerun to apply \
+                     \"{}\" ({} matches)", query_label, n,
+                ));
+                return;
+            };
+            app.pending_metadata_editor = Some(state_owned);
+            app.set_status(format!(
+                ":tags-mb: {} releases matched \"{}\" — pick one (Enter / Esc / arrows)",
+                n, query_label,
+            ));
+            let state = super::app::MbSelectState::new(outcome.releases, paths);
+            if let Some(top) = state.releases.first() {
+                let cached_body = app.db.get_cached_mb_search(
+                    &super::musicbrainz::detail_cache_key(&top.release_id),
+                );
+                spawn_mb_detail_prefetch(
+                    tx.clone(),
+                    top.release_id.clone(),
+                    state.paths.len(),
+                    std::sync::Arc::clone(&state.generation),
+                    state.generation.load(std::sync::atomic::Ordering::Relaxed),
+                    cached_body,
+                );
+            }
+            app.active_overlay = ActiveOverlay::MbSelect(Box::new(state));
+        }
+    }
+}
+
+/// Phase C-2a: handle the result of a SACD `:tags-mb` **TOC** lookup
+/// dispatched from inside a SACD metadata editor. Modelled on the
+/// audio-file `handle_tags_from_mb_complete` (same cache shape, same
+/// 0/1/N branching) plus two SACD-specific concerns:
+///
+/// 1. **Editor parking.** The dispatch deliberately left the editor
+///    in `active_overlay` to defeat the surrounding command-input /
+///    context-menu auto-restore wrappers. Single-match populates
+///    via `take_metadata_editor`; multi-match moves it to
+///    `pending_metadata_editor` so MbSelect cancel paths can restore
+///    it. Zero-match and error leave it in `active_overlay`.
+///
+/// 2. **Zero-match text-search fallback (C-2b).** On `Ok(empty)` we
+///    spawn a `search_releases_by_query` using the editor's
+///    ARTIST / ALBUM / CATALOGNUMBER / DATE rows as the seed. The
+///    fallback runs **only** on zero match, not on network/parse
+///    error — surfacing the error so the user can retry is clearer
+///    than silently degrading to a different (lower-quality)
+///    lookup mechanism.
+fn handle_tags_from_mb_toc_sacd_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    outcome: Result<super::musicbrainz::MbLookupOutcome, String>,
+    paths: Vec<std::path::PathBuf>,
+    toc_string: String,
+) {
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            app.set_status(format!(":tags-mb: TOC lookup failed: {}", e));
+            return;
+        }
+    };
+
+    if let Some(json) = outcome.cache_response.as_deref() {
+        if let Err(e) = app.db.store_mb_response(&toc_string, json) {
+            log::warn!("MB TOC cache store failed: {}", e);
+        }
+    }
+
+    match outcome.releases.len() {
+        0 => {
+            // C-2b: TOC missed — try a text/release search seeded from
+            // the editor's current metadata rows. Junk in those rows
+            // (ScarletBook's `[ISO]`, `(SME JSACD …)` tokens, etc.)
+            // makes this brittle, but it's a fallback for the case
+            // where MB has no CD reissue with matching geometry.
+            let seed = match app.active_overlay {
+                ActiveOverlay::MetadataEditor(ref state) => {
+                    super::command::seed_sacd_mb_query(state)
+                }
+                _ => None,
+            };
+            let Some(seed) = seed else {
+                app.set_status(
+                    ":tags-mb: no MB release matched the disc TOC, and no \
+                     ARTIST / ALBUM / CATALOGNUMBER / DATE to fall back on"
+                        .to_string(),
+                );
+                return;
+            };
+            let super::command::SacdMbSeed { artist, album, catalog, year } = seed;
+            let n_tracks = paths.len();
+
+            // In-memory cache lookup for both candidate query forms
+            // (with-catno + without-catno fallback inside
+            // `search_releases_by_query`).
+            let mut cached: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let key_with = super::musicbrainz::search_cache_key(
+                &artist, &album, catalog.as_deref(), year.as_deref(),
+            );
+            if let Some(b) = app.db.get_cached_mb_search(&key_with) {
+                cached.insert(key_with, b);
+            }
+            if catalog.is_some() {
+                let key_without = super::musicbrainz::search_cache_key(
+                    &artist, &album, None, year.as_deref(),
+                );
+                if let Some(b) = app.db.get_cached_mb_search(&key_without) {
+                    cached.insert(key_without, b);
+                }
+            }
+            let cache_hit = !cached.is_empty();
+            let label = match (artist.is_empty(), album.is_empty()) {
+                (false, false) => format!("{} / {}", artist, album),
+                (false, true) => artist.clone(),
+                (true, false) => album.clone(),
+                (true, true) => catalog
+                    .clone()
+                    .unwrap_or_else(|| year.clone().unwrap_or_default()),
+            };
+            app.set_status(format!(
+                ":tags-mb: TOC missed, {} text search for \"{}\"…",
+                if cache_hit { "cached" } else { "trying" },
+                label,
+            ));
+
+            let tx = tx.clone();
+            let artist_s = artist;
+            let album_s = album;
+            let catalog_s = catalog;
+            let year_s = year;
+            let label_for_msg = label;
+            let paths_for_msg = paths;
+
+            tokio::spawn(async move {
+                let outcome = super::musicbrainz::search_releases_by_query(
+                    &artist_s,
+                    &album_s,
+                    catalog_s.as_deref(),
+                    year_s.as_deref(),
+                    n_tracks,
+                    cached,
+                )
+                .await;
+                let _ = tx
+                    .send(AppMessage::TagsFromMbSearchComplete {
+                        outcome,
+                        paths: paths_for_msg,
+                        query_label: label_for_msg,
+                        origin: super::message::TagsMbSearchOrigin::SacdFallback,
+                    })
+                    .await;
+            });
+        }
+        1 => {
+            // Single TOC match → auto-populate. `open_editor_with_mb_release`
+            // takes the editor from `active_overlay` via
+            // `take_metadata_editor`, applies the release, and puts it
+            // back as the active overlay.
+            open_editor_with_mb_release(app, outcome.releases, 0, paths);
+        }
+        n => {
+            let Some(state_owned) = take_metadata_editor(app) else {
+                app.set_status(format!(
+                    ":tags-mb: editor closed during TOC lookup; rerun to apply \
+                     ({} matches)",
+                    n,
+                ));
+                return;
+            };
+            app.pending_metadata_editor = Some(state_owned);
+            app.set_status(format!(
+                ":tags-mb: {} releases matched the disc TOC — pick one \
+                 (Enter / Esc / arrows)",
+                n,
+            ));
+            let state = super::app::MbSelectState::new(outcome.releases, paths);
+            if let Some(top) = state.releases.first() {
+                let cached_body = app.db.get_cached_mb_search(
+                    &super::musicbrainz::detail_cache_key(&top.release_id),
+                );
+                spawn_mb_detail_prefetch(
+                    tx.clone(),
+                    top.release_id.clone(),
+                    state.paths.len(),
+                    std::sync::Arc::clone(&state.generation),
+                    state.generation.load(std::sync::atomic::Ordering::Relaxed),
+                    cached_body,
+                );
+            }
+            app.active_overlay = ActiveOverlay::MbSelect(Box::new(state));
+        }
+    }
+}
+
+/// Pop a parked metadata editor back into `active_overlay`. No-op
+/// when no editor was parked. Used by every `MbSelect` cancel path
+/// (Esc, click-outside, cancel pill, context-menu cancel) so the
+/// user lands back on the editor they came from instead of a blank
+/// screen.
+pub(super) fn restore_parked_editor(app: &mut AppState) {
+    if let Some(parked) = app.pending_metadata_editor.take() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+    }
+}
+
+/// Take the metadata editor from wherever it's currently living —
+/// either parked in `pending_metadata_editor` or sitting as the
+/// `active_overlay`. Returns `None` when neither slot holds an editor
+/// (e.g., the user closed it during an async wait).
+///
+/// Pending is checked first because the existing TOC `:mb-back` and
+/// related back-nav flows leave the editor parked there. The SACD
+/// `:tags-mb` flow (Phase C-2) deliberately leaves it in `active`
+/// during the async search so the surrounding command-input /
+/// context-menu auto-restore wrappers see `active != None` and
+/// don't drain the parking slot before our async result arrives.
+pub(super) fn take_metadata_editor(
+    app: &mut AppState,
+) -> Option<Box<super::app::MetadataEditorState>> {
+    if let Some(parked) = app.pending_metadata_editor.take() {
+        return Some(parked);
+    }
+    if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
+        if let ActiveOverlay::MetadataEditor(s) =
+            std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+        {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// Spawn a Phase B-4 prefetch task for an MbSelect candidate. The task
 /// sleeps for the debounce window (150 ms), re-checks the picker's
 /// generation atomic — bailing out if the user has moved cursor — and
@@ -1400,42 +1718,68 @@ pub(super) fn open_editor_with_mb_release(
         app.set_status(":tags-mb: invalid release index".to_string());
         return;
     };
-    super::keybindings::open_metadata_editor(app);
-    let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
-    match prior {
-        ActiveOverlay::MetadataEditor(mut state) => {
-            if state.paths != paths {
-                app.set_status(":tags-mb: selection changed since lookup; rerun".to_string());
-                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+
+    // Three arrival modes, checked via `take_metadata_editor`:
+    // - Browse → MbSelect: no editor was open before `:tags-mb`,
+    //   neither slot holds one; `open_metadata_editor` builds fresh
+    //   from the selection.
+    // - Editor → MbSelect (multi-match SACD path): the source editor
+    //   was parked in `pending_metadata_editor` when MbSelect opened.
+    // - Editor (SACD single-match path): the editor is sitting in
+    //   `active_overlay` because the dispatch deliberately left it
+    //   there during the async wait to suppress auto-restore from
+    //   the command-input / context-menu wrappers.
+    let mut state = if let Some(s) = take_metadata_editor(app) {
+        s
+    } else {
+        super::keybindings::open_metadata_editor(app);
+        let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        match prior {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => {
+                app.active_overlay = other;
                 return;
             }
-            // Compute the skip reason BEFORE populate so we can surface
-            // it on the status line — populate itself runs the same
-            // checks internally for the gate but only logs to env_logger.
-            let skip_reason = super::musicbrainz::per_track_skip_reason(&state.paths, release);
-            super::musicbrainz::populate_editor_from_mb(&mut state, release);
-            let label = if release.title.is_empty() { "(untitled)" } else { &release.title };
-            let mut msg = format!(":tags-mb: applied \"{}\" — review then save", label);
-            if let Some(reason) = skip_reason {
-                msg.push_str(&format!(" [{}]", reason));
-            }
-            app.set_status(msg);
-            // Cache release list for :mb-back when there's more than
-            // one to choose from. Single-match has nothing to go back
-            // to (re-opening the picker with one entry is pointless).
-            if releases.len() > 1 {
-                state.mb_back = Some(super::app::MbBackCache {
-                    releases,
-                    paths,
-                    selected,
-                });
-            }
-            app.active_overlay = ActiveOverlay::MetadataEditor(state);
         }
-        other => {
-            app.active_overlay = other;
-        }
+    };
+
+    if state.paths != paths {
+        app.set_status(":tags-mb: selection changed since lookup; rerun".to_string());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        return;
     }
+    // Compute the skip reason BEFORE populate so we can surface
+    // it on the status line — populate itself runs the same
+    // checks internally for the gate but only logs to env_logger.
+    let skip_reason = super::musicbrainz::per_track_skip_reason(&state.paths, release);
+    // Phase C-2: surface track-count divergence as a non-fatal
+    // warning. MB releases sometimes carry bonus/hidden tracks not
+    // present on the SACD area being tagged, or the reverse —
+    // populate writes what it can match by position.
+    let track_count_warning = (release.tracks.len() != state.paths.len())
+        .then(|| format!("MB release has {} tracks, editor has {}",
+            release.tracks.len(), state.paths.len()));
+    super::musicbrainz::populate_editor_from_mb(&mut state, release);
+    let label = if release.title.is_empty() { "(untitled)" } else { &release.title };
+    let mut msg = format!(":tags-mb: applied \"{}\" — review then save", label);
+    if let Some(reason) = skip_reason {
+        msg.push_str(&format!(" [{}]", reason));
+    }
+    if let Some(warn) = track_count_warning {
+        msg.push_str(&format!(" [{}]", warn));
+    }
+    app.set_status(msg);
+    // Cache release list for :mb-back when there's more than
+    // one to choose from. Single-match has nothing to go back
+    // to (re-opening the picker with one entry is pointless).
+    if releases.len() > 1 {
+        state.mb_back = Some(super::app::MbBackCache {
+            releases,
+            paths,
+            selected,
+        });
+    }
+    app.active_overlay = ActiveOverlay::MetadataEditor(state);
 }
 
 /// Handle the result of a `:cue-fill` MusicBrainz lookup. Caches the response,
