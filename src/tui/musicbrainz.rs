@@ -79,7 +79,7 @@ pub fn build_mb_toc(sectors: &[u32]) -> Option<String> {
 }
 
 const MB_BASE: &str = "https://musicbrainz.org/ws/2/discid/-";
-const MB_SEARCH_BASE: &str = "https://musicbrainz.org/ws/2/release/";
+const MB_RELEASE_BASE: &str = "https://musicbrainz.org/ws/2/release/";
 const USER_AGENT: &str = concat!(
     "tonepoet/",
     env!("CARGO_PKG_VERSION"),
@@ -397,7 +397,7 @@ async fn fire_search(
     mb_acquire().await;
 
     let resp = client
-        .get(MB_SEARCH_BASE)
+        .get(MB_RELEASE_BASE)
         .query(&[("query", query), ("fmt", "json"), ("limit", "25")])
         .send()
         .await
@@ -417,6 +417,96 @@ async fn fire_search(
     }
 
     parse_mb_response_all(&body, n_tracks)
+}
+
+/// Fetch a single MusicBrainz release by MBID with full sub-entity
+/// detail (Phase B-3). Where `search_releases_by_query` returns
+/// shallow rows, this endpoint returns the per-track titles, recording
+/// IDs, ISRCs, and label catalog numbers that `populate_editor_from_mb`
+/// needs to fill the editor.
+///
+/// **Response shape differs from search/TOC.** `/ws/2/release/?query=…`
+/// and `/ws/2/discid/-?toc=…` wrap matches in `{releases: [...]}`; the
+/// detail endpoint returns the release object at the top level. The
+/// existing `parse_mb_response_all` doesn't fit — we parse the body
+/// straight through `release_from_json`.
+///
+/// `n_tracks` selects the right medium on multi-disc releases via
+/// `release_from_json::pick_medium`. Pass the disc's track count; pass
+/// `0` only when the caller genuinely doesn't know (the fallback then
+/// picks `media[0]`).
+///
+/// Returns `Ok(None)` when MB has no release with this MBID (HTTP 404).
+/// `Err(_)` is transport/parse failure.
+pub async fn fetch_release_detail(
+    mbid: &str,
+    n_tracks: usize,
+) -> Result<Option<MbRelease>, String> {
+    if mbid.is_empty() {
+        return Err("fetch_release_detail requires a non-empty MBID".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    // `inc=` separators must reach MB as literal `+` characters; using
+    // `.query()` would percent-encode them to `%2B` and break the
+    // sub-entity split. Matches the TOC path's `format!` style for the
+    // same reason. MBIDs from MB are UUIDs (hex + dashes, URL-safe).
+    let url = format!(
+        "{}{}?inc=artist-credits+isrcs+labels+recordings+release-groups&fmt=json",
+        MB_RELEASE_BASE, mbid,
+    );
+
+    mb_acquire().await;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("MusicBrainz query failed: {}", e))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("MusicBrainz response error: {}", e))?;
+
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("MusicBrainz returned HTTP {}", status));
+    }
+
+    parse_mb_detail_response(&body, n_tracks).map(Some)
+}
+
+/// Parse a top-level MusicBrainz release object (detail endpoint).
+/// Distinct from `parse_mb_response_all` which expects the
+/// `{releases: [...]}` wrapper shape returned by search and TOC.
+pub fn parse_mb_detail_response(
+    body: &str,
+    n_tracks: usize,
+) -> Result<MbRelease, String> {
+    use serde_json::Value;
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("MusicBrainz JSON parse error: {}", e))?;
+
+    if v.get("error").is_some() {
+        return Err(format!(
+            "MusicBrainz error: {}",
+            v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown")
+        ));
+    }
+    if v.get("id").and_then(|i| i.as_str()).is_none() {
+        return Err("MusicBrainz detail response missing top-level release id".to_string());
+    }
+
+    Ok(release_from_json(&v, n_tracks))
 }
 
 fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
@@ -1452,6 +1542,40 @@ mod tests {
     fn parse_mb_response_returns_none_on_empty() {
         assert!(parse_mb_response(r#"{"releases":[]}"#, 0).unwrap().is_none());
         assert!(parse_mb_response(r#"{"error":"not found"}"#, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_mb_detail_response_unwraps_top_level_release() {
+        let body = r#"{
+            "id": "abc-123", "title": "Album",
+            "artist-credit": [{ "artist": { "id": "art-1", "name": "Artist" } }],
+            "media": [{
+                "track-count": 2,
+                "tracks": [
+                    { "position": 1, "title": "T1", "length": 200000 },
+                    { "position": 2, "title": "T2", "length": 250000 }
+                ]
+            }]
+        }"#;
+        let r = parse_mb_detail_response(body, 2).unwrap();
+        assert_eq!(r.release_id, "abc-123");
+        assert_eq!(r.tracks.len(), 2);
+        assert_eq!(r.tracks[0].title, "T1");
+        assert_eq!(r.tracks[1].length_ms, Some(250000));
+    }
+
+    #[test]
+    fn parse_mb_detail_response_rejects_search_shape() {
+        // The wrapped `{releases:[]}` shape from search/TOC should not
+        // be silently accepted here — it lacks a top-level `id`.
+        let body = r#"{"releases":[{"id":"a","title":"A","media":[]}]}"#;
+        assert!(parse_mb_detail_response(body, 0).is_err());
+    }
+
+    #[test]
+    fn parse_mb_detail_response_surfaces_error_body() {
+        let body = r#"{"error":"Not Found"}"#;
+        assert!(parse_mb_detail_response(body, 0).is_err());
     }
 
     #[test]
