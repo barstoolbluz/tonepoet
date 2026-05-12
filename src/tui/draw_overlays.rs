@@ -3338,7 +3338,9 @@ fn draw_mb_select(
         .constraints([
             Constraint::Length(1), // header
             Constraint::Length(1), // separator
-            Constraint::Min(1),    // list
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // tracks separator
+            Constraint::Length(7), // tracks pane (Phase B-4 prefetch)
             Constraint::Length(1), // footer
         ])
         .split(inner);
@@ -3400,6 +3402,16 @@ fn draw_mb_select(
         .collect();
     f.render_widget(Paragraph::new(lines), chunks[2]);
 
+    // Tracks pane: separator + per-track preview from prefetch cache.
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(chunks[3].width as usize),
+            theme::muted(),
+        )),
+        chunks[3],
+    );
+    draw_mb_select_tracks(f, state, chunks[4]);
+
     // Footer pills: clickable Accept / Cancel + scroll hint.
     let accept_label = " [Accept] ";
     let cancel_label = " [Cancel] ";
@@ -3415,18 +3427,74 @@ fn draw_mb_select(
         ),
         Span::styled(scroll_hint, theme::muted()),
     ]);
-    f.render_widget(Paragraph::new(footer), chunks[3]);
+    f.render_widget(Paragraph::new(footer), chunks[5]);
     // Register footer pill rects.
     let accept_w = accept_label.chars().count() as u16;
     let cancel_w = cancel_label.chars().count() as u16;
     button_map.record_button(
         super::button_map::TuiButton::MbSelectAccept,
-        Rect::new(chunks[3].x, chunks[3].y, accept_w, 1),
+        Rect::new(chunks[5].x, chunks[5].y, accept_w, 1),
     );
     button_map.record_button(
         super::button_map::TuiButton::MbSelectCancel,
-        Rect::new(chunks[3].x + accept_w, chunks[3].y, cancel_w, 1),
+        Rect::new(chunks[5].x + accept_w, chunks[5].y, cancel_w, 1),
     );
+}
+
+/// Render the per-track preview pane below the MbSelect list. Pulls
+/// the detail for the currently-highlighted release from `state.prefetch`
+/// (filled by Phase B-4's debounced prefetch). On cache miss shows a
+/// "Fetching tracks…" placeholder so users know one is on the way; on
+/// detail with no tracks shows "No tracks in MB record" rather than
+/// blank space.
+fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let placeholder = |msg: &str| -> Paragraph<'_> {
+        Paragraph::new(Span::styled(msg.to_string(), theme::muted()))
+    };
+    let Some(row) = state.releases.get(state.selected) else {
+        f.render_widget(placeholder("No release selected"), area);
+        return;
+    };
+    if row.release_id.is_empty() {
+        f.render_widget(placeholder("(release has no MBID)"), area);
+        return;
+    }
+    let Some(detail) = state.prefetch.get(&row.release_id) else {
+        f.render_widget(placeholder("Fetching tracks…"), area);
+        return;
+    };
+    if detail.tracks.is_empty() {
+        f.render_widget(placeholder("No tracks in MB record"), area);
+        return;
+    }
+    let visible = area.height as usize;
+    let total = detail.tracks.len();
+    let lines: Vec<Line> = detail
+        .tracks
+        .iter()
+        .take(visible.saturating_sub(if total > visible { 1 } else { 0 }))
+        .map(|t| {
+            let title = if t.title.is_empty() { "(untitled)" } else { t.title.as_str() };
+            Line::from(Span::styled(
+                format!("  {:>2}. {}", t.position, title),
+                Style::default().fg(theme::TEXT),
+            ))
+        })
+        .chain(
+            (total > visible)
+                .then(|| {
+                    Line::from(Span::styled(
+                        format!("  … +{} more", total - (visible - 1)),
+                        theme::muted(),
+                    ))
+                })
+                .into_iter(),
+        )
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 

@@ -861,6 +861,28 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         AppMessage::TagsFromMbComplete { outcome, paths, toc_string } => {
             handle_tags_from_mb_complete(app, tx, outcome, paths, toc_string);
         }
+        AppMessage::MbDetailPrefetchComplete { release_id, generation, result } => {
+            // Drop the result if the picker has since closed or the
+            // user moved cursor past the snapshot. The atomic check
+            // inside the spawn task already filters most stale
+            // deliveries; this handler-side check covers the close
+            // race (overlay swapped after task fired HTTP).
+            if let ActiveOverlay::MbSelect(ref mut state) = app.active_overlay {
+                let current = state.generation.load(std::sync::atomic::Ordering::Relaxed);
+                if current == generation {
+                    if let Ok(Some(release)) = result {
+                        state.prefetch.insert(release_id, release);
+                    }
+                    // Errors are silent — the prefetch is best-effort,
+                    // a network blip shouldn't surface a status flash
+                    // while the user is just navigating the picker.
+                    // The empty `releases` body case (`Ok(None)`) is
+                    // also silent: detail-by-MBID shouldn't 404 on an
+                    // MBID we got from search, but if it does the
+                    // tracks pane just stays in "fetching" state.
+                }
+            }
+        }
         AppMessage::AccurateRipComplete { pages } => {
             // Aggregate summary across all discs.
             let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
@@ -1247,7 +1269,7 @@ fn handle_cue_mb_complete(
 /// empty; non-empty MB fields replace them.
 fn handle_tags_from_mb_complete(
     app: &mut AppState,
-    _tx: &mpsc::Sender<AppMessage>,
+    tx: &mpsc::Sender<AppMessage>,
     outcome: Result<super::musicbrainz::MbLookupOutcome, String>,
     paths: Vec<std::path::PathBuf>,
     toc_string: String,
@@ -1281,11 +1303,62 @@ fn handle_tags_from_mb_complete(
                 ":tags-mb: {} releases matched — pick one (Enter / Esc / arrows)",
                 n,
             ));
-            app.active_overlay = ActiveOverlay::MbSelect(Box::new(
-                super::app::MbSelectState::new(outcome.releases, paths),
-            ));
+            let state = super::app::MbSelectState::new(outcome.releases, paths);
+            // Kick off the prefetch for the top candidate (cursor lands
+            // on index 0). Highlight-change handlers fire follow-up
+            // prefetches as the user navigates. Generation starts at 0;
+            // the spawned task sees a match unless the user has already
+            // moved before the 150 ms debounce elapses.
+            if let Some(top) = state.releases.first() {
+                spawn_mb_detail_prefetch(
+                    tx.clone(),
+                    top.release_id.clone(),
+                    state.paths.len(),
+                    std::sync::Arc::clone(&state.generation),
+                    state.generation.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+            app.active_overlay = ActiveOverlay::MbSelect(Box::new(state));
         }
     }
+}
+
+/// Spawn a Phase B-4 prefetch task for an MbSelect candidate. The task
+/// sleeps for the debounce window (150 ms), re-checks the picker's
+/// generation atomic — bailing out if the user has moved cursor — and
+/// only then fires `fetch_release_detail` and the rate-limited MB
+/// request. Result is delivered via `AppMessage::MbDetailPrefetchComplete`
+/// which the event-loop handler stamps onto `MbSelectState.prefetch` if
+/// the generation still matches at delivery time.
+///
+/// Pass `release_id` empty to skip — callers shouldn't generally do
+/// this but the guard is cheap.
+pub(super) fn spawn_mb_detail_prefetch(
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    release_id: String,
+    n_tracks: usize,
+    generation_arc: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    snapshot: u64,
+) {
+    if release_id.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        if generation_arc.load(std::sync::atomic::Ordering::Relaxed) != snapshot {
+            // User moved cursor during the debounce window. Drop the
+            // request before consuming an MB rate-limit token.
+            return;
+        }
+        let result = super::musicbrainz::fetch_release_detail(&release_id, n_tracks).await;
+        let _ = tx
+            .send(crate::tui::message::AppMessage::MbDetailPrefetchComplete {
+                release_id,
+                generation: snapshot,
+                result,
+            })
+            .await;
+    });
 }
 
 /// Open the metadata editor on the supplied `paths`, populated with the

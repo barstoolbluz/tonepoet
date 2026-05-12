@@ -1790,18 +1790,22 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
                 KeyCode::Up => {
                     state.selected = state.selected.saturating_sub(1);
+                    prefetch_current_mb_row(tx, &state);
                     app.active_overlay = ActiveOverlay::MbSelect(state);
                 }
                 KeyCode::Down => {
                     state.selected = (state.selected + 1).min(n.saturating_sub(1));
+                    prefetch_current_mb_row(tx, &state);
                     app.active_overlay = ActiveOverlay::MbSelect(state);
                 }
                 KeyCode::PageUp => {
                     state.selected = state.selected.saturating_sub(10);
+                    prefetch_current_mb_row(tx, &state);
                     app.active_overlay = ActiveOverlay::MbSelect(state);
                 }
                 KeyCode::PageDown => {
                     state.selected = (state.selected + 10).min(n.saturating_sub(1));
+                    prefetch_current_mb_row(tx, &state);
                     app.active_overlay = ActiveOverlay::MbSelect(state);
                 }
                 _ => {
@@ -2096,6 +2100,39 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         }
         ActiveOverlay::None => {}
     }
+}
+
+/// Bump the MbSelect picker's prefetch generation and spawn a detail
+/// fetch for the currently-highlighted row — unless the cache already
+/// has it, in which case nothing fires (no wasted MB token).
+///
+/// Called after every cursor move (keyboard Up/Down/PgUp/PgDn and
+/// future mouse-row click). The spawn helper handles the 150 ms
+/// debounce and the generation-mismatch bail-out; this caller just
+/// supplies the new snapshot.
+fn prefetch_current_mb_row(
+    tx: &mpsc::Sender<AppMessage>,
+    state: &crate::tui::app::MbSelectState,
+) {
+    // Always bump generation on navigation so any in-flight prefetch
+    // for a no-longer-current row sees the mismatch and exits. The
+    // bump is cheap; the alternative (skip bump when destination is
+    // already cached) has subtle interactions when rapidly traversing
+    // a mix of cached and uncached rows.
+    let snapshot = state.bump_generation();
+    let Some(row) = state.releases.get(state.selected) else {
+        return;
+    };
+    if row.release_id.is_empty() || state.prefetch.contains_key(&row.release_id) {
+        return;
+    }
+    super::event_loop::spawn_mb_detail_prefetch(
+        tx.clone(),
+        row.release_id.clone(),
+        state.paths.len(),
+        std::sync::Arc::clone(&state.generation),
+        snapshot,
+    );
 }
 
 /// Close the active context-menu overlay and restore any parked
@@ -5389,7 +5426,7 @@ fn build_mb_select_context_menu()
 fn handle_mb_select_mouse(
     app: &mut AppState,
     mouse: MouseEvent,
-    _tx: &mpsc::Sender<AppMessage>,
+    tx: &mpsc::Sender<AppMessage>,
 ) {
     let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
         ActiveOverlay::MbSelect(s) => s,
@@ -5412,11 +5449,13 @@ fn handle_mb_select_mouse(
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             state.selected = state.selected.saturating_sub(1);
+            prefetch_current_mb_row(tx, &state);
             app.active_overlay = ActiveOverlay::MbSelect(state);
         }
         MouseEventKind::ScrollDown => {
             let n = state.releases.len();
             state.selected = (state.selected + 1).min(n.saturating_sub(1));
+            prefetch_current_mb_row(tx, &state);
             app.active_overlay = ActiveOverlay::MbSelect(state);
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -5454,6 +5493,7 @@ fn handle_mb_select_mouse(
                             return;
                         }
                         state.last_click = Some((idx, now));
+                        prefetch_current_mb_row(tx, &state);
                         app.active_overlay = ActiveOverlay::MbSelect(state);
                     } else {
                         app.active_overlay = ActiveOverlay::MbSelect(state);
@@ -5475,6 +5515,10 @@ fn handle_mb_select_mouse(
             {
                 if idx < state.releases.len() {
                     state.selected = idx;
+                    // Fire a prefetch for the just-selected row so the
+                    // tracks pane is ready if the user closes the
+                    // context menu and lands back on the picker.
+                    prefetch_current_mb_row(tx, &state);
                 }
             }
             if in_popup {
@@ -7864,13 +7908,11 @@ fn execute_confirm_action(
             // Discard parked editor (and its edits); transition back
             // to MbSelect with the cached release list + paths.
             app.pending_metadata_editor = None;
-            let mb_state = super::app::MbSelectState {
-                releases: cache.releases.clone(),
-                selected: cache.selected,
-                scroll: 0,
-                paths: cache.paths.clone(),
-                last_click: None,
-            };
+            let mut mb_state = super::app::MbSelectState::new(
+                cache.releases.clone(),
+                cache.paths.clone(),
+            );
+            mb_state.selected = cache.selected;
             app.active_overlay = ActiveOverlay::MbSelect(Box::new(mb_state));
             app.set_status(":mb-back: pick a different release".to_string());
         }

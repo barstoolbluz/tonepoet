@@ -1094,6 +1094,19 @@ pub struct MbSelectState {
     /// detection. Skipped from Clone-derived semantics by being
     /// reset on each click cycle.
     pub last_click: Option<(usize, std::time::Instant)>,
+    /// Per-release detail cache populated by Phase B-4 prefetch. Keyed
+    /// by `MbRelease.release_id`. Search-endpoint rows in `releases`
+    /// are shallow (no per-track titles); when a row is highlighted
+    /// and not yet cached, a debounced detail fetch fires and the
+    /// result lands here for the renderer to consume.
+    pub prefetch: std::collections::BTreeMap<String, crate::tui::musicbrainz::MbRelease>,
+    /// Monotonically-increasing generation counter. Incremented each
+    /// time the highlighted row changes; spawned prefetch tasks
+    /// capture the value at spawn time and re-check the atomic after
+    /// the 150 ms debounce — a mismatch means the user moved on, so
+    /// the task exits without firing HTTP and without consuming an
+    /// MB rate-limit token.
+    pub generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MbSelectState {
@@ -1101,7 +1114,25 @@ impl MbSelectState {
         releases: Vec<crate::tui::musicbrainz::MbRelease>,
         paths: Vec<std::path::PathBuf>,
     ) -> Self {
-        Self { releases, selected: 0, scroll: 0, paths, last_click: None }
+        Self {
+            releases,
+            selected: 0,
+            scroll: 0,
+            paths,
+            last_click: None,
+            prefetch: std::collections::BTreeMap::new(),
+            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Bump the prefetch generation, returning the new value for the
+    /// caller to pass into a freshly-spawned prefetch task. Use after
+    /// any highlight change (Up/Down/PgUp/PgDn/click) — older in-flight
+    /// tasks will observe the mismatch on wake and exit cleanly.
+    pub fn bump_generation(&self) -> u64 {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
     }
 }
 

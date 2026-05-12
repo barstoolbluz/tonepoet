@@ -1615,13 +1615,8 @@ pub fn execute_command(
             }
             // Not dirty — go directly back, no confirmation.
             drop(state);
-            let mb_state = super::app::MbSelectState {
-                releases: cache.releases,
-                selected: cache.selected,
-                scroll: 0,
-                paths: cache.paths,
-                last_click: None,
-            };
+            let mut mb_state = super::app::MbSelectState::new(cache.releases, cache.paths);
+            mb_state.selected = cache.selected;
             app.active_overlay = super::app::ActiveOverlay::MbSelect(Box::new(mb_state));
             app.set_status(":mb-back: pick a different release".to_string());
         }

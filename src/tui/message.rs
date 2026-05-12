@@ -168,6 +168,16 @@ pub enum AppMessage {
         paths: Vec<std::path::PathBuf>,
         toc_string: String,
     },
+    /// Result of an MbSelect prefetch: the detail fetch
+    /// (`/ws/2/release/{mbid}?inc=…`) for a candidate currently visible
+    /// in the picker. `generation` matches the value of
+    /// `MbSelectState.generation` at spawn time; the handler discards
+    /// the result when generation has advanced (user moved cursor).
+    MbDetailPrefetchComplete {
+        release_id: String,
+        generation: u64,
+        result: Result<Option<crate::tui::musicbrainz::MbRelease>, String>,
+    },
 }
 
 /// Re-emission target form for `:cue-fill`. Captures whether the source
