@@ -4083,6 +4083,71 @@ pub(super) fn build_sacd_editor_state(
     });
     push_per_track(&mut entries, "ISRC", ItemKey::Isrc, isrcs);
 
+    // Phase C-1: MusicBrainz per-track identifiers. ScarletBook
+    // metadata has no MB equivalent, so the fallback is always
+    // empty — push_per_track suppresses the entry when every slot
+    // is empty, matching the existing "don't show empty rows"
+    // policy. populate_editor_from_mb creates these rows on demand
+    // when the user later runs `:tags-mb`.
+    let mb_track_ids: Vec<String> = resolve_per_track("MUSICBRAINZ_TRACKID", &|_| String::new());
+    push_per_track(
+        &mut entries,
+        "MUSICBRAINZ_TRACKID",
+        ItemKey::MusicBrainzRecordingId,
+        mb_track_ids,
+    );
+    let mb_release_track_ids: Vec<String> =
+        resolve_per_track("MUSICBRAINZ_RELEASETRACKID", &|_| String::new());
+    push_per_track(
+        &mut entries,
+        "MUSICBRAINZ_RELEASETRACKID",
+        ItemKey::MusicBrainzTrackId,
+        mb_release_track_ids,
+    );
+    let mb_artist_ids: Vec<String> = resolve_per_track("MUSICBRAINZ_ARTISTID", &|_| String::new());
+    push_per_track(
+        &mut entries,
+        "MUSICBRAINZ_ARTISTID",
+        ItemKey::MusicBrainzArtistId,
+        mb_artist_ids,
+    );
+
+    // Phase C-1: MusicBrainz album-level identifiers + supplemental
+    // fields. Each is replicated across every track (matching the
+    // existing ALBUM/ALBUMARTIST/etc. pattern) so save can write
+    // back uniformly through the album-level branch of
+    // save_sacd_sidecar.
+    if let Some(s) = sidecar_album_value("MUSICBRAINZ_ALBUMID") {
+        push_album(&mut entries, "MUSICBRAINZ_ALBUMID", ItemKey::MusicBrainzReleaseId, s);
+    }
+    if let Some(s) = sidecar_album_value("MUSICBRAINZ_ALBUMARTISTID") {
+        push_album(
+            &mut entries,
+            "MUSICBRAINZ_ALBUMARTISTID",
+            ItemKey::MusicBrainzReleaseArtistId,
+            s,
+        );
+    }
+    if let Some(s) = sidecar_album_value("MUSICBRAINZ_RELEASEGROUPID") {
+        push_album(
+            &mut entries,
+            "MUSICBRAINZ_RELEASEGROUPID",
+            ItemKey::MusicBrainzReleaseGroupId,
+            s,
+        );
+    }
+    if let Some(s) = sidecar_album_value("ORIGINALDATE") {
+        push_album(&mut entries, "ORIGINALDATE", ItemKey::OriginalReleaseDate, s);
+    }
+    if let Some(s) = sidecar_album_value("RELEASECOUNTRY") {
+        push_album(
+            &mut entries,
+            "RELEASECOUNTRY",
+            ItemKey::Unknown("RELEASECOUNTRY".to_string()),
+            s,
+        );
+    }
+
     let file_labels: Vec<String> = (1..=n_tracks).map(|i| format!("{:>02}", i)).collect();
 
     // Writability: editor unlocks for save when either
@@ -4331,6 +4396,18 @@ fn editor_key_to_sidecar_key(display_key: &str) -> Option<&'static str> {
         "LYRICIST" => Some("LYRICIST"),
         "ARRANGER" => Some("ARRANGER"),
         "ISRC" => Some("ISRC"),
+        // Phase C-1: MusicBrainz identifiers + supplemental album-level
+        // fields. populate_editor_from_mb writes these into TagEntry
+        // rows on SACD editors today; without translation the save
+        // path silently drops them.
+        "MUSICBRAINZ_TRACKID" => Some("MUSICBRAINZ_TRACKID"),
+        "MUSICBRAINZ_RELEASETRACKID" => Some("MUSICBRAINZ_RELEASETRACKID"),
+        "MUSICBRAINZ_ARTISTID" => Some("MUSICBRAINZ_ARTISTID"),
+        "MUSICBRAINZ_ALBUMID" => Some("MUSICBRAINZ_ALBUMID"),
+        "MUSICBRAINZ_ALBUMARTISTID" => Some("MUSICBRAINZ_ALBUMARTISTID"),
+        "MUSICBRAINZ_RELEASEGROUPID" => Some("MUSICBRAINZ_RELEASEGROUPID"),
+        "ORIGINALDATE" => Some("ORIGINALDATE"),
+        "RELEASECOUNTRY" => Some("RELEASECOUNTRY"),
         _ => None,
     }
 }
@@ -4345,6 +4422,15 @@ fn is_album_level_sidecar_key(key: &str) -> bool {
     matches!(
         key,
         "ALBUM" | "ALBUMARTIST" | "DATE" | "CATALOGNUMBER" | "GENRE" | "PUBLISHER"
+        // Phase C-1: MB identifiers and supplemental album-level
+        // fields. Replicating these to every track in the area
+        // matches foobar2000's writer behavior for MB-populated
+        // sidecars.
+        | "MUSICBRAINZ_ALBUMID"
+        | "MUSICBRAINZ_ALBUMARTISTID"
+        | "MUSICBRAINZ_RELEASEGROUPID"
+        | "ORIGINALDATE"
+        | "RELEASECOUNTRY"
     )
 }
 
@@ -9974,6 +10060,144 @@ mod phase4_tests {
         save_sacd_sidecar(&state, &xml_path).expect("save");
         let reparsed = parse_sidecar(&xml_path).expect("re-parse");
         (td, reparsed)
+    }
+
+    #[test]
+    fn build_sacd_editor_state_surfaces_musicbrainz_per_track_ids() {
+        // Phase C-1: per-track MUSICBRAINZ_* entries from sidecar
+        // surface in the editor; ScarletBook fallback is empty so
+        // entries only appear when the sidecar carries them.
+        let md = synth_sacd_metadata(
+            Some("Album"), None, 0, None,
+            &["t1", "t2"], &["", ""], &[None, None],
+        );
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="t1"/><meta name="MUSICBRAINZ_TRACKID" value="rec-1"/><meta name="MUSICBRAINZ_RELEASETRACKID" value="trk-1"/><meta name="MUSICBRAINZ_ARTISTID" value="art-1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="2"><meta name="TITLE" value="t2"/><meta name="MUSICBRAINZ_TRACKID" value="rec-2"/><meta name="MUSICBRAINZ_RELEASETRACKID" value="trk-2"/><meta name="MUSICBRAINZ_ARTISTID" value="art-2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        assert_eq!(
+            by_key("MUSICBRAINZ_TRACKID").map(|e| e.per_file_values.clone()),
+            Some(vec!["rec-1".to_string(), "rec-2".to_string()]),
+        );
+        assert_eq!(
+            by_key("MUSICBRAINZ_RELEASETRACKID").map(|e| e.per_file_values.clone()),
+            Some(vec!["trk-1".to_string(), "trk-2".to_string()]),
+        );
+        assert_eq!(
+            by_key("MUSICBRAINZ_ARTISTID").map(|e| e.per_file_values.clone()),
+            Some(vec!["art-1".to_string(), "art-2".to_string()]),
+        );
+    }
+
+    #[test]
+    fn build_sacd_editor_state_surfaces_musicbrainz_album_level() {
+        // Phase C-1: album-level MUSICBRAINZ_* + ORIGINALDATE +
+        // RELEASECOUNTRY surface as single rows replicated across
+        // tracks. Sidecar carries the value on track 1 only — the
+        // album-level reader picks the first non-empty.
+        let md = synth_sacd_metadata(
+            Some("Album"), None, 0, None,
+            &["t1", "t2"], &["", ""], &[None, None],
+        );
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="t1"/><meta name="MUSICBRAINZ_ALBUMID" value="alb-1"/><meta name="MUSICBRAINZ_ALBUMARTISTID" value="aart-1"/><meta name="MUSICBRAINZ_RELEASEGROUPID" value="rg-1"/><meta name="ORIGINALDATE" value="1959"/><meta name="RELEASECOUNTRY" value="US"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="2"><meta name="TITLE" value="t2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        assert_eq!(by_key("MUSICBRAINZ_ALBUMID").map(|e| e.value.as_str()), Some("alb-1"));
+        assert_eq!(by_key("MUSICBRAINZ_ALBUMARTISTID").map(|e| e.value.as_str()), Some("aart-1"));
+        assert_eq!(by_key("MUSICBRAINZ_RELEASEGROUPID").map(|e| e.value.as_str()), Some("rg-1"));
+        assert_eq!(by_key("ORIGINALDATE").map(|e| e.value.as_str()), Some("1959"));
+        assert_eq!(by_key("RELEASECOUNTRY").map(|e| e.value.as_str()), Some("US"));
+    }
+
+    #[test]
+    fn build_sacd_editor_state_skips_musicbrainz_when_absent() {
+        // No MUSICBRAINZ_* in sidecar (the typical foobar2000-untouched
+        // case) → no rows surface for them. Critical because empty
+        // rows would clutter the editor for the 99% of SACDs not yet
+        // tagged via MB.
+        let md = synth_sacd_metadata(
+            Some("Album"), None, 0, None,
+            &["t1"], &[""], &[None],
+        );
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="t1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="1"/></track>
+</store></root>"#;
+        let sidecar = parse_sidecar_for_test(xml);
+        let path = std::path::PathBuf::from("/tmp/x.iso");
+        let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
+        for k in [
+            "MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ_ARTISTID",
+            "MUSICBRAINZ_ALBUMID", "MUSICBRAINZ_ALBUMARTISTID", "MUSICBRAINZ_RELEASEGROUPID",
+            "ORIGINALDATE", "RELEASECOUNTRY",
+        ] {
+            assert!(
+                state.entries.iter().all(|e| e.display_key != k),
+                "{} should not surface when sidecar carries no value", k,
+            );
+        }
+    }
+
+    #[test]
+    fn save_sacd_sidecar_round_trips_musicbrainz_keys() {
+        // Phase C-1 acceptance: edit MB keys, save, re-parse — every
+        // MB id round-trips byte-for-byte.
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="t1"/><meta name="MUSICBRAINZ_TRACKID" value="rec-1"/><meta name="MUSICBRAINZ_RELEASETRACKID" value="trk-1"/><meta name="MUSICBRAINZ_ARTISTID" value="art-1"/><meta name="MUSICBRAINZ_ALBUMID" value="alb-old"/><meta name="MUSICBRAINZ_ALBUMARTISTID" value="aart-old"/><meta name="MUSICBRAINZ_RELEASEGROUPID" value="rg-old"/><meta name="ORIGINALDATE" value="1959"/><meta name="RELEASECOUNTRY" value="US"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="2"><meta name="TITLE" value="t2"/><meta name="MUSICBRAINZ_TRACKID" value="rec-2"/><meta name="MUSICBRAINZ_RELEASETRACKID" value="trk-2"/><meta name="MUSICBRAINZ_ARTISTID" value="art-2"/><meta name="MUSICBRAINZ_ALBUMID" value="alb-old"/><meta name="MUSICBRAINZ_ALBUMARTISTID" value="aart-old"/><meta name="MUSICBRAINZ_RELEASEGROUPID" value="rg-old"/><meta name="ORIGINALDATE" value="1959"/><meta name="RELEASECOUNTRY" value="US"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="3"><meta name="TITLE" value="t3"/><meta name="MUSICBRAINZ_TRACKID" value="rec-3"/><meta name="MUSICBRAINZ_RELEASETRACKID" value="trk-3"/><meta name="MUSICBRAINZ_ARTISTID" value="art-3"/><meta name="MUSICBRAINZ_ALBUMID" value="alb-old"/><meta name="MUSICBRAINZ_ALBUMARTISTID" value="aart-old"/><meta name="MUSICBRAINZ_RELEASEGROUPID" value="rg-old"/><meta name="ORIGINALDATE" value="1959"/><meta name="RELEASECOUNTRY" value="US"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/></track>
+</store></root>"#;
+        let (_td, reparsed) = round_trip_save(xml, |state| {
+            // Update the album-level MB id (simulating an `:mb-back`
+            // re-pick) and per-track MB recording ids.
+            for entry in state.entries.iter_mut() {
+                match entry.display_key.as_str() {
+                    "MUSICBRAINZ_ALBUMID" => {
+                        entry.per_file_values = vec!["alb-new".into(); 3];
+                        entry.value = "alb-new".into();
+                    }
+                    "MUSICBRAINZ_TRACKID" => {
+                        entry.per_file_values =
+                            vec!["rec-new-1".into(), "rec-new-2".into(), "rec-new-3".into()];
+                        entry.value = "<multiple values>".into();
+                        entry.is_mixed = true;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        for tid in 1..=3 {
+            let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
+            assert_eq!(t.meta.get("MUSICBRAINZ_ALBUMID").map(String::as_str), Some("alb-new"),
+                "tid={} album-level MB id replicated", tid);
+            assert_eq!(t.meta.get("MUSICBRAINZ_ARTISTID").map(String::as_str), Some(&*format!("art-{}", tid)),
+                "tid={} per-track MUSICBRAINZ_ARTISTID preserved", tid);
+            assert_eq!(t.meta.get("MUSICBRAINZ_RELEASETRACKID").map(String::as_str), Some(&*format!("trk-{}", tid)),
+                "tid={} MUSICBRAINZ_RELEASETRACKID preserved", tid);
+            assert_eq!(t.meta.get("MUSICBRAINZ_ALBUMARTISTID").map(String::as_str), Some("aart-old"),
+                "tid={} album-level MUSICBRAINZ_ALBUMARTISTID preserved", tid);
+            assert_eq!(t.meta.get("MUSICBRAINZ_RELEASEGROUPID").map(String::as_str), Some("rg-old"),
+                "tid={} album-level MUSICBRAINZ_RELEASEGROUPID preserved", tid);
+            assert_eq!(t.meta.get("ORIGINALDATE").map(String::as_str), Some("1959"),
+                "tid={} ORIGINALDATE preserved", tid);
+            assert_eq!(t.meta.get("RELEASECOUNTRY").map(String::as_str), Some("US"),
+                "tid={} RELEASECOUNTRY preserved", tid);
+        }
+        // Per-track MUSICBRAINZ_TRACKID also got the new values.
+        let by_tid_trackid = |tid: u32| reparsed.tracks.iter().find(|t| t.id == tid)
+            .and_then(|t| t.meta.get("MUSICBRAINZ_TRACKID")).map(String::as_str);
+        assert_eq!(by_tid_trackid(1), Some("rec-new-1"));
+        assert_eq!(by_tid_trackid(2), Some("rec-new-2"));
+        assert_eq!(by_tid_trackid(3), Some("rec-new-3"));
     }
 
     #[test]
