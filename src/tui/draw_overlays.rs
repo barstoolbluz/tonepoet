@@ -1646,6 +1646,14 @@ fn draw_metadata_editor(
                 spans.push(footer_pill("← back", theme::AMBER));
                 spans.push(pill_gap());
             }
+            // Click dispatches `:tags-mb`, which routes through
+            // `try_dispatch_in_editor_tags_mb` and handles SACD ISOs
+            // and regular file editors uniformly. Sync any change
+            // here with the matching tuple in `keybindings.rs`'s
+            // footer hit-test list — see
+            // `project_editor_footer_pills.md` memory entry.
+            spans.push(footer_pill(":tags-mb", theme::CYAN));
+            spans.push(pill_gap());
             spans.extend_from_slice(&[
                 footer_pill(":fix-caps", theme::BLUE),
                 pill_gap(),

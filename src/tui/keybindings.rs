@@ -6130,6 +6130,11 @@ fn handle_metadata_editor_mouse(
                     } else if state.mb_back.is_some() {
                         pills.push(("← back", ":mb-back"));
                     }
+                    // Mirror of the render list in `draw_overlays.rs`
+                    // `draw_metadata_editor` Editing arm. Order and
+                    // labels MUST match exactly so click hit-tests
+                    // align. See `project_editor_footer_pills.md`.
+                    pills.push((":tags-mb", ":tags-mb"));
                     pills.extend_from_slice(&[
                         (":fix-caps", ":fix-caps"),
                         (":d delete", ":d"),
