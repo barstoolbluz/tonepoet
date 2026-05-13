@@ -379,6 +379,18 @@ impl BrowseEntry {
         matches!(self.kind, EntryKind::SacdIso)
     }
 
+    /// Probe-pipeline gate: entries this returns `true` for produce
+    /// a `SourceInfo` + `SourceMetadata` pair via `probe_audio` +
+    /// `read_metadata`, which routes SACDs to their ScarletBook/
+    /// sidecar-aware variants. Distinct from `is_audio()`, which
+    /// gates per-file lofty tag operations (`:edit-tags`, lofty
+    /// save) — SACDs use a different write path. Use this for
+    /// probe-cache and InfoPane decisions; use `is_audio()` for
+    /// lofty-specific feature gates.
+    pub fn is_probeable(&self) -> bool {
+        self.is_audio() || self.is_sacd_iso()
+    }
+
     /// Short type/format label for display in the type column.
     /// Audio files show their format (FLAC/MP3/etc), archives show their
     /// format (7z/zip/rar/tar.gz/etc), directories show "dir", other
@@ -1659,7 +1671,7 @@ impl BrowseState {
             None => return,
         };
 
-        if entry.is_audio() {
+        if entry.is_probeable() {
             let path = entry.path.clone();
             if self.probe_cache.contains_key(&path) || self.probe_pending.contains(&path) {
                 return;
@@ -1711,7 +1723,7 @@ impl BrowseState {
     /// Get cached info for the currently selected audio file, if probed
     pub fn current_cached_info(&self) -> Option<&Arc<CachedInfo>> {
         let entry = self.entries.get(self.selected_index)?;
-        if !entry.is_audio() {
+        if !entry.is_probeable() {
             return None;
         }
         self.probe_cache.get(&entry.path)?.as_ref()
@@ -2423,5 +2435,30 @@ mod tests {
         state.all_files[0].kind = EntryKind::Archive;
         state.upgrade_iso_kinds();
         assert!(matches!(state.all_files[0].kind, EntryKind::SacdIso));
+    }
+
+    #[test]
+    fn is_probeable_covers_audio_files_and_sacd_isos() {
+        let entry_with_kind = |kind: EntryKind| BrowseEntry::new(
+            std::path::PathBuf::from("/tmp/x"),
+            "x".to_string(),
+            kind,
+            0,
+            None,
+        );
+
+        // Probeable: audio files (any format) and SACD ISOs.
+        assert!(entry_with_kind(EntryKind::AudioFile(AudioFormat::Flac)).is_probeable());
+        assert!(entry_with_kind(EntryKind::AudioFile(AudioFormat::Wav)).is_probeable());
+        assert!(entry_with_kind(EntryKind::AudioFile(AudioFormat::Mp3)).is_probeable());
+        assert!(entry_with_kind(EntryKind::SacdIso).is_probeable());
+
+        // Not probeable: directories, archives (data ISOs included here),
+        // other files. The probe pipeline produces no useful output for
+        // these and the InfoPane has no SourceMetadata to render.
+        assert!(!entry_with_kind(EntryKind::Directory).is_probeable());
+        assert!(!entry_with_kind(EntryKind::Archive).is_probeable());
+        assert!(!entry_with_kind(EntryKind::OtherFile).is_probeable());
+        assert!(!entry_with_kind(EntryKind::ParentDir).is_probeable());
     }
 }
