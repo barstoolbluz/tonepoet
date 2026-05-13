@@ -1676,13 +1676,13 @@ pub(super) fn open_editor_with_mb_release(
     // it on the status line — populate itself runs the same
     // checks internally for the gate but only logs to env_logger.
     let skip_reason = super::musicbrainz::per_track_skip_reason(&state.paths, release);
-    // Phase C-2: surface track-count divergence as a non-fatal
+    // Phase C item 3: surface track-count divergence as a non-fatal
     // warning. MB releases sometimes carry bonus/hidden tracks not
     // present on the SACD area being tagged, or the reverse —
-    // populate writes what it can match by position.
-    let track_count_warning = (release.tracks.len() != state.paths.len())
-        .then(|| format!("MB release has {} tracks, editor has {}",
-            release.tracks.len(), state.paths.len()));
+    // populate writes what it can match by position. The helper
+    // guards single-image rips (where N>1 MB tracks ride in the
+    // CUESHEET tag, not in N files) so they don't false-warn.
+    let track_count_warning = super::musicbrainz::track_count_mismatch_message(&state, release);
     super::musicbrainz::populate_editor_from_mb(&mut state, release);
     let label = if release.title.is_empty() { "(untitled)" } else { &release.title };
     let mut msg = format!(":tags-mb: applied \"{}\" — review then save", label);

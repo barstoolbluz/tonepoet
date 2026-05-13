@@ -859,6 +859,13 @@ async fn run_tags_mb(
     );
 
     // ── populate + save ────────────────────────────────────────────
+    // Phase C item 3: surface track-count divergence as a non-fatal
+    // stderr warning before populate. Emit to stderr (not stdout) so
+    // `--quiet` doesn't hide it — a partial-tag write is the kind of
+    // thing scripts should still see.
+    if let Some(warn) = musicbrainz::track_count_mismatch_message(&state, &release) {
+        err!("tags-mb: {}", warn);
+    }
     musicbrainz::populate_editor_from_mb(&mut state, &release);
 
     if matches!(kind, PathKind::Audio(_)) {

@@ -985,6 +985,46 @@ pub fn populate_editor_mb_supplemental(
 /// understand why no CUESHEET row appeared.
 ///
 /// Returns None on the not-applicable case (multi-file or single-track
+/// Phase C item 3: format a track-count divergence warning for the
+/// status line when populate's editor row count won't equal the MB
+/// release's track count. Non-fatal — populate writes what it can
+/// match by position; the message exists to tell the user why some
+/// tracks didn't get tagged.
+///
+/// **Single-image guard:** a 1-file editor with N>1 MB tracks is NOT
+/// a mismatch — per-track titles ride in the embedded CUESHEET tag
+/// rather than in N separate files. The helper returns `None` for
+/// that shape. Mismatches with multi-file editors and SACD areas
+/// (where `paths.len()` reflects the area's track count) fire
+/// normally.
+///
+/// Inner helper `count_mismatch_text` takes numbers directly so the
+/// branching is unit-testable without building a full
+/// `MetadataEditorState`.
+pub fn track_count_mismatch_message(
+    state: &crate::tui::app::MetadataEditorState,
+    release: &MbRelease,
+) -> Option<String> {
+    let n_files = state.paths.len();
+    let n_mb = release.tracks.len();
+    if n_files == 1 && n_mb > 1 {
+        return None;
+    }
+    count_mismatch_text(n_files, n_mb)
+}
+
+pub(super) fn count_mismatch_text(n_files: usize, n_mb: usize) -> Option<String> {
+    if n_files == n_mb {
+        return None;
+    }
+    Some(format!(
+        "MB release has {} track{}, editor has {}",
+        n_mb,
+        if n_mb == 1 { "" } else { "s" },
+        n_files,
+    ))
+}
+
 /// release) — no per-track expectation in those cases, no message
 /// needed.
 pub(super) fn per_track_skip_reason(
@@ -2124,6 +2164,121 @@ mod tests {
         assert!(!is_per_track_eligible(&[std::path::PathBuf::from("/tmp/a.flac")],
             &single_track, false),
             "single-track release → not eligible");
+    }
+
+    #[test]
+    fn count_mismatch_text_equal_counts_no_warning() {
+        assert!(count_mismatch_text(12, 12).is_none());
+        assert!(count_mismatch_text(1, 1).is_none());
+        assert!(count_mismatch_text(0, 0).is_none());
+    }
+
+    #[test]
+    fn count_mismatch_text_multi_file_mismatch_warns() {
+        let msg = count_mismatch_text(12, 14).expect("warn");
+        assert!(msg.contains("14 tracks"));
+        assert!(msg.contains("editor has 12"));
+    }
+
+    #[test]
+    fn count_mismatch_text_singular_track_word() {
+        let msg = count_mismatch_text(2, 1).expect("warn");
+        assert!(msg.contains("1 track,"), "got: {}", msg);
+        assert!(!msg.contains("1 tracks"), "got: {}", msg);
+    }
+
+    #[test]
+    fn count_mismatch_text_zero_mb_tracks_warns() {
+        // Edge: malformed release with no tracks. Differs from
+        // n_files, so fires. Content is "0 tracks, editor has N" —
+        // user sees that nothing was matched.
+        let msg = count_mismatch_text(5, 0).expect("warn");
+        assert!(msg.contains("0 tracks"));
+        assert!(msg.contains("editor has 5"));
+    }
+
+    #[test]
+    fn track_count_mismatch_message_single_image_no_warning() {
+        // paths.len() == 1 with N>1 MB tracks is the legitimate
+        // single-image rip case (titles ride in the CUESHEET tag).
+        // Helper returns None.
+        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        let state = MetadataEditorState {
+            paths: vec![std::path::PathBuf::from("/tmp/x.flac")],
+            entries: Vec::new(),
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false, deleted: Vec::new(),
+            file_labels: vec!["01".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0,
+            detail_edit: None, mb_back: None, gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None, sacd_area_kind: None,
+            sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+        };
+        let release = rel("rid", vec![
+            trk(1, "T1", "A", None),
+            trk(2, "T2", "A", None),
+            trk(3, "T3", "A", None),
+        ]);
+        assert!(track_count_mismatch_message(&state, &release).is_none());
+    }
+
+    #[test]
+    fn track_count_mismatch_message_single_image_single_track_no_warning() {
+        // paths.len() == 1, n_mb == 1: genuine 1:1 match, not a
+        // mismatch and not a single-image case. No warning.
+        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        let state = MetadataEditorState {
+            paths: vec![std::path::PathBuf::from("/tmp/x.flac")],
+            entries: Vec::new(),
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false, deleted: Vec::new(),
+            file_labels: vec!["01".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0,
+            detail_edit: None, mb_back: None, gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None, sacd_area_kind: None,
+            sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+        };
+        let release = rel("rid", vec![trk(1, "T", "A", None)]);
+        assert!(track_count_mismatch_message(&state, &release).is_none());
+    }
+
+    #[test]
+    fn track_count_mismatch_message_multi_file_mismatch_warns() {
+        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        let state = MetadataEditorState {
+            paths: vec![
+                std::path::PathBuf::from("/tmp/01.flac"),
+                std::path::PathBuf::from("/tmp/02.flac"),
+                std::path::PathBuf::from("/tmp/03.flac"),
+            ],
+            entries: Vec::new(),
+            cursor: 0, scroll: 0, last_click: None,
+            edit_input: None, add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: false, deleted: Vec::new(),
+            file_labels: vec!["01".into(), "02".into(), "03".into()],
+            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0,
+            detail_edit: None, mb_back: None, gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None, sacd_area_kind: None,
+            sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+        };
+        let release = rel("rid", vec![
+            trk(1, "T1", "A", None),
+            trk(2, "T2", "A", None),
+            trk(3, "T3", "A", None),
+            trk(4, "T4", "A", None),
+            trk(5, "T5", "A", None),
+        ]);
+        let msg = track_count_mismatch_message(&state, &release).expect("warn");
+        assert!(msg.contains("5 tracks"));
+        assert!(msg.contains("editor has 3"));
     }
 
     #[test]
