@@ -1047,6 +1047,81 @@ pub fn parse_title_from_filename(stem: &str) -> (Option<u32>, Option<String>) {
 /// Sort paths by (disc, track, filename) for logical display order.
 /// Reads disc/track tags from each file via lofty (lightweight read),
 /// falls back to directory/filename patterns.
+/// Entry-aware variant of `sort_paths_by_track`. Sorts `paths` by
+/// (disc, track, filename) AND permutes each entry's `per_file_values`
+/// + `per_file_originals` in lockstep so the per-file vectors stay
+/// aligned with the new path order.
+///
+/// Pulls disc/track from already-merged `entries` (the canonical
+/// source after `read_all_tags_merged`); falls back to path-name
+/// extraction when an entry is empty or missing. Treats empty
+/// strings as "no tag" — divergence from `sort_paths_by_track`'s
+/// `parse_track_disc_tag("")=0` behavior, but matches what
+/// `open_metadata_editor` has always done.
+///
+/// Used by:
+/// - TUI's `open_metadata_editor` after `read_all_tags_merged`.
+/// - CLI `tonepoet tags-mb` audio-file path before populate.
+///
+/// Caller's responsibility: don't mix this with `sort_paths_by_track`
+/// in the same flow — they may produce slightly different orderings
+/// on edge cases (present-but-empty tags), and the latter doesn't
+/// touch the entry vectors.
+pub fn sort_paths_and_entries_by_track(
+    paths: &mut Vec<std::path::PathBuf>,
+    entries: &mut Vec<TagEntry>,
+) {
+    let n = paths.len();
+    if n <= 1 {
+        return;
+    }
+
+    let disc_entry = entries.iter().find(|e|
+        e.display_key.to_ascii_uppercase() == "DISCNUMBER");
+    let track_entry = entries.iter().find(|e|
+        e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
+
+    let sort_keys: Vec<(u32, u32, String)> = (0..n).map(|i| {
+        let tag_disc = disc_entry
+            .and_then(|e| e.per_file_values.get(i))
+            .filter(|v| !v.is_empty())
+            .map(|v| parse_track_disc_tag(v));
+        let tag_track = track_entry
+            .and_then(|e| e.per_file_values.get(i))
+            .filter(|v| !v.is_empty())
+            .map(|v| parse_track_disc_tag(v));
+
+        let disc = tag_disc.unwrap_or_else(|| extract_disc_from_path(&paths[i]));
+        let track = tag_track.unwrap_or_else(|| {
+            let stem = paths[i].file_stem()
+                .and_then(|s| s.to_str()).unwrap_or("");
+            extract_track_from_filename(stem)
+        });
+        let filename = paths[i].file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        (disc, track, filename)
+    }).collect();
+
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.sort_by(|&a, &b| sort_keys[a].cmp(&sort_keys[b]));
+
+    let sorted_paths: Vec<_> = perm.iter().map(|&i| paths[i].clone()).collect();
+    *paths = sorted_paths;
+
+    for entry in entries.iter_mut() {
+        if entry.per_file_values.len() == n {
+            let sv: Vec<_> = perm.iter().map(|&i| entry.per_file_values[i].clone()).collect();
+            let so: Vec<_> = perm.iter().map(|&i| entry.per_file_originals[i].clone()).collect();
+            entry.per_file_values = sv;
+            entry.per_file_originals = so;
+        }
+        // Per-track entries (len != n, single-image rips with embedded
+        // CUESHEET) are indexed by MB-track position, not file position,
+        // so the path permutation doesn't apply.
+    }
+}
+
 pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
     use lofty::file::TaggedFileExt;
     use lofty::tag::ItemKey;
@@ -1302,6 +1377,57 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
     sort_entries_standard_first(&mut entries);
 
     Ok(entries)
+}
+
+/// Apply a metadata-editor snapshot to a set of audio files, writing
+/// every per-file diff via `write_all_tags`. Synchronous and blocking
+/// — callers that share an async runtime should wrap this in
+/// `tokio::task::spawn_blocking`. Returns one `(path, Result)` per
+/// file that had changes (files with no diff are silently skipped).
+///
+/// Used by:
+/// - TUI editor's `:w` (`metadata_editor_save` wraps in spawn_blocking
+///   and sends `MetadataEditorWriteComplete` afterwards).
+/// - CLI `tonepoet tags-mb` (calls directly via spawn_blocking + await).
+///
+/// `entries_snap` is the editor's per-entry snapshot
+/// `(ItemKey, per_file_values, per_file_originals)`. Per-track entries
+/// (where `vals.len() != paths.len()`) are skipped — they round-trip
+/// through the CUESHEET tag via `regenerate_cuesheet_for_save`, not
+/// through individual file writes. `deleted` is the editor's
+/// `state.deleted` (indices of entries the user removed).
+pub fn apply_audio_tag_changes(
+    paths: &[std::path::PathBuf],
+    entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
+    deleted: &[usize],
+) -> Vec<(std::path::PathBuf, Result<(), String>)> {
+    let mut results = Vec::new();
+    for (file_idx, path) in paths.iter().enumerate() {
+        let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
+        for (entry_idx, (key, vals, origs)) in entries_snap.iter().enumerate() {
+            // Per-track entries (single-image rips with embedded CUESHEET)
+            // round-trip through the regenerated CUESHEET tag instead of
+            // having a per-file lofty home; skip them here.
+            if vals.len() != paths.len() {
+                continue;
+            }
+            if deleted.contains(&entry_idx) {
+                changes.push((key.clone(), None));
+            } else if file_idx < vals.len() && file_idx < origs.len() {
+                if vals[file_idx] != origs[file_idx] {
+                    changes.push((
+                        key.clone(),
+                        Some(vals[file_idx].clone()),
+                    ));
+                }
+            }
+        }
+        if !changes.is_empty() {
+            let r = write_all_tags(path, &changes);
+            results.push((path.clone(), r));
+        }
+    }
+    results
 }
 
 /// Write a batch of tag changes to an audio file.

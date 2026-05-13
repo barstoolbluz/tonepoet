@@ -2486,37 +2486,17 @@ pub(super) fn metadata_editor_save(
 
     let tx = tx.clone();
     tokio::spawn(async move {
-        let mut results = Vec::new();
-        for (file_idx, path) in paths.iter().enumerate() {
-            let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
-            for (entry_idx, (key, vals, origs)) in entries_snap.iter().enumerate() {
-                // Phase 4 Step B: per-track entries (vals.len() !=
-                // paths.len()) round-trip through the regenerated
-                // CUESHEET tag — no per-file lofty home.
-                if vals.len() != paths.len() {
-                    continue;
-                }
-                if deleted.contains(&entry_idx) {
-                    changes.push((key.clone(), None));
-                } else if file_idx < vals.len() && file_idx < origs.len() {
-                    if vals[file_idx] != origs[file_idx] {
-                        changes.push((
-                            key.clone(),
-                            Some(vals[file_idx].clone()),
-                        ));
-                    }
-                }
-            }
-            if !changes.is_empty() {
-                let r = tokio::task::spawn_blocking({
-                    let path = path.clone();
-                    move || crate::tui::probe::write_all_tags(&path, &changes)
-                })
-                .await
-                .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
-                results.push((path.clone(), r));
-            }
-        }
+        let results = tokio::task::spawn_blocking(move || {
+            crate::tui::probe::apply_audio_tag_changes(&paths, &entries_snap, &deleted)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            // Whole-batch task panic is unusual (write_all_tags errors
+            // are returned, not panicked). If it does happen, surface
+            // a single batch-level error rather than losing the
+            // request silently.
+            vec![(std::path::PathBuf::new(), Err(format!("save task panic: {}", e)))]
+        });
         let _ = tx.send(AppMessage::MetadataEditorWriteComplete { results }).await;
     });
 }
@@ -2916,7 +2896,7 @@ fn handle_metadata_editor_key(
 ///   Err(reason) — refuse save (no CUESHEET anchor for per-track
 ///               edits, or CUESHEET parses to no tracks); caller
 ///               surfaces status and aborts
-fn regenerate_cuesheet_for_save(
+pub fn regenerate_cuesheet_for_save(
     state: &mut super::app::MetadataEditorState,
 ) -> Result<bool, String> {
     let n_paths = state.paths.len();
@@ -3122,7 +3102,7 @@ fn regenerate_cuesheet_for_save(
 /// - the sidecar is track-by-track structured (different FILE per
 ///   TRACK) — those CUE timestamps reset per file and don't make
 ///   sense as a single-image embedded CUESHEET
-fn inject_sidecar_cuesheet_if_present(
+pub fn inject_sidecar_cuesheet_if_present(
     entries: &mut Vec<super::probe::TagEntry>,
     audio_path: &std::path::Path,
 ) {
@@ -3176,7 +3156,7 @@ fn inject_sidecar_cuesheet_if_present(
 /// - no CUESHEET entry exists or its value is empty
 /// - the CUESHEET parses to fewer than two tracks
 /// - all per-track values for a given field are empty (no data to show)
-fn apply_embedded_cuesheet_per_track(entries: &mut Vec<super::probe::TagEntry>) {
+pub fn apply_embedded_cuesheet_per_track(entries: &mut Vec<super::probe::TagEntry>) {
     use lofty::tag::ItemKey;
 
     let cue_text = match entries.iter()
@@ -3561,54 +3541,9 @@ pub fn open_metadata_editor(app: &mut AppState) {
     }
 
     // Sort files by (disc, track, filename) for logical display order.
-    if paths.len() > 1 {
-        let n = paths.len();
-
-        // Extract disc/track from merged entries, falling back to path patterns.
-        let disc_entry = entries.iter().find(|e|
-            e.display_key.to_ascii_uppercase() == "DISCNUMBER");
-        let track_entry = entries.iter().find(|e|
-            e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
-
-        let sort_keys: Vec<(u32, u32, String)> = (0..n).map(|i| {
-            let tag_disc = disc_entry
-                .and_then(|e| e.per_file_values.get(i))
-                .filter(|v| !v.is_empty())
-                .map(|v| super::probe::parse_track_disc_tag(v));
-            let tag_track = track_entry
-                .and_then(|e| e.per_file_values.get(i))
-                .filter(|v| !v.is_empty())
-                .map(|v| super::probe::parse_track_disc_tag(v));
-
-            let disc = tag_disc.unwrap_or_else(||
-                super::probe::extract_disc_from_path(&paths[i]));
-            let track = tag_track.unwrap_or_else(|| {
-                let stem = paths[i].file_stem()
-                    .and_then(|s| s.to_str()).unwrap_or("");
-                super::probe::extract_track_from_filename(stem)
-            });
-            let filename = paths[i].file_name()
-                .map(|n| n.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            (disc, track, filename)
-        }).collect();
-
-        // Build sort permutation.
-        let mut perm: Vec<usize> = (0..n).collect();
-        perm.sort_by(|&a, &b| sort_keys[a].cmp(&sort_keys[b]));
-
-        // Apply permutation to paths.
-        let sorted_paths: Vec<_> = perm.iter().map(|&i| paths[i].clone()).collect();
-        paths = sorted_paths;
-
-        // Apply permutation to all per_file_values and per_file_originals.
-        for entry in &mut entries {
-            let sorted_vals: Vec<_> = perm.iter().map(|&i| entry.per_file_values[i].clone()).collect();
-            let sorted_origs: Vec<_> = perm.iter().map(|&i| entry.per_file_originals[i].clone()).collect();
-            entry.per_file_values = sorted_vals;
-            entry.per_file_originals = sorted_origs;
-        }
-    }
+    // Entry-aware sort: paths AND per-file vectors are permuted together
+    // so the indexing relationship stays consistent.
+    super::probe::sort_paths_and_entries_by_track(&mut paths, &mut entries);
 
     // Auto-populate TITLE and TRACKNUMBER from filenames where missing.
     let mut did_auto_populate = false;
@@ -3849,7 +3784,7 @@ fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBu
 /// Returns (state, area_label, n_tracks) on success so the caller
 /// can compose a status message; returns Err with a short reason
 /// string when no readable area exists or the area is empty.
-pub(super) fn build_sacd_editor_state(
+pub fn build_sacd_editor_state(
     iso_path: &std::path::Path,
     md: &super::sacd::SacdMetadata,
     sidecar: Option<&super::sacd_sidecar::SidecarMetadata>,
@@ -4469,7 +4404,7 @@ fn is_album_level_sidecar_key(key: &str) -> bool {
 /// save path; `<store id>` freshly computed) from updates to an
 /// existing one (id preserved verbatim).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SacdSaveOutcome {
+pub enum SacdSaveOutcome {
     Created,
     Updated,
 }
@@ -4488,7 +4423,7 @@ pub(super) enum SacdSaveOutcome {
 /// any failure (parse, re-probe, mint, or write). The editor state
 /// isn't mutated; the caller resets `dirty` and snapshots `originals`
 /// after a successful write.
-fn save_sacd_sidecar(
+pub fn save_sacd_sidecar(
     state: &super::app::MetadataEditorState,
     sidecar_path: &std::path::Path,
 ) -> Result<SacdSaveOutcome, String> {

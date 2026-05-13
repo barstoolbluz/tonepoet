@@ -121,6 +121,60 @@ enum Commands {
         #[arg(long)]
         path: bool,
     },
+
+    /// Tag audio files or an SACD ISO from MusicBrainz, headless.
+    ///
+    /// Computes a CD-equivalent TOC from the supplied paths, looks up
+    /// matching MusicBrainz releases, populates per-track tags, and
+    /// writes them in place. On multi-match the command refuses with
+    /// the candidate list unless `--auto` or `--release-id` is given.
+    /// Mirrors the in-editor `:tags-mb` flow with no interactive UI.
+    TagsMb {
+        /// Audio files (FLAC, WAV, etc.) — same album, same directory.
+        /// Or one SACD ISO file (writes the sidecar XML).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Catalog number (matches MB's `catno:` Lucene clause).
+        /// Quote values that contain spaces: `--catno "SRGS 4520"`.
+        #[arg(long, conflicts_with = "release_id")]
+        catno: Option<String>,
+
+        /// Release year (matches MB's `date:` Lucene clause).
+        #[arg(long, conflicts_with = "release_id")]
+        year: Option<String>,
+
+        /// Free-form text query (matches MB's `release:` field).
+        /// When any of --catno/--year/--query is supplied, the TOC
+        /// lookup is skipped in favor of a direct text search.
+        #[arg(long, conflicts_with = "release_id")]
+        query: Option<String>,
+
+        /// Skip lookup entirely and fetch this MBID directly. Useful
+        /// for scripted workflows that already know the release id.
+        /// Mutually exclusive with --catno, --year, --query, and --auto.
+        #[arg(long, conflicts_with = "auto")]
+        release_id: Option<String>,
+
+        /// On multi-match, take the highest-scoring release instead
+        /// of refusing. Mutually exclusive with --release-id (which
+        /// already picks a specific release).
+        #[arg(long)]
+        auto: bool,
+
+        /// Show planned tag writes; write nothing. Exits 0 on success
+        /// (lookup + populate succeeded), regardless of write count.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Only set exit code; no stdout/stderr output beyond errors.
+        #[arg(long, conflicts_with = "verbose")]
+        quiet: bool,
+
+        /// Per-file before/after diff of each tag change.
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
@@ -157,6 +211,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Config { show, reset, path } => {
             run_config(show, reset, path, &config)?;
+        }
+        Commands::TagsMb {
+            paths, catno, year, query, release_id,
+            auto, dry_run, quiet, verbose,
+        } => {
+            let exit_code = run_tags_mb(
+                paths, catno, year, query, release_id,
+                auto, dry_run, quiet, verbose,
+            ).await;
+            std::process::exit(exit_code);
         }
     }
 
@@ -710,4 +774,469 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     terminal.show_cursor()?;
 
     result.map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// Headless `:tags-mb`. Mirrors the in-editor flow:
+/// 1. Classify paths (audio files vs single SACD ISO; reject mixes).
+/// 2. Build an editor state from the paths (using the same helpers
+///    the TUI editor-open path uses, minus the AppState wiring).
+/// 3. Run lookup — TOC primary, or text search when --query/--catno/
+///    --year are present, or direct fetch when --release-id is given.
+/// 4. Disambiguate multi-match. Default: refuse + list (exit 2);
+///    --auto takes the top score.
+/// 5. Populate the state with MB values (`populate_editor_from_mb`).
+/// 6. Regenerate CUESHEET for single-image rips, then save via the
+///    shared `apply_audio_tag_changes` / `save_sacd_sidecar` helpers.
+///
+/// Returns the process exit code: 0 ok, 1 no match, 2 ambiguous,
+/// 3 argument/IO error, 4 MB transport/parse error.
+#[allow(clippy::too_many_arguments)]
+async fn run_tags_mb(
+    paths: Vec<PathBuf>,
+    catno: Option<String>,
+    year: Option<String>,
+    query: Option<String>,
+    release_id: Option<String>,
+    auto: bool,
+    dry_run: bool,
+    quiet: bool,
+    verbose: bool,
+) -> i32 {
+    use tonepoet::tui::{musicbrainz, probe};
+
+    macro_rules! say { ($($arg:tt)*) => { if !quiet { println!($($arg)*); } } }
+    macro_rules! err { ($($arg:tt)*) => { eprintln!($($arg)*); } }
+
+    // ── classify paths ──────────────────────────────────────────────
+    let kind = match classify_tags_mb_paths(&paths) {
+        Ok(k) => k,
+        Err(e) => { err!("tags-mb: {}", e); return 3; }
+    };
+
+    // ── build state ────────────────────────────────────────────────
+    let mut state = match kind {
+        PathKind::SacdIso(ref iso) => match build_sacd_state_for_cli(iso) {
+            Ok(s) => s,
+            Err(e) => { err!("tags-mb: {}", e); return 3; }
+        },
+        PathKind::Audio(ref audio_paths) => match build_audio_state_for_cli(audio_paths) {
+            Ok(s) => s,
+            Err(e) => { err!("tags-mb: {}", e); return 3; }
+        },
+    };
+
+    // ── read-only refusal (SACD where parent dir isn't writable) ──
+    if state.read_only && !dry_run {
+        err!("tags-mb: destination is read-only (sidecar dir not writable)");
+        return 3;
+    }
+
+    // ── lookup ─────────────────────────────────────────────────────
+    let n_tracks = match kind {
+        PathKind::SacdIso(_) => state.paths.len(), // ISO replicated × n_tracks
+        PathKind::Audio(ref a) => a.len(),
+    };
+
+    let db = match tonepoet::db::Database::open() {
+        Ok(d) => d,
+        Err(e) => { err!("tags-mb: open DB: {}", e); return 3; }
+    };
+
+    let release = match resolve_release(
+        &db, &state, &kind, n_tracks,
+        query.as_deref(), catno.as_deref(), year.as_deref(),
+        release_id.as_deref(), auto, quiet,
+    ).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return 1, // no-match status was already printed
+        Err(rc) => return rc, // ambiguous (2), MB err (4), etc.
+    };
+
+    say!("Matched: {} — {} ({})",
+        release.artist,
+        release.title,
+        release.year.as_deref().unwrap_or("?"),
+    );
+
+    // ── populate + save ────────────────────────────────────────────
+    musicbrainz::populate_editor_from_mb(&mut state, &release);
+
+    if matches!(kind, PathKind::Audio(_)) {
+        if let Err(e) = tonepoet::tui::keybindings::regenerate_cuesheet_for_save(&mut state) {
+            err!("tags-mb: cuesheet regen: {}", e);
+            return 3;
+        }
+    }
+
+    if dry_run {
+        let count = state.entries.iter()
+            .filter(|e| e.value != e.original
+                || e.per_file_values.iter().zip(e.per_file_originals.iter())
+                    .any(|(v, o)| v != o))
+            .count();
+        say!("Dry run: {} editor entries differ from on-file values; no writes.", count);
+        if verbose {
+            for e in &state.entries {
+                let dirty = e.value != e.original
+                    || e.per_file_values.iter().zip(e.per_file_originals.iter())
+                        .any(|(v, o)| v != o);
+                if dirty {
+                    say!("  {}: \"{}\" → \"{}\"", e.display_key, e.original, e.value);
+                }
+            }
+        }
+        return 0;
+    }
+
+    match kind {
+        PathKind::SacdIso(_) => {
+            let sidecar_path = match state.sacd_sidecar_path.clone() {
+                Some(p) => p,
+                None => {
+                    err!("tags-mb: SACD editor has no sidecar target");
+                    return 3;
+                }
+            };
+            match tonepoet::tui::keybindings::save_sacd_sidecar(&state, &sidecar_path) {
+                Ok(outcome) => {
+                    let verb = match outcome {
+                        tonepoet::tui::keybindings::SacdSaveOutcome::Created => "created",
+                        tonepoet::tui::keybindings::SacdSaveOutcome::Updated => "updated",
+                    };
+                    say!("SACD sidecar {}: {}", verb, sidecar_path.display());
+                    0
+                }
+                Err(e) => { err!("tags-mb: sidecar save failed: {}", e); 3 }
+            }
+        }
+        PathKind::Audio(ref audio_paths) => {
+            let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> =
+                state.entries.iter().map(|e| (
+                    e.item_key.clone(),
+                    e.per_file_values.clone(),
+                    e.per_file_originals.clone(),
+                )).collect();
+            let deleted: Vec<usize> = state.deleted.clone();
+            let paths_owned = audio_paths.clone();
+            let results = match tokio::task::spawn_blocking(move || {
+                probe::apply_audio_tag_changes(&paths_owned, &entries_snap, &deleted)
+            }).await {
+                Ok(r) => r,
+                Err(e) => { err!("tags-mb: save task panic: {}", e); return 3; }
+            };
+            let mut wrote = 0usize;
+            let mut failed = 0usize;
+            for (path, r) in &results {
+                match r {
+                    Ok(()) => {
+                        wrote += 1;
+                        if verbose {
+                            say!("  wrote: {}", path.display());
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        err!("  failed: {}: {}", path.display(), e);
+                    }
+                }
+            }
+            if failed > 0 {
+                say!("{} file(s) written, {} failed.", wrote, failed);
+                3
+            } else {
+                say!("{} file(s) written.", wrote);
+                0
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PathKind {
+    Audio(Vec<PathBuf>),
+    SacdIso(PathBuf),
+}
+
+fn classify_tags_mb_paths(paths: &[PathBuf]) -> Result<PathKind, String> {
+    if paths.is_empty() {
+        return Err("no paths supplied".to_string());
+    }
+    let isos: Vec<&PathBuf> = paths.iter()
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")))
+        .collect();
+    if !isos.is_empty() {
+        if paths.len() != 1 {
+            return Err("SACD ISO must be passed alone (no mixed paths)".to_string());
+        }
+        let iso = isos[0].clone();
+        if !iso.exists() {
+            return Err(format!("ISO not found: {}", iso.display()));
+        }
+        return Ok(PathKind::SacdIso(iso));
+    }
+    let mut dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for p in paths {
+        if !p.exists() {
+            return Err(format!("file not found: {}", p.display()));
+        }
+        if let Some(d) = p.parent() {
+            dirs.insert(d.to_path_buf());
+        }
+    }
+    if dirs.len() > 1 {
+        return Err("audio file paths must share a single directory".to_string());
+    }
+    Ok(PathKind::Audio(paths.to_vec()))
+}
+
+fn build_audio_state_for_cli(
+    paths: &[PathBuf],
+) -> Result<tonepoet::tui::app::MetadataEditorState, String> {
+    use tonepoet::tui::{app, keybindings, probe};
+    let mut paths = paths.to_vec();
+    let mut entries = probe::read_all_tags_merged(&paths)
+        .map_err(|e| format!("read tags: {}", e))?;
+    if paths.len() == 1 {
+        keybindings::inject_sidecar_cuesheet_if_present(&mut entries, &paths[0]);
+        keybindings::apply_embedded_cuesheet_per_track(&mut entries);
+    }
+    probe::sort_paths_and_entries_by_track(&mut paths, &mut entries);
+    let n = paths.len();
+    let file_labels: Vec<String> = (1..=n).map(|i| format!("{:>02}", i)).collect();
+    Ok(app::MetadataEditorState {
+        paths,
+        entries,
+        cursor: 0,
+        scroll: 0,
+        last_click: None,
+        edit_input: None,
+        add_key_input: None,
+        phase: app::MetadataEditorPhase::Editing,
+        dirty: false,
+        deleted: Vec::new(),
+        file_labels,
+        detail_field_idx: 0,
+        detail_cursor: 0,
+        detail_scroll: 0,
+        detail_edit: None,
+        mb_back: None,
+        gnudb_back: None,
+        read_only: false,
+        sacd_sidecar_path: None,
+        sacd_area_kind: None,
+        sacd_stereo_durations: None,
+        sacd_multi_channel_durations: None,
+    })
+}
+
+fn build_sacd_state_for_cli(
+    iso: &std::path::Path,
+) -> Result<tonepoet::tui::app::MetadataEditorState, String> {
+    use tonepoet::tui::{keybindings, sacd, sacd_sidecar};
+    let md = sacd::parse_sacd_iso(iso).map_err(|e| format!("parse SACD ISO: {}", e))?;
+    let sidecar_path = sacd_sidecar::find_sidecar_for_iso(iso);
+    let sidecar = sidecar_path.as_ref()
+        .and_then(|p| sacd_sidecar::parse_sidecar(p).ok());
+    let (state, _label, _n) = keybindings::build_sacd_editor_state(iso, &md, sidecar.as_ref())
+        .map_err(|e| format!("build SACD editor state: {}", e))?;
+    Ok(state)
+}
+
+/// Run the right MB lookup mode for the CLI args, disambiguate, and
+/// return the chosen release. `Ok(None)` means "no match" (caller
+/// returns 1). `Err(code)` is a direct process exit code.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_release(
+    db: &tonepoet::db::Database,
+    state: &tonepoet::tui::app::MetadataEditorState,
+    kind: &PathKind,
+    n_tracks: usize,
+    query: Option<&str>,
+    catno: Option<&str>,
+    year: Option<&str>,
+    release_id: Option<&str>,
+    auto: bool,
+    quiet: bool,
+) -> Result<Option<tonepoet::tui::musicbrainz::MbRelease>, i32> {
+    use tonepoet::tui::musicbrainz;
+
+    macro_rules! say { ($($arg:tt)*) => { if !quiet { println!($($arg)*); } } }
+
+    if let Some(mbid) = release_id {
+        let cached = db.get_cached_mb_search(&musicbrainz::detail_cache_key(mbid));
+        let outcome = musicbrainz::fetch_release_detail(mbid, n_tracks, cached).await
+            .map_err(|e| { eprintln!("tags-mb: fetch release: {}", e); 4 })?;
+        if let Some((k, v)) = outcome.cache_write {
+            let _ = db.store_mb_search(&k, &v);
+        }
+        return Ok(outcome.release);
+    }
+
+    let explicit = query.is_some() || catno.is_some() || year.is_some();
+    if explicit {
+        let mut cached: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let key = musicbrainz::search_cache_key("", query.unwrap_or(""), catno, year);
+        if let Some(b) = db.get_cached_mb_search(&key) {
+            cached.insert(key, b);
+        }
+        let outcome = musicbrainz::search_releases_by_query(
+            "", query.unwrap_or(""), catno, year, n_tracks, cached,
+        ).await.map_err(|e| { eprintln!("tags-mb: search: {}", e); 4 })?;
+        for (k, v) in &outcome.cache_writes {
+            let _ = db.store_mb_search(k, v);
+        }
+        return disambiguate(outcome.releases, auto, quiet, "search");
+    }
+
+    let sectors: Vec<u32> = match kind {
+        PathKind::Audio(paths) => {
+            let dir = paths[0].parent().unwrap_or_else(|| std::path::Path::new("."));
+            match tonepoet::tui::accuraterip::find_toc_offsets(dir) {
+                Some(s) => s,
+                None => {
+                    let (sample_counts, sample_rate) =
+                        tonepoet::tui::accuraterip::collect_sample_counts(paths)
+                            .map_err(|e| { eprintln!("tags-mb: {}", e); 3 })?;
+                    let samples_per_frame = (sample_rate / 75) as u64;
+                    let mut s = Vec::with_capacity(sample_counts.len() + 1);
+                    let mut frame: u64 = 150;
+                    for &c in &sample_counts { s.push(frame as u32); frame += c / samples_per_frame; }
+                    s.push(frame as u32);
+                    s
+                }
+            }
+        }
+        PathKind::SacdIso(_) => {
+            let durations = match state.sacd_area_kind {
+                Some(tonepoet::tui::sacd::AreaKind::Stereo) => state.sacd_stereo_durations.as_deref(),
+                Some(tonepoet::tui::sacd::AreaKind::MultiChannel) => state.sacd_multi_channel_durations.as_deref(),
+                None => None,
+            };
+            let durations = durations.ok_or_else(|| {
+                eprintln!("tags-mb: SACD has no per-track durations (TRL sectors malformed?)");
+                3
+            })?;
+            tonepoet::tui::command::sacd_durations_to_sectors(durations)
+        }
+    };
+    let toc_string = musicbrainz::build_mb_toc(&sectors)
+        .ok_or_else(|| { eprintln!("tags-mb: TOC too short"); 3 })?;
+    say!("TOC lookup ({} tracks)...", n_tracks);
+    let cached = db.get_cached_mb_response(&toc_string);
+    let outcome = musicbrainz::lookup_release_by_toc(&sectors, cached).await
+        .map_err(|e| { eprintln!("tags-mb: TOC lookup: {}", e); 4 })?;
+    if let Some(body) = outcome.cache_response {
+        let _ = db.store_mb_response(&toc_string, &body);
+    }
+    disambiguate(outcome.releases, auto, quiet, "TOC")
+}
+
+#[cfg(test)]
+mod tags_mb_cli_tests {
+    use super::*;
+
+    #[test]
+    fn classify_rejects_empty_paths() {
+        let r = classify_tags_mb_paths(&[]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn classify_rejects_mixed_iso_and_audio() {
+        let td = tempfile::tempdir().unwrap();
+        let iso = td.path().join("a.iso");
+        let flac = td.path().join("b.flac");
+        std::fs::write(&iso, b"").unwrap();
+        std::fs::write(&flac, b"").unwrap();
+        let r = classify_tags_mb_paths(&[iso, flac]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn classify_rejects_multi_directory_audio() {
+        let td = tempfile::tempdir().unwrap();
+        let dir_a = td.path().join("a");
+        let dir_b = td.path().join("b");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        let f_a = dir_a.join("01.flac");
+        let f_b = dir_b.join("02.flac");
+        std::fs::write(&f_a, b"").unwrap();
+        std::fs::write(&f_b, b"").unwrap();
+        let r = classify_tags_mb_paths(&[f_a, f_b]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("single directory"));
+    }
+
+    #[test]
+    fn classify_accepts_audio_files_in_same_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let f1 = td.path().join("01.flac");
+        let f2 = td.path().join("02.flac");
+        std::fs::write(&f1, b"").unwrap();
+        std::fs::write(&f2, b"").unwrap();
+        match classify_tags_mb_paths(&[f1.clone(), f2.clone()]) {
+            Ok(PathKind::Audio(v)) => assert_eq!(v, vec![f1, f2]),
+            other => panic!("expected Audio, got {:?}", match other {
+                Ok(PathKind::SacdIso(_)) => "SacdIso".to_string(),
+                Err(e) => format!("Err({})", e),
+                _ => "?".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn classify_accepts_single_iso() {
+        let td = tempfile::tempdir().unwrap();
+        let iso = td.path().join("disc.iso");
+        std::fs::write(&iso, b"").unwrap();
+        match classify_tags_mb_paths(&[iso.clone()]) {
+            Ok(PathKind::SacdIso(p)) => assert_eq!(p, iso),
+            _ => panic!("expected SacdIso"),
+        }
+    }
+
+    #[test]
+    fn classify_rejects_nonexistent_paths() {
+        let r = classify_tags_mb_paths(&[PathBuf::from("/nonexistent.flac")]);
+        assert!(r.is_err());
+        let r = classify_tags_mb_paths(&[PathBuf::from("/nonexistent.iso")]);
+        assert!(r.is_err());
+    }
+}
+
+fn disambiguate(
+    releases: Vec<tonepoet::tui::musicbrainz::MbRelease>,
+    auto: bool,
+    quiet: bool,
+    source: &str,
+) -> Result<Option<tonepoet::tui::musicbrainz::MbRelease>, i32> {
+    match releases.len() {
+        0 => {
+            if !quiet { println!("No MusicBrainz release matched the {}.", source); }
+            Ok(None)
+        }
+        1 => Ok(Some(releases.into_iter().next().unwrap())),
+        _ if auto => Ok(Some(releases.into_iter().next().unwrap())),
+        n => {
+            eprintln!(
+                "tags-mb: {} candidate releases matched. Re-run with --release-id <MBID> or --auto:",
+                n,
+            );
+            for r in releases.iter().take(10) {
+                eprintln!(
+                    "  [{}]  {} — {} ({})",
+                    r.release_id,
+                    r.artist,
+                    r.title,
+                    r.year.as_deref().unwrap_or("?"),
+                );
+            }
+            if releases.len() > 10 {
+                eprintln!("  …and {} more.", releases.len() - 10);
+            }
+            Err(2)
+        }
+    }
 }

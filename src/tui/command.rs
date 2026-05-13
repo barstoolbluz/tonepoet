@@ -3640,7 +3640,7 @@ pub(super) fn seed_sacd_mb_query(
 /// against arithmetic overflow on pathological inputs (a 24-hour
 /// compilation is ~6.5M frames, well within u32, so this is purely
 /// defensive).
-pub(super) fn sacd_durations_to_sectors(durations: &[f64]) -> Vec<u32> {
+pub fn sacd_durations_to_sectors(durations: &[f64]) -> Vec<u32> {
     let mut sectors = Vec::with_capacity(durations.len() + 1);
     let mut cur: u32 = 150;
     sectors.push(cur);
