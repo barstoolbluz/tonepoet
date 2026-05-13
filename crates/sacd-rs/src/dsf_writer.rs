@@ -119,8 +119,18 @@ pub struct DsfWriter<W: Write + Seek> {
     /// Bit-reversed bytes accumulate here; when all channels fill,
     /// they get flushed in channel-major order.
     channel_buffers: Vec<Vec<u8>>,
-    /// Total audio data bytes written to the data chunk so far.
+    /// Total audio data bytes written to the data chunk so far,
+    /// including zero-padding emitted at finish().
     audio_data_size: u64,
+    /// Total real (un-padded) bytes received via `write_interleaved`,
+    /// summed across all channels. The fmt-chunk `sample_count`
+    /// field is derived from this, **not** from `audio_data_size`,
+    /// to match the C reference's `handle->sample_count /
+    /// channel_count * 8` (where `handle->sample_count` only counts
+    /// real bytes — partial-tail flush in `dsf_close` adds the real
+    /// remainder, while `audio_data_size` gets the full padded
+    /// block).
+    real_bytes_total: u64,
 }
 
 impl<W: Write + Seek> DsfWriter<W> {
@@ -148,6 +158,7 @@ impl<W: Write + Seek> DsfWriter<W> {
                 .map(|_| Vec::with_capacity(BLOCK_SIZE_PER_CHANNEL))
                 .collect(),
             audio_data_size: 0,
+            real_bytes_total: 0,
         })
     }
 
@@ -162,6 +173,7 @@ impl<W: Write + Seek> DsfWriter<W> {
         while idx < data.len() {
             let ch = idx % n;
             self.channel_buffers[ch].push(BIT_REVERSE[data[idx] as usize]);
+            self.real_bytes_total += 1;
             idx += 1;
             // After we put a byte into the LAST channel of a cycle,
             // check whether the buffers are full. They all fill at
@@ -200,12 +212,14 @@ impl<W: Write + Seek> DsfWriter<W> {
             self.flush_block()?;
         }
 
-        // Now we know audio_data_size and can compute sample_count.
-        // sample_count is per-channel, in DSD samples. Each byte of
-        // payload carries 8 DSD samples. Per-channel byte count =
-        // audio_data_size / channel_count.
-        let bytes_per_channel = self.audio_data_size / (self.channel_count as u64);
-        let sample_count_per_channel = bytes_per_channel * 8;
+        // sample_count is per-channel, in DSD samples (bits). The C
+        // reference computes this from REAL bytes only (no zero
+        // padding): `handle->sample_count / channel_count * 8`,
+        // with integer truncation. Mirror that exactly so the fmt
+        // chunk is byte-identical for the same input.
+        let real_bytes_per_channel =
+            self.real_bytes_total / (self.channel_count as u64);
+        let sample_count_per_channel = real_bytes_per_channel * 8;
         let total_file_size = HEADER_TOTAL_SIZE + self.audio_data_size;
 
         self.writer.seek(SeekFrom::Start(0))?;
@@ -416,11 +430,13 @@ mod tests {
         let payload = synth_interleaved(2, 100);
         let out = run_write_and_capture(2, &payload);
         assert_eq!(out.len(), 92 + 2 * 4096);
-        // sample_count should reflect padded length: 4096 bytes × 8
-        // = 32768 per channel.
+        // sample_count must reflect REAL bytes per channel, not the
+        // padded block size — matching the C reference, which only
+        // bumps `handle->sample_count` by the real partial length in
+        // dsf_close. 100 real bytes × 8 bits = 800 samples/channel.
         assert_eq!(
             u64::from_le_bytes(out[64..72].try_into().unwrap()),
-            32_768,
+            800,
         );
         // ch0 byte 99 was the last real byte: bit-reverse of 99.
         assert_eq!(out[92 + 99], BIT_REVERSE[99]);
@@ -445,6 +461,26 @@ mod tests {
         assert_eq!(u64::from_le_bytes(out[12..20].try_into().unwrap()), 92);
         // data chunk size = 12 (header only, no payload).
         assert_eq!(u64::from_le_bytes(out[84..92].try_into().unwrap()), 12);
+    }
+
+    #[test]
+    fn sample_count_excludes_padding_with_full_plus_partial_block() {
+        // One full block per channel (4096 real bytes/ch) plus a
+        // 100-byte partial. C reference: sample_count_per_channel =
+        // (4096 + 100) * 8 = 33_568. audio_data_size = 2 full blocks
+        // worth = 2 channels × 2 × 4096 = 16384 (padded).
+        let payload = synth_interleaved(2, BLOCK_SIZE_PER_CHANNEL + 100);
+        let out = run_write_and_capture(2, &payload);
+        assert_eq!(out.len(), 92 + 2 * 2 * 4096);
+        assert_eq!(
+            u64::from_le_bytes(out[64..72].try_into().unwrap()),
+            (4096 + 100) * 8,
+        );
+        // total_file_size = 92 + padded audio.
+        assert_eq!(
+            u64::from_le_bytes(out[12..20].try_into().unwrap()),
+            92 + 2 * 2 * 4096,
+        );
     }
 
     #[test]
