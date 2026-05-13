@@ -3862,11 +3862,16 @@ pub fn build_sacd_editor_state(
                       item_key: ItemKey,
                       value: String| {
         let vals = vec![value.clone(); n_tracks];
+        // Sidecar (or ScarletBook fallback) is the source of truth
+        // for the displayed value. Mirror it into `original` so the
+        // row-level revert pill restores to what the user originally
+        // saw, not to an empty string. (Previously `original:
+        // String::new()` made row-level revert show a blank cell.)
         entries.push(TagEntry {
             display_key: display_key.to_string(),
             item_key,
-            value,
-            original: String::new(),
+            value: value.clone(),
+            original: value,
             is_binary: false,
             is_mixed: false,
             per_file_values: vals.clone(),
@@ -3947,11 +3952,16 @@ pub fn build_sacd_editor_state(
         } else {
             "<multiple values>".to_string()
         };
+        // Mirror the displayed value into `original` so the row-level
+        // revert pill restores the sidecar/ScarletBook truth instead
+        // of an empty string. For mixed entries `value` is
+        // `<multiple values>`; storing that as `original` matches
+        // how `grow_or_create_per_track` handles the same case.
         entries.push(TagEntry {
             display_key: display_key.to_string(),
             item_key,
-            value,
-            original: String::new(),
+            value: value.clone(),
+            original: value,
             is_binary: false,
             is_mixed: !all_same,
             per_file_originals: values.clone(),
