@@ -392,52 +392,7 @@ fn frame_is_complete(p: &PendingFrame) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::io::Write;
-
-    /// Build a synthetic sector with one audio packet of `payload`,
-    /// optionally starting a new frame. Pads the rest of the 2048
-    /// bytes with zeros. Uncompressed (dst=false). `tc` is the
-    /// timecode the frame_info entry carries.
-    fn synth_audio_sector(frame_start: bool, payload: &[u8], tc: Timecode) -> Vec<u8> {
-        let mut s = vec![0u8; SECTOR_SIZE as usize];
-        // header: dst=0, frame_info_count=1 (if frame_start, else 0),
-        // packet_info_count=1
-        let frame_info_count: u8 = if frame_start { 1 } else { 0 };
-        let header = 0u8 | (frame_info_count << 2) | (1 << 5);
-        s[0] = header;
-
-        let plen = payload.len() as u16;
-        // packet_info[0]
-        let fs_bit = if frame_start { 1u8 << 7 } else { 0 };
-        let dt = DATA_TYPE_AUDIO << 3;
-        s[1] = fs_bit | dt | ((plen >> 8) as u8 & 0x07);
-        s[2] = (plen & 0xFF) as u8;
-        let mut off = 3usize;
-
-        if frame_start {
-            // frame_info[0] (3 bytes for uncompressed)
-            s[off] = tc.minutes;
-            s[off + 1] = tc.seconds;
-            s[off + 2] = tc.frames;
-            off += 3;
-        }
-
-        // payload
-        s[off..off + payload.len()].copy_from_slice(payload);
-        s
-    }
-
-    fn write_iso(sectors: &[Vec<u8>]) -> tempfile::TempDir {
-        let td = tempfile::tempdir().unwrap();
-        let path = td.path().join("test.iso");
-        let mut f = File::create(&path).unwrap();
-        for s in sectors {
-            assert_eq!(s.len(), SECTOR_SIZE as usize);
-            f.write_all(s).unwrap();
-        }
-        td
-    }
+    use crate::test_util::{synth_audio_sector, synth_continuation_sector, write_iso};
 
     #[test]
     fn header_parsing_extracts_bitfields() {
@@ -469,19 +424,12 @@ mod tests {
             Timecode { minutes: 0, seconds: 0, frames: 1 },
         );
         // Sector 2..N: continuation packets (frame_start=false), no
-        // frame_info entry. Build manually.
+        // frame_info entry.
         let mut sectors = vec![sector1];
         let mut written = part_size;
         while written < frame_bytes.len() {
             let chunk = (frame_bytes.len() - written).min(part_size);
-            let mut s = vec![0u8; SECTOR_SIZE as usize];
-            // header: dst=0, frame_info_count=0, packet_info_count=1
-            s[0] = 1 << 5;
-            let plen = chunk as u16;
-            s[1] = (DATA_TYPE_AUDIO << 3) | ((plen >> 8) as u8 & 0x07);
-            s[2] = (plen & 0xFF) as u8;
-            s[3..3 + chunk].copy_from_slice(&frame_bytes[written..written + chunk]);
-            sectors.push(s);
+            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
             written += chunk;
         }
         // Trailing sector with a frame_start so the previous frame
@@ -520,13 +468,7 @@ mod tests {
         let mut written = part_size;
         while written < frame_bytes.len() {
             let chunk = (frame_bytes.len() - written).min(part_size);
-            let mut s = vec![0u8; SECTOR_SIZE as usize];
-            s[0] = 1 << 5;
-            let plen = chunk as u16;
-            s[1] = (DATA_TYPE_AUDIO << 3) | ((plen >> 8) as u8 & 0x07);
-            s[2] = (plen & 0xFF) as u8;
-            s[3..3 + chunk].copy_from_slice(&frame_bytes[written..written + chunk]);
-            sectors.push(s);
+            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
             written += chunk;
         }
         // NO trailing frame_start sector — range ends with the last
