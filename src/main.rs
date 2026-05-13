@@ -906,11 +906,24 @@ async fn run_tags_mb(
             };
             match tonepoet::tui::keybindings::save_sacd_sidecar(&state, &sidecar_path) {
                 Ok(outcome) => {
-                    let verb = match outcome {
-                        tonepoet::tui::keybindings::SacdSaveOutcome::Created => "created",
-                        tonepoet::tui::keybindings::SacdSaveOutcome::Updated => "updated",
+                    let verb = match outcome.kind {
+                        tonepoet::tui::keybindings::SacdSaveKind::Created => "created",
+                        tonepoet::tui::keybindings::SacdSaveKind::Updated => "updated",
                     };
-                    say!("SACD sidecar {}: {}", verb, sidecar_path.display());
+                    // Phase D mirror outcome: surface if both areas
+                    // got touched, mirror coverage on divergence.
+                    let mirror_note = if !outcome.mirror.sibling_present {
+                        String::new()
+                    } else if outcome.mirror.mirrored_count == outcome.mirror.sibling_total {
+                        " (stereo + MCH areas linked)".to_string()
+                    } else {
+                        format!(
+                            " (sibling area: {}/{} tracks mirrored)",
+                            outcome.mirror.mirrored_count,
+                            outcome.mirror.sibling_total,
+                        )
+                    };
+                    say!("SACD sidecar {}: {}{}", verb, sidecar_path.display(), mirror_note);
                     0
                 }
                 Err(e) => { err!("tags-mb: sidecar save failed: {}", e); 3 }

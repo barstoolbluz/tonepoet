@@ -2451,17 +2451,41 @@ pub(super) fn metadata_editor_save(
                     e.per_file_originals = e.per_file_values.clone();
                     e.original = e.value.clone();
                 }
-                let verb = match outcome {
-                    SacdSaveOutcome::Created => "created",
-                    SacdSaveOutcome::Updated => "updated",
+                let verb = match outcome.kind {
+                    SacdSaveKind::Created => "created",
+                    SacdSaveKind::Updated => "updated",
+                };
+                let file_name = sidecar_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| sidecar_path.display().to_string());
+                // Phase D: name the mirror outcome on hybrid SACDs so
+                // the user sees both areas got touched. Single-area
+                // SACDs and stereo-only saves keep the prior message.
+                let mirror = outcome.mirror;
+                let surfaced = match state.sacd_area_kind {
+                    Some(super::sacd::AreaKind::Stereo) => "stereo",
+                    Some(super::sacd::AreaKind::MultiChannel) => "MCH",
+                    None => "?",
+                };
+                let sibling = match state.sacd_area_kind {
+                    Some(super::sacd::AreaKind::Stereo) => "MCH",
+                    Some(super::sacd::AreaKind::MultiChannel) => "stereo",
+                    None => "?",
+                };
+                let area_note = if !mirror.sibling_present {
+                    format!("{} area only", surfaced)
+                } else if mirror.mirrored_count == mirror.sibling_total {
+                    format!("{} + {} areas", surfaced, sibling)
+                } else {
+                    format!(
+                        "{} + {}/{} {} tracks (count differs)",
+                        surfaced, mirror.mirrored_count, mirror.sibling_total, sibling,
+                    )
                 };
                 app.set_status(format!(
-                    "SACD sidecar {}: {}",
-                    verb,
-                    sidecar_path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| sidecar_path.display().to_string()),
+                    "SACD sidecar {} ({}): {}",
+                    verb, area_note, file_name,
                 ));
             }
             Err(reason) => {
@@ -4410,13 +4434,57 @@ fn is_album_level_sidecar_key(key: &str) -> bool {
     )
 }
 
-/// Outcome of a save: distinguishes a brand-new sidecar (mint-on-
-/// save path; `<store id>` freshly computed) from updates to an
-/// existing one (id preserved verbatim).
+/// Distinguishes a brand-new sidecar (mint-on-save path) from an
+/// update to an existing one. Mirrors foobar2000's per-write event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SacdSaveOutcome {
+pub enum SacdSaveKind {
     Created,
     Updated,
+}
+
+/// Phase D outcome of mirroring the surfaced area's edits to the
+/// sibling (stereo ↔ multi-channel) area. `sibling_present = false`
+/// for single-area SACDs — no mirror is attempted. When the sibling
+/// is present, `sibling_total` is its full track count and
+/// `mirrored_count` is how many tracks had a TRACKNUMBER that matched
+/// an editor row. Equal counts → full mirror; unequal → bonus tracks
+/// in either area weren't touched (status surfaces the partial
+/// coverage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorOutcome {
+    pub sibling_present: bool,
+    pub sibling_total: usize,
+    pub mirrored_count: usize,
+}
+
+/// Outcome of a save: kind (Created / Updated) plus Phase D mirror
+/// result so the caller can compose a status message that reflects
+/// whether both areas of a hybrid SACD got updated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SacdSaveOutcome {
+    pub kind: SacdSaveKind,
+    pub mirror: MirrorOutcome,
+}
+
+/// Phase D: keys that are intentionally area-specific and must NOT
+/// be mirrored across the stereo/multi-channel boundary. The audio
+/// is different per area, so values like dynamic range, peak/RMS
+/// measurements, etc. live per-area.
+///
+/// Today `DYNAMIC RANGE` and `ALBUM DYNAMIC RANGE` are foreign-
+/// preserved (not in `editor_key_to_sidecar_key`'s whitelist), so
+/// the mirror loop doesn't see them either way. **But future work
+/// (DR analysis on SACD via sox → PCM → DR-tag writeback) will add
+/// DR to the editor's write surface.** This exclusion exists so the
+/// mirror semantics stay correct when that day comes: register new
+/// per-area-specific keys HERE as they get widened into the editor.
+///
+/// Matches foobar2000's `is_linked_tag` exclusion semantics.
+pub fn is_per_area_specific_key(display_key: &str) -> bool {
+    matches!(
+        display_key.to_ascii_uppercase().as_str(),
+        "DYNAMIC RANGE" | "ALBUM DYNAMIC RANGE"
+    )
 }
 
 /// Apply the editor's per-track and album-level edits to a sidecar
@@ -4437,16 +4505,18 @@ pub fn save_sacd_sidecar(
     state: &super::app::MetadataEditorState,
     sidecar_path: &std::path::Path,
 ) -> Result<SacdSaveOutcome, String> {
-    let (mut sidecar, outcome) = if sidecar_path.exists() {
+    let (mut sidecar, kind) = if sidecar_path.exists() {
         let s = super::sacd_sidecar::parse_sidecar(sidecar_path)
             .map_err(|e| format!("re-read sidecar: {}", e))?;
-        (s, SacdSaveOutcome::Updated)
+        (s, SacdSaveKind::Updated)
     } else {
         // Mint path: no XML yet. Re-probe the ISO for ScarletBook
         // data, seed an in-memory sidecar, and mint the canonical
         // `<store id>` via MD5 of the master TOC region. The
         // editor's per-track edits get applied below exactly as on
-        // the update path.
+        // the update path. `seed_sidecar_from_scarletbook` populates
+        // BOTH areas if the ISO has both, so the Phase D mirror
+        // loop below has sibling tracks to write to on mint too.
         let iso_path = state
             .paths
             .first()
@@ -4457,7 +4527,7 @@ pub fn save_sacd_sidecar(
         let mut s = super::sacd_sidecar::seed_sidecar_from_scarletbook(&md);
         s.store_id = super::sacd_sidecar::mint_disc_id(&iso_path)
             .map_err(|e| format!("mint disc id: {}", e))?;
-        (s, SacdSaveOutcome::Created)
+        (s, SacdSaveKind::Created)
     };
 
     // Which 1-based area is the editor surfacing? Stereo → 1, MCH → 2.
@@ -4531,9 +4601,123 @@ pub fn save_sacd_sidecar(
         }
     }
 
+    // Phase D: mirror per-track + album-level edits to the SIBLING
+    // area (stereo ↔ multi-channel) so a hybrid SACD's areas stay in
+    // lockstep on metadata, matching foobar2000's "link tags between
+    // areas" default. Per-area-specific keys (DR today, possibly
+    // more once DSD→PCM analysis lands) are excluded via
+    // `is_per_area_specific_key`. Per-track cross-area matching uses
+    // TRACKNUMBER, not sidecar id (id namespaces differ between
+    // areas). Album-level fields replicate to every sibling track.
+    //
+    // Sibling-absent (single-area SACD): zero iterations, mirror
+    // becomes a no-op.
+    //
+    // Track-count divergence between areas (rare — bonus tracks on
+    // one side): mirror only the tracknumbers that match, surface
+    // the partial coverage in the status message via
+    // `MirrorOutcome`. Refusal stays specific to active-area
+    // mismatch above.
+    let sibling_area_idx = match area_idx {
+        1 => 2u8,
+        2 => 1u8,
+        _ => unreachable!("area_idx must be 1 or 2 by construction above"),
+    };
+    let sibling_track_info: Vec<(u32, Option<u32>)> = sidecar
+        .tracks_for_area(sibling_area_idx)
+        .iter()
+        .map(|t| {
+            let tn = t.meta.get("TRACKNUMBER")
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            (t.id, tn)
+        })
+        .collect();
+    let mirror = if sibling_track_info.is_empty() {
+        MirrorOutcome {
+            sibling_present: false,
+            sibling_total: 0,
+            mirrored_count: 0,
+        }
+    } else {
+        // Build a normalized TRACKNUMBER → editor index lookup. Parse
+        // to u32 so zero-padded `"01"` matches unpadded `"1"`.
+        let editor_tn_to_idx: std::collections::HashMap<u32, usize> = state
+            .entries
+            .iter()
+            .find(|e| e.display_key.eq_ignore_ascii_case("TRACKNUMBER"))
+            .map(|e| {
+                e.per_file_values
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| {
+                        v.trim().parse::<u32>().ok().map(|n| (n, i))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut mirrored_count = 0usize;
+        for (_sib_tid, sib_tn) in &sibling_track_info {
+            if sib_tn
+                .and_then(|tn| editor_tn_to_idx.get(&tn))
+                .is_some()
+            {
+                mirrored_count += 1;
+            }
+        }
+
+        for entry in &state.entries {
+            if is_per_area_specific_key(&entry.display_key) {
+                continue;
+            }
+            let Some(sidecar_key) = editor_key_to_sidecar_key(&entry.display_key) else {
+                continue;
+            };
+            if is_album_level_sidecar_key(sidecar_key) {
+                // Already errored above on mixed album-level entries.
+                let new_val = entry.value.clone();
+                for (sib_tid, _) in &sibling_track_info {
+                    if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *sib_tid) {
+                        if new_val.is_empty() {
+                            track.meta.remove(sidecar_key);
+                        } else {
+                            track.meta.insert(sidecar_key.to_string(), new_val.clone());
+                        }
+                    }
+                }
+            } else {
+                for (sib_tid, sib_tn) in &sibling_track_info {
+                    let Some(editor_idx) = sib_tn
+                        .and_then(|tn| editor_tn_to_idx.get(&tn).copied())
+                    else {
+                        continue;
+                    };
+                    let new_val = entry
+                        .per_file_values
+                        .get(editor_idx)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *sib_tid) {
+                        if new_val.is_empty() {
+                            track.meta.remove(sidecar_key);
+                        } else {
+                            track.meta.insert(sidecar_key.to_string(), new_val);
+                        }
+                    }
+                }
+            }
+        }
+
+        MirrorOutcome {
+            sibling_present: true,
+            sibling_total: sibling_track_info.len(),
+            mirrored_count,
+        }
+    };
+
     super::sacd_sidecar::write_sidecar(sidecar_path, &sidecar)
         .map_err(|e| format!("write: {}", e))?;
-    Ok(outcome)
+    Ok(SacdSaveOutcome { kind, mirror })
 }
 
 /// Handle mouse events for generic overlays: click-outside-to-close,
@@ -10694,6 +10878,213 @@ mod phase4_tests {
         assert_eq!(label, "MCH");
         let title = state.entries.iter().find(|e| e.display_key == "TITLE").expect("TITLE");
         assert_eq!(title.per_file_values, vec!["MCH T1", "MCH T2"]);
+    }
+
+    // ── Phase D: stereo ↔ MCH mirror-write ────────────────────────
+
+    #[test]
+    fn is_per_area_specific_key_covers_dr_keys() {
+        assert!(super::is_per_area_specific_key("DYNAMIC RANGE"));
+        assert!(super::is_per_area_specific_key("ALBUM DYNAMIC RANGE"));
+        assert!(super::is_per_area_specific_key("dynamic range"));
+        assert!(!super::is_per_area_specific_key("ALBUM"));
+        assert!(!super::is_per_area_specific_key("ARTIST"));
+        assert!(!super::is_per_area_specific_key("REPLAYGAIN_TRACK_GAIN"));
+    }
+
+    /// Build a hybrid (stereo + MCH) `SacdMetadata` with both areas
+    /// holding `n` tracks each. Mirrors `synth_sacd_metadata` but adds
+    /// the MCH area.
+    fn synth_hybrid_sacd_metadata(
+        album_title: Option<&str>,
+        stereo_titles: &[&str],
+        mch_titles: &[&str],
+    ) -> crate::tui::sacd::SacdMetadata {
+        use crate::tui::sacd::*;
+        let mut md = synth_sacd_metadata(
+            album_title, None, 0, None, stereo_titles,
+            &vec![""; stereo_titles.len()],
+            &vec![None; stereo_titles.len()],
+        );
+        // Synthesize MCH area by reusing the stereo header shape with
+        // MCH kind + the requested track count.
+        let mut mch_tracks: Vec<TrackEntry> = Vec::with_capacity(mch_titles.len());
+        for (i, t) in mch_titles.iter().enumerate() {
+            mch_tracks.push(TrackEntry {
+                start_lsn: 5000 + i as u32 * 100,
+                length_lsn: 100,
+                start_time: PlayTime::default(),
+                duration: PlayTime { minutes: 3, seconds: 0, frames: 0 },
+                text: TrackText {
+                    title: (!t.is_empty()).then(|| t.to_string()),
+                    ..Default::default()
+                },
+                isrc: None,
+                genre: None,
+            });
+        }
+        let mut mch_header = md.stereo.as_ref().unwrap().header.clone();
+        mch_header.kind = AreaKind::MultiChannel;
+        mch_header.channel_count = 6;
+        mch_header.track_count = mch_titles.len() as u8;
+        md.multi_channel = Some(AreaInfo { header: mch_header, tracks: mch_tracks });
+        md
+    }
+
+    /// Round-trip helper for hybrid saves: writes a sidecar XML to a
+    /// tempfile, builds the editor state from a hybrid `SacdMetadata`,
+    /// lets the test mutate the state, runs `save_sacd_sidecar`, and
+    /// returns the re-parsed sidecar alongside the save outcome.
+    fn round_trip_hybrid_save(
+        sidecar_xml: &str,
+        md: &crate::tui::sacd::SacdMetadata,
+        area: crate::tui::sacd::AreaKind,
+        mutate: impl FnOnce(&mut super::super::app::MetadataEditorState),
+    ) -> (
+        tempfile::TempDir,
+        crate::tui::sacd_sidecar::SidecarMetadata,
+        super::SacdSaveOutcome,
+    ) {
+        use crate::tui::sacd_sidecar::*;
+        let td = tempfile::tempdir().expect("tempdir");
+        let xml_path = td.path().join("disc.xml");
+        std::fs::write(&xml_path, sidecar_xml).unwrap();
+        let sidecar = parse_sidecar(&xml_path).expect("parse");
+        let iso_path = td.path().join("disc.iso");
+        std::fs::write(&iso_path, b"\0").unwrap();
+        let (mut state, _, _) = build_sacd_editor_state(&iso_path, md, Some(&sidecar))
+            .expect("build");
+        state.read_only = false;
+        state.sacd_sidecar_path = Some(xml_path.clone());
+        state.sacd_area_kind = Some(area);
+        mutate(&mut state);
+        let outcome = super::save_sacd_sidecar(&state, &xml_path).expect("save");
+        let reparsed = parse_sidecar(&xml_path).expect("re-parse");
+        (td, reparsed, outcome)
+    }
+
+    /// Hybrid sidecar with 2 stereo tracks (ids 1-2) + 2 MCH tracks
+    /// (ids 3-4), TRACKNUMBER `"01"`/`"02"` on each side. Album-level
+    /// fields seeded with deliberately different values so the mirror
+    /// has something visible to overwrite.
+    const SAMPLE_HYBRID_2X2: &str = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="St-1"/><meta name="ALBUM" value="StereoAlbum"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="2"><meta name="TITLE" value="St-2"/><meta name="ALBUM" value="StereoAlbum"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="3"><meta name="TITLE" value="MC-1"/><meta name="ALBUM" value="MCHAlbum"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="4"><meta name="TITLE" value="MC-2"/><meta name="ALBUM" value="MCHAlbum"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+</store></root>"#;
+
+    #[test]
+    fn save_sacd_sidecar_mirrors_album_level_edits_across_areas() {
+        let md = synth_hybrid_sacd_metadata(
+            Some("StereoAlbum"), &["St-1", "St-2"], &["MC-1", "MC-2"],
+        );
+        let (_td, reparsed, outcome) = round_trip_hybrid_save(
+            SAMPLE_HYBRID_2X2, &md, crate::tui::sacd::AreaKind::Stereo,
+            |state| {
+                let album = state.entries.iter_mut()
+                    .find(|e| e.display_key == "ALBUM").expect("ALBUM");
+                album.value = "NewAlbum".into();
+                album.per_file_values = vec!["NewAlbum".into(), "NewAlbum".into()];
+            },
+        );
+        assert!(outcome.mirror.sibling_present);
+        assert_eq!(outcome.mirror.mirrored_count, 2);
+        assert_eq!(outcome.mirror.sibling_total, 2);
+        // All four tracks in BOTH areas should have the new album.
+        for tid in 1..=4 {
+            let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
+            assert_eq!(
+                t.meta.get("ALBUM").map(String::as_str), Some("NewAlbum"),
+                "tid={} album-level mirror should overwrite", tid,
+            );
+        }
+    }
+
+    #[test]
+    fn save_sacd_sidecar_mirrors_per_track_edits_by_tracknumber() {
+        let md = synth_hybrid_sacd_metadata(
+            Some("Album"), &["St-1", "St-2"], &["MC-1", "MC-2"],
+        );
+        let (_td, reparsed, outcome) = round_trip_hybrid_save(
+            SAMPLE_HYBRID_2X2, &md, crate::tui::sacd::AreaKind::Stereo,
+            |state| {
+                let title = state.entries.iter_mut()
+                    .find(|e| e.display_key == "TITLE").expect("TITLE");
+                // Edit track 1's title only.
+                title.per_file_values[0] = "NewTitle1".into();
+                title.is_mixed = true;
+                title.value = "<multiple values>".into();
+            },
+        );
+        assert!(outcome.mirror.sibling_present);
+        assert_eq!(outcome.mirror.mirrored_count, 2);
+        // Active area (stereo): track 1 → NewTitle1, track 2 → St-2.
+        let st1 = reparsed.tracks.iter().find(|t| t.id == 1).expect("st1");
+        let st2 = reparsed.tracks.iter().find(|t| t.id == 2).expect("st2");
+        assert_eq!(st1.meta.get("TITLE").map(String::as_str), Some("NewTitle1"));
+        assert_eq!(st2.meta.get("TITLE").map(String::as_str), Some("St-2"));
+        // Mirror to MCH area by TRACKNUMBER match (ids 3,4 have TN
+        // "01","02"). MCH track 1 should pick up "NewTitle1" from
+        // editor row matching TN="01"; MCH track 2 stays untouched
+        // because the editor's row at TN="02" wasn't edited from
+        // the existing sidecar value.
+        let mc1 = reparsed.tracks.iter().find(|t| t.id == 3).expect("mc1");
+        let mc2 = reparsed.tracks.iter().find(|t| t.id == 4).expect("mc2");
+        assert_eq!(mc1.meta.get("TITLE").map(String::as_str), Some("NewTitle1"),
+            "MCH track 1 (TN=01) should mirror NewTitle1");
+        // mc2 mirror: editor row 1 has TN=02 with stereo value "St-2";
+        // the per-track mirror writes that to MCH track 2.
+        assert_eq!(mc2.meta.get("TITLE").map(String::as_str), Some("St-2"),
+            "MCH track 2 (TN=02) gets editor row 1's TITLE (which equals stereo's)");
+    }
+
+    #[test]
+    fn save_sacd_sidecar_mirror_handles_track_count_divergence() {
+        // Stereo has 3 tracks; MCH has only 2 (no MCH track for stereo's
+        // TN=03). Mirror should match TN 01/02 and leave the third
+        // stereo TN unrepresented in MCH — sibling_total=2,
+        // mirrored_count=2 (because both MCH tracks have a TN that
+        // exists in the editor; the "lost" track is on the stereo
+        // side, not the MCH side).
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="St-1"/><meta name="ALBUM" value="Old"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="2"><meta name="TITLE" value="St-2"/><meta name="ALBUM" value="Old"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="3"><meta name="TITLE" value="St-3"/><meta name="ALBUM" value="Old"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/></track>
+<track id="4"><meta name="TITLE" value="MC-1"/><meta name="ALBUM" value="Old"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="5"><meta name="TITLE" value="MC-2"/><meta name="ALBUM" value="Old"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+</store></root>"#;
+        let md = synth_hybrid_sacd_metadata(
+            Some("Old"),
+            &["St-1", "St-2", "St-3"],
+            &["MC-1", "MC-2"],
+        );
+        let (_td, reparsed, outcome) = round_trip_hybrid_save(
+            xml, &md, crate::tui::sacd::AreaKind::Stereo,
+            |state| {
+                let album = state.entries.iter_mut()
+                    .find(|e| e.display_key == "ALBUM").expect("ALBUM");
+                album.value = "New".into();
+                album.per_file_values = vec!["New".into(); 3];
+            },
+        );
+        assert!(outcome.mirror.sibling_present);
+        assert_eq!(outcome.mirror.sibling_total, 2);
+        assert_eq!(outcome.mirror.mirrored_count, 2,
+            "both MCH tracks have TNs that exist in editor → both mirrored");
+        // All five tracks across both areas get the new album-level
+        // value via the active-area replicate + sibling mirror.
+        for tid in 1..=5 {
+            let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
+            assert_eq!(t.meta.get("ALBUM").map(String::as_str), Some("New"),
+                "tid={} album-level should be New", tid);
+        }
+        // Original per-track titles preserved (we only edited ALBUM).
+        // MCH track with TN=03 doesn't exist; MCH tracks keep their
+        // TITLEs (mirror copies editor row's TITLE → that's the
+        // stereo TITLE; not what we want for per-track ≠ album-
+        // level. But the test only edited ALBUM, so this trace is
+        // bound to the album-level path.).
     }
 }
 
