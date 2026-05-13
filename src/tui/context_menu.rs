@@ -429,12 +429,20 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         EntryKind::SacdIso => {
             // C5 surfaces ScarletBook metadata in a read-only editor;
             // convert/export wiring lands in C7 (needs audio extraction).
+            // Tagging + Utilities re-enabled in C-2d: `:tags-mb` on a
+            // Browse-selected SACD ISO now auto-opens the editor and
+            // dispatches the TOC path. `has_cue = false` because SACDs
+            // use sidecar XML, not `.cue` — the "Get tags from CUE"
+            // item wouldn't apply anyway.
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(separator());
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
             items.push(item("Select Inverse", ContextAction::SelectInverse));
             items.push(item("Deselect", ContextAction::Deselect));
+            items.push(separator());
+            items.push(build_tagging_submenu(false));
+            items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(false));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));

@@ -1875,6 +1875,57 @@ pub fn execute_command(
                 None
             };
 
+            // C-2d: Browse + single SACD ISO selection + no editor
+            // open → auto-open the SACD editor first, then fall
+            // through to in-editor dispatch which uses the TOC path.
+            // Without this, right-click → "Get tags from MusicBrainz"
+            // on an ISO surfaces the editor-first hint instead of
+            // doing what the user asked.
+            if app.current_screen == AppScreen::Browse
+                && !matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_))
+                && app.pending_metadata_editor.is_none()
+            {
+                let sel = collect_selection_for_file_ops(app);
+                let sacd_isos: Vec<std::path::PathBuf> = sel
+                    .iter()
+                    .filter(|p| p.extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("iso")))
+                    .filter(|p| super::sacd::is_sacd_iso(p))
+                    .cloned()
+                    .collect();
+                let has_audio = sel.iter().any(|p| matches!(
+                    super::browse::classify_file(p),
+                    super::browse::EntryKind::AudioFile(_)
+                ));
+
+                if sacd_isos.len() > 1 {
+                    app.set_status(
+                        ":tags-mb: multiple SACD ISOs selected — select one at a time",
+                    );
+                    return;
+                }
+                if !sacd_isos.is_empty() && has_audio {
+                    app.set_status(
+                        ":tags-mb: mixed selection (SACD ISO + audio files) — select one type",
+                    );
+                    return;
+                }
+                if let Some(iso) = sacd_isos.into_iter().next() {
+                    super::keybindings::open_metadata_editor_for_sacd(app, iso);
+                    // If parse failed (or any reason left the editor
+                    // unset), the open helper already set a clear
+                    // status; surface it instead of letting the
+                    // Browse fallthrough overwrite with a less
+                    // specific hint.
+                    if !matches!(
+                        app.active_overlay,
+                        super::app::ActiveOverlay::MetadataEditor(_),
+                    ) {
+                        return;
+                    }
+                }
+            }
+
             // In-editor dispatch (SACD or regular file). Returns Some
             // when an editor was in scope; the Browse-path fall-through
             // below runs only when no editor is open. `direct_seed` is
@@ -1903,29 +1954,11 @@ pub fn execute_command(
                 _ => Vec::new(),
             };
             if paths.is_empty() {
-                // SACD ISOs are stripped by the AudioFile filter
-                // (they're not classified as audio files). When the
-                // user lands here with a `.iso` in their selection,
-                // they're almost certainly trying to MB-tag a SACD —
-                // surface the editor-first workflow hint rather than
-                // the generic "no audio files" message.
-                //
-                // Pre-existing Browse → SACD-ISO direct dispatch is
-                // a future phase (C-2d); for now the hint sends the
-                // user to the correct entry point.
-                let sel = collect_selection_for_file_ops(app);
-                let has_iso = sel.iter().any(|p| {
-                    p.extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
-                });
-                if has_iso {
-                    app.set_status(
-                        ":tags-mb: SACD ISO selected — open it in the metadata \
-                         editor first (Enter / right-click → Edit Metadata)",
-                    );
-                } else {
-                    app.set_status(":tags-mb: no audio files in selection");
-                }
+                // SACD ISOs are handled by the auto-open block at the
+                // top of this arm (C-2d); anything reaching here is
+                // genuinely a "no audio files" case (empty selection,
+                // data-disc `.iso`, or unrecognized extensions).
+                app.set_status(":tags-mb: no audio files in selection");
                 return;
             }
             super::probe::sort_paths_by_track(&mut paths);

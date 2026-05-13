@@ -3721,7 +3721,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
 /// metabase format), hands both to `build_sacd_editor_state` to
 /// construct the editor state, and installs it on the app. Sidecar
 /// data wins on every field it provides; ScarletBook fills gaps.
-fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBuf) {
+pub(super) fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBuf) {
     let md = match super::sacd::parse_sacd_iso(&iso_path) {
         Ok(m) => m,
         Err(e) => {
