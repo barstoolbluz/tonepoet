@@ -32,3 +32,6 @@
 //!   for the dense math, integrated here).
 //! - **PR 3**: tonepoet pipeline integration (Convert UI for SACD,
 //!   Analyze + DR via sox decimation).
+
+pub mod frame;
+pub mod iso_reader;
