@@ -1,0 +1,12 @@
+[package]
+name = "sacd-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Pure-Rust SACD ISO audio extraction (DSF/DFF output, DST decoding)"
+license = "GPL-2.0-or-later"
+authors = ["tonepoet contributors"]
+
+[dependencies]
+
+[dev-dependencies]
