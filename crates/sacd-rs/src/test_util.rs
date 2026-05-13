@@ -96,6 +96,20 @@ pub(crate) fn synth_continuation_sector(payload: &[u8]) -> Vec<u8> {
     s
 }
 
+/// Build a [`Timecode`] from a total 75fps frame count. Useful for
+/// readable test setup when frame counts are the natural unit.
+///
+/// Formula matches sacd_extract's `TIME_FRAMECOUNT` macro (defined
+/// in `libsacd/scarletbook.h`):
+/// `total = minutes * 60 * 75 + seconds * 75 + frames`.
+pub(crate) fn tc_at(frame_count: u32) -> Timecode {
+    let m = (frame_count / (60 * 75)) as u8;
+    let rem = frame_count % (60 * 75);
+    let s = (rem / 75) as u8;
+    let f = (rem % 75) as u8;
+    Timecode { minutes: m, seconds: s, frames: f }
+}
+
 /// Write `sectors` to a temp file and return the TempDir (kept alive
 /// by the caller to prevent cleanup before the test finishes).
 pub(crate) fn write_iso(sectors: &[Vec<u8>]) -> tempfile::TempDir {

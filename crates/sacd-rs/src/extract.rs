@@ -42,6 +42,88 @@ pub enum OutputFormat {
     Dff,
 }
 
+/// Time-based frame filter for excluding pre-gap and inter-track
+/// pause frames. Matches sacd_extract's `frame_read_callback`
+/// default behavior (`audio_frame_trimming = 1`): frames whose
+/// absolute timecode is outside `[start_frame, start_frame +
+/// duration_frames)` get silently dropped.
+///
+/// Source the values from SACDTRL2 — in tonepoet's parser, that's
+/// `TrackEntry.start_time` and `TrackEntry.duration` (both as
+/// `PlayTime`). Convert each to 75fps frame counts:
+/// `m * 60 * 75 + s * 75 + f`. This formula is identical to
+/// sacd_extract's `TIME_FRAMECOUNT` macro
+/// (libsacd/scarletbook.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeFilter {
+    /// Track start absolute timecode in 75fps frame units.
+    pub start_frame: u32,
+    /// Track duration in 75fps frame units.
+    pub duration_frames: u32,
+}
+
+impl TimeFilter {
+    /// Construct a filter from frame counts. Use the formula
+    /// `m * 60 * 75 + s * 75 + f` to derive each value from a
+    /// (minutes, seconds, frames) timecode triple.
+    pub fn new(start_frame: u32, duration_frames: u32) -> Self {
+        Self { start_frame, duration_frames }
+    }
+
+    /// True iff `tc ∈ [start_frame, start_frame + duration_frames)`,
+    /// matching sacd_extract's keep-frame condition. Uses saturating
+    /// arithmetic so adversarial inputs (e.g. `duration_frames =
+    /// u32::MAX`) don't panic.
+    pub fn includes(&self, tc: u32) -> bool {
+        let end = self.start_frame.saturating_add(self.duration_frames);
+        tc >= self.start_frame && tc < end
+    }
+}
+
+/// Options bundle for [`extract_track`]. Forward-compatible with
+/// future Series-3 parity items (ID3 mode, edit-master, concatenate,
+/// etc.) — new knobs land here without changing the function
+/// signature.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractOptions {
+    pub start_lsn: u64,
+    pub end_lsn: u64,
+    pub channel_count: u8,
+    pub format: OutputFormat,
+    /// If set, frames whose timecode is outside the filter's range
+    /// are silently dropped. Matches sacd_extract's default
+    /// `audio_frame_trimming = 1` behavior. Use when passing the
+    /// wider `area_toc.track_start..track_start_lsn[next]` LSN
+    /// range; leave `None` when passing pre-trimmed SACDTRL1
+    /// ranges (no frames will be out of timecode bounds anyway).
+    pub time_filter: Option<TimeFilter>,
+}
+
+impl ExtractOptions {
+    /// Construct options for the no-filter case (matches
+    /// sacd_extract's `-b pauses` flag behavior).
+    pub fn new(
+        start_lsn: u64,
+        end_lsn: u64,
+        channel_count: u8,
+        format: OutputFormat,
+    ) -> Self {
+        Self {
+            start_lsn,
+            end_lsn,
+            channel_count,
+            format,
+            time_filter: None,
+        }
+    }
+
+    /// Attach a time filter (sacd_extract's default behavior).
+    pub fn with_time_filter(mut self, filter: TimeFilter) -> Self {
+        self.time_filter = Some(filter);
+        self
+    }
+}
+
 /// Errors from `extract_track`.
 #[derive(Debug)]
 pub enum ExtractError {
@@ -83,76 +165,111 @@ impl From<io::Error> for ExtractError {
 /// Summary returned on successful extraction.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExtractStats {
-    /// Number of complete frames read from the ISO.
+    /// Number of frames **written to output**. Frames dropped by
+    /// the time filter are not counted, matching sacd_extract's
+    /// `count_frames` semantics (incremented only inside the
+    /// keep-range branch of `frame_read_callback`).
     pub frames_read: u64,
-    /// Total audio bytes pushed to the writer (pre-pad).
+    /// Total audio bytes pushed to the writer (pre-pad,
+    /// post-filter).
     pub audio_bytes: u64,
 }
 
-/// Extract a single track's DSD audio from `iso` (sector range
-/// `[start_lsn, end_lsn)`) into `output`, formatted per `format`.
+/// Extract a single track's DSD audio from `iso` into `output`,
+/// per `opts`.
 ///
-/// `channel_count` is the area's channel layout (2, 5, or 6 for real
-/// SACDs). It populates the output container's metadata; uncompressed
-/// DSD frames don't carry channel count themselves, so the value
-/// must match the area_toc.
+/// `opts.channel_count` must match the SACD area's channel layout
+/// (2, 5, or 6 for real SACDs). Uncompressed DSD frames don't
+/// self-describe channel count; the orchestrator trusts the caller.
 ///
-/// ## LSN range selection
+/// ## LSN range + time filter
 ///
-/// Pass the per-track range from SACDTRL1 (`TrackEntry.start_lsn`
-/// + `length_lsn` in tonepoet's SACD parser), NOT the area_toc's
-/// `track_start`/`track_end`. SACDTRL1 ranges already exclude
-/// pre-gaps and inter-track pauses. If you pass the wider area_toc
-/// range, pre-gap and pause audio gets included in the output.
+/// Two valid call patterns produce identical output for real SACDs:
 ///
-/// The C reference sacd_extract uses the area_toc range plus a
-/// frame-timecode filter to drop the same pause frames; we don't
-/// implement that filter, so caller-side range selection matters
-/// for byte-exact matching with sacd_extract's default behavior.
+/// 1. **Pre-trimmed LSN range, no filter** — pass tonepoet's
+///    `TrackEntry.start_lsn` + `length_lsn` from SACDTRL1, with
+///    `opts.time_filter = None`. The SACDTRL1 range already
+///    excludes pre-gaps + inter-track pauses, so no frame filter
+///    is needed.
 ///
-/// On error, the output is left in an inconsistent state (header
-/// shows zero audio but file contains partial bytes). Caller should
-/// delete the output.
+/// 2. **Wide LSN range + time filter** — pass the
+///    `area_toc.track_start..track_start_lsn[next_track]` range
+///    plus `opts.time_filter = Some(TimeFilter { ... })` built from
+///    SACDTRL2's per-track start time + duration. This matches
+///    sacd_extract's default behavior (`audio_frame_trimming = 1`).
+///
+/// Both patterns produce sacd_extract-default-equivalent audio
+/// output. Pattern 1 is more efficient (fewer sectors read);
+/// pattern 2 is sacd_extract-faithful when reproducing legacy
+/// behavior matters.
+///
+/// On error, the output writer is dropped without `finish()`;
+/// the file ends up with a placeholder header (zero chunk sizes)
+/// plus partial audio bytes. **Discard the output on any error.**
 pub fn extract_track<W: Write + Seek>(
     iso: &mut IsoReader,
     output: &mut W,
-    start_lsn: u64,
-    end_lsn: u64,
-    channel_count: u8,
-    format: OutputFormat,
+    opts: ExtractOptions,
 ) -> Result<ExtractStats, ExtractError> {
-    let mut reader = FrameReader::new(iso, start_lsn, end_lsn);
+    let mut reader = FrameReader::new(iso, opts.start_lsn, opts.end_lsn);
 
-    match format {
+    match opts.format {
         OutputFormat::Dsf => {
-            let mut writer = DsfWriter::new(output, channel_count, SACD_SAMPLING_FREQUENCY)?;
-            let mut stats = ExtractStats::default();
-            while let Some(frame) = reader.next_frame()? {
-                if frame.dst_encoded {
-                    return Err(ExtractError::DstFrameUnsupported);
-                }
-                writer.write_interleaved(&frame.data)?;
-                stats.frames_read += 1;
-                stats.audio_bytes += frame.data.len() as u64;
-            }
+            let mut writer =
+                DsfWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
+            let stats = drain_frames(&mut reader, opts.time_filter, |data| {
+                writer.write_interleaved(data).map_err(ExtractError::Io)
+            })?;
             writer.finish()?;
             Ok(stats)
         }
         OutputFormat::Dff => {
-            let mut writer = DffWriter::new(output, channel_count, SACD_SAMPLING_FREQUENCY)?;
-            let mut stats = ExtractStats::default();
-            while let Some(frame) = reader.next_frame()? {
-                if frame.dst_encoded {
-                    return Err(ExtractError::DstFrameUnsupported);
-                }
-                writer.write_frame(&frame.data)?;
-                stats.frames_read += 1;
-                stats.audio_bytes += frame.data.len() as u64;
-            }
+            let mut writer =
+                DffWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
+            let stats = drain_frames(&mut reader, opts.time_filter, |data| {
+                writer.write_frame(data).map_err(ExtractError::Io)
+            })?;
             writer.finish()?;
             Ok(stats)
         }
     }
+}
+
+/// Drain frames from `reader`, applying `time_filter` (if any),
+/// erroring on DST frames in the keep-range, and forwarding each
+/// kept frame's data to `write_data`.
+///
+/// Filter-then-DST order mirrors sacd_extract's `frame_read_callback`
+/// nesting: out-of-range DST frames are silently dropped without
+/// triggering an unsupported-format error.
+fn drain_frames<F>(
+    reader: &mut FrameReader<'_>,
+    time_filter: Option<TimeFilter>,
+    mut write_data: F,
+) -> Result<ExtractStats, ExtractError>
+where
+    F: FnMut(&[u8]) -> Result<(), ExtractError>,
+{
+    let mut stats = ExtractStats::default();
+    while let Some(frame) = reader.next_frame()? {
+        // (1) Time filter: matches sacd_extract's outer-guard
+        // ordering. Out-of-range frames drop silently regardless
+        // of compression.
+        if let Some(filter) = time_filter {
+            if !filter.includes(frame.timecode.as_frame_count()) {
+                continue;
+            }
+        }
+        // (2) DST check: only applies to in-range frames.
+        if frame.dst_encoded {
+            return Err(ExtractError::DstFrameUnsupported);
+        }
+        // (3) Write to format-specific sink.
+        write_data(&frame.data)?;
+        stats.frames_read += 1;
+        stats.audio_bytes += frame.data.len() as u64;
+    }
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -161,7 +278,7 @@ mod tests {
     use crate::dsf_writer::BLOCK_SIZE_PER_CHANNEL;
     use crate::frame::{Timecode, FRAME_SIZE_UNCOMPRESSED};
     use crate::test_util::{
-        synth_audio_sector, synth_continuation_sector, synth_dst_sector, write_iso,
+        synth_audio_sector, synth_continuation_sector, synth_dst_sector, tc_at, write_iso,
     };
 
     const PART_SIZE: usize = 2000;
@@ -211,18 +328,27 @@ mod tests {
     fn run_extract(sectors: Vec<Vec<u8>>, channel_count: u8, format: OutputFormat)
         -> (Vec<u8>, ExtractStats)
     {
+        run_extract_with(sectors, channel_count, format, None)
+    }
+
+    /// Same as `run_extract` but with an optional time filter. End
+    /// LSN is set to the sector count.
+    fn run_extract_with(
+        sectors: Vec<Vec<u8>>,
+        channel_count: u8,
+        format: OutputFormat,
+        time_filter: Option<TimeFilter>,
+    ) -> (Vec<u8>, ExtractStats) {
+        let end_lsn = sectors.len() as u64;
         let td = write_iso(&sectors);
         let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
         let mut output = std::io::Cursor::new(Vec::<u8>::new());
-        let stats = extract_track(
-            &mut iso,
-            &mut output,
-            0,
-            sectors.len() as u64,
-            channel_count,
-            format,
-        )
-        .expect("extract should succeed");
+        let mut opts = ExtractOptions::new(0, end_lsn, channel_count, format);
+        if let Some(tf) = time_filter {
+            opts = opts.with_time_filter(tf);
+        }
+        let stats = extract_track(&mut iso, &mut output, opts)
+            .expect("extract should succeed");
         (output.into_inner(), stats)
     }
 
@@ -344,8 +470,12 @@ mod tests {
         let td = write_iso(&sectors);
         let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
         let mut output = std::io::Cursor::new(Vec::<u8>::new());
-        let err = extract_track(&mut iso, &mut output, 0, 1, 2, OutputFormat::Dff)
-            .expect_err("DST frame must error");
+        let err = extract_track(
+            &mut iso,
+            &mut output,
+            ExtractOptions::new(0, 1, 2, OutputFormat::Dff),
+        )
+        .expect_err("DST frame must error");
         assert!(matches!(err, ExtractError::DstFrameUnsupported), "got {:?}", err);
     }
 
@@ -355,7 +485,12 @@ mod tests {
         let td = write_iso(&[]);
         let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
         let mut output = std::io::Cursor::new(Vec::<u8>::new());
-        let stats = extract_track(&mut iso, &mut output, 0, 0, 2, OutputFormat::Dff).unwrap();
+        let stats = extract_track(
+            &mut iso,
+            &mut output,
+            ExtractOptions::new(0, 0, 2, OutputFormat::Dff),
+        )
+        .unwrap();
         let out = output.into_inner();
         assert_eq!(out.len(), 144);
         assert_eq!(read_u64_be(&out, 136), 0); // DSD-data.chunk_data_size
@@ -369,12 +504,193 @@ mod tests {
         let td = write_iso(&[]);
         let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
         let mut output = std::io::Cursor::new(Vec::<u8>::new());
-        let stats = extract_track(&mut iso, &mut output, 0, 0, 2, OutputFormat::Dsf).unwrap();
+        let stats = extract_track(
+            &mut iso,
+            &mut output,
+            ExtractOptions::new(0, 0, 2, OutputFormat::Dsf),
+        )
+        .unwrap();
         let out = output.into_inner();
         assert_eq!(out.len(), 92);
         assert_eq!(read_u64_le(&out, 64), 0); // sample_count
         assert_eq!(stats.frames_read, 0);
         assert_eq!(stats.audio_bytes, 0);
+    }
+
+    // ============================================================
+    //  PR 3a — TimeFilter tests
+    // ============================================================
+
+    #[test]
+    fn time_filter_includes_in_range_frame() {
+        // Range [150, 11281) — Solo Monk track 1 from PR 1e
+        // validation.
+        let tf = TimeFilter::new(150, 11131);
+        assert!(!tf.includes(0), "tc 0 should be out (pre-gap)");
+        assert!(!tf.includes(149), "tc 149 (one before start) should be out");
+        assert!(tf.includes(150), "tc 150 (start, inclusive) should be in");
+        assert!(tf.includes(5000), "tc 5000 (mid-track) should be in");
+        assert!(tf.includes(11280), "tc 11280 (end-1, inclusive) should be in");
+        assert!(!tf.includes(11281), "tc 11281 (end, exclusive) should be out");
+        assert!(!tf.includes(50000), "tc 50000 (post-track) should be out");
+    }
+
+    #[test]
+    fn time_filter_with_zero_duration_rejects_everything() {
+        let tf = TimeFilter::new(100, 0);
+        for tc in [0, 99, 100, 101, 1000, u32::MAX] {
+            assert!(!tf.includes(tc), "tc {} should be rejected (duration=0)", tc);
+        }
+    }
+
+    #[test]
+    fn time_filter_overflow_saturates() {
+        // start=u32::MAX - 50, duration=100 would mathematically end
+        // at u32::MAX + 50; saturating arithmetic clamps end to
+        // u32::MAX. The half-open interval [MAX-50, MAX) thus
+        // includes MAX-50..MAX-1 inclusive but excludes MAX itself.
+        // No panic, deterministic behavior on adversarial inputs.
+        let tf = TimeFilter::new(u32::MAX - 50, 100);
+        assert!(tf.includes(u32::MAX - 50), "start (inclusive) included");
+        assert!(tf.includes(u32::MAX - 1), "in-range value included");
+        assert!(!tf.includes(u32::MAX), "MAX is the exclusive saturated end");
+        assert!(!tf.includes(u32::MAX - 51), "before start excluded");
+    }
+
+    #[test]
+    fn extract_with_filter_drops_pre_gap_frames() {
+        // Three frames at tc=100, tc=200, tc=300. Filter [150, 250)
+        // keeps only the tc=200 frame.
+        let frame_pre = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let frame_mid: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
+            .map(|i| ((i + 17) & 0xFF) as u8)
+            .collect();
+        let frame_post: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
+            .map(|i| ((i + 31) & 0xFF) as u8)
+            .collect();
+        let mut sectors = synth_uncompressed_frame_sectors(&frame_pre, tc_at(100));
+        sectors.extend(synth_uncompressed_frame_sectors(&frame_mid, tc_at(200)));
+        sectors.extend(synth_uncompressed_frame_sectors(&frame_post, tc_at(300)));
+
+        let (out, stats) = run_extract_with(
+            sectors,
+            2,
+            OutputFormat::Dff,
+            Some(TimeFilter::new(150, 100)), // range [150, 250)
+        );
+
+        assert_eq!(stats.frames_read, 1, "only frame_mid kept");
+        assert_eq!(stats.audio_bytes, 9408);
+        // DFF header (144) + 9408 audio bytes (just frame_mid).
+        assert_eq!(out.len(), 144 + 9408);
+        assert_eq!(&out[144..144 + 9408], &frame_mid[..]);
+    }
+
+    #[test]
+    fn extract_with_filter_drops_post_track_frames() {
+        // Three frames at tc=100, tc=200, tc=300. Filter [50, 200)
+        // keeps tc=100 only (tc=200 is at the exclusive end).
+        let frame_a = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let frame_b: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
+            .map(|i| ((i + 17) & 0xFF) as u8)
+            .collect();
+        let frame_c: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
+            .map(|i| ((i + 31) & 0xFF) as u8)
+            .collect();
+        let mut sectors = synth_uncompressed_frame_sectors(&frame_a, tc_at(100));
+        sectors.extend(synth_uncompressed_frame_sectors(&frame_b, tc_at(200)));
+        sectors.extend(synth_uncompressed_frame_sectors(&frame_c, tc_at(300)));
+
+        let (out, stats) = run_extract_with(
+            sectors,
+            2,
+            OutputFormat::Dff,
+            Some(TimeFilter::new(50, 150)), // range [50, 200)
+        );
+
+        assert_eq!(stats.frames_read, 1, "only frame_a kept (tc=100)");
+        assert_eq!(&out[144..144 + 9408], &frame_a[..]);
+    }
+
+    #[test]
+    fn extract_with_filter_boundary_frames() {
+        // tc=150 (= start, INCLUDED), tc=11280 (= end-1, INCLUDED),
+        // tc=11281 (= end, EXCLUDED). Filter {start:150, dur:11131}.
+        let frame_at_start = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let frame_at_end_minus_one: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
+            .map(|i| ((i + 7) & 0xFF) as u8)
+            .collect();
+        let frame_at_end: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
+            .map(|i| ((i + 41) & 0xFF) as u8)
+            .collect();
+        let mut sectors = synth_uncompressed_frame_sectors(&frame_at_start, tc_at(150));
+        sectors.extend(synth_uncompressed_frame_sectors(
+            &frame_at_end_minus_one, tc_at(11280),
+        ));
+        sectors.extend(synth_uncompressed_frame_sectors(&frame_at_end, tc_at(11281)));
+
+        let (out, stats) = run_extract_with(
+            sectors,
+            2,
+            OutputFormat::Dff,
+            Some(TimeFilter::new(150, 11131)), // range [150, 11281)
+        );
+
+        assert_eq!(stats.frames_read, 2, "start and end-1 kept; end excluded");
+        assert_eq!(stats.audio_bytes, 9408 * 2);
+        assert_eq!(&out[144..144 + 9408], &frame_at_start[..]);
+        assert_eq!(&out[144 + 9408..144 + 9408 * 2], &frame_at_end_minus_one[..]);
+    }
+
+    #[test]
+    fn extract_with_filter_on_dsf_drops_out_of_range_frames() {
+        // Two frames; only tc=200 in range. DSF demuxes + bit-reverses
+        // just that single frame's bytes.
+        let frame_pre = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let frame_mid: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
+            .map(|i| ((i + 17) & 0xFF) as u8)
+            .collect();
+        let mut sectors = synth_uncompressed_frame_sectors(&frame_pre, tc_at(100));
+        sectors.extend(synth_uncompressed_frame_sectors(&frame_mid, tc_at(200)));
+
+        let (out, stats) = run_extract_with(
+            sectors,
+            2,
+            OutputFormat::Dsf,
+            Some(TimeFilter::new(150, 100)), // range [150, 250) — drops pre
+        );
+
+        assert_eq!(stats.frames_read, 1);
+        // Per-channel real bytes = 4704 = 1 full block + 608 partial.
+        // File = 92 header + 2 * 2 * 4096 = 16476 bytes.
+        assert_eq!(out.len(), 92 + 2 * 2 * BLOCK_SIZE_PER_CHANNEL);
+        // ch0 block 0 byte 0 = bit_reverse of frame_mid[0] (not
+        // frame_pre[0]).
+        assert_eq!(out[92], bit_reverse(frame_mid[0]));
+        assert_eq!(out[92 + 4096], bit_reverse(frame_mid[1]));
+        // sample_count = 4704 * 8 (real bytes/channel × 8 bits).
+        assert_eq!(read_u64_le(&out, 64), (FRAME_SIZE_UNCOMPRESSED as u64) * 8);
+    }
+
+    #[test]
+    fn extract_with_no_filter_matches_pr1e_behavior() {
+        // Explicit regression check: opts.time_filter = None must
+        // produce identical output to the equivalent unfiltered
+        // call. Same input as `extract_uncompressed_stereo_to_dff_
+        // preserves_bytes`.
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let sectors = synth_uncompressed_frame_sectors(&frame, tc_at(150));
+        let (out_filtered, stats_filtered) = run_extract_with(
+            sectors.clone(),
+            2,
+            OutputFormat::Dff,
+            None,
+        );
+        let (out_plain, stats_plain) = run_extract(sectors, 2, OutputFormat::Dff);
+        assert_eq!(out_filtered, out_plain);
+        assert_eq!(stats_filtered.frames_read, stats_plain.frames_read);
+        assert_eq!(stats_filtered.audio_bytes, stats_plain.audio_bytes);
+        assert_eq!(stats_filtered.frames_read, 1);
     }
 
     #[test]

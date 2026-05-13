@@ -42,11 +42,13 @@ fn main() {
         for (i, t) in area.tracks.iter().enumerate() {
             let end_lsn = t.start_lsn as u64 + t.length_lsn as u64;
             println!(
-                "  track {:>2}: start_lsn={:>7} length_lsn={:>7} end_lsn={:>7}",
+                "  track {:>2}: lsn=[{:>7}, {:>7}) ({:>7} sectors)  time-filter-start={:02}:{:02}:{:02}  time-filter-duration={:02}:{:02}:{:02}",
                 i + 1,
                 t.start_lsn,
-                t.length_lsn,
                 end_lsn,
+                t.length_lsn,
+                t.start_time.minutes, t.start_time.seconds, t.start_time.frames,
+                t.duration.minutes, t.duration.seconds, t.duration.frames,
             );
         }
     }
