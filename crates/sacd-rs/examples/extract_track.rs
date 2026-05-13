@@ -12,9 +12,18 @@
 //!     --output /tmp/track.dff
 //! ```
 //!
-//! Find the LSN range for a track by running `sacd-extract --verbose
-//! ...` and reading the per-track start_lsn + sector_count from its
-//! log output, then compute `end_lsn = start_lsn + sector_count`.
+//! Find the LSN range for a track via tonepoet's
+//! `examples/dump_sacd_lsn`, which reads SACDTRL1 from the area TOC
+//! and prints the per-track start_lsn + length_lsn (= end_lsn).
+//!
+//! **Important**: use the per-track values from SACDTRL1, NOT
+//! area_toc.track_start/track_end. Sacd-rs extracts whatever LSN
+//! range the caller passes; SACDTRL1 ranges already exclude
+//! pre-gaps and inter-track pauses. If you pass the wider
+//! area_toc range, pre-gap and pause audio gets included. The C
+//! reference sacd_extract reads the wider range but applies a
+//! frame-timecode filter to drop the same pause frames; we don't
+//! implement that filter, so caller-side range selection matters.
 
 use sacd_rs::extract::{extract_track, OutputFormat};
 use sacd_rs::iso_reader::IsoReader;

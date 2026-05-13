@@ -97,6 +97,19 @@ pub struct ExtractStats {
 /// DSD frames don't carry channel count themselves, so the value
 /// must match the area_toc.
 ///
+/// ## LSN range selection
+///
+/// Pass the per-track range from SACDTRL1 (`TrackEntry.start_lsn`
+/// + `length_lsn` in tonepoet's SACD parser), NOT the area_toc's
+/// `track_start`/`track_end`. SACDTRL1 ranges already exclude
+/// pre-gaps and inter-track pauses. If you pass the wider area_toc
+/// range, pre-gap and pause audio gets included in the output.
+///
+/// The C reference sacd_extract uses the area_toc range plus a
+/// frame-timecode filter to drop the same pause frames; we don't
+/// implement that filter, so caller-side range selection matters
+/// for byte-exact matching with sacd_extract's default behavior.
+///
 /// On error, the output is left in an inconsistent state (header
 /// shows zero audio but file contains partial bytes). Caller should
 /// delete the output.
