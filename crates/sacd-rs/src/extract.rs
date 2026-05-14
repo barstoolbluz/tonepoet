@@ -4,9 +4,10 @@
 //!
 //! ## Scope
 //!
-//! This module handles **uncompressed DSD only**. DST-encoded frames
-//! cause `extract_track` to return `ExtractError::DstFrameUnsupported`.
-//! DST decode lands in a later PR.
+//! This module handles uncompressed DSD frames and DST-encoded frames.
+//! DST payloads are decoded into the same clustered-frame byte layout
+//! that uncompressed SACD sectors already carry before being forwarded
+//! to the DSF/DFF writers.
 //!
 //! ## Error semantics
 //!
@@ -27,10 +28,12 @@
 
 use crate::dff_footer::{render_dff_footer, DffMetadata};
 use crate::dff_writer::DffWriter;
+use crate::dst::{decode_frame, DstError};
 use crate::dsf_writer::{DsfWriter, SACD_SAMPLING_FREQUENCY};
 use crate::frame::{FrameError, FrameReader};
 use crate::id3::{render_id3v24, Id3Metadata};
 use crate::iso_reader::IsoReader;
+use std::borrow::Cow;
 use std::io::{self, Seek, Write};
 
 /// Output container format.
@@ -162,11 +165,8 @@ pub enum ExtractError {
     Frame(FrameError),
     /// Failure writing to the output sink.
     Io(io::Error),
-    /// Encountered a DST-encoded frame. DST decode is not yet
-    /// implemented; the caller should fall back to a different
-    /// extraction path (e.g. the C sacd-extract binary) or convert
-    /// the ISO to DST-decoded form externally.
-    DstFrameUnsupported,
+    /// Failure decoding a DST-encoded frame.
+    Dst(DstError),
 }
 
 impl std::fmt::Display for ExtractError {
@@ -174,7 +174,7 @@ impl std::fmt::Display for ExtractError {
         match self {
             Self::Frame(e) => write!(f, "frame read error: {}", e),
             Self::Io(e) => write!(f, "output write error: {}", e),
-            Self::DstFrameUnsupported => write!(f, "DST-encoded frames are not yet supported"),
+            Self::Dst(e) => write!(f, "DST decode error: {}", e),
         }
     }
 }
@@ -190,6 +190,12 @@ impl From<FrameError> for ExtractError {
 impl From<io::Error> for ExtractError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<DstError> for ExtractError {
+    fn from(e: DstError) -> Self {
+        Self::Dst(e)
     }
 }
 
@@ -273,12 +279,12 @@ pub fn extract_track<W: Write + Seek>(
 }
 
 /// Drain frames from `reader`, applying `time_filter` (if any),
-/// erroring on DST frames in the keep-range, and forwarding each
-/// kept frame's data to `write_data`.
+/// decoding DST frames in the keep-range, and forwarding each kept
+/// frame's clustered DSD bytes to `write_data`.
 ///
 /// Filter-then-DST order mirrors sacd_extract's `frame_read_callback`
 /// nesting: out-of-range DST frames are silently dropped without
-/// triggering an unsupported-format error.
+/// triggering an decode error.
 fn drain_frames<F>(
     reader: &mut FrameReader<'_>,
     time_filter: Option<TimeFilter>,
@@ -297,14 +303,17 @@ where
                 continue;
             }
         }
-        // (2) DST check: only applies to in-range frames.
-        if frame.dst_encoded {
-            return Err(ExtractError::DstFrameUnsupported);
-        }
+        // (2) DST decode: only applies to in-range frames.
+        let payload: Cow<'_, [u8]> = if frame.dst_encoded {
+            Cow::Owned(decode_frame(&frame.data, frame.channel_count)?)
+        } else {
+            Cow::Borrowed(&frame.data)
+        };
+
         // (3) Write to format-specific sink.
-        write_data(&frame.data)?;
+        write_data(payload.as_ref())?;
         stats.frames_read += 1;
-        stats.audio_bytes += frame.data.len() as u64;
+        stats.audio_bytes += payload.len() as u64;
     }
     Ok(stats)
 }
@@ -719,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_dst_frame_returns_dst_unsupported() {
+    fn extract_bad_dst_frame_returns_decode_error() {
         let payload = vec![0xDEu8; 100];
         let sectors = vec![synth_dst_sector(
             &payload,
@@ -735,8 +744,8 @@ mod tests {
             &mut output,
             ExtractOptions::new(0, 1, 2, OutputFormat::Dff),
         )
-        .expect_err("DST frame must error");
-        assert!(matches!(err, ExtractError::DstFrameUnsupported), "got {:?}", err);
+        .expect_err("malformed DST frame must error");
+        assert!(matches!(err, ExtractError::Dst(_)), "got {:?}", err);
     }
 
     #[test]
@@ -1105,7 +1114,7 @@ mod tests {
     fn filter_drops_out_of_range_dst_frame_silently() {
         // Critical ordering check: filter MUST run before the DST
         // check. Out-of-range DST frames should drop silently (no
-        // DstFrameUnsupported error) — matching sacd_extract's
+        // DST decode error) — matching sacd_extract's
         // frame_read_callback nesting where the timecode filter is
         // the outer guard.
         //
@@ -1145,8 +1154,8 @@ mod tests {
     #[test]
     fn filter_keeps_in_range_dst_frame_then_errors() {
         // Complement to the silent-drop test: when filter includes
-        // a DST frame, the orchestrator errors (because we don't
-        // decode DST yet). This pins the second half of the
+        // a DST frame, the orchestrator errors (because the decoder must run and report malformed data for
+        // this synthetic payload). This pins the second half of the
         // filter-then-DST nesting.
         let payload = vec![0xDEu8; 100];
         let sectors = vec![synth_dst_sector(
@@ -1162,7 +1171,7 @@ mod tests {
             .with_time_filter(TimeFilter::new(150, 100));
         let err = extract_track(&mut iso, &mut output, opts)
             .expect_err("in-range DST must error");
-        assert!(matches!(err, ExtractError::DstFrameUnsupported), "got {:?}", err);
+        assert!(matches!(err, ExtractError::Dst(_)), "got {:?}", err);
     }
 
     #[test]
