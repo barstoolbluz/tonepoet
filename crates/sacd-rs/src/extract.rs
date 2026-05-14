@@ -307,6 +307,9 @@ mod tests {
     fn read_u16_be(b: &[u8], off: usize) -> u16 {
         u16::from_be_bytes(b[off..off + 2].try_into().unwrap())
     }
+    fn read_u32_le(b: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+    }
     fn read_u64_be(b: &[u8], off: usize) -> u64 {
         u64::from_be_bytes(b[off..off + 8].try_into().unwrap())
     }
@@ -451,6 +454,66 @@ mod tests {
         assert_eq!(
             sha256_hex(&out),
             "5c113971a54c52abba78c07fd2ff1a765e0b36630e7e05680a2710a79343c4d1",
+        );
+    }
+
+    #[test]
+    fn extract_six_channel_to_dsf_demuxes_correctly() {
+        // One 6-channel uncompressed frame = 6 * 4704 = 28_224 bytes.
+        // After write_interleaved: each of 6 channels gets 4704 bytes
+        // (4096 in block 0 + 608 in block 1, padded to 4096 with
+        // zeros). File = 92 header + 6 * 2 * 4096 = 49,244 bytes.
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 6);
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
+        );
+        let (out, stats) = run_extract(sectors, 6, OutputFormat::Dsf);
+
+        // Structural.
+        assert_eq!(out.len(), 92 + 6 * 2 * BLOCK_SIZE_PER_CHANNEL);
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, 28_224);
+
+        // fmt chunk fields:
+        //   channel_type = 7 (Surround51) at offset 48 (LE u32)
+        //   channel_count = 6 at offset 52 (LE u32)
+        //   sample_count = 4704 * 8 at offset 64 (LE u64) — same
+        //     per-channel sample count as stereo since each channel
+        //     still has FRAME_SIZE_UNCOMPRESSED real bytes.
+        assert_eq!(read_u32_le(&out, 48), 7);
+        assert_eq!(read_u32_le(&out, 52), 6);
+        assert_eq!(read_u64_le(&out, 64), (FRAME_SIZE_UNCOMPRESSED as u64) * 8);
+
+        // Per-channel block 0 first byte verifies the 6-channel
+        // demux cycle: ch_c receives input bytes at indices
+        // c, c+6, c+12, ... so ch_c's first byte = bit_reverse(frame[c]).
+        for c in 0..6 {
+            let block_start = 92 + c * BLOCK_SIZE_PER_CHANNEL;
+            assert_eq!(
+                out[block_start],
+                bit_reverse(frame[c]),
+                "ch{} block0 byte 0 mismatch", c,
+            );
+        }
+
+        // Block 1 zero-pad zones: 608 real bytes + (4096 - 608)
+        // zero-pad bytes per channel. Verify the pad zone for all
+        // 6 channels.
+        for c in 0..6 {
+            let block_start = 92 + (6 + c) * BLOCK_SIZE_PER_CHANNEL;
+            assert!(
+                out[block_start + 608..block_start + BLOCK_SIZE_PER_CHANNEL]
+                    .iter().all(|&b| b == 0),
+                "ch{} block1 pad zone non-zero", c,
+            );
+        }
+
+        // Hash-pinned canonical output for 6-channel DSF.
+        // Re-derive on writer changes (PR 3b DSF ID3 footer, etc.).
+        assert_eq!(
+            sha256_hex(&out),
+            "84a657bab020e3206afe62722deeb9b4b2374334afa99f7d56de4ba7607dc24f",
         );
     }
 
