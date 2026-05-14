@@ -36,6 +36,7 @@
 pub mod dff_footer;
 pub mod dff_writer;
 pub mod dsf_writer;
+pub mod dst;
 pub mod extract;
 pub mod frame;
 pub mod id3;
