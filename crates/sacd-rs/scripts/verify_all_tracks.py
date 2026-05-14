@@ -114,6 +114,15 @@ PROFILES = {
         "tracks": TRACKS_AL_JARREAU_ALL_I_GOT,
         "channels": 2,
     },
+    "al_jarreau_all_i_got_6ch": {
+        "iso": os.environ.get(
+            "SACD_VERIFY_ISO",
+            "/home/daedalus/library/jarreau/Al Jarreau - All I Got (2002) [ISO]/AL JARREAU - ALL I GOT.iso",
+        ),
+        "album_dir": "ALL I GOT",
+        "tracks": TRACKS_AL_JARREAU_ALL_I_GOT,
+        "channels": 6,
+    },
 }
 
 
@@ -162,6 +171,10 @@ def parse_dsf_id3_footer(path: str) -> dict[str, str]:
             frames[fid] = decode_id3_text(body)
         elif fid == "TXXX" and len(body) >= 2:
             # body: <encoding><description>\0<value>\0
+            # Note: only the UTF-8 (encoding=3) branch is exercised by
+            # current fixtures (Al Jarreau, Solo Monk both emit UTF-8).
+            # The latin-1 (encoding=0) branch is provided for an older
+            # SACD encoding convention but is untested in practice.
             encoding = body[0]
             rest = body[1:]
             sep = rest.find(b"\x00")

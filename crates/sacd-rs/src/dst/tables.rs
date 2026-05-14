@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Pure-Rust port of DST lookup tables and constants from libdstdec/ in
+// https://github.com/Sound-Linux-More/sacd-extract (GPL-2.0).
+
 pub(crate) const MAX_CHANNELS: usize = 6;
 pub(crate) const MAX_ELEMENTS: usize = 2 * MAX_CHANNELS;
 pub(crate) const MAX_TABLE_LEN: usize = 128;

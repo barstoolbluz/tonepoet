@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Pure-Rust port of the DST arithmetic-coded decoder from libdstdec/
+// in https://github.com/Sound-Linux-More/sacd-extract (GPL-2.0).
+// Implements the "simple segmentation" subset observed in real-world
+// SACD DST streams (see comment on decode_compressed_dst_payload).
+
 use super::bitreader::BitReader;
 use super::tables::{
     log2_floor_u32, log2_floor_usize, prob_dst_x_bit, FilterTable, Table,

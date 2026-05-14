@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Pure-Rust port of bit-reading helpers from libdstdec/ in
+// https://github.com/Sound-Linux-More/sacd-extract (GPL-2.0).
+
 use super::DstError;
 
 #[derive(Clone, Debug)]
