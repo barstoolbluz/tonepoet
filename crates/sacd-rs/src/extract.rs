@@ -28,6 +28,7 @@
 use crate::dff_writer::DffWriter;
 use crate::dsf_writer::{DsfWriter, SACD_SAMPLING_FREQUENCY};
 use crate::frame::{FrameError, FrameReader};
+use crate::id3::{render_id3v24, Id3Metadata};
 use crate::iso_reader::IsoReader;
 use std::io::{self, Seek, Write};
 
@@ -84,7 +85,7 @@ impl TimeFilter {
 /// future Series-3 parity items (ID3 mode, edit-master, concatenate,
 /// etc.) — new knobs land here without changing the function
 /// signature.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ExtractOptions {
     pub start_lsn: u64,
     pub end_lsn: u64,
@@ -97,6 +98,11 @@ pub struct ExtractOptions {
     /// range; leave `None` when passing pre-trimmed SACDTRL1
     /// ranges (no frames will be out of timecode bounds anyway).
     pub time_filter: Option<TimeFilter>,
+    /// If set, an ID3v2.4 footer is appended to the output after
+    /// the audio data (DSF only; DFF footer support lands in a
+    /// later PR). Matches sacd_extract's default
+    /// `id3_tag_mode = 4` behavior.
+    pub id3_metadata: Option<Id3Metadata>,
 }
 
 impl ExtractOptions {
@@ -114,12 +120,22 @@ impl ExtractOptions {
             channel_count,
             format,
             time_filter: None,
+            id3_metadata: None,
         }
     }
 
     /// Attach a time filter (sacd_extract's default behavior).
     pub fn with_time_filter(mut self, filter: TimeFilter) -> Self {
         self.time_filter = Some(filter);
+        self
+    }
+
+    /// Attach ID3v2.4 metadata. When set on a DSF extraction, the
+    /// rendered tag is appended after audio + pad and the DSF
+    /// header's `metadata_offset` is updated to point to it.
+    /// Matches sacd_extract's default `id3_tag_mode = 4`.
+    pub fn with_id3_metadata(mut self, meta: Id3Metadata) -> Self {
+        self.id3_metadata = Some(meta);
         self
     }
 }
@@ -217,6 +233,9 @@ pub fn extract_track<W: Write + Seek>(
         OutputFormat::Dsf => {
             let mut writer =
                 DsfWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
+            if let Some(ref meta) = opts.id3_metadata {
+                writer.set_id3_footer(render_id3v24(meta));
+            }
             let stats = drain_frames(&mut reader, opts.time_filter, |data| {
                 writer.write_interleaved(data).map_err(ExtractError::Io)
             })?;
@@ -916,6 +935,79 @@ mod tests {
             sha256_hex(&out),
             "fe112487cab4fb38be81212595f29038fd1eaaaaccd7a487bebb50c9ad71f0b9",
         );
+    }
+
+    #[test]
+    fn extract_with_id3_metadata_appends_footer_and_updates_dsf_header() {
+        // Verifies DsfWriter's footer support end-to-end:
+        // - the rendered ID3 bytes appear after the audio payload
+        // - DSD chunk's metadata_offset points to the footer
+        // - total_file_size includes the footer length
+        // - audio bytes still hash to the same canonical value
+        //   (regression: PR 1e audio gate must hold when footer present)
+        use crate::id3::{render_id3v24, Id3Metadata};
+
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
+        );
+        let meta = Id3Metadata {
+            tit2: Some("TEST TITLE".into()),
+            ..Default::default()
+        };
+        let footer_bytes = render_id3v24(&meta);
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dsf)
+            .with_id3_metadata(meta.clone());
+        let stats = extract_track(&mut iso, &mut output, opts).unwrap();
+        let out = output.into_inner();
+
+        // Audio bytes: 1 stereo frame = 9408 bytes → ch0 4096 + 608 pad,
+        // ch1 4096 + 608 pad → audio_data_size = 16384.
+        let audio_data_size = 16384u64;
+        let expected_total = 92 + audio_data_size + footer_bytes.len() as u64;
+        assert_eq!(out.len() as u64, expected_total);
+
+        // DSD chunk header fields (LE u64 at the relevant offsets):
+        // total_file_size at 12..20, metadata_offset at 20..28.
+        assert_eq!(
+            read_u64_le(&out, 12),
+            expected_total,
+            "total_file_size must include footer length",
+        );
+        assert_eq!(
+            read_u64_le(&out, 20),
+            92 + audio_data_size,
+            "metadata_offset must point to footer start",
+        );
+
+        // Footer bytes appear verbatim after the audio.
+        let footer_start = (92 + audio_data_size) as usize;
+        assert_eq!(
+            &out[footer_start..footer_start + footer_bytes.len()],
+            &footer_bytes[..],
+        );
+
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, 9408);
+    }
+
+    #[test]
+    fn extract_no_id3_metadata_leaves_metadata_offset_zero() {
+        // Regression: when id3_metadata = None, DsfWriter must NOT
+        // append a footer and the DSD-chunk's metadata_offset must
+        // be 0 (matches PR 1e canonical Solo Monk output mode).
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
+        );
+        let (out, _) = run_extract(sectors, 2, OutputFormat::Dsf);
+        assert_eq!(read_u64_le(&out, 20), 0, "no footer → metadata_offset = 0");
     }
 
     #[test]

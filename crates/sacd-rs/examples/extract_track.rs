@@ -27,6 +27,7 @@
 //! Both modes produce sacd_extract-default-equivalent audio.
 
 use sacd_rs::extract::{extract_track, ExtractOptions, OutputFormat, TimeFilter};
+use sacd_rs::id3::Id3Metadata;
 use sacd_rs::iso_reader::IsoReader;
 use std::fs::File;
 use std::path::PathBuf;
@@ -40,14 +41,39 @@ struct Args {
     channels: u8,
     format: OutputFormat,
     time_filter: Option<TimeFilter>,
+    id3: Id3Metadata,
 }
 
 fn print_usage() {
     eprintln!(
         "usage: extract_track --iso PATH --start-lsn N --end-lsn N \\
                       --channels N --format dsf|dff --output PATH \\
-                      [--time-filter-start MM:SS:FF --time-filter-duration MM:SS:FF]"
+                      [--time-filter-start MM:SS:FF --time-filter-duration MM:SS:FF] \\
+                      [--id3-title S] [--id3-album S] [--id3-artist S] \\
+                      [--id3-album-artist S] [--id3-performer S] [--id3-composer S] \\
+                      [--id3-isrc S] [--id3-publisher S] [--id3-copyright S] \\
+                      [--id3-disc N/M] [--id3-genre S] [--id3-year YYYY] \\
+                      [--id3-date MMDD] [--id3-track N/M]"
     );
+}
+
+/// Parse \"N/M\" → (N, M) as u16 pair.
+fn parse_pair_u16(s: &str) -> Result<(u16, u16), String> {
+    let (a, b) = s.split_once('/').ok_or_else(|| format!("expected N/M, got {:?}", s))?;
+    let n: u16 = a.parse().map_err(|_| format!("bad first u16: {}", a))?;
+    let m: u16 = b.parse().map_err(|_| format!("bad second u16: {}", b))?;
+    Ok((n, m))
+}
+
+/// Parse "MMDD" → (M, D) as u8 pair. SMPTE-style fields not enforced
+/// (caller passes whatever the SACD's master_toc gives).
+fn parse_mmdd(s: &str) -> Result<(u8, u8), String> {
+    if s.len() != 4 {
+        return Err(format!("expected MMDD (4 chars), got {:?}", s));
+    }
+    let m: u8 = s[..2].parse().map_err(|_| format!("bad month: {}", &s[..2]))?;
+    let d: u8 = s[2..].parse().map_err(|_| format!("bad day: {}", &s[2..]))?;
+    Ok((m, d))
 }
 
 /// Parse a `MM:SS:FF` timecode into a total 75fps frame count.
@@ -82,6 +108,7 @@ fn parse_args() -> Result<Args, String> {
     let mut format = None;
     let mut time_filter_start: Option<u32> = None;
     let mut time_filter_duration: Option<u32> = None;
+    let mut id3 = Id3Metadata::default();
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -111,6 +138,20 @@ fn parse_args() -> Result<Args, String> {
             "--time-filter-duration" => {
                 time_filter_duration = Some(parse_mmss_ff(&val()?)?);
             }
+            "--id3-title" => id3.tit2 = Some(val()?),
+            "--id3-album" => id3.talb = Some(val()?),
+            "--id3-artist" => id3.tpe1 = Some(val()?),
+            "--id3-album-artist" => id3.tpe2 = Some(val()?),
+            "--id3-performer" => id3.txxx_performer = Some(val()?),
+            "--id3-composer" => id3.tcom = Some(val()?),
+            "--id3-isrc" => id3.tsrc = Some(val()?),
+            "--id3-publisher" => id3.tpub = Some(val()?),
+            "--id3-copyright" => id3.tcop = Some(val()?),
+            "--id3-disc" => id3.tpos = Some(parse_pair_u16(&val()?)?),
+            "--id3-genre" => id3.tcon = Some(val()?),
+            "--id3-year" => id3.tyer = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
+            "--id3-date" => id3.tdat = Some(parse_mmdd(&val()?)?),
+            "--id3-track" => id3.trck = Some(parse_pair_u16(&val()?)?),
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -135,7 +176,16 @@ fn parse_args() -> Result<Args, String> {
         channels: channels.ok_or("--channels required")?,
         format: format.ok_or("--format required")?,
         time_filter,
+        id3,
     })
+}
+
+/// True if any field on `Id3Metadata` is populated.
+fn id3_is_populated(m: &Id3Metadata) -> bool {
+    m.tit2.is_some() || m.talb.is_some() || m.tpe1.is_some() || m.tpe2.is_some()
+        || m.txxx_performer.is_some() || m.tcom.is_some() || m.tsrc.is_some()
+        || m.tpub.is_some() || m.tcop.is_some() || m.tpos.is_some() || m.tcon.is_some()
+        || m.tyer.is_some() || m.tdat.is_some() || m.trck.is_some()
 }
 
 fn main() -> ExitCode {
@@ -172,6 +222,9 @@ fn main() -> ExitCode {
     );
     if let Some(tf) = args.time_filter {
         opts = opts.with_time_filter(tf);
+    }
+    if id3_is_populated(&args.id3) {
+        opts = opts.with_id3_metadata(args.id3);
     }
 
     match extract_track(&mut iso, &mut output_file, opts) {

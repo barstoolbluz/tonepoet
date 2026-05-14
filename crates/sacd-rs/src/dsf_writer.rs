@@ -131,6 +131,12 @@ pub struct DsfWriter<W: Write + Seek> {
     /// remainder, while `audio_data_size` gets the full padded
     /// block).
     real_bytes_total: u64,
+    /// Optional ID3v2.4 footer bytes to append after audio. When
+    /// set, `finish()` writes these bytes after the padded audio
+    /// payload and updates the DSD-chunk's `metadata_offset` and
+    /// `total_file_size` accordingly. Use [`Self::set_id3_footer`]
+    /// to populate.
+    id3_footer: Option<Vec<u8>>,
 }
 
 impl<W: Write + Seek> DsfWriter<W> {
@@ -159,7 +165,21 @@ impl<W: Write + Seek> DsfWriter<W> {
                 .collect(),
             audio_data_size: 0,
             real_bytes_total: 0,
+            id3_footer: None,
         })
+    }
+
+    /// Set the ID3v2.4 footer bytes to append after audio. Must be
+    /// called before `finish()`. Pass the output of
+    /// [`crate::id3::render_id3v24`].
+    ///
+    /// When set, `finish()` writes the bytes after the audio
+    /// payload (which is padded to even via `audio_data_size`). The
+    /// DSD-chunk's `metadata_offset` field will point to the
+    /// footer's start (= 92 + audio_data_size_padded); the
+    /// `total_file_size` field will include the footer length.
+    pub fn set_id3_footer(&mut self, bytes: Vec<u8>) {
+        self.id3_footer = Some(bytes);
     }
 
     /// Append byte-interleaved DSD samples. Input layout: bytes
@@ -200,8 +220,9 @@ impl<W: Write + Seek> DsfWriter<W> {
     }
 
     /// Finalize the file: pad the last partial block per channel
-    /// with zeros, flush it, then seek back and write the final
-    /// header with the now-known sample_count and total_file_size.
+    /// with zeros, write the optional ID3 footer if set, then seek
+    /// back and rewrite the header with final sizes + metadata
+    /// offset.
     pub fn finish(mut self) -> io::Result<()> {
         // Pad any remaining bytes per channel.
         let partial = self.channel_buffers[0].len();
@@ -212,6 +233,13 @@ impl<W: Write + Seek> DsfWriter<W> {
             self.flush_block()?;
         }
 
+        // Write the ID3 footer if set. After audio + pad, write
+        // position is HEADER_TOTAL_SIZE + audio_data_size.
+        let footer_size = self.id3_footer.as_ref().map_or(0, |f| f.len() as u64);
+        if let Some(ref footer) = self.id3_footer {
+            self.writer.write_all(footer)?;
+        }
+
         // sample_count is per-channel, in DSD samples (bits). The C
         // reference computes this from REAL bytes only (no zero
         // padding): `handle->sample_count / channel_count * 8`,
@@ -220,24 +248,32 @@ impl<W: Write + Seek> DsfWriter<W> {
         let real_bytes_per_channel =
             self.real_bytes_total / (self.channel_count as u64);
         let sample_count_per_channel = real_bytes_per_channel * 8;
-        let total_file_size = HEADER_TOTAL_SIZE + self.audio_data_size;
+        let total_file_size = HEADER_TOTAL_SIZE + self.audio_data_size + footer_size;
+        // metadata_offset: per sacd_extract's dsf_create_header,
+        // 0 if no footer, else the offset where the footer begins.
+        let metadata_offset = if footer_size > 0 {
+            HEADER_TOTAL_SIZE + self.audio_data_size
+        } else {
+            0
+        };
 
         self.writer.seek(SeekFrom::Start(0))?;
-        let header = serialize_header(
+        let header = serialize_header_with_metadata(
             self.channel_type,
             self.channel_count,
             self.sample_rate,
             sample_count_per_channel,
             self.audio_data_size,
             total_file_size,
+            metadata_offset,
         );
         self.writer.write_all(&header)?;
         Ok(())
     }
 }
 
-/// Build the 92-byte header (DSD + fmt + data-header chunks). Pure
-/// function for testability.
+/// Build the 92-byte header (DSD + fmt + data-header chunks).
+/// Convenience wrapper for the no-metadata case. Pure function.
 pub fn serialize_header(
     channel_type: ChannelType,
     channel_count: u8,
@@ -246,13 +282,35 @@ pub fn serialize_header(
     audio_data_size: u64,
     total_file_size: u64,
 ) -> Vec<u8> {
+    serialize_header_with_metadata(
+        channel_type,
+        channel_count,
+        sample_rate,
+        sample_count_per_channel,
+        audio_data_size,
+        total_file_size,
+        0,
+    )
+}
+
+/// Build the 92-byte header with explicit `metadata_offset`. Pass
+/// `metadata_offset = 0` when there's no ID3 footer; otherwise pass
+/// the absolute offset where the footer begins (= 92 + audio_data_size).
+pub fn serialize_header_with_metadata(
+    channel_type: ChannelType,
+    channel_count: u8,
+    sample_rate: u32,
+    sample_count_per_channel: u64,
+    audio_data_size: u64,
+    total_file_size: u64,
+    metadata_offset: u64,
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(HEADER_TOTAL_SIZE as usize);
 
     // DSD chunk
     buf.extend_from_slice(b"DSD ");
     buf.extend_from_slice(&DSD_CHUNK_SIZE.to_le_bytes());
     buf.extend_from_slice(&total_file_size.to_le_bytes());
-    let metadata_offset: u64 = 0; // no ID3 tag — wired in a later PR
     buf.extend_from_slice(&metadata_offset.to_le_bytes());
 
     // fmt chunk
