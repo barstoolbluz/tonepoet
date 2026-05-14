@@ -110,6 +110,18 @@ pub(crate) fn tc_at(frame_count: u32) -> Timecode {
     Timecode { minutes: m, seconds: s, frames: f }
 }
 
+/// Hash `bytes` with SHA-256 and return the result as a lowercase
+/// 64-character hex string. Used by extract::tests to pin canonical
+/// outputs against regression-induced bit drift. The point-check
+/// assertions in each test are the primary diagnostic; the hash
+/// catches drift outside the point-checked offsets.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// Write `sectors` to a temp file and return the TempDir (kept alive
 /// by the caller to prevent cleanup before the test finishes).
 pub(crate) fn write_iso(sectors: &[Vec<u8>]) -> tempfile::TempDir {
@@ -121,4 +133,27 @@ pub(crate) fn write_iso(sectors: &[Vec<u8>]) -> tempfile::TempDir {
         f.write_all(s).unwrap();
     }
     td
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::sha256_hex;
+
+    #[test]
+    fn sha256_hex_empty_string() {
+        // Standard SHA-256 of the empty byte string.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+    }
+
+    #[test]
+    fn sha256_hex_rfc6234_abc() {
+        // RFC 6234 test vector: SHA-256("abc").
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+    }
 }

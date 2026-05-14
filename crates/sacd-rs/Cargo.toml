@@ -11,3 +11,4 @@ authors = ["tonepoet contributors"]
 
 [dev-dependencies]
 tempfile = "3"
+sha2 = "0.10"

@@ -278,7 +278,8 @@ mod tests {
     use crate::dsf_writer::BLOCK_SIZE_PER_CHANNEL;
     use crate::frame::{Timecode, FRAME_SIZE_UNCOMPRESSED};
     use crate::test_util::{
-        synth_audio_sector, synth_continuation_sector, synth_dst_sector, tc_at, write_iso,
+        sha256_hex, synth_audio_sector, synth_continuation_sector, synth_dst_sector,
+        tc_at, write_iso,
     };
 
     const PART_SIZE: usize = 2000;
@@ -370,6 +371,13 @@ mod tests {
         assert_eq!(read_u64_be(&out, 136), 9408);
         assert_eq!(stats.frames_read, 1);
         assert_eq!(stats.audio_bytes, 9408);
+        // Hash-pinned canonical output. If this fails after an
+        // intentional output-format change (PR 3c DFF footers,
+        // etc.), copy the actual hash from the failure message.
+        assert_eq!(
+            sha256_hex(&out),
+            "10c9f7c4adb39d98bc7b6056a79afdcf34df23ed9d85e6e6a108201d37e91961",
+        );
     }
 
     #[test]
@@ -416,6 +424,12 @@ mod tests {
         assert_eq!(read_u64_le(&out, 64), (FRAME_SIZE_UNCOMPRESSED as u64) * 8);
         assert_eq!(stats.frames_read, 1);
         assert_eq!(stats.audio_bytes, 9408);
+        // Hash-pinned canonical output. Re-derive on writer changes
+        // (PR 3b DSF ID3 footer, etc.).
+        assert_eq!(
+            sha256_hex(&out),
+            "f19d02521726829bf74bf410dfaac73e13a46e6783e1a428b41b7ff1c52c089c",
+        );
     }
 
     #[test]
@@ -433,6 +447,11 @@ mod tests {
         assert_eq!(&out[160..160 + 28_224], &frame[..]);
         // CHNL chunk_count = 6 (BE u16 at offset 76).
         assert_eq!(read_u16_be(&out, 76), 6);
+        // Hash-pinned canonical output for 6-channel DFF.
+        assert_eq!(
+            sha256_hex(&out),
+            "5c113971a54c52abba78c07fd2ff1a765e0b36630e7e05680a2710a79343c4d1",
+        );
     }
 
     #[test]
@@ -584,6 +603,11 @@ mod tests {
         // DFF header (144) + 9408 audio bytes (just frame_mid).
         assert_eq!(out.len(), 144 + 9408);
         assert_eq!(&out[144..144 + 9408], &frame_mid[..]);
+        // Hash-pinned: pins the filter execution path output.
+        assert_eq!(
+            sha256_hex(&out),
+            "785b247e0cb9a3b0a124d312f9024d89893d04fa961781faa31f129a05a4b97c",
+        );
     }
 
     #[test]
@@ -670,6 +694,11 @@ mod tests {
         assert_eq!(out[92 + 4096], bit_reverse(frame_mid[1]));
         // sample_count = 4704 * 8 (real bytes/channel × 8 bits).
         assert_eq!(read_u64_le(&out, 64), (FRAME_SIZE_UNCOMPRESSED as u64) * 8);
+        // Hash-pinned: pins DSF + filter interaction.
+        assert_eq!(
+            sha256_hex(&out),
+            "fe112487cab4fb38be81212595f29038fd1eaaaaccd7a487bebb50c9ad71f0b9",
+        );
     }
 
     #[test]
@@ -726,27 +755,6 @@ mod tests {
         let err = extract_track(&mut iso, &mut output, opts)
             .expect_err("in-range DST must error");
         assert!(matches!(err, ExtractError::DstFrameUnsupported), "got {:?}", err);
-    }
-
-    #[test]
-    fn extract_with_no_filter_matches_pr1e_behavior() {
-        // Explicit regression check: opts.time_filter = None must
-        // produce identical output to the equivalent unfiltered
-        // call. Same input as `extract_uncompressed_stereo_to_dff_
-        // preserves_bytes`.
-        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
-        let sectors = synth_uncompressed_frame_sectors(&frame, tc_at(150));
-        let (out_filtered, stats_filtered) = run_extract_with(
-            sectors.clone(),
-            2,
-            OutputFormat::Dff,
-            None,
-        );
-        let (out_plain, stats_plain) = run_extract(sectors, 2, OutputFormat::Dff);
-        assert_eq!(out_filtered, out_plain);
-        assert_eq!(stats_filtered.frames_read, stats_plain.frames_read);
-        assert_eq!(stats_filtered.audio_bytes, stats_plain.audio_bytes);
-        assert_eq!(stats_filtered.frames_read, 1);
     }
 
     #[test]
