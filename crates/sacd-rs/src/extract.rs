@@ -25,6 +25,7 @@
 //! (`Frame.channel_count` is always 0 for uncompressed); the
 //! orchestrator trusts the caller's parameter and never validates.
 
+use crate::dff_footer::{render_dff_footer, DffMetadata};
 use crate::dff_writer::DffWriter;
 use crate::dsf_writer::{DsfWriter, SACD_SAMPLING_FREQUENCY};
 use crate::frame::{FrameError, FrameReader};
@@ -99,10 +100,13 @@ pub struct ExtractOptions {
     /// ranges (no frames will be out of timecode bounds anyway).
     pub time_filter: Option<TimeFilter>,
     /// If set, an ID3v2.4 footer is appended to the output after
-    /// the audio data (DSF only; DFF footer support lands in a
-    /// later PR). Matches sacd_extract's default
+    /// the audio data (DSF only). Matches sacd_extract's default
     /// `id3_tag_mode = 4` behavior.
     pub id3_metadata: Option<Id3Metadata>,
+    /// If set, the DSDIFF footer (DIIN + COMT + ID3 chunks) is
+    /// appended to DFF output after audio. Matches sacd_extract's
+    /// non-edit-master default footer.
+    pub dff_metadata: Option<DffMetadata>,
 }
 
 impl ExtractOptions {
@@ -121,6 +125,7 @@ impl ExtractOptions {
             format,
             time_filter: None,
             id3_metadata: None,
+            dff_metadata: None,
         }
     }
 
@@ -136,6 +141,16 @@ impl ExtractOptions {
     /// Matches sacd_extract's default `id3_tag_mode = 4`.
     pub fn with_id3_metadata(mut self, meta: Id3Metadata) -> Self {
         self.id3_metadata = Some(meta);
+        self
+    }
+
+    /// Attach DFF footer metadata (DIIN + COMT + ID3 chunks). When
+    /// set on a DFF extraction, the rendered footer is appended
+    /// after audio + pad and the FRM8 chunk_data_size is updated to
+    /// include the footer length. Matches sacd_extract's
+    /// non-edit-master default footer.
+    pub fn with_dff_metadata(mut self, meta: DffMetadata) -> Self {
+        self.dff_metadata = Some(meta);
         self
     }
 }
@@ -245,6 +260,9 @@ pub fn extract_track<W: Write + Seek>(
         OutputFormat::Dff => {
             let mut writer =
                 DffWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
+            if let Some(ref meta) = opts.dff_metadata {
+                writer.set_footer_bytes(render_dff_footer(meta));
+            }
             let stats = drain_frames(&mut reader, opts.time_filter, |data| {
                 writer.write_frame(data).map_err(ExtractError::Io)
             })?;
@@ -994,6 +1012,79 @@ mod tests {
 
         assert_eq!(stats.frames_read, 1);
         assert_eq!(stats.audio_bytes, 9408);
+    }
+
+    #[test]
+    fn extract_with_dff_metadata_appends_footer_and_updates_frm8() {
+        // End-to-end test: DffWriter's footer support correctly
+        // attaches the rendered footer and updates FRM8.chunk_data_size.
+        use crate::dff_footer::{render_dff_footer, DffMetadata};
+        use crate::id3::Id3Metadata;
+
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
+        );
+        let meta = DffMetadata {
+            diar: Some("ARTIST".into()),
+            diti: Some("TITLE".into()),
+            duration_minutes_total: 0,
+            duration_seconds: 1,
+            duration_frames: 0,
+            disc_date_year: 2026,
+            disc_date_month_1_indexed: 5,
+            disc_date_day: 13,
+            disc_or_album_title: "ALBUM".into(),
+            creation_year: 2026,
+            creation_month_0_indexed: 4,
+            creation_day: 13,
+            creation_hour: 12,
+            creation_minute: 0,
+            creating_machine: "test".into(),
+            id3: Id3Metadata {
+                tit2: Some("TITLE".into()),
+                ..Default::default()
+            },
+        };
+        let footer_bytes = render_dff_footer(&meta);
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff)
+            .with_dff_metadata(meta);
+        let _stats = extract_track(&mut iso, &mut output, opts).unwrap();
+        let out = output.into_inner();
+
+        // Stereo DFF: header = 144, audio = 9408 (even, no pad)
+        let header = 144usize;
+        let audio = 9408usize;
+        let footer = footer_bytes.len();
+        assert_eq!(out.len(), header + audio + footer);
+
+        // FRM8.chunk_data_size at offset 4..12 (BE u64) =
+        // header + audio + footer - 12.
+        let frm8_size = read_u64_be(&out, 4);
+        assert_eq!(frm8_size as usize, header + audio + footer - 12);
+
+        // Footer bytes appear verbatim after audio.
+        let footer_start = header + audio;
+        assert_eq!(&out[footer_start..footer_start + footer], &footer_bytes[..]);
+    }
+
+    #[test]
+    fn extract_no_dff_metadata_omits_footer() {
+        // Regression: when dff_metadata = None, DFF output has
+        // no footer (PR 1e behavior preserved).
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
+        );
+        let (out, _) = run_extract(sectors, 2, OutputFormat::Dff);
+        // No footer → file size = header (144) + audio (9408) = 9552.
+        assert_eq!(out.len(), 144 + 9408);
     }
 
     #[test]

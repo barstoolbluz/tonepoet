@@ -33,6 +33,7 @@
 //! - **PR 3**: tonepoet pipeline integration (Convert UI for SACD,
 //!   Analyze + DR via sox decimation).
 
+pub mod dff_footer;
 pub mod dff_writer;
 pub mod dsf_writer;
 pub mod extract;

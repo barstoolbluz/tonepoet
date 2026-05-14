@@ -26,6 +26,7 @@
 //!
 //! Both modes produce sacd_extract-default-equivalent audio.
 
+use sacd_rs::dff_footer::DffMetadata;
 use sacd_rs::extract::{extract_track, ExtractOptions, OutputFormat, TimeFilter};
 use sacd_rs::id3::Id3Metadata;
 use sacd_rs::iso_reader::IsoReader;
@@ -42,6 +43,28 @@ struct Args {
     format: OutputFormat,
     time_filter: Option<TimeFilter>,
     id3: Id3Metadata,
+    dff_footer_opts: DffFooterOptions,
+}
+
+/// Collected from --dff-* CLI flags. Combined with `--id3-*` flags
+/// to construct a full DffMetadata if any field is populated.
+#[derive(Default)]
+struct DffFooterOptions {
+    diar: Option<String>,
+    diti: Option<String>,
+    duration_minutes_total: Option<u32>,
+    duration_seconds: Option<u8>,
+    duration_frames: Option<u8>,
+    disc_date_year: Option<u16>,
+    disc_date_month_1_indexed: Option<u8>,
+    disc_date_day: Option<u8>,
+    disc_or_album_title: Option<String>,
+    creation_year: Option<u16>,
+    creation_month_0_indexed: Option<u8>,
+    creation_day: Option<u8>,
+    creation_hour: Option<u8>,
+    creation_minute: Option<u8>,
+    creating_machine: Option<String>,
 }
 
 fn print_usage() {
@@ -109,6 +132,7 @@ fn parse_args() -> Result<Args, String> {
     let mut time_filter_start: Option<u32> = None;
     let mut time_filter_duration: Option<u32> = None;
     let mut id3 = Id3Metadata::default();
+    let mut dff_opts = DffFooterOptions::default();
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -152,6 +176,36 @@ fn parse_args() -> Result<Args, String> {
             "--id3-year" => id3.tyer = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
             "--id3-date" => id3.tdat = Some(parse_mmdd(&val()?)?),
             "--id3-track" => id3.trck = Some(parse_pair_u16(&val()?)?),
+            // --- DFF footer args ---
+            "--dff-diar" => dff_opts.diar = Some(val()?),
+            "--dff-diti" => dff_opts.diti = Some(val()?),
+            "--dff-duration-minutes" => dff_opts.duration_minutes_total = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
+            "--dff-duration-seconds" => dff_opts.duration_seconds = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
+            "--dff-duration-frames" => dff_opts.duration_frames = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
+            "--dff-disc-date" => {
+                // Format YYYY-MM-DD (month 1-indexed)
+                let s = val()?;
+                let parts: Vec<&str> = s.split('-').collect();
+                if parts.len() != 3 { return Err(format!("--dff-disc-date expects YYYY-MM-DD, got {}", s)); }
+                dff_opts.disc_date_year = Some(parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                dff_opts.disc_date_month_1_indexed = Some(parts[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                dff_opts.disc_date_day = Some(parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+            }
+            "--dff-title" => dff_opts.disc_or_album_title = Some(val()?),
+            "--dff-creation-time" => {
+                // Format YYYY-MM-DD-HH:MM (month 0-indexed for tm_mon)
+                let s = val()?;
+                let dash_parts: Vec<&str> = s.split('-').collect();
+                if dash_parts.len() != 4 { return Err(format!("--dff-creation-time expects YYYY-MM-DD-HH:MM, got {}", s)); }
+                dff_opts.creation_year = Some(dash_parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                dff_opts.creation_month_0_indexed = Some(dash_parts[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                dff_opts.creation_day = Some(dash_parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                let hm: Vec<&str> = dash_parts[3].split(':').collect();
+                if hm.len() != 2 { return Err(format!("--dff-creation-time HH:MM section bad, got {}", s)); }
+                dff_opts.creation_hour = Some(hm[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                dff_opts.creation_minute = Some(hm[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+            }
+            "--dff-creating-machine" => dff_opts.creating_machine = Some(val()?),
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -176,6 +230,38 @@ fn parse_args() -> Result<Args, String> {
         channels: channels.ok_or("--channels required")?,
         format: format.ok_or("--format required")?,
         time_filter,
+        id3,
+        dff_footer_opts: dff_opts,
+    })
+}
+
+/// True if any --dff-* flag was specified.
+fn dff_opts_populated(d: &DffFooterOptions) -> bool {
+    d.diar.is_some() || d.diti.is_some() || d.duration_minutes_total.is_some()
+        || d.duration_seconds.is_some() || d.duration_frames.is_some()
+        || d.disc_date_year.is_some() || d.disc_or_album_title.is_some()
+        || d.creation_year.is_some() || d.creating_machine.is_some()
+}
+
+/// Build a DffMetadata from the collected CLI options + ID3 metadata.
+/// All --dff-* and the ID3 fields must be present.
+fn build_dff_metadata(opts: DffFooterOptions, id3: Id3Metadata) -> Result<DffMetadata, String> {
+    Ok(DffMetadata {
+        diar: opts.diar,
+        diti: opts.diti,
+        duration_minutes_total: opts.duration_minutes_total.ok_or("--dff-duration-minutes required for DFF footer")?,
+        duration_seconds: opts.duration_seconds.ok_or("--dff-duration-seconds required")?,
+        duration_frames: opts.duration_frames.ok_or("--dff-duration-frames required")?,
+        disc_date_year: opts.disc_date_year.ok_or("--dff-disc-date required")?,
+        disc_date_month_1_indexed: opts.disc_date_month_1_indexed.unwrap(),
+        disc_date_day: opts.disc_date_day.unwrap(),
+        disc_or_album_title: opts.disc_or_album_title.ok_or("--dff-title required for COMT comment 1")?,
+        creation_year: opts.creation_year.ok_or("--dff-creation-time required")?,
+        creation_month_0_indexed: opts.creation_month_0_indexed.unwrap(),
+        creation_day: opts.creation_day.unwrap(),
+        creation_hour: opts.creation_hour.unwrap(),
+        creation_minute: opts.creation_minute.unwrap(),
+        creating_machine: opts.creating_machine.ok_or("--dff-creating-machine required")?,
         id3,
     })
 }
@@ -222,6 +308,21 @@ fn main() -> ExitCode {
     );
     if let Some(tf) = args.time_filter {
         opts = opts.with_time_filter(tf);
+    }
+    // DFF footer: if any --dff-* arg was set, build DffMetadata
+    // (will fail if a required sub-field is missing). When set,
+    // attach to opts. ID3 fields are also threaded through because
+    // the embedded ID3 chunk inside the DFF footer uses them.
+    if dff_opts_populated(&args.dff_footer_opts) {
+        let id3_clone = args.id3.clone();
+        let dff_meta = match build_dff_metadata(args.dff_footer_opts, id3_clone) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return ExitCode::from(2);
+            }
+        };
+        opts = opts.with_dff_metadata(dff_meta);
     }
     if id3_is_populated(&args.id3) {
         opts = opts.with_id3_metadata(args.id3);

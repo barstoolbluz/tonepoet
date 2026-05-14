@@ -100,6 +100,11 @@ pub struct DffWriter<W: Write + Seek> {
     channel_count: u8,
     sample_rate: u32,
     audio_data_size: u64,
+    /// Optional footer bytes (DIIN + COMT + ID3 chunks) to append
+    /// after audio. Set via [`Self::set_footer_bytes`]; `finish()`
+    /// writes them and updates `FRM8.chunk_data_size` to include
+    /// the footer length.
+    footer_bytes: Option<Vec<u8>>,
 }
 
 impl<W: Write + Seek> DffWriter<W> {
@@ -122,7 +127,21 @@ impl<W: Write + Seek> DffWriter<W> {
             channel_count,
             sample_rate,
             audio_data_size: 0,
+            footer_bytes: None,
         })
+    }
+
+    /// Set the footer bytes (DIIN + COMT + ID3 chunks) to append
+    /// after audio. Pass the output of
+    /// [`crate::dff_footer::render_dff_footer`]. Must be called
+    /// before `finish()`.
+    ///
+    /// When set, `finish()` writes the bytes after the audio's
+    /// optional odd-pad byte and updates `FRM8.chunk_data_size` to
+    /// include the footer length, matching sacd_extract's
+    /// non-edit-master default output.
+    pub fn set_footer_bytes(&mut self, bytes: Vec<u8>) {
+        self.footer_bytes = Some(bytes);
     }
 
     /// Append raw DSD audio bytes. The byte stream is assumed to be
@@ -135,16 +154,28 @@ impl<W: Write + Seek> DffWriter<W> {
         Ok(())
     }
 
-    /// Finalize: pad audio to even length if needed, then seek back
-    /// and rewrite the header with the final sizes.
+    /// Finalize: pad audio to even length if needed, write optional
+    /// footer, then seek back and rewrite the FRM8 header with the
+    /// final sizes (including footer length).
     pub fn finish(mut self) -> io::Result<()> {
         if self.audio_data_size % 2 == 1 {
             self.writer.write_all(&[0u8])?;
             self.audio_data_size += 1;
         }
+        // Write footer after audio + pad. Footer is expected to be
+        // even-byte-aligned (each chunk pads internally per
+        // CALC_CHUNK_SIZE); we don't add a global pad after.
+        let footer_size = self.footer_bytes.as_ref().map_or(0, |f| f.len() as u64);
+        if let Some(ref footer) = self.footer_bytes {
+            self.writer.write_all(footer)?;
+        }
         self.writer.seek(SeekFrom::Start(0))?;
-        let header =
-            serialize_header(self.channel_count, self.sample_rate, self.audio_data_size);
+        let header = serialize_header_with_footer(
+            self.channel_count,
+            self.sample_rate,
+            self.audio_data_size,
+            footer_size,
+        );
         self.writer.write_all(&header)?;
         Ok(())
     }
@@ -153,18 +184,32 @@ impl<W: Write + Seek> DffWriter<W> {
 /// Build the complete header byte sequence for the given parameters.
 /// `audio_data_size` must already reflect any pad byte (i.e. even).
 /// The output length equals `header_size(channel_count)`.
+/// Convenience wrapper for the no-footer case.
 pub fn serialize_header(
     channel_count: u8,
     sample_rate: u32,
     audio_data_size: u64,
 ) -> Vec<u8> {
+    serialize_header_with_footer(channel_count, sample_rate, audio_data_size, 0)
+}
+
+/// Build the complete header with explicit `footer_size`. Sets
+/// `FRM8.chunk_data_size` to include the footer length per
+/// dsdiff.c's `form_dsd_chunk->chunk_data_size =
+/// CALC_CHUNK_SIZE(header_size + audio_data_size + footer_size - 12)`.
+pub fn serialize_header_with_footer(
+    channel_count: u8,
+    sample_rate: u32,
+    audio_data_size: u64,
+    footer_size: u64,
+) -> Vec<u8> {
     let total_header = header_size(channel_count);
     let mut buf = Vec::with_capacity(total_header as usize);
 
     // FRM8 (16 bytes): chunk_id, chunk_data_size, form_type.
-    // chunk_data_size = header_size + audio_data_size - 12. With no
-    // footer in this MVP, footer contribution is 0.
-    let frm8_size = total_header + audio_data_size - CHUNK_HEADER_SIZE;
+    // chunk_data_size = header_size + audio_data_size + footer_size - 12.
+    let frm8_size =
+        total_header + audio_data_size + footer_size - CHUNK_HEADER_SIZE;
     buf.extend_from_slice(FRM8);
     buf.extend_from_slice(&frm8_size.to_be_bytes());
     buf.extend_from_slice(DSD);
