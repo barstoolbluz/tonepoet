@@ -673,6 +673,62 @@ mod tests {
     }
 
     #[test]
+    fn filter_drops_out_of_range_dst_frame_silently() {
+        // Critical ordering check: filter MUST run before the DST
+        // check. Out-of-range DST frames should drop silently (no
+        // DstFrameUnsupported error) — matching sacd_extract's
+        // frame_read_callback nesting where the timecode filter is
+        // the outer guard.
+        //
+        // If someone refactors to DST-then-filter, the in-range
+        // case still errors but THIS case starts erroring too,
+        // diverging from sacd_extract behavior. This test pins the
+        // semantic contract.
+        let payload = vec![0xDEu8; 100];
+        let sectors = vec![synth_dst_sector(
+            &payload,
+            2,
+            1,
+            tc_at(50), // tc=50, outside filter [150, 250)
+        )];
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, 1, 2, OutputFormat::Dff)
+            .with_time_filter(TimeFilter::new(150, 100));
+        let stats = extract_track(&mut iso, &mut output, opts)
+            .expect("out-of-range DST must drop silently, not error");
+        assert_eq!(stats.frames_read, 0);
+        assert_eq!(stats.audio_bytes, 0);
+        // Output is a valid header-only DFF (filter dropped everything).
+        let out = output.into_inner();
+        assert_eq!(out.len(), 144);
+    }
+
+    #[test]
+    fn filter_keeps_in_range_dst_frame_then_errors() {
+        // Complement to the silent-drop test: when filter includes
+        // a DST frame, the orchestrator errors (because we don't
+        // decode DST yet). This pins the second half of the
+        // filter-then-DST nesting.
+        let payload = vec![0xDEu8; 100];
+        let sectors = vec![synth_dst_sector(
+            &payload,
+            2,
+            1,
+            tc_at(200), // tc=200, inside filter [150, 250)
+        )];
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, 1, 2, OutputFormat::Dff)
+            .with_time_filter(TimeFilter::new(150, 100));
+        let err = extract_track(&mut iso, &mut output, opts)
+            .expect_err("in-range DST must error");
+        assert!(matches!(err, ExtractError::DstFrameUnsupported), "got {:?}", err);
+    }
+
+    #[test]
     fn extract_with_no_filter_matches_pr1e_behavior() {
         // Explicit regression check: opts.time_filter = None must
         // produce identical output to the equivalent unfiltered
