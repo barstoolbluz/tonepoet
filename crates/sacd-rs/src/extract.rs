@@ -518,6 +518,147 @@ mod tests {
     }
 
     #[test]
+    fn extract_five_channel_to_dff_passes_clustered_bytes_through() {
+        // 5-channel uncompressed = 5 * 4704 = 23_520 bytes per frame.
+        // Real SACDs with 5.0 (no-LFE) surround exist; this pins the
+        // 5-channel DFF orchestration path.
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 5);
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
+        );
+        let (out, _stats) = run_extract(sectors, 5, OutputFormat::Dff);
+
+        // 5-channel DFF header = 156 bytes. Audio payload follows.
+        assert_eq!(out.len(), 156 + 23_520);
+        assert_eq!(&out[156..156 + 23_520], &frame[..]);
+        // CHNL chunk_count = 5 (BE u16 at offset 76).
+        assert_eq!(read_u16_be(&out, 76), 5);
+        // Hash-pinned canonical output for 5-channel DFF.
+        assert_eq!(
+            sha256_hex(&out),
+            "b5cdbac6d433b98b111e51a46d33d3f271551686ddfcfda1df849e20301dbb4f",
+        );
+    }
+
+    #[test]
+    fn extract_five_channel_to_dsf_demuxes_correctly() {
+        // 5-channel uncompressed = 23_520 bytes per frame.
+        // Per-channel real = 4704 bytes = 1 full block + 608 partial.
+        // File = 92 header + 5 * 2 * 4096 = 41_052 bytes.
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 5);
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
+        );
+        let (out, stats) = run_extract(sectors, 5, OutputFormat::Dsf);
+
+        // Structural.
+        assert_eq!(out.len(), 92 + 5 * 2 * BLOCK_SIZE_PER_CHANNEL);
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, 23_520);
+
+        // fmt chunk: channel_type=6 (Surround5), channel_count=5,
+        // sample_count = 4704 * 8.
+        assert_eq!(read_u32_le(&out, 48), 6);
+        assert_eq!(read_u32_le(&out, 52), 5);
+        assert_eq!(read_u64_le(&out, 64), (FRAME_SIZE_UNCOMPRESSED as u64) * 8);
+
+        // Per-channel block 0 first byte verifies the 5-channel demux
+        // cycle: ch_c receives input bytes at indices c, c+5, c+10, …
+        for c in 0..5 {
+            let block_start = 92 + c * BLOCK_SIZE_PER_CHANNEL;
+            assert_eq!(
+                out[block_start],
+                bit_reverse(frame[c]),
+                "ch{} block0 byte 0 mismatch", c,
+            );
+        }
+
+        // Block 1 zero-pad zones: 608 real bytes + 3488 zero pad per
+        // channel. Verify the pad zone for all 5 channels.
+        for c in 0..5 {
+            let block_start = 92 + (5 + c) * BLOCK_SIZE_PER_CHANNEL;
+            assert!(
+                out[block_start + 608..block_start + BLOCK_SIZE_PER_CHANNEL]
+                    .iter().all(|&b| b == 0),
+                "ch{} block1 pad zone non-zero", c,
+            );
+        }
+
+        // Hash-pinned canonical output for 5-channel DSF.
+        assert_eq!(
+            sha256_hex(&out),
+            "74fc7f71c95448f429dba77d21d338bb1b7384131cee907068d197dc2b9955bd",
+        );
+    }
+
+    #[test]
+    fn extract_six_channel_with_filter_drops_out_of_range_dsf() {
+        // Two 6-channel frames: tc=100 (dropped), tc=200 (kept).
+        // Filter [150, 250). Verifies 6-channel + filter interaction
+        // on the DSF format path.
+        let frame_pre = pattern(FRAME_SIZE_UNCOMPRESSED * 6);
+        let frame_mid: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 6))
+            .map(|i| ((i + 17) & 0xFF) as u8)
+            .collect();
+        let mut sectors = synth_uncompressed_frame_sectors(&frame_pre, tc_at(100));
+        sectors.extend(synth_uncompressed_frame_sectors(&frame_mid, tc_at(200)));
+
+        let (out, stats) = run_extract_with(
+            sectors,
+            6,
+            OutputFormat::Dsf,
+            Some(TimeFilter::new(150, 100)),
+        );
+
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, 28_224);
+        // File = 92 + 6 channels × 2 blocks × 4096 = 49_244 bytes.
+        assert_eq!(out.len(), 92 + 6 * 2 * BLOCK_SIZE_PER_CHANNEL);
+        // ch0 block 0 byte 0 = bit_reverse(frame_mid[0]); NOT frame_pre[0].
+        // This is the load-bearing check that the kept frame survived
+        // demux correctly.
+        assert_eq!(out[92], bit_reverse(frame_mid[0]));
+        // Hash-pinned: pins 6-channel + filter DSF interaction.
+        assert_eq!(
+            sha256_hex(&out),
+            "bbd3af4d297ed2da380c56e02a9af69bbad81204d71ab54486ae05c820ebc8a9",
+        );
+    }
+
+    #[test]
+    fn extract_six_channel_with_filter_drops_out_of_range_dff() {
+        // 6-channel + filter on the DFF path. Same setup as the DSF
+        // variant above.
+        let frame_pre = pattern(FRAME_SIZE_UNCOMPRESSED * 6);
+        let frame_mid: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 6))
+            .map(|i| ((i + 17) & 0xFF) as u8)
+            .collect();
+        let mut sectors = synth_uncompressed_frame_sectors(&frame_pre, tc_at(100));
+        sectors.extend(synth_uncompressed_frame_sectors(&frame_mid, tc_at(200)));
+
+        let (out, stats) = run_extract_with(
+            sectors,
+            6,
+            OutputFormat::Dff,
+            Some(TimeFilter::new(150, 100)),
+        );
+
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, 28_224);
+        // 6-channel DFF: 160 header + 28_224 audio = 28_384 bytes.
+        assert_eq!(out.len(), 160 + 28_224);
+        // Audio = just frame_mid (clustered passthrough).
+        assert_eq!(&out[160..160 + 28_224], &frame_mid[..]);
+        // Hash-pinned.
+        assert_eq!(
+            sha256_hex(&out),
+            "9ac9eec69511b2faf5a4a77190c99f232b686f995ed283435330cac6dbe6f952",
+        );
+    }
+
+    #[test]
     fn extract_partial_block_in_dsf_pads_with_zeros() {
         // Same input as the demux test, but assert ONLY the padding
         // contract: per-channel real bytes = 4704, which is 4096 +
@@ -579,6 +720,13 @@ mod tests {
         assert_eq!(read_u64_be(&out, 4), 132); // FRM8.chunk_data_size
         assert_eq!(stats.frames_read, 0);
         assert_eq!(stats.audio_bytes, 0);
+        // Hash-pinned: cross-test invariant with
+        // `filter_drops_out_of_range_dst_frame_silently` — both
+        // produce the same finalized empty 2-channel DFF.
+        assert_eq!(
+            sha256_hex(&out),
+            "5eb7736a725cf433c7d7fc75ceb07942d758cd9d0b832667621d47f12f45bed9",
+        );
     }
 
     #[test]
@@ -597,6 +745,12 @@ mod tests {
         assert_eq!(read_u64_le(&out, 64), 0); // sample_count
         assert_eq!(stats.frames_read, 0);
         assert_eq!(stats.audio_bytes, 0);
+        // Hash-pinned: pins the 92-byte empty DSF header (all fmt
+        // chunk fields, magic, sample_count, etc.).
+        assert_eq!(
+            sha256_hex(&out),
+            "e41afb408919fb9f59f0b7bd5b071dfc1fcaf3a5660706b8388ec5346f3be94a",
+        );
     }
 
     // ============================================================
@@ -795,6 +949,14 @@ mod tests {
         // Output is a valid header-only DFF (filter dropped everything).
         let out = output.into_inner();
         assert_eq!(out.len(), 144);
+        // Hash-pinned: pins the 2-channel filter-drops-all DFF output.
+        // MUST equal the hash in `extract_zero_frames_produces_header_only_dff`
+        // (cross-test invariant: both paths produce identical 144-byte
+        // finalized empty DFF headers via serialize_header(2, _, 0)).
+        assert_eq!(
+            sha256_hex(&out),
+            "5eb7736a725cf433c7d7fc75ceb07942d758cd9d0b832667621d47f12f45bed9",
+        );
     }
 
     #[test]

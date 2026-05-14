@@ -504,4 +504,27 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn five_channel_block_layout() {
+        // 5 channels × 4096 bytes per channel = 20480 interleaved.
+        // Mirror of six_channel_block_layout for the Surround5 path
+        // (5-channel ITU-R BS.775 layout: L, R, C, Ls, Rs, no LFE).
+        let payload = synth_interleaved(5, BLOCK_SIZE_PER_CHANNEL);
+        let out = run_write_and_capture(5, &payload);
+        assert_eq!(out.len(), 92 + 5 * 4096);
+        // channel_type = 6 (Surround5) for channel_count=5.
+        assert_eq!(u32::from_le_bytes(out[48..52].try_into().unwrap()), 6);
+        // channel_count = 5.
+        assert_eq!(u32::from_le_bytes(out[52..56].try_into().unwrap()), 5);
+        // Per-channel first byte verifies the 5-channel demux cycle.
+        for ch in 0..5 {
+            let block_start = 92 + ch * 4096;
+            let expected = BIT_REVERSE[((ch * 100) & 0xFF) as usize];
+            assert_eq!(
+                out[block_start], expected,
+                "ch{} first byte mismatch", ch,
+            );
+        }
+    }
 }

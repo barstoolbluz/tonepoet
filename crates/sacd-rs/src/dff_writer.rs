@@ -388,6 +388,46 @@ mod tests {
     }
 
     #[test]
+    fn header_byte_layout_for_five_channel() {
+        // Mirror of header_byte_layout_for_six_channel for the
+        // 5-channel ITU-R BS.775 layout (L, R, C, Ls, Rs — no LFE).
+        // Real SACDs with this configuration exist (mostly older
+        // surround mixes that don't use the LFE channel).
+        let out = run(5, &[]);
+        // Header size: 136 + 4 * 5 = 156 bytes.
+        assert_eq!(out.len(), 156);
+
+        // CHNL: 14 (CHNL header+count) + 20 (5 channel_ids × 4) = 34
+        // on disk; chunk_data_size = 2 + 4*5 = 22.
+        assert_eq!(&out[64..68], CHNL);
+        assert_eq!(read_u64_be(&out, 68), 2 + 4 * 5);
+        assert_eq!(read_u16_be(&out, 76), 5);
+        // Channel IDs: MLFT, MRGT, C, LS, RS (no LFE between C and LS).
+        assert_eq!(&out[78..82], MLFT);
+        assert_eq!(&out[82..86], MRGT);
+        assert_eq!(&out[86..90], C_ID);
+        assert_eq!(&out[90..94], LS_ID);
+        assert_eq!(&out[94..98], RS_ID);
+
+        // CMPR starts at 64 + (14 + 20) = 98.
+        assert_eq!(&out[98..102], CMPR);
+        assert_eq!(read_u64_be(&out, 102), 20);
+        // CMPR pad byte at cmpr_start + 31 = 129.
+        assert_eq!(out[129], 0);
+
+        // LSCO at 98 + 32 = 130.
+        assert_eq!(&out[130..134], LSCO);
+        assert_eq!(read_u16_be(&out, 142), LS_CONFIG_5_CHNL);
+
+        // PROP.chunk_data_size for 5ch: 4 + 16 + 34 + 32 + 14 = 100.
+        assert_eq!(read_u64_be(&out, 36), 100);
+
+        // DSD-data header at 130 + 14 = 144; audio starts at 156.
+        assert_eq!(&out[144..148], DSD);
+        assert_eq!(read_u64_be(&out, 148), 0);
+    }
+
+    #[test]
     fn audio_passes_through_unchanged_no_bit_reversal() {
         // A pattern that would be detectable if accidentally
         // bit-reversed (0xAA → 0x55) or demuxed.
