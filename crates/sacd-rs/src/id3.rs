@@ -431,12 +431,12 @@ mod tests {
         // on the value. For text="X": fr_size = 1 + 9 + 1 + 1 + 1 = 13.
         let mut buf = Vec::new();
         emit_txxx_performer(&mut buf, "X");
-        let fr_size = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         // For size 13, libid3_size28 produces [0, 0, 0, 13].
         assert_eq!(libid3_size28(13), [0, 0, 0, 13]);
-        // The frame size bytes spell out [0, 0, 0, 13] in the
-        // header.
-        assert_eq!(&buf[4..8], &[0, 0, 0, 13]);
+        // The frame size bytes in the header spell out the encoded
+        // libid3_size28(13). This pins both the size value AND the
+        // encoding.
+        assert_eq!(&buf[4..8], &libid3_size28(13));
     }
 
     // ============================================================
