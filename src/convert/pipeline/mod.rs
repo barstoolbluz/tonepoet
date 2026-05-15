@@ -591,4 +591,236 @@ mod tests {
         let debug = format!("{:?}", events);
         assert!(!debug.contains("hunter2"));
     }
+
+    // ====================================================================
+    // PR 2 — RealToolRunner exit-condition tests
+    // ====================================================================
+
+    /// Helper: build a ToolCommand that maps `binary` to a shell
+    /// command via a custom tool_paths entry, so we can run arbitrary
+    /// commands through the real runner without needing actual audio
+    /// tools installed.
+    fn real_runner_with(overrides: Vec<(ToolBinary, &str)>) -> RealToolRunner {
+        let mut paths = std::collections::HashMap::new();
+        for (binary, path) in overrides {
+            paths.insert(binary.default_name().to_string(), PathBuf::from(path));
+        }
+        RealToolRunner::new(paths)
+    }
+
+    fn sh_command(script: &str, timeout_secs: u64) -> ToolCommand {
+        ToolCommand {
+            binary: ToolBinary::Ffmpeg, // arbitrary; overridden by tool_paths
+            args: vec!["-c".into(), script.into()],
+            secret_args: vec![],
+            cwd: None,
+            env: vec![],
+            timeout: Duration::from_secs(timeout_secs),
+        }
+    }
+
+    // 1. Timeout --------------------------------------------------------
+
+    #[tokio::test]
+    async fn real_runner_timeout_returns_error_with_record() {
+        let runner = real_runner_with(vec![(ToolBinary::Ffmpeg, "/bin/sh")]);
+        let cmd = sh_command("sleep 60", 1);
+        let cancel = CancellationToken::new();
+
+        let err = runner.run(cmd, &cancel).await.expect_err("should timeout");
+        match err {
+            ToolRunnerError::Timeout { elapsed, command } => {
+                assert!(elapsed >= Duration::from_millis(900));
+                assert_eq!(command.binary, ToolBinary::Ffmpeg);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    // 2. Cancellation ---------------------------------------------------
+
+    #[tokio::test]
+    async fn real_runner_cancellation_returns_error_with_record() {
+        let runner = real_runner_with(vec![(ToolBinary::Ffmpeg, "/bin/sh")]);
+        let cmd = sh_command("sleep 60", 300);
+        let cancel = CancellationToken::new();
+
+        // Cancel after a short delay.
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel2.cancel();
+        });
+
+        let err = runner.run(cmd, &cancel).await.expect_err("should cancel");
+        match err {
+            ToolRunnerError::Cancelled { command } => {
+                assert_eq!(command.binary, ToolBinary::Ffmpeg);
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    // 3. Signal ---------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_runner_signal_death_maps_to_process_exit_signal() {
+        let runner = real_runner_with(vec![(ToolBinary::Ffmpeg, "/bin/sh")]);
+        // The shell sends SIGKILL to itself — uncatchable.
+        let cmd = sh_command("kill -9 $$", 10);
+        let cancel = CancellationToken::new();
+
+        let err = runner.run(cmd, &cancel).await.expect_err("should fail");
+        match err {
+            ToolRunnerError::NonZeroExit { exit, .. } => {
+                assert!(
+                    matches!(exit, ProcessExit::Signal(9)),
+                    "expected Signal(9), got {exit:?}"
+                );
+            }
+            other => panic!("expected NonZeroExit with signal, got {other:?}"),
+        }
+    }
+
+    // 4. Redaction ------------------------------------------------------
+
+    #[tokio::test]
+    async fn real_runner_redacts_secrets_in_records_and_errors() {
+        let runner = real_runner_with(vec![(ToolBinary::SevenZip, "/bin/sh")]);
+        let cmd = ToolCommand {
+            binary: ToolBinary::SevenZip,
+            args: vec!["-c".into(), "-phunter2".into(), "echo ok".into()],
+            secret_args: vec![1], // index 1 is the password arg
+            cwd: None,
+            env: vec![EnvVar {
+                key: "SECRET_TOKEN".into(),
+                value: SecretString::new("s3cr3t_v4lue"),
+                secret: true,
+            }],
+            timeout: Duration::from_secs(10),
+        };
+        let cancel = CancellationToken::new();
+
+        // The command will fail (bad shell syntax), but that's fine —
+        // we're testing redaction, not success.
+        let result = runner.run(cmd, &cancel).await;
+        let record = match &result {
+            Ok(output) => &output.command,
+            Err(ToolRunnerError::NonZeroExit { command, .. }) => command,
+            Err(ToolRunnerError::Spawn { command }) => command,
+            other => panic!("unexpected result: {other:?}"),
+        };
+
+        // The sanitized args must redact index 1.
+        assert_eq!(record.sanitized_args[1], "<redacted>");
+        // Env keys are present but values are not.
+        assert_eq!(record.env_keys, vec!["SECRET_TOKEN".to_string()]);
+        // Full serialization must not contain either secret.
+        let json = serde_json::to_string(record).unwrap();
+        assert!(!json.contains("hunter2"), "password leaked in record JSON");
+        assert!(!json.contains("s3cr3t_v4lue"), "env secret leaked in record JSON");
+
+        // The error's Debug output must not contain secrets.
+        if let Err(ref e) = result {
+            let debug = format!("{e:?}");
+            assert!(!debug.contains("hunter2"), "password leaked in error Debug");
+            assert!(!debug.contains("s3cr3t_v4lue"), "env secret leaked in error Debug");
+        }
+    }
+
+    // 5. Non-zero exit --------------------------------------------------
+
+    #[tokio::test]
+    async fn real_runner_nonzero_exit_returns_stderr_and_record() {
+        let runner = real_runner_with(vec![(ToolBinary::Ffmpeg, "/bin/sh")]);
+        let cmd = sh_command("echo 'some error text' >&2; exit 42", 10);
+        let cancel = CancellationToken::new();
+
+        let err = runner.run(cmd, &cancel).await.expect_err("should fail");
+        match err {
+            ToolRunnerError::NonZeroExit {
+                exit,
+                stderr_tail,
+                command,
+            } => {
+                assert_eq!(exit, ProcessExit::Code(42));
+                assert!(
+                    stderr_tail.contains("some error text"),
+                    "stderr should contain the error message"
+                );
+                assert_eq!(command.binary, ToolBinary::Ffmpeg);
+                assert!(command.elapsed > Duration::ZERO || command.elapsed == Duration::ZERO);
+            }
+            other => panic!("expected NonZeroExit, got {other:?}"),
+        }
+    }
+
+    // 6. Bounded capture ------------------------------------------------
+
+    #[tokio::test]
+    async fn real_runner_bounds_stderr_to_64kib_tail() {
+        let runner = real_runner_with(vec![(ToolBinary::Ffmpeg, "/bin/sh")]);
+        // Generate 128 KiB of output to stderr, then exit 1 so we
+        // can inspect the stderr_tail on the error.
+        let script = format!(
+            "dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\0' 'X' >&2; exit 1"
+        );
+        let cmd = sh_command(&script, 30);
+        let cancel = CancellationToken::new();
+
+        let err = runner.run(cmd, &cancel).await.expect_err("should fail");
+        match err {
+            ToolRunnerError::NonZeroExit { stderr_tail, .. } => {
+                assert!(
+                    stderr_tail.len() <= TOOL_OUTPUT_TAIL_BYTES,
+                    "stderr_tail {} exceeds 64 KiB bound",
+                    stderr_tail.len()
+                );
+                // Should have captured data (not empty).
+                assert!(stderr_tail.len() > 1024, "expected substantial stderr capture");
+            }
+            other => panic!("expected NonZeroExit, got {other:?}"),
+        }
+    }
+
+    // 7. Path resolution ------------------------------------------------
+
+    #[test]
+    fn every_tool_binary_has_a_default_name() {
+        // Exhaustive check: every variant maps to a non-empty name.
+        let all = [
+            ToolBinary::SevenZip,
+            ToolBinary::Ffmpeg,
+            ToolBinary::Ffprobe,
+            ToolBinary::Sox,
+            ToolBinary::Loudgain,
+            ToolBinary::Metaflac,
+            ToolBinary::Opustags,
+            ToolBinary::Wvunpack,
+            ToolBinary::Wvtag,
+            ToolBinary::AtomicParsley,
+        ];
+        for binary in &all {
+            let name = binary.default_name();
+            assert!(!name.is_empty(), "{binary:?} has empty default_name");
+        }
+    }
+
+    #[test]
+    fn path_resolution_uses_custom_override() {
+        let mut paths = std::collections::HashMap::new();
+        paths.insert("sox".to_string(), PathBuf::from("/custom/path/to/sox"));
+        let runner = RealToolRunner::new(paths);
+        let resolved = runner.resolve_binary(ToolBinary::Sox);
+        assert_eq!(resolved, PathBuf::from("/custom/path/to/sox"));
+    }
+
+    #[test]
+    fn path_resolution_falls_back_to_default_name() {
+        let runner = RealToolRunner::new(std::collections::HashMap::new());
+        // Without a custom override, Ffprobe resolves to its default name.
+        let resolved = runner.resolve_binary(ToolBinary::Ffprobe);
+        assert_eq!(resolved, PathBuf::from("ffprobe"));
+    }
 }

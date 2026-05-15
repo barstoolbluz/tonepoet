@@ -4,12 +4,15 @@
 //! command/output types, the `ToolRunner` trait, and a transcript-
 //! backed stub runner for materializer/orchestrator unit tests.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::ToolRunnerError;
@@ -29,6 +32,25 @@ pub enum ToolBinary {
     Wvunpack,
     Wvtag,
     AtomicParsley,
+}
+
+impl ToolBinary {
+    /// The canonical system binary name used for PATH lookup and as
+    /// the key into `ProcessorConfig.tool_paths`.
+    pub fn default_name(&self) -> &'static str {
+        match self {
+            Self::SevenZip => "7z",
+            Self::Ffmpeg => "ffmpeg",
+            Self::Ffprobe => "ffprobe",
+            Self::Sox => "sox",
+            Self::Loudgain => "loudgain",
+            Self::Metaflac => "metaflac",
+            Self::Opustags => "opustags",
+            Self::Wvunpack => "wvunpack",
+            Self::Wvtag => "wvtag",
+            Self::AtomicParsley => "AtomicParsley",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +251,204 @@ impl ToolRunner for StubToolRunner {
                     command: record,
                 })
             }
+        }
+    }
+}
+
+// ===========================================================================
+// Real runner — PR 2
+// ===========================================================================
+
+/// Async child-process `ToolRunner`. Spawns real processes via tokio,
+/// enforces per-command timeouts, honours cancellation tokens, captures
+/// bounded stdout/stderr tails, and always produces sanitized
+/// `CommandRecord`s on both success and failure.
+pub struct RealToolRunner {
+    tool_paths: HashMap<String, PathBuf>,
+}
+
+impl RealToolRunner {
+    /// Create a runner. `tool_paths` keys are canonical binary names
+    /// (e.g. `"ffmpeg"`, `"sox"`) matching `ToolBinary::default_name()`.
+    /// An empty map means all tools are resolved from `$PATH`.
+    pub fn new(tool_paths: HashMap<String, PathBuf>) -> Self {
+        Self { tool_paths }
+    }
+
+    /// Resolve a `ToolBinary` to an executable path.
+    ///
+    /// 1. If `tool_paths` contains a custom override for the binary's
+    ///    canonical name, use it.
+    /// 2. For `SevenZip`, probe for `7zz` (faster) then `7z`.
+    /// 3. Otherwise fall back to the canonical name on `$PATH`.
+    pub(crate) fn resolve_binary(&self, binary: ToolBinary) -> PathBuf {
+        let name = binary.default_name();
+        if let Some(path) = self.tool_paths.get(name) {
+            return path.clone();
+        }
+        if binary == ToolBinary::SevenZip {
+            if let Some(bin) = crate::detect_7z_binary() {
+                return PathBuf::from(bin);
+            }
+        }
+        PathBuf::from(name)
+    }
+
+    /// Build a sanitized `CommandRecord` from a `ToolCommand` and
+    /// whatever exit / output info is available at the call site.
+    fn build_record(
+        cmd: &ToolCommand,
+        exit: Option<ProcessExit>,
+        stdout_tail: &str,
+        stderr_tail: &str,
+        elapsed: Duration,
+    ) -> CommandRecord {
+        CommandRecord {
+            binary: cmd.binary,
+            sanitized_args: cmd.sanitized_args(),
+            cwd: cmd.cwd.clone(),
+            env_keys: cmd.env_keys(),
+            exit,
+            stdout_tail: stdout_tail.to_string(),
+            stderr_tail: stderr_tail.to_string(),
+            elapsed,
+        }
+    }
+}
+
+/// Read an async reader to completion and return at most the last
+/// `TOOL_OUTPUT_TAIL_BYTES` as a UTF-8 string (lossy).
+async fn read_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> String {
+    let mut buf = Vec::new();
+    // Read everything. Pipeline tools don't flood stderr/stdout — they
+    // write to files. If a pathological tool does, we truncate below.
+    let _ = reader.read_to_end(&mut buf).await;
+    if buf.len() > TOOL_OUTPUT_TAIL_BYTES {
+        let start = buf.len() - TOOL_OUTPUT_TAIL_BYTES;
+        return String::from_utf8_lossy(&buf[start..]).into_owned();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Map a `std::process::ExitStatus` to a `ProcessExit`.
+fn map_exit_status(status: std::process::ExitStatus) -> ProcessExit {
+    if let Some(code) = status.code() {
+        return ProcessExit::Code(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return ProcessExit::Signal(sig);
+        }
+    }
+    ProcessExit::Unknown
+}
+
+#[async_trait]
+impl ToolRunner for RealToolRunner {
+    async fn run(
+        &self,
+        cmd: ToolCommand,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolRunnerError> {
+        let binary_path = self.resolve_binary(cmd.binary);
+        let start = Instant::now();
+
+        // Build the process command.
+        let mut proc = tokio::process::Command::new(&binary_path);
+        proc.args(&cmd.args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        if let Some(ref cwd) = cmd.cwd {
+            proc.current_dir(cwd);
+        }
+        for env_var in &cmd.env {
+            proc.env(&env_var.key, env_var.value.expose());
+        }
+
+        // Spawn.
+        let mut child = proc.spawn().map_err(|_io| {
+            let elapsed = start.elapsed();
+            ToolRunnerError::Spawn {
+                command: Self::build_record(&cmd, None, "", "", elapsed),
+            }
+        })?;
+
+        // Take pipe handles so we can read them concurrently.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+
+        let stdout_task = tokio::spawn(async move {
+            match stdout_pipe {
+                Some(r) => read_tail(r).await,
+                None => String::new(),
+            }
+        });
+        let stderr_task = tokio::spawn(async move {
+            match stderr_pipe {
+                Some(r) => read_tail(r).await,
+                None => String::new(),
+            }
+        });
+
+        // Race: child completion vs timeout vs cancellation.
+        let wait_result = tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(s) => Ok(s),
+                    Err(e) => Err(e),
+                }
+            }
+            _ = tokio::time::sleep(cmd.timeout) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await; // reap
+                let elapsed = start.elapsed();
+                return Err(ToolRunnerError::Timeout {
+                    elapsed,
+                    command: Self::build_record(&cmd, None, "", "", elapsed),
+                });
+            }
+            _ = cancel.cancelled() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await; // reap
+                let elapsed = start.elapsed();
+                return Err(ToolRunnerError::Cancelled {
+                    command: Self::build_record(&cmd, None, "", "", elapsed),
+                });
+            }
+        };
+
+        let elapsed = start.elapsed();
+
+        // Collect stdout/stderr (the tasks complete once the pipe closes).
+        let stdout_tail = stdout_task.await.unwrap_or_default();
+        let stderr_tail = stderr_task.await.unwrap_or_default();
+
+        match wait_result {
+            Ok(status) => {
+                let exit = map_exit_status(status);
+                let record =
+                    Self::build_record(&cmd, Some(exit), &stdout_tail, &stderr_tail, elapsed);
+
+                if status.success() {
+                    Ok(ToolOutput {
+                        exit,
+                        stdout_tail,
+                        stderr_tail,
+                        elapsed,
+                        command: record,
+                    })
+                } else {
+                    Err(ToolRunnerError::NonZeroExit {
+                        exit,
+                        stderr_tail,
+                        command: record,
+                    })
+                }
+            }
+            Err(io_err) => Err(ToolRunnerError::Io(io_err)),
         }
     }
 }
