@@ -563,10 +563,18 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
             let phase_name = phase.as_ref().map(|p| p.display_name()).unwrap_or("Processing");
             format!("{:.1}% - {}", progress, phase_name)
         }
-        ConversionStatus::Completed { output_path } => {
+        ConversionStatus::Completed { output_path, .. } => {
             format!("Completed -> {}", output_path.display())
         }
-        ConversionStatus::Failed { error } => format!("Failed: {}", error),
+        ConversionStatus::Partial { output_path, successful, failed, .. } => {
+            format!(
+                "Partial ({}/{} ok) -> {}",
+                successful,
+                successful + failed,
+                output_path.display()
+            )
+        }
+        ConversionStatus::Failed { error, .. } => format!("Failed: {}", error),
         ConversionStatus::Paused => "Paused".to_string(),
         ConversionStatus::Cancelled => "Cancelled".to_string(),
     };

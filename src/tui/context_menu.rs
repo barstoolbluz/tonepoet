@@ -1181,7 +1181,7 @@ pub fn execute_context_action(
         ContextAction::ShowItemInfo => {
             if let Some(qi) = app.items_snapshot.get(app.selected_index) {
                 match &qi.status {
-                    ConversionStatus::Failed { error } => {
+                    ConversionStatus::Failed { error, .. } => {
                         app.active_overlay = ActiveOverlay::ErrorDetail {
                             item_id: qi.id.clone(),
                             error: error.clone(),

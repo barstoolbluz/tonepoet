@@ -98,9 +98,27 @@ pub enum ConversionStatus {
         phase_progress: Option<f32>,
     },
     /// Successfully completed
-    Completed { output_path: PathBuf },
+    Completed {
+        output_path: PathBuf,
+        /// Durable per-album run log, when one was written.
+        #[serde(default)]
+        log_path: Option<PathBuf>,
+    },
+    /// Completed with some tracks dropped (explicit partial opt-in).
+    /// Terminal; never an alias for success.
+    Partial {
+        output_path: PathBuf,
+        successful: u32,
+        failed: u32,
+        log_path: PathBuf,
+    },
     /// Failed with error message
-    Failed { error: String },
+    Failed {
+        error: String,
+        /// Durable per-album run log, when one was written.
+        #[serde(default)]
+        log_path: Option<PathBuf>,
+    },
     /// Paused by user
     Paused,
     /// Cancelled by user
@@ -137,6 +155,10 @@ pub struct ConversionItem {
     pub selected: bool,
     /// Archive password (for 7z files)
     pub archive_password: Option<String>,
+    /// New pipeline request (populated during migration; legacy fields
+    /// remain until PR 10 finishes CLI/TUI surface).
+    #[serde(default)]
+    pub pipeline_request: Option<crate::convert::pipeline::PipelineRequest>,
 }
 
 impl Default for ConversionItem {
@@ -155,6 +177,7 @@ impl Default for ConversionItem {
             file_size: 0,
             selected: false,
             archive_password: None,
+            pipeline_request: None,
         }
     }
 }
@@ -187,24 +210,28 @@ impl ConversionItem {
             file_size,
             selected: false,
             archive_password,
+            pipeline_request: None,
         }
     }
-    
+
     /// Check if the item is in a terminal state
     pub fn is_finished(&self) -> bool {
         matches!(
             self.status,
-            ConversionStatus::Completed { .. } 
+            ConversionStatus::Completed { .. }
+            | ConversionStatus::Partial { .. }
             | ConversionStatus::Failed { .. }
             | ConversionStatus::Cancelled
         )
     }
-    
+
     /// Check if the item can be retried
     pub fn can_retry(&self) -> bool {
         matches!(
             self.status,
-            ConversionStatus::Failed { .. } | ConversionStatus::Cancelled
+            ConversionStatus::Failed { .. }
+            | ConversionStatus::Partial { .. }
+            | ConversionStatus::Cancelled
         )
     }
 }
@@ -279,7 +306,8 @@ impl ConversionQueue {
                         current.started_at = Some(Utc::now());
                     }
                 }
-                ConversionStatus::Completed { .. } 
+                ConversionStatus::Completed { .. }
+                | ConversionStatus::Partial { .. }
                 | ConversionStatus::Failed { .. }
                 | ConversionStatus::Cancelled => {
                     current.completed_at = Some(Utc::now());
@@ -332,6 +360,13 @@ impl ConversionQueue {
     pub fn failed_items(&self) -> usize {
         self.completed.iter()
             .filter(|item| matches!(item.status, ConversionStatus::Failed { .. }))
+            .count()
+    }
+
+    /// Get partial items (counted separately from completed and failed)
+    pub fn partial_items(&self) -> usize {
+        self.completed.iter()
+            .filter(|item| matches!(item.status, ConversionStatus::Partial { .. }))
             .count()
     }
     

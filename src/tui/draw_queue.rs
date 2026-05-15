@@ -189,7 +189,14 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             vec![Span::styled("Completed", Style::default().fg(Color::Green))],
             Style::default(),
         ),
-        ConversionStatus::Failed { error } => {
+        ConversionStatus::Partial { successful, failed, .. } => (
+            vec![Span::styled(
+                format!("Partial {}/{}", successful, successful + failed),
+                Style::default().fg(Color::Yellow),
+            )],
+            Style::default(),
+        ),
+        ConversionStatus::Failed { error, .. } => {
             let short_err: String = if error.len() > 30 {
                 let truncated: String = error.chars().take(27).collect();
                 format!("{}...", truncated)

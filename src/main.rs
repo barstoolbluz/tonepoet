@@ -474,10 +474,18 @@ async fn run_convert(
                     let msg = message.as_deref().unwrap_or("");
                     pb.set_message(format!("{}: {}", phase_name, msg));
                 }
-                ConversionStatus::Completed { output_path } => {
+                ConversionStatus::Completed { output_path, .. } => {
                     pb.println(format!("  Completed: {}", output_path.display()));
                 }
-                ConversionStatus::Failed { error } => {
+                ConversionStatus::Partial { output_path, successful, failed, .. } => {
+                    pb.println(format!(
+                        "  Partial ({}/{} ok): {}",
+                        successful,
+                        successful + failed,
+                        output_path.display()
+                    ));
+                }
+                ConversionStatus::Failed { error, .. } => {
                     pb.println(format!("  Failed: {}", error));
                 }
                 _ => {}

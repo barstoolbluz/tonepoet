@@ -669,7 +669,7 @@ impl ConversionProcessor {
                     Ok(result) => Ok(result),
                     Err(e) => {
                         // Convert error into a Failed status so the queue item gets updated
-                        Ok((item_id_for_err, ConversionStatus::Failed { error: e.to_string() }))
+                        Ok((item_id_for_err, ConversionStatus::Failed { error: e.to_string(), log_path: None }))
                     }
                 }
             });
@@ -778,7 +778,7 @@ impl ConversionProcessor {
                     match process_item(item, progress_tx, tool_paths, file_semaphore, scratch_dir).await {
                         Ok(result) => Ok(result),
                         Err(e) => {
-                            Ok((item_id_for_err, ConversionStatus::Failed { error: e.to_string() }))
+                            Ok((item_id_for_err, ConversionStatus::Failed { error: e.to_string(), log_path: None }))
                         }
                     }
                 });
@@ -1175,7 +1175,7 @@ pub async fn process_item(
     if !item.input_path.exists() {
         let error_msg = format!("Source file not found: {}", item.input_path.display());
         log::error!("{}", error_msg);
-        return Ok((item.id.clone(), ConversionStatus::Failed { error: error_msg }));
+        return Ok((item.id.clone(), ConversionStatus::Failed { error: error_msg, log_path: None }));
     }
 
     // Update status to processing - 0%
@@ -1369,7 +1369,7 @@ pub async fn process_item(
     ).await;
     
     // Update status to completed - 100%
-    let final_status = ConversionStatus::Completed { output_path: output_path.clone() };
+    let final_status = ConversionStatus::Completed { output_path: output_path.clone(), log_path: None };
     let _ = progress_tx.send(ProgressUpdate {
         item_id: item.id.clone(),
         progress: 100.0,
@@ -1616,10 +1616,10 @@ fn map_backend_status_to_main(backend_status: tonepoet_backend::integration::Con
             }
         }
         tonepoet_backend::integration::ConversionStatus::Completed { output_path } => {
-            ConversionStatus::Completed { output_path }
+            ConversionStatus::Completed { output_path, log_path: None }
         }
         tonepoet_backend::integration::ConversionStatus::Failed { error } => {
-            ConversionStatus::Failed { error }
+            ConversionStatus::Failed { error, log_path: None }
         }
         tonepoet_backend::integration::ConversionStatus::Paused => ConversionStatus::Paused,
         tonepoet_backend::integration::ConversionStatus::Cancelled => ConversionStatus::Cancelled,
@@ -3579,6 +3579,7 @@ async fn extract_and_convert_7z(
         progress: 100.0,
         status: ConversionStatus::Completed {
             output_path: output_dir.clone(),
+            log_path: None,
         },
     });
     

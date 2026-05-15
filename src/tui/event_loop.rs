@@ -173,10 +173,13 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         AppMessage::ConversionProgress { item_id, status } => {
             // Capture terminal state info BEFORE the status is moved into the item.
             let history_data = match &status {
-                crate::convert::ConversionStatus::Completed { output_path } => {
+                crate::convert::ConversionStatus::Completed { output_path, .. } => {
                     Some((true, Some(output_path.display().to_string()), None::<String>))
                 }
-                crate::convert::ConversionStatus::Failed { error } => {
+                crate::convert::ConversionStatus::Partial { output_path, .. } => {
+                    Some((true, Some(output_path.display().to_string()), None::<String>))
+                }
+                crate::convert::ConversionStatus::Failed { error, .. } => {
                     Some((false, None, Some(error.clone())))
                 }
                 _ => None,

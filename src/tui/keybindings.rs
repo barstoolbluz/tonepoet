@@ -1130,7 +1130,7 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
         (KeyCode::Enter, KeyModifiers::NONE) => {
             if let Some(item) = app.items_snapshot.get(app.selected_index) {
                 match &item.status {
-                    ConversionStatus::Failed { error } => {
+                    ConversionStatus::Failed { error, .. } => {
                         app.active_overlay = ActiveOverlay::ErrorDetail {
                             item_id: item.id.clone(),
                             error: error.clone(),

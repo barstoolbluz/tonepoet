@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod queue;
 pub mod formats;
+pub mod pipeline;
 pub mod processor;
 pub mod wizard;
 pub mod simple_wizard;
@@ -280,7 +281,11 @@ impl ConversionManager {
                     ConversionStatus::Processing { .. } if item.started_at.is_none() => {
                         item.started_at = Some(chrono::Utc::now());
                     }
-                    ConversionStatus::Completed { output_path } => {
+                    ConversionStatus::Completed { output_path, .. } => {
+                        item.completed_at = Some(chrono::Utc::now());
+                        item.output_path = Some(output_path.clone());
+                    }
+                    ConversionStatus::Partial { output_path, .. } => {
                         item.completed_at = Some(chrono::Utc::now());
                         item.output_path = Some(output_path.clone());
                     }
