@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod errors;
+pub mod materializer_7z;
 pub mod reporter;
 pub mod stages;
 pub mod tool;
@@ -822,5 +823,566 @@ mod tests {
         // Without a custom override, Ffprobe resolves to its default name.
         let resolved = runner.resolve_binary(ToolBinary::Ffprobe);
         assert_eq!(resolved, PathBuf::from("ffprobe"));
+    }
+
+    // ====================================================================
+    // PR 3 — SevenZipMaterializer exit-condition tests
+    // ====================================================================
+
+    use crate::convert::pipeline::materializer_7z::SevenZipMaterializer;
+    use crate::convert::pipeline::stages::Materializer;
+
+    /// Build a minimal `PipelineRequest` for materializer tests.
+    fn mat_request(container: PathBuf, password: Option<&str>) -> PipelineRequest {
+        PipelineRequest {
+            job_id: "mat-job".into(),
+            item_id: "mat-item".into(),
+            container,
+            source: SourceOptions {
+                archive_password: password.map(SecretString::new),
+                sacd_area: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            target_format: AudioFormat::Flac,
+            encode: EncodeOptions {
+                backend: EncodeBackend::Auto,
+                bitrate: None,
+                compression_level: Some(8),
+                dither: DitherPolicy::Auto,
+            },
+            merge: false,
+            output_root: PathBuf::from("/tmp/out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".into(),
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+            },
+            log: LogPolicy { root: PathBuf::from("/tmp/logs"), write_for_blocked: true },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Enabled,
+                features: StageRequirement::Disabled,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        }
+    }
+
+    /// JSON that ffprobe would return for one audio stream.
+    fn ffprobe_json(sample_rate: u32, duration_secs: f64) -> String {
+        format!(
+            r#"{{"streams":[{{"sample_rate":"{}","duration":"{}"}}],"format":{{"duration":"{}"}}}}"#,
+            sample_rate, duration_secs, duration_secs,
+        )
+    }
+
+    /// Create fake audio files in a staging dir and return the staging root.
+    fn setup_staging(names: &[&str]) -> (tempfile::TempDir, StagingDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in names {
+            let path = tmp.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, b"fake-audio").unwrap();
+        }
+        let staging = StagingDir::new(tmp.path().to_path_buf(), "test-job".into());
+        // Disarm so tempdir cleanup doesn't race with StagingDir Drop.
+        // (The tempdir owns the directory; StagingDir just borrows the path.)
+        // Actually, we need StagingDir armed for cancellation tests.
+        // We'll handle this per-test.
+        (tmp, staging)
+    }
+
+    // 1. Plain 7z — success path ----------------------------------------
+
+    #[tokio::test]
+    async fn materializer_plain_7z_yields_expected_prepared_source() {
+        let (tmp, mut staging) = setup_staging(&[
+            "01 - First Track.flac",
+            "02 - Second Track.flac",
+            "03 - Third Track.flac",
+        ]);
+        staging.disarm(); // tmp owns cleanup
+
+        let runner = StubToolRunner::new();
+        // 7z extraction: success (files already pre-staged).
+        // Push one default success for 7z, then three for ffprobe.
+        // StubToolRunner returns default success when no responses queued.
+        // Queue explicit ffprobe outputs.
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::SevenZip,
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+        for rate in [44100, 44100, 44100] {
+            runner.push_output(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: ffprobe_json(rate, 240.0),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: CommandRecord {
+                    binary: ToolBinary::Ffprobe,
+                    sanitized_args: vec![],
+                    cwd: None,
+                    env_keys: vec![],
+                    exit: Some(ProcessExit::Code(0)),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                },
+            });
+        }
+
+        let req = mat_request(PathBuf::from("/fake/archive.7z"), None);
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+
+        assert_eq!(source.kind, SourceKind::SevenZip);
+        assert_eq!(source.tracks.len(), 3);
+        // Verify track ordering by source_ordinal.
+        for (i, t) in source.tracks.iter().enumerate() {
+            assert_eq!(t.id.source_ordinal, (i + 1) as u32);
+            assert_eq!(t.sample_rate, 44100);
+            assert!(t.expected_samples.is_some());
+            assert!(matches!(t.source_ref, TrackSourceRef::StagedFile(_)));
+        }
+        assert_eq!(source.provenance.source_kind, SourceKind::SevenZip);
+        drop(tmp);
+    }
+
+    // 2. Password-protected — redaction on success + failure --------------
+
+    #[tokio::test]
+    async fn materializer_password_success_redacts_in_command_record() {
+        let (tmp, mut staging) = setup_staging(&["track.flac"]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        // Queue 7z success + ffprobe success.
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::SevenZip,
+                sanitized_args: vec![],
+                cwd: None, env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(), stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: ffprobe_json(48000, 180.0),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: vec![], cwd: None, env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(), stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+
+        let req = mat_request(PathBuf::from("/fake/pw.7z"), Some("s3cretPW"));
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let _source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+
+        // The 7z command record must have the password redacted.
+        let transcript = runner.transcript();
+        let sz_record = &transcript[0];
+        assert_eq!(sz_record.binary, ToolBinary::SevenZip);
+        let json = serde_json::to_string(sz_record).unwrap();
+        assert!(!json.contains("s3cretPW"), "password leaked in success record");
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn materializer_password_failure_redacts_in_error() {
+        let (tmp, mut staging) = setup_staging(&[]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        // 7z returns "Wrong password" error.
+        runner.push_failure("Wrong password");
+
+        let req = mat_request(PathBuf::from("/fake/pw.7z"), Some("badPW123"));
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+
+        assert!(matches!(err, MaterializeError::Encrypted));
+        // Verify the command record on the error path doesn't leak the password.
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 1);
+        let json = serde_json::to_string(&transcript[0]).unwrap();
+        assert!(!json.contains("badPW123"), "password leaked in failure record");
+        drop(tmp);
+    }
+
+    // 3. Malformed archive -----------------------------------------------
+
+    #[tokio::test]
+    async fn materializer_malformed_archive_returns_extraction_error() {
+        let (tmp, mut staging) = setup_staging(&[]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        runner.push_failure("Cannot open the file as archive");
+
+        let req = mat_request(PathBuf::from("/fake/bad.7z"), None);
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+
+        assert!(matches!(err, MaterializeError::Extraction(_)));
+        drop(tmp);
+    }
+
+    // 4. Empty archive ---------------------------------------------------
+
+    #[tokio::test]
+    async fn materializer_empty_archive_returns_error() {
+        // 7z succeeds but no audio files in the staging dir.
+        let (tmp, mut staging) = setup_staging(&["readme.txt", "cover.jpg"]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        // 7z success.
+
+        let req = mat_request(PathBuf::from("/fake/empty.7z"), None);
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+
+        assert!(
+            matches!(err, MaterializeError::Extraction(ref msg) if msg.contains("no audio")),
+            "expected 'no audio files' error, got: {err:?}"
+        );
+        drop(tmp);
+    }
+
+    // 5. Mixed audio/non-audio -------------------------------------------
+
+    #[tokio::test]
+    async fn materializer_mixed_archive_returns_only_audio_tracks() {
+        let (tmp, mut staging) = setup_staging(&[
+            "cover.jpg",
+            "info.txt",
+            "track1.flac",
+            "track2.flac",
+            "thumbs.db",
+        ]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        // 7z success + 2 ffprobe calls (one per audio file).
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(), stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::SevenZip, sanitized_args: vec![],
+                cwd: None, env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(), stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+        for _ in 0..2 {
+            runner.push_output(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: ffprobe_json(44100, 300.0),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: CommandRecord {
+                    binary: ToolBinary::Ffprobe, sanitized_args: vec![],
+                    cwd: None, env_keys: vec![],
+                    exit: Some(ProcessExit::Code(0)),
+                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                },
+            });
+        }
+
+        let req = mat_request(PathBuf::from("/fake/mixed.7z"), None);
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+
+        assert_eq!(source.tracks.len(), 2, "should only have audio tracks");
+        drop(tmp);
+    }
+
+    // 6. Multi-disc archive ----------------------------------------------
+
+    #[tokio::test]
+    async fn materializer_multi_disc_assigns_correct_disc_numbers() {
+        // Simulate a multi-disc archive with subdirectories.
+        let (tmp, mut staging) = setup_staging(&[
+            "CD1/01 - Track A.flac",
+            "CD1/02 - Track B.flac",
+            "CD2/01 - Track C.flac",
+        ]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        // 7z success + 3 ffprobe calls.
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(), stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::SevenZip, sanitized_args: vec![],
+                cwd: None, env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(), stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+        for _ in 0..3 {
+            runner.push_output(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: ffprobe_json(96000, 400.0),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: CommandRecord {
+                    binary: ToolBinary::Ffprobe, sanitized_args: vec![],
+                    cwd: None, env_keys: vec![],
+                    exit: Some(ProcessExit::Code(0)),
+                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                },
+            });
+        }
+
+        let req = mat_request(PathBuf::from("/fake/multi.7z"), None);
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+
+        assert_eq!(source.tracks.len(), 3);
+        // Tracks are sorted by path — CD1 before CD2.
+        assert_eq!(source.tracks[0].id.source_ordinal, 1);
+        assert_eq!(source.tracks[2].id.source_ordinal, 3);
+        // All tracks should have StagedFile refs.
+        for t in &source.tracks {
+            assert!(matches!(t.source_ref, TrackSourceRef::StagedFile(_)));
+            assert_eq!(t.sample_rate, 96000);
+        }
+        drop(tmp);
+    }
+
+    // 7. TrackSelection::Range -------------------------------------------
+
+    #[tokio::test]
+    async fn materializer_track_selection_range_filters_correctly() {
+        let (tmp, mut staging) = setup_staging(&[
+            "01.flac", "02.flac", "03.flac", "04.flac", "05.flac",
+        ]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        // 7z success + 5 ffprobe calls.
+        for _ in 0..6 {
+            runner.push_output(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: ffprobe_json(44100, 200.0),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: CommandRecord {
+                    binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
+                    cwd: None, env_keys: vec![],
+                    exit: Some(ProcessExit::Code(0)),
+                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                },
+            });
+        }
+
+        let mut req = mat_request(PathBuf::from("/fake/five.7z"), None);
+        req.source.track_selection = TrackSelection::Range { start: 2, end: 4 };
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+
+        assert_eq!(source.tracks.len(), 3);
+        let ordinals: Vec<u32> = source.tracks.iter().map(|t| t.id.source_ordinal).collect();
+        assert_eq!(ordinals, vec![2, 3, 4]);
+        drop(tmp);
+    }
+
+    // 8. TrackSelection::Set + invalid -----------------------------------
+
+    #[tokio::test]
+    async fn materializer_track_selection_set_filters_correctly() {
+        let (tmp, mut staging) = setup_staging(&[
+            "01.flac", "02.flac", "03.flac", "04.flac",
+        ]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        for _ in 0..5 {
+            runner.push_output(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: ffprobe_json(44100, 200.0),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: CommandRecord {
+                    binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
+                    cwd: None, env_keys: vec![],
+                    exit: Some(ProcessExit::Code(0)),
+                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                },
+            });
+        }
+
+        let mut req = mat_request(PathBuf::from("/fake/four.7z"), None);
+        req.source.track_selection = TrackSelection::Set([1, 3].into_iter().collect());
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+
+        assert_eq!(source.tracks.len(), 2);
+        let ordinals: Vec<u32> = source.tracks.iter().map(|t| t.id.source_ordinal).collect();
+        assert_eq!(ordinals, vec![1, 3]);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn materializer_track_selection_invalid_range_rejected() {
+        let (tmp, mut staging) = setup_staging(&["01.flac", "02.flac"]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        for _ in 0..3 {
+            runner.push_output(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: ffprobe_json(44100, 200.0),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: CommandRecord {
+                    binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
+                    cwd: None, env_keys: vec![],
+                    exit: Some(ProcessExit::Code(0)),
+                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                },
+            });
+        }
+
+        let mut req = mat_request(PathBuf::from("/fake/two.7z"), None);
+        req.source.track_selection = TrackSelection::Range { start: 5, end: 10 };
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        assert!(matches!(err, MaterializeError::InvalidTrackSelection(_)));
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn materializer_track_selection_invalid_set_rejected() {
+        let (tmp, mut staging) = setup_staging(&["01.flac"]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        for _ in 0..2 {
+            runner.push_output(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: ffprobe_json(44100, 200.0),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: CommandRecord {
+                    binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
+                    cwd: None, env_keys: vec![],
+                    exit: Some(ProcessExit::Code(0)),
+                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                },
+            });
+        }
+
+        let mut req = mat_request(PathBuf::from("/fake/one.7z"), None);
+        req.source.track_selection = TrackSelection::Set([1, 99].into_iter().collect());
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        assert!(matches!(err, MaterializeError::InvalidTrackSelection(_)));
+        drop(tmp);
+    }
+
+    // 9. Cancellation ---------------------------------------------------
+
+    #[tokio::test]
+    async fn materializer_cancellation_returns_cancelled_and_cleans_staging() {
+        let staging_path = std::env::temp_dir().join("tonepoet-mat-cancel-test");
+        let _ = std::fs::remove_dir_all(&staging_path);
+        std::fs::create_dir_all(&staging_path).unwrap();
+        // Create a file so the directory isn't empty.
+        std::fs::write(staging_path.join("track.flac"), b"data").unwrap();
+
+        // StagingDir is armed — Drop will clean up.
+        let staging = StagingDir::new(staging_path.clone(), "cancel-job".into());
+
+        let runner = StubToolRunner::new();
+        // Don't queue any response — stub returns success immediately
+        // for 7z, but we'll cancel before ffprobe.
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // Already cancelled.
+
+        let req = mat_request(PathBuf::from("/fake/archive.7z"), None);
+        let mat = SevenZipMaterializer;
+        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        assert!(matches!(err, MaterializeError::Cancelled));
+
+        // Drop the staging dir — it should clean up.
+        drop(staging);
+        assert!(!staging_path.exists(), "staging dir should be deleted by RAII Drop");
+    }
+
+    // 10. Permission-denied ---------------------------------------------
+
+    #[tokio::test]
+    async fn materializer_permission_denied_returns_structured_error() {
+        let (tmp, mut staging) = setup_staging(&[]);
+        staging.disarm();
+
+        let runner = StubToolRunner::new();
+        runner.push_failure("ERROR: /protected/file : Can not open the file as [7z] archive\nPermission denied");
+
+        let req = mat_request(PathBuf::from("/protected/archive.7z"), None);
+        let cancel = CancellationToken::new();
+        let mat = SevenZipMaterializer;
+        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+
+        // Should be a structured error, not a panic.
+        assert!(
+            matches!(err, MaterializeError::Extraction(_) | MaterializeError::Tool(_)),
+            "expected structured error, got: {err:?}"
+        );
+        drop(tmp);
     }
 }
