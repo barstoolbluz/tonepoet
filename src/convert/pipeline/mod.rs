@@ -480,13 +480,15 @@ mod tests {
 
         let meta = apply_metadata(&sample_artifacts(), &prepared_source(), &req, &runner, &cancel)
             .await
-            .expect("stub metadata");
-        assert_eq!(meta.outcome, StageOutcome::Skipped);
+            .expect("metadata");
+        // metadata is Enabled in sample_request(); with stub runner it succeeds.
+        assert!(matches!(meta.outcome, StageOutcome::Ok | StageOutcome::Skipped));
 
         let rg = apply_replaygain(&sample_artifacts(), &req, &runner, &cancel)
             .await
-            .expect("stub replaygain");
-        assert_eq!(rg.outcome, StageOutcome::Skipped);
+            .expect("replaygain");
+        // replaygain is Enabled in sample_request(); with stub runner it succeeds.
+        assert!(matches!(rg.outcome, StageOutcome::Ok | StageOutcome::Skipped));
 
         let outcome = AlbumOutcome::Complete { tracks: vec![], stages: vec![] };
         let feats = run_features(
@@ -525,7 +527,8 @@ mod tests {
             outcome: AlbumOutcome::Complete { tracks: vec![], stages: vec![] },
             durable_log: None,
         };
-        assert!(write_durable_log(&report, &req.log).is_err());
+        // write_durable_log now has a real body (PR 6) — it succeeds.
+        assert!(write_durable_log(&report, &req.log).is_ok());
 
         let final_report = run_pipeline_item(req, &runner, &reporter, &cancel).await;
         assert!(matches!(final_report.outcome, AlbumOutcome::Blocked { .. }));
@@ -1634,5 +1637,324 @@ mod tests {
         }
         // No tool calls — single track doesn't need concat.
         assert!(runner.transcript().is_empty());
+    }
+
+    // ====================================================================
+    // PR 6 — metadata, replaygain, features, durable log tests
+    // ====================================================================
+
+    // ---- apply_metadata -----------------------------------------------
+
+    #[tokio::test]
+    async fn metadata_enabled_flac_tracks_calls_metaflac_with_tags() {
+        let artifacts = merge_artifacts(&[Some(441000), Some(441000)]);
+        let mut source = prepared_source();
+        source.tracks = vec![
+            PreparedTrack {
+                id: TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
+                source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac")),
+                metadata: TrackMetadata {
+                    title: Some("First Song".into()),
+                    artist: Some("The Band".into()),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(441000),
+                sample_rate: 44100,
+            },
+            PreparedTrack {
+                id: TrackId { source_ordinal: 2, disc_number: None, track_number: 2 },
+                source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/02.flac")),
+                metadata: TrackMetadata {
+                    title: Some("Second Song".into()),
+                    artist: Some("The Band".into()),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(441000),
+                sample_rate: 44100,
+            },
+        ];
+
+        let mut req = sample_request();
+        req.stages.metadata = StageRequirement::Enabled;
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let record = apply_metadata(&artifacts, &source, &req, &runner, &cancel)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(record.outcome, StageOutcome::Ok);
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 2, "should call metaflac for each track");
+        assert_eq!(transcript[0].binary, ToolBinary::Metaflac);
+        // Check tag values appear in args.
+        let args_joined = transcript[0].sanitized_args.join(" ");
+        assert!(args_joined.contains("First Song"), "should contain track title");
+        assert!(args_joined.contains("The Band"), "should contain artist");
+    }
+
+    #[tokio::test]
+    async fn metadata_disabled_skips_with_no_tool_calls() {
+        let artifacts = merge_artifacts(&[Some(441000)]);
+        let source = prepared_source();
+        let mut req = sample_request();
+        req.stages.metadata = StageRequirement::Disabled;
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let record = apply_metadata(&artifacts, &source, &req, &runner, &cancel)
+            .await
+            .expect("should skip");
+
+        assert_eq!(record.outcome, StageOutcome::Skipped);
+        assert!(runner.transcript().is_empty());
+    }
+
+    #[tokio::test]
+    async fn metadata_enabled_tool_failure_returns_error() {
+        let artifacts = merge_artifacts(&[Some(441000)]);
+        let mut source = prepared_source();
+        source.tracks[0].metadata.title = Some("Song".into());
+
+        let mut req = sample_request();
+        req.stages.metadata = StageRequirement::Enabled;
+
+        let runner = StubToolRunner::new();
+        runner.push_failure("metaflac: invalid argument");
+        let cancel = CancellationToken::new();
+
+        let err = apply_metadata(&artifacts, &source, &req, &runner, &cancel)
+            .await
+            .expect_err("should fail");
+
+        assert!(matches!(err, MetadataError::Tool(_)));
+    }
+
+    // ---- apply_replaygain ---------------------------------------------
+
+    #[tokio::test]
+    async fn replaygain_enabled_tracks_uses_album_mode() {
+        let artifacts = merge_artifacts(&[Some(441000), Some(441000)]);
+        let mut req = sample_request();
+        req.stages.replaygain = StageRequirement::Enabled;
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let record = apply_replaygain(&artifacts, &req, &runner, &cancel)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(record.outcome, StageOutcome::Ok);
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].binary, ToolBinary::Loudgain);
+        let args = &transcript[0].sanitized_args;
+        assert!(args.contains(&"-a".to_string()), "should use album mode (-a)");
+        assert!(args.contains(&"-k".to_string()), "should prevent clipping (-k)");
+    }
+
+    #[tokio::test]
+    async fn replaygain_enabled_merged_uses_single_file_mode() {
+        let inner = ArtifactSet {
+            audio: AudioArtifacts::Merged(MergedArtifact {
+                staged_path: PathBuf::from("/stage/merged.flac"),
+                final_path: PathBuf::from("/out/merged.flac"),
+                total_samples: 882000,
+                source_tracks: vec![
+                    TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
+                ],
+            }),
+            sidecars: vec![],
+        };
+        let mut req = sample_request();
+        req.stages.replaygain = StageRequirement::Enabled;
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let record = apply_replaygain(&inner, &req, &runner, &cancel)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(record.outcome, StageOutcome::Ok);
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 1);
+        let args = &transcript[0].sanitized_args;
+        assert!(!args.contains(&"-a".to_string()), "merged should NOT use album mode");
+        assert!(args.iter().any(|a| a.contains("merged.flac")));
+    }
+
+    #[tokio::test]
+    async fn replaygain_disabled_skips() {
+        let artifacts = merge_artifacts(&[Some(441000)]);
+        let mut req = sample_request();
+        req.stages.replaygain = StageRequirement::Disabled;
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let record = apply_replaygain(&artifacts, &req, &runner, &cancel)
+            .await
+            .expect("should skip");
+
+        assert_eq!(record.outcome, StageOutcome::Skipped);
+        assert!(runner.transcript().is_empty());
+    }
+
+    // ---- run_features -------------------------------------------------
+
+    #[tokio::test]
+    async fn features_enabled_adds_sidecar_artifacts() {
+        let artifacts = merge_artifacts(&[Some(441000), Some(441000)]);
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![track_record(1, true), track_record(2, true)],
+            stages: vec![],
+        };
+        let source = prepared_source();
+        let mut req = sample_request();
+        req.stages.features = StageRequirement::Enabled;
+
+        let staging = StagingDir::new(
+            std::env::temp_dir().join("tonepoet-feat-test"),
+            "feat-1".into(),
+        );
+        let _ = std::fs::create_dir_all(&staging.root);
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let (result, record) =
+            run_features(artifacts, &outcome, &source, &req, &staging, &runner, &cancel)
+                .await
+                .expect("should succeed");
+
+        assert_eq!(record.outcome, StageOutcome::Ok);
+        // Should have at least a conversion log sidecar.
+        assert!(
+            result.sidecars.iter().any(|s| s.kind == SidecarKind::ConversionLog),
+            "should have conversion log sidecar"
+        );
+        // The staged file written by run_features should exist on disk.
+        // (merge_artifacts pre-populates a sidecar at /stage/log.txt which
+        // doesn't exist; the real one is under the staging root.)
+        let log_sidecar = result.sidecars.iter()
+            .find(|s| s.kind == SidecarKind::ConversionLog && s.staged_path.starts_with(&staging.root))
+            .expect("should have a conversion log sidecar under staging root");
+        assert!(log_sidecar.staged_path.exists(), "log file should exist on disk");
+
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    #[tokio::test]
+    async fn features_disabled_passes_through() {
+        let artifacts = merge_artifacts(&[Some(441000)]);
+        let outcome = AlbumOutcome::Complete { tracks: vec![], stages: vec![] };
+        let source = prepared_source();
+        let mut req = sample_request();
+        req.stages.features = StageRequirement::Disabled;
+
+        let staging = StagingDir::new(PathBuf::from("/nonexistent"), "x".into());
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let (_, record) =
+            run_features(artifacts, &outcome, &source, &req, &staging, &runner, &cancel)
+                .await
+                .expect("should pass through");
+
+        assert_eq!(record.outcome, StageOutcome::Skipped);
+    }
+
+    // ---- write_durable_log --------------------------------------------
+
+    #[test]
+    fn durable_log_writes_readable_json_with_expected_fields() {
+        let req = sample_request();
+        let report = PipelineReport {
+            request: RedactedPipelineRequest::from(&req),
+            source: Some(prepared_source()),
+            plan: Some(AlbumPlan {
+                album_dir: PathBuf::from("/out/album"),
+                entries: vec![],
+            }),
+            artifacts: Some(sample_artifacts()),
+            published: None,
+            outcome: AlbumOutcome::Complete {
+                tracks: vec![track_record(1, true)],
+                stages: vec![StageRecord {
+                    stage: PipelineStage::Convert,
+                    outcome: StageOutcome::Ok,
+                }],
+            },
+            durable_log: None,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = LogPolicy {
+            root: tmp.path().to_path_buf(),
+            write_for_blocked: true,
+        };
+
+        let path = write_durable_log(&report, &policy).expect("should write");
+        assert!(path.exists(), "log file should exist");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content)
+            .expect("should be valid JSON");
+
+        // Verify key fields are present.
+        assert!(parsed.get("request").is_some(), "should have request");
+        assert!(parsed.get("source").is_some(), "should have source");
+        assert!(parsed.get("plan").is_some(), "should have plan");
+        assert!(parsed.get("artifacts").is_some(), "should have artifacts");
+        assert!(parsed.get("outcome").is_some(), "should have outcome");
+    }
+
+    #[test]
+    fn durable_log_never_contains_secrets() {
+        let req = sample_request(); // has password "hunter2"
+        let report = PipelineReport {
+            request: RedactedPipelineRequest::from(&req),
+            source: None,
+            plan: None,
+            artifacts: None,
+            published: None,
+            outcome: AlbumOutcome::Complete { tracks: vec![], stages: vec![] },
+            durable_log: None,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = LogPolicy {
+            root: tmp.path().to_path_buf(),
+            write_for_blocked: true,
+        };
+
+        let path = write_durable_log(&report, &policy).expect("should write");
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        assert!(!content.contains("hunter2"), "durable log must not contain password");
+    }
+
+    #[test]
+    fn durable_log_io_failure_returns_error() {
+        let req = sample_request();
+        let report = PipelineReport {
+            request: RedactedPipelineRequest::from(&req),
+            source: None, plan: None, artifacts: None, published: None,
+            outcome: AlbumOutcome::Complete { tracks: vec![], stages: vec![] },
+            durable_log: None,
+        };
+
+        // Write to a path that can't be created.
+        let policy = LogPolicy {
+            root: PathBuf::from("/nonexistent/deeply/nested/path"),
+            write_for_blocked: true,
+        };
+
+        let err = write_durable_log(&report, &policy).expect_err("should fail");
+        assert!(matches!(err, LogError::Io(_)));
     }
 }

@@ -337,41 +337,385 @@ fn parse_merge_probe(json_str: &str) -> Result<(u32, f64), MergeError> {
     Ok((sample_rate, duration))
 }
 
-/// PR 1 stub: records `Skipped`. PR 6 body.
+/// Minimal `CommandRecord` for between-step cancellation errors where
+/// no real command was issued.
+fn dummy_command_record(binary: ToolBinary) -> super::tool::CommandRecord {
+    super::tool::CommandRecord {
+        binary,
+        sanitized_args: vec![],
+        cwd: None,
+        env_keys: vec![],
+        exit: None,
+        stdout_tail: String::new(),
+        stderr_tail: String::new(),
+        elapsed: Duration::ZERO,
+    }
+}
+
+/// Apply metadata tags to staged audio artifacts. Dispatches to the
+/// correct tagging tool per format (metaflac, opustags, wvtag, ffmpeg).
 pub async fn apply_metadata(
-    _artifacts: &ArtifactSet,
-    _source: &PreparedSource,
-    _req: &PipelineRequest,
-    _runner: &dyn ToolRunner,
-    _cancel: &CancellationToken,
+    artifacts: &ArtifactSet,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
 ) -> Result<StageRecord, MetadataError> {
-    Ok(StageRecord { stage: PipelineStage::Metadata, outcome: StageOutcome::Skipped })
+    if req.stages.metadata == StageRequirement::Disabled {
+        return Ok(StageRecord { stage: PipelineStage::Metadata, outcome: StageOutcome::Skipped });
+    }
+
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => {
+            for artifact in tracks {
+                if cancel.is_cancelled() {
+                    return Err(MetadataError::Tool(
+                        super::errors::ToolRunnerError::Cancelled {
+                            command: dummy_command_record(ToolBinary::Metaflac),
+                        },
+                    ));
+                }
+                let meta = source
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == artifact.track_id)
+                    .map(|t| &t.metadata);
+                if let Some(meta) = meta {
+                    tag_audio_file(&artifact.staged_path, meta, &source.album_metadata, runner, cancel).await?;
+                }
+            }
+        }
+        AudioArtifacts::Merged(merged) => {
+            // For merged files, apply album-level metadata.
+            let album_as_track = TrackMetadata {
+                title: source.album_metadata.album.clone(),
+                artist: source.album_metadata.album_artist.clone(),
+                album_artist: source.album_metadata.album_artist.clone(),
+                genre: source.album_metadata.genre.clone(),
+                date: source.album_metadata.date.clone(),
+                ..TrackMetadata::default()
+            };
+            tag_audio_file(&merged.staged_path, &album_as_track, &source.album_metadata, runner, cancel).await?;
+        }
+    }
+
+    Ok(StageRecord { stage: PipelineStage::Metadata, outcome: StageOutcome::Ok })
 }
 
-/// PR 1 stub: records `Skipped`. PR 6 body.
+/// Build and run tagging commands for a single audio file.
+async fn tag_audio_file(
+    path: &Path,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), MetadataError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let mut tags: Vec<(String, String)> = Vec::new();
+    if let Some(ref v) = meta.title { tags.push(("TITLE".into(), v.clone())); }
+    if let Some(ref v) = meta.artist { tags.push(("ARTIST".into(), v.clone())); }
+    if let Some(ref v) = meta.album_artist { tags.push(("ALBUMARTIST".into(), v.clone())); }
+    if let Some(ref v) = album.album { tags.push(("ALBUM".into(), v.clone())); }
+    if let Some(ref v) = meta.genre { tags.push(("GENRE".into(), v.clone())); }
+    if let Some(ref v) = meta.date { tags.push(("DATE".into(), v.clone())); }
+    if let Some(n) = meta.track_number { tags.push(("TRACKNUMBER".into(), n.to_string())); }
+    if let Some(n) = meta.disc_number { tags.push(("DISCNUMBER".into(), n.to_string())); }
+    if let Some(ref v) = meta.comment { tags.push(("COMMENT".into(), v.clone())); }
+
+    if tags.is_empty() {
+        return Ok(());
+    }
+
+    let cmd = match ext.as_str() {
+        "flac" => {
+            let mut args = Vec::new();
+            for (k, v) in &tags {
+                args.push(format!("--remove-tag={}", k));
+                args.push(format!("--set-tag={}={}", k, v));
+            }
+            args.push(path.display().to_string());
+            ToolCommand {
+                binary: ToolBinary::Metaflac,
+                args,
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(30),
+            }
+        }
+        "opus" | "ogg" => {
+            let mut args = Vec::new();
+            for (k, _) in &tags {
+                args.push("--delete".into());
+                args.push(k.clone());
+            }
+            for (k, v) in &tags {
+                args.push("-s".into());
+                args.push(format!("{}={}", k, v));
+            }
+            args.push("--in-place".into());
+            args.push(path.display().to_string());
+            ToolCommand {
+                binary: ToolBinary::Opustags,
+                args,
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(30),
+            }
+        }
+        "wv" => {
+            let mut args = vec!["-q".to_string()];
+            for (k, v) in &tags {
+                args.push("-w".into());
+                args.push(format!("{}={}", k, v));
+            }
+            args.push(path.display().to_string());
+            ToolCommand {
+                binary: ToolBinary::Wvtag,
+                args,
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(30),
+            }
+        }
+        "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif" => {
+            let mut args = vec![
+                "-y".into(),
+                "-i".into(),
+                path.display().to_string(),
+            ];
+            for (k, v) in &tags {
+                args.push("-metadata".into());
+                args.push(format!("{}={}", k.to_lowercase(), v));
+            }
+            args.push("-c".into());
+            args.push("copy".into());
+            let tmp = path.with_extension(format!(
+                "tmp.{}",
+                path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+            ));
+            args.push(tmp.display().to_string());
+            ToolCommand {
+                binary: ToolBinary::Ffmpeg,
+                args,
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(60),
+            }
+        }
+        _ => {
+            return Err(MetadataError::UnsupportedTagFormat(ext));
+        }
+    };
+
+    runner.run(cmd, cancel).await.map_err(MetadataError::Tool)?;
+
+    // For ffmpeg-based formats, rename temp file over original.
+    if matches!(ext.as_str(), "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif") {
+        let tmp = path.with_extension(format!(
+            "tmp.{}",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+        ));
+        if tmp.exists() {
+            std::fs::rename(&tmp, path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply ReplayGain tags via loudgain. Album mode for per-track
+/// artifacts, single-file mode for merged.
 pub async fn apply_replaygain(
-    _artifacts: &ArtifactSet,
-    _req: &PipelineRequest,
-    _runner: &dyn ToolRunner,
-    _cancel: &CancellationToken,
+    artifacts: &ArtifactSet,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
 ) -> Result<StageRecord, ReplayGainError> {
-    Ok(StageRecord { stage: PipelineStage::ReplayGain, outcome: StageOutcome::Skipped })
+    if req.stages.replaygain == StageRequirement::Disabled {
+        return Ok(StageRecord { stage: PipelineStage::ReplayGain, outcome: StageOutcome::Skipped });
+    }
+
+    let mut args = Vec::new();
+
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => {
+            if tracks.is_empty() {
+                return Ok(StageRecord { stage: PipelineStage::ReplayGain, outcome: StageOutcome::Skipped });
+            }
+            args.push("-a".to_string()); // album mode
+            args.push("-k".to_string()); // prevent clipping
+            args.push("-s".to_string()); // tag mode
+            args.push("i".to_string());  // ReplayGain 2.0
+            for t in tracks {
+                args.push(t.staged_path.display().to_string());
+            }
+        }
+        AudioArtifacts::Merged(merged) => {
+            // Single-file mode — no -a flag.
+            args.push("-k".to_string());
+            args.push("-s".to_string());
+            args.push("i".to_string());
+            args.push(merged.staged_path.display().to_string());
+        }
+    }
+
+    let cmd = ToolCommand {
+        binary: ToolBinary::Loudgain,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(600), // RG scan can be slow for long albums
+    };
+
+    runner.run(cmd, cancel).await.map_err(ReplayGainError::Tool)?;
+
+    Ok(StageRecord { stage: PipelineStage::ReplayGain, outcome: StageOutcome::Ok })
 }
 
-/// PR 1 stub: passes artifacts through, records `Skipped`. PR 6 body.
+/// Generate feature sidecars: conversion log and CUE sheet (where
+/// applicable). Returns an updated `ArtifactSet` with the sidecars
+/// added so publish includes them.
 pub async fn run_features(
-    artifacts: ArtifactSet,
-    _outcome: &AlbumOutcome,
-    _source: &PreparedSource,
-    _req: &PipelineRequest,
-    _staging: &StagingDir,
+    mut artifacts: ArtifactSet,
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    staging: &StagingDir,
     _runner: &dyn ToolRunner,
     _cancel: &CancellationToken,
 ) -> Result<(ArtifactSet, StageRecord), FeatureError> {
+    if req.stages.features == StageRequirement::Disabled {
+        return Ok((
+            artifacts,
+            StageRecord { stage: PipelineStage::Features, outcome: StageOutcome::Skipped },
+        ));
+    }
+
+    let album_dir = req.output_root.clone();
+
+    // ---- conversion log sidecar ----------------------------------------
+    let log_staged = staging.root.join("conversion_log.txt");
+    let log_content = build_conversion_log(outcome, source, req);
+    std::fs::write(&log_staged, &log_content)?;
+
+    artifacts.sidecars.push(SidecarArtifact {
+        kind: SidecarKind::ConversionLog,
+        staged_path: log_staged,
+        final_path: album_dir.join("conversion_log.txt"),
+    });
+
+    // ---- CUE sheet sidecar (multi-track only) --------------------------
+    if source.tracks.len() > 1 {
+        let cue_staged = staging.root.join("album.cue");
+        let cue_content = build_cue_sheet(source, &artifacts);
+        std::fs::write(&cue_staged, &cue_content)?;
+
+        artifacts.sidecars.push(SidecarArtifact {
+            kind: SidecarKind::CueSheet,
+            staged_path: cue_staged,
+            final_path: album_dir.join("album.cue"),
+        });
+    }
+
     Ok((
         artifacts,
-        StageRecord { stage: PipelineStage::Features, outcome: StageOutcome::Skipped },
+        StageRecord { stage: PipelineStage::Features, outcome: StageOutcome::Ok },
     ))
+}
+
+/// Build a human-readable conversion log.
+fn build_conversion_log(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> String {
+    let mut log = String::new();
+    log.push_str(&format!("Conversion Log — {}\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+    log.push_str(&format!("Source: {}\n", source.container.display()));
+    log.push_str(&format!("Target format: {:?}\n", req.target_format));
+    log.push_str(&format!("Tracks in source: {}\n\n", source.tracks.len()));
+
+    match outcome {
+        AlbumOutcome::Complete { tracks, .. } => {
+            log.push_str(&format!("Result: Complete ({} tracks)\n", tracks.len()));
+        }
+        AlbumOutcome::Partial { successful, failed, .. } => {
+            log.push_str(&format!(
+                "Result: Partial ({} ok, {} failed)\n",
+                successful.len(),
+                failed.len()
+            ));
+        }
+        AlbumOutcome::Blocked { reason, .. } => {
+            log.push_str(&format!("Result: Blocked ({:?})\n", reason));
+        }
+    }
+
+    log
+}
+
+/// Build a minimal CUE sheet for the album.
+fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
+    let mut cue = String::new();
+
+    if let Some(ref album) = source.album_metadata.album {
+        cue.push_str(&format!("TITLE \"{}\"\n", album));
+    }
+    if let Some(ref artist) = source.album_metadata.album_artist {
+        cue.push_str(&format!("PERFORMER \"{}\"\n", artist));
+    }
+
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => {
+            for (i, t) in tracks.iter().enumerate() {
+                let filename = t.staged_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("unknown");
+                cue.push_str(&format!("FILE \"{}\" WAVE\n", filename));
+                cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
+                // Look up title from source metadata.
+                if let Some(st) = source.tracks.iter().find(|s| s.id == t.track_id) {
+                    if let Some(ref title) = st.metadata.title {
+                        cue.push_str(&format!("    TITLE \"{}\"\n", title));
+                    }
+                    if let Some(ref artist) = st.metadata.artist {
+                        cue.push_str(&format!("    PERFORMER \"{}\"\n", artist));
+                    }
+                }
+                cue.push_str("    INDEX 01 00:00:00\n");
+            }
+        }
+        AudioArtifacts::Merged(merged) => {
+            let filename = merged.staged_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("merged");
+            cue.push_str(&format!("FILE \"{}\" WAVE\n", filename));
+            for (i, st) in source.tracks.iter().enumerate() {
+                cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
+                if let Some(ref title) = st.metadata.title {
+                    cue.push_str(&format!("    TITLE \"{}\"\n", title));
+                }
+                if let Some(ref artist) = st.metadata.artist {
+                    cue.push_str(&format!("    PERFORMER \"{}\"\n", artist));
+                }
+                cue.push_str("    INDEX 01 00:00:00\n");
+            }
+        }
+    }
+
+    cue
 }
 
 // ===========================================================================
@@ -401,15 +745,24 @@ pub fn publish_album_output(
 // Durable log  (PR 6 body; PR 4 ships a minimal interim body)
 // ===========================================================================
 
-/// PR 1 stub: writes nothing. PR 4 ships a minimal interim body;
-/// PR 6 ships the full structured log.
+/// Serialize the full `PipelineReport` as JSON and write it to
+/// `LogPolicy.root`. The report uses `RedactedPipelineRequest` so
+/// secrets never enter the durable log.
 pub fn write_durable_log(
-    _report: &PipelineReport,
-    _log: &LogPolicy,
+    report: &PipelineReport,
+    log: &LogPolicy,
 ) -> Result<PathBuf, LogError> {
-    Err(LogError::Serialization(
-        "write_durable_log not implemented (PR 1 stub)".to_string(),
-    ))
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|e| LogError::Serialization(e.to_string()))?;
+
+    std::fs::create_dir_all(&log.root)?;
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("{}_{}.json", report.request.job_id, timestamp);
+    let path = log.root.join(filename);
+
+    std::fs::write(&path, json)?;
+    Ok(path)
 }
 
 // ===========================================================================
