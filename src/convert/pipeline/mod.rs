@@ -1385,4 +1385,254 @@ mod tests {
         );
         drop(tmp);
     }
+
+    // ====================================================================
+    // PR 5 — merge_tracks exit-condition tests
+    // ====================================================================
+
+    /// Build a 3-track ArtifactSet for merge tests.
+    fn merge_artifacts(sample_counts: &[Option<u64>]) -> ArtifactSet {
+        let tracks: Vec<TrackArtifact> = sample_counts
+            .iter()
+            .enumerate()
+            .map(|(i, &samples)| {
+                let n = (i + 1) as u32;
+                TrackArtifact {
+                    track_id: TrackId {
+                        source_ordinal: n,
+                        disc_number: None,
+                        track_number: n,
+                    },
+                    staged_path: PathBuf::from(format!("/stage/{:02}.flac", n)),
+                    final_path: PathBuf::from(format!("/out/album/{:02}.flac", n)),
+                    samples,
+                }
+            })
+            .collect();
+        ArtifactSet {
+            audio: AudioArtifacts::Tracks(tracks),
+            sidecars: vec![SidecarArtifact {
+                kind: SidecarKind::ConversionLog,
+                staged_path: PathBuf::from("/stage/log.txt"),
+                final_path: PathBuf::from("/out/album/log.txt"),
+            }],
+        }
+    }
+
+    fn merge_request(do_merge: bool) -> PipelineRequest {
+        let mut req = sample_request();
+        req.merge = do_merge;
+        req
+    }
+
+    // 1. Multi-track merge on → one merged artifact ---------------------
+
+    #[tokio::test]
+    async fn merge_multi_track_yields_one_merged_artifact() {
+        let artifacts = merge_artifacts(&[Some(441000), Some(441000), Some(441000)]);
+        let req = merge_request(true);
+        let staging = StagingDir::new(
+            std::env::temp_dir().join("tonepoet-merge-test-1"),
+            "merge-1".into(),
+        );
+        let _ = std::fs::create_dir_all(&staging.root);
+
+        let runner = StubToolRunner::new();
+        // ffmpeg concat: success
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::Ffmpeg,
+                sanitized_args: vec![],
+                cwd: None, env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(), stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+        // ffprobe validation: report duration matching 3 * 441000 samples at 44100
+        // 441000 / 44100 = 10.0 seconds per track → 30.0 seconds total
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: ffprobe_json(44100, 30.0),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: vec![], cwd: None, env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(), stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+
+        let cancel = CancellationToken::new();
+        let (result_artifacts, record) =
+            merge_tracks(artifacts, &req, &staging, &runner, &cancel)
+                .await
+                .expect("merge should succeed");
+
+        assert_eq!(record.outcome, StageOutcome::Ok);
+        match &result_artifacts.audio {
+            AudioArtifacts::Merged(m) => {
+                assert_eq!(m.source_tracks.len(), 3);
+                assert!(m.total_samples > 0);
+            }
+            AudioArtifacts::Tracks(_) => panic!("expected Merged, got Tracks"),
+        }
+        // Sidecars preserved.
+        assert_eq!(result_artifacts.sidecars.len(), 1);
+
+        // Verify ffmpeg used -c copy (concat demuxer).
+        let transcript = runner.transcript();
+        let ffmpeg_record = &transcript[0];
+        assert_eq!(ffmpeg_record.binary, ToolBinary::Ffmpeg);
+
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    // 2. Truncated merge → DurationMismatch -----------------------------
+
+    #[tokio::test]
+    async fn merge_truncated_output_returns_duration_mismatch() {
+        let artifacts = merge_artifacts(&[Some(441000), Some(441000), Some(441000)]);
+        let req = merge_request(true);
+        let staging = StagingDir::new(
+            std::env::temp_dir().join("tonepoet-merge-test-2"),
+            "merge-2".into(),
+        );
+        let _ = std::fs::create_dir_all(&staging.root);
+
+        let runner = StubToolRunner::new();
+        // ffmpeg concat: success
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(), stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
+                cwd: None, env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(), stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+        // ffprobe: report only 5 seconds (expected 30) — way too short.
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: ffprobe_json(44100, 5.0),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                binary: ToolBinary::Ffprobe, sanitized_args: vec![],
+                cwd: None, env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(), stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+
+        let cancel = CancellationToken::new();
+        let err = merge_tracks(artifacts, &req, &staging, &runner, &cancel)
+            .await
+            .expect_err("should fail with mismatch");
+
+        assert!(
+            matches!(err, MergeError::DurationMismatch(_)),
+            "expected DurationMismatch, got: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    // 3. Merge failure → Blocked via aggregation ------------------------
+
+    #[tokio::test]
+    async fn merge_failure_maps_to_blocked_via_aggregation() {
+        let artifacts = merge_artifacts(&[Some(441000), Some(441000)]);
+        let req = merge_request(true);
+        let staging = StagingDir::new(
+            std::env::temp_dir().join("tonepoet-merge-test-3"),
+            "merge-3".into(),
+        );
+        let _ = std::fs::create_dir_all(&staging.root);
+
+        let runner = StubToolRunner::new();
+        // ffmpeg concat fails.
+        runner.push_failure("ffmpeg: concat error");
+
+        let cancel = CancellationToken::new();
+        let err = merge_tracks(artifacts, &req, &staging, &runner, &cancel)
+            .await
+            .expect_err("should fail");
+
+        // Now simulate how the orchestrator would record this:
+        let stage_record = StageRecord {
+            stage: PipelineStage::Merge,
+            outcome: StageOutcome::Failed(format!("{}", err)),
+        };
+        let outcome = aggregate_album_outcome(
+            vec![track_record(1, true), track_record(2, true)],
+            vec![stage_record],
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+        );
+        assert!(matches!(
+            outcome,
+            AlbumOutcome::Blocked {
+                reason: BlockReason::RequiredStageFailure(PipelineStage::Merge),
+                ..
+            }
+        ));
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    // 4. Merge off → passthrough with Skipped ---------------------------
+
+    #[tokio::test]
+    async fn merge_off_passes_through_with_skipped() {
+        let artifacts = merge_artifacts(&[Some(441000), Some(441000)]);
+        let req = merge_request(false);
+        let staging = StagingDir::new(PathBuf::from("/nonexistent"), "x".into());
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let (result_artifacts, record) =
+            merge_tracks(artifacts, &req, &staging, &runner, &cancel)
+                .await
+                .expect("should pass through");
+
+        assert_eq!(record.outcome, StageOutcome::Skipped);
+        assert!(matches!(result_artifacts.audio, AudioArtifacts::Tracks(ref t) if t.len() == 2));
+        // No tool calls should have been made.
+        assert!(runner.transcript().is_empty());
+    }
+
+    // 5. Single track merge → wrapped as MergedArtifact -----------------
+
+    #[tokio::test]
+    async fn merge_single_track_wraps_as_merged() {
+        let artifacts = merge_artifacts(&[Some(441000)]);
+        let req = merge_request(true);
+        let staging = StagingDir::new(PathBuf::from("/nonexistent"), "x".into());
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let (result_artifacts, record) =
+            merge_tracks(artifacts, &req, &staging, &runner, &cancel)
+                .await
+                .expect("should succeed");
+
+        assert_eq!(record.outcome, StageOutcome::Ok);
+        match &result_artifacts.audio {
+            AudioArtifacts::Merged(m) => {
+                assert_eq!(m.source_tracks.len(), 1);
+                assert_eq!(m.total_samples, 441000);
+            }
+            AudioArtifacts::Tracks(_) => panic!("expected Merged"),
+        }
+        // No tool calls — single track doesn't need concat.
+        assert!(runner.transcript().is_empty());
+    }
 }

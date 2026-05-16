@@ -9,17 +9,18 @@
 //! pure logic and are exercised by PR 1's exit-condition tests.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{
-    ConvertError, FeatureError, LogError, MaterializeError, MetadataError, PlanError,
-    PublishError, ReplayGainError, RequestValidationError, SourceDetectError,
+    ConvertError, FeatureError, LogError, MaterializeError, MergeError, MetadataError,
+    PlanError, PublishError, ReplayGainError, RequestValidationError, SourceDetectError,
     SourceDispatchError,
 };
 use super::reporter::PipelineReporter;
-use super::tool::ToolRunner;
+use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 use crate::convert::ConversionStatus;
 
@@ -130,18 +131,210 @@ pub async fn convert_tracks(
     }
 }
 
-/// PR 1 stub: passes artifacts through, records `Skipped`. PR 5 body.
+/// Merge per-track audio artifacts into a single file using ffmpeg's
+/// concat demuxer (`-c copy`, no re-encoding). Skipped when
+/// `req.merge` is false.
 pub async fn merge_tracks(
     artifacts: ArtifactSet,
-    _req: &PipelineRequest,
-    _staging: &StagingDir,
-    _runner: &dyn ToolRunner,
-    _cancel: &CancellationToken,
-) -> Result<(ArtifactSet, StageRecord), super::errors::MergeError> {
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(ArtifactSet, StageRecord), MergeError> {
+    // ---- skip when merge is off ----------------------------------------
+    if !req.merge {
+        return Ok((
+            artifacts,
+            StageRecord { stage: PipelineStage::Merge, outcome: StageOutcome::Skipped },
+        ));
+    }
+
+    // ---- extract per-track artifacts -----------------------------------
+    let (track_artifacts, sidecars) = match artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => (tracks, artifacts.sidecars),
+        AudioArtifacts::Merged(_) => {
+            return Err(MergeError::UnsupportedFormat(
+                "artifacts are already merged".into(),
+            ));
+        }
+    };
+
+    if track_artifacts.is_empty() {
+        return Err(MergeError::UnsupportedFormat(
+            "no track artifacts to merge".into(),
+        ));
+    }
+
+    // ---- single track: wrap as MergedArtifact, no concat ---------------
+    if track_artifacts.len() == 1 {
+        let t = &track_artifacts[0];
+        let merged = MergedArtifact {
+            staged_path: t.staged_path.clone(),
+            final_path: t.final_path.clone(),
+            total_samples: t.samples.unwrap_or(0),
+            source_tracks: vec![t.track_id.clone()],
+        };
+        return Ok((
+            ArtifactSet { audio: AudioArtifacts::Merged(merged), sidecars },
+            StageRecord { stage: PipelineStage::Merge, outcome: StageOutcome::Ok },
+        ));
+    }
+
+    // ---- multi-track: ffmpeg concat ------------------------------------
+    let ext = track_artifacts[0]
+        .staged_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("flac");
+    let merged_staged = staging.root.join(format!("merged.{}", ext));
+    let concat_list = staging.root.join("_merge_concat.txt");
+
+    // Build the concat list file.
+    let mut list_content = String::new();
+    for t in &track_artifacts {
+        let escaped = t.staged_path.display().to_string().replace('\'', "'\\''");
+        list_content.push_str(&format!("file '{}'\n", escaped));
+    }
+    std::fs::write(&concat_list, &list_content)?;
+
+    // Build and run the ffmpeg concat command.
+    let cmd = ToolCommand {
+        binary: ToolBinary::Ffmpeg,
+        args: vec![
+            "-y".into(),
+            "-f".into(), "concat".into(),
+            "-safe".into(), "0".into(),
+            "-i".into(), concat_list.display().to_string(),
+            "-c".into(), "copy".into(),
+            merged_staged.display().to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(3600),
+    };
+
+    let merge_result = runner.run(cmd, cancel).await;
+
+    // Clean up the concat list regardless of outcome.
+    let _ = std::fs::remove_file(&concat_list);
+
+    // Handle merge failure — delete partial output.
+    if let Err(e) = merge_result {
+        let _ = std::fs::remove_file(&merged_staged);
+        return Err(e.into()); // ToolRunnerError → MergeError::Tool
+    }
+
+    // ---- validate merged output via ffprobe ----------------------------
+    // (If cancellation fired after the merge but before the probe,
+    // the next runner.run() call catches it via the CancellationToken.)
+    let probe_cmd = ToolCommand {
+        binary: ToolBinary::Ffprobe,
+        args: vec![
+            "-v".into(), "error".into(),
+            "-select_streams".into(), "a:0".into(),
+            "-show_entries".into(), "stream=sample_rate,duration".into(),
+            "-show_entries".into(), "format=duration".into(),
+            "-of".into(), "json".into(),
+            merged_staged.display().to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(30),
+    };
+
+    let probe_output = match runner.run(probe_cmd, cancel).await {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&merged_staged);
+            return Err(e.into());
+        }
+    };
+
+    let (actual_sample_rate, actual_duration) =
+        parse_merge_probe(&probe_output.stdout_tail)?;
+    let actual_samples = (actual_duration * actual_sample_rate as f64).round() as u64;
+
+    // Validate against expected sum when all input tracks have sample counts.
+    let expected_sum: Option<u64> = track_artifacts
+        .iter()
+        .map(|t| t.samples)
+        .collect::<Option<Vec<u64>>>()
+        .map(|v| v.iter().sum());
+
+    if let Some(expected) = expected_sum {
+        // Tolerance: 1 second of samples at the merged file's sample rate.
+        let tolerance = actual_sample_rate as u64;
+        let diff = if actual_samples > expected {
+            actual_samples - expected
+        } else {
+            expected - actual_samples
+        };
+        if diff > tolerance {
+            let _ = std::fs::remove_file(&merged_staged);
+            return Err(MergeError::DurationMismatch(format!(
+                "expected ~{} samples, got ~{} (diff {} exceeds tolerance {})",
+                expected, actual_samples, diff, tolerance,
+            )));
+        }
+    }
+
+    // ---- build MergedArtifact ------------------------------------------
+    let final_dir = track_artifacts[0]
+        .final_path
+        .parent()
+        .unwrap_or(Path::new("."));
+    let merged_final = final_dir.join(format!("merged.{}", ext));
+
+    let source_tracks: Vec<TrackId> = track_artifacts
+        .iter()
+        .map(|t| t.track_id.clone())
+        .collect();
+
+    let merged = MergedArtifact {
+        staged_path: merged_staged,
+        final_path: merged_final,
+        total_samples: actual_samples,
+        source_tracks,
+    };
+
     Ok((
-        artifacts,
-        StageRecord { stage: PipelineStage::Merge, outcome: StageOutcome::Skipped },
+        ArtifactSet { audio: AudioArtifacts::Merged(merged), sidecars },
+        StageRecord { stage: PipelineStage::Merge, outcome: StageOutcome::Ok },
     ))
+}
+
+/// Parse ffprobe JSON for the merged-file validation probe.
+/// Returns `(sample_rate, duration_secs)`.
+fn parse_merge_probe(json_str: &str) -> Result<(u32, f64), MergeError> {
+    let val: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| MergeError::DurationMismatch(format!("probe parse failed: {e}")))?;
+
+    let sample_rate = val
+        .pointer("/streams/0/sample_rate")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    if sample_rate == 0 {
+        return Err(MergeError::DurationMismatch(
+            "merged file has no valid sample_rate".into(),
+        ));
+    }
+
+    let duration = val
+        .pointer("/streams/0/duration")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| {
+            val.pointer("/format/duration")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0);
+
+    Ok((sample_rate, duration))
 }
 
 /// PR 1 stub: records `Skipped`. PR 6 body.
