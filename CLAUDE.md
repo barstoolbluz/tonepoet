@@ -45,13 +45,23 @@ tonepoet/
 │   ├── config.rs           # TonepoetConfig (TOML at ~/.config/tonepoet/config.toml)
 │   ├── convert/
 │   │   ├── mod.rs           # Module root — re-exports, ConversionManager, ConversionConfig
-│   │   ├── processor.rs     # ConversionProcessor — main orchestration (~4K LOC)
+│   │   ├── processor.rs     # ConversionProcessor — main orchestration
 │   │   ├── queue.rs         # ConversionQueue, ConversionItem, ConversionStatus
 │   │   ├── formats.rs       # AudioFormat, FileFormat, FormatDetector, ConversionOptions
+│   │   ├── pipeline/        # Staged conversion pipeline (PRs 1-9)
+│   │   │   ├── mod.rs           # Module root, #![forbid(unsafe_code)], re-exports, tests
+│   │   │   ├── types.rs         # PipelineRequest, PreparedSource, ArtifactSet, AlbumOutcome, etc.
+│   │   │   ├── errors.rs        # All pipeline error types (14 enums)
+│   │   │   ├── tool.rs          # ToolBinary, ToolCommand, ToolRunner trait, RealToolRunner, StubToolRunner
+│   │   │   ├── reporter.rs      # PipelineEvent, PipelineReporter, RecordingReporter
+│   │   │   ├── stages.rs        # Stage functions, orchestrator (run_pipeline_item), publish
+│   │   │   ├── materializer_7z.rs   # SevenZipMaterializer
+│   │   │   ├── materializer_cue.rs  # CueImageMaterializer
+│   │   │   └── materializer_sacd.rs # SacdIsoMaterializer
 │   │   ├── wizard_integration.rs  # Wizard state → ConversionOptions bridge
 │   │   ├── simple_wizard.rs # ReplayGainMode, DitherType, NyquistTransition enums
 │   │   ├── wizard.rs        # ConversionWizard (step-based, non-TUI)
-│   │   ├── renaming.rs      # Tag-based file/folder renaming
+│   │   ├── renaming.rs      # Tag-based file/folder renaming (dormant, pending preset system)
 │   │   ├── labels.rs        # Label/pressing info detection
 │   │   └── metadata.rs      # FLAC metadata extraction
 │   └── tui/
@@ -98,7 +108,7 @@ tonepoet (main binary + lib)
 
 **CLI subcommands** (src/main.rs):
 - `tui` — launches the new TUI (default convert screen)
-- `convert <PATHS>... [--format --output --workers --replaygain --preset --bitrate ...]`
+- `convert <PATHS>... [--format --output --workers --replaygain --preset --bitrate --track --track-range --area --no-cue --partial --overwrite --naming --no-metadata --no-features ...]`
 - `wizard` — launches legacy TUI wizard
 - `check-tools` — probes for ffmpeg, sox, ssrc, 7z, loudgain, opustags, etc.
 - `config --show | --reset | --path`
@@ -120,10 +130,11 @@ tonepoet (main binary + lib)
 - ffmpeg initialized once via `std::sync::Once`
 
 **Core conversion flow:**
-1. CLI args → `ConversionOptions` (src/main.rs `run_convert()`)
-2. Files scanned → `ConversionQueue` populated with `ConversionItem`s
+1. CLI args → `ConversionOptions` + optional `PipelineRequest` (src/main.rs `run_convert()`)
+2. Files scanned → `ConversionQueue` populated with `ConversionItem`s (with `pipeline_request` if pipeline flags set)
 3. `ConversionProcessor::process_queue_with_progress()` runs items through workers
-4. Each item: extract archive (if 7z) → detect format → convert via backend → apply ReplayGain → rename → write log/CUE
+4. Multi-track sources (7z/CUE/SACD) route through `run_pipeline_item()`: materialize → plan → convert → merge? → metadata → RG → features → publish → log → terminal
+5. Single audio files use the legacy single-file path via the backend crate
 
 **Config location:** `~/.config/tonepoet/config.toml`
 **Preset location:** `~/.config/tonepoet/presets/` (TOML files)

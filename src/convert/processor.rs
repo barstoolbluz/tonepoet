@@ -1606,7 +1606,10 @@ pub async fn process_item(
                 CueSidecarPolicy, TrackSelection, run_pipeline_item,
             };
 
-            let pipeline_req = PipelineRequest {
+            // Use pre-built pipeline request if the CLI set one.
+            let pipeline_req = if let Some(req) = item.pipeline_request.clone() {
+                req
+            } else { PipelineRequest {
                 job_id: format!("job-{}", item.id),
                 item_id: item.id.clone(),
                 container: item.input_path.clone(),
@@ -1669,7 +1672,7 @@ pub async fn process_item(
                     features: StageRequirement::Enabled,
                 },
                 failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
-            };
+            }};
 
             let runner = RealToolRunner::new(tool_paths);
             let reporter = RecordingReporter::new();

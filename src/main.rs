@@ -85,6 +85,44 @@ enum Commands {
         /// Generate CUE files
         #[arg(long)]
         generate_cue: bool,
+
+        // ---- Pipeline flags (PR 10) ----
+
+        /// Select single track by number (1-based)
+        #[arg(long)]
+        track: Option<u32>,
+
+        /// Select track range (e.g. "3-7", 1-based inclusive)
+        #[arg(long)]
+        track_range: Option<String>,
+
+        /// SACD area selection (stereo or multichannel)
+        #[arg(long)]
+        area: Option<String>,
+
+        /// Ignore CUE sheets, treat as single file
+        #[arg(long)]
+        no_cue: bool,
+
+        /// Allow partial album output on track failures
+        #[arg(long)]
+        partial: bool,
+
+        /// Overwrite existing output (with backup)
+        #[arg(long, name = "overwrite")]
+        overwrite_output: bool,
+
+        /// Output naming template (e.g. "%NN% - %TITLE%")
+        #[arg(long)]
+        naming: Option<String>,
+
+        /// Disable metadata tagging stage
+        #[arg(long)]
+        no_metadata: bool,
+
+        /// Disable feature generation (log/CUE sidecars)
+        #[arg(long)]
+        no_features: bool,
     },
 
     /// Launch full interactive TUI
@@ -195,12 +233,17 @@ async fn main() -> anyhow::Result<()> {
             archive_password, preset, compression_level, bitrate,
             reencode_flac, merge, backend, append_lineage,
             write_log, generate_cue,
+            track, track_range, area, no_cue, partial,
+            overwrite_output, naming, no_metadata, no_features,
         } => {
             run_convert(
                 paths, format, output, workers, replaygain,
                 archive_password, preset, compression_level, bitrate,
                 reencode_flac, merge, backend, append_lineage,
-                write_log, generate_cue, &config,
+                write_log, generate_cue,
+                track, track_range, area, no_cue, partial,
+                overwrite_output, naming, no_metadata, no_features,
+                &config,
             ).await?;
         }
         Commands::Wizard => {
@@ -301,6 +344,15 @@ async fn run_convert(
     append_lineage: bool,
     write_log: bool,
     generate_cue: bool,
+    track: Option<u32>,
+    track_range: Option<String>,
+    area: Option<String>,
+    no_cue: bool,
+    partial: bool,
+    overwrite_output: bool,
+    naming: Option<String>,
+    no_metadata: bool,
+    no_features: bool,
     config: &TonepoetConfig,
 ) -> anyhow::Result<()> {
     // Load preset if specified
@@ -397,6 +449,17 @@ async fn run_convert(
     options.write_log_file = write_log || config.conversion.write_log_file;
     options.generate_cue_files = generate_cue || config.conversion.generate_cue_files;
 
+    // Build pipeline request template from CLI flags (PR 10).
+    // If any pipeline-specific flags are set, we construct a PipelineRequest
+    // and attach it to each ConversionItem so the processor uses it directly.
+    let pipeline_request_template = build_pipeline_request_template(
+        &output, &options, output_format, merge,
+        &archive_password, &replaygain,
+        track, track_range.as_deref(), area.as_deref(),
+        no_cue, partial, overwrite_output,
+        naming.as_deref(), no_metadata, no_features,
+    );
+
     // Build processor
     let worker_count = workers.unwrap_or(config.conversion.worker_count);
     let processor_config = ProcessorConfig {
@@ -444,6 +507,24 @@ async fn run_convert(
                 } else {
                     eprintln!("Warning: unsupported file format: {}", path.display());
                 }
+            }
+        }
+
+        // Attach pipeline request template to each item if pipeline flags were set.
+        if let Some(ref template) = pipeline_request_template {
+            for item in q.all_items_mut() {
+                let mut req = template.clone();
+                // Per-item overrides: container path and item_id.
+                req.container = item.input_path.clone();
+                req.item_id = item.id.clone();
+                req.job_id = format!("job-{}", item.id);
+                // Carry the item's archive password if set.
+                if let Some(ref pw) = item.archive_password {
+                    req.source.archive_password = Some(
+                        tonepoet::convert::pipeline::SecretString::new(pw.clone())
+                    );
+                }
+                item.pipeline_request = Some(req);
             }
         }
 
@@ -533,6 +614,139 @@ fn add_item_to_queue(
     }
     item.status = ConversionStatus::Queued;
     queue.add_item_direct(item);
+}
+
+/// Build a `PipelineRequest` template from CLI flags. Returns `None` if no
+/// pipeline-specific flags were set (items use the legacy routing defaults).
+#[allow(clippy::too_many_arguments)]
+fn build_pipeline_request_template(
+    output: &Option<PathBuf>,
+    options: &ConversionOptions,
+    output_format: AudioFormat,
+    merge: bool,
+    archive_password: &Option<String>,
+    replaygain: &Option<String>,
+    track: Option<u32>,
+    track_range: Option<&str>,
+    area: Option<&str>,
+    no_cue: bool,
+    partial: bool,
+    overwrite_output: bool,
+    naming: Option<&str>,
+    no_metadata: bool,
+    no_features: bool,
+) -> Option<tonepoet::convert::pipeline::PipelineRequest> {
+    use tonepoet::convert::pipeline::*;
+    use std::collections::BTreeSet;
+
+    // Only build a PipelineRequest if pipeline-specific flags are set.
+    let has_pipeline_flags = track.is_some()
+        || track_range.is_some()
+        || area.is_some()
+        || no_cue
+        || partial
+        || overwrite_output
+        || naming.is_some()
+        || no_metadata
+        || no_features;
+
+    if !has_pipeline_flags {
+        return None;
+    }
+
+    let track_selection = if let Some(n) = track {
+        let mut set = BTreeSet::new();
+        set.insert(n);
+        TrackSelection::Set(set)
+    } else if let Some(range_str) = track_range {
+        if let Some((a, b)) = range_str.split_once('-') {
+            let start = a.trim().parse::<u32>().unwrap_or(1);
+            let end = b.trim().parse::<u32>().unwrap_or(start);
+            TrackSelection::Range { start, end }
+        } else {
+            TrackSelection::All
+        }
+    } else {
+        TrackSelection::All
+    };
+
+    let sacd_area = area.map(|a| match a.to_lowercase().as_str() {
+        "multichannel" | "multi" | "mc" => SacdArea::MultiChannel,
+        _ => SacdArea::Stereo,
+    });
+
+    let cue_policy = if no_cue {
+        CueSidecarPolicy::IgnoreCue
+    } else {
+        CueSidecarPolicy::PreferSidecar
+    };
+
+    let output_root = output.clone().unwrap_or_else(|| PathBuf::from("."));
+
+    let rg_enabled = match replaygain.as_deref() {
+        Some("off") | Some("none") => false,
+        _ => options.calculate_replaygain,
+    };
+
+    Some(PipelineRequest {
+        job_id: String::new(),       // filled per-item
+        item_id: String::new(),      // filled per-item
+        container: PathBuf::new(),   // filled per-item
+        source: SourceOptions {
+            archive_password: archive_password.as_ref().map(|p| SecretString::new(p.clone())),
+            sacd_area,
+            cue_sidecar: cue_policy,
+            track_selection,
+        },
+        target_format: output_format,
+        encode: EncodeOptions {
+            backend: EncodeBackend::Auto,
+            bitrate: match &options.quality {
+                QualitySettings::Opus { bitrate, .. } => Some(*bitrate),
+                QualitySettings::Aac { bitrate, .. } => Some(*bitrate),
+                QualitySettings::Mp3 { bitrate_mode, .. } => match bitrate_mode {
+                    Mp3BitrateMode::Cbr { bitrate } => Some(*bitrate),
+                    Mp3BitrateMode::Vbr { quality } => Some(*quality as u32),
+                    Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
+                },
+                _ => None,
+            },
+            compression_level: match &options.quality {
+                QualitySettings::Flac { compression_level } => Some(*compression_level),
+                _ => None,
+            },
+            dither: DitherPolicy::Auto,
+        },
+        merge,
+        output_root: output_root.clone(),
+        naming: NamingPolicy {
+            template: naming.unwrap_or("%NN% - %TITLE%").to_string(),
+            per_album_subdir: true,
+            collision_policy: NamingCollisionPolicy::Fail,
+        },
+        publish: PublishPolicy {
+            overwrite: if overwrite_output {
+                OverwritePolicy::ReplaceWithBackup
+            } else {
+                OverwritePolicy::FailIfExists
+            },
+            same_filesystem_required: false,
+        },
+        log: LogPolicy {
+            root: output_root.join(".tonepoet-logs"),
+            write_for_blocked: true,
+        },
+        stages: StagePolicy {
+            metadata: if no_metadata { StageRequirement::Disabled } else { StageRequirement::Enabled },
+            replaygain: if rg_enabled { StageRequirement::Enabled } else { StageRequirement::Disabled },
+            features: if no_features { StageRequirement::Disabled } else { StageRequirement::Enabled },
+        },
+        failure_policy: if partial {
+            FailurePolicy::AllowPartialAlbum
+        } else {
+            FailurePolicy::FailAlbumOnAnyTrackFailure
+        },
+    })
 }
 
 /// Convert a wizard ConversionPreset to ConversionOptions
@@ -1266,5 +1480,123 @@ fn disambiguate(
             }
             Err(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_cli_tests {
+    use super::*;
+
+    fn default_options() -> ConversionOptions {
+        ConversionOptions {
+            output_format: AudioFormat::Flac,
+            quality: AudioFormat::Flac.default_quality(),
+            ..ConversionOptions::default()
+        }
+    }
+
+    #[test]
+    fn no_pipeline_flags_returns_none() {
+        let result = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            None, None, None, false, false, false, None, false, false,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn track_flag_maps_to_set() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            Some(5), None, None, false, false, false, None, false, false,
+        ).unwrap();
+        assert!(matches!(req.source.track_selection,
+            tonepoet::convert::pipeline::TrackSelection::Set(ref s) if s.contains(&5) && s.len() == 1
+        ));
+    }
+
+    #[test]
+    fn track_range_flag_maps_to_range() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            None, Some("3-7"), None, false, false, false, None, false, false,
+        ).unwrap();
+        assert!(matches!(req.source.track_selection,
+            tonepoet::convert::pipeline::TrackSelection::Range { start: 3, end: 7 }
+        ));
+    }
+
+    #[test]
+    fn area_flag_maps_to_sacd_area() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            None, None, Some("multichannel"), false, false, false, None, false, false,
+        ).unwrap();
+        assert_eq!(req.source.sacd_area, Some(tonepoet::convert::pipeline::SacdArea::MultiChannel));
+    }
+
+    #[test]
+    fn no_cue_flag_maps_to_ignore_cue() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            None, None, None, true, false, false, None, false, false,
+        ).unwrap();
+        assert_eq!(req.source.cue_sidecar, tonepoet::convert::pipeline::CueSidecarPolicy::IgnoreCue);
+    }
+
+    #[test]
+    fn partial_flag_maps_to_allow_partial() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            None, None, None, false, true, false, None, false, false,
+        ).unwrap();
+        assert_eq!(req.failure_policy, tonepoet::convert::pipeline::FailurePolicy::AllowPartialAlbum);
+    }
+
+    #[test]
+    fn overwrite_flag_maps_to_replace_with_backup() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            None, None, None, false, false, true, None, false, false,
+        ).unwrap();
+        assert_eq!(req.publish.overwrite, tonepoet::convert::pipeline::OverwritePolicy::ReplaceWithBackup);
+    }
+
+    #[test]
+    fn naming_flag_maps_to_template() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            None, None, None, false, false, false, Some("{nn} - {title}"), false, false,
+        ).unwrap();
+        assert_eq!(req.naming.template, "{nn} - {title}");
+    }
+
+    #[test]
+    fn stage_flags_disable_stages() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &None,
+            None, None, None, false, false, false, None, true, true,
+        ).unwrap();
+        assert_eq!(req.stages.metadata, tonepoet::convert::pipeline::StageRequirement::Disabled);
+        assert_eq!(req.stages.features, tonepoet::convert::pipeline::StageRequirement::Disabled);
+    }
+
+    #[test]
+    fn replaygain_off_disables_rg_stage() {
+        let req = build_pipeline_request_template(
+            &None, &default_options(), AudioFormat::Flac, false,
+            &None, &Some("off".to_string()),
+            None, None, None, false, false, false, None, false, true,
+        ).unwrap();
+        assert_eq!(req.stages.replaygain, tonepoet::convert::pipeline::StageRequirement::Disabled);
     }
 }
