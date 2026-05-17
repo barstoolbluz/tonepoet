@@ -890,11 +890,9 @@ pub fn execute_command(
             app.convert.metadata.genre = metadata.genre.clone();
             app.convert.metadata.year = metadata.year.clone();
 
-            app.convert.source.mode = SourceMode::Single {
-                path: p.clone(),
-                info: Some(info),
-                metadata,
-            };
+            app.convert.source.mode = SourceMode::from_single(
+                p.clone(), Some(info), metadata,
+            );
             app.set_status(format!(
                 "Loaded: {}",
                 p.file_name().unwrap_or_default().to_string_lossy()
@@ -3342,6 +3340,10 @@ fn execute_queue(
                 SourceMode::Batch { cursor_info, cursor_metadata, .. } => {
                     *cursor_info = Some(info);
                     *cursor_metadata = metadata;
+                }
+                SourceMode::MultiTrack { info: slot, metadata: meta_slot, .. } => {
+                    *slot = Some(info);
+                    *meta_slot = metadata;
                 }
                 SourceMode::Empty => {
                     // Unreachable given paths.is_empty() check above.

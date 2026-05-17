@@ -336,6 +336,17 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                                 *metadata_slot = probed_metadata;
                             }
                         }
+                        super::app::SourceMode::MultiTrack {
+                            path: mt_path,
+                            info: info_slot,
+                            metadata: metadata_slot,
+                            ..
+                        } => {
+                            if mt_path == &path {
+                                *info_slot = Some(probed_info);
+                                *metadata_slot = probed_metadata;
+                            }
+                        }
                         super::app::SourceMode::Empty => {}
                     }
                 }

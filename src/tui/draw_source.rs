@@ -1,8 +1,10 @@
 //! Source pane: file path, format info, duration + browse pill (amber border)
 
+use std::path::Path;
+
 use ratatui::{
     layout::Rect,
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -45,6 +47,7 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
     // Top border with title: ┌ source ─── advanced ┐
     let title = match source.mode {
         SourceMode::Batch { .. } => " source (batch) ",
+        SourceMode::MultiTrack { .. } => " source (tracks) ",
         _ => " source ",
     };
     let adv_label = " advanced ";
@@ -71,6 +74,15 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
         SourceMode::Single { path, info, .. } => {
             render_single(border_color, w, path, info.as_ref())
         }
+        SourceMode::MultiTrack {
+            path,
+            tracks,
+            area_label,
+            album_title,
+            album_artist,
+            scroll,
+            ..
+        } => render_multi_track(border_color, w, path, tracks, area_label.as_deref(), album_title.as_deref(), album_artist.as_deref(), *scroll),
         SourceMode::Batch {
             paths,
             cursor,
@@ -419,4 +431,106 @@ fn bordered_line<'a>(
         theme::border(border_color),
     ));
     Line::from(spans)
+}
+
+/// Render multi-track source (SACD ISO or CUE+image).
+#[allow(clippy::too_many_arguments)]
+fn render_multi_track<'a>(
+    border_color: ratatui::style::Color,
+    w: usize,
+    path: &Path,
+    tracks: &[super::app::MultiTrackEntry],
+    area_label: Option<&str>,
+    album_title: Option<&str>,
+    album_artist: Option<&str>,
+    scroll: usize,
+) -> Vec<Line<'a>> {
+    let mut lines = Vec::new();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+    // Header: filename + area label
+    let mut header_spans = vec![
+        Span::styled("   ", Style::default()),
+        Span::styled(
+            truncate_to(&name, w.saturating_sub(6)),
+            Style::default().fg(Color::White),
+        ),
+    ];
+    if let Some(area) = area_label {
+        header_spans.push(Span::styled(
+            format!("  [{}]", area),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    lines.push(bordered_line(border_color, w, header_spans));
+
+    // Album info
+    if let Some(title) = album_title {
+        let mut info = format!("   {}", title);
+        if let Some(artist) = album_artist {
+            info = format!("   {} — {}", artist, title);
+        }
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![Span::styled(
+                truncate_to(&info, w.saturating_sub(4)),
+                Style::default().fg(Color::DarkGray),
+            )],
+        ));
+    }
+
+    // Track count
+    lines.push(bordered_line(
+        border_color,
+        w,
+        vec![Span::styled(
+            format!("   {} tracks", tracks.len()),
+            Style::default().fg(Color::Gray),
+        )],
+    ));
+
+    // Track listing (scrollable)
+    let max_visible = 6_usize;
+    let end = tracks.len().min(scroll + max_visible);
+    let visible = &tracks[scroll..end];
+    for t in visible {
+        let title_str = t.title.as_deref().unwrap_or("—");
+        let dur_str = t.duration_display.as_deref().unwrap_or("");
+        let line_text = if dur_str.is_empty() {
+            format!("   {:2}. {}", t.number, title_str)
+        } else {
+            format!("   {:2}. {} [{}]", t.number, title_str, dur_str)
+        };
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![Span::styled(
+                truncate_to(&line_text, w.saturating_sub(4)),
+                Style::default().fg(Color::White),
+            )],
+        ));
+    }
+    if end < tracks.len() {
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![Span::styled(
+                format!("   ... and {} more", tracks.len() - end),
+                Style::default().fg(Color::DarkGray),
+            )],
+        ));
+    }
+
+    lines
+}
+
+fn truncate_to(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max > 3 {
+        format!("{}...", &s[..max - 3])
+    } else {
+        s[..max].to_string()
+    }
 }

@@ -1013,11 +1013,9 @@ fn load_browse_selection(
                     app.convert.metadata.year = metadata.year.clone();
                     // Browse Enter loads a single file — abandon any
                     // pending batch from a previous :queue.
-                    app.convert.source.mode = SourceMode::Single {
-                        path: path.clone(),
-                        info: Some(info),
-                        metadata,
-                    };
+                    app.convert.source.mode = SourceMode::from_single(
+                        path.clone(), Some(info), metadata,
+                    );
                     app.set_status(format!(
                         "Loaded: {}",
                         path.file_name().unwrap_or_default().to_string_lossy()
@@ -7405,19 +7403,15 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         // If this is the same file we already had info for, carry it over.
         if old_cursor_path.as_ref() == Some(&path) {
             if let Some((info, metadata)) = old_cursor_info {
-                app.convert.source.mode = SourceMode::Single {
-                    path,
-                    info: Some(info),
-                    metadata,
-                };
+                app.convert.source.mode = SourceMode::from_single(
+                    path, Some(info), metadata,
+                );
                 return;
             }
         }
-        app.convert.source.mode = SourceMode::Single {
-            path: path.clone(),
-            info: None,
-            metadata: crate::tui::probe::SourceMetadata::default(),
-        };
+        app.convert.source.mode = SourceMode::from_single(
+            path.clone(), None, crate::tui::probe::SourceMetadata::default(),
+        );
         super::browse::spawn_audio_probe(path, tx.clone());
         return;
     }
@@ -8090,11 +8084,9 @@ fn load_recent_as_source(app: &mut AppState, path: &std::path::Path) {
             app.convert.metadata.year = metadata.year.clone();
             // Loading from recent replaces the source — abandon any
             // pending batch from a previous :queue.
-            app.convert.source.mode = SourceMode::Single {
-                path: path.to_path_buf(),
-                info: Some(info),
-                metadata,
-            };
+            app.convert.source.mode = SourceMode::from_single(
+                path.to_path_buf(), Some(info), metadata,
+            );
             app.set_status(format!(
                 "Loaded: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -8136,11 +8128,9 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
             app.convert.metadata.genre = metadata.genre.clone();
             app.convert.metadata.year = metadata.year.clone();
             // FileInput replaces the source — abandon any pending batch.
-            app.convert.source.mode = SourceMode::Single {
-                path: path.to_path_buf(),
-                info: Some(info),
-                metadata,
-            };
+            app.convert.source.mode = SourceMode::from_single(
+                path.to_path_buf(), Some(info), metadata,
+            );
             app.set_status(format!(
                 "Loaded: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()

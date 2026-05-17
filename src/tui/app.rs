@@ -160,6 +160,15 @@ pub enum MergeMode {
     SingleImage,
 }
 
+/// A track entry from a parsed multi-track source (SACD TOC or CUE sheet).
+#[derive(Debug, Clone)]
+pub struct MultiTrackEntry {
+    pub number: u32,
+    pub title: Option<String>,
+    pub performer: Option<String>,
+    pub duration_display: Option<String>,
+}
+
 /// Source state: empty, a single reviewed file, or a multi-file batch.
 /// Phase 6d: replaces the flat `file_path / info / metadata / batch_queue`
 /// fields with a proper type-safe enum so callers must explicitly handle
@@ -173,6 +182,19 @@ pub enum SourceMode {
         path: PathBuf,
         info: Option<SourceInfo>,
         metadata: SourceMetadata,
+    },
+    /// A multi-track source (SACD ISO, CUE+image) loaded for review.
+    /// The track list comes from TOC/CUE parsing, not audio probing.
+    MultiTrack {
+        path: PathBuf,
+        info: Option<SourceInfo>,
+        metadata: SourceMetadata,
+        tracks: Vec<MultiTrackEntry>,
+        /// "Stereo" / "Multichannel" for SACD, None for CUE.
+        area_label: Option<String>,
+        album_title: Option<String>,
+        album_artist: Option<String>,
+        scroll: usize,
     },
     /// A multi-file batch loaded for review. The cursor indexes into
     /// `paths` for the "currently previewed" file, whose probe result
@@ -205,14 +227,10 @@ impl SourceMode {
     pub fn from_paths(paths: Vec<PathBuf>) -> Self {
         match paths.len() {
             0 => Self::Empty,
-            1 => Self::Single {
-                path: paths
-                    .into_iter()
-                    .next()
-                    .expect("len == 1 means one element"),
-                info: None,
-                metadata: SourceMetadata::default(),
-            },
+            1 => {
+                let path = paths.into_iter().next().expect("len == 1 means one element");
+                Self::from_single(path, None, SourceMetadata::default())
+            }
             _ => {
                 let total_size: u64 = paths
                     .iter()
@@ -248,20 +266,20 @@ impl SourceMode {
         matches!(self, Self::Batch { .. })
     }
 
-    /// All paths in this source (0 for Empty, 1 for Single, N for Batch).
+    /// All paths in this source (0 for Empty, 1 for Single/MultiTrack, N for Batch).
     pub fn all_paths(&self) -> Vec<PathBuf> {
         match self {
             Self::Empty => Vec::new(),
-            Self::Single { path, .. } => vec![path.clone()],
+            Self::Single { path, .. } | Self::MultiTrack { path, .. } => vec![path.clone()],
             Self::Batch { paths, .. } => paths.clone(),
         }
     }
 
-    /// The currently previewed path (Single's path, or Batch's cursor).
+    /// The currently previewed path (Single/MultiTrack path, or Batch cursor).
     pub fn current_path(&self) -> Option<&PathBuf> {
         match self {
             Self::Empty => None,
-            Self::Single { path, .. } => Some(path),
+            Self::Single { path, .. } | Self::MultiTrack { path, .. } => Some(path),
             Self::Batch { paths, cursor, .. } => paths.get(*cursor),
         }
     }
@@ -270,7 +288,7 @@ impl SourceMode {
     pub fn current_info(&self) -> Option<&SourceInfo> {
         match self {
             Self::Empty => None,
-            Self::Single { info, .. } => info.as_ref(),
+            Self::Single { info, .. } | Self::MultiTrack { info, .. } => info.as_ref(),
             Self::Batch { cursor_info, .. } => cursor_info.as_ref(),
         }
     }
@@ -281,18 +299,103 @@ impl SourceMode {
     pub fn current_metadata(&self) -> SourceMetadata {
         match self {
             Self::Empty => SourceMetadata::default(),
-            Self::Single { metadata, .. } => metadata.clone(),
+            Self::Single { metadata, .. } | Self::MultiTrack { metadata, .. } => metadata.clone(),
             Self::Batch { cursor_metadata, .. } => cursor_metadata.clone(),
         }
     }
 
-    /// Number of files (0/1/N for Empty/Single/Batch).
+    /// Number of files (0/1/N for Empty/Single/Batch; 1 for MultiTrack).
     pub fn len(&self) -> usize {
         match self {
             Self::Empty => 0,
-            Self::Single { .. } => 1,
+            Self::Single { .. } | Self::MultiTrack { .. } => 1,
             Self::Batch { paths, .. } => paths.len(),
         }
+    }
+
+    /// Build a SourceMode for a single path. Detects SACD ISOs and CUE
+    /// pairs and returns MultiTrack when a track listing is available.
+    pub fn from_single(path: PathBuf, info: Option<SourceInfo>, metadata: SourceMetadata) -> Self {
+        // SACD ISO detection
+        if crate::tui::sacd::is_sacd_iso(&path) {
+            if let Ok(sacd) = crate::tui::sacd::parse_sacd_iso(&path) {
+                let area = sacd.stereo.as_ref().or(sacd.multi_channel.as_ref());
+                if let Some(area_info) = area {
+                    let area_label = if sacd.stereo.is_some() {
+                        "Stereo"
+                    } else {
+                        "Multichannel"
+                    };
+                    let tracks: Vec<MultiTrackEntry> = area_info
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let dur = format!("{}:{:02}", t.duration.minutes, t.duration.seconds);
+                            MultiTrackEntry {
+                                number: (i + 1) as u32,
+                                title: t.text.title.clone(),
+                                performer: t.text.performer.clone(),
+                                duration_display: Some(dur),
+                            }
+                        })
+                        .collect();
+
+                    let album_title = sacd.album_title().map(|s| s.to_string());
+                    let album_artist = sacd.album_artist().map(|s| s.to_string());
+
+                    let mut meta = metadata;
+                    if meta.album.is_none() { meta.album = album_title.clone(); }
+                    if meta.artist.is_none() { meta.artist = album_artist.clone(); }
+
+                    return Self::MultiTrack {
+                        path,
+                        info,
+                        metadata: meta,
+                        tracks,
+                        area_label: Some(area_label.to_string()),
+                        album_title,
+                        album_artist,
+                        scroll: 0,
+                    };
+                }
+            }
+        }
+
+        // CUE sidecar detection
+        if let Some(cue_path) = crate::tui::cue_parser::find_sidecar_cue(&path) {
+            if let Ok(sheet) = crate::tui::cue_parser::parse_cue_file(&cue_path) {
+                if sheet.tracks.len() >= 2 {
+                    let tracks: Vec<MultiTrackEntry> = sheet
+                        .tracks
+                        .iter()
+                        .map(|t| MultiTrackEntry {
+                            number: t.number,
+                            title: t.title.clone(),
+                            performer: t.performer.clone().or_else(|| sheet.performer.clone()),
+                            duration_display: None,
+                        })
+                        .collect();
+
+                    let mut meta = metadata;
+                    if meta.album.is_none() { meta.album = sheet.title.clone(); }
+                    if meta.artist.is_none() { meta.artist = sheet.performer.clone(); }
+
+                    return Self::MultiTrack {
+                        path,
+                        info,
+                        metadata: meta,
+                        tracks,
+                        area_label: None,
+                        album_title: sheet.title,
+                        album_artist: sheet.performer,
+                        scroll: 0,
+                    };
+                }
+            }
+        }
+
+        Self::Single { path, info, metadata }
     }
 }
 
@@ -1984,6 +2087,10 @@ impl AppState {
             SourceMode::Batch { cursor_info, cursor_metadata, .. } => {
                 *cursor_info = info;
                 *cursor_metadata = metadata;
+            }
+            SourceMode::MultiTrack { info: slot, metadata: meta_slot, .. } => {
+                *slot = info;
+                *meta_slot = metadata;
             }
             SourceMode::Empty => {
                 // Unreachable — valid.is_empty() check guards against 0 paths.
