@@ -24,10 +24,14 @@ use super::errors::{
 };
 use super::materializer_7z::SevenZipMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
+use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
 use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 use crate::convert::{AudioFormat, ConversionStatus};
+use crate::tui::sacd::{parse_sacd_iso, AreaInfo, PlayTime, SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE, SACD_SAMPLE_RATE_HZ};
+use sacd_rs::extract::{extract_track, ExtractOptions, ExtractStats, OutputFormat};
+use sacd_rs::iso_reader::IsoReader;
 use tonepoet_backend::{
     Backend as BackendCrateKind, CommandBuilder, ConversionCommand,
     ConversionSettings as BackendConversionSettings,
@@ -137,6 +141,9 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
         _ => {}
     }
 
+    if is_sacd_iso_candidate(req)? {
+        return Ok(SourceKind::SacdIso);
+    }
     if is_cue_image_candidate(req)? {
         return Ok(SourceKind::CueImage);
     }
@@ -151,7 +158,7 @@ pub fn materializer_for(
     match kind {
         SourceKind::SevenZip => Ok(Box::new(SevenZipMaterializer)),
         SourceKind::CueImage => Ok(Box::new(CueImageMaterializer)),
-        _ => Err(SourceDispatchError::Unsupported(kind)),
+        SourceKind::SacdIso => Ok(Box::new(SacdIsoMaterializer)),
     }
 }
 
@@ -204,7 +211,13 @@ pub async fn realize_track(
             )
             .await
         }
-        TrackSourceRef::SacdTrack { .. } => Err(ConvertError::UnsupportedTrackSource),
+        TrackSourceRef::SacdTrack {
+            iso,
+            track_index,
+            area,
+        } => {
+            realize_sacd_track(iso, *track_index, *area, staging, cancel).await
+        }
     }
 }
 
@@ -586,6 +599,473 @@ fn has_path_extension(path: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ===========================================================================
+// SACD track realization  (PR 9)
+// ===========================================================================
+
+async fn realize_sacd_track(
+    iso: &Path,
+    track_index: u32,
+    area: SacdArea,
+    staging: &StagingDir,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, ConvertError> {
+    if cancel.is_cancelled() {
+        return Err(ConvertError::Realize("cancelled".to_string()));
+    }
+    if !iso.is_file() {
+        return Err(ConvertError::TrackValidation(format!(
+            "SACD ISO does not exist: {}",
+            iso.display()
+        )));
+    }
+
+    let iso = iso.to_path_buf();
+    let staging_root = staging.root.clone();
+
+    let output = tokio::task::spawn_blocking(move || {
+        realize_sacd_track_blocking(&iso, track_index, area, &staging_root)
+    })
+    .await
+    .map_err(|err| ConvertError::Realize(format!("SACD extraction task failed: {err}")))??;
+
+    if cancel.is_cancelled() {
+        return Err(ConvertError::Realize("cancelled".to_string()));
+    }
+
+    Ok(output)
+}
+
+fn realize_sacd_track_blocking(
+    iso: &Path,
+    track_index: u32,
+    area: SacdArea,
+    staging_root: &Path,
+) -> Result<PathBuf, ConvertError> {
+    let metadata = parse_sacd_iso(iso).map_err(sacd_error_to_convert)?;
+    let area_info = sacd_area_info(&metadata, area).ok_or_else(|| {
+        ConvertError::TrackValidation(format!(
+            "requested SACD area {} is not present in {}",
+            sacd_area_label(area),
+            iso.display()
+        ))
+    })?;
+    let entry = area_info.tracks.get(track_index as usize).ok_or_else(|| {
+        ConvertError::TrackValidation(format!(
+            "SACD track index {} outside area {} track count {}",
+            track_index,
+            sacd_area_label(area),
+            area_info.tracks.len()
+        ))
+    })?;
+
+    if entry.length_lsn == 0 {
+        return Err(ConvertError::TrackValidation(format!(
+            "SACD track index {} has zero sectors",
+            track_index
+        )));
+    }
+    if !matches!(area_info.header.channel_count, 2 | 5 | 6) {
+        return Err(ConvertError::TrackValidation(format!(
+            "SACD area {} has unsupported channel count {}",
+            sacd_area_label(area),
+            area_info.header.channel_count
+        )));
+    }
+
+    let start_lsn = u64::from(entry.start_lsn);
+    let end_lsn = start_lsn
+        .checked_add(u64::from(entry.length_lsn))
+        .ok_or_else(|| ConvertError::TrackValidation("SACD track sector range overflows".to_string()))?;
+
+    let realized_dir = staging_root.join("realized-sacd-tracks");
+    fs::create_dir_all(&realized_dir)?;
+    let expectation = DsfExpectation::from_area(area_info, entry.duration);
+    let out_path = realized_dir.join(sacd_track_output_name(iso, area, track_index, entry));
+
+    if dsf_output_is_ready_for(&out_path, expectation) {
+        return Ok(out_path);
+    }
+
+    let tmp_path = unique_sacd_tmp_path(&out_path);
+    let _ = fs::remove_file(&tmp_path);
+
+    let extraction_result = (|| {
+        let mut iso_reader = IsoReader::open(iso).map_err(|err| {
+            ConvertError::Realize(format!("could not open SACD ISO {}: {err}", iso.display()))
+        })?;
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+
+        let options = ExtractOptions::new(
+            start_lsn,
+            end_lsn,
+            area_info.header.channel_count,
+            OutputFormat::Dsf,
+        );
+        let stats = extract_track(&mut iso_reader, &mut writer, options).map_err(|err| {
+            ConvertError::Realize(format!(
+                "SACD extraction failed for {} track {}: {err}",
+                iso.display(),
+                track_index + 1
+            ))
+        })?;
+        writer.sync_all()?;
+        drop(writer);
+
+        validate_sacd_realization(&tmp_path, area_info, entry.duration, stats)?;
+        Ok(())
+    })();
+
+    if let Err(err) = extraction_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    match fs::rename(&tmp_path, &out_path) {
+        Ok(()) => Ok(out_path),
+        Err(first_err) if out_path.exists() => {
+            let _ = fs::remove_file(&out_path);
+            fs::rename(&tmp_path, &out_path).map_err(|second_err| {
+                ConvertError::Io(io::Error::new(
+                    second_err.kind(),
+                    format!(
+                        "failed to replace {} after successful SACD extraction: {}; first rename error: {}",
+                        out_path.display(),
+                        second_err,
+                        first_err
+                    ),
+                ))
+            })?;
+            Ok(out_path)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(ConvertError::Io(err))
+        }
+    }
+}
+
+fn sacd_area_info(metadata: &SacdMetadata, area: SacdArea) -> Option<&AreaInfo> {
+    match area {
+        SacdArea::Stereo => metadata.stereo.as_ref(),
+        SacdArea::MultiChannel => metadata.multi_channel.as_ref(),
+    }
+}
+
+fn sacd_area_label(area: SacdArea) -> &'static str {
+    match area {
+        SacdArea::Stereo => "stereo",
+        SacdArea::MultiChannel => "multichannel",
+    }
+}
+
+fn sacd_track_output_name(
+    iso: &Path,
+    area: SacdArea,
+    track_index: u32,
+    entry: &TrackEntry,
+) -> String {
+    let stem = sanitize_segment_component(
+        iso.file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("sacd"),
+    );
+    let path_hash = stable_path_hash(iso);
+    format!(
+        "{stem}_{path_hash:016x}_{}_track_{:03}_{:08x}_{:08x}.dsf",
+        sacd_area_label(area),
+        track_index + 1,
+        entry.start_lsn,
+        entry.length_lsn
+    )
+}
+
+fn unique_sacd_tmp_path(out_path: &Path) -> PathBuf {
+    let file_name = out_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("track.dsf");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    out_path.with_file_name(format!(".{file_name}.{}.{}.tmp", std::process::id(), stamp))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DsfExpectation {
+    channel_count: u32,
+    sample_frequency: u32,
+    sample_count: u64,
+}
+
+impl DsfExpectation {
+    fn from_area(area_info: &AreaInfo, duration: PlayTime) -> Self {
+        Self {
+            channel_count: u32::from(area_info.header.channel_count),
+            sample_frequency: SACD_SAMPLE_RATE_HZ,
+            sample_count: sacd_dsf_sample_count(duration),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct DsfHeader {
+    file_size: u64,
+    metadata_offset: u64,
+    channel_count: u32,
+    sample_frequency: u32,
+    bits_per_sample: u32,
+    sample_count: u64,
+    block_size_per_channel: u32,
+    data_chunk_size: u64,
+}
+
+fn dsf_output_is_ready_for(path: &Path, expectation: DsfExpectation) -> bool {
+    validate_dsf_container(path, Some(expectation)).is_ok()
+}
+
+fn validate_sacd_realization(
+    path: &Path,
+    area_info: &AreaInfo,
+    duration: PlayTime,
+    stats: ExtractStats,
+) -> Result<(), ConvertError> {
+    if stats.frames_read == 0 || stats.audio_bytes == 0 {
+        return Err(ConvertError::TrackValidation(format!(
+            "SACD extraction produced no audio for {}",
+            path.display()
+        )));
+    }
+    if stats.audio_bytes % u64::from(area_info.header.channel_count) != 0 {
+        return Err(ConvertError::TrackValidation(format!(
+            "SACD extraction produced audio bytes not divisible by channel count: {} bytes / {} channels",
+            stats.audio_bytes,
+            area_info.header.channel_count
+        )));
+    }
+
+    let expectation = DsfExpectation::from_area(area_info, duration);
+    validate_dsf_container(path, Some(expectation))?;
+
+    let expected_frames = u64::from(playtime_to_frame_count(duration));
+    if expected_frames > 0 {
+        let delta = stats.frames_read.abs_diff(expected_frames);
+        if delta > 1 {
+            return Err(ConvertError::TrackValidation(format!(
+                "SACD frame count drift: expected {expected_frames}, got {}, allowed 1",
+                stats.frames_read
+            )));
+        }
+    }
+
+    let stats_sample_count = stats
+        .audio_bytes
+        .checked_div(u64::from(area_info.header.channel_count))
+        .unwrap_or(0)
+        .saturating_mul(8);
+    if expectation.sample_count != 0 && stats_sample_count != expectation.sample_count {
+        return Err(ConvertError::TrackValidation(format!(
+            "SACD DSF sample-count mismatch: expected {}, got {} from extracted bytes",
+            expectation.sample_count,
+            stats_sample_count
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_dsf_container(
+    path: &Path,
+    expectation: Option<DsfExpectation>,
+) -> Result<DsfHeader, ConvertError> {
+    let metadata = fs::metadata(path).map_err(|err| {
+        ConvertError::TrackValidation(format!(
+            "realized SACD track missing: {} ({err})",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.len() <= 92 {
+        return Err(ConvertError::TrackValidation(format!(
+            "realized SACD track is empty or missing DSF payload: {}",
+            path.display()
+        )));
+    }
+
+    let mut file = fs::File::open(path)?;
+    let mut header = [0_u8; 92];
+    use std::io::Read;
+    file.read_exact(&mut header)?;
+
+    if &header[0..4] != b"DSD " || &header[28..32] != b"fmt " || &header[80..84] != b"data" {
+        return Err(ConvertError::TrackValidation(format!(
+            "realized SACD track is not a complete DSF container: {}",
+            path.display()
+        )));
+    }
+
+    let parsed = DsfHeader {
+        file_size: read_u64_le(&header, 12),
+        metadata_offset: read_u64_le(&header, 20),
+        channel_count: read_u32_le(&header, 52),
+        sample_frequency: read_u32_le(&header, 56),
+        bits_per_sample: read_u32_le(&header, 60),
+        sample_count: read_u64_le(&header, 64),
+        block_size_per_channel: read_u32_le(&header, 72),
+        data_chunk_size: read_u64_le(&header, 84),
+    };
+
+    if parsed.file_size != metadata.len() {
+        return Err(ConvertError::TrackValidation(format!(
+            "DSF header file size {} does not match actual size {} for {}",
+            parsed.file_size,
+            metadata.len(),
+            path.display()
+        )));
+    }
+    if parsed.bits_per_sample != 1 || parsed.block_size_per_channel == 0 {
+        return Err(ConvertError::TrackValidation(format!(
+            "DSF header has invalid DSD format fields for {}",
+            path.display()
+        )));
+    }
+    if parsed.data_chunk_size < 12 || parsed.data_chunk_size > parsed.file_size.saturating_sub(80) {
+        return Err(ConvertError::TrackValidation(format!(
+            "DSF data chunk size is invalid for {}",
+            path.display()
+        )));
+    }
+    if parsed.metadata_offset != 0 && parsed.metadata_offset >= parsed.file_size {
+        return Err(ConvertError::TrackValidation(format!(
+            "DSF metadata offset is outside the file for {}",
+            path.display()
+        )));
+    }
+
+    if let Some(expectation) = expectation {
+        if parsed.channel_count != expectation.channel_count {
+            return Err(ConvertError::TrackValidation(format!(
+                "DSF channel count mismatch: expected {}, got {} for {}",
+                expectation.channel_count,
+                parsed.channel_count,
+                path.display()
+            )));
+        }
+        if parsed.sample_frequency != expectation.sample_frequency {
+            return Err(ConvertError::TrackValidation(format!(
+                "DSF sample frequency mismatch: expected {}, got {} for {}",
+                expectation.sample_frequency,
+                parsed.sample_frequency,
+                path.display()
+            )));
+        }
+        if expectation.sample_count != 0 && parsed.sample_count != expectation.sample_count {
+            return Err(ConvertError::TrackValidation(format!(
+                "DSF sample count mismatch: expected {}, got {} for {}",
+                expectation.sample_count,
+                parsed.sample_count,
+                path.display()
+            )));
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn sacd_dsf_sample_count(time: PlayTime) -> u64 {
+    u64::from(playtime_to_frame_count(time))
+        * u64::from(SACD_SAMPLE_RATE_HZ)
+        / u64::from(SACD_FRAME_RATE)
+}
+
+fn playtime_to_frame_count(time: PlayTime) -> u32 {
+    u32::from(time.minutes) * 60 * SACD_FRAME_RATE
+        + u32::from(time.seconds) * SACD_FRAME_RATE
+        + u32::from(time.frames)
+}
+
+fn sacd_error_to_convert(err: SacdError) -> ConvertError {
+    match err {
+        SacdError::NotSacdIso => ConvertError::Realize(
+            "SACD ISO is encrypted, corrupt, or missing Master TOC magic".to_string(),
+        ),
+        SacdError::Malformed(message) if looks_encrypted_sacd(&message) => {
+            ConvertError::Realize("SACD ISO is encrypted or scrambled".to_string())
+        }
+        SacdError::Malformed(message) => ConvertError::Realize(message),
+        SacdError::TooSmall { .. } => ConvertError::Realize(err.to_string()),
+        SacdError::Io(message) => ConvertError::Realize(message),
+    }
+}
+
+fn looks_encrypted_sacd(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("encrypted") || lower.contains("scrambled") || lower.contains("cipher")
+}
+
+#[cfg(test)]
+pub(crate) mod sacd_stage_test_support {
+    use super::*;
+
+    pub(crate) fn output_name_for_test(
+        path: &Path,
+        area: SacdArea,
+        track_index: u32,
+        start_lsn: u32,
+        length_lsn: u32,
+    ) -> String {
+        let entry = TrackEntry {
+            start_lsn,
+            length_lsn,
+            ..TrackEntry::default()
+        };
+        sacd_track_output_name(path, area, track_index, &entry)
+    }
+
+    pub(crate) fn playtime_frames_for_test(minutes: u8, seconds: u8, frames: u8) -> u32 {
+        playtime_to_frame_count(PlayTime {
+            minutes,
+            seconds,
+            frames,
+        })
+    }
+
+    pub(crate) fn dsf_ready_for_test(
+        path: &Path,
+        channel_count: u32,
+        sample_frequency: u32,
+        sample_count: u64,
+    ) -> bool {
+        dsf_output_is_ready_for(
+            path,
+            DsfExpectation {
+                channel_count,
+                sample_frequency,
+                sample_count,
+            },
+        )
+    }
+
+    pub(crate) fn dsf_sample_count_for_test(minutes: u8, seconds: u8, frames: u8) -> u64 {
+        sacd_dsf_sample_count(PlayTime {
+            minutes,
+            seconds,
+            frames,
+        })
+    }
+}
 
 // ===========================================================================
 // Output planning  (PR 4 body)

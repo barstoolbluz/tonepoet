@@ -16,6 +16,7 @@
 pub mod errors;
 pub mod materializer_7z;
 pub mod materializer_cue;
+pub mod materializer_sacd;
 pub mod reporter;
 pub mod stages;
 pub mod tool;
@@ -2906,6 +2907,211 @@ FILE "{image_name}" WAVE
         assert!(pr8_flac_has_tag(first_track, "CUE_FLAGS"));
         assert!(published.entries.iter().any(|entry| matches!(entry.role, PublishRole::Sidecar(_))));
         assert!(report.durable_log.as_ref().is_some_and(|path| path.exists()));
+    }
+
+
+    // ====================================================================
+    // PR 9 — SACD materializer / realization wiring tests
+    // ====================================================================
+    #[test]
+    fn pr9_default_sacd_area_is_stereo() {
+        assert_eq!(
+            materializer_sacd::test_support::default_area_for_test(None),
+            SacdArea::Stereo
+        );
+        assert_eq!(
+            materializer_sacd::test_support::default_area_for_test(Some(SacdArea::MultiChannel)),
+            SacdArea::MultiChannel
+        );
+    }
+
+    #[test]
+    fn pr9_sacd_expected_samples_are_unset_for_encoded_merge_accounting() {
+        assert_eq!(
+            materializer_sacd::test_support::sacd_expected_samples_for_test(),
+            None
+        );
+    }
+
+    #[test]
+    fn pr9_track_selection_range_and_set_are_one_based() {
+        let range = materializer_sacd::test_support::selection_ordinals_for_test(
+            5,
+            TrackSelection::Range { start: 2, end: 4 },
+        )
+        .unwrap();
+        assert_eq!(range, vec![2, 3, 4]);
+
+        let mut set = std::collections::BTreeSet::new();
+        set.insert(1);
+        set.insert(5);
+        let selected = materializer_sacd::test_support::selection_ordinals_for_test(
+            5,
+            TrackSelection::Set(set),
+        )
+        .unwrap();
+        assert_eq!(selected, vec![1, 5]);
+    }
+
+    #[test]
+    fn pr9_detection_positive_only_for_sacd_master_toc_magic() {
+        use crate::tui::sacd::DetectionResult;
+
+        assert!(materializer_sacd::test_support::detection_positive_for_test(
+            DetectionResult::HealthyAllRedundant
+        ));
+        assert!(materializer_sacd::test_support::detection_positive_for_test(
+            DetectionResult::HealthyPartialRedundant { good: 1 }
+        ));
+        assert!(!materializer_sacd::test_support::detection_positive_for_test(
+            DetectionResult::NotSacd
+        ));
+        assert!(!materializer_sacd::test_support::detection_positive_for_test(
+            DetectionResult::TooSmall
+        ));
+    }
+
+    #[test]
+    fn pr9_non_sacd_iso_without_explicit_sacd_selection_is_unknown_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso = tmp.path().join("ordinary-data.iso");
+        std::fs::write(&iso, vec![0_u8; 1_200_000]).unwrap();
+
+        let mut req = sample_request();
+        req.container = iso;
+        req.source.sacd_area = None;
+
+        assert!(matches!(
+            detect_source_kind(&req),
+            Err(SourceDetectError::UnknownSource)
+        ));
+    }
+
+    #[test]
+    fn pr9_explicit_sacd_selection_routes_iso_to_materializer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso = tmp.path().join("deliberate-sacd.iso");
+        std::fs::write(&iso, vec![0_u8; 1_200_000]).unwrap();
+
+        let mut req = sample_request();
+        req.container = iso;
+        req.source.sacd_area = Some(SacdArea::Stereo);
+
+        assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::SacdIso);
+        assert!(materializer_sacd::test_support::explicit_sacd_for_test(&req));
+    }
+
+    #[test]
+    fn pr9_not_sacd_maps_to_encrypted_only_for_explicit_sacd_requests() {
+        use crate::tui::sacd::SacdError;
+
+        let implicit = materializer_sacd::test_support::encrypted_mapping_for_test(
+            SacdError::NotSacdIso,
+            false,
+        );
+        assert!(matches!(implicit, MaterializeError::Parse(_)));
+
+        let explicit = materializer_sacd::test_support::encrypted_mapping_for_test(
+            SacdError::NotSacdIso,
+            true,
+        );
+        assert!(matches!(explicit, MaterializeError::Encrypted));
+
+        let tiny = materializer_sacd::test_support::encrypted_mapping_for_test(
+            SacdError::TooSmall { size: 1, required: 2 },
+            true,
+        );
+        assert!(matches!(tiny, MaterializeError::Parse(_)));
+    }
+
+    #[test]
+    fn pr9_materializer_for_sacd_iso_is_wired() {
+        assert!(materializer_for(SourceKind::SacdIso).is_ok());
+    }
+
+    #[test]
+    fn pr9_sacd_output_names_are_source_area_track_and_range_specific() {
+        let stereo = stages::sacd_stage_test_support::output_name_for_test(
+            &PathBuf::from("/music/Solo Monk.iso"),
+            SacdArea::Stereo,
+            0,
+            1234,
+            77,
+        );
+        assert!(stereo.starts_with("Solo_Monk_"));
+        assert!(stereo.contains("_stereo_track_001_000004d2_0000004d.dsf"));
+
+        let multichannel = stages::sacd_stage_test_support::output_name_for_test(
+            &PathBuf::from("/music/Solo Monk.iso"),
+            SacdArea::MultiChannel,
+            10,
+            1234,
+            77,
+        );
+        assert!(multichannel.contains("_multichannel_track_011_000004d2_0000004d.dsf"));
+        assert_ne!(stereo, multichannel);
+    }
+
+    #[test]
+    fn pr9_dsf_cache_check_validates_header_fields() {
+        fn write_fake_dsf(path: &std::path::Path, channels: u32, sample_rate: u32, samples: u64) {
+            let file_size = 108_u64;
+            let mut bytes = vec![0_u8; file_size as usize];
+            bytes[0..4].copy_from_slice(b"DSD ");
+            bytes[12..20].copy_from_slice(&file_size.to_le_bytes());
+            bytes[20..28].copy_from_slice(&0_u64.to_le_bytes());
+            bytes[28..32].copy_from_slice(b"fmt ");
+            bytes[52..56].copy_from_slice(&channels.to_le_bytes());
+            bytes[56..60].copy_from_slice(&sample_rate.to_le_bytes());
+            bytes[60..64].copy_from_slice(&1_u32.to_le_bytes());
+            bytes[64..72].copy_from_slice(&samples.to_le_bytes());
+            bytes[72..76].copy_from_slice(&4096_u32.to_le_bytes());
+            bytes[80..84].copy_from_slice(b"data");
+            bytes[84..92].copy_from_slice(&(file_size - 80).to_le_bytes());
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.dsf");
+        assert!(!stages::sacd_stage_test_support::dsf_ready_for_test(
+            &missing,
+            2,
+            crate::tui::sacd::SACD_SAMPLE_RATE_HZ,
+            37_632,
+        ));
+
+        let valid = tmp.path().join("valid.dsf");
+        write_fake_dsf(&valid, 2, crate::tui::sacd::SACD_SAMPLE_RATE_HZ, 37_632);
+        assert!(stages::sacd_stage_test_support::dsf_ready_for_test(
+            &valid,
+            2,
+            crate::tui::sacd::SACD_SAMPLE_RATE_HZ,
+            37_632,
+        ));
+        assert!(!stages::sacd_stage_test_support::dsf_ready_for_test(
+            &valid,
+            6,
+            crate::tui::sacd::SACD_SAMPLE_RATE_HZ,
+            37_632,
+        ));
+        assert!(!stages::sacd_stage_test_support::dsf_ready_for_test(
+            &valid,
+            2,
+            crate::tui::sacd::SACD_SAMPLE_RATE_HZ,
+            75_264,
+        ));
+    }
+
+    #[test]
+    fn pr9_dsf_sample_count_uses_sacd_frame_timing_only_for_dsf_validation() {
+        assert_eq!(
+            stages::sacd_stage_test_support::dsf_sample_count_for_test(0, 0, 1),
+            37_632
+        );
+        assert_eq!(
+            stages::sacd_stage_test_support::dsf_sample_count_for_test(0, 1, 0),
+            2_822_400
+        );
     }
 
 }
