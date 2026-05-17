@@ -584,7 +584,15 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let lines = vec![
+    // Extract durable log path from terminal status variants.
+    let log_path_str = match &item.status {
+        ConversionStatus::Completed { log_path: Some(p), .. } => Some(p.display().to_string()),
+        ConversionStatus::Partial { log_path, .. } => Some(log_path.display().to_string()),
+        ConversionStatus::Failed { log_path: Some(p), .. } => Some(p.display().to_string()),
+        _ => None,
+    };
+
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("File: ", Style::default().fg(Color::Gray)),
             Span::styled(name.to_string(), Style::default().fg(Color::White)),
@@ -613,6 +621,13 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
             Span::styled(status_str, Style::default().fg(Color::Yellow)),
         ]),
     ];
+
+    if let Some(log_path) = log_path_str {
+        lines.push(Line::from(vec![
+            Span::styled("Log: ", Style::default().fg(Color::Gray)),
+            Span::styled(log_path, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), chunks[0]);
     f.render_widget(
