@@ -2204,11 +2204,8 @@ pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
     for path in paths {
         if path.is_dir() {
             collect_audio_recursive(path, &mut result);
-        } else {
-            let kind = classify_file(path);
-            if matches!(kind, EntryKind::AudioFile(_) | EntryKind::Archive) {
-                result.push(path.clone());
-            }
+        } else if is_queueable_file(path) {
+            result.push(path.clone());
         }
     }
     result
@@ -2234,12 +2231,34 @@ fn collect_audio_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if file_type.is_dir() {
             collect_audio_recursive(&path, out);
-        } else {
-            let kind = classify_file(&path);
-            if matches!(kind, EntryKind::AudioFile(_) | EntryKind::Archive) {
-                out.push(path);
+        } else if is_queueable_file(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// A file is queueable for conversion if it's an audio file, a supported
+/// archive (7z), or a valid SACD ISO. Generic ISOs, zips, rars, etc. that
+/// the pipeline can't handle are excluded to avoid noisy queue errors.
+fn is_queueable_file(path: &Path) -> bool {
+    let kind = classify_file(path);
+    match kind {
+        EntryKind::AudioFile(_) => true,
+        EntryKind::Archive => {
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+            match ext.as_deref() {
+                // 7z archives are always queueable (pipeline supports them).
+                Some("7z") => true,
+                // ISOs are only queueable if they're SACD ISOs.
+                Some("iso") => crate::tui::sacd::is_sacd_iso(path),
+                // Other archive formats (zip, rar, tar, etc.) are not
+                // supported by the conversion pipeline.
+                _ => false,
             }
         }
+        _ => false,
     }
 }
 
