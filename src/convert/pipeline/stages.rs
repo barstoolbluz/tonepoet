@@ -1252,7 +1252,7 @@ pub async fn convert_tracks(
         }
 
         let bytes_in = file_len(&realized_input);
-        let cmd = match encode_command(&realized_input, &staged_path, req) {
+        let cmd = match encode_command(&realized_input, &staged_path, req, track.sample_rate) {
             Ok(cmd) => cmd,
             Err(err) => {
                 records.push(failed_track_record(
@@ -2816,7 +2816,17 @@ fn staged_audio_path(
     ))
 }
 
-fn encode_command(input: &Path, output: &Path, req: &PipelineRequest) -> Result<ToolCommand, ConvertError> {
+fn encode_command(input: &Path, output: &Path, req: &PipelineRequest, source_sample_rate: u32) -> Result<ToolCommand, ConvertError> {
+    // DSD sources (DSF/DFF) require sox for decimation to PCM.
+    let is_dsd = input.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_lowercase().as_str(), "dsf" | "dff"))
+        .unwrap_or(false);
+
+    if is_dsd {
+        return dsd_to_pcm_command(input, output, source_sample_rate);
+    }
+
     let backend = match req.encode.backend {
         EncodeBackend::Sox => BackendCrateKind::Sox,
         EncodeBackend::Auto | EncodeBackend::Ffmpeg | EncodeBackend::BackendCrate => {
@@ -2828,6 +2838,33 @@ fn encode_command(input: &Path, output: &Path, req: &PipelineRequest) -> Result<
         .build(input, output, &settings)
         .map_err(|err| ConvertError::Backend(err.to_string()))?;
     tool_command_from_backend(command)
+}
+
+/// Build a sox command for DSD→PCM conversion. Maps the source DSD rate
+/// to an appropriate PCM target rate and uses sox's very-high quality
+/// resampler (`rate -v`).
+fn dsd_to_pcm_command(input: &Path, output: &Path, source_sample_rate: u32) -> Result<ToolCommand, ConvertError> {
+    let target_rate = match source_sample_rate {
+        r if r <= 2_822_400 => 88_200,     // DSD64 → 88.2 kHz
+        r if r <= 5_644_800 => 176_400,    // DSD128 → 176.4 kHz
+        r if r <= 11_289_600 => 352_800,   // DSD256 → 352.8 kHz
+        _ => 705_600,                       // DSD512/1024 → 705.6 kHz
+    };
+
+    Ok(ToolCommand {
+        binary: ToolBinary::Sox,
+        args: vec![
+            input.display().to_string(),
+            "-b".into(), "24".into(),
+            output.display().to_string(),
+            "rate".into(), "-v".into(),
+            target_rate.to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(3600),
+    })
 }
 
 fn backend_settings(req: &PipelineRequest) -> BackendConversionSettings {
