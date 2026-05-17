@@ -15,6 +15,7 @@
 
 pub mod errors;
 pub mod materializer_7z;
+pub mod materializer_cue;
 pub mod reporter;
 pub mod stages;
 pub mod tool;
@@ -1966,4 +1967,945 @@ mod tests {
         let err = write_durable_log(&report, &policy).expect_err("should fail");
         assert!(matches!(err, LogError::Io(_)));
     }
+    fn pr8_command_record(binary: ToolBinary) -> CommandRecord {
+        CommandRecord {
+            binary,
+            sanitized_args: Vec::new(),
+            cwd: None,
+            env_keys: Vec::new(),
+            exit: Some(ProcessExit::Code(0)),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn pr8_tool_output(binary: ToolBinary, stdout_tail: String) -> ToolOutput {
+        ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail,
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: pr8_command_record(binary),
+        }
+    }
+
+    fn pr8_exact_ffprobe_json(sample_rate: u32, samples: u64) -> String {
+        let duration = samples as f64 / sample_rate as f64;
+        format!(
+            r#"{{"streams":[{{"sample_rate":"{}","duration_ts":"{}","time_base":"1/{}","duration":"{:.9}"}}],"format":{{"duration":"{:.9}"}}}}"#,
+            sample_rate, samples, sample_rate, duration, duration
+        )
+    }
+
+    fn pr8_duration_ffprobe_json(sample_rate: u32, duration: f64) -> String {
+        format!(
+            r#"{{"streams":[{{"sample_rate":"{}","duration":"{:.9}"}}],"format":{{"duration":"{:.9}"}}}}"#,
+            sample_rate, duration, duration
+        )
+    }
+
+    fn pr8_cue_text(file_name: &str) -> String {
+        format!(
+            r#"PERFORMER "Artist"
+TITLE "Album"
+REM DATE 1970
+REM GENRE Rock
+REM COMMENT "matrix"
+FILE "{}" WAVE
+  TRACK 01 AUDIO
+    TITLE "One"
+    ISRC USAAA0000001
+    FLAGS PRE
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Two"
+    REM NOTE "track-extra"
+    INDEX 01 00:01:00
+"#,
+            file_name
+        )
+    }
+
+    async fn pr8_materialize_fixture(image_name: &str) -> PreparedSource {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = tmp.path().join(image_name);
+        let cue_path = tmp.path().join("album.cue");
+        std::fs::write(&image_path, b"dummy image").unwrap();
+        std::fs::write(&cue_path, pr8_cue_text(image_name)).unwrap();
+
+        let mut req = sample_request();
+        req.container = image_path.clone();
+        req.source.archive_password = None;
+        req.source.cue_sidecar = CueSidecarPolicy::PreferSidecar;
+        req.output_root = tmp.path().join("out");
+        req.log.root = tmp.path().join("logs");
+
+        let staging = StagingDir::new(tmp.path().join("stage"), "job-cue".to_string());
+        let runner = StubToolRunner::new();
+        runner.push_output(pr8_tool_output(
+            ToolBinary::Ffprobe,
+            pr8_exact_ffprobe_json(44_100, 132_300),
+        ));
+
+        let mat = super::materializer_cue::CueImageMaterializer;
+        mat.materialize(&req, &staging, &runner, &CancellationToken::new())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pr8_cue_materializer_matrix_yields_segments_and_metadata() {
+        for image_name in ["album.flac", "album.wv", "album.ape", "ümlaut album.flac"] {
+            let source = pr8_materialize_fixture(image_name).await;
+            assert_eq!(source.kind, SourceKind::CueImage);
+            assert_eq!(source.tracks.len(), 2, "{image_name}");
+            assert_eq!(source.album_metadata.album.as_deref(), Some("Album"));
+            assert_eq!(source.album_metadata.album_artist.as_deref(), Some("Artist"));
+            assert_eq!(source.album_metadata.genre.as_deref(), Some("Rock"));
+            assert_eq!(source.album_metadata.date.as_deref(), Some("1970"));
+            assert_eq!(source.album_metadata.extra.get("rem_comment").map(String::as_str), Some("matrix"));
+            assert!(source.tracks[0].metadata.pre_emphasis);
+            assert_eq!(source.tracks[0].metadata.isrc.as_deref(), Some("USAAA0000001"));
+            assert_eq!(source.tracks[1].metadata.extra.get("rem_note").map(String::as_str), Some("track-extra"));
+            match &source.tracks[0].source_ref {
+                TrackSourceRef::ImageSegment { image, start_sample, samples } => {
+                    assert_eq!(image.file_name().and_then(|value| value.to_str()), Some(image_name));
+                    assert_eq!(*start_sample, 0);
+                    assert_eq!(*samples, 44_100);
+                }
+                other => panic!("expected ImageSegment, got {other:?}"),
+            }
+            match &source.tracks[1].source_ref {
+                TrackSourceRef::ImageSegment { start_sample, samples, .. } => {
+                    assert_eq!(*start_sample, 44_100);
+                    assert_eq!(*samples, 88_200);
+                }
+                other => panic!("expected ImageSegment, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pr8_detect_source_kind_validates_matching_single_image_cue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = tmp.path().join("album.flac");
+        let cue_path = tmp.path().join("album.cue");
+        let foreign_cue_path = tmp.path().join("foreign.cue");
+        let other_path = tmp.path().join("other.flac");
+        std::fs::write(&image_path, b"dummy image").unwrap();
+        std::fs::write(&other_path, b"dummy image").unwrap();
+        std::fs::write(&foreign_cue_path, pr8_cue_text("other.flac")).unwrap();
+
+        let mut req = sample_request();
+        req.container = image_path.clone();
+        req.source.archive_password = None;
+        req.source.cue_sidecar = CueSidecarPolicy::PreferSidecar;
+        assert!(matches!(detect_source_kind(&req), Err(SourceDetectError::UnknownSource)));
+
+        std::fs::write(&cue_path, "not a cue sheet at all").unwrap();
+        assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::CueImage);
+
+        std::fs::write(&cue_path, pr8_cue_text("album.flac")).unwrap();
+        assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::CueImage);
+
+        req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        assert!(matches!(detect_source_kind(&req), Err(SourceDetectError::UnknownSource)));
+
+        req.container = tmp.path().join("album.7z");
+        assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::SevenZip);
+        assert!(materializer_for(SourceKind::CueImage).is_ok());
+    }
+
+
+    #[tokio::test]
+    async fn pr8_malformed_same_stem_sidecar_fails_in_materializer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = tmp.path().join("album.flac");
+        let cue_path = tmp.path().join("album.cue");
+        std::fs::write(&image_path, b"dummy image").unwrap();
+        std::fs::write(&cue_path, "not a cue sheet at all").unwrap();
+
+        let mut req = sample_request();
+        req.container = image_path;
+        req.source.archive_password = None;
+        req.source.cue_sidecar = CueSidecarPolicy::PreferSidecar;
+        req.output_root = tmp.path().join("out");
+        req.log.root = tmp.path().join("logs");
+
+        let staging = StagingDir::new(tmp.path().join("stage"), "job-cue".to_string());
+        let runner = StubToolRunner::new();
+        let mat = super::materializer_cue::CueImageMaterializer;
+        let err = mat
+            .materialize(&req, &staging, &runner, &CancellationToken::new())
+            .await
+            .expect_err("malformed same-stem sidecar should fail in materialization");
+        assert!(matches!(err, MaterializeError::Parse(_)));
+    }
+
+    #[tokio::test]
+    async fn pr8_sidecar_policy_failures_are_structured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = tmp.path().join("album.flac");
+        std::fs::write(&image_path, b"dummy image").unwrap();
+
+        let mut req = sample_request();
+        req.container = image_path;
+        req.source.archive_password = None;
+        req.output_root = tmp.path().join("out");
+        req.log.root = tmp.path().join("logs");
+        let staging = StagingDir::new(tmp.path().join("stage"), "job-cue".to_string());
+        let runner = StubToolRunner::new();
+        let mat = super::materializer_cue::CueImageMaterializer;
+
+        req.source.cue_sidecar = CueSidecarPolicy::SidecarOnly;
+        let err = mat
+            .materialize(&req, &staging, &runner, &CancellationToken::new())
+            .await
+            .expect_err("missing sidecar should fail");
+        assert!(matches!(err, MaterializeError::Parse(_)));
+
+        req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        let err = mat
+            .materialize(&req, &staging, &runner, &CancellationToken::new())
+            .await
+            .expect_err("IgnoreCue must not materialize");
+        assert!(matches!(err, MaterializeError::Parse(_)));
+    }
+
+    #[test]
+    fn pr8_probe_prefers_duration_ts_sample_count() {
+        let parsed = super::materializer_cue::test_support::parse_probe_for_test(
+            &pr8_exact_ffprobe_json(48_000, 96_001),
+        )
+        .unwrap();
+        assert_eq!(parsed, (48_000, 96_001, true));
+
+        let parsed = super::materializer_cue::test_support::parse_probe_for_test(
+            &pr8_duration_ffprobe_json(44_100, 2.0),
+        )
+        .unwrap();
+        assert_eq!(parsed, (44_100, 88_200, false));
+    }
+
+    struct CaptureFfmpegCutRunner {
+        ffmpeg_args: std::sync::Mutex<Option<Vec<String>>>,
+    }
+
+    impl CaptureFfmpegCutRunner {
+        fn new() -> Self {
+            Self { ffmpeg_args: std::sync::Mutex::new(None) }
+        }
+
+        fn ffmpeg_args(&self) -> Vec<String> {
+            self.ffmpeg_args
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("ffmpeg should have been invoked")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolRunner for CaptureFfmpegCutRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            match cmd.binary {
+                ToolBinary::Ffmpeg => {
+                    *self.ffmpeg_args.lock().unwrap() = Some(cmd.args.clone());
+                    let out = cmd.args.last().unwrap().clone();
+                    std::fs::write(out, b"track flac").unwrap();
+                    Ok(pr8_tool_output(ToolBinary::Ffmpeg, String::new()))
+                }
+                ToolBinary::Ffprobe => Ok(pr8_tool_output(
+                    ToolBinary::Ffprobe,
+                    pr8_exact_ffprobe_json(44_100, 4_410),
+                )),
+                other => panic!("unexpected call {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pr8_image_segment_cut_uses_absolute_sample_trim_without_input_seek() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = tmp.path().join("album.flac");
+        std::fs::write(&image_path, b"dummy image").unwrap();
+        let src = TrackSourceRef::ImageSegment {
+            image: image_path,
+            start_sample: 88_200,
+            samples: 4_410,
+        };
+        let mut req = sample_request();
+        req.source.archive_password = None;
+        let staging = StagingDir::new(tmp.path().join("stage"), "job-realize".to_string());
+        let runner = CaptureFfmpegCutRunner::new();
+
+        let out = realize_track(&src, &req, &staging, &runner, &CancellationToken::new())
+            .await
+            .expect("realization should succeed");
+        assert!(out.exists());
+
+        let args = runner.ffmpeg_args();
+        assert!(
+            !args.iter().any(|arg| arg == "-ss"),
+            "input-side -ss is not allowed for PR8 CUE segment cutting: {args:?}"
+        );
+        let filter = args
+            .windows(2)
+            .find(|pair| pair[0] == "-af")
+            .map(|pair| pair[1].as_str())
+            .expect("ffmpeg command should include an audio filter");
+        assert_eq!(
+            filter,
+            "atrim=start_sample=88200:end_sample=92610,asetpts=PTS-STARTPTS"
+        );
+    }
+
+    struct FailingWavpackFallbackRunner {
+        ffmpeg_calls: std::sync::Mutex<u32>,
+    }
+
+    impl FailingWavpackFallbackRunner {
+        fn new() -> Self {
+            Self { ffmpeg_calls: std::sync::Mutex::new(0) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolRunner for FailingWavpackFallbackRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            match cmd.binary {
+                ToolBinary::Ffprobe => Ok(pr8_tool_output(
+                    ToolBinary::Ffprobe,
+                    pr8_exact_ffprobe_json(44_100, 44_100),
+                )),
+                ToolBinary::Wvunpack => {
+                    let out = cmd.args[2].clone();
+                    std::fs::write(out, b"decoded wav").unwrap();
+                    Ok(pr8_tool_output(ToolBinary::Wvunpack, String::new()))
+                }
+                ToolBinary::Ffmpeg => {
+                    let mut calls = self.ffmpeg_calls.lock().unwrap();
+                    *calls += 1;
+                    let call_no = *calls;
+                    drop(calls);
+
+                    if call_no == 2 {
+                        let out = cmd.args.last().unwrap().clone();
+                        std::fs::write(out, b"partial flac").unwrap();
+                    }
+                    Err(ToolRunnerError::NonZeroExit {
+                        exit: ProcessExit::Code(1),
+                        stderr_tail: if call_no == 1 {
+                            "direct cut failed".to_string()
+                        } else {
+                            "fallback cut failed".to_string()
+                        },
+                        command: pr8_command_record(ToolBinary::Ffmpeg),
+                    })
+                }
+                other => panic!("unexpected call {other:?}"),
+            }
+        }
+    }
+
+
+    struct CachingWavpackFallbackRunner {
+        wvunpack_calls: std::sync::Mutex<u32>,
+    }
+
+    impl CachingWavpackFallbackRunner {
+        fn new() -> Self {
+            Self { wvunpack_calls: std::sync::Mutex::new(0) }
+        }
+
+        fn wvunpack_calls(&self) -> u32 {
+            *self.wvunpack_calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolRunner for CachingWavpackFallbackRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            match cmd.binary {
+                ToolBinary::Ffmpeg => {
+                    let input = cmd
+                        .args
+                        .windows(2)
+                        .find(|pair| pair[0] == "-i")
+                        .map(|pair| pair[1].clone())
+                        .unwrap_or_default();
+                    if input.ends_with(".wv") {
+                        return Err(ToolRunnerError::NonZeroExit {
+                            exit: ProcessExit::Code(1),
+                            stderr_tail: "direct cut failed".to_string(),
+                            command: pr8_command_record(ToolBinary::Ffmpeg),
+                        });
+                    }
+                    let out = cmd.args.last().unwrap().clone();
+                    std::fs::write(out, b"track flac").unwrap();
+                    Ok(pr8_tool_output(ToolBinary::Ffmpeg, String::new()))
+                }
+                ToolBinary::Wvunpack => {
+                    *self.wvunpack_calls.lock().unwrap() += 1;
+                    let out = cmd.args[2].clone();
+                    std::fs::write(out, b"decoded wav").unwrap();
+                    Ok(pr8_tool_output(ToolBinary::Wvunpack, String::new()))
+                }
+                ToolBinary::Ffprobe => Ok(pr8_tool_output(
+                    ToolBinary::Ffprobe,
+                    pr8_exact_ffprobe_json(44_100, 44_100),
+                )),
+                other => panic!("unexpected call {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pr8_wavpack_fallback_failure_deletes_partial_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = tmp.path().join("album.wv");
+        std::fs::write(&image_path, b"dummy image").unwrap();
+        let src = TrackSourceRef::ImageSegment {
+            image: image_path,
+            start_sample: 0,
+            samples: 44_100,
+        };
+        let mut req = sample_request();
+        req.source.archive_password = None;
+        let staging = StagingDir::new(tmp.path().join("stage"), "job-realize".to_string());
+        let runner = FailingWavpackFallbackRunner::new();
+
+        let err = realize_track(&src, &req, &staging, &runner, &CancellationToken::new())
+            .await
+            .expect_err("fallback cut should fail");
+        assert!(matches!(err, ConvertError::Tool(_)));
+
+        let segment_dir = staging.root.join("realized-image-segments");
+        let partial_outputs: Vec<_> = if segment_dir.exists() {
+            std::fs::read_dir(&segment_dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("flac"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        assert!(partial_outputs.is_empty(), "failed realization left partial track outputs: {partial_outputs:?}");
+        assert!(segment_dir.join("decoded-image-cache").exists(), "decoded cache should be retained for retry/reuse");
+    }
+
+
+    #[tokio::test]
+    async fn pr8_wavpack_fallback_reuses_decoded_image_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_path = tmp.path().join("album.wv");
+        std::fs::write(&image_path, b"dummy image").unwrap();
+        let mut req = sample_request();
+        req.source.archive_password = None;
+        let staging = StagingDir::new(tmp.path().join("stage"), "job-realize".to_string());
+        let runner = CachingWavpackFallbackRunner::new();
+
+        for start_sample in [0_u64, 44_100_u64] {
+            let src = TrackSourceRef::ImageSegment {
+                image: image_path.clone(),
+                start_sample,
+                samples: 44_100,
+            };
+            let out = realize_track(&src, &req, &staging, &runner, &CancellationToken::new())
+                .await
+                .expect("fallback realization should succeed");
+            assert!(out.exists());
+        }
+
+        assert_eq!(runner.wvunpack_calls(), 1, "WavPack image should be decoded once per staging cache");
+    }
+
+
+    fn pr8_real_corpus_enabled() -> bool {
+        std::env::var("TONEPOET_PR8_REAL_CORPUS").ok().as_deref() == Some("1")
+    }
+
+    fn pr8_command_available(program: &str) -> bool {
+        ["-version", "--version", "-h", "--help"].iter().any(|flag| {
+            std::process::Command::new(program)
+                .arg(flag)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        })
+    }
+
+    fn pr8_run_command(program: &str, args: &[&str]) {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program}: {err}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn pr8_command_stdout(program: &str, args: &[&str]) -> String {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program}: {err}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn pr8_command_output(program: &str, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program}: {err}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn pr8_decode_pcm_s16le(path: &std::path::Path) -> Vec<u8> {
+        pr8_command_output(
+            "ffmpeg",
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                path.to_str().unwrap(),
+                "-map",
+                "0:a:0",
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                "pipe:1",
+            ],
+        )
+    }
+
+    fn pr8_flac_has_tag(path: &std::path::Path, tag: &str) -> bool {
+        let tag_arg = format!("--show-tag={tag}");
+        let output = pr8_command_stdout("metaflac", &[tag_arg.as_str(), path.to_str().unwrap()]);
+        let prefix = format!("{}=", tag.to_ascii_uppercase());
+        output
+            .lines()
+            .any(|line| line.to_ascii_uppercase().starts_with(prefix.as_str()))
+    }
+
+    fn pr8_write_cue(path: &std::path::Path, image_name: &str, album: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"PERFORMER "Corpus Artist"
+TITLE "{album}"
+REM DATE 1971
+REM GENRE Test
+FILE "{image_name}" WAVE
+  TRACK 01 AUDIO
+    TITLE "First"
+    ISRC USAAA0000001
+    FLAGS PRE
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Second"
+    INDEX 01 00:01:00
+  TRACK 03 AUDIO
+    TITLE "Third"
+    INDEX 01 00:02:00
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn pr8_write_many_track_cue(
+        path: &std::path::Path,
+        image_name: &str,
+        album: &str,
+        track_count: u32,
+        seconds_per_track: u32,
+    ) {
+        let mut text = format!(
+            "PERFORMER \"Corpus Artist\"\nTITLE \"{album}\"\nFILE \"{image_name}\" WAVE\n"
+        );
+        for track in 1..=track_count {
+            let seconds = (track - 1) * seconds_per_track;
+            let mm = seconds / 60;
+            let ss = seconds % 60;
+            text.push_str(&format!(
+                "  TRACK {track:02} AUDIO\n    TITLE \"Track {track:02}\"\n    INDEX 01 {mm:02}:{ss:02}:00\n"
+            ));
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    async fn pr8_materialize_real_cue(image: PathBuf, policy: CueSidecarPolicy) -> PreparedSource {
+        let tmp_root = image.parent().unwrap().to_path_buf();
+        let mut req = sample_request();
+        req.container = image;
+        req.source.archive_password = None;
+        req.source.cue_sidecar = policy;
+        req.output_root = tmp_root.join("out");
+        req.log.root = tmp_root.join("logs");
+        let staging = StagingDir::new(tmp_root.join("stage"), "job-real-corpus".to_string());
+        let runner = RealToolRunner::new(std::collections::HashMap::new());
+        super::materializer_cue::CueImageMaterializer
+            .materialize(&req, &staging, &runner, &CancellationToken::new())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pr8_real_corpus_generated_images_when_enabled() {
+        if !pr8_real_corpus_enabled() {
+            eprintln!("skipping generated real-corpus PR8 test; set TONEPOET_PR8_REAL_CORPUS=1 to run");
+            return;
+        }
+        assert!(pr8_command_available("ffmpeg"), "ffmpeg is required");
+        assert!(pr8_command_available("ffprobe"), "ffprobe is required");
+        assert!(pr8_command_available("wavpack"), "wavpack is required");
+        assert!(pr8_command_available("metaflac"), "metaflac is required");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wav = root.join("source.wav");
+        let flac = root.join("standard.flac");
+        let wv = root.join("standard.wv");
+        let ape = root.join("standard.ape");
+
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=3", "-ar", "44100", "-ac", "2", wav.to_str().unwrap(),
+            ],
+        );
+        pr8_run_command("ffmpeg", &["-y", "-hide_banner", "-loglevel", "error", "-i", wav.to_str().unwrap(), flac.to_str().unwrap()]);
+        pr8_run_command("wavpack", &["-y", "-q", wav.to_str().unwrap(), "-o", wv.to_str().unwrap()]);
+        pr8_run_command("ffmpeg", &["-y", "-hide_banner", "-loglevel", "error", "-i", wav.to_str().unwrap(), ape.to_str().unwrap()]);
+
+        for image in [&flac, &wv, &ape] {
+            let cue = image.with_extension("cue");
+            pr8_write_cue(&cue, image.file_name().unwrap().to_str().unwrap(), "Corpus Album");
+            let source = pr8_materialize_real_cue(image.to_path_buf(), CueSidecarPolicy::PreferSidecar).await;
+            assert_eq!(source.kind, SourceKind::CueImage);
+            assert_eq!(source.tracks.len(), 3);
+            assert_eq!(source.tracks[0].metadata.album_artist.as_deref(), Some("Corpus Artist"));
+            assert!(source.tracks[0].metadata.pre_emphasis);
+            assert_eq!(source.tracks[0].sample_rate, 44_100);
+            assert_eq!(source.tracks[0].expected_samples, Some(44_100));
+            assert!(matches!(source.tracks[0].source_ref, TrackSourceRef::ImageSegment { .. }));
+        }
+
+        let embedded_cue = root.join("embedded.cue");
+        pr8_write_cue(&embedded_cue, flac.file_name().unwrap().to_str().unwrap(), "Embedded Album");
+        pr8_run_command("metaflac", &["--remove-tag=CUESHEET", flac.to_str().unwrap()]);
+        pr8_run_command(
+            "metaflac",
+            &[
+                &format!("--set-tag-from-file=CUESHEET={}", embedded_cue.display()),
+                flac.to_str().unwrap(),
+            ],
+        );
+        let sidecar_cue = flac.with_extension("cue");
+        pr8_write_cue(&sidecar_cue, flac.file_name().unwrap().to_str().unwrap(), "Sidecar Album");
+
+        let prefer = pr8_materialize_real_cue(flac.clone(), CueSidecarPolicy::PreferSidecar).await;
+        assert_eq!(prefer.album_metadata.album.as_deref(), Some("Sidecar Album"));
+        let embedded = pr8_materialize_real_cue(flac.clone(), CueSidecarPolicy::EmbeddedOnly).await;
+        assert_eq!(embedded.album_metadata.album.as_deref(), Some("Embedded Album"));
+    }
+
+    #[tokio::test]
+    async fn pr8_real_segment_alignment_when_enabled() {
+        if !pr8_real_corpus_enabled() {
+            eprintln!("skipping generated segment-alignment PR8 test; set TONEPOET_PR8_REAL_CORPUS=1 to run");
+            return;
+        }
+        assert!(pr8_command_available("ffmpeg"), "ffmpeg is required");
+        assert!(pr8_command_available("ffprobe"), "ffprobe is required");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wav = root.join("alignment.wav");
+        let flac = root.join("alignment.flac");
+
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=330:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1760:duration=1",
+                "-filter_complex",
+                "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]",
+                "-map",
+                "[a]",
+                "-ar",
+                "44100",
+                "-ac",
+                "1",
+                wav.to_str().unwrap(),
+            ],
+        );
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                wav.to_str().unwrap(),
+                flac.to_str().unwrap(),
+            ],
+        );
+
+        let mut req = sample_request();
+        req.container = flac.clone();
+        req.source.archive_password = None;
+        let staging = StagingDir::new(root.join("stage-alignment"), "job-align".to_string());
+        let runner = RealToolRunner::new(std::collections::HashMap::new());
+        let src = TrackSourceRef::ImageSegment {
+            image: flac.clone(),
+            start_sample: 44_100,
+            samples: 44_100,
+        };
+        let realized = realize_track(&src, &req, &staging, &runner, &CancellationToken::new())
+            .await
+            .expect("segment realization should succeed");
+
+        let source_pcm = pr8_decode_pcm_s16le(&flac);
+        let realized_pcm = pr8_decode_pcm_s16le(&realized);
+        let start = 44_100_usize * 2;
+        let len = 44_100_usize * 2;
+        assert_eq!(
+            &realized_pcm[..],
+            &source_pcm[start..start + len],
+            "realized segment PCM must match the source-aligned sample window exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr8_real_long_image_many_tracks_benchmark_when_enabled() {
+        if std::env::var("TONEPOET_PR8_LONG_IMAGE").ok().as_deref() != Some("1") {
+            eprintln!(
+                "skipping long-image PR8 benchmark; set TONEPOET_PR8_LONG_IMAGE=1 to run"
+            );
+            return;
+        }
+        assert!(pr8_command_available("ffmpeg"), "ffmpeg is required");
+        assert!(pr8_command_available("ffprobe"), "ffprobe is required");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wav = root.join("long.wav");
+        let flac = root.join("long.flac");
+        let cue = root.join("long.cue");
+        let track_count = std::env::var("TONEPOET_PR8_LONG_IMAGE_TRACKS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(60);
+        let seconds_per_track = std::env::var("TONEPOET_PR8_LONG_IMAGE_SECONDS_PER_TRACK")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(2);
+        let duration = track_count * seconds_per_track;
+        let sine = format!("sine=frequency=440:duration={duration}");
+
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                sine.as_str(),
+                "-ar",
+                "44100",
+                "-ac",
+                "1",
+                wav.to_str().unwrap(),
+            ],
+        );
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                wav.to_str().unwrap(),
+                flac.to_str().unwrap(),
+            ],
+        );
+        pr8_write_many_track_cue(
+            &cue,
+            flac.file_name().unwrap().to_str().unwrap(),
+            "Long Benchmark Album",
+            track_count,
+            seconds_per_track,
+        );
+
+        let source = pr8_materialize_real_cue(flac.clone(), CueSidecarPolicy::PreferSidecar).await;
+        assert_eq!(source.tracks.len(), track_count as usize);
+
+        let mut req = sample_request();
+        req.container = flac;
+        req.source.archive_password = None;
+        let staging = StagingDir::new(root.join("stage-long"), "job-long".to_string());
+        let runner = RealToolRunner::new(std::collections::HashMap::new());
+        let started = std::time::Instant::now();
+        for track in &source.tracks {
+            let out = realize_track(
+                &track.source_ref,
+                &req,
+                &staging,
+                &runner,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("long-image segment realization should succeed");
+            assert!(out.exists());
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "PR8 long-image benchmark: {track_count} tracks x {seconds_per_track}s realized in {:.3}s",
+            elapsed.as_secs_f64()
+        );
+        if let Ok(max_seconds) = std::env::var("TONEPOET_PR8_LONG_IMAGE_MAX_SECONDS") {
+            let max_seconds = max_seconds.parse::<f64>().expect("invalid max seconds");
+            assert!(
+                elapsed.as_secs_f64() <= max_seconds,
+                "long-image realization exceeded configured budget: {:.3}s > {max_seconds:.3}s",
+                elapsed.as_secs_f64()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pr8_real_pipeline_end_to_end_when_enabled() {
+        if !pr8_real_corpus_enabled() {
+            eprintln!("skipping generated end-to-end PR8 test; set TONEPOET_PR8_REAL_CORPUS=1 to run");
+            return;
+        }
+        assert!(pr8_command_available("ffmpeg"), "ffmpeg is required");
+        assert!(pr8_command_available("ffprobe"), "ffprobe is required");
+        assert!(pr8_command_available("loudgain"), "loudgain is required");
+        assert!(pr8_command_available("metaflac"), "metaflac is required");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wav = root.join("e2e.wav");
+        let flac = root.join("e2e.flac");
+        let cue = root.join("e2e.cue");
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                "sine=frequency=330:duration=3", "-ar", "44100", "-ac", "2", wav.to_str().unwrap(),
+            ],
+        );
+        pr8_run_command("ffmpeg", &["-y", "-hide_banner", "-loglevel", "error", "-i", wav.to_str().unwrap(), flac.to_str().unwrap()]);
+        pr8_write_cue(&cue, flac.file_name().unwrap().to_str().unwrap(), "Pipeline Album");
+
+        let mut req = sample_request();
+        req.job_id = "job-pr8-e2e".to_string();
+        req.item_id = "item-pr8-e2e".to_string();
+        req.container = flac;
+        req.source.archive_password = None;
+        req.source.cue_sidecar = CueSidecarPolicy::PreferSidecar;
+        req.output_root = root.join("published");
+        req.log.root = root.join("logs");
+        req.stages.metadata = StageRequirement::Enabled;
+        req.stages.replaygain = StageRequirement::Enabled;
+        req.stages.features = StageRequirement::Enabled;
+
+        let runner = RealToolRunner::new(std::collections::HashMap::new());
+        let reporter = RecordingReporter::new();
+        let report = run_pipeline_item(req, &runner, &reporter, &CancellationToken::new()).await;
+        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }), "unexpected outcome: {:?}", report.outcome);
+        let published = report.published.expect("end-to-end test should publish outputs");
+        let audio_entries = published
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.role, PublishRole::Audio))
+            .count();
+        assert_eq!(audio_entries, 3);
+        let audio_paths: Vec<_> = published
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.role, PublishRole::Audio))
+            .map(|entry| entry.final_path.clone())
+            .collect();
+        assert_eq!(audio_paths.len(), 3);
+        for path in &audio_paths {
+            assert!(path.exists(), "published audio file is missing: {}", path.display());
+            assert!(
+                pr8_flac_has_tag(path, "REPLAYGAIN_TRACK_GAIN"),
+                "published file lacks ReplayGain tag: {}",
+                path.display()
+            );
+        }
+        let first_track = audio_paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("01 - First"))
+            })
+            .expect("expected first published track");
+        assert!(pr8_flac_has_tag(first_track, "ISRC"));
+        assert!(pr8_flac_has_tag(first_track, "PRE_EMPHASIS"));
+        assert!(pr8_flac_has_tag(first_track, "CUE_FLAGS"));
+        assert!(published.entries.iter().any(|entry| matches!(entry.role, PublishRole::Sidecar(_))));
+        assert!(report.durable_log.as_ref().is_some_and(|path| path.exists()));
+    }
+
 }

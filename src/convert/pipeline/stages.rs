@@ -23,6 +23,7 @@ use super::errors::{
     SourceDispatchError, ToolRunnerError,
 };
 use super::materializer_7z::SevenZipMaterializer;
+use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
@@ -130,10 +131,17 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+
     match ext.as_str() {
-        "7z" => Ok(SourceKind::SevenZip),
-        _ => Err(SourceDetectError::UnknownSource),
+        "7z" => return Ok(SourceKind::SevenZip),
+        _ => {}
     }
+
+    if is_cue_image_candidate(req)? {
+        return Ok(SourceKind::CueImage);
+    }
+
+    Err(SourceDetectError::UnknownSource)
 }
 
 /// Dispatch a supported source kind to its materializer.
@@ -142,6 +150,7 @@ pub fn materializer_for(
 ) -> Result<Box<dyn Materializer>, SourceDispatchError> {
     match kind {
         SourceKind::SevenZip => Ok(Box::new(SevenZipMaterializer)),
+        SourceKind::CueImage => Ok(Box::new(CueImageMaterializer)),
         _ => Err(SourceDispatchError::Unsupported(kind)),
     }
 }
@@ -154,9 +163,9 @@ pub fn materializer_for(
 /// Realize a materialized track as a file the encoder can consume.
 pub async fn realize_track(
     src: &TrackSourceRef,
-    _req: &PipelineRequest,
-    _staging: &StagingDir,
-    _runner: &dyn ToolRunner,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<PathBuf, ConvertError> {
     if cancel.is_cancelled() {
@@ -179,11 +188,404 @@ pub async fn realize_track(
             }
             Ok(path.clone())
         }
-        TrackSourceRef::ImageSegment { .. } | TrackSourceRef::SacdTrack { .. } => {
-            Err(ConvertError::UnsupportedTrackSource)
+        TrackSourceRef::ImageSegment {
+            image,
+            start_sample,
+            samples,
+        } => {
+            realize_image_segment(
+                image,
+                *start_sample,
+                *samples,
+                req,
+                staging,
+                runner,
+                cancel,
+            )
+            .await
         }
+        TrackSourceRef::SacdTrack { .. } => Err(ConvertError::UnsupportedTrackSource),
     }
 }
+
+fn cue_segment_output_name(image: &Path, start_sample: u64, samples: u64) -> String {
+    let stem = sanitize_segment_component(
+        image
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image"),
+    );
+    format!("{stem}_{start_sample:012}_{samples:012}.flac")
+}
+
+fn sanitize_segment_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "image".to_string()
+    } else {
+        sanitized
+    }
+}
+
+async fn realize_image_segment(
+    image: &Path,
+    start_sample: u64,
+    samples: u64,
+    _req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, ConvertError> {
+    if samples == 0 {
+        return Err(ConvertError::TrackValidation(
+            "image segment has zero samples".to_string(),
+        ));
+    }
+    if !image.is_file() {
+        return Err(ConvertError::TrackValidation(format!(
+            "image file does not exist: {}",
+            image.display()
+        )));
+    }
+
+    let realized_dir = staging.root.join("realized-image-segments");
+    fs::create_dir_all(&realized_dir)?;
+    let out_path = realized_dir.join(cue_segment_output_name(image, start_sample, samples));
+    let _ = fs::remove_file(&out_path);
+
+    let direct = cut_segment_with_ffmpeg(image, start_sample, samples, &out_path, runner, cancel).await;
+    if let Err(err) = direct {
+        let _ = fs::remove_file(&out_path);
+        if !has_path_extension(image, "wv") {
+            return Err(err);
+        }
+
+        let fallback = async {
+            let wav_path = ensure_decoded_wavpack_image(image, &realized_dir, runner, cancel).await?;
+            cut_segment_with_ffmpeg(&wav_path, start_sample, samples, &out_path, runner, cancel).await
+        }
+        .await;
+
+        if let Err(err) = fallback {
+            let _ = fs::remove_file(&out_path);
+            return Err(err);
+        }
+    }
+
+    if let Err(err) = validate_realized_segment(&out_path, samples, runner, cancel).await {
+        let _ = fs::remove_file(&out_path);
+        return Err(err);
+    }
+
+    Ok(out_path)
+}
+
+async fn cut_segment_with_ffmpeg(
+    input: &Path,
+    start_sample: u64,
+    samples: u64,
+    out_path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), ConvertError> {
+    let end_sample = start_sample.checked_add(samples).ok_or_else(|| {
+        ConvertError::TrackValidation("image segment sample range overflows".to_string())
+    })?;
+
+    // Deliberately avoid input-side `-ss` here. On compressed images, ffmpeg may
+    // seek to the closest preceding seek point and then make filters count from
+    // that decoded stream, which can yield the expected length but the wrong
+    // source-aligned first sample. Absolute sample trimming is slower for late
+    // tracks, but it preserves correctness until a separately proven exact
+    // seek/copy strategy is introduced.
+    let filter = format!(
+        "atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS"
+    );
+    let cmd = ToolCommand {
+        binary: ToolBinary::Ffmpeg,
+        args: vec![
+            "-y".into(),
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-i".into(),
+            input.to_string_lossy().into_owned(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-vn".into(),
+            "-af".into(),
+            filter,
+            "-c:a".into(),
+            "flac".into(),
+            "-compression_level".into(),
+            "0".into(),
+            out_path.to_string_lossy().into_owned(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: DEFAULT_CONVERT_TIMEOUT,
+    };
+
+    match runner.run(cmd, cancel).await {
+        Ok(_) => Ok(()),
+        Err(ToolRunnerError::Cancelled { .. }) => Err(ConvertError::Realize("cancelled".to_string())),
+        Err(err) => Err(ConvertError::Tool(err)),
+    }
+}
+
+async fn ensure_decoded_wavpack_image(
+    input: &Path,
+    realized_dir: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, ConvertError> {
+    let cache_dir = realized_dir.join("decoded-image-cache");
+    fs::create_dir_all(&cache_dir)?;
+
+    let wav_path = cache_dir.join(decoded_wavpack_cache_name(input));
+    if cached_audio_is_ready(&wav_path) {
+        return Ok(wav_path);
+    }
+
+    let lock_path = wav_path.with_extension("wav.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    lock_file.lock_exclusive()?;
+
+    let result = async {
+        if cached_audio_is_ready(&wav_path) {
+            return Ok(wav_path.clone());
+        }
+
+        let tmp_path = wav_path.with_file_name(format!(
+            ".{}.{}.tmp",
+            wav_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("decoded.wav"),
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&tmp_path);
+
+        if let Err(err) = decode_wavpack_image(input, &tmp_path, runner, cancel).await {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
+        fs::rename(&tmp_path, &wav_path)?;
+        Ok(wav_path.clone())
+    }
+    .await;
+
+    let _ = lock_file.unlock();
+    result
+}
+
+fn cached_audio_is_ready(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+fn decoded_wavpack_cache_name(input: &Path) -> String {
+    let stem = sanitize_segment_component(
+        input
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image"),
+    );
+    let hash = stable_path_hash(input);
+    format!("{stem}_{hash:016x}.wav")
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+async fn decode_wavpack_image(
+    input: &Path,
+    out_path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), ConvertError> {
+    let cmd = ToolCommand {
+        binary: ToolBinary::Wvunpack,
+        args: vec![
+            "-q".into(),
+            "-o".into(),
+            out_path.to_string_lossy().into_owned(),
+            input.to_string_lossy().into_owned(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: DEFAULT_CONVERT_TIMEOUT,
+    };
+
+    match runner.run(cmd, cancel).await {
+        Ok(_) => Ok(()),
+        Err(ToolRunnerError::Cancelled { .. }) => Err(ConvertError::Realize("cancelled".to_string())),
+        Err(err) => Err(ConvertError::Tool(err)),
+    }
+}
+
+async fn validate_realized_segment(
+    out_path: &Path,
+    expected_samples: u64,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), ConvertError> {
+    let metadata = fs::metadata(out_path).map_err(|err| {
+        ConvertError::TrackValidation(format!(
+            "realized image segment missing: {} ({err})",
+            out_path.display()
+        ))
+    })?;
+    if metadata.len() == 0 {
+        return Err(ConvertError::TrackValidation(format!(
+            "realized image segment is empty: {}",
+            out_path.display()
+        )));
+    }
+
+    let probe = probe_realized_segment(out_path, runner, cancel).await?;
+    let actual_samples = probe.samples.ok_or_else(|| {
+        ConvertError::TrackValidation(format!(
+            "could not measure realized segment samples: {}",
+            out_path.display()
+        ))
+    })?;
+    let delta = actual_samples.abs_diff(expected_samples);
+    let allowed = if probe.exact { 0 } else { (probe.sample_rate / 75).max(1) as u64 };
+    if delta > allowed {
+        return Err(ConvertError::TrackValidation(format!(
+            "realized segment sample drift: expected {expected_samples}, got {actual_samples}, allowed {allowed}"
+        )));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealizedProbe {
+    sample_rate: u32,
+    samples: Option<u64>,
+    exact: bool,
+}
+
+async fn probe_realized_segment(
+    path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<RealizedProbe, ConvertError> {
+    let cmd = ToolCommand {
+        binary: ToolBinary::Ffprobe,
+        args: vec![
+            "-v".into(),
+            "error".into(),
+            "-select_streams".into(),
+            "a:0".into(),
+            "-show_entries".into(),
+            "stream=sample_rate,duration_ts,time_base,duration".into(),
+            "-show_entries".into(),
+            "format=duration".into(),
+            "-of".into(),
+            "json".into(),
+            path.to_string_lossy().into_owned(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(30),
+    };
+
+    let output = match runner.run(cmd, cancel).await {
+        Ok(output) => output,
+        Err(ToolRunnerError::Cancelled { .. }) => return Err(ConvertError::Realize("cancelled".to_string())),
+        Err(err) => return Err(ConvertError::Tool(err)),
+    };
+    parse_realized_probe_json(&output.stdout_tail)
+}
+
+fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|err| ConvertError::TrackValidation(format!("ffprobe JSON parse failed: {err}")))?;
+    let stream = value
+        .pointer("/streams/0")
+        .ok_or_else(|| ConvertError::TrackValidation("ffprobe returned no audio stream".to_string()))?;
+    let sample_rate = stream
+        .get("sample_rate")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    if sample_rate == 0 {
+        return Err(ConvertError::TrackValidation(
+            "ffprobe returned no valid sample_rate".to_string(),
+        ));
+    }
+
+    if let Some(samples) = samples_from_stream_duration_ts(stream, sample_rate) {
+        return Ok(RealizedProbe { sample_rate, samples: Some(samples), exact: true });
+    }
+
+    let duration_secs = stream
+        .get("duration")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<f64>().ok())
+        .or_else(|| {
+            value
+                .pointer("/format/duration")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<f64>().ok())
+        });
+    let samples = duration_secs.map(|duration| (duration * f64::from(sample_rate)).round() as u64);
+    Ok(RealizedProbe { sample_rate, samples, exact: false })
+}
+
+fn samples_from_stream_duration_ts(stream: &serde_json::Value, sample_rate: u32) -> Option<u64> {
+    let duration_ts = stream.get("duration_ts").and_then(json_u64)?;
+    let time_base = stream.get("time_base")?.as_str()?;
+    let (num, den) = time_base.split_once('/')?;
+    let num = num.parse::<u64>().ok()?;
+    let den = den.parse::<u64>().ok()?;
+    if den == 0 {
+        return None;
+    }
+    let samples = (duration_ts as u128)
+        .checked_mul(num as u128)?
+        .checked_mul(sample_rate as u128)?
+        .checked_div(den as u128)?;
+    u64::try_from(samples).ok()
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn has_path_extension(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case(ext))
+        .unwrap_or(false)
+}
+
 
 // ===========================================================================
 // Output planning  (PR 4 body)
@@ -681,6 +1083,34 @@ pub async fn apply_metadata(
     Ok(StageRecord { stage: PipelineStage::Metadata, outcome: StageOutcome::Ok })
 }
 
+fn push_tag_value(tags: &mut Vec<(String, String)>, key: &str, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    if tags.iter().any(|(existing, _)| existing == key) {
+        return;
+    }
+    tags.push((key.to_string(), value.to_string()));
+}
+
+fn cue_extra_tag_key(scope: &str, key: &str) -> String {
+    let mut suffix = String::new();
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() {
+            suffix.push(ch.to_ascii_uppercase());
+        } else if !suffix.ends_with('_') {
+            suffix.push('_');
+        }
+    }
+    let suffix = suffix.trim_matches('_');
+    if suffix.is_empty() {
+        format!("TONEPOET_{scope}_EXTRA")
+    } else {
+        format!("TONEPOET_{scope}_{suffix}")
+    }
+}
+
 async fn tag_audio_file(
     path: &Path,
     meta: &TrackMetadata,
@@ -691,15 +1121,40 @@ async fn tag_audio_file(
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
     let mut tags: Vec<(String, String)> = Vec::new();
-    if let Some(ref v) = meta.title { tags.push(("TITLE".into(), v.clone())); }
-    if let Some(ref v) = meta.artist { tags.push(("ARTIST".into(), v.clone())); }
-    if let Some(ref v) = meta.album_artist { tags.push(("ALBUMARTIST".into(), v.clone())); }
-    if let Some(ref v) = album.album { tags.push(("ALBUM".into(), v.clone())); }
-    if let Some(ref v) = meta.genre { tags.push(("GENRE".into(), v.clone())); }
-    if let Some(ref v) = meta.date { tags.push(("DATE".into(), v.clone())); }
-    if let Some(n) = meta.track_number { tags.push(("TRACKNUMBER".into(), n.to_string())); }
-    if let Some(n) = meta.disc_number { tags.push(("DISCNUMBER".into(), n.to_string())); }
-    if let Some(ref v) = meta.comment { tags.push(("COMMENT".into(), v.clone())); }
+    if let Some(ref v) = meta.title { push_tag_value(&mut tags, "TITLE", v); }
+    if let Some(ref v) = meta.artist { push_tag_value(&mut tags, "ARTIST", v); }
+    if let Some(ref v) = meta.album_artist { push_tag_value(&mut tags, "ALBUMARTIST", v); }
+    if let Some(ref v) = album.album { push_tag_value(&mut tags, "ALBUM", v); }
+    if let Some(ref v) = meta.genre { push_tag_value(&mut tags, "GENRE", v); }
+    if let Some(ref v) = meta.date { push_tag_value(&mut tags, "DATE", v); }
+    if let Some(n) = meta.track_number { push_tag_value(&mut tags, "TRACKNUMBER", &n.to_string()); }
+    if let Some(n) = meta.disc_number { push_tag_value(&mut tags, "DISCNUMBER", &n.to_string()); }
+    if let Some(ref v) = meta.comment { push_tag_value(&mut tags, "COMMENT", v); }
+
+    // PR 8 CUE-specific metadata. The materializer preserves these fields in
+    // TrackMetadata/AlbumMetadata, and the metadata stage writes them through
+    // so published split files remain self-describing.
+    if let Some(ref v) = meta.composer { push_tag_value(&mut tags, "COMPOSER", v); }
+    if let Some(ref v) = meta.performer { push_tag_value(&mut tags, "PERFORMER", v); }
+    if let Some(ref v) = meta.isrc { push_tag_value(&mut tags, "ISRC", v); }
+    if let Some(ref v) = meta.publisher { push_tag_value(&mut tags, "PUBLISHER", v); }
+    if let Some(ref v) = meta.copyright { push_tag_value(&mut tags, "COPYRIGHT", v); }
+    if meta.pre_emphasis {
+        push_tag_value(&mut tags, "PRE_EMPHASIS", "1");
+        push_tag_value(&mut tags, "CUE_FLAGS", "PRE");
+    }
+    if album.total_tracks > 0 { push_tag_value(&mut tags, "TOTALTRACKS", &album.total_tracks.to_string()); }
+    if let Some(n) = album.total_discs { push_tag_value(&mut tags, "TOTALDISCS", &n.to_string()); }
+    if let Some(n) = album.disc_number { push_tag_value(&mut tags, "DISCNUMBER", &n.to_string()); }
+    if let Some(v) = album.extra.get("catalog") { push_tag_value(&mut tags, "CATALOG", v); }
+    for (key, value) in &album.extra {
+        let tag_key = cue_extra_tag_key("ALBUM", key);
+        push_tag_value(&mut tags, &tag_key, value);
+    }
+    for (key, value) in &meta.extra {
+        let tag_key = cue_extra_tag_key("TRACK", key);
+        push_tag_value(&mut tags, &tag_key, value);
+    }
 
     if tags.is_empty() { return Ok(()); }
 

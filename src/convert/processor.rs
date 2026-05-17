@@ -1164,6 +1164,176 @@ fn can_use_copy_mode(item: &ConversionItem) -> bool {
     true
 }
 
+
+fn cue_capable_input_path(path: &Path) -> bool {
+    const AUDIO_IMAGE_EXTENSIONS: &[&str] = &[
+        "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4",
+        "aac", "opus", "ogg", "ape", "w64", "rf64",
+    ];
+
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| {
+            let ext = ext.to_ascii_lowercase();
+            ext == "cue" || AUDIO_IMAGE_EXTENSIONS.contains(&ext.as_str())
+        })
+        .unwrap_or(false)
+}
+
+fn pipeline_request_for_cue_item(
+    item: &ConversionItem,
+    fallback_cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) -> crate::convert::pipeline::PipelineRequest {
+    if let Some(req) = &item.pipeline_request {
+        return req.clone();
+    }
+
+    use crate::convert::pipeline::{
+        CueSidecarPolicy, DitherPolicy, EncodeBackend, EncodeOptions, FailurePolicy, LogPolicy,
+        NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PublishPolicy,
+        SourceOptions, StagePolicy, StageRequirement, TrackSelection,
+    };
+
+    let output_root = item.options.output_dir.clone().unwrap_or_else(|| {
+        item.input_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    });
+
+    PipelineRequest {
+        job_id: format!("job-{}", item.id),
+        item_id: item.id.clone(),
+        container: item.input_path.clone(),
+        source: SourceOptions {
+            archive_password: None,
+            sacd_area: None,
+            cue_sidecar: match fallback_cue_policy {
+                CueSidecarPolicy::PreferSidecar => CueSidecarPolicy::PreferSidecar,
+                CueSidecarPolicy::SidecarOnly => CueSidecarPolicy::SidecarOnly,
+                CueSidecarPolicy::EmbeddedOnly => CueSidecarPolicy::EmbeddedOnly,
+                CueSidecarPolicy::IgnoreCue => CueSidecarPolicy::IgnoreCue,
+            },
+            track_selection: TrackSelection::All,
+        },
+        target_format: item.output_format,
+        encode: EncodeOptions {
+            backend: EncodeBackend::Auto,
+            bitrate: match &item.options.quality {
+                crate::convert::formats::QualitySettings::Opus { bitrate, .. } => Some(*bitrate),
+                crate::convert::formats::QualitySettings::Aac { bitrate, .. } => Some(*bitrate),
+                crate::convert::formats::QualitySettings::Mp3 { bitrate_mode, .. } => match bitrate_mode {
+                    crate::convert::formats::Mp3BitrateMode::Cbr { bitrate } => Some(*bitrate),
+                    crate::convert::formats::Mp3BitrateMode::Vbr { quality } => Some(*quality as u32),
+                    crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
+                },
+                _ => None,
+            },
+            compression_level: match &item.options.quality {
+                crate::convert::formats::QualitySettings::Flac { compression_level } => {
+                    Some(*compression_level)
+                }
+                _ => None,
+            },
+            dither: DitherPolicy::Auto,
+        },
+        merge: item.options.merge_to_single,
+        output_root: output_root.clone(),
+        naming: NamingPolicy {
+            template: "%NN% - %TITLE%".to_string(),
+            per_album_subdir: true,
+            collision_policy: NamingCollisionPolicy::Fail,
+        },
+        publish: PublishPolicy {
+            overwrite: OverwritePolicy::FailIfExists,
+            same_filesystem_required: false,
+        },
+        log: LogPolicy {
+            root: output_root.join(".tonepoet-logs"),
+            write_for_blocked: true,
+        },
+        stages: StagePolicy {
+            metadata: StageRequirement::Enabled,
+            replaygain: if item.options.calculate_replaygain {
+                StageRequirement::Enabled
+            } else {
+                StageRequirement::Disabled
+            },
+            features: StageRequirement::Enabled,
+        },
+        failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+    }
+}
+
+fn cue_pipeline_policy_for_item(
+    item: &ConversionItem,
+) -> Result<Option<crate::convert::pipeline::CueSidecarPolicy>, crate::convert::pipeline::SourceDetectError> {
+    use crate::convert::pipeline::{detect_source_kind, CueSidecarPolicy, SourceKind};
+
+    if matches!(item.input_format, crate::convert::FileFormat::SevenZip) {
+        return Ok(None);
+    }
+
+    let candidate_req = if let Some(req) = &item.pipeline_request {
+        req.clone()
+    } else if cue_capable_input_path(&item.input_path) {
+        pipeline_request_for_cue_item(item, CueSidecarPolicy::PreferSidecar)
+    } else {
+        return Ok(None);
+    };
+
+    match candidate_req.source.cue_sidecar {
+        CueSidecarPolicy::IgnoreCue => Ok(None),
+        CueSidecarPolicy::SidecarOnly | CueSidecarPolicy::EmbeddedOnly => {
+            Ok(Some(candidate_req.source.cue_sidecar))
+        }
+        CueSidecarPolicy::PreferSidecar => match detect_source_kind(&candidate_req) {
+            Ok(SourceKind::CueImage) => Ok(Some(CueSidecarPolicy::PreferSidecar)),
+            Ok(_) | Err(crate::convert::pipeline::SourceDetectError::UnknownSource) => Ok(None),
+            Err(err) => Err(err),
+        },
+    }
+}
+
+async fn run_cue_pipeline_conversion_item(
+    item: &ConversionItem,
+    progress_tx: broadcast::Sender<ProgressUpdate>,
+    tool_paths: HashMap<String, PathBuf>,
+    fallback_cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) -> ConversionResult<(String, ConversionStatus)> {
+    use crate::convert::pipeline::{map_album_outcome, RealToolRunner, RecordingReporter, run_pipeline_item};
+
+    let pipeline_req = pipeline_request_for_cue_item(item, fallback_cue_policy);
+    let runner = RealToolRunner::new(tool_paths);
+    let reporter = RecordingReporter::new();
+    let cancel = CancellationToken::new();
+    let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
+
+    let status = map_album_outcome(
+        &report.outcome,
+        report.published.as_ref(),
+        report.durable_log.as_deref(),
+    );
+
+    let _ = progress_tx.send(ProgressUpdate {
+        item_id: item.id.clone(),
+        progress: 100.0,
+        status: status.clone(),
+    });
+
+    if let ConversionStatus::Failed { error, .. } = &status {
+        return Ok((
+            item.id.clone(),
+            ConversionStatus::Failed {
+                error: error.clone(),
+                log_path: report.durable_log,
+            },
+        ));
+    }
+
+    Ok((item.id.clone(), status))
+}
+
 /// Process a single conversion item
 pub async fn process_item(
     mut item: ConversionItem,
@@ -1226,6 +1396,32 @@ pub async fn process_item(
         },
     });
     
+    // Route single-image CUE albums through the staged pipeline before the
+    // legacy one-file audio path. Explicit SidecarOnly and EmbeddedOnly
+    // requests route here so missing CUE inputs fail in materialization;
+    // IgnoreCue is the only policy that intentionally stays legacy.
+    match cue_pipeline_policy_for_item(&item) {
+        Ok(Some(policy)) => {
+            return run_cue_pipeline_conversion_item(
+                &item,
+                progress_tx.clone(),
+                tool_paths.clone(),
+                policy,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Ok((
+                item.id.clone(),
+                ConversionStatus::Failed {
+                    error: format!("CUE source detection failed: {err}"),
+                    log_path: None,
+                },
+            ));
+        }
+    }
+
     // Perform conversion based on format
     match &item.input_format {
         crate::convert::FileFormat::SevenZip => {
