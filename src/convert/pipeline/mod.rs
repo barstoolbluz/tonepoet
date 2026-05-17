@@ -3094,11 +3094,12 @@ FILE "{image_name}" WAVE
             crate::tui::sacd::SACD_SAMPLE_RATE_HZ,
             37_632,
         ));
+        // Sample count beyond 1-TOC-frame tolerance (37_632) must be rejected.
         assert!(!stages::sacd_stage_test_support::dsf_ready_for_test(
             &valid,
             2,
             crate::tui::sacd::SACD_SAMPLE_RATE_HZ,
-            75_264,
+            37_632 + 37_632 + 1, // > 1 frame beyond actual
         ));
     }
 

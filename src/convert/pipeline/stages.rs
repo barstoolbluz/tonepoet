@@ -863,17 +863,25 @@ fn validate_sacd_realization(
         }
     }
 
+    // Duration sanity check: compare extracted byte-derived sample count
+    // against TOC-derived expectation with ±1 TOC frame tolerance.
     let stats_sample_count = stats
         .audio_bytes
         .checked_div(u64::from(area_info.header.channel_count))
         .unwrap_or(0)
         .saturating_mul(8);
-    if expectation.sample_count != 0 && stats_sample_count != expectation.sample_count {
-        return Err(ConvertError::TrackValidation(format!(
-            "SACD DSF sample-count mismatch: expected {}, got {} from extracted bytes",
-            expectation.sample_count,
-            stats_sample_count
-        )));
+    if expectation.sample_count != 0 {
+        let one_toc_frame_samples = u64::from(SACD_SAMPLE_RATE_HZ / 75);
+        let delta = stats_sample_count.abs_diff(expectation.sample_count);
+        if delta > one_toc_frame_samples {
+            return Err(ConvertError::TrackValidation(format!(
+                "SACD DSF sample-count mismatch: expected ~{}, got {}, delta {} exceeds 1-frame tolerance {}",
+                expectation.sample_count,
+                stats_sample_count,
+                delta,
+                one_toc_frame_samples,
+            )));
+        }
     }
 
     Ok(())
@@ -963,13 +971,23 @@ fn validate_dsf_container(
                 path.display()
             )));
         }
-        if expectation.sample_count != 0 && parsed.sample_count != expectation.sample_count {
-            return Err(ConvertError::TrackValidation(format!(
-                "DSF sample count mismatch: expected {}, got {} for {}",
-                expectation.sample_count,
-                parsed.sample_count,
-                path.display()
-            )));
+        // SACD TOC PlayTime has 75 fps granularity. DSF sample counts
+        // are derived from realized sector/frame extraction and can
+        // differ by one TOC frame. Treat PlayTime-derived samples as
+        // a duration sanity check, not an exact sample-count invariant.
+        if expectation.sample_count != 0 {
+            let one_toc_frame_samples = u64::from(expectation.sample_frequency / 75);
+            let delta = parsed.sample_count.abs_diff(expectation.sample_count);
+            if delta > one_toc_frame_samples {
+                return Err(ConvertError::TrackValidation(format!(
+                    "DSF sample count mismatch: expected ~{}, got {}, delta {} exceeds 1-frame tolerance {} for {}",
+                    expectation.sample_count,
+                    parsed.sample_count,
+                    delta,
+                    one_toc_frame_samples,
+                    path.display()
+                )));
+            }
         }
     }
 
