@@ -2041,6 +2041,7 @@ pub async fn run_pipeline_item(
     let mut plan = None;
     let mut artifacts = None;
     let mut published = None;
+    #[allow(unused_assignments)]
     let mut tracks = Vec::new();
     let mut stages = Vec::new();
 
