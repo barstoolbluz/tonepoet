@@ -81,8 +81,10 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
             album_title,
             album_artist,
             scroll,
+            cursor,
+            selected,
             ..
-        } => render_multi_track(border_color, w, path, tracks, area_label.as_deref(), album_title.as_deref(), album_artist.as_deref(), *scroll),
+        } => render_multi_track(border_color, w, path, tracks, area_label.as_deref(), album_title.as_deref(), album_artist.as_deref(), *scroll, *cursor, selected),
         SourceMode::Batch {
             paths,
             cursor,
@@ -444,6 +446,8 @@ fn render_multi_track<'a>(
     album_title: Option<&str>,
     album_artist: Option<&str>,
     scroll: usize,
+    cursor: usize,
+    selected: &[bool],
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -490,24 +494,33 @@ fn render_multi_track<'a>(
         )],
     ));
 
-    // Track listing (scrollable)
+    // Track listing (scrollable) with selection checkboxes
     let max_visible = 6_usize;
     let end = tracks.len().min(scroll + max_visible);
-    let visible = &tracks[scroll..end];
-    for t in visible {
+    for idx in scroll..end {
+        let t = &tracks[idx];
+        let checked = selected.get(idx).copied().unwrap_or(true);
+        let check = if checked { "[x]" } else { "[ ]" };
         let title_str = t.title.as_deref().unwrap_or("—");
         let dur_str = t.duration_display.as_deref().unwrap_or("");
         let line_text = if dur_str.is_empty() {
-            format!("   {:2}. {}", t.number, title_str)
+            format!("   {} {:2}. {}", check, t.number, title_str)
         } else {
-            format!("   {:2}. {} [{}]", t.number, title_str, dur_str)
+            format!("   {} {:2}. {} [{}]", check, t.number, title_str, dur_str)
+        };
+        let fg = if idx == cursor {
+            Color::Cyan
+        } else if checked {
+            Color::White
+        } else {
+            Color::DarkGray
         };
         lines.push(bordered_line(
             border_color,
             w,
             vec![Span::styled(
                 truncate_to(&line_text, w.saturating_sub(4)),
-                Style::default().fg(Color::White),
+                Style::default().fg(fg),
             )],
         ));
     }

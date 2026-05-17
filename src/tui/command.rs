@@ -3437,6 +3437,14 @@ fn execute_commit(
         return;
     }
 
+    // Block commit when all tracks are deselected.
+    if let SourceMode::MultiTrack { selected, .. } = &app.convert.source.mode {
+        if selected.iter().all(|s| !s) {
+            app.set_status("no tracks selected");
+            return;
+        }
+    }
+
     // Build options from the current pill state.
     let options = super::convert_actions::pills_to_options(
         &app.convert.format,
@@ -3462,6 +3470,83 @@ fn execute_commit(
             ));
         }
         return;
+    }
+
+    // For MultiTrack sources with deselected tracks, attach a PipelineRequest
+    // with TrackSelection::Set to the just-enqueued item.
+    if let SourceMode::MultiTrack { tracks, selected, path, .. } = &app.convert.source.mode {
+        let has_deselected = selected.iter().any(|s| !s);
+        if has_deselected {
+            use std::collections::BTreeSet;
+            let selected_numbers: BTreeSet<u32> = tracks
+                .iter()
+                .zip(selected.iter())
+                .filter(|(_, &sel)| sel)
+                .map(|(t, _)| t.number)
+                .collect();
+
+            if !selected_numbers.is_empty() {
+                // Build a minimal PipelineRequest with the track selection.
+                use crate::convert::pipeline::*;
+                let output_root = options.output_dir.clone()
+                    .unwrap_or_else(|| path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+                let rg_enabled = options.calculate_replaygain;
+
+                let req = PipelineRequest {
+                    job_id: String::new(),
+                    item_id: String::new(),
+                    container: path.clone(),
+                    source: SourceOptions {
+                        archive_password: None,
+                        sacd_area: None,
+                        cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                        track_selection: TrackSelection::Set(selected_numbers),
+                    },
+                    target_format: options.output_format,
+                    encode: EncodeOptions {
+                        backend: EncodeBackend::Auto,
+                        bitrate: None,
+                        compression_level: None,
+                        dither: DitherPolicy::Auto,
+                    },
+                    merge: options.merge_to_single,
+                    output_root: output_root.clone(),
+                    naming: NamingPolicy {
+                        template: "%NN% - %TITLE%".to_string(),
+                        per_album_subdir: true,
+                        collision_policy: NamingCollisionPolicy::Fail,
+                    },
+                    publish: PublishPolicy {
+                        overwrite: OverwritePolicy::FailIfExists,
+                        same_filesystem_required: false,
+                    },
+                    log: LogPolicy {
+                        root: output_root.join(".tonepoet-logs"),
+                        write_for_blocked: true,
+                    },
+                    stages: StagePolicy {
+                        metadata: StageRequirement::Enabled,
+                        replaygain: if rg_enabled { StageRequirement::Enabled } else { StageRequirement::Disabled },
+                        features: StageRequirement::Enabled,
+                    },
+                    failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+                };
+
+                if let Ok(mut q) = app.manager.queue.try_write() {
+                    for item in q.all_items_mut() {
+                        if item.input_path == *path && item.pipeline_request.is_none() {
+                            let mut item_req = req.clone();
+                            item_req.item_id = item.id.clone();
+                            item_req.job_id = format!("job-{}", item.id);
+                            if let Some(ref pw) = item.archive_password {
+                                item_req.source.archive_password = Some(SecretString::new(pw.clone()));
+                            }
+                            item.pipeline_request = Some(item_req);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Build the success status message.

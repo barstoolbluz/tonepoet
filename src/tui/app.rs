@@ -195,6 +195,10 @@ pub enum SourceMode {
         album_title: Option<String>,
         album_artist: Option<String>,
         scroll: usize,
+        /// Cursor position in the track list (0-based).
+        cursor: usize,
+        /// Per-track selection (all true initially).
+        selected: Vec<bool>,
     },
     /// A multi-file batch loaded for review. The cursor indexes into
     /// `paths` for the "currently previewed" file, whose probe result
@@ -348,6 +352,7 @@ impl SourceMode {
                     if meta.album.is_none() { meta.album = album_title.clone(); }
                     if meta.artist.is_none() { meta.artist = album_artist.clone(); }
 
+                    let track_count = tracks.len();
                     return Self::MultiTrack {
                         path,
                         info,
@@ -357,6 +362,8 @@ impl SourceMode {
                         album_title,
                         album_artist,
                         scroll: 0,
+                        cursor: 0,
+                        selected: vec![true; track_count],
                     };
                 }
             }
@@ -381,6 +388,7 @@ impl SourceMode {
                     if meta.album.is_none() { meta.album = sheet.title.clone(); }
                     if meta.artist.is_none() { meta.artist = sheet.performer.clone(); }
 
+                    let track_count = tracks.len();
                     return Self::MultiTrack {
                         path,
                         info,
@@ -390,6 +398,8 @@ impl SourceMode {
                         album_title: sheet.title,
                         album_artist: sheet.performer,
                         scroll: 0,
+                        cursor: 0,
+                        selected: vec![true; track_count],
                     };
                 }
             }

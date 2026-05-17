@@ -241,6 +241,45 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
             app.convert.focus = app.convert.focus.prev();
         }
 
+        // Within Source pane + MultiTrack: Up/Down moves track cursor, Space toggles selection
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Source
+            && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+        {
+            if let SourceMode::MultiTrack { cursor, scroll, .. } = &mut app.convert.source.mode {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                    if *cursor < *scroll {
+                        *scroll = *cursor;
+                    }
+                }
+            }
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Source
+            && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+        {
+            if let SourceMode::MultiTrack { cursor, scroll, tracks, .. } = &mut app.convert.source.mode {
+                if *cursor + 1 < tracks.len() {
+                    *cursor += 1;
+                    // Keep cursor visible (max_visible = 6 in render)
+                    if *cursor >= *scroll + 6 {
+                        *scroll = cursor.saturating_sub(5);
+                    }
+                }
+            }
+        }
+        (KeyCode::Char(' '), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Source
+            && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+        {
+            if let SourceMode::MultiTrack { cursor, selected, .. } = &mut app.convert.source.mode {
+                if let Some(sel) = selected.get_mut(*cursor) {
+                    *sel = !*sel;
+                }
+            }
+        }
+
         // Within Format pane: Up/Down moves between pill rows
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
             app.convert.format.field_focus = app.convert.format.field_focus.prev();
