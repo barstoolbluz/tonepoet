@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::convert::{ConversionItem, ConversionPhase, ConversionStatus};
-use super::app::{AppState, QueueFocus};
+use super::app::AppState;
 use super::button_map::TuiButton;
 
 /// Draw the queue content area (item list + action bar)
@@ -238,35 +238,35 @@ fn phase_color(phase: Option<&ConversionPhase>) -> Color {
 
 /// Draw the action bar at the bottom of the queue screen
 fn draw_action_bar(f: &mut Frame, area: Rect, app: &mut AppState) {
-    let buttons: Vec<(&str, TuiButton, Color)> = vec![
-        ("Add Files[a]", TuiButton::AddFiles, Color::Blue),
-        ("Add Folder[f]", TuiButton::AddFolder, Color::Blue),
-        ("Configure[c]", TuiButton::Configure, Color::Magenta),
-        ("Convert[s]", TuiButton::Convert, Color::Green),
-        ("Pause[p]", TuiButton::Pause, Color::Yellow),
-        ("Stop[x]", TuiButton::Stop, Color::Red),
-        ("Clear Done[C-l]", TuiButton::ClearCompleted, Color::DarkGray),
-        ("Retry[C-r]", TuiButton::RetryFailed, Color::Cyan),
-    ];
+    use super::draw_overlays::{footer_pill_pub, pill_gap_pub};
+    use super::theme;
 
-    let is_action_focus = app.queue_focus == QueueFocus::ActionBar;
+    let pills: Vec<(&str, TuiButton, Color)> = vec![
+        ("a add files", TuiButton::AddFiles, theme::BLUE),
+        ("f add folder", TuiButton::AddFolder, theme::BLUE),
+        ("c configure", TuiButton::Configure, theme::PURPLE),
+        ("s start", TuiButton::Convert, theme::GREEN),
+        ("p pause", TuiButton::Pause, theme::AMBER),
+        ("x stop", TuiButton::Stop, theme::RED),
+        ("r retry", TuiButton::RetryFailed, theme::CYAN),
+        ("C-l clear done", TuiButton::ClearFinished, theme::PURPLE),
+        ("clear all", TuiButton::ClearAll, theme::RED),
+    ];
 
     let mut spans: Vec<Span> = Vec::new();
     let mut x = area.x;
 
-    for (label, btn, color) in &buttons {
-        let style = if is_action_focus {
-            Style::default().fg(*color).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(*color)
-        };
-        let btn_text = format!(" [{}] ", label);
-        let btn_width = btn_text.len() as u16;
-
-        spans.push(Span::styled(btn_text, style));
-
-        app.button_map.record_button(*btn, Rect::new(x, area.y, btn_width, 1));
-        x += btn_width;
+    for (i, (label, btn, color)) in pills.iter().enumerate() {
+        if i > 0 {
+            let gap = pill_gap_pub();
+            x += 1; // gap is 1 char
+            spans.push(gap);
+        }
+        let pill = footer_pill_pub(label, *color);
+        let pill_width = (label.len() + 2) as u16; // " label " padding
+        app.button_map.record_button(*btn, Rect::new(x, area.y, pill_width, 1));
+        x += pill_width;
+        spans.push(pill);
     }
 
     let bar = Paragraph::new(Line::from(spans));

@@ -1610,6 +1610,8 @@ pub enum ConfirmAction {
     GnudbBack(Box<GnudbReviewState>),
     RemoveSelected,
     ClearCompleted,
+    ClearFinished,
+    ClearAll,
     StopAll,
     ClearQueue,
     /// Move the given paths to the system trash (XDG Trash / Finder Trash).

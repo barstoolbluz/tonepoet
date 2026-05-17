@@ -381,14 +381,27 @@ impl ConversionQueue {
         self.items.len() + (if self.current.is_some() { 1 } else { 0 })
     }
 
-    /// Clear completed items
+    /// Clear completed items only
     pub fn clear_completed(&mut self) {
-        // Remove items that match Completed status (keep Failed and Cancelled)
-        // Items can be in either the main items vector or the completed vector
         self.items.retain(|item| !matches!(item.status, ConversionStatus::Completed { .. }));
         self.completed.retain(|item| !matches!(item.status, ConversionStatus::Completed { .. }));
     }
-    
+
+    /// Clear all terminal items (Completed, Failed, Partial, Cancelled)
+    pub fn clear_finished(&mut self) {
+        let is_terminal = |item: &ConversionItem| {
+            matches!(
+                item.status,
+                ConversionStatus::Completed { .. }
+                | ConversionStatus::Partial { .. }
+                | ConversionStatus::Failed { .. }
+                | ConversionStatus::Cancelled
+            )
+        };
+        self.items.retain(|item| !is_terminal(item));
+        self.completed.retain(|item| !is_terminal(item));
+    }
+
     /// Clear all items from the queue
     pub fn clear(&mut self) {
         self.items.clear();

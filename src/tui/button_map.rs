@@ -70,6 +70,8 @@ pub enum TuiButton {
     Pause,
     Stop,
     ClearCompleted,
+    ClearFinished,
+    ClearAll,
     RetryFailed,
 
     // Queue items
@@ -182,6 +184,8 @@ impl TuiButton {
             | Self::Pause
             | Self::Stop
             | Self::ClearCompleted
+            | Self::ClearFinished
+            | Self::ClearAll
             | Self::RetryFailed
             | Self::QueueItem(_) => Some(AppScreen::Queue),
             Self::BrowseEntry(_)

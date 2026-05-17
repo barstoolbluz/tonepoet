@@ -1247,13 +1247,18 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
 
         // Clear completed
         (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
-            let completed_count = app.items_snapshot.iter()
-                .filter(|i| matches!(i.status, ConversionStatus::Completed { .. }))
+            let finished_count = app.items_snapshot.iter()
+                .filter(|i| matches!(i.status,
+                    ConversionStatus::Completed { .. }
+                    | ConversionStatus::Partial { .. }
+                    | ConversionStatus::Failed { .. }
+                    | ConversionStatus::Cancelled
+                ))
                 .count();
-            if completed_count > 0 {
-                app.manager.clear_completed();
+            if finished_count > 0 {
+                app.manager.clear_finished();
                 app.save_queue();
-                app.set_status(format!("Cleared {} completed items", completed_count));
+                app.set_status(format!("Cleared {} finished items", finished_count));
             }
         }
 
@@ -8222,6 +8227,16 @@ fn execute_confirm_action(
             app.save_queue();
             app.set_status("Cleared completed items");
         }
+        ConfirmAction::ClearFinished => {
+            app.manager.clear_finished();
+            app.save_queue();
+            app.set_status("Cleared all finished items");
+        }
+        ConfirmAction::ClearAll => {
+            app.manager.clear_all();
+            app.save_queue();
+            app.set_status("Cleared all items");
+        }
         ConfirmAction::StopAll => {
             app.manager.stop_all_conversions();
             app.processing_active = false;
@@ -8896,6 +8911,17 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.manager.clear_completed();
                 app.save_queue();
                 app.set_status("Cleared completed items");
+            }
+            TuiButton::ClearFinished => {
+                app.manager.clear_finished();
+                app.save_queue();
+                app.set_status("Cleared all finished items");
+            }
+            TuiButton::ClearAll => {
+                app.active_overlay = ActiveOverlay::Confirmation {
+                    message: "Clear all items from the queue?".to_string(),
+                    action: ConfirmAction::ClearAll,
+                };
             }
             TuiButton::RetryFailed => {
                 retry_failed(app);

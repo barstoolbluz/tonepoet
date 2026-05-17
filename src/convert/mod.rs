@@ -412,6 +412,18 @@ impl ConversionManager {
         }
     }
 
+    pub fn clear_finished(&mut self) {
+        if let Ok(mut queue) = self.queue.try_write() {
+            queue.clear_finished();
+        }
+    }
+
+    pub fn clear_all(&mut self) {
+        if let Ok(mut queue) = self.queue.try_write() {
+            queue.clear();
+        }
+    }
+
     /// Get path to persisted conversion queue file
     fn queue_path() -> PathBuf {
         dirs::cache_dir()
