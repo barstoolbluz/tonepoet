@@ -8,7 +8,7 @@
 //! `map_album_outcome` are real implementations in PR 1 — they are
 //! pure logic and are exercised by PR 1's exit-condition tests.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
@@ -19,18 +19,24 @@ use tokio_util::sync::CancellationToken;
 
 use super::errors::{
     ConvertError, FeatureError, LogError, MaterializeError, MergeError, MetadataError, PlanError,
-    PublishError, ReplayGainError, RequestValidationError, SourceDetectError,
-    SourceDispatchError, ToolRunnerError,
+    PublishError, ReplayGainError, RequestValidationError, SourceDetectError, SourceDispatchError,
+    ToolRunnerError,
 };
 use super::materializer_7z::SevenZipMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
-use super::progress::OperationProgressTracker;
+use super::progress::{
+    heartbeat, probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker,
+    StreamSource, StreamingHeartbeat,
+};
 use super::reporter::{PipelineEvent, PipelineReporter};
-use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolRunner};
+use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
 use super::types::*;
 use crate::convert::{AudioFormat, ConversionStatus};
-use crate::tui::sacd::{parse_sacd_iso, AreaInfo, PlayTime, SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE, SACD_SAMPLE_RATE_HZ};
+use crate::tui::sacd::{
+    parse_sacd_iso, AreaInfo, PlayTime, SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE,
+    SACD_SAMPLE_RATE_HZ,
+};
 use sacd_rs::extract::{extract_track, ExtractOptions, ExtractStats, OutputFormat};
 use sacd_rs::iso_reader::IsoReader;
 use tonepoet_backend::{
@@ -54,6 +60,8 @@ pub trait Materializer: Send + Sync {
         req: &PipelineRequest,
         staging: &StagingDir,
         runner: &dyn ToolRunner,
+        reporter: Option<&dyn PipelineReporter>,
+        tool_paths: &HashMap<String, PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<PreparedSource, MaterializeError>;
 }
@@ -153,9 +161,7 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
 }
 
 /// Dispatch a supported source kind to its materializer.
-pub fn materializer_for(
-    kind: SourceKind,
-) -> Result<Box<dyn Materializer>, SourceDispatchError> {
+pub fn materializer_for(kind: SourceKind) -> Result<Box<dyn Materializer>, SourceDispatchError> {
     match kind {
         SourceKind::SevenZip => Ok(Box::new(SevenZipMaterializer)),
         SourceKind::CueImage => Ok(Box::new(CueImageMaterializer)),
@@ -175,6 +181,7 @@ pub async fn realize_track(
     staging: &StagingDir,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
 ) -> Result<PathBuf, ConvertError> {
     if cancel.is_cancelled() {
         return Err(ConvertError::Realize("cancelled".to_string()));
@@ -201,24 +208,14 @@ pub async fn realize_track(
             start_sample,
             samples,
         } => {
-            realize_image_segment(
-                image,
-                *start_sample,
-                *samples,
-                req,
-                staging,
-                runner,
-                cancel,
-            )
-            .await
+            realize_image_segment(image, *start_sample, *samples, req, staging, runner, cancel)
+                .await
         }
         TrackSourceRef::SacdTrack {
             iso,
             track_index,
             area,
-        } => {
-            realize_sacd_track(iso, *track_index, *area, staging, cancel).await
-        }
+        } => realize_sacd_track(iso, *track_index, *area, staging, cancel, progress_tracker).await,
     }
 }
 
@@ -276,7 +273,8 @@ async fn realize_image_segment(
     let out_path = realized_dir.join(cue_segment_output_name(image, start_sample, samples));
     let _ = fs::remove_file(&out_path);
 
-    let direct = cut_segment_with_ffmpeg(image, start_sample, samples, &out_path, runner, cancel).await;
+    let direct =
+        cut_segment_with_ffmpeg(image, start_sample, samples, &out_path, runner, cancel).await;
     if let Err(err) = direct {
         let _ = fs::remove_file(&out_path);
         if !has_path_extension(image, "wv") {
@@ -284,8 +282,10 @@ async fn realize_image_segment(
         }
 
         let fallback = async {
-            let wav_path = ensure_decoded_wavpack_image(image, &realized_dir, runner, cancel).await?;
-            cut_segment_with_ffmpeg(&wav_path, start_sample, samples, &out_path, runner, cancel).await
+            let wav_path =
+                ensure_decoded_wavpack_image(image, &realized_dir, runner, cancel).await?;
+            cut_segment_with_ffmpeg(&wav_path, start_sample, samples, &out_path, runner, cancel)
+                .await
         }
         .await;
 
@@ -321,9 +321,8 @@ async fn cut_segment_with_ffmpeg(
     // source-aligned first sample. Absolute sample trimming is slower for late
     // tracks, but it preserves correctness until a separately proven exact
     // seek/copy strategy is introduced.
-    let filter = format!(
-        "atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS"
-    );
+    let filter =
+        format!("atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS");
     let cmd = ToolCommand {
         binary: ToolBinary::Ffmpeg,
         args: vec![
@@ -352,7 +351,9 @@ async fn cut_segment_with_ffmpeg(
 
     match runner.run(cmd, cancel).await {
         Ok(_) => Ok(()),
-        Err(ToolRunnerError::Cancelled { .. }) => Err(ConvertError::Realize("cancelled".to_string())),
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            Err(ConvertError::Realize("cancelled".to_string()))
+        }
         Err(err) => Err(ConvertError::Tool(err)),
     }
 }
@@ -455,7 +456,9 @@ async fn decode_wavpack_image(
 
     match runner.run(cmd, cancel).await {
         Ok(_) => Ok(()),
-        Err(ToolRunnerError::Cancelled { .. }) => Err(ConvertError::Realize("cancelled".to_string())),
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            Err(ConvertError::Realize("cancelled".to_string()))
+        }
         Err(err) => Err(ConvertError::Tool(err)),
     }
 }
@@ -487,7 +490,11 @@ async fn validate_realized_segment(
         ))
     })?;
     let delta = actual_samples.abs_diff(expected_samples);
-    let allowed = if probe.exact { 0 } else { (probe.sample_rate / 75).max(1) as u64 };
+    let allowed = if probe.exact {
+        0
+    } else {
+        (probe.sample_rate / 75).max(1) as u64
+    };
     if delta > allowed {
         return Err(ConvertError::TrackValidation(format!(
             "realized segment sample drift: expected {expected_samples}, got {actual_samples}, allowed {allowed}"
@@ -532,18 +539,21 @@ async fn probe_realized_segment(
 
     let output = match runner.run(cmd, cancel).await {
         Ok(output) => output,
-        Err(ToolRunnerError::Cancelled { .. }) => return Err(ConvertError::Realize("cancelled".to_string())),
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            return Err(ConvertError::Realize("cancelled".to_string()))
+        }
         Err(err) => return Err(ConvertError::Tool(err)),
     };
     parse_realized_probe_json(&output.stdout_tail)
 }
 
 fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> {
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|err| ConvertError::TrackValidation(format!("ffprobe JSON parse failed: {err}")))?;
-    let stream = value
-        .pointer("/streams/0")
-        .ok_or_else(|| ConvertError::TrackValidation("ffprobe returned no audio stream".to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|err| {
+        ConvertError::TrackValidation(format!("ffprobe JSON parse failed: {err}"))
+    })?;
+    let stream = value.pointer("/streams/0").ok_or_else(|| {
+        ConvertError::TrackValidation("ffprobe returned no audio stream".to_string())
+    })?;
     let sample_rate = stream
         .get("sample_rate")
         .and_then(|value| value.as_str())
@@ -556,7 +566,11 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
     }
 
     if let Some(samples) = samples_from_stream_duration_ts(stream, sample_rate) {
-        return Ok(RealizedProbe { sample_rate, samples: Some(samples), exact: true });
+        return Ok(RealizedProbe {
+            sample_rate,
+            samples: Some(samples),
+            exact: true,
+        });
     }
 
     let duration_secs = stream
@@ -570,7 +584,11 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
                 .and_then(|value| value.parse::<f64>().ok())
         });
     let samples = duration_secs.map(|duration| (duration * f64::from(sample_rate)).round() as u64);
-    Ok(RealizedProbe { sample_rate, samples, exact: false })
+    Ok(RealizedProbe {
+        sample_rate,
+        samples,
+        exact: false,
+    })
 }
 
 fn samples_from_stream_duration_ts(stream: &serde_json::Value, sample_rate: u32) -> Option<u64> {
@@ -590,7 +608,9 @@ fn samples_from_stream_duration_ts(stream: &serde_json::Value, sample_rate: u32)
 }
 
 fn json_u64(value: &serde_json::Value) -> Option<u64> {
-    value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
 }
 
 fn has_path_extension(path: &Path, ext: &str) -> bool {
@@ -610,6 +630,7 @@ async fn realize_sacd_track(
     area: SacdArea,
     staging: &StagingDir,
     cancel: &CancellationToken,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
 ) -> Result<PathBuf, ConvertError> {
     if cancel.is_cancelled() {
         return Err(ConvertError::Realize("cancelled".to_string()));
@@ -677,7 +698,9 @@ fn realize_sacd_track_blocking(
     let start_lsn = u64::from(entry.start_lsn);
     let end_lsn = start_lsn
         .checked_add(u64::from(entry.length_lsn))
-        .ok_or_else(|| ConvertError::TrackValidation("SACD track sector range overflows".to_string()))?;
+        .ok_or_else(|| {
+            ConvertError::TrackValidation("SACD track sector range overflows".to_string())
+        })?;
 
     let realized_dir = staging_root.join("realized-sacd-tracks");
     fs::create_dir_all(&realized_dir)?;
@@ -1004,8 +1027,7 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> u64 {
 }
 
 fn sacd_dsf_sample_count(time: PlayTime) -> u64 {
-    u64::from(playtime_to_frame_count(time))
-        * u64::from(SACD_SAMPLE_RATE_HZ)
+    u64::from(playtime_to_frame_count(time)) * u64::from(SACD_SAMPLE_RATE_HZ)
         / u64::from(SACD_FRAME_RATE)
 }
 
@@ -1169,7 +1191,10 @@ pub fn plan_outputs(
         }
         seen.insert(collision_key);
 
-        entries.push(PlannedTrackOutput { track_id: track.id.clone(), final_path });
+        entries.push(PlannedTrackOutput {
+            track_id: track.id.clone(),
+            final_path,
+        });
     }
 
     Ok(AlbumPlan { album_dir, entries })
@@ -1201,6 +1226,30 @@ async fn convert_tracks_with_reporter(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     reporter: Option<&dyn PipelineReporter>,
+) -> ConvertStageResult {
+    let tool_paths: HashMap<String, PathBuf> = HashMap::new();
+    convert_tracks_with_reporter_with_tool_paths(
+        source,
+        plan,
+        req,
+        staging,
+        runner,
+        cancel,
+        reporter,
+        &tool_paths,
+    )
+    .await
+}
+
+async fn convert_tracks_with_reporter_with_tool_paths(
+    source: &PreparedSource,
+    plan: &AlbumPlan,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    reporter: Option<&dyn PipelineReporter>,
+    tool_paths: &HashMap<String, PathBuf>,
 ) -> ConvertStageResult {
     let mut records = Vec::with_capacity(source.tracks.len());
     let mut artifacts = Vec::new();
@@ -1234,11 +1283,8 @@ async fn convert_tracks_with_reporter(
     let total_tracks = source.tracks.len();
     let total_expected_samples = total_expected_samples(source);
     let mut completed_expected_samples = 0_u64;
-    let mut progress_tracker = OperationProgressTracker::new(
-        req.item_id.clone(),
-        PipelineStage::Convert,
-        reporter,
-    );
+    let mut progress_tracker =
+        OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
 
     for (track_index, track) in source.tracks.iter().enumerate() {
         let track_number = track_index + 1;
@@ -1249,24 +1295,47 @@ async fn convert_tracks_with_reporter(
             track_index,
             total_tracks,
         );
-        progress_tracker.estimated(start_fraction, convert_track_message("Converting", track_number, total_tracks, track, planned_final_path.as_deref())).await;
+        progress_tracker
+            .estimated(
+                start_fraction,
+                convert_track_message(
+                    "Converting",
+                    track_number,
+                    total_tracks,
+                    track,
+                    planned_final_path.as_deref(),
+                ),
+            )
+            .await;
 
         if cancel.is_cancelled() {
             progress_tracker.cancel_requested().await;
-records.push(failed_track_record(
+            records.push(failed_track_record(
                 track,
                 None,
                 None,
                 Vec::new(),
                 "cancelled".to_string(),
             ));
-            completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-            progress_tracker.estimated(convert_progress_fraction(
-                    completed_expected_samples,
-                    total_expected_samples,
-                    track_number,
-                    total_tracks,
-                ), convert_track_message("Cancelled before", track_number, total_tracks, track, planned_final_path.as_deref())).await;
+            completed_expected_samples =
+                advance_expected_samples(completed_expected_samples, track);
+            progress_tracker
+                .estimated(
+                    convert_progress_fraction(
+                        completed_expected_samples,
+                        total_expected_samples,
+                        track_number,
+                        total_tracks,
+                    ),
+                    convert_track_message(
+                        "Cancelled before",
+                        track_number,
+                        total_tracks,
+                        track,
+                        planned_final_path.as_deref(),
+                    ),
+                )
+                .await;
             continue;
         }
 
@@ -1276,20 +1345,42 @@ records.push(failed_track_record(
                 None,
                 None,
                 Vec::new(),
-                format!("missing planned output for track {}", track.id.source_ordinal),
+                format!(
+                    "missing planned output for track {}",
+                    track.id.source_ordinal
+                ),
             ));
-            completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-            progress_tracker.estimated(convert_progress_fraction(
-                    completed_expected_samples,
-                    total_expected_samples,
-                    track_number,
-                    total_tracks,
-                ), format!("Track {} of {} failed: missing planned output", track_number, total_tracks)).await;
+            completed_expected_samples =
+                advance_expected_samples(completed_expected_samples, track);
+            progress_tracker
+                .estimated(
+                    convert_progress_fraction(
+                        completed_expected_samples,
+                        total_expected_samples,
+                        track_number,
+                        total_tracks,
+                    ),
+                    format!(
+                        "Track {} of {} failed: missing planned output",
+                        track_number, total_tracks
+                    ),
+                )
+                .await;
             continue;
         };
 
-        let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, req.target_format);
-        let realized_input = match realize_track(&track.source_ref, req, staging, runner, cancel).await {
+        let staged_path =
+            staged_audio_path(&convert_root, &final_path, &track.id, req.target_format);
+        let realized_input = match realize_track(
+            &track.source_ref,
+            req,
+            staging,
+            runner,
+            cancel,
+            Some(&mut progress_tracker),
+        )
+        .await
+        {
             Ok(path) => path,
             Err(err) => {
                 let error = err.to_string();
@@ -1300,13 +1391,25 @@ records.push(failed_track_record(
                     Vec::new(),
                     error.clone(),
                 ));
-                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                progress_tracker.estimated(convert_progress_fraction(
-                        completed_expected_samples,
-                        total_expected_samples,
-                        track_number,
-                        total_tracks,
-                    ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
+                completed_expected_samples =
+                    advance_expected_samples(completed_expected_samples, track);
+                progress_tracker
+                    .estimated(
+                        convert_progress_fraction(
+                            completed_expected_samples,
+                            total_expected_samples,
+                            track_number,
+                            total_tracks,
+                        ),
+                        convert_track_failure_message(
+                            track_number,
+                            total_tracks,
+                            track,
+                            Some(&final_path),
+                            &error,
+                        ),
+                    )
+                    .await;
                 continue;
             }
         };
@@ -1321,13 +1424,25 @@ records.push(failed_track_record(
                     Vec::new(),
                     error.clone(),
                 ));
-                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                progress_tracker.estimated(convert_progress_fraction(
-                        completed_expected_samples,
-                        total_expected_samples,
-                        track_number,
-                        total_tracks,
-                    ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
+                completed_expected_samples =
+                    advance_expected_samples(completed_expected_samples, track);
+                progress_tracker
+                    .estimated(
+                        convert_progress_fraction(
+                            completed_expected_samples,
+                            total_expected_samples,
+                            track_number,
+                            total_tracks,
+                        ),
+                        convert_track_failure_message(
+                            track_number,
+                            total_tracks,
+                            track,
+                            Some(&final_path),
+                            &error,
+                        ),
+                    )
+                    .await;
                 continue;
             }
         }
@@ -1344,24 +1459,61 @@ records.push(failed_track_record(
                     Vec::new(),
                     error.clone(),
                 ));
-                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                progress_tracker.estimated(convert_progress_fraction(
-                        completed_expected_samples,
-                        total_expected_samples,
-                        track_number,
-                        total_tracks,
-                    ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
+                completed_expected_samples =
+                    advance_expected_samples(completed_expected_samples, track);
+                progress_tracker
+                    .estimated(
+                        convert_progress_fraction(
+                            completed_expected_samples,
+                            total_expected_samples,
+                            track_number,
+                            total_tracks,
+                        ),
+                        convert_track_failure_message(
+                            track_number,
+                            total_tracks,
+                            track,
+                            Some(&final_path),
+                            &error,
+                        ),
+                    )
+                    .await;
                 continue;
             }
         };
 
-        let output = runner.run(cmd, cancel).await;
+        let end_fraction = convert_progress_fraction(
+            advance_expected_samples(completed_expected_samples, track),
+            total_expected_samples,
+            track_number,
+            total_tracks,
+        );
+        let output = run_encode_command_with_progress(
+            cmd,
+            runner,
+            cancel,
+            reporter,
+            tool_paths,
+            &mut progress_tracker,
+            track,
+            start_fraction,
+            end_fraction,
+            convert_track_message(
+                "Converting",
+                track_number,
+                total_tracks,
+                track,
+                Some(&final_path),
+            ),
+        )
+        .await;
         match output {
             Ok(tool_output) => {
                 let command = tool_output.command.clone();
                 let bytes_out = file_len(&staged_path);
                 if bytes_out.unwrap_or(0) == 0 {
-                    let error = format!("encoder did not produce output: {}", staged_path.display());
+                    let error =
+                        format!("encoder did not produce output: {}", staged_path.display());
                     records.push(failed_track_record(
                         track,
                         Some(realized_input),
@@ -1369,13 +1521,25 @@ records.push(failed_track_record(
                         vec![command],
                         error.clone(),
                     ));
-                    completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                    progress_tracker.estimated(convert_progress_fraction(
-                            completed_expected_samples,
-                            total_expected_samples,
-                            track_number,
-                            total_tracks,
-                        ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
+                    completed_expected_samples =
+                        advance_expected_samples(completed_expected_samples, track);
+                    progress_tracker
+                        .estimated(
+                            convert_progress_fraction(
+                                completed_expected_samples,
+                                total_expected_samples,
+                                track_number,
+                                total_tracks,
+                            ),
+                            convert_track_failure_message(
+                                track_number,
+                                total_tracks,
+                                track,
+                                Some(&final_path),
+                                &error,
+                            ),
+                        )
+                        .await;
                     continue;
                 }
                 let record = TrackRecord {
@@ -1396,13 +1560,25 @@ records.push(failed_track_record(
                     samples: track.expected_samples,
                 });
                 records.push(record);
-                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                progress_tracker.estimated(convert_progress_fraction(
-                        completed_expected_samples,
-                        total_expected_samples,
-                        track_number,
-                        total_tracks,
-                    ), convert_track_message("Finished", track_number, total_tracks, track, Some(&final_path))).await;
+                completed_expected_samples =
+                    advance_expected_samples(completed_expected_samples, track);
+                progress_tracker
+                    .estimated(
+                        convert_progress_fraction(
+                            completed_expected_samples,
+                            total_expected_samples,
+                            track_number,
+                            total_tracks,
+                        ),
+                        convert_track_message(
+                            "Finished",
+                            track_number,
+                            total_tracks,
+                            track,
+                            Some(&final_path),
+                        ),
+                    )
+                    .await;
             }
             Err(err) => {
                 let error = err.to_string();
@@ -1414,13 +1590,25 @@ records.push(failed_track_record(
                     commands,
                     error.clone(),
                 ));
-                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                progress_tracker.estimated(convert_progress_fraction(
-                        completed_expected_samples,
-                        total_expected_samples,
-                        track_number,
-                        total_tracks,
-                    ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
+                completed_expected_samples =
+                    advance_expected_samples(completed_expected_samples, track);
+                progress_tracker
+                    .estimated(
+                        convert_progress_fraction(
+                            completed_expected_samples,
+                            total_expected_samples,
+                            track_number,
+                            total_tracks,
+                        ),
+                        convert_track_failure_message(
+                            track_number,
+                            total_tracks,
+                            track,
+                            Some(&final_path),
+                            &error,
+                        ),
+                    )
+                    .await;
             }
         }
     }
@@ -1435,13 +1623,97 @@ records.push(failed_track_record(
     }
 }
 
+async fn run_encode_command_with_progress(
+    cmd: ToolCommand,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    reporter: Option<&dyn PipelineReporter>,
+    tool_paths: &HashMap<String, PathBuf>,
+    progress_tracker: &mut OperationProgressTracker<'_>,
+    track: &PreparedTrack,
+    start_fraction: f32,
+    end_fraction: f32,
+    label: String,
+) -> Result<ToolOutput, ToolRunnerError> {
+    if reporter.is_none() {
+        return runner.run(cmd, cancel).await;
+    }
+
+    match cmd.binary {
+        ToolBinary::Ffmpeg => {
+            if let Some(duration) = track_expected_duration(track) {
+                return run_streaming_tool_with_probe_with_tool_paths(
+                    cmd,
+                    cancel,
+                    Some(progress_tracker),
+                    None,
+                    tool_paths,
+                    |source, line| {
+                        if source == StreamSource::Stderr {
+                            probes::ffmpeg::parse_line(
+                                line,
+                                duration,
+                                start_fraction,
+                                end_fraction,
+                                &label,
+                            )
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .await;
+            }
+            runner.run(cmd, cancel).await
+        }
+        ToolBinary::Sox => {
+            let heartbeat = StreamingHeartbeat::new(
+                "sox-progress-unavailable",
+                probes::sox::unknown_fallback_message(&label),
+            );
+            run_streaming_tool_with_probe_with_tool_paths(
+                cmd,
+                cancel,
+                Some(progress_tracker),
+                Some(heartbeat),
+                tool_paths,
+                |source, line| {
+                    if source == StreamSource::Stderr {
+                        probes::sox::parse_line(line, start_fraction, end_fraction, &label)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .await
+        }
+        _ => runner.run(cmd, cancel).await,
+    }
+}
+
+fn track_expected_duration(track: &PreparedTrack) -> Option<Duration> {
+    if track.sample_rate == 0 {
+        return None;
+    }
+    let samples = track.expected_samples?;
+    if samples == 0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(
+        samples as f64 / track.sample_rate as f64,
+    ))
+}
 fn total_expected_samples(source: &PreparedSource) -> Option<u64> {
     let mut total = 0_u64;
     for track in &source.tracks {
         let samples = track.expected_samples?;
         total = total.saturating_add(samples);
     }
-    if total == 0 { None } else { Some(total) }
+    if total == 0 {
+        None
+    } else {
+        Some(total)
+    }
 }
 
 fn advance_expected_samples(completed: u64, track: &PreparedTrack) -> u64 {
@@ -1497,7 +1769,13 @@ fn convert_track_failure_message(
 }
 
 fn progress_track_label(track: &PreparedTrack, final_path: Option<&Path>) -> String {
-    if let Some(title) = track.metadata.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(title) = track
+        .metadata
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         return title.to_string();
     }
     if let Some(stem) = final_path
@@ -1510,7 +1788,6 @@ fn progress_track_label(track: &PreparedTrack, final_path: Option<&Path>) -> Str
     }
     format!("Track {:02}", track.id.track_number)
 }
-
 
 /// Merge per-track audio artifacts into a single file using ffmpeg's
 /// concat demuxer (`-c copy`, no re-encoding). Skipped when
@@ -1525,7 +1802,10 @@ pub async fn merge_tracks(
     if !req.merge {
         return Ok((
             artifacts,
-            StageRecord { stage: PipelineStage::Merge, outcome: StageOutcome::Skipped },
+            StageRecord {
+                stage: PipelineStage::Merge,
+                outcome: StageOutcome::Skipped,
+            },
         ));
     }
 
@@ -1553,8 +1833,14 @@ pub async fn merge_tracks(
             source_tracks: vec![t.track_id.clone()],
         };
         return Ok((
-            ArtifactSet { audio: AudioArtifacts::Merged(merged), sidecars },
-            StageRecord { stage: PipelineStage::Merge, outcome: StageOutcome::Ok },
+            ArtifactSet {
+                audio: AudioArtifacts::Merged(merged),
+                sidecars,
+            },
+            StageRecord {
+                stage: PipelineStage::Merge,
+                outcome: StageOutcome::Ok,
+            },
         ));
     }
 
@@ -1577,10 +1863,14 @@ pub async fn merge_tracks(
         binary: ToolBinary::Ffmpeg,
         args: vec![
             "-y".into(),
-            "-f".into(), "concat".into(),
-            "-safe".into(), "0".into(),
-            "-i".into(), concat_list.display().to_string(),
-            "-c".into(), "copy".into(),
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "0".into(),
+            "-i".into(),
+            concat_list.display().to_string(),
+            "-c".into(),
+            "copy".into(),
             merged_staged.display().to_string(),
         ],
         secret_args: vec![],
@@ -1601,11 +1891,16 @@ pub async fn merge_tracks(
     let probe_cmd = ToolCommand {
         binary: ToolBinary::Ffprobe,
         args: vec![
-            "-v".into(), "error".into(),
-            "-select_streams".into(), "a:0".into(),
-            "-show_entries".into(), "stream=sample_rate,duration".into(),
-            "-show_entries".into(), "format=duration".into(),
-            "-of".into(), "json".into(),
+            "-v".into(),
+            "error".into(),
+            "-select_streams".into(),
+            "a:0".into(),
+            "-show_entries".into(),
+            "stream=sample_rate,duration".into(),
+            "-show_entries".into(),
+            "format=duration".into(),
+            "-of".into(),
+            "json".into(),
             merged_staged.display().to_string(),
         ],
         secret_args: vec![],
@@ -1622,8 +1917,7 @@ pub async fn merge_tracks(
         }
     };
 
-    let (actual_sample_rate, actual_duration) =
-        parse_merge_probe(&probe_output.stdout_tail)?;
+    let (actual_sample_rate, actual_duration) = parse_merge_probe(&probe_output.stdout_tail)?;
     let actual_samples = (actual_duration * actual_sample_rate as f64).round() as u64;
 
     let expected_sum: Option<u64> = track_artifacts
@@ -1654,10 +1948,7 @@ pub async fn merge_tracks(
         .unwrap_or(Path::new("."));
     let merged_final = final_dir.join(format!("merged.{}", ext));
 
-    let source_tracks: Vec<TrackId> = track_artifacts
-        .iter()
-        .map(|t| t.track_id.clone())
-        .collect();
+    let source_tracks: Vec<TrackId> = track_artifacts.iter().map(|t| t.track_id.clone()).collect();
 
     let merged = MergedArtifact {
         staged_path: merged_staged,
@@ -1667,8 +1958,14 @@ pub async fn merge_tracks(
     };
 
     Ok((
-        ArtifactSet { audio: AudioArtifacts::Merged(merged), sidecars },
-        StageRecord { stage: PipelineStage::Merge, outcome: StageOutcome::Ok },
+        ArtifactSet {
+            audio: AudioArtifacts::Merged(merged),
+            sidecars,
+        },
+        StageRecord {
+            stage: PipelineStage::Merge,
+            outcome: StageOutcome::Ok,
+        },
     ))
 }
 
@@ -1712,7 +2009,10 @@ pub async fn apply_metadata(
     cancel: &CancellationToken,
 ) -> Result<StageRecord, MetadataError> {
     if req.stages.metadata == StageRequirement::Disabled {
-        return Ok(StageRecord { stage: PipelineStage::Metadata, outcome: StageOutcome::Skipped });
+        return Ok(StageRecord {
+            stage: PipelineStage::Metadata,
+            outcome: StageOutcome::Skipped,
+        });
     }
 
     match &artifacts.audio {
@@ -1722,17 +2022,30 @@ pub async fn apply_metadata(
                     return Err(MetadataError::Tool(ToolRunnerError::Cancelled {
                         command: CommandRecord {
                             binary: ToolBinary::Metaflac,
-                            sanitized_args: vec![], cwd: None, env_keys: vec![],
-                            exit: None, stdout_tail: String::new(),
-                            stderr_tail: String::new(), elapsed: Duration::ZERO,
+                            sanitized_args: vec![],
+                            cwd: None,
+                            env_keys: vec![],
+                            exit: None,
+                            stdout_tail: String::new(),
+                            stderr_tail: String::new(),
+                            elapsed: Duration::ZERO,
                         },
                     }));
                 }
-                let meta = source.tracks.iter()
+                let meta = source
+                    .tracks
+                    .iter()
                     .find(|t| t.id == artifact.track_id)
                     .map(|t| &t.metadata);
                 if let Some(meta) = meta {
-                    tag_audio_file(&artifact.staged_path, meta, &source.album_metadata, runner, cancel).await?;
+                    tag_audio_file(
+                        &artifact.staged_path,
+                        meta,
+                        &source.album_metadata,
+                        runner,
+                        cancel,
+                    )
+                    .await?;
                 }
             }
         }
@@ -1745,11 +2058,21 @@ pub async fn apply_metadata(
                 date: source.album_metadata.date.clone(),
                 ..TrackMetadata::default()
             };
-            tag_audio_file(&merged.staged_path, &album_as_track, &source.album_metadata, runner, cancel).await?;
+            tag_audio_file(
+                &merged.staged_path,
+                &album_as_track,
+                &source.album_metadata,
+                runner,
+                cancel,
+            )
+            .await?;
         }
     }
 
-    Ok(StageRecord { stage: PipelineStage::Metadata, outcome: StageOutcome::Ok })
+    Ok(StageRecord {
+        stage: PipelineStage::Metadata,
+        outcome: StageOutcome::Ok,
+    })
 }
 
 fn push_tag_value(tags: &mut Vec<(String, String)>, key: &str, value: &str) {
@@ -1787,35 +2110,75 @@ async fn tag_audio_file(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<(), MetadataError> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
 
     let mut tags: Vec<(String, String)> = Vec::new();
-    if let Some(ref v) = meta.title { push_tag_value(&mut tags, "TITLE", v); }
-    if let Some(ref v) = meta.artist { push_tag_value(&mut tags, "ARTIST", v); }
-    if let Some(ref v) = meta.album_artist { push_tag_value(&mut tags, "ALBUMARTIST", v); }
-    if let Some(ref v) = album.album { push_tag_value(&mut tags, "ALBUM", v); }
-    if let Some(ref v) = meta.genre { push_tag_value(&mut tags, "GENRE", v); }
-    if let Some(ref v) = meta.date { push_tag_value(&mut tags, "DATE", v); }
-    if let Some(n) = meta.track_number { push_tag_value(&mut tags, "TRACKNUMBER", &n.to_string()); }
-    if let Some(n) = meta.disc_number { push_tag_value(&mut tags, "DISCNUMBER", &n.to_string()); }
-    if let Some(ref v) = meta.comment { push_tag_value(&mut tags, "COMMENT", v); }
+    if let Some(ref v) = meta.title {
+        push_tag_value(&mut tags, "TITLE", v);
+    }
+    if let Some(ref v) = meta.artist {
+        push_tag_value(&mut tags, "ARTIST", v);
+    }
+    if let Some(ref v) = meta.album_artist {
+        push_tag_value(&mut tags, "ALBUMARTIST", v);
+    }
+    if let Some(ref v) = album.album {
+        push_tag_value(&mut tags, "ALBUM", v);
+    }
+    if let Some(ref v) = meta.genre {
+        push_tag_value(&mut tags, "GENRE", v);
+    }
+    if let Some(ref v) = meta.date {
+        push_tag_value(&mut tags, "DATE", v);
+    }
+    if let Some(n) = meta.track_number {
+        push_tag_value(&mut tags, "TRACKNUMBER", &n.to_string());
+    }
+    if let Some(n) = meta.disc_number {
+        push_tag_value(&mut tags, "DISCNUMBER", &n.to_string());
+    }
+    if let Some(ref v) = meta.comment {
+        push_tag_value(&mut tags, "COMMENT", v);
+    }
 
     // PR 8 CUE-specific metadata. The materializer preserves these fields in
     // TrackMetadata/AlbumMetadata, and the metadata stage writes them through
     // so published split files remain self-describing.
-    if let Some(ref v) = meta.composer { push_tag_value(&mut tags, "COMPOSER", v); }
-    if let Some(ref v) = meta.performer { push_tag_value(&mut tags, "PERFORMER", v); }
-    if let Some(ref v) = meta.isrc { push_tag_value(&mut tags, "ISRC", v); }
-    if let Some(ref v) = meta.publisher { push_tag_value(&mut tags, "PUBLISHER", v); }
-    if let Some(ref v) = meta.copyright { push_tag_value(&mut tags, "COPYRIGHT", v); }
+    if let Some(ref v) = meta.composer {
+        push_tag_value(&mut tags, "COMPOSER", v);
+    }
+    if let Some(ref v) = meta.performer {
+        push_tag_value(&mut tags, "PERFORMER", v);
+    }
+    if let Some(ref v) = meta.isrc {
+        push_tag_value(&mut tags, "ISRC", v);
+    }
+    if let Some(ref v) = meta.publisher {
+        push_tag_value(&mut tags, "PUBLISHER", v);
+    }
+    if let Some(ref v) = meta.copyright {
+        push_tag_value(&mut tags, "COPYRIGHT", v);
+    }
     if meta.pre_emphasis {
         push_tag_value(&mut tags, "PRE_EMPHASIS", "1");
         push_tag_value(&mut tags, "CUE_FLAGS", "PRE");
     }
-    if album.total_tracks > 0 { push_tag_value(&mut tags, "TOTALTRACKS", &album.total_tracks.to_string()); }
-    if let Some(n) = album.total_discs { push_tag_value(&mut tags, "TOTALDISCS", &n.to_string()); }
-    if let Some(n) = album.disc_number { push_tag_value(&mut tags, "DISCNUMBER", &n.to_string()); }
-    if let Some(v) = album.extra.get("catalog") { push_tag_value(&mut tags, "CATALOG", v); }
+    if album.total_tracks > 0 {
+        push_tag_value(&mut tags, "TOTALTRACKS", &album.total_tracks.to_string());
+    }
+    if let Some(n) = album.total_discs {
+        push_tag_value(&mut tags, "TOTALDISCS", &n.to_string());
+    }
+    if let Some(n) = album.disc_number {
+        push_tag_value(&mut tags, "DISCNUMBER", &n.to_string());
+    }
+    if let Some(v) = album.extra.get("catalog") {
+        push_tag_value(&mut tags, "CATALOG", v);
+    }
     for (key, value) in &album.extra {
         let tag_key = cue_extra_tag_key("ALBUM", key);
         push_tag_value(&mut tags, &tag_key, value);
@@ -1825,7 +2188,9 @@ async fn tag_audio_file(
         push_tag_value(&mut tags, &tag_key, value);
     }
 
-    if tags.is_empty() { return Ok(()); }
+    if tags.is_empty() {
+        return Ok(());
+    }
 
     let cmd = match ext.as_str() {
         "flac" => {
@@ -1835,38 +2200,89 @@ async fn tag_audio_file(
                 args.push(format!("--set-tag={}={}", k, v));
             }
             args.push(path.display().to_string());
-            ToolCommand { binary: ToolBinary::Metaflac, args, secret_args: vec![], cwd: None, env: vec![], timeout: Duration::from_secs(30) }
+            ToolCommand {
+                binary: ToolBinary::Metaflac,
+                args,
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(30),
+            }
         }
         "opus" | "ogg" => {
             let mut args = Vec::new();
-            for (k, _) in &tags { args.push("--delete".into()); args.push(k.clone()); }
-            for (k, v) in &tags { args.push("-s".into()); args.push(format!("{}={}", k, v)); }
+            for (k, _) in &tags {
+                args.push("--delete".into());
+                args.push(k.clone());
+            }
+            for (k, v) in &tags {
+                args.push("-s".into());
+                args.push(format!("{}={}", k, v));
+            }
             args.push("--in-place".into());
             args.push(path.display().to_string());
-            ToolCommand { binary: ToolBinary::Opustags, args, secret_args: vec![], cwd: None, env: vec![], timeout: Duration::from_secs(30) }
+            ToolCommand {
+                binary: ToolBinary::Opustags,
+                args,
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(30),
+            }
         }
         "wv" => {
             let mut args = vec!["-q".to_string()];
-            for (k, v) in &tags { args.push("-w".into()); args.push(format!("{}={}", k, v)); }
+            for (k, v) in &tags {
+                args.push("-w".into());
+                args.push(format!("{}={}", k, v));
+            }
             args.push(path.display().to_string());
-            ToolCommand { binary: ToolBinary::Wvtag, args, secret_args: vec![], cwd: None, env: vec![], timeout: Duration::from_secs(30) }
+            ToolCommand {
+                binary: ToolBinary::Wvtag,
+                args,
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(30),
+            }
         }
         "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif" => {
-            let tmp = path.with_extension(format!("tmp.{}", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
+            let tmp = path.with_extension(format!(
+                "tmp.{}",
+                path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+            ));
             let mut args = vec!["-y".into(), "-i".into(), path.display().to_string()];
-            for (k, v) in &tags { args.push("-metadata".into()); args.push(format!("{}={}", k.to_lowercase(), v)); }
-            args.push("-c".into()); args.push("copy".into());
+            for (k, v) in &tags {
+                args.push("-metadata".into());
+                args.push(format!("{}={}", k.to_lowercase(), v));
+            }
+            args.push("-c".into());
+            args.push("copy".into());
             args.push(tmp.display().to_string());
-            ToolCommand { binary: ToolBinary::Ffmpeg, args, secret_args: vec![], cwd: None, env: vec![], timeout: Duration::from_secs(60) }
+            ToolCommand {
+                binary: ToolBinary::Ffmpeg,
+                args,
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(60),
+            }
         }
-        _ => { return Err(MetadataError::UnsupportedTagFormat(ext)); }
+        _ => {
+            return Err(MetadataError::UnsupportedTagFormat(ext));
+        }
     };
 
     runner.run(cmd, cancel).await.map_err(MetadataError::Tool)?;
 
     if matches!(ext.as_str(), "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif") {
-        let tmp = path.with_extension(format!("tmp.{}", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
-        if tmp.exists() { fs::rename(&tmp, path)?; }
+        let tmp = path.with_extension(format!(
+            "tmp.{}",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+        ));
+        if tmp.exists() {
+            fs::rename(&tmp, path)?;
+        }
     }
 
     Ok(())
@@ -1880,20 +2296,28 @@ pub async fn apply_replaygain(
     cancel: &CancellationToken,
 ) -> Result<StageRecord, ReplayGainError> {
     if req.stages.replaygain == StageRequirement::Disabled {
-        return Ok(StageRecord { stage: PipelineStage::ReplayGain, outcome: StageOutcome::Skipped });
+        return Ok(StageRecord {
+            stage: PipelineStage::ReplayGain,
+            outcome: StageOutcome::Skipped,
+        });
     }
 
     let mut args = Vec::new();
     match &artifacts.audio {
         AudioArtifacts::Tracks(tracks) => {
             if tracks.is_empty() {
-                return Ok(StageRecord { stage: PipelineStage::ReplayGain, outcome: StageOutcome::Skipped });
+                return Ok(StageRecord {
+                    stage: PipelineStage::ReplayGain,
+                    outcome: StageOutcome::Skipped,
+                });
             }
             args.push("-a".to_string());
             args.push("-k".to_string());
             args.push("-s".to_string());
             args.push("i".to_string());
-            for t in tracks { args.push(t.staged_path.display().to_string()); }
+            for t in tracks {
+                args.push(t.staged_path.display().to_string());
+            }
         }
         AudioArtifacts::Merged(merged) => {
             args.push("-k".to_string());
@@ -1904,11 +2328,21 @@ pub async fn apply_replaygain(
     }
 
     let cmd = ToolCommand {
-        binary: ToolBinary::Loudgain, args, secret_args: vec![],
-        cwd: None, env: vec![], timeout: Duration::from_secs(600),
+        binary: ToolBinary::Loudgain,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(600),
     };
-    runner.run(cmd, cancel).await.map_err(ReplayGainError::Tool)?;
-    Ok(StageRecord { stage: PipelineStage::ReplayGain, outcome: StageOutcome::Ok })
+    runner
+        .run(cmd, cancel)
+        .await
+        .map_err(ReplayGainError::Tool)?;
+    Ok(StageRecord {
+        stage: PipelineStage::ReplayGain,
+        outcome: StageOutcome::Ok,
+    })
 }
 
 /// Generate feature sidecars: conversion log and CUE sheet.
@@ -1924,7 +2358,10 @@ pub async fn run_features(
     if req.stages.features == StageRequirement::Disabled {
         return Ok((
             artifacts,
-            StageRecord { stage: PipelineStage::Features, outcome: StageOutcome::Skipped },
+            StageRecord {
+                stage: PipelineStage::Features,
+                outcome: StageOutcome::Skipped,
+            },
         ));
     }
 
@@ -1952,48 +2389,90 @@ pub async fn run_features(
 
     Ok((
         artifacts,
-        StageRecord { stage: PipelineStage::Features, outcome: StageOutcome::Ok },
+        StageRecord {
+            stage: PipelineStage::Features,
+            outcome: StageOutcome::Ok,
+        },
     ))
 }
 
-fn build_conversion_log(outcome: &AlbumOutcome, source: &PreparedSource, req: &PipelineRequest) -> String {
+fn build_conversion_log(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> String {
     let mut log = String::new();
-    log.push_str(&format!("Conversion Log — {}\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+    log.push_str(&format!(
+        "Conversion Log — {}\n",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    ));
     log.push_str(&format!("Source: {}\n", source.container.display()));
     log.push_str(&format!("Target format: {:?}\n", req.target_format));
     log.push_str(&format!("Tracks in source: {}\n\n", source.tracks.len()));
     match outcome {
-        AlbumOutcome::Complete { tracks, .. } => { log.push_str(&format!("Result: Complete ({} tracks)\n", tracks.len())); }
-        AlbumOutcome::Partial { successful, failed, .. } => { log.push_str(&format!("Result: Partial ({} ok, {} failed)\n", successful.len(), failed.len())); }
-        AlbumOutcome::Blocked { reason, .. } => { log.push_str(&format!("Result: Blocked ({:?})\n", reason)); }
+        AlbumOutcome::Complete { tracks, .. } => {
+            log.push_str(&format!("Result: Complete ({} tracks)\n", tracks.len()));
+        }
+        AlbumOutcome::Partial {
+            successful, failed, ..
+        } => {
+            log.push_str(&format!(
+                "Result: Partial ({} ok, {} failed)\n",
+                successful.len(),
+                failed.len()
+            ));
+        }
+        AlbumOutcome::Blocked { reason, .. } => {
+            log.push_str(&format!("Result: Blocked ({:?})\n", reason));
+        }
     }
     log
 }
 
 fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
     let mut cue = String::new();
-    if let Some(ref album) = source.album_metadata.album { cue.push_str(&format!("TITLE \"{}\"\n", album)); }
-    if let Some(ref artist) = source.album_metadata.album_artist { cue.push_str(&format!("PERFORMER \"{}\"\n", artist)); }
+    if let Some(ref album) = source.album_metadata.album {
+        cue.push_str(&format!("TITLE \"{}\"\n", album));
+    }
+    if let Some(ref artist) = source.album_metadata.album_artist {
+        cue.push_str(&format!("PERFORMER \"{}\"\n", artist));
+    }
     match &artifacts.audio {
         AudioArtifacts::Tracks(tracks) => {
             for (i, t) in tracks.iter().enumerate() {
-                let filename = t.staged_path.file_name().and_then(|f| f.to_str()).unwrap_or("unknown");
+                let filename = t
+                    .staged_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("unknown");
                 cue.push_str(&format!("FILE \"{}\" WAVE\n", filename));
                 cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
                 if let Some(st) = source.tracks.iter().find(|s| s.id == t.track_id) {
-                    if let Some(ref title) = st.metadata.title { cue.push_str(&format!("    TITLE \"{}\"\n", title)); }
-                    if let Some(ref artist) = st.metadata.artist { cue.push_str(&format!("    PERFORMER \"{}\"\n", artist)); }
+                    if let Some(ref title) = st.metadata.title {
+                        cue.push_str(&format!("    TITLE \"{}\"\n", title));
+                    }
+                    if let Some(ref artist) = st.metadata.artist {
+                        cue.push_str(&format!("    PERFORMER \"{}\"\n", artist));
+                    }
                 }
                 cue.push_str("    INDEX 01 00:00:00\n");
             }
         }
         AudioArtifacts::Merged(merged) => {
-            let filename = merged.staged_path.file_name().and_then(|f| f.to_str()).unwrap_or("merged");
+            let filename = merged
+                .staged_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("merged");
             cue.push_str(&format!("FILE \"{}\" WAVE\n", filename));
             for (i, st) in source.tracks.iter().enumerate() {
                 cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
-                if let Some(ref title) = st.metadata.title { cue.push_str(&format!("    TITLE \"{}\"\n", title)); }
-                if let Some(ref artist) = st.metadata.artist { cue.push_str(&format!("    PERFORMER \"{}\"\n", artist)); }
+                if let Some(ref title) = st.metadata.title {
+                    cue.push_str(&format!("    TITLE \"{}\"\n", title));
+                }
+                if let Some(ref artist) = st.metadata.artist {
+                    cue.push_str(&format!("    PERFORMER \"{}\"\n", artist));
+                }
                 cue.push_str("    INDEX 01 00:00:00\n");
             }
         }
@@ -2140,7 +2619,9 @@ pub fn publish_album_output(
         match policy.overwrite {
             OverwritePolicy::FailIfExists => {
                 let _ = fs::remove_dir_all(&temp_dir);
-                return Err(PublishError::DestinationExists(plan.album_dir.display().to_string()));
+                return Err(PublishError::DestinationExists(
+                    plan.album_dir.display().to_string(),
+                ));
             }
             OverwritePolicy::ReplaceWithBackup => {
                 if let Err(err) = write_publish_marker(&marker_path, &backup_dir) {
@@ -2197,10 +2678,7 @@ pub fn publish_album_output(
 // ===========================================================================
 
 /// Write the interim durable JSON report used by PR 4.
-pub fn write_durable_log(
-    report: &PipelineReport,
-    log: &LogPolicy,
-) -> Result<PathBuf, LogError> {
+pub fn write_durable_log(report: &PipelineReport, log: &LogPolicy) -> Result<PathBuf, LogError> {
     fs::create_dir_all(&log.root).map_err(LogError::Io)?;
     let job = sanitize_component(&report.request.job_id);
     let item = sanitize_component(&report.request.item_id);
@@ -2225,6 +2703,17 @@ pub async fn run_pipeline_item(
     reporter: &dyn PipelineReporter,
     cancel: &CancellationToken,
 ) -> PipelineReport {
+    let tool_paths: HashMap<String, PathBuf> = HashMap::new();
+    run_pipeline_item_with_tool_paths(req, runner, reporter, cancel, &tool_paths).await
+}
+
+pub async fn run_pipeline_item_with_tool_paths(
+    req: PipelineRequest,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> PipelineReport {
     let item_id = req.item_id.clone();
     let mut source = None;
     let mut plan = None;
@@ -2245,7 +2734,10 @@ pub async fn run_pipeline_item(
     }
 
     if let Err(err) = validate_request(&req) {
-        let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(err.to_string()));
+        let record = stage_record(
+            PipelineStage::Materialize,
+            StageOutcome::Failed(err.to_string()),
+        );
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
         let outcome = AlbumOutcome::Blocked {
@@ -2276,7 +2768,10 @@ pub async fn run_pipeline_item(
     let _run_lock = match acquire_run_lock(&staging_parent, &req.job_id, &req.item_id) {
         Ok(lock) => lock,
         Err(err) => {
-            let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(err.to_string()));
+            let record = stage_record(
+                PipelineStage::Materialize,
+                StageOutcome::Failed(err.to_string()),
+            );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
             let outcome = AlbumOutcome::Blocked {
@@ -2285,7 +2780,8 @@ pub async fn run_pipeline_item(
                 stages,
                 reason: BlockReason::MaterializeFailed,
             };
-            return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
+            return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
+                .await;
         }
     };
     let staging_root = staging_parent.join(format!(
@@ -2315,7 +2811,11 @@ pub async fn run_pipeline_item(
     emit_stage_started(reporter, &item_id, PipelineStage::Materialize).await;
     let materialized = match detect_source_kind(&req) {
         Ok(kind) => match materializer_for(kind) {
-            Ok(materializer) => materializer.materialize(&req, &staging, runner, cancel).await,
+            Ok(materializer) => {
+                materializer
+                    .materialize(&req, &staging, runner, Some(reporter), tool_paths, cancel)
+                    .await
+            }
             Err(err) => Err(MaterializeError::Parse(err.to_string())),
         },
         Err(err) => Err(MaterializeError::Parse(err.to_string())),
@@ -2333,7 +2833,10 @@ pub async fn run_pipeline_item(
             } else {
                 BlockReason::MaterializeFailed
             };
-            let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(err.to_string()));
+            let record = stage_record(
+                PipelineStage::Materialize,
+                StageOutcome::Failed(err.to_string()),
+            );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
             let outcome = AlbumOutcome::Blocked {
@@ -2342,7 +2845,8 @@ pub async fn run_pipeline_item(
                 stages,
                 reason,
             };
-            return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
+            return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
+                .await;
         }
     }
 
@@ -2365,7 +2869,10 @@ pub async fn run_pipeline_item(
             plan = Some(album_plan);
         }
         Err(err) => {
-            let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(err.to_string()));
+            let record = stage_record(
+                PipelineStage::PlanOutputs,
+                StageOutcome::Failed(err.to_string()),
+            );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
             let outcome = AlbumOutcome::Blocked {
@@ -2374,18 +2881,21 @@ pub async fn run_pipeline_item(
                 stages,
                 reason: BlockReason::PlanFailed,
             };
-            return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
+            return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
+                .await;
         }
     }
 
     emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
-    let converted = convert_tracks(
+    let converted = convert_tracks_with_reporter_with_tool_paths(
         source.as_ref().expect("source present"),
         plan.as_ref().expect("plan present"),
         &req,
         &staging,
         runner,
         cancel,
+        Some(reporter),
+        tool_paths,
     )
     .await;
     emit_stage_finished(reporter, &item_id, converted.record.clone()).await;
@@ -2393,10 +2903,20 @@ pub async fn run_pipeline_item(
     tracks = converted.tracks.clone();
     artifacts = Some(converted.artifacts);
 
-    let mut current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+    let mut current_outcome =
+        aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if cancel.is_cancelled() {
         current_outcome = cancelled_outcome_from(current_outcome);
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return finalize_report(
+            &req,
+            reporter,
+            source,
+            plan,
+            artifacts,
+            published,
+            current_outcome,
+        )
+        .await;
     }
     if matches!(current_outcome, AlbumOutcome::Partial { .. })
         && artifacts.as_ref().map(audio_artifact_count).unwrap_or(0) == 0
@@ -2409,7 +2929,16 @@ pub async fn run_pipeline_item(
         };
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return finalize_report(
+            &req,
+            reporter,
+            source,
+            plan,
+            artifacts,
+            published,
+            current_outcome,
+        )
+        .await;
     }
 
     if req.merge {
@@ -2429,11 +2958,22 @@ pub async fn run_pipeline_item(
                 artifacts = Some(merged_artifacts);
             }
             Err(err) => {
-                let record = stage_record(PipelineStage::Merge, StageOutcome::Failed(err.to_string()));
+                let record =
+                    stage_record(PipelineStage::Merge, StageOutcome::Failed(err.to_string()));
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
-                current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                current_outcome =
+                    aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return finalize_report(
+                    &req,
+                    reporter,
+                    source,
+                    plan,
+                    artifacts,
+                    published,
+                    current_outcome,
+                )
+                .await;
             }
         }
     } else {
@@ -2458,11 +2998,24 @@ pub async fn run_pipeline_item(
                 stages.push(record);
             }
             Err(err) => {
-                let record = stage_record(PipelineStage::Metadata, StageOutcome::Failed(err.to_string()));
+                let record = stage_record(
+                    PipelineStage::Metadata,
+                    StageOutcome::Failed(err.to_string()),
+                );
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
-                current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                current_outcome =
+                    aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return finalize_report(
+                    &req,
+                    reporter,
+                    source,
+                    plan,
+                    artifacts,
+                    published,
+                    current_outcome,
+                )
+                .await;
             }
         }
     } else {
@@ -2486,11 +3039,24 @@ pub async fn run_pipeline_item(
                 stages.push(record);
             }
             Err(err) => {
-                let record = stage_record(PipelineStage::ReplayGain, StageOutcome::Failed(err.to_string()));
+                let record = stage_record(
+                    PipelineStage::ReplayGain,
+                    StageOutcome::Failed(err.to_string()),
+                );
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
-                current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                current_outcome =
+                    aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return finalize_report(
+                    &req,
+                    reporter,
+                    source,
+                    plan,
+                    artifacts,
+                    published,
+                    current_outcome,
+                )
+                .await;
             }
         }
     } else {
@@ -2501,7 +3067,16 @@ pub async fn run_pipeline_item(
 
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return finalize_report(
+            &req,
+            reporter,
+            source,
+            plan,
+            artifacts,
+            published,
+            current_outcome,
+        )
+        .await;
     }
 
     if req.stages.features == StageRequirement::Enabled {
@@ -2523,11 +3098,24 @@ pub async fn run_pipeline_item(
                 artifacts = Some(feature_artifacts);
             }
             Err(err) => {
-                let record = stage_record(PipelineStage::Features, StageOutcome::Failed(err.to_string()));
+                let record = stage_record(
+                    PipelineStage::Features,
+                    StageOutcome::Failed(err.to_string()),
+                );
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
-                current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                current_outcome =
+                    aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return finalize_report(
+                    &req,
+                    reporter,
+                    source,
+                    plan,
+                    artifacts,
+                    published,
+                    current_outcome,
+                )
+                .await;
             }
         }
     } else {
@@ -2539,10 +3127,28 @@ pub async fn run_pipeline_item(
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if cancel.is_cancelled() {
         current_outcome = cancelled_outcome_from(current_outcome);
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return finalize_report(
+            &req,
+            reporter,
+            source,
+            plan,
+            artifacts,
+            published,
+            current_outcome,
+        )
+        .await;
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return finalize_report(
+            &req,
+            reporter,
+            source,
+            plan,
+            artifacts,
+            published,
+            current_outcome,
+        )
+        .await;
     }
 
     emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
@@ -2559,7 +3165,10 @@ pub async fn run_pipeline_item(
             published = Some(album);
         }
         Err(err) => {
-            let record = stage_record(PipelineStage::Publish, StageOutcome::Failed(err.to_string()));
+            let record = stage_record(
+                PipelineStage::Publish,
+                StageOutcome::Failed(err.to_string()),
+            );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
             current_outcome = AlbumOutcome::Blocked {
@@ -2568,12 +3177,30 @@ pub async fn run_pipeline_item(
                 stages,
                 reason: BlockReason::PublishFailed,
             };
-            return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+            return finalize_report(
+                &req,
+                reporter,
+                source,
+                plan,
+                artifacts,
+                published,
+                current_outcome,
+            )
+            .await;
         }
     }
 
     current_outcome = aggregate_album_outcome(tracks, stages, req.failure_policy);
-    finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await
+    finalize_report(
+        &req,
+        reporter,
+        source,
+        plan,
+        artifacts,
+        published,
+        current_outcome,
+    )
+    .await
 }
 
 async fn finalize_report(
@@ -2615,12 +3242,10 @@ async fn finalize_report(
             }
             Err(err) => {
                 let error_text = err.to_string();
-                let terminal_error = durable_log_failure_terminal_error(
-                    &outcome,
-                    published.as_ref(),
-                    &error_text,
-                );
-                let record = stage_record(PipelineStage::DurableLog, StageOutcome::Failed(error_text));
+                let terminal_error =
+                    durable_log_failure_terminal_error(&outcome, published.as_ref(), &error_text);
+                let record =
+                    stage_record(PipelineStage::DurableLog, StageOutcome::Failed(error_text));
                 push_stage(&mut outcome, record.clone());
                 emit_stage_finished(reporter, &item_id, record).await;
                 terminal_error_override = Some(terminal_error);
@@ -2647,10 +3272,7 @@ async fn finalize_report(
         terminal_error_override,
     );
     reporter
-        .emit(PipelineEvent::Terminal {
-            item_id,
-            status,
-        })
+        .emit(PipelineEvent::Terminal { item_id, status })
         .await;
 
     PipelineReport {
@@ -2700,7 +3322,10 @@ pub fn aggregate_album_outcome(
     }
 
     if failed.is_empty() {
-        return AlbumOutcome::Complete { tracks: successful, stages };
+        return AlbumOutcome::Complete {
+            tracks: successful,
+            stages,
+        };
     }
 
     match policy {
@@ -2710,7 +3335,11 @@ pub fn aggregate_album_outcome(
             stages,
             reason: BlockReason::TrackFailures,
         },
-        FailurePolicy::AllowPartialAlbum => AlbumOutcome::Partial { successful, failed, stages },
+        FailurePolicy::AllowPartialAlbum => AlbumOutcome::Partial {
+            successful,
+            failed,
+            stages,
+        },
     }
 }
 
@@ -2722,14 +3351,17 @@ pub fn map_album_outcome(
     published: Option<&PublishedAlbum>,
     durable_log: Option<&Path>,
 ) -> ConversionStatus {
-    let output_path = published
-        .map(|p| p.album_dir.clone())
-        .unwrap_or_default();
+    let output_path = published.map(|p| p.album_dir.clone()).unwrap_or_default();
     let log_path = durable_log.map(|p| p.to_path_buf());
 
     match outcome {
-        AlbumOutcome::Complete { .. } => ConversionStatus::Completed { output_path, log_path },
-        AlbumOutcome::Partial { successful, failed, .. } => ConversionStatus::Partial {
+        AlbumOutcome::Complete { .. } => ConversionStatus::Completed {
+            output_path,
+            log_path,
+        },
+        AlbumOutcome::Partial {
+            successful, failed, ..
+        } => ConversionStatus::Partial {
             output_path,
             successful: successful.len() as u32,
             failed: failed.len() as u32,
@@ -2802,11 +3434,7 @@ fn stage_record(stage: PipelineStage, outcome: StageOutcome) -> StageRecord {
     StageRecord { stage, outcome }
 }
 
-async fn emit_stage_started(
-    reporter: &dyn PipelineReporter,
-    item_id: &str,
-    stage: PipelineStage,
-) {
+async fn emit_stage_started(reporter: &dyn PipelineReporter, item_id: &str, stage: PipelineStage) {
     reporter
         .emit(PipelineEvent::StageStarted {
             item_id: item_id.to_string(),
@@ -2815,11 +3443,7 @@ async fn emit_stage_started(
         .await;
 }
 
-async fn emit_stage_finished(
-    reporter: &dyn PipelineReporter,
-    item_id: &str,
-    record: StageRecord,
-) {
+async fn emit_stage_finished(reporter: &dyn PipelineReporter, item_id: &str, record: StageRecord) {
     reporter
         .emit(PipelineEvent::StageFinished {
             item_id: item_id.to_string(),
@@ -2830,7 +3454,15 @@ async fn emit_stage_finished(
 
 fn validate_template(template: &str) -> Result<(), String> {
     let known = [
-        "NN", "N", "TRACK", "TITLE", "ARTIST", "ALBUM_ARTIST", "ALBUM", "DISC", "FORMAT",
+        "NN",
+        "N",
+        "TRACK",
+        "TITLE",
+        "ARTIST",
+        "ALBUM_ARTIST",
+        "ALBUM",
+        "DISC",
+        "FORMAT",
     ];
     let mut rest = template;
     while let Some(start) = rest.find('%') {
@@ -2878,7 +3510,11 @@ fn render_track_template(
         .as_deref()
         .map(sanitize_component)
         .unwrap_or_else(|| "Album".to_string());
-    let disc = track.id.disc_number.or(track.metadata.disc_number).unwrap_or(1);
+    let disc = track
+        .id
+        .disc_number
+        .or(track.metadata.disc_number)
+        .unwrap_or(1);
     let n = track.metadata.track_number.unwrap_or(track.id.track_number);
 
     let mut rendered = template.to_string();
@@ -2894,7 +3530,9 @@ fn render_track_template(
 
     let rel = PathBuf::from(rendered);
     if rel.as_os_str().is_empty() {
-        return Err(PlanError::InvalidTemplate("template rendered empty".to_string()));
+        return Err(PlanError::InvalidTemplate(
+            "template rendered empty".to_string(),
+        ));
     }
     Ok(rel)
 }
@@ -3005,9 +3643,15 @@ fn staged_audio_path(
     ))
 }
 
-fn encode_command(input: &Path, output: &Path, req: &PipelineRequest, source_sample_rate: u32) -> Result<ToolCommand, ConvertError> {
+fn encode_command(
+    input: &Path,
+    output: &Path,
+    req: &PipelineRequest,
+    source_sample_rate: u32,
+) -> Result<ToolCommand, ConvertError> {
     // DSD sources (DSF/DFF) require sox for decimation to PCM.
-    let is_dsd = input.extension()
+    let is_dsd = input
+        .extension()
         .and_then(|e| e.to_str())
         .map(|e| matches!(e.to_lowercase().as_str(), "dsf" | "dff"))
         .unwrap_or(false);
@@ -3032,21 +3676,27 @@ fn encode_command(input: &Path, output: &Path, req: &PipelineRequest, source_sam
 /// Build a sox command for DSD→PCM conversion. Maps the source DSD rate
 /// to an appropriate PCM target rate and uses sox's very-high quality
 /// resampler (`rate -v`).
-fn dsd_to_pcm_command(input: &Path, output: &Path, source_sample_rate: u32) -> Result<ToolCommand, ConvertError> {
+fn dsd_to_pcm_command(
+    input: &Path,
+    output: &Path,
+    source_sample_rate: u32,
+) -> Result<ToolCommand, ConvertError> {
     let target_rate = match source_sample_rate {
-        r if r <= 2_822_400 => 88_200,     // DSD64 → 88.2 kHz
-        r if r <= 5_644_800 => 176_400,    // DSD128 → 176.4 kHz
-        r if r <= 11_289_600 => 352_800,   // DSD256 → 352.8 kHz
-        _ => 705_600,                       // DSD512/1024 → 705.6 kHz
+        r if r <= 2_822_400 => 88_200,   // DSD64 → 88.2 kHz
+        r if r <= 5_644_800 => 176_400,  // DSD128 → 176.4 kHz
+        r if r <= 11_289_600 => 352_800, // DSD256 → 352.8 kHz
+        _ => 705_600,                    // DSD512/1024 → 705.6 kHz
     };
 
     Ok(ToolCommand {
         binary: ToolBinary::Sox,
         args: vec![
             input.display().to_string(),
-            "-b".into(), "24".into(),
+            "-b".into(),
+            "24".into(),
             output.display().to_string(),
-            "rate".into(), "-v".into(),
+            "rate".into(),
+            "-v".into(),
             target_rate.to_string(),
         ],
         secret_args: vec![],
@@ -3166,13 +3816,21 @@ fn push_publish_entry(
 ) -> Result<(), PublishError> {
     let final_path = normalize_path(&final_path);
     if !path_is_under_root(&final_path, output_root) {
-        return Err(PublishError::PathOutsideOutputRoot(final_path.display().to_string()));
+        return Err(PublishError::PathOutsideOutputRoot(
+            final_path.display().to_string(),
+        ));
     }
     let key = normalized_collision_key(&final_path);
     if !seen.insert(key) {
-        return Err(PublishError::DestinationExists(final_path.display().to_string()));
+        return Err(PublishError::DestinationExists(
+            final_path.display().to_string(),
+        ));
     }
-    entries.push(PublishEntry { staged_path, final_path, role });
+    entries.push(PublishEntry {
+        staged_path,
+        final_path,
+        role,
+    });
     Ok(())
 }
 
@@ -3188,9 +3846,9 @@ fn infer_publish_album_dir(
     let mut album_component: Option<PathBuf> = None;
     for entry in entries {
         let final_path = normalize_path(&entry.final_path);
-        let rel = final_path.strip_prefix(output_root).map_err(|_| {
-            PublishError::PathOutsideOutputRoot(final_path.display().to_string())
-        })?;
+        let rel = final_path
+            .strip_prefix(output_root)
+            .map_err(|_| PublishError::PathOutsideOutputRoot(final_path.display().to_string()))?;
         let first_component = rel.components().find_map(|component| match component {
             Component::Normal(name) => Some(PathBuf::from(name.to_os_string())),
             _ => None,
@@ -3503,11 +4161,12 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn acquire_publish_lock(album_dir: &Path) -> Result<FileLock, PublishError> {
     let lock_path = album_lock_path(album_dir);
-    acquire_file_lock(&lock_path, "album directory is locked by another process")
-        .map_err(|err| match err {
+    acquire_file_lock(&lock_path, "album directory is locked by another process").map_err(|err| {
+        match err {
             LockAcquireError::Busy(message) => PublishError::DestinationExists(message),
             LockAcquireError::Io(err) => PublishError::Io(err),
-        })
+        }
+    })
 }
 
 fn acquire_run_lock(
@@ -3520,11 +4179,10 @@ fn acquire_run_lock(
         sanitize_component(job_id),
         sanitize_component(item_id)
     ));
-    acquire_file_lock(&lock_path, "pipeline item is already running")
-        .map_err(|err| match err {
-            LockAcquireError::Busy(message) => MaterializeError::Parse(message),
-            LockAcquireError::Io(err) => MaterializeError::Io(err),
-        })
+    acquire_file_lock(&lock_path, "pipeline item is already running").map_err(|err| match err {
+        LockAcquireError::Busy(message) => MaterializeError::Parse(message),
+        LockAcquireError::Io(err) => MaterializeError::Io(err),
+    })
 }
 
 fn acquire_file_lock(lock_path: &Path, busy_message: &str) -> Result<FileLock, LockAcquireError> {
@@ -3715,4 +4373,3 @@ mod rich_progress_stage_tests {
         assert_eq!(convert_progress_fraction(750, Some(1_000), 1, 2), 0.75);
     }
 }
-

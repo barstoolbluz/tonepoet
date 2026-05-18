@@ -1,10 +1,10 @@
 //! Conversion queue management
 
-use std::path::PathBuf;
-use std::collections::VecDeque;
+use super::formats::{AudioFormat, ConversionOptions, FileFormat};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use super::formats::{AudioFormat, FileFormat, ConversionOptions};
+use std::collections::VecDeque;
+use std::path::PathBuf;
 
 /// Phases of conversion process
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -30,7 +30,7 @@ impl ConversionPhase {
             ConversionPhase::Finalizing => "Finalizing",
         }
     }
-    
+
     /// Short name for progress bar display
     pub fn short_name(&self) -> &str {
         match self {
@@ -43,20 +43,20 @@ impl ConversionPhase {
             ConversionPhase::Finalizing => "Finalizing",
         }
     }
-    
+
     /// Weight of this phase in overall progress (0.0 to 1.0)
     pub fn weight(&self) -> f32 {
         match self {
-            ConversionPhase::Extracting => 0.15,      // 15%
-            ConversionPhase::Analyzing => 0.05,       // 5%
-            ConversionPhase::Renaming => 0.10,        // 10%
-            ConversionPhase::Tagging => 0.10,         // 10%
-            ConversionPhase::Converting => 0.50,      // 50% (bulk of the work)
-            ConversionPhase::PostProcessing => 0.05,  // 5%
-            ConversionPhase::Finalizing => 0.05,      // 5%
+            ConversionPhase::Extracting => 0.15,     // 15%
+            ConversionPhase::Analyzing => 0.05,      // 5%
+            ConversionPhase::Renaming => 0.10,       // 10%
+            ConversionPhase::Tagging => 0.10,        // 10%
+            ConversionPhase::Converting => 0.50,     // 50% (bulk of the work)
+            ConversionPhase::PostProcessing => 0.05, // 5%
+            ConversionPhase::Finalizing => 0.05,     // 5%
         }
     }
-    
+
     /// Starting point of this phase in overall progress
     pub fn start_progress(&self) -> f32 {
         match self {
@@ -69,7 +69,7 @@ impl ConversionPhase {
             ConversionPhase::Finalizing => 0.95,
         }
     }
-    
+
     /// Calculate overall progress given phase progress
     pub fn calculate_overall_progress(&self, phase_progress: f32) -> f32 {
         let phase_progress_normalized = phase_progress.max(0.0).min(100.0) / 100.0;
@@ -87,8 +87,8 @@ pub enum ConversionStatus {
     /// Waiting to be processed
     Queued,
     /// Currently being processed
-    Processing { 
-        progress: f32,             // Keep for backward compatibility
+    Processing {
+        progress: f32, // Keep for backward compatibility
         /// Optional message like "Converting file 3 of 10..."
         message: Option<String>,
         /// For multi-file conversions: current file and total files
@@ -184,18 +184,12 @@ impl Default for ConversionItem {
 
 impl ConversionItem {
     /// Create a new conversion item
-    pub fn new(
-        input_path: PathBuf,
-        input_format: FileFormat,
-        options: ConversionOptions,
-    ) -> Self {
+    pub fn new(input_path: PathBuf, input_format: FileFormat, options: ConversionOptions) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let file_size = std::fs::metadata(&input_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        
+        let file_size = std::fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
+
         let archive_password = None;
-        
+
         Self {
             id,
             input_path,
@@ -203,7 +197,7 @@ impl ConversionItem {
             output_format: options.output_format,
             output_path: None,
             options,
-            status: ConversionStatus::NotConfigured,  // Items start as NotConfigured; user must select settings
+            status: ConversionStatus::NotConfigured, // Items start as NotConfigured; user must select settings
             queued_at: Utc::now(),
             started_at: None,
             completed_at: None,
@@ -219,9 +213,9 @@ impl ConversionItem {
         matches!(
             self.status,
             ConversionStatus::Completed { .. }
-            | ConversionStatus::Partial { .. }
-            | ConversionStatus::Failed { .. }
-            | ConversionStatus::Cancelled
+                | ConversionStatus::Partial { .. }
+                | ConversionStatus::Failed { .. }
+                | ConversionStatus::Cancelled
         )
     }
 
@@ -230,19 +224,19 @@ impl ConversionItem {
         matches!(
             self.status,
             ConversionStatus::Failed { .. }
-            | ConversionStatus::Partial { .. }
-            | ConversionStatus::Cancelled
+                | ConversionStatus::Partial { .. }
+                | ConversionStatus::Cancelled
         )
     }
 }
-
-
 
 fn status_progress(status: &ConversionStatus) -> f32 {
     match status {
         ConversionStatus::Processing { progress, .. } => *progress,
         ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
-        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => 0.0,
+        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => {
+            0.0
+        }
         ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => 0.0,
     }
 }
@@ -271,7 +265,7 @@ impl ConversionQueue {
     pub(crate) fn items_mut(&mut self) -> &mut VecDeque<ConversionItem> {
         &mut self.items
     }
-    
+
     /// Add an item to the queue
     pub fn add_item(&mut self, path: PathBuf, format: FileFormat, options: ConversionOptions) {
         let item = ConversionItem::new(path, format, options);
@@ -282,7 +276,7 @@ impl ConversionQueue {
     pub fn add_item_direct(&mut self, item: ConversionItem) {
         self.items.push_back(item);
     }
-    
+
     /// Get the next item to process
     pub fn next_item(&mut self) -> Option<ConversionItem> {
         // Move current to completed if it exists
@@ -294,7 +288,7 @@ impl ConversionQueue {
                 self.items.push_front(current);
             }
         }
-        
+
         // Find next queued item
         for i in 0..self.items.len() {
             if self.items[i].status == ConversionStatus::Queued {
@@ -302,15 +296,15 @@ impl ConversionQueue {
                 return self.current.clone();
             }
         }
-        
+
         None
     }
-    
+
     /// Update the status of the current item
     pub fn update_current_status(&mut self, status: ConversionStatus) {
         if let Some(ref mut current) = self.current {
             current.status = status;
-            
+
             match &current.status {
                 ConversionStatus::Processing { .. } => {
                     if current.started_at.is_none() {
@@ -327,12 +321,12 @@ impl ConversionQueue {
             }
         }
     }
-    
+
     /// Get the current item being processed
     pub fn current_item(&self) -> Option<&ConversionItem> {
         self.current.as_ref()
     }
-    
+
     /// Get all items (queued + current + completed)
     pub fn all_items(&self) -> Vec<&ConversionItem> {
         let mut items: Vec<&ConversionItem> = self.items.iter().collect();
@@ -342,7 +336,7 @@ impl ConversionQueue {
         items.extend(self.completed.iter());
         items
     }
-    
+
     /// Get all items mutably (queued + current + completed)
     pub fn all_items_mut(&mut self) -> Vec<&mut ConversionItem> {
         let mut items: Vec<&mut ConversionItem> = self.items.iter_mut().collect();
@@ -352,35 +346,39 @@ impl ConversionQueue {
         items.extend(self.completed.iter_mut());
         items
     }
-    
+
     /// Get queued items (only those ready for conversion, not NotConfigured)
     pub fn queued_items(&self) -> Vec<&ConversionItem> {
-        self.items.iter()
+        self.items
+            .iter()
             .filter(|item| item.status == ConversionStatus::Queued)
             .collect()
     }
-    
+
     /// Get completed items
     pub fn completed_items(&self) -> usize {
-        self.completed.iter()
+        self.completed
+            .iter()
             .filter(|item| matches!(item.status, ConversionStatus::Completed { .. }))
             .count()
     }
-    
+
     /// Get failed items
     pub fn failed_items(&self) -> usize {
-        self.completed.iter()
+        self.completed
+            .iter()
             .filter(|item| matches!(item.status, ConversionStatus::Failed { .. }))
             .count()
     }
 
     /// Get partial items (counted separately from completed and failed)
     pub fn partial_items(&self) -> usize {
-        self.completed.iter()
+        self.completed
+            .iter()
             .filter(|item| matches!(item.status, ConversionStatus::Partial { .. }))
             .count()
     }
-    
+
     /// Get total items
     pub fn total_items(&self) -> usize {
         self.items.len() + (if self.current.is_some() { 1 } else { 0 }) + self.completed.len()
@@ -394,8 +392,10 @@ impl ConversionQueue {
 
     /// Clear completed items only
     pub fn clear_completed(&mut self) {
-        self.items.retain(|item| !matches!(item.status, ConversionStatus::Completed { .. }));
-        self.completed.retain(|item| !matches!(item.status, ConversionStatus::Completed { .. }));
+        self.items
+            .retain(|item| !matches!(item.status, ConversionStatus::Completed { .. }));
+        self.completed
+            .retain(|item| !matches!(item.status, ConversionStatus::Completed { .. }));
     }
 
     /// Clear all terminal items (Completed, Failed, Partial, Cancelled)
@@ -404,9 +404,9 @@ impl ConversionQueue {
             matches!(
                 item.status,
                 ConversionStatus::Completed { .. }
-                | ConversionStatus::Partial { .. }
-                | ConversionStatus::Failed { .. }
-                | ConversionStatus::Cancelled
+                    | ConversionStatus::Partial { .. }
+                    | ConversionStatus::Failed { .. }
+                    | ConversionStatus::Cancelled
             )
         };
         self.items.retain(|item| !is_terminal(item));
@@ -419,29 +419,29 @@ impl ConversionQueue {
         self.current = None;
         self.completed.clear();
     }
-    
+
     /// Find a specific item by ID for updating
     pub fn find_item_mut(&mut self, item_id: &str) -> Option<&mut ConversionItem> {
         // Check in the main items queue
         if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
             return Some(item);
         }
-        
+
         // Check if it's the current item
         if let Some(ref mut current) = self.current {
             if current.id == item_id {
                 return Some(current);
             }
         }
-        
+
         // Check in completed items
         if let Some(item) = self.completed.iter_mut().find(|item| item.id == item_id) {
             return Some(item);
         }
-        
+
         None
     }
-    
+
     /// Update item status by ID
     pub fn update_item_status(&mut self, item_id: &str, status: ConversionStatus) -> bool {
         if let Some(item) = self.find_item_mut(item_id) {
@@ -451,7 +451,7 @@ impl ConversionQueue {
             false
         }
     }
-    
+
     /// Pause selected items
     pub fn pause_selected(&mut self) {
         for item in &mut self.items {
@@ -460,7 +460,7 @@ impl ConversionQueue {
             }
         }
     }
-    
+
     /// Resume selected items
     pub fn resume_selected(&mut self) {
         for item in &mut self.items {
@@ -469,14 +469,18 @@ impl ConversionQueue {
             }
         }
     }
-    
+
     /// Cancel selected items
     pub fn cancel_selected(&mut self) {
         self.items.retain(|item| {
-            !(item.selected && matches!(item.status, ConversionStatus::Queued | ConversionStatus::Paused))
+            !(item.selected
+                && matches!(
+                    item.status,
+                    ConversionStatus::Queued | ConversionStatus::Paused
+                ))
         });
     }
-    
+
     /// Retry failed items
     pub fn retry_failed(&mut self) {
         let mut to_retry = Vec::new();
@@ -502,7 +506,6 @@ impl ConversionQueue {
         self.items.retain(|item| !item.selected);
         initial_count - self.items.len()
     }
-
 }
 
 impl Default for ConversionQueue {

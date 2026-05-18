@@ -7,7 +7,7 @@
 //! Does not convert, tag, merge, run ReplayGain, generate feature
 //! files, publish, write durable logs, or emit terminal events.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,6 +15,11 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{MaterializeError, ToolRunnerError};
+use super::progress::{
+    probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker, StreamSource,
+    StreamingHeartbeat,
+};
+use super::reporter::PipelineReporter;
 use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 
@@ -23,8 +28,8 @@ use super::types::*;
 // =========================================================================
 
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "wav", "aiff", "aif", "wv", "mp3", "m4a", "aac", "opus",
-    "ogg", "ape", "dsf", "dff", "w64", "rf64",
+    "flac", "wav", "aiff", "aif", "wv", "mp3", "m4a", "aac", "opus", "ogg", "ape", "dsf", "dff",
+    "w64", "rf64",
 ];
 
 fn is_audio_extension(ext: &str) -> bool {
@@ -44,13 +49,15 @@ impl super::stages::Materializer for SevenZipMaterializer {
         req: &PipelineRequest,
         staging: &StagingDir,
         runner: &dyn ToolRunner,
+        reporter: Option<&dyn PipelineReporter>,
+        tool_paths: &HashMap<String, PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<PreparedSource, MaterializeError> {
         // Ensure the staging directory exists.
         std::fs::create_dir_all(&staging.root)?;
 
         // 1. Extract the archive.
-        extract_archive(req, staging, runner, cancel).await?;
+        extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
 
         // Check cancellation between major steps.
         if cancel.is_cancelled() {
@@ -122,6 +129,8 @@ async fn extract_archive(
     req: &PipelineRequest,
     staging: &StagingDir,
     runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    tool_paths: &HashMap<String, PathBuf>,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
     let mut args = vec![
@@ -185,9 +194,7 @@ fn discover_audio_files(dir: &Path) -> Result<Vec<PathBuf>, MaterializeError> {
 fn walk_audio_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), MaterializeError> {
     let entries = std::fs::read_dir(dir).map_err(MaterializeError::Io)?;
     // Collect and sort directory entries for deterministic traversal.
-    let mut entries: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
@@ -318,16 +325,28 @@ fn read_track_metadata(path: &Path) -> TrackMetadata {
     TrackMetadata {
         title: tag.title().map(|s| s.to_string()),
         artist: tag.artist().map(|s| s.to_string()),
-        album_artist: tag.get_string(&lofty::tag::ItemKey::AlbumArtist).map(|s| s.to_string()),
-        composer: tag.get_string(&lofty::tag::ItemKey::Composer).map(|s| s.to_string()),
-        performer: tag.get_string(&lofty::tag::ItemKey::Performer).map(|s| s.to_string()),
+        album_artist: tag
+            .get_string(&lofty::tag::ItemKey::AlbumArtist)
+            .map(|s| s.to_string()),
+        composer: tag
+            .get_string(&lofty::tag::ItemKey::Composer)
+            .map(|s| s.to_string()),
+        performer: tag
+            .get_string(&lofty::tag::ItemKey::Performer)
+            .map(|s| s.to_string()),
         genre: tag.genre().map(|s| s.to_string()),
         date: tag.year().map(|y| y.to_string()),
         track_number: tag.track().map(|t| t as u32),
         disc_number: tag.disk().map(|d| d as u32),
-        isrc: tag.get_string(&lofty::tag::ItemKey::Isrc).map(|s| s.to_string()),
-        publisher: tag.get_string(&lofty::tag::ItemKey::Publisher).map(|s| s.to_string()),
-        copyright: tag.get_string(&lofty::tag::ItemKey::CopyrightMessage).map(|s| s.to_string()),
+        isrc: tag
+            .get_string(&lofty::tag::ItemKey::Isrc)
+            .map(|s| s.to_string()),
+        publisher: tag
+            .get_string(&lofty::tag::ItemKey::Publisher)
+            .map(|s| s.to_string()),
+        copyright: tag
+            .get_string(&lofty::tag::ItemKey::CopyrightMessage)
+            .map(|s| s.to_string()),
         comment: tag.comment().map(|s| s.to_string()),
         pre_emphasis: false,
         extra,
@@ -348,15 +367,15 @@ fn apply_track_selection(
         TrackSelection::All => Ok(tracks),
         TrackSelection::Range { start, end } => {
             if *start == 0 || *end == 0 || start > end {
-                return Err(MaterializeError::InvalidTrackSelection(
-                    format!("invalid range {start}-{end}"),
-                ));
+                return Err(MaterializeError::InvalidTrackSelection(format!(
+                    "invalid range {start}-{end}"
+                )));
             }
             let max_ordinal = tracks.len() as u32;
             if *start > max_ordinal {
-                return Err(MaterializeError::InvalidTrackSelection(
-                    format!("range start {start} exceeds track count {max_ordinal}"),
-                ));
+                return Err(MaterializeError::InvalidTrackSelection(format!(
+                    "range start {start} exceeds track count {max_ordinal}"
+                )));
             }
             Ok(tracks
                 .into_iter()
@@ -372,9 +391,9 @@ fn apply_track_selection(
             let max_ordinal = tracks.len() as u32;
             for &idx in indices {
                 if idx == 0 || idx > max_ordinal {
-                    return Err(MaterializeError::InvalidTrackSelection(
-                        format!("track {idx} outside valid range 1-{max_ordinal}"),
-                    ));
+                    return Err(MaterializeError::InvalidTrackSelection(format!(
+                        "track {idx} outside valid range 1-{max_ordinal}"
+                    )));
                 }
             }
             Ok(tracks
@@ -401,7 +420,10 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
         F: Fn(&TrackMetadata) -> &Option<String>,
     {
         let first = f(&tracks[0].metadata).as_ref()?;
-        if tracks.iter().all(|t| f(&t.metadata).as_deref() == Some(first)) {
+        if tracks
+            .iter()
+            .all(|t| f(&t.metadata).as_deref() == Some(first))
+        {
             Some(first.clone())
         } else {
             None
@@ -409,17 +431,17 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
     }
 
     let total_tracks = tracks.len() as u32;
-    let total_discs = tracks
-        .iter()
-        .filter_map(|t| t.id.disc_number)
-        .max();
+    let total_discs = tracks.iter().filter_map(|t| t.id.disc_number).max();
 
     // Album name lives in extra["album"] (TrackMetadata has no
     // dedicated album field). Extract if all tracks agree.
     let album = {
         let first = tracks[0].metadata.extra.get("album");
         if let Some(a) = first {
-            if tracks.iter().all(|t| t.metadata.extra.get("album") == Some(a)) {
+            if tracks
+                .iter()
+                .all(|t| t.metadata.extra.get("album") == Some(a))
+            {
                 Some(a.clone())
             } else {
                 None
@@ -431,8 +453,7 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
 
     AlbumMetadata {
         album,
-        album_artist: common(tracks, |m| &m.album_artist)
-            .or_else(|| common(tracks, |m| &m.artist)),
+        album_artist: common(tracks, |m| &m.album_artist).or_else(|| common(tracks, |m| &m.artist)),
         genre: common(tracks, |m| &m.genre),
         date: common(tracks, |m| &m.date),
         total_tracks,

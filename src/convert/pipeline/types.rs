@@ -547,7 +547,11 @@ impl StagingDir {
     /// Create a staging dir handle. Does not create the directory —
     /// the runtime owns directory creation.
     pub fn new(root: PathBuf, job_id: String) -> Self {
-        Self { root, job_id, armed: true }
+        Self {
+            root,
+            job_id,
+            armed: true,
+        }
     }
 
     /// Suppress `Drop` cleanup — the tree is now owned by a

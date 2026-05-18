@@ -22,7 +22,7 @@ pub const CYAN: Color = Color::Rgb(115, 218, 202);
 pub const RED: Color = Color::Rgb(247, 118, 142);
 
 // Hover
-pub const HOVER_BG: Color = SURFACE;  // Subtle background lift on hover
+pub const HOVER_BG: Color = SURFACE; // Subtle background lift on hover
 
 // Pill styles
 pub const PILL_ACTIVE_BG: Color = BLUE;

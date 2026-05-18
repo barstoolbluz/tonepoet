@@ -100,12 +100,7 @@ mod tests {
         let now = Instant::now();
 
         assert!(throttle.should_send(0.100, "track-1", false, now));
-        assert!(throttle.should_send(
-            0.101,
-            "track-2",
-            false,
-            now + Duration::from_millis(100),
-        ));
+        assert!(throttle.should_send(0.101, "track-2", false, now + Duration::from_millis(100),));
     }
 
     #[test]
@@ -156,12 +151,7 @@ mod tests {
         let now = Instant::now();
 
         assert!(throttle.should_send(0.100, "working", false, now));
-        assert!(throttle.should_send(
-            0.106,
-            "working",
-            false,
-            now + Duration::from_millis(100),
-        ));
+        assert!(throttle.should_send(0.106, "working", false, now + Duration::from_millis(100),));
     }
 
     #[test]
@@ -170,12 +160,7 @@ mod tests {
         let now = Instant::now();
 
         assert!(throttle.should_send(0.100, "working", false, now));
-        assert!(throttle.should_send(
-            0.101,
-            "working",
-            false,
-            now + Duration::from_millis(501),
-        ));
+        assert!(throttle.should_send(0.101, "working", false, now + Duration::from_millis(501),));
     }
 
     #[test]
@@ -184,11 +169,6 @@ mod tests {
         let now = Instant::now();
 
         assert!(throttle.should_send(0.100, "working", false, now));
-        assert!(throttle.should_send(
-            0.100,
-            "working",
-            true,
-            now + Duration::from_millis(1),
-        ));
+        assert!(throttle.should_send(0.100, "working", true, now + Duration::from_millis(1),));
     }
 }

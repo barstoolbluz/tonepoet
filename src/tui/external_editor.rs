@@ -70,7 +70,7 @@ pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
         "vim" | "vi" | "nvim" => Some("-R"),
         "nano" => Some("-v"),
         "less" | "more" | "bat" | "cat" => None, // inherently read-only
-        _ => Some("-R"), // best guess (vim-compatible)
+        _ => Some("-R"),                         // best guess (vim-compatible)
     };
 
     // Suspend TUI.
@@ -90,7 +90,8 @@ pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
         cmd.arg(flag);
     }
     cmd.arg(path);
-    let status = cmd.status()
+    let status = cmd
+        .status()
         .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
 
     // Restore TUI.

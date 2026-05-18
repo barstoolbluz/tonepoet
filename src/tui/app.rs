@@ -15,12 +15,12 @@ use crate::tui::probe::{SourceInfo, SourceMetadata};
 /// Which screen is currently displayed
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppScreen {
-    Browse,    // Tab 1 — default home; file browsing + selection
-    Library,   // Tab 2 — placeholder
-    Convert,   // Tab 3 — conversion settings / staging area for new batches
-    Queue,     // Tab 4 — file queue
-    Config,    // Tab 5 — settings
-    Wizard,    // Full-screen overlay (not a tab)
+    Browse,  // Tab 1 — default home; file browsing + selection
+    Library, // Tab 2 — placeholder
+    Convert, // Tab 3 — conversion settings / staging area for new batches
+    Queue,   // Tab 4 — file queue
+    Config,  // Tab 5 — settings
+    Wizard,  // Full-screen overlay (not a tab)
 }
 
 impl AppScreen {
@@ -232,7 +232,10 @@ impl SourceMode {
         match paths.len() {
             0 => Self::Empty,
             1 => {
-                let path = paths.into_iter().next().expect("len == 1 means one element");
+                let path = paths
+                    .into_iter()
+                    .next()
+                    .expect("len == 1 means one element");
                 Self::from_single(path, None, SourceMetadata::default())
             }
             _ => {
@@ -304,7 +307,9 @@ impl SourceMode {
         match self {
             Self::Empty => SourceMetadata::default(),
             Self::Single { metadata, .. } | Self::MultiTrack { metadata, .. } => metadata.clone(),
-            Self::Batch { cursor_metadata, .. } => cursor_metadata.clone(),
+            Self::Batch {
+                cursor_metadata, ..
+            } => cursor_metadata.clone(),
         }
     }
 
@@ -349,8 +354,12 @@ impl SourceMode {
                     let album_artist = sacd.album_artist().map(|s| s.to_string());
 
                     let mut meta = metadata;
-                    if meta.album.is_none() { meta.album = album_title.clone(); }
-                    if meta.artist.is_none() { meta.artist = album_artist.clone(); }
+                    if meta.album.is_none() {
+                        meta.album = album_title.clone();
+                    }
+                    if meta.artist.is_none() {
+                        meta.artist = album_artist.clone();
+                    }
 
                     let track_count = tracks.len();
                     return Self::MultiTrack {
@@ -385,8 +394,12 @@ impl SourceMode {
                         .collect();
 
                     let mut meta = metadata;
-                    if meta.album.is_none() { meta.album = sheet.title.clone(); }
-                    if meta.artist.is_none() { meta.artist = sheet.performer.clone(); }
+                    if meta.album.is_none() {
+                        meta.album = sheet.title.clone();
+                    }
+                    if meta.artist.is_none() {
+                        meta.artist = sheet.performer.clone();
+                    }
 
                     let track_count = tracks.len();
                     return Self::MultiTrack {
@@ -405,7 +418,11 @@ impl SourceMode {
             }
         }
 
-        Self::Single { path, info, metadata }
+        Self::Single {
+            path,
+            info,
+            metadata,
+        }
     }
 }
 
@@ -1084,7 +1101,10 @@ pub enum GnudbRowKind {
     /// Per-track header line (non-selectable, cursor skips).
     TrackHeader { track_idx: usize },
     /// Per-track editable field: "Title" or "Artist".
-    TrackField { track_idx: usize, field: &'static str },
+    TrackField {
+        track_idx: usize,
+        field: &'static str,
+    },
 }
 
 /// A single proposed change from a CUE import.
@@ -1340,7 +1360,9 @@ impl CuePreviewState {
         let Some(line) = self.content.lines().nth(line_idx) else {
             return false;
         };
-        self.edit = Some(crate::tui::text_input::TextInputState::new(line.to_string()));
+        self.edit = Some(crate::tui::text_input::TextInputState::new(
+            line.to_string(),
+        ));
         self.cursor = Some(line_idx);
         true
     }
@@ -1428,10 +1450,7 @@ impl BulkRenameState {
             })
             .collect();
         let default_template = "%NN% - %TITLE%".to_string();
-        let plan = crate::tui::rename_plan::RenamePlan::new(
-            base_dir,
-            Vec::new(),
-        );
+        let plan = crate::tui::rename_plan::RenamePlan::new(base_dir, Vec::new());
         let mut state = Self {
             sources,
             metadata,
@@ -1819,8 +1838,7 @@ impl AppState {
             }
             Err(e) => {
                 log::error!("Failed to open database: {}. Using in-memory fallback.", e);
-                crate::db::Database::open_memory()
-                    .expect("in-memory DB should never fail")
+                crate::db::Database::open_memory().expect("in-memory DB should never fail")
             }
         };
 
@@ -1928,7 +1946,8 @@ impl AppState {
         self.manager.save_queue(true).ok();
         // SQLite sync (ACID, transactional).
         if let Ok(q) = self.manager.queue.try_read() {
-            let items: Vec<&crate::convert::ConversionItem> = q.all_items()
+            let items: Vec<&crate::convert::ConversionItem> = q
+                .all_items()
                 .into_iter()
                 .filter(|item| {
                     !matches!(
@@ -2092,15 +2111,27 @@ impl AppState {
         // first-file probe/metadata in the appropriate variant.
         let mut mode = SourceMode::from_paths(valid);
         match &mut mode {
-            SourceMode::Single { info: slot, metadata: meta_slot, .. } => {
+            SourceMode::Single {
+                info: slot,
+                metadata: meta_slot,
+                ..
+            } => {
                 *slot = info;
                 *meta_slot = metadata;
             }
-            SourceMode::Batch { cursor_info, cursor_metadata, .. } => {
+            SourceMode::Batch {
+                cursor_info,
+                cursor_metadata,
+                ..
+            } => {
                 *cursor_info = info;
                 *cursor_metadata = metadata;
             }
-            SourceMode::MultiTrack { info: slot, metadata: meta_slot, .. } => {
+            SourceMode::MultiTrack {
+                info: slot,
+                metadata: meta_slot,
+                ..
+            } => {
                 *slot = info;
                 *meta_slot = metadata;
             }
@@ -2150,7 +2181,11 @@ mod cue_preview_state_tests {
 
     #[test]
     fn new_defaults_to_writable() {
-        let s = CuePreviewState::new("x".into(), std::path::PathBuf::from("/tmp/x.cue"), "s".into());
+        let s = CuePreviewState::new(
+            "x".into(),
+            std::path::PathBuf::from("/tmp/x.cue"),
+            "s".into(),
+        );
         assert!(!s.read_only, "::new must default to writable");
     }
 
@@ -2158,8 +2193,11 @@ mod cue_preview_state_tests {
     fn new_readonly_sets_flag_and_clears_write_path() {
         let s = CuePreviewState::new_readonly("content\nline\n".into(), "summary".into());
         assert!(s.read_only, "new_readonly must set read_only");
-        assert_eq!(s.write_path, std::path::PathBuf::new(),
-            "new_readonly must use empty write_path (no disk target)");
+        assert_eq!(
+            s.write_path,
+            std::path::PathBuf::new(),
+            "new_readonly must use empty write_path (no disk target)"
+        );
         assert!(s.edit.is_none());
         assert!(s.cursor.is_none());
     }

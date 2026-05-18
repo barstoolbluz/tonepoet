@@ -30,7 +30,9 @@ pub fn pills_to_options(
 
     // Build format-specific quality settings
     let quality = match output_format {
-        AudioFormat::Flac => QualitySettings::Flac { compression_level: 5 },
+        AudioFormat::Flac => QualitySettings::Flac {
+            compression_level: 5,
+        },
         AudioFormat::Wav => QualitySettings::Wav {
             bit_depth: backend_depth as u16,
             sample_rate: target_sample_rate,

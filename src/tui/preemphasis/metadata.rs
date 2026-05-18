@@ -129,10 +129,7 @@ fn sorted_paths_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
         Err(_) => Vec::new(),
     };
 
-    paths.sort_by(|a, b| {
-        normalized_path_text(a)
-            .cmp(&normalized_path_text(b))
-    });
+    paths.sort_by(|a, b| normalized_path_text(a).cmp(&normalized_path_text(b)));
     paths
 }
 
@@ -154,7 +151,8 @@ fn check_cue_file_for_audio_preemphasis(cue_path: &Path, audio_path: &Path) -> b
 
     for line in content.lines() {
         if let Some(file_ref) = parse_cue_file_reference(line) {
-            current_file_matches_audio = cue_file_reference_matches_audio(cue_path, &file_ref, audio_path);
+            current_file_matches_audio =
+                cue_file_reference_matches_audio(cue_path, &file_ref, audio_path);
             continue;
         }
 
@@ -263,7 +261,8 @@ struct LogBlockState {
 }
 
 fn sidecar_path_stem_matches_audio(sidecar_path: &Path, audio_path: &Path) -> bool {
-    paths_have_same_parent(sidecar_path, audio_path) && paths_have_same_audio_stem(sidecar_path, audio_path)
+    paths_have_same_parent(sidecar_path, audio_path)
+        && paths_have_same_audio_stem(sidecar_path, audio_path)
 }
 
 fn log_content_has_positive_preemphasis_for_audio(
@@ -456,14 +455,16 @@ fn line_has_filename_field(line: &str) -> bool {
     let tokens = alphanumeric_tokens(&lowercase);
 
     tokens.iter().any(|token| *token == "filename")
-        || tokens.windows(2).any(|pair| pair[0] == "file" && pair[1] == "name")
+        || tokens
+            .windows(2)
+            .any(|pair| pair[0] == "file" && pair[1] == "name")
 }
 
 fn line_mentions_known_audio_file(line: &str) -> bool {
     let lowercase = line.to_ascii_lowercase();
     const AUDIO_EXTENSIONS: &[&str] = &[
-        ".aif", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus",
-        ".wav", ".wave", ".wv",
+        ".aif", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav",
+        ".wave", ".wv",
     ];
 
     AUDIO_EXTENSIONS
@@ -574,7 +575,18 @@ fn path_has_known_audio_extension(path: &Path) -> bool {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some(ext) => matches!(
             ext.to_ascii_lowercase().as_str(),
-            "aif" | "aiff" | "alac" | "ape" | "flac" | "m4a" | "mp3" | "ogg" | "opus" | "wav" | "wave" | "wv"
+            "aif"
+                | "aiff"
+                | "alac"
+                | "ape"
+                | "flac"
+                | "m4a"
+                | "mp3"
+                | "ogg"
+                | "opus"
+                | "wav"
+                | "wave"
+                | "wv"
         ),
         None => false,
     }
@@ -746,7 +758,10 @@ mod tests {
         );
         write_file(&log, "Pre-emphasis: Yes\n");
 
-        assert_eq!(check_file_evidence(&audio), Some(PreemphasisEvidence::CueFile));
+        assert_eq!(
+            check_file_evidence(&audio),
+            Some(PreemphasisEvidence::CueFile)
+        );
     }
 
     #[test]
@@ -754,9 +769,7 @@ mod tests {
         assert!(!text_has_positive_preemphasis_statement(
             "No pre-emphasis detected"
         ));
-        assert!(!text_has_positive_preemphasis_statement(
-            "Pre-emphasis: No"
-        ));
+        assert!(!text_has_positive_preemphasis_statement("Pre-emphasis: No"));
         assert!(!text_has_positive_preemphasis_statement(
             "without pre emphasis"
         ));
@@ -767,9 +780,7 @@ mod tests {
 
     #[test]
     fn logs_accept_positive_preemphasis_mentions() {
-        assert!(text_has_positive_preemphasis_statement(
-            "Pre-emphasis: Yes"
-        ));
+        assert!(text_has_positive_preemphasis_statement("Pre-emphasis: Yes"));
         assert!(text_has_positive_preemphasis_statement("with pre emphasis"));
         assert!(text_has_positive_preemphasis_statement("has pre-emphasis"));
         assert!(text_has_positive_preemphasis_statement(
@@ -830,7 +841,11 @@ mod tests {
         let audio = Path::new("/music/Disc 1/01 - Zimbabwe.flac");
         let log = "Track 02\nPre-emphasis: Yes\n";
 
-        assert!(!log_content_has_positive_preemphasis_for_audio(log, audio, LogAssociation::SharedLog));
+        assert!(!log_content_has_positive_preemphasis_for_audio(
+            log,
+            audio,
+            LogAssociation::SharedLog
+        ));
     }
 
     #[test]
@@ -838,7 +853,11 @@ mod tests {
         let audio = Path::new("/music/Disc 1/01 - Zimbabwe.flac");
         let log = "Track 99\nFilename 01 - Zimbabwe.wav\nPre-emphasis: Yes\n";
 
-        assert!(log_content_has_positive_preemphasis_for_audio(log, audio, LogAssociation::SharedLog));
+        assert!(log_content_has_positive_preemphasis_for_audio(
+            log,
+            audio,
+            LogAssociation::SharedLog
+        ));
     }
 
     #[test]
@@ -846,7 +865,11 @@ mod tests {
         let audio = Path::new("/music/Disc 1/01 - Zimbabwe.flac");
         let log = "Track 01\nFilename 02 - Gondwana.wav\nPre-emphasis: Yes\n";
 
-        assert!(!log_content_has_positive_preemphasis_for_audio(log, audio, LogAssociation::SharedLog));
+        assert!(!log_content_has_positive_preemphasis_for_audio(
+            log,
+            audio,
+            LogAssociation::SharedLog
+        ));
     }
 
     #[test]
@@ -885,7 +908,10 @@ mod tests {
             "Disc 1\nTrack 01\nFilename Disc 1/01 - Zimbabwe.wav\nPre-emphasis: Yes\n",
         );
 
-        assert_eq!(check_file_evidence(&audio), Some(PreemphasisEvidence::LogFile));
+        assert_eq!(
+            check_file_evidence(&audio),
+            Some(PreemphasisEvidence::LogFile)
+        );
     }
 
     #[test]

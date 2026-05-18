@@ -7,13 +7,13 @@ use ratatui::{
 
 use super::app::{AppState, ConvertFocus};
 use super::button_map::{ButtonRenderMap, MetadataFieldKind, TuiButton};
+use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
-use super::draw_preset_bar::draw_preset_bar;
-use super::draw_source::draw_source_pane;
 use super::draw_metadata::draw_metadata_pane;
 use super::draw_output::draw_format_pane;
 use super::draw_output_options::draw_output_options_pane;
-use super::draw_footer::draw_footer;
+use super::draw_preset_bar::draw_preset_bar;
+use super::draw_source::draw_source_pane;
 use super::pill::PillState;
 
 /// Draw the full convert screen
@@ -29,7 +29,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
             Constraint::Length(5),  // metadata pane
             Constraint::Length(10), // format pane
             Constraint::Length(7),  // output options pane
-            Constraint::Min(0),    // absorb extra vertical space
+            Constraint::Min(0),     // absorb extra vertical space
             Constraint::Length(2),  // footer (tabs + context)
         ])
         .split(area);
@@ -42,23 +42,37 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         draw_preset_bar(f, chunks[2], preset, buttons);
     }
     draw_source_pane(
-        f, chunks[4], &app.convert.source,
+        f,
+        chunks[4],
+        &app.convert.source,
         app.convert.focus == ConvertFocus::Source,
     );
     draw_metadata_pane(
-        f, chunks[5], &app.convert.metadata,
+        f,
+        chunks[5],
+        &app.convert.metadata,
         app.convert.focus == ConvertFocus::Metadata,
     );
     draw_format_pane(
-        f, chunks[6], &app.convert.format,
+        f,
+        chunks[6],
+        &app.convert.format,
         app.convert.focus == ConvertFocus::Format,
     );
     draw_output_options_pane(
-        f, chunks[7], &app.convert.output_options,
+        f,
+        chunks[7],
+        &app.convert.output_options,
         app.convert.focus == ConvertFocus::OutputOptions,
     );
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
-    draw_footer(f, chunks[9], app.current_screen, &mut app.button_map, status_msg);
+    draw_footer(
+        f,
+        chunks[9],
+        app.current_screen,
+        &mut app.button_map,
+        status_msg,
+    );
 
     // Pass 2: Register mouse button areas (mutable access to button_map)
     register_buttons(app, &chunks);
@@ -73,10 +87,16 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
     let output_options_area = chunks[7];
 
     // Pane focus areas
-    app.button_map.record_button(TuiButton::Pane(ConvertFocus::Source), source_area);
-    app.button_map.record_button(TuiButton::Pane(ConvertFocus::Metadata), metadata_area);
-    app.button_map.record_button(TuiButton::Pane(ConvertFocus::Format), format_area);
-    app.button_map.record_button(TuiButton::Pane(ConvertFocus::OutputOptions), output_options_area);
+    app.button_map
+        .record_button(TuiButton::Pane(ConvertFocus::Source), source_area);
+    app.button_map
+        .record_button(TuiButton::Pane(ConvertFocus::Metadata), metadata_area);
+    app.button_map
+        .record_button(TuiButton::Pane(ConvertFocus::Format), format_area);
+    app.button_map.record_button(
+        TuiButton::Pane(ConvertFocus::OutputOptions),
+        output_options_area,
+    );
 
     // Format pane pill buttons
     // Layout within format pane (10 lines):
@@ -95,11 +115,46 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         let buttons = &mut app.button_map;
         let label_col = format_area.x + 17; // "│" + "   " + 11-char label + "  " = 17
 
-        register_pill_row(buttons, &state.format, format_area.y + 2, label_col, format_area.width, |i| TuiButton::FormatPill(i));
-        register_pill_row(buttons, &state.sample_rate, format_area.y + 4, label_col, format_area.width, |i| TuiButton::RatePill(i));
-        register_pill_row(buttons, &state.bit_depth, format_area.y + 5, label_col, format_area.width, |i| TuiButton::DepthPill(i));
-        register_pill_row(buttons, &state.dither, format_area.y + 6, label_col, format_area.width, |i| TuiButton::DitherPill(i));
-        register_pill_row(buttons, &state.replaygain, format_area.y + 7, label_col, format_area.width, |i| TuiButton::ReplayGainPill(i));
+        register_pill_row(
+            buttons,
+            &state.format,
+            format_area.y + 2,
+            label_col,
+            format_area.width,
+            |i| TuiButton::FormatPill(i),
+        );
+        register_pill_row(
+            buttons,
+            &state.sample_rate,
+            format_area.y + 4,
+            label_col,
+            format_area.width,
+            |i| TuiButton::RatePill(i),
+        );
+        register_pill_row(
+            buttons,
+            &state.bit_depth,
+            format_area.y + 5,
+            label_col,
+            format_area.width,
+            |i| TuiButton::DepthPill(i),
+        );
+        register_pill_row(
+            buttons,
+            &state.dither,
+            format_area.y + 6,
+            label_col,
+            format_area.width,
+            |i| TuiButton::DitherPill(i),
+        );
+        register_pill_row(
+            buttons,
+            &state.replaygain,
+            format_area.y + 7,
+            label_col,
+            format_area.width,
+            |i| TuiButton::ReplayGainPill(i),
+        );
     }
 
     // Output options pane pill buttons
@@ -116,7 +171,14 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         let buttons = &mut app.button_map;
         let label_col = output_options_area.x + 17;
 
-        register_pill_row(buttons, &state.merge, output_options_area.y + 4, label_col, output_options_area.width, |i| TuiButton::MergePill(i));
+        register_pill_row(
+            buttons,
+            &state.merge,
+            output_options_area.y + 4,
+            label_col,
+            output_options_area.width,
+            |i| TuiButton::MergePill(i),
+        );
     }
 
     // Tab bar buttons are registered by draw_footer() itself.
@@ -126,7 +188,11 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
     register_advanced_toggle(&mut app.button_map, source_area, ConvertFocus::Source);
     register_advanced_toggle(&mut app.button_map, metadata_area, ConvertFocus::Metadata);
     register_advanced_toggle(&mut app.button_map, format_area, ConvertFocus::Format);
-    register_advanced_toggle(&mut app.button_map, output_options_area, ConvertFocus::OutputOptions);
+    register_advanced_toggle(
+        &mut app.button_map,
+        output_options_area,
+        ConvertFocus::OutputOptions,
+    );
 
     // Output options editable text fields (rows 1-3 of the pane)
     {
@@ -187,9 +253,11 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
                 }
 
                 // Enqueue pill row (row 5 of the pane).
-                let enq_start_w = super::draw_source::ENQUEUE_START_PILL_LABEL.chars().count() as u16;
+                let enq_start_w =
+                    super::draw_source::ENQUEUE_START_PILL_LABEL.chars().count() as u16;
                 let enq_w = super::draw_source::ENQUEUE_PILL_LABEL.chars().count() as u16;
-                let enq_start_x = source_area.x + 1 + (inner_w as u16).saturating_sub(enq_start_w + right_margin);
+                let enq_start_x =
+                    source_area.x + 1 + (inner_w as u16).saturating_sub(enq_start_w + right_margin);
                 let enq_x = enq_start_x.saturating_sub(enq_w + gap);
                 let enq_row = source_area.y + 5;
                 if enq_row < source_area.y + source_area.height {
@@ -247,11 +315,7 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
 /// Register an "advanced" toggle button at the top-right of a pane.
 /// Text layout: "...─── a dvanced ┐"
 /// Clickable "advanced" spans 8 chars starting at area.x + area.width - 10.
-fn register_advanced_toggle(
-    buttons: &mut ButtonRenderMap,
-    pane_area: Rect,
-    focus: ConvertFocus,
-) {
+fn register_advanced_toggle(buttons: &mut ButtonRenderMap, pane_area: Rect, focus: ConvertFocus) {
     if pane_area.width < 12 {
         return;
     }

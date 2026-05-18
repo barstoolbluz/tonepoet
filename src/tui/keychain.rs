@@ -12,9 +12,7 @@ use std::path::PathBuf;
 /// Return the path to the password keychain file.
 pub fn keychain_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg)
-            .join("tonepoet")
-            .join("passwords.toml")
+        PathBuf::from(xdg).join("tonepoet").join("passwords.toml")
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home)
             .join(".config")
@@ -51,8 +49,7 @@ pub fn save_keychain(passwords: &[String]) -> Result<(), String> {
     let file = KeychainFile {
         passwords: passwords.to_vec(),
     };
-    let toml_str =
-        toml::to_string_pretty(&file).map_err(|e| format!("serialize error: {}", e))?;
+    let toml_str = toml::to_string_pretty(&file).map_err(|e| format!("serialize error: {}", e))?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir error: {}", e))?;
@@ -84,7 +81,11 @@ pub fn add_password(password: &str) -> Result<(), String> {
 pub fn remove_password(index: usize) -> Result<(), String> {
     let mut passwords = load_keychain();
     if index >= passwords.len() {
-        return Err(format!("index {} out of range ({})", index, passwords.len()));
+        return Err(format!(
+            "index {} out of range ({})",
+            index,
+            passwords.len()
+        ));
     }
     passwords.remove(index);
     save_keychain(&passwords)
@@ -104,8 +105,8 @@ pub fn promote_password(password: &str) -> Result<(), String> {
 pub async fn test_password(archive: &std::path::Path, password: &str) -> Result<bool, String> {
     use tokio::process::Command;
 
-    let bin = crate::detect_7z_binary()
-        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+    let bin =
+        crate::detect_7z_binary().ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
 
     let mut cmd = Command::new(bin);
     cmd.arg("t")

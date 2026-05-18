@@ -158,11 +158,7 @@ fn draw_naming_mode(f: &mut Frame, inner: Rect, naming: &BookmarkNaming) {
                     s
                 }
             };
-            (
-                "add bookmark (name)",
-                input,
-                Some(path_display),
-            )
+            ("add bookmark (name)", input, Some(path_display))
         }
         BookmarkNaming::Rename { input, .. } => ("rename bookmark", input, None),
     };

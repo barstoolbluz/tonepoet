@@ -158,14 +158,20 @@ pub fn cue_from_mb_release(
 
     let mut cue_tracks: Vec<CueTrackInfo> = Vec::with_capacity(tracks_sorted.len());
     for t in &tracks_sorted {
-        let length_ms = t.length_ms.ok_or_else(|| format!(
-            "MB track {} ({:?}) has no length; cannot generate timestamps",
-            t.position, t.title,
-        ))?;
+        let length_ms = t.length_ms.ok_or_else(|| {
+            format!(
+                "MB track {} ({:?}) has no length; cannot generate timestamps",
+                t.position, t.title,
+            )
+        })?;
         cue_tracks.push(CueTrackInfo {
             filename: image_filename.to_string(),
             title: t.title.clone(),
-            artist: if t.artist.is_empty() { release.artist.clone() } else { t.artist.clone() },
+            artist: if t.artist.is_empty() {
+                release.artist.clone()
+            } else {
+                t.artist.clone()
+            },
             track_number: t.position,
             duration: Duration::from_millis(length_ms as u64),
             format_tag: cue_format_tag(image_ext).to_string(),
@@ -179,12 +185,19 @@ pub fn cue_from_mb_release(
         artist: release.artist.clone(),
         year: release.year.clone(),
         genre: None,
-        catalog: release.catalog.clone()
+        catalog: release
+            .catalog
+            .clone()
             .or_else(|| release.barcode.clone())
             .filter(|s| !s.is_empty()),
     };
     let format_tag = cue_format_tag(image_ext);
-    Ok(generate_single_image_cue(&album, &cue_tracks, image_filename, format_tag))
+    Ok(generate_single_image_cue(
+        &album,
+        &cue_tracks,
+        image_filename,
+        format_tag,
+    ))
 }
 
 /// Regenerate a CUE sheet from a parsed `CueSheet`, applying per-track
@@ -237,29 +250,41 @@ pub fn regenerate_cue_with_overrides(
     for (i, track) in parsed.tracks.iter().enumerate() {
         cue.push_str(&format!("  TRACK {:02} AUDIO\n", track.number));
         // Title: override > parsed > nothing
-        let title = track_overrides.get(i).and_then(|o| o.title.as_deref())
+        let title = track_overrides
+            .get(i)
+            .and_then(|o| o.title.as_deref())
             .or(track.title.as_deref())
             .filter(|s| !s.is_empty());
         if let Some(t) = title {
             cue.push_str(&format!("    TITLE \"{}\"\n", escape(t)));
         }
-        let performer = track_overrides.get(i).and_then(|o| o.performer.as_deref())
+        let performer = track_overrides
+            .get(i)
+            .and_then(|o| o.performer.as_deref())
             .or(track.performer.as_deref())
             .filter(|s| !s.is_empty());
         if let Some(p) = performer {
             cue.push_str(&format!("    PERFORMER \"{}\"\n", escape(p)));
         }
-        let isrc = track_overrides.get(i).and_then(|o| o.isrc.as_deref())
+        let isrc = track_overrides
+            .get(i)
+            .and_then(|o| o.isrc.as_deref())
             .or(track.isrc.as_deref())
             .filter(|s| !s.is_empty());
         if let Some(c) = isrc {
             cue.push_str(&format!("    ISRC {}\n", escape(c)));
         }
         if let Some(idx00) = track.index00_frames {
-            cue.push_str(&format!("    INDEX 00 {}\n", frames_to_cue_timestamp(idx00)));
+            cue.push_str(&format!(
+                "    INDEX 00 {}\n",
+                frames_to_cue_timestamp(idx00)
+            ));
         }
         if let Some(idx01) = track.index01_frames {
-            cue.push_str(&format!("    INDEX 01 {}\n", frames_to_cue_timestamp(idx01)));
+            cue.push_str(&format!(
+                "    INDEX 01 {}\n",
+                frames_to_cue_timestamp(idx01)
+            ));
         }
     }
 
@@ -382,10 +407,7 @@ pub fn gather_cue_info(
             .map(|i| Duration::from_secs_f64(i.duration_secs))
             .unwrap_or(Duration::ZERO);
 
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("wav");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("wav");
         let format_tag = cue_format_tag(ext).to_string();
 
         // FILE reference: relative to CUE output directory.
@@ -395,10 +417,7 @@ pub fn gather_cue_info(
             .to_string_lossy()
             .to_string();
 
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
         // Track number: prefer tag, fall back to filename.
         let track_number = meta
@@ -528,7 +547,8 @@ pub fn cue_sheet_to_track_info(
 
     // Probe each audio file once for duration. For single-image, this is
     // the one image file; for multi-file, it's each track file in order.
-    let durations: Vec<Duration> = audio_paths.iter()
+    let durations: Vec<Duration> = audio_paths
+        .iter()
         .map(|p| {
             super::probe::probe_audio(p)
                 .map(|info| Duration::from_secs_f64(info.duration_secs))
@@ -545,10 +565,14 @@ pub fn cue_sheet_to_track_info(
         let audio_path: &std::path::PathBuf = if single_image {
             &audio_paths[0]
         } else {
-            audio_paths.get(i).ok_or_else(|| format!(
-                "audio path missing for track {}; expected {} files, got {}",
-                ct.number, sheet.tracks.len(), audio_paths.len(),
-            ))?
+            audio_paths.get(i).ok_or_else(|| {
+                format!(
+                    "audio path missing for track {}; expected {} files, got {}",
+                    ct.number,
+                    sheet.tracks.len(),
+                    audio_paths.len(),
+                )
+            })?
         };
 
         // Per-track duration. Multi-file: probe of this file. Single-image:
@@ -557,7 +581,9 @@ pub fn cue_sheet_to_track_info(
             let total = durations.first().copied().unwrap_or_default();
             let total_frames = (total.as_secs_f64() * 75.0).round() as u32;
             let this_idx01 = ct.index01_frames.unwrap_or(0);
-            let next_idx01 = sheet.tracks.get(i + 1)
+            let next_idx01 = sheet
+                .tracks
+                .get(i + 1)
                 .and_then(|n| n.index01_frames)
                 .unwrap_or(total_frames);
             let frames = next_idx01.saturating_sub(this_idx01);
@@ -567,28 +593,34 @@ pub fn cue_sheet_to_track_info(
         };
 
         // Pregap reconstruction.
-        let pregap_frames = ct.index00_frames.and_then(|idx00| {
-            if single_image {
-                // Absolute cumulative: pregap = INDEX 01 - INDEX 00
-                ct.index01_frames.and_then(|idx01| idx01.checked_sub(idx00))
-            } else if i == 0 {
-                // Track 1's INDEX 00 is the lead-in pregap (not in rip).
-                None
-            } else {
-                // Multi-file noncompliant: INDEX 00 is in prev FILE.
-                // pregap = (prev track length frames) - INDEX 00 position
-                let prev_dur = durations.get(i - 1).copied().unwrap_or_default();
-                let prev_frames = (prev_dur.as_secs_f64() * 75.0).round() as u32;
-                prev_frames.checked_sub(idx00)
-            }
-        }).filter(|&n| n > 0);
+        let pregap_frames = ct
+            .index00_frames
+            .and_then(|idx00| {
+                if single_image {
+                    // Absolute cumulative: pregap = INDEX 01 - INDEX 00
+                    ct.index01_frames.and_then(|idx01| idx01.checked_sub(idx00))
+                } else if i == 0 {
+                    // Track 1's INDEX 00 is the lead-in pregap (not in rip).
+                    None
+                } else {
+                    // Multi-file noncompliant: INDEX 00 is in prev FILE.
+                    // pregap = (prev track length frames) - INDEX 00 position
+                    let prev_dur = durations.get(i - 1).copied().unwrap_or_default();
+                    let prev_frames = (prev_dur.as_secs_f64() * 75.0).round() as u32;
+                    prev_frames.checked_sub(idx00)
+                }
+            })
+            .filter(|&n| n > 0);
 
         let filename = audio_path
             .strip_prefix(cue_dir)
             .unwrap_or(audio_path)
             .to_string_lossy()
             .to_string();
-        let ext = audio_path.extension().and_then(|e| e.to_str()).unwrap_or("flac");
+        let ext = audio_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("flac");
         let format_tag = cue_format_tag(ext).to_string();
 
         tracks.push(CueTrackInfo {
@@ -681,7 +713,11 @@ pub fn fill_cue_with_mb(
         true
     }
     fn fill_opt(field: &mut Option<String>, candidate: Option<&str>) -> bool {
-        if field.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        if field
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
             return false;
         }
         if let Some(c) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
@@ -691,16 +727,30 @@ pub fn fill_cue_with_mb(
         false
     }
 
-    if fill_string(&mut album.title, &mb.title) { stats.titles_filled += 1; }
-    if fill_string(&mut album.artist, &mb.artist) { stats.artists_filled += 1; }
-    if fill_opt(&mut album.year, mb.year.as_deref()) { stats.year_filled = true; }
-    if fill_opt(&mut album.catalog, mb.barcode.as_deref()) { stats.catalog_filled = true; }
+    if fill_string(&mut album.title, &mb.title) {
+        stats.titles_filled += 1;
+    }
+    if fill_string(&mut album.artist, &mb.artist) {
+        stats.artists_filled += 1;
+    }
+    if fill_opt(&mut album.year, mb.year.as_deref()) {
+        stats.year_filled = true;
+    }
+    if fill_opt(&mut album.catalog, mb.barcode.as_deref()) {
+        stats.catalog_filled = true;
+    }
 
     for t in tracks.iter_mut() {
         if let Some(mt) = mb.tracks.iter().find(|m| m.position == t.track_number) {
-            if fill_string(&mut t.title, &mt.title) { stats.titles_filled += 1; }
-            if fill_string(&mut t.artist, &mt.artist) { stats.artists_filled += 1; }
-            if fill_opt(&mut t.isrc, mt.isrc.as_deref()) { stats.isrcs_filled += 1; }
+            if fill_string(&mut t.title, &mt.title) {
+                stats.titles_filled += 1;
+            }
+            if fill_string(&mut t.artist, &mt.artist) {
+                stats.artists_filled += 1;
+            }
+            if fill_opt(&mut t.isrc, mt.isrc.as_deref()) {
+                stats.isrcs_filled += 1;
+            }
         }
     }
 
@@ -828,7 +878,10 @@ mod tests {
         ];
         let cue = generate_multifile_cue(&album(), &tracks);
 
-        assert!(!cue.contains("INDEX 00"), "pregap exceeding prev track must be skipped");
+        assert!(
+            !cue.contains("INDEX 00"),
+            "pregap exceeding prev track must be skipped"
+        );
         assert_eq!(cue.matches("  TRACK 02 AUDIO").count(), 1);
     }
 
@@ -865,8 +918,10 @@ mod tests {
         let file1_pos = cue.find("FILE \"01 - Track.flac\"").unwrap();
         let file2_pos = cue.find("FILE \"02 - Track.flac\"").unwrap();
         let isrc_pos = cue.find("ISRC USRC17607840").unwrap();
-        assert!(isrc_pos > file1_pos && isrc_pos < file2_pos,
-            "ISRC for track 2 should sit inside track 1's FILE block (pregap injection)");
+        assert!(
+            isrc_pos > file1_pos && isrc_pos < file2_pos,
+            "ISRC for track 2 should sit inside track 1's FILE block (pregap injection)"
+        );
     }
 
     #[test]
@@ -933,10 +988,10 @@ mod tests {
 
         let mut album = CueAlbumInfo {
             title: "User Title".to_string(),
-            artist: "".to_string(),  // empty → fill from MB
-            year: None,              // absent → fill from MB
+            artist: "".to_string(), // empty → fill from MB
+            year: None,             // absent → fill from MB
             genre: None,
-            catalog: Some("USER-CAT".to_string()),  // present → keep
+            catalog: Some("USER-CAT".to_string()), // present → keep
         };
         let mut tracks = vec![
             // ISRC absent → fill; title present → keep
@@ -957,15 +1012,13 @@ mod tests {
             artist: "MB Artist".to_string(),
             year: Some("1971".to_string()),
             barcode: Some("MB-BARCODE".to_string()),
-            tracks: vec![
-                MbTrack {
-                    position: 1,
-                    title: "MB Track 1".to_string(),
-                    artist: "MB Performer".to_string(),
-                    isrc: Some("USRC17607839".to_string()),
-                    ..Default::default()
-                },
-            ],
+            tracks: vec![MbTrack {
+                position: 1,
+                title: "MB Track 1".to_string(),
+                artist: "MB Performer".to_string(),
+                isrc: Some("USRC17607839".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let stats = fill_cue_with_mb(&mut album, &mut tracks, &mb);
@@ -984,7 +1037,7 @@ mod tests {
         // Stats: artist+isrc per track, year at album level. titles_filled
         // counts only what was actually filled.
         assert_eq!(stats.titles_filled, 0);
-        assert_eq!(stats.artists_filled, 2);  // album + 1 track
+        assert_eq!(stats.artists_filled, 2); // album + 1 track
         assert_eq!(stats.isrcs_filled, 1);
         assert!(stats.year_filled);
         assert!(!stats.catalog_filled);
@@ -996,8 +1049,10 @@ mod tests {
         use super::super::musicbrainz::MbRelease;
 
         let mut album = CueAlbumInfo {
-            title: "T".to_string(), artist: "A".to_string(),
-            year: Some("1971".to_string()), genre: None,
+            title: "T".to_string(),
+            artist: "A".to_string(),
+            year: Some("1971".to_string()),
+            genre: None,
             catalog: Some("C".to_string()),
         };
         let mut tracks: Vec<CueTrackInfo> = vec![];
@@ -1067,9 +1122,12 @@ mod tests {
         assert_eq!(tracks[1].isrc, None);
     }
 
-    fn mb_track(position: u32, title: &str, length_ms: Option<u32>, isrc: Option<&str>)
-        -> super::super::musicbrainz::MbTrack
-    {
+    fn mb_track(
+        position: u32,
+        title: &str,
+        length_ms: Option<u32>,
+        isrc: Option<&str>,
+    ) -> super::super::musicbrainz::MbTrack {
         super::super::musicbrainz::MbTrack {
             position,
             track_id: None,
@@ -1098,8 +1156,8 @@ mod tests {
             disc_count: 1,
             tracks: vec![
                 mb_track(1, "Track 1", Some(240_000), Some("USRC17607839")), // 4:00
-                mb_track(2, "Track 2", Some(180_000), None),                  // 3:00
-                mb_track(3, "Track 3", Some(120_000), None),                  // 2:00
+                mb_track(2, "Track 2", Some(180_000), None),                 // 3:00
+                mb_track(3, "Track 3", Some(120_000), None),                 // 2:00
             ],
         };
         let cue = cue_from_mb_release(&release, "image.flac", "flac")
@@ -1109,9 +1167,21 @@ mod tests {
         // FILE line carries the right name + format tag.
         assert!(cue.contains("FILE \"image.flac\" FLAC"));
         // Track 1 starts at 00:00:00, Track 2 at 04:00:00, Track 3 at 07:00:00.
-        assert!(cue.contains("    INDEX 01 00:00:00"), "track 1 INDEX 01\n{}", cue);
-        assert!(cue.contains("    INDEX 01 04:00:00"), "track 2 INDEX 01\n{}", cue);
-        assert!(cue.contains("    INDEX 01 07:00:00"), "track 3 INDEX 01\n{}", cue);
+        assert!(
+            cue.contains("    INDEX 01 00:00:00"),
+            "track 1 INDEX 01\n{}",
+            cue
+        );
+        assert!(
+            cue.contains("    INDEX 01 04:00:00"),
+            "track 2 INDEX 01\n{}",
+            cue
+        );
+        assert!(
+            cue.contains("    INDEX 01 07:00:00"),
+            "track 3 INDEX 01\n{}",
+            cue
+        );
         // ISRC carried per-track when MB provides it.
         assert!(cue.contains("USRC17607839"));
         // Catalog from release.
@@ -1139,7 +1209,11 @@ mod tests {
         };
         let err = cue_from_mb_release(&release, "image.flac", "flac")
             .expect_err("must refuse when a track has no length");
-        assert!(err.contains("length"), "error should mention length: {}", err);
+        assert!(
+            err.contains("length"),
+            "error should mention length: {}",
+            err
+        );
     }
 
     #[test]
@@ -1247,19 +1321,21 @@ mod tests {
             date: None,
             genre: None,
             catalog: None,
-            tracks: vec![
-                CueTrack {
-                    number: 1,
-                    title: Some("Original Title".into()),
-                    performer: None,
-                    file: Some("a.flac".into()),
-                    index01_frames: Some(0),
-                    index00_frames: None,
-                    isrc: None,
-                },
-            ],
+            tracks: vec![CueTrack {
+                number: 1,
+                title: Some("Original Title".into()),
+                performer: None,
+                file: Some("a.flac".into()),
+                index01_frames: Some(0),
+                index00_frames: None,
+                isrc: None,
+            }],
         };
-        let overrides = vec![TrackOverride { title: None, performer: None, isrc: None }];
+        let overrides = vec![TrackOverride {
+            title: None,
+            performer: None,
+            isrc: None,
+        }];
         let cue = regenerate_cue_with_overrides(&parsed, &overrides, "a.flac", "FLAC");
         assert!(cue.contains("    TITLE \"Original Title\""));
     }

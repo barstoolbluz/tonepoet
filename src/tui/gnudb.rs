@@ -98,12 +98,14 @@ pub async fn query_gnudb(id: &DiscIdResult) -> Result<Vec<GnudbMatch>, String> {
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .send()
         .await
         .map_err(|e| format!("GNUDB query failed: {}", e))?;
 
-    let body = resp.text()
+    let body = resp
+        .text()
         .await
         .map_err(|e| format!("GNUDB response error: {}", e))?;
 
@@ -120,12 +122,14 @@ pub async fn read_gnudb(category: &str, disc_id: &str) -> Result<GnudbEntry, Str
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .send()
         .await
         .map_err(|e| format!("GNUDB read failed: {}", e))?;
 
-    let body = resp.text()
+    let body = resp
+        .text()
         .await
         .map_err(|e| format!("GNUDB response error: {}", e))?;
 
@@ -150,7 +154,9 @@ fn parse_query_response(body: &str) -> Result<Vec<GnudbMatch>, String> {
         let mut matches = Vec::new();
         for line in body.lines().skip(1) {
             let trimmed = line.trim();
-            if trimmed == "." { break; }
+            if trimmed == "." {
+                break;
+            }
             if let Some(m) = parse_match_line(trimmed) {
                 matches.push(m);
             }
@@ -174,7 +180,11 @@ fn parse_match_line(line: &str) -> Option<GnudbMatch> {
     let category = parts.next()?.to_string();
     let disc_id = parts.next()?.to_string();
     let title = parts.next()?.to_string();
-    Some(GnudbMatch { category, disc_id, title })
+    Some(GnudbMatch {
+        category,
+        disc_id,
+        title,
+    })
 }
 
 fn parse_read_response(body: &str) -> Result<GnudbEntry, String> {
@@ -192,8 +202,12 @@ fn parse_read_response(body: &str) -> Result<GnudbEntry, String> {
     // xmcd fields can span multiple lines (concatenated).
     for line in body.lines().skip(1) {
         let trimmed = line.trim();
-        if trimmed == "." { break; }
-        if trimmed.starts_with('#') { continue; }
+        if trimmed == "." {
+            break;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
 
         if let Some(val) = trimmed.strip_prefix("DISCID=") {
             disc_id = val.to_string();
@@ -240,10 +254,7 @@ fn parse_read_response(body: &str) -> Result<GnudbEntry, String> {
 // ── Review state builders ────────────────────────────────────────────
 
 /// Build a GnudbReviewState from a single GNUDB entry.
-pub fn build_review_state(
-    entry: &GnudbEntry,
-    paths: Vec<PathBuf>,
-) -> super::app::GnudbReviewState {
+pub fn build_review_state(entry: &GnudbEntry, paths: Vec<PathBuf>) -> super::app::GnudbReviewState {
     use super::app::*;
 
     let mut tracks = Vec::new();
@@ -338,8 +349,14 @@ fn build_page_rows(tracks: &[super::app::GnudbReviewTrack]) -> Vec<super::app::G
 
     for (ti, _track) in tracks.iter().enumerate() {
         rows.push(GnudbRowKind::TrackHeader { track_idx: ti });
-        rows.push(GnudbRowKind::TrackField { track_idx: ti, field: "Title" });
-        rows.push(GnudbRowKind::TrackField { track_idx: ti, field: "Artist" });
+        rows.push(GnudbRowKind::TrackField {
+            track_idx: ti,
+            field: "Title",
+        });
+        rows.push(GnudbRowKind::TrackField {
+            track_idx: ti,
+            field: "Artist",
+        });
     }
 
     rows
@@ -367,13 +384,21 @@ pub fn populate_editor_from_review(
     // contradiction in this UI so the page-count check guards it.
     let single_image = n == 1
         && review.pages.len() == 1
-        && review.pages.first().map(|p| p.tracks.len() > 1).unwrap_or(false);
-    let has_cuesheet = state.entries.iter()
+        && review
+            .pages
+            .first()
+            .map(|p| p.tracks.len() > 1)
+            .unwrap_or(false);
+    let has_cuesheet = state
+        .entries
+        .iter()
         .any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"));
     let per_track_populate = single_image && has_cuesheet;
     let track_dim = if per_track_populate {
         review.pages[0].tracks.len()
-    } else { n };
+    } else {
+        n
+    };
 
     fn find_or_create(
         entries: &mut Vec<super::probe::TagEntry>,
@@ -381,7 +406,10 @@ pub fn populate_editor_from_review(
         item_key: lofty::tag::ItemKey,
         dim: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+        if let Some(i) = entries
+            .iter()
+            .position(|e| e.display_key.eq_ignore_ascii_case(key))
+        {
             return i;
         }
         entries.push(super::probe::TagEntry {
@@ -399,10 +427,30 @@ pub fn populate_editor_from_review(
         entries.len() - 1
     }
 
-    let title_idx = find_or_create(&mut state.entries, "TITLE", lofty::tag::ItemKey::TrackTitle, track_dim);
-    let artist_idx = find_or_create(&mut state.entries, "ARTIST", lofty::tag::ItemKey::TrackArtist, track_dim);
-    let album_idx = find_or_create(&mut state.entries, "ALBUM", lofty::tag::ItemKey::AlbumTitle, n);
-    let tn_idx = find_or_create(&mut state.entries, "TRACKNUMBER", lofty::tag::ItemKey::TrackNumber, n);
+    let title_idx = find_or_create(
+        &mut state.entries,
+        "TITLE",
+        lofty::tag::ItemKey::TrackTitle,
+        track_dim,
+    );
+    let artist_idx = find_or_create(
+        &mut state.entries,
+        "ARTIST",
+        lofty::tag::ItemKey::TrackArtist,
+        track_dim,
+    );
+    let album_idx = find_or_create(
+        &mut state.entries,
+        "ALBUM",
+        lofty::tag::ItemKey::AlbumTitle,
+        n,
+    );
+    let tn_idx = find_or_create(
+        &mut state.entries,
+        "TRACKNUMBER",
+        lofty::tag::ItemKey::TrackNumber,
+        n,
+    );
     let year_idx = find_or_create(&mut state.entries, "DATE", lofty::tag::ItemKey::Year, n);
     let genre_idx = find_or_create(&mut state.entries, "GENRE", lofty::tag::ItemKey::Genre, n);
 
@@ -431,10 +479,10 @@ pub fn populate_editor_from_review(
     } else if single_image {
         // Album-level fallback (no CUESHEET anchor available).
         let page = &review.pages[0];
-        let title_dim_one = (state.entries[title_idx].per_file_values.len() == 1)
-            .then_some(title_idx);
-        let artist_dim_one = (state.entries[artist_idx].per_file_values.len() == 1)
-            .then_some(artist_idx);
+        let title_dim_one =
+            (state.entries[title_idx].per_file_values.len() == 1).then_some(title_idx);
+        let artist_dim_one =
+            (state.entries[artist_idx].per_file_values.len() == 1).then_some(artist_idx);
         if let Some(idx) = title_dim_one {
             state.entries[idx].per_file_values[0] = page.album.clone();
         }
@@ -461,7 +509,9 @@ pub fn populate_editor_from_review(
         for page in &review.pages {
             for track in &page.tracks {
                 let i = track.file_index;
-                if i >= n { continue; }
+                if i >= n {
+                    continue;
+                }
                 state.entries[title_idx].per_file_values[i] = track.title.clone();
                 state.entries[artist_idx].per_file_values[i] = track.artist.clone();
                 state.entries[album_idx].per_file_values[i] = page.album.clone();
@@ -476,7 +526,9 @@ pub fn populate_editor_from_review(
         }
     }
 
-    for idx in [title_idx, artist_idx, album_idx, tn_idx, year_idx, genre_idx] {
+    for idx in [
+        title_idx, artist_idx, album_idx, tn_idx, year_idx, genre_idx,
+    ] {
         let e = &mut state.entries[idx];
         let dim = e.per_file_values.len();
         let all_same = e.per_file_values.windows(2).all(|w| w[0] == w[1]);
@@ -503,7 +555,10 @@ pub fn group_by_disc(paths: &[PathBuf]) -> Vec<(String, Vec<PathBuf>)> {
     // Group by parent directory path.
     let mut groups: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for path in paths {
-        let parent = path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+        let parent = path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
         groups.entry(parent).or_default().push(path.clone());
     }
 
@@ -514,19 +569,27 @@ pub fn group_by_disc(paths: &[PathBuf]) -> Vec<(String, Vec<PathBuf>)> {
     }
 
     // Multiple directories — sort by disc number and label.
-    let mut result: Vec<(u32, String, Vec<PathBuf>)> = groups.into_iter().map(|(dir, files)| {
-        // Use the first file to detect disc number.
-        let disc_num = files.first()
-            .map(|p| super::probe::extract_disc_from_path(p))
-            .unwrap_or(1);
-        let label = dir.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("Disc {}", disc_num));
-        (disc_num, label, files)
-    }).collect();
+    let mut result: Vec<(u32, String, Vec<PathBuf>)> = groups
+        .into_iter()
+        .map(|(dir, files)| {
+            // Use the first file to detect disc number.
+            let disc_num = files
+                .first()
+                .map(|p| super::probe::extract_disc_from_path(p))
+                .unwrap_or(1);
+            let label = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("Disc {}", disc_num));
+            (disc_num, label, files)
+        })
+        .collect();
 
     result.sort_by_key(|(num, _, _)| *num);
-    result.into_iter().map(|(_, label, files)| (label, files)).collect()
+    result
+        .into_iter()
+        .map(|(_, label, files)| (label, files))
+        .collect()
 }
 
 // ── CUE → review state builders ─────────────────────────────────────
@@ -544,7 +607,10 @@ pub fn build_review_state_from_cue(
     for (i, ct) in sheet.tracks.iter().enumerate() {
         tracks.push(GnudbReviewTrack {
             title: ct.title.clone().unwrap_or_default(),
-            artist: ct.performer.clone().unwrap_or_else(|| album_performer.clone()),
+            artist: ct
+                .performer
+                .clone()
+                .unwrap_or_else(|| album_performer.clone()),
             track_number: ct.number,
             file_index: i,
         });
@@ -591,7 +657,10 @@ pub fn build_multi_disc_review_state_from_cue(
         for (i, ct) in sheet.tracks.iter().enumerate() {
             tracks.push(GnudbReviewTrack {
                 title: ct.title.clone().unwrap_or_default(),
-                artist: ct.performer.clone().unwrap_or_else(|| album_performer.clone()),
+                artist: ct
+                    .performer
+                    .clone()
+                    .unwrap_or_else(|| album_performer.clone()),
                 track_number: ct.number,
                 file_index: base_file_idx + i,
             });
@@ -624,11 +693,16 @@ pub fn build_multi_disc_review_state_from_cue(
 /// Find a .cue file in a directory. Returns the first one found
 /// (sorted alphabetically for determinism).
 pub fn find_cue_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
-    let mut cues: Vec<PathBuf> = std::fs::read_dir(dir).ok()?
+    let mut cues: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("cue")).unwrap_or(false) {
+            if p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("cue"))
+                .unwrap_or(false)
+            {
                 Some(p)
             } else {
                 None
@@ -643,7 +717,10 @@ pub fn find_cue_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
 /// falls back to direct ffmpeg probe for files not yet cached.
 pub fn collect_durations(
     paths: &[PathBuf],
-    probe_cache: &std::collections::HashMap<PathBuf, Option<std::sync::Arc<super::browse::CachedInfo>>>,
+    probe_cache: &std::collections::HashMap<
+        PathBuf,
+        Option<std::sync::Arc<super::browse::CachedInfo>>,
+    >,
 ) -> Vec<f64> {
     let mut durations = Vec::new();
     for path in paths {
@@ -674,7 +751,7 @@ pub fn collect_durations(
 mod gnudb_per_track_tests {
     //! Phase A: gnudb parity with MB's per-track populate flow.
     use super::*;
-    use crate::tui::app::{MetadataEditorState, MetadataEditorPhase};
+    use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
     use crate::tui::probe::TagEntry;
 
     fn empty_state(n: usize) -> (MetadataEditorState, tempfile::TempDir) {
@@ -685,12 +762,26 @@ mod gnudb_per_track_tests {
         let state = MetadataEditorState {
             paths,
             entries: Vec::new(),
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: Vec::new(),
+            dirty: false,
+            deleted: Vec::new(),
             file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false, sacd_sidecar_path: None, sacd_area_kind: None, sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
         (state, td)
     }
@@ -723,9 +814,12 @@ mod gnudb_per_track_tests {
 
     // ---- populate_editor_from_review (production path) ----
 
-    fn track(num: u32, title: &str, artist: &str, file_index: usize)
-        -> crate::tui::app::GnudbReviewTrack
-    {
+    fn track(
+        num: u32,
+        title: &str,
+        artist: &str,
+        file_index: usize,
+    ) -> crate::tui::app::GnudbReviewTrack {
         crate::tui::app::GnudbReviewTrack {
             title: title.to_string(),
             artist: artist.to_string(),
@@ -734,10 +828,12 @@ mod gnudb_per_track_tests {
         }
     }
 
-    fn page(album: &str, year: &str, genre: &str,
-        tracks: Vec<crate::tui::app::GnudbReviewTrack>)
-        -> crate::tui::app::GnudbReviewPage
-    {
+    fn page(
+        album: &str,
+        year: &str,
+        genre: &str,
+        tracks: Vec<crate::tui::app::GnudbReviewTrack>,
+    ) -> crate::tui::app::GnudbReviewPage {
         crate::tui::app::GnudbReviewPage {
             label: String::new(),
             album: album.to_string(),
@@ -748,10 +844,10 @@ mod gnudb_per_track_tests {
         }
     }
 
-    fn review(pages: Vec<crate::tui::app::GnudbReviewPage>,
-        paths: Vec<std::path::PathBuf>)
-        -> crate::tui::app::GnudbReviewState
-    {
+    fn review(
+        pages: Vec<crate::tui::app::GnudbReviewPage>,
+        paths: Vec<std::path::PathBuf>,
+    ) -> crate::tui::app::GnudbReviewState {
         crate::tui::app::GnudbReviewState {
             pages,
             active_page: 0,
@@ -773,23 +869,34 @@ mod gnudb_per_track_tests {
         ));
         // Compilation case: per-track artists differ.
         let r = review(
-            vec![page("Disc Album", "1995", "Rock", vec![
-                track(1, "T1", "Artist A", 0),
-                track(2, "T2", "Artist B", 0),
-                track(3, "T3", "Artist C", 0),
-            ])],
+            vec![page(
+                "Disc Album",
+                "1995",
+                "Rock",
+                vec![
+                    track(1, "T1", "Artist A", 0),
+                    track(2, "T2", "Artist B", 0),
+                    track(3, "T3", "Artist C", 0),
+                ],
+            )],
             state.paths.clone(),
         );
         populate_editor_from_review(&mut state, &r);
 
         let lookup = |k: &str| -> Vec<String> {
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case(k))
-                .map(|e| e.per_file_values.clone()).unwrap_or_default()
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case(k))
+                .map(|e| e.per_file_values.clone())
+                .unwrap_or_default()
         };
         assert_eq!(lookup("TITLE"), vec!["T1", "T2", "T3"]);
-        assert_eq!(lookup("ARTIST"),
+        assert_eq!(
+            lookup("ARTIST"),
             vec!["Artist A", "Artist B", "Artist C"],
-            "review path honors per-track ARTIST (compilation)");
+            "review path honors per-track ARTIST (compilation)"
+        );
         assert_eq!(lookup("ALBUM"), vec!["Disc Album"]);
         assert_eq!(lookup("DATE"), vec!["1995"]);
         assert_eq!(lookup("TRACKNUMBER"), vec!["1"]);
@@ -799,17 +906,23 @@ mod gnudb_per_track_tests {
     fn review_album_fallback_when_single_image_without_cuesheet() {
         let (mut state, _td) = empty_state(1);
         let r = review(
-            vec![page("Disc Album", "1995", "Rock", vec![
-                track(1, "T1", "Artist A", 0),
-                track(2, "T2", "Artist B", 0),
-            ])],
+            vec![page(
+                "Disc Album",
+                "1995",
+                "Rock",
+                vec![track(1, "T1", "Artist A", 0), track(2, "T2", "Artist B", 0)],
+            )],
             state.paths.clone(),
         );
         populate_editor_from_review(&mut state, &r);
 
         let lookup = |k: &str| -> Vec<String> {
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case(k))
-                .map(|e| e.per_file_values.clone()).unwrap_or_default()
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case(k))
+                .map(|e| e.per_file_values.clone())
+                .unwrap_or_default()
         };
         assert_eq!(lookup("TITLE"), vec!["Disc Album"]);
         // First track's artist as a representative.
@@ -824,23 +937,38 @@ mod gnudb_per_track_tests {
         let (mut state, _td) = empty_state(4);
         let r = review(
             vec![
-                page("Disc 1", "", "", vec![
-                    track(1, "D1T1", "Art", 0),
-                    track(2, "D1T2", "Art", 1),
-                ]),
-                page("Disc 2", "", "", vec![
-                    track(1, "D2T1", "Art", 2),
-                    track(2, "D2T2", "Art", 3),
-                ]),
+                page(
+                    "Disc 1",
+                    "",
+                    "",
+                    vec![track(1, "D1T1", "Art", 0), track(2, "D1T2", "Art", 1)],
+                ),
+                page(
+                    "Disc 2",
+                    "",
+                    "",
+                    vec![track(1, "D2T1", "Art", 2), track(2, "D2T2", "Art", 3)],
+                ),
             ],
             state.paths.clone(),
         );
         populate_editor_from_review(&mut state, &r);
 
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .unwrap();
         assert_eq!(title.per_file_values, vec!["D1T1", "D1T2", "D2T1", "D2T2"]);
-        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
-        assert_eq!(album.per_file_values, vec!["Disc 1", "Disc 1", "Disc 2", "Disc 2"]);
+        let album = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ALBUM")
+            .unwrap();
+        assert_eq!(
+            album.per_file_values,
+            vec!["Disc 1", "Disc 1", "Disc 2", "Disc 2"]
+        );
     }
 
     #[test]
@@ -849,7 +977,9 @@ mod gnudb_per_track_tests {
         // one file is the user-error case). Falls through to per-file
         // index path. Last disc's last track wins for slot 0.
         let (mut state, _td) = empty_state(1);
-        state.entries.push(cuesheet_entry("FILE \"x\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n"));
+        state.entries.push(cuesheet_entry(
+            "FILE \"x\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        ));
         let r = review(
             vec![
                 page("Disc 1", "", "", vec![track(1, "D1T1", "A", 0)]),
@@ -859,9 +989,12 @@ mod gnudb_per_track_tests {
         );
         populate_editor_from_review(&mut state, &r);
 
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .unwrap();
         // Last write wins (per-file behavior).
         assert_eq!(title.per_file_values, vec!["D2T1"]);
     }
-
 }

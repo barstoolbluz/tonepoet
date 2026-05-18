@@ -1,22 +1,24 @@
 //! Audio conversion processor with parallel execution
 
-use std::path::{Path, PathBuf};
+use super::formats::{Mp3BitrateMode, QualitySettings};
+use super::{
+    ConversionError, ConversionItem, ConversionPhase, ConversionQueue, ConversionResult,
+    ConversionStatus,
+};
+use log::{info, warn};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{mpsc, broadcast, Semaphore};
+use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use log::{info, warn};
-use super::{ConversionError, ConversionResult, ConversionQueue, ConversionStatus, ConversionItem, ConversionPhase};
-use super::formats::{QualitySettings, Mp3BitrateMode};
 
 // Import conversion backend
 use tonepoet_backend::convert_with_backend;
 
 // Import conversion features (log files, cue files)
 use tonepoet_features::{
-    ConversionConfig as FeaturesConfig,
-    ConversionResult as FeaturesResult,
+    ConversionConfig as FeaturesConfig, ConversionResult as FeaturesResult,
     ConversionStatus as FeaturesStatus,
 };
 
@@ -26,17 +28,21 @@ fn is_32bit_float(file_path: &Path) -> bool {
 
     let output = Command::new("ffprobe")
         .args(&[
-            "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=sample_fmt",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_fmt",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
         ])
         .arg(file_path)
         .output();
 
     if let Ok(output) = output {
         let fmt = String::from_utf8_lossy(&output.stdout);
-        fmt.trim().starts_with("flt")  // "flt" or "fltp" = float
+        fmt.trim().starts_with("flt") // "flt" or "fltp" = float
     } else {
         // If ffprobe fails, assume float (safer default)
         true
@@ -56,9 +62,9 @@ fn detect_audio_bit_depth(file_path: &Path) -> Option<u16> {
     // Use ffprobe to distinguish
     if depth == 32 {
         if is_32bit_float(file_path) {
-            Some(320)  // Maps to pcm_f32le
+            Some(320) // Maps to pcm_f32le
         } else {
-            Some(32)   // Maps to pcm_s32le
+            Some(32) // Maps to pcm_s32le
         }
     } else {
         Some(depth as u16)
@@ -67,8 +73,8 @@ fn detect_audio_bit_depth(file_path: &Path) -> Option<u16> {
 
 /// Detect comprehensive source file information
 fn detect_source_info(file_path: &Path) -> Option<tonepoet_features::SourceInfo> {
-    use lofty::prelude::*;
     use lofty::file::FileType;
+    use lofty::prelude::*;
 
     let tagged_file = lofty::read_from_path(file_path).ok()?;
     let props = tagged_file.properties();
@@ -83,7 +89,8 @@ fn detect_source_info(file_path: &Path) -> Option<tonepoet_features::SourceInfo>
         FileType::Opus => "Opus",
         FileType::WavPack => "WavPack",
         _ => "Unknown",
-    }.to_string();
+    }
+    .to_string();
 
     // Get bit depth (reuse existing function)
     let bit_depth = detect_audio_bit_depth(file_path);
@@ -100,18 +107,19 @@ fn detect_source_info(file_path: &Path) -> Option<tonepoet_features::SourceInfo>
 /// loudgain writes: REPLAYGAIN_TRACK_GAIN
 /// iTunes/AtomicParsley expects: replaygain_track_gain
 async fn fix_m4a_replaygain_atom_names(m4a_file: &Path) -> Result<(), ConversionError> {
-    use tonepoet_backend::{AacMetadataExtractor, AacMetadataApplier};
+    use tonepoet_backend::{AacMetadataApplier, AacMetadataExtractor};
 
     // Extract metadata (this will read the uppercase atoms and map them correctly)
     let extractor = AacMetadataExtractor::new();
-    let metadata = extractor.extract(m4a_file)
-        .map_err(|e| ConversionError::ToolError(format!("Failed to extract M4A metadata: {}", e)))?;
+    let metadata = extractor.extract(m4a_file).map_err(|e| {
+        ConversionError::ToolError(format!("Failed to extract M4A metadata: {}", e))
+    })?;
 
     // Only proceed if we have ReplayGain tags
-    let has_replaygain = metadata.custom_fields.contains_key("REPLAYGAIN_TRACK_GAIN") ||
-                         metadata.custom_fields.contains_key("REPLAYGAIN_TRACK_PEAK") ||
-                         metadata.custom_fields.contains_key("REPLAYGAIN_ALBUM_GAIN") ||
-                         metadata.custom_fields.contains_key("REPLAYGAIN_ALBUM_PEAK");
+    let has_replaygain = metadata.custom_fields.contains_key("REPLAYGAIN_TRACK_GAIN")
+        || metadata.custom_fields.contains_key("REPLAYGAIN_TRACK_PEAK")
+        || metadata.custom_fields.contains_key("REPLAYGAIN_ALBUM_GAIN")
+        || metadata.custom_fields.contains_key("REPLAYGAIN_ALBUM_PEAK");
 
     if !has_replaygain {
         return Ok(());
@@ -119,10 +127,14 @@ async fn fix_m4a_replaygain_atom_names(m4a_file: &Path) -> Result<(), Conversion
 
     // Reapply metadata (this will write them with proper lowercase atom names)
     let applier = AacMetadataApplier::new();
-    applier.apply(&metadata, m4a_file)
+    applier
+        .apply(&metadata, m4a_file)
         .map_err(|e| ConversionError::ToolError(format!("Failed to apply M4A metadata: {}", e)))?;
 
-    log::debug!("Fixed M4A ReplayGain atom names for: {}", m4a_file.display());
+    log::debug!(
+        "Fixed M4A ReplayGain atom names for: {}",
+        m4a_file.display()
+    );
     Ok(())
 }
 
@@ -176,17 +188,21 @@ async fn send_phase_update(
     });
 }
 
-fn terminal_progress_for_status(status: &ConversionStatus, last_known_progress: Option<f32>) -> f32 {
+fn terminal_progress_for_status(
+    status: &ConversionStatus,
+    last_known_progress: Option<f32>,
+) -> f32 {
     match status {
         ConversionStatus::Processing { progress, .. } => *progress,
         ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
         ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
             last_known_progress.unwrap_or(0.0).clamp(0.0, 100.0)
         }
-        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => 0.0,
+        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => {
+            0.0
+        }
     }
 }
-
 
 impl ConversionProcessor {
     /// Create a new processor
@@ -196,7 +212,7 @@ impl ConversionProcessor {
             progress_tx: None,
         }
     }
-    
+
     /// Set progress channel
     pub fn set_progress_channel(&mut self, tx: broadcast::Sender<ProgressUpdate>) {
         self.progress_tx = Some(tx);
@@ -206,7 +222,9 @@ impl ConversionProcessor {
     pub async fn process_queue(&mut self, queue: &mut ConversionQueue) -> ConversionResult<()> {
         // For backward compat, wrap in Arc<RwLock> temporarily
         let queue_arc = std::sync::Arc::new(tokio::sync::RwLock::new(std::mem::take(queue)));
-        let result = self.process_queue_with_progress_arc(queue_arc.clone(), None).await;
+        let result = self
+            .process_queue_with_progress_arc(queue_arc.clone(), None)
+            .await;
         // Move the queue back
         *queue = std::mem::take(&mut *queue_arc.write().await);
         result
@@ -219,7 +237,8 @@ impl ConversionProcessor {
         queue: std::sync::Arc<tokio::sync::RwLock<ConversionQueue>>,
         progress_rx: Option<broadcast::Receiver<ProgressUpdate>>,
     ) -> ConversionResult<()> {
-        self.process_queue_with_progress_arc(queue, progress_rx).await
+        self.process_queue_with_progress_arc(queue, progress_rx)
+            .await
     }
 
     /// Internal implementation
@@ -238,7 +257,10 @@ impl ConversionProcessor {
             let q = queue.read().await;
             (q.total_items(), q.queued_items().len())
         };
-        info!("Queue has {} total items, {} queued", total_items, queued_count);
+        info!(
+            "Queue has {} total items, {} queued",
+            total_items, queued_count
+        );
 
         // Debug to file
         if let Ok(mut debug_file) = std::fs::OpenOptions::new()
@@ -249,9 +271,14 @@ impl ConversionProcessor {
             writeln!(debug_file, "\n[PROCESSOR START] process_queue called").ok();
             writeln!(debug_file, "  Queue total items: {}", total_items).ok();
             writeln!(debug_file, "  Queue queued items: {}", queued_count).ok();
-            writeln!(debug_file, "  Progress channel set? {}", self.progress_tx.is_some()).ok();
+            writeln!(
+                debug_file,
+                "  Progress channel set? {}",
+                self.progress_tx.is_some()
+            )
+            .ok();
         }
-        
+
         // Use existing UI channel if set, don't overwrite it
         let progress_tx = if let Some(tx) = &self.progress_tx {
             // Debug: Log that we're using existing channel
@@ -270,7 +297,11 @@ impl ConversionProcessor {
                 .open("conversion-debug.log")
             {
                 use std::io::Write;
-                writeln!(debug_file, "  ⚠ Creating new local progress channel (not connected to UI!)").ok();
+                writeln!(
+                    debug_file,
+                    "  ⚠ Creating new local progress channel (not connected to UI!)"
+                )
+                .ok();
             }
             let (tx, _rx) = broadcast::channel::<ProgressUpdate>(100);
             self.progress_tx = Some(tx.clone());
@@ -305,9 +336,20 @@ impl ConversionProcessor {
             .open("conversion-debug.log")
         {
             use std::io::Write;
-            writeln!(debug_file, "\n[PROCESSOR] Got {} items to process:", queued_items.len()).ok();
+            writeln!(
+                debug_file,
+                "\n[PROCESSOR] Got {} items to process:",
+                queued_items.len()
+            )
+            .ok();
             for item in &queued_items {
-                writeln!(debug_file, "  Will process: id={}, path={}", item.id, item.input_path.display()).ok();
+                writeln!(
+                    debug_file,
+                    "  Will process: id={}, path={}",
+                    item.id,
+                    item.input_path.display()
+                )
+                .ok();
             }
         }
 
@@ -316,12 +358,21 @@ impl ConversionProcessor {
             // Apply default destination directory if item has no output_dir set
             if item.options.output_dir.is_none() {
                 if let Some(ref default_dest) = self.config.default_destination_directory {
-                    log::info!("Applying default destination to item {}: {:?}", item.id, default_dest);
+                    log::info!(
+                        "Applying default destination to item {}: {:?}",
+                        item.id,
+                        default_dest
+                    );
                     item.options.output_dir = Some(default_dest.clone());
                 }
             }
 
-            info!("Worker {} processing item: {} ({:?})", i, item.input_path.display(), item.input_format);
+            info!(
+                "Worker {} processing item: {} ({:?})",
+                i,
+                item.input_path.display(),
+                item.input_format
+            );
 
             // Debug: Log marking as processing
             if let Ok(mut debug_file) = std::fs::OpenOptions::new()
@@ -329,7 +380,12 @@ impl ConversionProcessor {
                 .open("conversion-debug.log")
             {
                 use std::io::Write;
-                writeln!(debug_file, "\n[PROCESSOR] Worker {} starting item id={}", i, item.id).ok();
+                writeln!(
+                    debug_file,
+                    "\n[PROCESSOR] Worker {} starting item id={}",
+                    i, item.id
+                )
+                .ok();
             }
 
             // Mark as processing in queue before starting - use short write lock
@@ -359,7 +415,12 @@ impl ConversionProcessor {
                         .open("conversion-debug.log")
                     {
                         use std::io::Write;
-                        writeln!(debug_file, "  ✗ Could not find item {} in queue to mark as Processing!", item.id).ok();
+                        writeln!(
+                            debug_file,
+                            "  ✗ Could not find item {} in queue to mark as Processing!",
+                            item.id
+                        )
+                        .ok();
                     }
                 }
             } // Write lock released here
@@ -371,11 +432,18 @@ impl ConversionProcessor {
             let scratch_dir = self.config.scratch_directory.clone();
 
             workers.spawn(async move {
-                match process_item(item, progress_tx, tool_paths, file_semaphore, scratch_dir).await {
+                match process_item(item, progress_tx, tool_paths, file_semaphore, scratch_dir).await
+                {
                     Ok(result) => Ok(result),
                     Err(e) => {
                         // Convert error into a Failed status so the queue item gets updated
-                        Ok((item_id_for_err, ConversionStatus::Failed { error: e.to_string(), log_path: None }))
+                        Ok((
+                            item_id_for_err,
+                            ConversionStatus::Failed {
+                                error: e.to_string(),
+                                log_path: None,
+                            },
+                        ))
                     }
                 }
             });
@@ -432,22 +500,22 @@ impl ConversionProcessor {
                 // No more workers and no pending progress updates
                 else => break,
             }
-            
+
             // Get next queued item - use short lock
             let next_item = {
                 let q = queue.read().await;
-                q.queued_items()
-                    .into_iter()
-                    .take(1)
-                    .cloned()
-                    .next()
+                q.queued_items().into_iter().take(1).cloned().next()
             };
 
             if let Some(mut item) = next_item {
                 // Apply default destination directory if item has no output_dir set
                 if item.options.output_dir.is_none() {
                     if let Some(ref default_dest) = self.config.default_destination_directory {
-                        log::info!("Applying default destination to item {}: {:?}", item.id, default_dest);
+                        log::info!(
+                            "Applying default destination to item {}: {:?}",
+                            item.id,
+                            default_dest
+                        );
                         item.options.output_dir = Some(default_dest.clone());
                     }
                 }
@@ -460,8 +528,8 @@ impl ConversionProcessor {
                             progress: 0.0,
                             message: Some(format!("Starting conversion to {}", item.output_format)),
                             file_progress: None,
-                        phase: None,
-                        phase_progress: None,
+                            phase: None,
+                            phase_progress: None,
                         };
                     }
                 } // Lock released here
@@ -473,11 +541,17 @@ impl ConversionProcessor {
                 let scratch_dir = self.config.scratch_directory.clone();
 
                 workers.spawn(async move {
-                    match process_item(item, progress_tx, tool_paths, file_semaphore, scratch_dir).await {
+                    match process_item(item, progress_tx, tool_paths, file_semaphore, scratch_dir)
+                        .await
+                    {
                         Ok(result) => Ok(result),
-                        Err(e) => {
-                            Ok((item_id_for_err, ConversionStatus::Failed { error: e.to_string(), log_path: None }))
-                        }
+                        Err(e) => Ok((
+                            item_id_for_err,
+                            ConversionStatus::Failed {
+                                error: e.to_string(),
+                                log_path: None,
+                            },
+                        )),
                     }
                 });
             } else if workers.is_empty() {
@@ -486,7 +560,7 @@ impl ConversionProcessor {
                 progress_rx = None;
             }
         }
-        
+
         Ok(())
     }
 }
@@ -496,8 +570,8 @@ async fn copy_flac_with_full_pipeline(
     item: &ConversionItem,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
 ) -> ConversionResult<PathBuf> {
-    use tokio::process::Command as TokioCommand;
     use crate::convert::simple_wizard::ReplayGainMode;
+    use tokio::process::Command as TokioCommand;
 
     // Phase 1: Setup working directory (0-10%)
     send_phase_update(
@@ -507,19 +581,26 @@ async fn copy_flac_with_full_pipeline(
         0.0,
         Some("Setting up copy mode...".to_string()),
         None,
-    ).await;
+    )
+    .await;
 
-    let output_base = item.options.output_dir.as_ref()
+    let output_base = item
+        .options
+        .output_dir
+        .as_ref()
         .map(|p| p.as_path())
         .unwrap_or_else(|| Path::new("."));
 
-    let file_stem = item.input_path.file_stem()
+    let file_stem = item
+        .input_path
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("flac_file");
 
     let working_dir = output_base.join(format!(".flac_copy_{}", file_stem));
-    std::fs::create_dir_all(&working_dir)
-        .map_err(|e| ConversionError::ConversionFailed(format!("Failed to create working dir: {}", e)))?;
+    std::fs::create_dir_all(&working_dir).map_err(|e| {
+        ConversionError::ConversionFailed(format!("Failed to create working dir: {}", e))
+    })?;
 
     // Copy FLAC file to working directory
     send_phase_update(
@@ -529,9 +610,12 @@ async fn copy_flac_with_full_pipeline(
         50.0,
         Some("Copying FLAC file...".to_string()),
         None,
-    ).await;
+    )
+    .await;
 
-    let file_name = item.input_path.file_name()
+    let file_name = item
+        .input_path
+        .file_name()
         .ok_or_else(|| ConversionError::ConversionFailed("Invalid input filename".to_string()))?;
     let copied_file = working_dir.join(file_name);
     tokio::fs::copy(&item.input_path, &copied_file).await?;
@@ -543,7 +627,8 @@ async fn copy_flac_with_full_pipeline(
         100.0,
         Some("Copy complete".to_string()),
         None,
-    ).await;
+    )
+    .await;
 
     // Phase 2: Renaming (10-50%)
     send_phase_update(
@@ -553,14 +638,15 @@ async fn copy_flac_with_full_pipeline(
         0.0,
         Some("Analyzing folder structure...".to_string()),
         None,
-    ).await;
+    )
+    .await;
 
     let audio_files = vec![&copied_file];
     let renamed_folder = match crate::convert::apply_folder_renaming(
         &working_dir,
         &audio_files,
         None,
-        Some(&item.output_format)
+        Some(&item.output_format),
     ) {
         Ok(folder) => {
             send_phase_update(
@@ -570,7 +656,8 @@ async fn copy_flac_with_full_pipeline(
                 50.0,
                 Some("Folder renamed".to_string()),
                 None,
-            ).await;
+            )
+            .await;
             info!("Renamed folder to: {}", folder.display());
             folder
         }
@@ -587,7 +674,8 @@ async fn copy_flac_with_full_pipeline(
         70.0,
         Some("Renaming audio file...".to_string()),
         None,
-    ).await;
+    )
+    .await;
 
     let renamed_files = match crate::convert::rename_audio_files(&renamed_folder) {
         Ok(files) => {
@@ -598,7 +686,8 @@ async fn copy_flac_with_full_pipeline(
                 100.0,
                 Some(format!("Renamed {} file(s)", files.len())),
                 None,
-            ).await;
+            )
+            .await;
             info!("Renamed {} audio file(s)", files.len());
             files
         }
@@ -616,7 +705,8 @@ async fn copy_flac_with_full_pipeline(
         10.0,
         Some("Updating metadata...".to_string()),
         None,
-    ).await;
+    )
+    .await;
 
     match crate::convert::update_album_tags(&renamed_folder) {
         Ok(count) => {
@@ -627,7 +717,8 @@ async fn copy_flac_with_full_pipeline(
                 50.0,
                 Some(format!("Updated {} album tag(s)", count)),
                 None,
-            ).await;
+            )
+            .await;
             if count > 0 {
                 info!("Updated album tags for {} file(s)", count);
             }
@@ -646,7 +737,8 @@ async fn copy_flac_with_full_pipeline(
                 70.0,
                 Some(format!("Updated {} title tag(s)", count)),
                 None,
-            ).await;
+            )
+            .await;
             if count > 0 {
                 info!("Updated title tags for {} file(s)", count);
             }
@@ -660,7 +752,10 @@ async fn copy_flac_with_full_pipeline(
     if item.options.append_lineage_to_comment {
         // Look for Lineage.txt in the SOURCE file's parent directory, not the working directory
         let source_dir = item.input_path.parent();
-        log::debug!("Copy mode: Lineage feature ENABLED, searching in source directory: {:?}", source_dir);
+        log::debug!(
+            "Copy mode: Lineage feature ENABLED, searching in source directory: {:?}",
+            source_dir
+        );
         send_phase_update(
             progress_tx,
             &item.id,
@@ -668,7 +763,8 @@ async fn copy_flac_with_full_pipeline(
             75.0,
             Some("Appending Lineage.txt to COMMENT tags...".to_string()),
             None,
-        ).await;
+        )
+        .await;
 
         // Look for Lineage.txt in the SOURCE directory (case-insensitive)
         let lineage_path = source_dir.and_then(|dir| {
@@ -684,7 +780,10 @@ async fn copy_flac_with_full_pipeline(
             // Apply to all FLAC files
             for file in &renamed_files {
                 let result = TokioCommand::new("metaflac")
-                    .arg(format!("--set-tag-from-file=COMMENT={}", lineage_path.display()))
+                    .arg(format!(
+                        "--set-tag-from-file=COMMENT={}",
+                        lineage_path.display()
+                    ))
                     .arg(file)
                     .output()
                     .await;
@@ -710,9 +809,13 @@ async fn copy_flac_with_full_pipeline(
                 85.0,
                 Some("Lineage.txt applied to COMMENT tags".to_string()),
                 None,
-            ).await;
+            )
+            .await;
         } else {
-            log::debug!("Lineage.txt not found in source directory: {:?}", source_dir.map(|d| d.display()));
+            log::debug!(
+                "Lineage.txt not found in source directory: {:?}",
+                source_dir.map(|d| d.display())
+            );
         }
     }
 
@@ -725,7 +828,8 @@ async fn copy_flac_with_full_pipeline(
             0.0,
             Some("Calculating ReplayGain...".to_string()),
             None,
-        ).await;
+        )
+        .await;
 
         let mut args = vec![];
 
@@ -743,7 +847,7 @@ async fn copy_flac_with_full_pipeline(
             // Additional loudgain flags
             args.push("-k".to_string()); // Keep existing tags (noclip)
             args.push("-s".to_string()); // Tag mode
-            args.push("i".to_string());  // Write ReplayGain 2.0 tags
+            args.push("i".to_string()); // Write ReplayGain 2.0 tags
 
             // Add files
             for file in &renamed_files {
@@ -755,14 +859,20 @@ async fn copy_flac_with_full_pipeline(
                 .args(&args)
                 .output()
                 .await
-                .map_err(|e| ConversionError::ToolError(format!("Failed to run loudgain: {}", e)))?;
+                .map_err(|e| {
+                    ConversionError::ToolError(format!("Failed to run loudgain: {}", e))
+                })?;
 
             if output.status.success() {
                 // Fix M4A ReplayGain atom names (uppercase → lowercase)
                 for file in &renamed_files {
                     if file.extension().map_or(false, |ext| ext == "m4a") {
                         if let Err(e) = fix_m4a_replaygain_atom_names(file).await {
-                            log::warn!("Failed to fix M4A ReplayGain atom names for {}: {}", file.display(), e);
+                            log::warn!(
+                                "Failed to fix M4A ReplayGain atom names for {}: {}",
+                                file.display(),
+                                e
+                            );
                         }
                     }
                 }
@@ -774,7 +884,8 @@ async fn copy_flac_with_full_pipeline(
                     100.0,
                     Some("ReplayGain calculated".to_string()),
                     None,
-                ).await;
+                )
+                .await;
                 info!("ReplayGain tags applied successfully");
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -786,7 +897,8 @@ async fn copy_flac_with_full_pipeline(
                     100.0,
                     Some("ReplayGain calculation failed (continuing)".to_string()),
                     None,
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -799,7 +911,8 @@ async fn copy_flac_with_full_pipeline(
         100.0,
         Some("Copy mode complete".to_string()),
         None,
-    ).await;
+    )
+    .await;
 
     Ok(renamed_folder)
 }
@@ -807,19 +920,22 @@ async fn copy_flac_with_full_pipeline(
 /// Check if copy mode can be used (Tier 2: full pipeline with ReplayGain support)
 /// Returns false if user requested re-encoding via checkbox
 fn can_use_copy_mode(item: &ConversionItem) -> bool {
-    use crate::convert::FileFormat;
     use crate::convert::AudioFormat;
+    use crate::convert::FileFormat;
 
     log::debug!("🔍 Checking copy mode eligibility:");
     log::debug!("  reencode_flac: {}", item.options.reencode_flac);
     log::debug!("  dither_type: {:?}", item.options.dither_type);
     log::debug!("  target_bit_depth: {:?}", item.options.target_bit_depth);
-    log::debug!("  target_sample_rate: {:?}", item.options.target_sample_rate);
+    log::debug!(
+        "  target_sample_rate: {:?}",
+        item.options.target_sample_rate
+    );
 
     // User must NOT have requested re-encoding
     if item.options.reencode_flac {
         log::debug!("Copy mode skipped: Re-encode checkbox is checked");
-        return false;  // Re-encoding requested → don't use copy mode
+        return false; // Re-encoding requested → don't use copy mode
     }
 
     // Must be FLAC → FLAC
@@ -851,9 +967,10 @@ fn can_use_copy_mode(item: &ConversionItem) -> bool {
     }
 
     // No dithering (only matters when bit depth is actually 16 or 24)
-    if item.options.dither_type.is_some() &&
-       item.options.target_bit_depth.is_some() &&
-       (item.options.target_bit_depth == Some(16) || item.options.target_bit_depth == Some(24)) {
+    if item.options.dither_type.is_some()
+        && item.options.target_bit_depth.is_some()
+        && (item.options.target_bit_depth == Some(16) || item.options.target_bit_depth == Some(24))
+    {
         log::debug!("Copy mode skipped: Dithering requested");
         return false;
     }
@@ -861,11 +978,10 @@ fn can_use_copy_mode(item: &ConversionItem) -> bool {
     true
 }
 
-
 fn cue_capable_input_path(path: &Path) -> bool {
     const AUDIO_IMAGE_EXTENSIONS: &[&str] = &[
-        "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4",
-        "aac", "opus", "ogg", "ape", "w64", "rf64",
+        "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4", "aac", "opus",
+        "ogg", "ape", "w64", "rf64",
     ];
 
     path.extension()
@@ -919,11 +1035,15 @@ fn pipeline_request_for_cue_item(
             bitrate: match &item.options.quality {
                 crate::convert::formats::QualitySettings::Opus { bitrate, .. } => Some(*bitrate),
                 crate::convert::formats::QualitySettings::Aac { bitrate, .. } => Some(*bitrate),
-                crate::convert::formats::QualitySettings::Mp3 { bitrate_mode, .. } => match bitrate_mode {
-                    crate::convert::formats::Mp3BitrateMode::Cbr { bitrate } => Some(*bitrate),
-                    crate::convert::formats::Mp3BitrateMode::Vbr { quality } => Some(*quality as u32),
-                    crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
-                },
+                crate::convert::formats::QualitySettings::Mp3 { bitrate_mode, .. } => {
+                    match bitrate_mode {
+                        crate::convert::formats::Mp3BitrateMode::Cbr { bitrate } => Some(*bitrate),
+                        crate::convert::formats::Mp3BitrateMode::Vbr { quality } => {
+                            Some(*quality as u32)
+                        }
+                        crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
+                    }
+                }
                 _ => None,
             },
             compression_level: match &item.options.quality {
@@ -964,7 +1084,10 @@ fn pipeline_request_for_cue_item(
 
 fn cue_pipeline_policy_for_item(
     item: &ConversionItem,
-) -> Result<Option<crate::convert::pipeline::CueSidecarPolicy>, crate::convert::pipeline::SourceDetectError> {
+) -> Result<
+    Option<crate::convert::pipeline::CueSidecarPolicy>,
+    crate::convert::pipeline::SourceDetectError,
+> {
     use crate::convert::pipeline::{detect_source_kind, CueSidecarPolicy, SourceKind};
 
     if matches!(item.input_format, crate::convert::FileFormat::SevenZip) {
@@ -991,7 +1114,6 @@ fn cue_pipeline_policy_for_item(
         },
     }
 }
-
 
 fn sacd_capable_input_path(path: &Path) -> bool {
     path.extension()
@@ -1038,7 +1160,9 @@ fn pipeline_request_for_sacd_item(
                 crate::convert::formats::QualitySettings::Mp3 { bitrate_mode, .. } => {
                     match bitrate_mode {
                         crate::convert::formats::Mp3BitrateMode::Cbr { bitrate } => Some(*bitrate),
-                        crate::convert::formats::Mp3BitrateMode::Vbr { quality } => Some(*quality as u32),
+                        crate::convert::formats::Mp3BitrateMode::Vbr { quality } => {
+                            Some(*quality as u32)
+                        }
                         crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
                     }
                 }
@@ -1106,14 +1230,16 @@ async fn run_sacd_pipeline_conversion_item(
     tool_paths: HashMap<String, PathBuf>,
 ) -> ConversionResult<(String, ConversionStatus)> {
     use crate::convert::pipeline::{
-        map_album_outcome, run_pipeline_item, RealToolRunner, BroadcastReporter,
+        map_album_outcome, run_pipeline_item_with_tool_paths, BroadcastReporter, RealToolRunner,
     };
 
     let pipeline_req = pipeline_request_for_sacd_item(item);
-    let runner = RealToolRunner::new(tool_paths);
+    let runner = RealToolRunner::new(tool_paths.clone());
     let reporter = BroadcastReporter::new(progress_tx.clone(), item.id.clone());
     let cancel = CancellationToken::new();
-    let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
+    let report =
+        run_pipeline_item_with_tool_paths(pipeline_req, &runner, &reporter, &cancel, &tool_paths)
+            .await;
 
     let status = map_album_outcome(
         &report.outcome,
@@ -1142,13 +1268,17 @@ async fn run_cue_pipeline_conversion_item(
     tool_paths: HashMap<String, PathBuf>,
     fallback_cue_policy: crate::convert::pipeline::CueSidecarPolicy,
 ) -> ConversionResult<(String, ConversionStatus)> {
-    use crate::convert::pipeline::{map_album_outcome, RealToolRunner, BroadcastReporter, run_pipeline_item};
+    use crate::convert::pipeline::{
+        map_album_outcome, run_pipeline_item_with_tool_paths, BroadcastReporter, RealToolRunner,
+    };
 
     let pipeline_req = pipeline_request_for_cue_item(item, fallback_cue_policy);
-    let runner = RealToolRunner::new(tool_paths);
+    let runner = RealToolRunner::new(tool_paths.clone());
     let reporter = BroadcastReporter::new(progress_tx.clone(), item.id.clone());
     let cancel = CancellationToken::new();
-    let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
+    let report =
+        run_pipeline_item_with_tool_paths(pipeline_req, &runner, &reporter, &cancel, &tool_paths)
+            .await;
 
     let status = map_album_outcome(
         &report.outcome,
@@ -1171,29 +1301,27 @@ async fn run_cue_pipeline_conversion_item(
     Ok((item.id.clone(), status))
 }
 
-
-
 async fn run_sevenzip_pipeline_conversion_item(
     item: &ConversionItem,
     progress_tx: broadcast::Sender<ProgressUpdate>,
     tool_paths: HashMap<String, PathBuf>,
 ) -> ConversionResult<(String, ConversionStatus)> {
     use crate::convert::pipeline::{
-        map_album_outcome, run_pipeline_item, BroadcastReporter, CueSidecarPolicy,
+        map_album_outcome, run_pipeline_item_with_tool_paths, BroadcastReporter, CueSidecarPolicy,
         DitherPolicy, EncodeBackend, EncodeOptions, FailurePolicy, LogPolicy,
-        NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest,
-        PublishPolicy, RealToolRunner, SecretString, SourceOptions, StagePolicy,
-        StageRequirement, TrackSelection,
+        NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PublishPolicy,
+        RealToolRunner, SecretString, SourceOptions, StagePolicy, StageRequirement, TrackSelection,
     };
 
     let pipeline_req = if let Some(req) = item.pipeline_request.clone() {
         req
     } else {
-        let output_root = item
-            .options
-            .output_dir
-            .clone()
-            .unwrap_or_else(|| item.input_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        let output_root = item.options.output_dir.clone().unwrap_or_else(|| {
+            item.input_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
         PipelineRequest {
             job_id: format!("job-{}", item.id),
             item_id: item.id.clone(),
@@ -1211,13 +1339,21 @@ async fn run_sevenzip_pipeline_conversion_item(
             encode: EncodeOptions {
                 backend: EncodeBackend::Auto,
                 bitrate: match &item.options.quality {
-                    crate::convert::formats::QualitySettings::Opus { bitrate, .. } => Some(*bitrate),
+                    crate::convert::formats::QualitySettings::Opus { bitrate, .. } => {
+                        Some(*bitrate)
+                    }
                     crate::convert::formats::QualitySettings::Aac { bitrate, .. } => Some(*bitrate),
-                    crate::convert::formats::QualitySettings::Mp3 { bitrate_mode, .. } => match bitrate_mode {
-                        crate::convert::formats::Mp3BitrateMode::Cbr { bitrate }
-                        | crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
-                        crate::convert::formats::Mp3BitrateMode::Vbr { quality } => Some(*quality as u32),
-                    },
+                    crate::convert::formats::QualitySettings::Mp3 { bitrate_mode, .. } => {
+                        match bitrate_mode {
+                            crate::convert::formats::Mp3BitrateMode::Cbr { bitrate }
+                            | crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => {
+                                Some(*bitrate)
+                            }
+                            crate::convert::formats::Mp3BitrateMode::Vbr { quality } => {
+                                Some(*quality as u32)
+                            }
+                        }
+                    }
                     _ => None,
                 },
                 compression_level: match &item.options.quality {
@@ -1256,10 +1392,12 @@ async fn run_sevenzip_pipeline_conversion_item(
         }
     };
 
-    let runner = RealToolRunner::new(tool_paths);
+    let runner = RealToolRunner::new(tool_paths.clone());
     let reporter = BroadcastReporter::new(progress_tx, item.id.clone());
     let cancel = CancellationToken::new();
-    let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
+    let report =
+        run_pipeline_item_with_tool_paths(pipeline_req, &runner, &reporter, &cancel, &tool_paths)
+            .await;
     let status = map_album_outcome(
         &report.outcome,
         report.published.as_ref(),
@@ -1286,12 +1424,19 @@ pub async fn process_item(
     tool_paths: HashMap<String, PathBuf>,
     _file_semaphore: Arc<Semaphore>,
     _scratch_directory: Option<PathBuf>,
-) -> ConversionResult<(String, ConversionStatus)> {  // Return item_id and final status
+) -> ConversionResult<(String, ConversionStatus)> {
+    // Return item_id and final status
     // Pre-flight: verify input file exists
     if !item.input_path.exists() {
         let error_msg = format!("Source file not found: {}", item.input_path.display());
         log::error!("{}", error_msg);
-        return Ok((item.id.clone(), ConversionStatus::Failed { error: error_msg, log_path: None }));
+        return Ok((
+            item.id.clone(),
+            ConversionStatus::Failed {
+                error: error_msg,
+                log_path: None,
+            },
+        ));
     }
 
     // Update status to processing - 0%
@@ -1302,22 +1447,17 @@ pub async fn process_item(
             progress: 0.0,
             message: Some(format!("Starting conversion to {}", item.output_format)),
             file_progress: None,
-                    phase: None,
-                    phase_progress: None,
+            phase: None,
+            phase_progress: None,
         },
     });
-    
 
     // Route staged pipeline jobs before legacy 10%/25% setup updates.
     // The staged reporter owns the full 0-100 stage-window model, so sending
     // legacy setup updates first would make the user-visible stream regress.
     if let Ok(true) = sacd_pipeline_candidate_for_item(&item) {
-        return run_sacd_pipeline_conversion_item(
-            &item,
-            progress_tx.clone(),
-            tool_paths.clone(),
-        )
-        .await;
+        return run_sacd_pipeline_conversion_item(&item, progress_tx.clone(), tool_paths.clone())
+            .await;
     }
 
     match cue_pipeline_policy_for_item(&item) {
@@ -1354,7 +1494,7 @@ pub async fn process_item(
     // Determine output path - 10%
     let output_path = determine_output_path(&item)?;
     item.output_path = Some(output_path.clone());
-    
+
     let _ = progress_tx.send(ProgressUpdate {
         item_id: item.id.clone(),
         progress: 10.0,
@@ -1362,16 +1502,16 @@ pub async fn process_item(
             progress: 10.0,
             message: Some("Preparing output file".to_string()),
             file_progress: None,
-                    phase: None,
-                    phase_progress: None,
+            phase: None,
+            phase_progress: None,
         },
     });
-    
+
     // Create output directory if needed
     if let Some(parent) = output_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    
+
     // Send 25% progress before starting actual conversion
     let _ = progress_tx.send(ProgressUpdate {
         item_id: item.id.clone(),
@@ -1380,11 +1520,11 @@ pub async fn process_item(
             progress: 25.0,
             message: Some(format!("Converting to {}", item.output_format)),
             file_progress: None,
-                    phase: None,
-                    phase_progress: None,
+            phase: None,
+            phase_progress: None,
         },
     });
-    
+
     // Route SACD ISO and single-image CUE albums through the staged pipeline
     // before the legacy one-file audio path. SACD routing comes first because
     // `.iso` has no legacy one-file audio semantics in this processor.
@@ -1440,86 +1580,118 @@ pub async fn process_item(
         crate::convert::FileFormat::SevenZip => {
             // Route 7z archives through the new staged pipeline.
             use crate::convert::pipeline::{
-                RealToolRunner, BroadcastReporter, PipelineRequest, SourceOptions,
-                EncodeOptions, EncodeBackend, DitherPolicy, NamingPolicy,
-                NamingCollisionPolicy, PublishPolicy, OverwritePolicy, LogPolicy,
-                StagePolicy, StageRequirement, FailurePolicy, SecretString,
-                CueSidecarPolicy, TrackSelection, run_pipeline_item,
+                run_pipeline_item_with_tool_paths, BroadcastReporter, CueSidecarPolicy,
+                DitherPolicy, EncodeBackend, EncodeOptions, FailurePolicy, LogPolicy,
+                NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest,
+                PublishPolicy, RealToolRunner, SecretString, SourceOptions, StagePolicy,
+                StageRequirement, TrackSelection,
             };
 
             // Use pre-built pipeline request if the CLI set one.
             let pipeline_req = if let Some(req) = item.pipeline_request.clone() {
                 req
-            } else { PipelineRequest {
-                job_id: format!("job-{}", item.id),
-                item_id: item.id.clone(),
-                container: item.input_path.clone(),
-                source: SourceOptions {
-                    archive_password: item.archive_password.as_ref().map(|p| SecretString::new(p.clone())),
-                    sacd_area: None,
-                    cue_sidecar: CueSidecarPolicy::PreferSidecar,
-                    track_selection: TrackSelection::All,
-                },
-                target_format: item.output_format,
-                encode: EncodeOptions {
-                    backend: EncodeBackend::Auto,
-                    bitrate: match &item.options.quality {
-                        crate::convert::formats::QualitySettings::Opus { bitrate, .. } => Some(*bitrate),
-                        crate::convert::formats::QualitySettings::Aac { bitrate, .. } => Some(*bitrate),
-                        crate::convert::formats::QualitySettings::Mp3 { bitrate_mode, .. } => {
-                            match bitrate_mode {
-                                crate::convert::formats::Mp3BitrateMode::Cbr { bitrate } => Some(*bitrate),
-                                crate::convert::formats::Mp3BitrateMode::Vbr { quality } => Some(*quality as u32),
-                                crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
+            } else {
+                PipelineRequest {
+                    job_id: format!("job-{}", item.id),
+                    item_id: item.id.clone(),
+                    container: item.input_path.clone(),
+                    source: SourceOptions {
+                        archive_password: item
+                            .archive_password
+                            .as_ref()
+                            .map(|p| SecretString::new(p.clone())),
+                        sacd_area: None,
+                        cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                        track_selection: TrackSelection::All,
+                    },
+                    target_format: item.output_format,
+                    encode: EncodeOptions {
+                        backend: EncodeBackend::Auto,
+                        bitrate: match &item.options.quality {
+                            crate::convert::formats::QualitySettings::Opus { bitrate, .. } => {
+                                Some(*bitrate)
                             }
-                        }
-                        _ => None,
+                            crate::convert::formats::QualitySettings::Aac { bitrate, .. } => {
+                                Some(*bitrate)
+                            }
+                            crate::convert::formats::QualitySettings::Mp3 {
+                                bitrate_mode, ..
+                            } => match bitrate_mode {
+                                crate::convert::formats::Mp3BitrateMode::Cbr { bitrate } => {
+                                    Some(*bitrate)
+                                }
+                                crate::convert::formats::Mp3BitrateMode::Vbr { quality } => {
+                                    Some(*quality as u32)
+                                }
+                                crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => {
+                                    Some(*bitrate)
+                                }
+                            },
+                            _ => None,
+                        },
+                        compression_level: match &item.options.quality {
+                            crate::convert::formats::QualitySettings::Flac {
+                                compression_level,
+                            } => Some(*compression_level),
+                            _ => None,
+                        },
+                        dither: DitherPolicy::Auto,
                     },
-                    compression_level: match &item.options.quality {
-                        crate::convert::formats::QualitySettings::Flac { compression_level } => Some(*compression_level),
-                        _ => None,
-                    },
-                    dither: DitherPolicy::Auto,
-                },
-                merge: item.options.merge_to_single,
-                output_root: item.options.output_dir.clone()
-                    .unwrap_or_else(|| item.input_path.parent()
-                        .unwrap_or(Path::new("."))
-                        .to_path_buf()),
-                naming: NamingPolicy {
-                    template: "%NN% - %TITLE%".to_string(),
-                    per_album_subdir: true,
-                    collision_policy: NamingCollisionPolicy::Fail,
-                },
-                publish: PublishPolicy {
-                    overwrite: OverwritePolicy::FailIfExists,
-                    same_filesystem_required: false,
-                },
-                log: LogPolicy {
-                    root: item.options.output_dir.clone()
-                        .unwrap_or_else(|| item.input_path.parent()
+                    merge: item.options.merge_to_single,
+                    output_root: item.options.output_dir.clone().unwrap_or_else(|| {
+                        item.input_path
+                            .parent()
                             .unwrap_or(Path::new("."))
-                            .to_path_buf())
-                        .join(".tonepoet-logs"),
-                    write_for_blocked: true,
-                },
-                stages: StagePolicy {
-                    metadata: StageRequirement::Enabled,
-                    replaygain: if item.options.calculate_replaygain {
-                        StageRequirement::Enabled
-                    } else {
-                        StageRequirement::Disabled
+                            .to_path_buf()
+                    }),
+                    naming: NamingPolicy {
+                        template: "%NN% - %TITLE%".to_string(),
+                        per_album_subdir: true,
+                        collision_policy: NamingCollisionPolicy::Fail,
                     },
-                    features: StageRequirement::Enabled,
-                },
-                failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
-            }};
+                    publish: PublishPolicy {
+                        overwrite: OverwritePolicy::FailIfExists,
+                        same_filesystem_required: false,
+                    },
+                    log: LogPolicy {
+                        root: item
+                            .options
+                            .output_dir
+                            .clone()
+                            .unwrap_or_else(|| {
+                                item.input_path
+                                    .parent()
+                                    .unwrap_or(Path::new("."))
+                                    .to_path_buf()
+                            })
+                            .join(".tonepoet-logs"),
+                        write_for_blocked: true,
+                    },
+                    stages: StagePolicy {
+                        metadata: StageRequirement::Enabled,
+                        replaygain: if item.options.calculate_replaygain {
+                            StageRequirement::Enabled
+                        } else {
+                            StageRequirement::Disabled
+                        },
+                        features: StageRequirement::Enabled,
+                    },
+                    failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+                }
+            };
 
-            let runner = RealToolRunner::new(tool_paths);
+            let runner = RealToolRunner::new(tool_paths.clone());
             let reporter = BroadcastReporter::new(progress_tx.clone(), item.id.clone());
             let cancel = CancellationToken::new();
 
-            let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
+            let report = run_pipeline_item_with_tool_paths(
+                pipeline_req,
+                &runner,
+                &reporter,
+                &cancel,
+                &tool_paths,
+            )
+            .await;
 
             // Map pipeline outcome to legacy status.
             use crate::convert::pipeline::map_album_outcome;
@@ -1532,10 +1704,13 @@ pub async fn process_item(
             match &status {
                 ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => {}
                 ConversionStatus::Failed { error, .. } => {
-                    return Ok((item.id.clone(), ConversionStatus::Failed {
-                        error: error.clone(),
-                        log_path: report.durable_log,
-                    }));
+                    return Ok((
+                        item.id.clone(),
+                        ConversionStatus::Failed {
+                            error: error.clone(),
+                            log_path: report.durable_log,
+                        },
+                    ));
                 }
                 _ => {}
             }
@@ -1547,7 +1722,7 @@ pub async fn process_item(
         }
         crate::convert::FileFormat::Audio(_input_audio_format) => {
             // For audio files, we still use phases but skip extraction/renaming
-            
+
             // Analyzing phase - quick file analysis
             send_phase_update(
                 &progress_tx,
@@ -1556,11 +1731,12 @@ pub async fn process_item(
                 10.0,
                 Some("Analyzing audio file...".to_string()),
                 None,
-            ).await;
-            
+            )
+            .await;
+
             // Small delay to make phase visible
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            
+
             send_phase_update(
                 &progress_tx,
                 &item.id,
@@ -1568,8 +1744,9 @@ pub async fn process_item(
                 100.0,
                 Some("Analysis complete".to_string()),
                 None,
-            ).await;
-            
+            )
+            .await;
+
             // Jump to Converting phase (main work)
             send_phase_update(
                 &progress_tx,
@@ -1578,7 +1755,8 @@ pub async fn process_item(
                 0.0,
                 Some(format!("Starting conversion to {}...", item.output_format)),
                 None,
-            ).await;
+            )
+            .await;
 
             // Check if we can use fast copy mode (Tier 2: full pipeline with ReplayGain)
             if can_use_copy_mode(&item) {
@@ -1589,68 +1767,68 @@ pub async fn process_item(
 
                 // Skip backend conversion entirely - copy mode handled everything
             } else {
-            // Audio to audio conversion - Use conversion backend for all formats
-            // Detect source info for this file to pass to backend
-            let source_info = detect_source_info(&item.input_path);
-            // Create conversion backend adapter item since backend has its own ConversionItem type
-            let backend_item = create_backend_conversion_item(&item, source_info.as_ref());
-            
-            // Create progress adapter channel since backend uses different ProgressUpdate type
-            let (backend_progress_tx, mut backend_progress_rx) = mpsc::channel::<tonepoet_backend::integration::ProgressUpdate>(100);
-            
-            // Forward backend progress to main project progress format
-            let main_progress_tx = progress_tx.clone();
-            let _item_id_clone = item.id.clone();
-            let progress_forwarder = tokio::spawn(async move {
-                while let Some(backend_update) = backend_progress_rx.recv().await {
-                    // Map backend progress to main project format
-                    let main_update = ProgressUpdate {
-                        item_id: backend_update.item_id,
-                        progress: backend_update.progress,
-                        status: map_backend_status_to_main(backend_update.status),
-                    };
-                    let _ = main_progress_tx.send(main_update);
-                }
-            });
-            
-            // Replace entire format-specific dispatch with single backend call
-            let backend_result = convert_with_backend(
-                &backend_item,
-                &item.input_path,
-                &output_path,
-                &backend_progress_tx,
-                item.options.preferred_backend // Use backend from wizard/preset
-            ).await;
+                // Audio to audio conversion - Use conversion backend for all formats
+                // Detect source info for this file to pass to backend
+                let source_info = detect_source_info(&item.input_path);
+                // Create conversion backend adapter item since backend has its own ConversionItem type
+                let backend_item = create_backend_conversion_item(&item, source_info.as_ref());
 
-            // Wait for conversion to complete and cleanup progress forwarder
-            let result = match backend_result {
-                Ok((_, _pipeline)) => {
-                    // Conversion successful - backend handled the conversion
-                    // (Pipeline ignored for individual file conversions - no logs generated)
-                    Ok(())
-                }
-                Err(tonepoet_backend::ConversionError::InvalidSettings(msg)) => {
-                    Err(ConversionError::ValidationError(msg))
-                }
-                Err(tonepoet_backend::ConversionError::UnsupportedFormat(msg)) => {
-                    Err(ConversionError::UnsupportedFormat(msg))
-                }
-                Err(tonepoet_backend::ConversionError::BackendUnavailable(msg)) => {
-                    Err(ConversionError::ToolError(msg))
-                }
-                Err(tonepoet_backend::ConversionError::Io(e)) => {
-                    Err(ConversionError::Io(e))
-                }
-            };
-            
-            // Cleanup progress forwarder
-            progress_forwarder.abort();
+                // Create progress adapter channel since backend uses different ProgressUpdate type
+                let (backend_progress_tx, mut backend_progress_rx) =
+                    mpsc::channel::<tonepoet_backend::integration::ProgressUpdate>(100);
 
-            result?;
+                // Forward backend progress to main project progress format
+                let main_progress_tx = progress_tx.clone();
+                let _item_id_clone = item.id.clone();
+                let progress_forwarder = tokio::spawn(async move {
+                    while let Some(backend_update) = backend_progress_rx.recv().await {
+                        // Map backend progress to main project format
+                        let main_update = ProgressUpdate {
+                            item_id: backend_update.item_id,
+                            progress: backend_update.progress,
+                            status: map_backend_status_to_main(backend_update.status),
+                        };
+                        let _ = main_progress_tx.send(main_update);
+                    }
+                });
+
+                // Replace entire format-specific dispatch with single backend call
+                let backend_result = convert_with_backend(
+                    &backend_item,
+                    &item.input_path,
+                    &output_path,
+                    &backend_progress_tx,
+                    item.options.preferred_backend, // Use backend from wizard/preset
+                )
+                .await;
+
+                // Wait for conversion to complete and cleanup progress forwarder
+                let result = match backend_result {
+                    Ok((_, _pipeline)) => {
+                        // Conversion successful - backend handled the conversion
+                        // (Pipeline ignored for individual file conversions - no logs generated)
+                        Ok(())
+                    }
+                    Err(tonepoet_backend::ConversionError::InvalidSettings(msg)) => {
+                        Err(ConversionError::ValidationError(msg))
+                    }
+                    Err(tonepoet_backend::ConversionError::UnsupportedFormat(msg)) => {
+                        Err(ConversionError::UnsupportedFormat(msg))
+                    }
+                    Err(tonepoet_backend::ConversionError::BackendUnavailable(msg)) => {
+                        Err(ConversionError::ToolError(msg))
+                    }
+                    Err(tonepoet_backend::ConversionError::Io(e)) => Err(ConversionError::Io(e)),
+                };
+
+                // Cleanup progress forwarder
+                progress_forwarder.abort();
+
+                result?;
             } // end else (backend conversion)
         }
     }
-    
+
     // PostProcessing phase - ReplayGain is handled by the conversion backend if enabled
     if item.options.calculate_replaygain {
         send_phase_update(
@@ -1660,8 +1838,9 @@ pub async fn process_item(
             50.0,
             Some("ReplayGain applied by conversion backend".to_string()),
             None,
-        ).await;
-        
+        )
+        .await;
+
         send_phase_update(
             &progress_tx,
             &item.id,
@@ -1669,9 +1848,10 @@ pub async fn process_item(
             100.0,
             Some("Post-processing complete".to_string()),
             None,
-        ).await;
+        )
+        .await;
     }
-    
+
     // Finalizing phase
     send_phase_update(
         &progress_tx,
@@ -1680,10 +1860,14 @@ pub async fn process_item(
         50.0,
         Some("Finalizing conversion...".to_string()),
         None,
-    ).await;
-    
+    )
+    .await;
+
     // Update status to completed - 100%
-    let final_status = ConversionStatus::Completed { output_path: output_path.clone(), log_path: None };
+    let final_status = ConversionStatus::Completed {
+        output_path: output_path.clone(),
+        log_path: None,
+    };
     let _ = progress_tx.send(ProgressUpdate {
         item_id: item.id.clone(),
         progress: 100.0,
@@ -1711,7 +1895,7 @@ pub async fn process_item(
             status: FeaturesStatus::Success,
             source_size,
             output_size,
-            start_time: now,  // Approximate
+            start_time: now, // Approximate
             end_time: now,
             error_message: None,
             replaygain_values: None,
@@ -1721,7 +1905,7 @@ pub async fn process_item(
 
         let feature_config = FeaturesConfig {
             write_log_file: true,
-            generate_cue_files: false,  // Don't generate CUE for individual files
+            generate_cue_files: false, // Don't generate CUE for individual files
             cue_generation_mode: "IfMerging".to_string(),
             preferred_backend: "FFmpeg".to_string(),
             worker_count: 8,
@@ -1734,7 +1918,9 @@ pub async fn process_item(
             &[result],
             &feature_config,
             None,
-        ).await {
+        )
+        .await
+        {
             log::warn!("Failed to write conversion log for individual file: {}", e);
         }
     }
@@ -1746,19 +1932,23 @@ pub async fn process_item(
 fn determine_output_path(item: &ConversionItem) -> ConversionResult<PathBuf> {
     let input_path = &item.input_path;
     let output_ext = item.output_format.extension();
-    
+
     // For now, simple implementation - same directory, different extension
     let mut output_path = input_path.with_extension(output_ext);
-    
+
     // Handle overwrite
     if !item.options.overwrite && output_path.exists() {
         // Add number suffix
-        let stem = input_path.file_stem()
+        let stem = input_path
+            .file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| ConversionError::Io(
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid filename")
-            ))?;
-        
+            .ok_or_else(|| {
+                ConversionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid filename",
+                ))
+            })?;
+
         let mut counter = 1;
         loop {
             output_path = input_path.with_file_name(format!("{}_{}.{}", stem, counter, output_ext));
@@ -1768,7 +1958,7 @@ fn determine_output_path(item: &ConversionItem) -> ConversionResult<PathBuf> {
             counter += 1;
         }
     }
-    
+
     Ok(output_path)
 }
 
@@ -1782,73 +1972,120 @@ fn create_backend_conversion_item(
         crate::convert::AudioFormat::Flac => tonepoet_backend::integration::MainAudioFormat::Flac,
         crate::convert::AudioFormat::Wav => tonepoet_backend::integration::MainAudioFormat::Wav,
         crate::convert::AudioFormat::Aiff => tonepoet_backend::integration::MainAudioFormat::Aiff,
-        crate::convert::AudioFormat::WavPack => tonepoet_backend::integration::MainAudioFormat::WavPack,
+        crate::convert::AudioFormat::WavPack => {
+            tonepoet_backend::integration::MainAudioFormat::WavPack
+        }
         crate::convert::AudioFormat::Mp3 => tonepoet_backend::integration::MainAudioFormat::Mp3,
         crate::convert::AudioFormat::Aac => tonepoet_backend::integration::MainAudioFormat::Aac,
         crate::convert::AudioFormat::Opus => tonepoet_backend::integration::MainAudioFormat::Opus,
         crate::convert::AudioFormat::Alac => tonepoet_backend::integration::MainAudioFormat::Alac,
     };
-    
+
     // Map quality settings
     let quality = match &item.options.quality {
         QualitySettings::Flac { compression_level } => {
-            tonepoet_backend::integration::MainQualitySettings::Flac { compression_level: *compression_level }
+            tonepoet_backend::integration::MainQualitySettings::Flac {
+                compression_level: *compression_level,
+            }
         }
-        QualitySettings::Wav { bit_depth, sample_rate } => {
+        QualitySettings::Wav {
+            bit_depth,
+            sample_rate,
+        } => {
             // If bit_depth is 0 (same as source), detect from input file
             let actual_bit_depth = if *bit_depth == 0 {
                 detect_audio_bit_depth(&item.input_path).unwrap_or(24)
             } else {
                 *bit_depth
             };
-            tonepoet_backend::integration::MainQualitySettings::Wav { bit_depth: actual_bit_depth, sample_rate: *sample_rate }
+            tonepoet_backend::integration::MainQualitySettings::Wav {
+                bit_depth: actual_bit_depth,
+                sample_rate: *sample_rate,
+            }
         }
-        QualitySettings::Aiff { bit_depth, sample_rate } => {
+        QualitySettings::Aiff {
+            bit_depth,
+            sample_rate,
+        } => {
             // If bit_depth is 0 (same as source), detect from input file
             let actual_bit_depth = if *bit_depth == 0 {
                 detect_audio_bit_depth(&item.input_path).unwrap_or(24)
             } else {
                 *bit_depth
             };
-            tonepoet_backend::integration::MainQualitySettings::Aiff { bit_depth: actual_bit_depth, sample_rate: *sample_rate }
+            tonepoet_backend::integration::MainQualitySettings::Aiff {
+                bit_depth: actual_bit_depth,
+                sample_rate: *sample_rate,
+            }
         }
-        QualitySettings::Mp3 { bitrate_mode, quality } => {
+        QualitySettings::Mp3 {
+            bitrate_mode,
+            quality,
+        } => {
             let mapped_bitrate_mode = match bitrate_mode {
-                Mp3BitrateMode::Cbr { bitrate } => tonepoet_backend::integration::MainMp3BitrateMode::Cbr { bitrate: *bitrate },
-                Mp3BitrateMode::Vbr { quality } => tonepoet_backend::integration::MainMp3BitrateMode::Vbr { quality: *quality },
-                Mp3BitrateMode::Abr { bitrate } => tonepoet_backend::integration::MainMp3BitrateMode::Abr { bitrate: *bitrate },
+                Mp3BitrateMode::Cbr { bitrate } => {
+                    tonepoet_backend::integration::MainMp3BitrateMode::Cbr { bitrate: *bitrate }
+                }
+                Mp3BitrateMode::Vbr { quality } => {
+                    tonepoet_backend::integration::MainMp3BitrateMode::Vbr { quality: *quality }
+                }
+                Mp3BitrateMode::Abr { bitrate } => {
+                    tonepoet_backend::integration::MainMp3BitrateMode::Abr { bitrate: *bitrate }
+                }
             };
-            tonepoet_backend::integration::MainQualitySettings::Mp3 { bitrate_mode: mapped_bitrate_mode, quality: *quality }
+            tonepoet_backend::integration::MainQualitySettings::Mp3 {
+                bitrate_mode: mapped_bitrate_mode,
+                quality: *quality,
+            }
         }
         QualitySettings::Aac { bitrate, profile } => {
             let mapped_profile = match profile {
                 super::formats::AacProfile::Lc => tonepoet_backend::integration::MainAacProfile::Lc,
                 super::formats::AacProfile::He => tonepoet_backend::integration::MainAacProfile::He,
-                super::formats::AacProfile::HeV2 => tonepoet_backend::integration::MainAacProfile::HeV2,
+                super::formats::AacProfile::HeV2 => {
+                    tonepoet_backend::integration::MainAacProfile::HeV2
+                }
             };
-            tonepoet_backend::integration::MainQualitySettings::Aac { bitrate: *bitrate, profile: mapped_profile }
+            tonepoet_backend::integration::MainQualitySettings::Aac {
+                bitrate: *bitrate,
+                profile: mapped_profile,
+            }
         }
-        QualitySettings::Opus { bitrate, complexity } => {
-            tonepoet_backend::integration::MainQualitySettings::Opus { bitrate: *bitrate, complexity: *complexity }
-        }
-        QualitySettings::WavPack { compression_mode, hybrid_mode, correction_file } => {
+        QualitySettings::Opus {
+            bitrate,
+            complexity,
+        } => tonepoet_backend::integration::MainQualitySettings::Opus {
+            bitrate: *bitrate,
+            complexity: *complexity,
+        },
+        QualitySettings::WavPack {
+            compression_mode,
+            hybrid_mode,
+            correction_file,
+        } => {
             let mapped_mode = match compression_mode {
-                super::formats::WavPackMode::Fast => tonepoet_backend::integration::MainWavPackMode::Fast,
-                super::formats::WavPackMode::Normal => tonepoet_backend::integration::MainWavPackMode::Normal,
-                super::formats::WavPackMode::High => tonepoet_backend::integration::MainWavPackMode::High,
-                super::formats::WavPackMode::VeryHigh => tonepoet_backend::integration::MainWavPackMode::VeryHigh,
+                super::formats::WavPackMode::Fast => {
+                    tonepoet_backend::integration::MainWavPackMode::Fast
+                }
+                super::formats::WavPackMode::Normal => {
+                    tonepoet_backend::integration::MainWavPackMode::Normal
+                }
+                super::formats::WavPackMode::High => {
+                    tonepoet_backend::integration::MainWavPackMode::High
+                }
+                super::formats::WavPackMode::VeryHigh => {
+                    tonepoet_backend::integration::MainWavPackMode::VeryHigh
+                }
             };
             tonepoet_backend::integration::MainQualitySettings::WavPack {
                 compression_mode: mapped_mode,
                 hybrid_mode: *hybrid_mode,
-                correction_file: *correction_file
+                correction_file: *correction_file,
             }
         }
-        QualitySettings::Alac => {
-            tonepoet_backend::integration::MainQualitySettings::Alac
-        }
+        QualitySettings::Alac => tonepoet_backend::integration::MainQualitySettings::Alac,
     };
-    
+
     let options = tonepoet_backend::integration::MainConversionOptions {
         quality,
         calculate_replaygain: item.options.calculate_replaygain,
@@ -1867,23 +2104,37 @@ fn create_backend_conversion_item(
             match dt {
                 crate::convert::simple_wizard::DitherType::None => MainDitherType::None,
                 crate::convert::simple_wizard::DitherType::TPDF => MainDitherType::TPDF,
-                crate::convert::simple_wizard::DitherType::SloppedTPDF => MainDitherType::SloppedTPDF,
+                crate::convert::simple_wizard::DitherType::SloppedTPDF => {
+                    MainDitherType::SloppedTPDF
+                }
                 crate::convert::simple_wizard::DitherType::Shibata => MainDitherType::Shibata,
                 crate::convert::simple_wizard::DitherType::Lipshitz => MainDitherType::Lipshitz,
                 crate::convert::simple_wizard::DitherType::FWeighted => MainDitherType::FWeighted,
-                crate::convert::simple_wizard::DitherType::ModifiedEWeighted => MainDitherType::ModifiedEWeighted,
-                crate::convert::simple_wizard::DitherType::ImprovedEWeighted => MainDitherType::ImprovedEWeighted,
+                crate::convert::simple_wizard::DitherType::ModifiedEWeighted => {
+                    MainDitherType::ModifiedEWeighted
+                }
+                crate::convert::simple_wizard::DitherType::ImprovedEWeighted => {
+                    MainDitherType::ImprovedEWeighted
+                }
                 crate::convert::simple_wizard::DitherType::Gesemann => MainDitherType::Gesemann,
                 crate::convert::simple_wizard::DitherType::LowShibata => MainDitherType::LowShibata,
-                crate::convert::simple_wizard::DitherType::HighShibata => MainDitherType::HighShibata,
+                crate::convert::simple_wizard::DitherType::HighShibata => {
+                    MainDitherType::HighShibata
+                }
             }
         }),
         nyquist_transition: item.options.nyquist_transition.map(|nt| {
             use tonepoet_backend::integration::MainNyquistTransition;
             match nt {
-                crate::convert::simple_wizard::NyquistTransition::Gentle => MainNyquistTransition::Gentle,
-                crate::convert::simple_wizard::NyquistTransition::Steep => MainNyquistTransition::Steep,
-                crate::convert::simple_wizard::NyquistTransition::BrickWall => MainNyquistTransition::BrickWall,
+                crate::convert::simple_wizard::NyquistTransition::Gentle => {
+                    MainNyquistTransition::Gentle
+                }
+                crate::convert::simple_wizard::NyquistTransition::Steep => {
+                    MainNyquistTransition::Steep
+                }
+                crate::convert::simple_wizard::NyquistTransition::BrickWall => {
+                    MainNyquistTransition::BrickWall
+                }
             }
         }),
         target_sample_rate: item.options.target_sample_rate,
@@ -1905,22 +2156,44 @@ fn create_backend_conversion_item(
 }
 
 /// Map backend ConversionStatus to main project ConversionStatus
-fn map_backend_status_to_main(backend_status: tonepoet_backend::integration::ConversionStatus) -> ConversionStatus {
+fn map_backend_status_to_main(
+    backend_status: tonepoet_backend::integration::ConversionStatus,
+) -> ConversionStatus {
     match backend_status {
-        tonepoet_backend::integration::ConversionStatus::NotConfigured => ConversionStatus::NotConfigured,
+        tonepoet_backend::integration::ConversionStatus::NotConfigured => {
+            ConversionStatus::NotConfigured
+        }
         tonepoet_backend::integration::ConversionStatus::Queued => ConversionStatus::Queued,
-        tonepoet_backend::integration::ConversionStatus::Processing { progress, message, file_progress, phase, phase_progress } => {
+        tonepoet_backend::integration::ConversionStatus::Processing {
+            progress,
+            message,
+            file_progress,
+            phase,
+            phase_progress,
+        } => {
             // Map backend phase to main project phase
             let main_phase = phase.map(|p| match p {
-                tonepoet_backend::integration::ConversionPhase::Extracting => ConversionPhase::Extracting,
-                tonepoet_backend::integration::ConversionPhase::Analyzing => ConversionPhase::Analyzing,
-                tonepoet_backend::integration::ConversionPhase::Renaming => ConversionPhase::Renaming,
+                tonepoet_backend::integration::ConversionPhase::Extracting => {
+                    ConversionPhase::Extracting
+                }
+                tonepoet_backend::integration::ConversionPhase::Analyzing => {
+                    ConversionPhase::Analyzing
+                }
+                tonepoet_backend::integration::ConversionPhase::Renaming => {
+                    ConversionPhase::Renaming
+                }
                 tonepoet_backend::integration::ConversionPhase::Tagging => ConversionPhase::Tagging,
-                tonepoet_backend::integration::ConversionPhase::Converting => ConversionPhase::Converting,
-                tonepoet_backend::integration::ConversionPhase::PostProcessing => ConversionPhase::PostProcessing,
-                tonepoet_backend::integration::ConversionPhase::Finalizing => ConversionPhase::Finalizing,
+                tonepoet_backend::integration::ConversionPhase::Converting => {
+                    ConversionPhase::Converting
+                }
+                tonepoet_backend::integration::ConversionPhase::PostProcessing => {
+                    ConversionPhase::PostProcessing
+                }
+                tonepoet_backend::integration::ConversionPhase::Finalizing => {
+                    ConversionPhase::Finalizing
+                }
             });
-            
+
             ConversionStatus::Processing {
                 progress,
                 message,
@@ -1930,13 +2203,18 @@ fn map_backend_status_to_main(backend_status: tonepoet_backend::integration::Con
             }
         }
         tonepoet_backend::integration::ConversionStatus::Completed { output_path } => {
-            ConversionStatus::Completed { output_path, log_path: None }
+            ConversionStatus::Completed {
+                output_path,
+                log_path: None,
+            }
         }
         tonepoet_backend::integration::ConversionStatus::Failed { error } => {
-            ConversionStatus::Failed { error, log_path: None }
+            ConversionStatus::Failed {
+                error,
+                log_path: None,
+            }
         }
         tonepoet_backend::integration::ConversionStatus::Paused => ConversionStatus::Paused,
         tonepoet_backend::integration::ConversionStatus::Cancelled => ConversionStatus::Cancelled,
     }
 }
-

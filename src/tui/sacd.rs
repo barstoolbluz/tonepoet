@@ -120,7 +120,11 @@ impl std::fmt::Display for SacdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SacdError::TooSmall { size, required } => {
-                write!(f, "SACD: file too small ({} bytes, need at least {})", size, required)
+                write!(
+                    f,
+                    "SACD: file too small ({} bytes, need at least {})",
+                    size, required
+                )
             }
             SacdError::Io(msg) => write!(f, "SACD I/O: {}", msg),
             SacdError::NotSacdIso => write!(f, "SACD: not a valid SACD ISO (no Master TOC magic)"),
@@ -148,8 +152,12 @@ pub fn is_sacd_iso(path: &Path) -> bool {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
 
-    let Ok(mut f) = File::open(path) else { return false; };
-    let Ok(meta) = f.metadata() else { return false; };
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
     let size = meta.len();
 
     // Even the first Master TOC requires 510*2048 + 8 bytes = 1,044,488.
@@ -166,8 +174,12 @@ pub fn is_sacd_iso(path: &Path) -> bool {
         if offset + buf.len() as u64 > size {
             continue;
         }
-        if f.seek(SeekFrom::Start(offset)).is_err() { continue; }
-        if f.read_exact(&mut buf).is_err() { continue; }
+        if f.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        if f.read_exact(&mut buf).is_err() {
+            continue;
+        }
         if &buf == MASTER_TOC_MAGIC {
             return true;
         }
@@ -200,8 +212,12 @@ pub fn detect_sacd_iso(path: &Path) -> DetectionResult {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
 
-    let Ok(mut f) = File::open(path) else { return DetectionResult::IoFailure; };
-    let Ok(meta) = f.metadata() else { return DetectionResult::IoFailure; };
+    let Ok(mut f) = File::open(path) else {
+        return DetectionResult::IoFailure;
+    };
+    let Ok(meta) = f.metadata() else {
+        return DetectionResult::IoFailure;
+    };
     let size = meta.len();
 
     let min_size = MASTER_TOC_LSNS[0] * SECTOR_SIZE + MASTER_TOC_MAGIC.len() as u64;
@@ -213,10 +229,18 @@ pub fn detect_sacd_iso(path: &Path) -> DetectionResult {
     let mut buf = [0u8; 8];
     for &lsn in MASTER_TOC_LSNS.iter() {
         let offset = lsn * SECTOR_SIZE;
-        if offset + buf.len() as u64 > size { continue; }
-        if f.seek(SeekFrom::Start(offset)).is_err() { continue; }
-        if f.read_exact(&mut buf).is_err() { continue; }
-        if &buf == MASTER_TOC_MAGIC { good += 1; }
+        if offset + buf.len() as u64 > size {
+            continue;
+        }
+        if f.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        if f.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        if &buf == MASTER_TOC_MAGIC {
+            good += 1;
+        }
     }
     match good {
         0 => DetectionResult::NotSacd,
@@ -470,7 +494,11 @@ pub fn parse_master_toc(buf: &[u8]) -> Result<MasterToc, SacdError> {
         let year = read_be_u16(buf, 0x78);
         let month = buf[0x7a];
         let day = buf[0x7b];
-        if year == 0 { None } else { Some(DiscDate { year, month, day }) }
+        if year == 0 {
+            None
+        } else {
+            Some(DiscDate { year, month, day })
+        }
     };
 
     let text_area_count = buf[0x80];
@@ -525,7 +553,10 @@ pub fn read_master_toc(path: &Path) -> Result<MasterToc, SacdError> {
 
     let min_size = MASTER_TOC_LSNS[0] * SECTOR_SIZE + MASTER_TOC_T_SIZE as u64;
     if size < min_size {
-        return Err(SacdError::TooSmall { size, required: min_size });
+        return Err(SacdError::TooSmall {
+            size,
+            required: min_size,
+        });
     }
 
     let mut last_malformed: Option<SacdError> = None;
@@ -537,9 +568,15 @@ pub fn read_master_toc(path: &Path) -> Result<MasterToc, SacdError> {
         if offset + MASTER_TOC_T_SIZE as u64 > size {
             continue;
         }
-        if f.seek(SeekFrom::Start(offset)).is_err() { continue; }
-        if f.read_exact(&mut buf).is_err() { continue; }
-        if &buf[0..8] != MASTER_TOC_MAGIC { continue; }
+        if f.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        if f.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        if &buf[0..8] != MASTER_TOC_MAGIC {
+            continue;
+        }
         saw_any_magic = true;
         match parse_master_toc(&buf) {
             Ok(toc) => return Ok(toc),
@@ -547,12 +584,16 @@ pub fn read_master_toc(path: &Path) -> Result<MasterToc, SacdError> {
         }
     }
 
-    if let Some(e) = last_malformed { return Err(e); }
+    if let Some(e) = last_malformed {
+        return Err(e);
+    }
     if saw_any_magic {
         // Defensive: magic matched but we never produced an Ok or
         // Err above. Shouldn't be reachable but keeps the function
         // total.
-        return Err(SacdError::Malformed("master TOC: parse loop exited without result".into()));
+        return Err(SacdError::Malformed(
+            "master TOC: parse loop exited without result".into(),
+        ));
     }
     Err(SacdError::NotSacdIso)
 }
@@ -684,9 +725,15 @@ pub fn parse_sacd_text(buf: &[u8], charset: u8) -> Result<SacdText, SacdError> {
     // non-zero position.
     let read_at = |pos_off: usize| -> Option<String> {
         let pos = read_be_u16(buf, pos_off) as usize;
-        if pos == 0 || pos >= buf.len() { return None; }
+        if pos == 0 || pos >= buf.len() {
+            return None;
+        }
         let s = read_cstr_at(buf, pos, charset);
-        if s.is_empty() { None } else { Some(s) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     };
 
     Ok(SacdText {
@@ -760,12 +807,16 @@ pub fn read_master_text(
     if master_toc.text_area_count == 0 {
         return Ok(None);
     }
-    let charset = master_toc.locales.first().map(|l| l.character_set).unwrap_or(0);
+    let charset = master_toc
+        .locales
+        .first()
+        .map(|l| l.character_set)
+        .unwrap_or(0);
     let sector_lsn = master_toc_lsn + 1;
     let buf = read_sector(path, sector_lsn)?;
     match parse_sacd_text(&buf, charset) {
         Ok(t) => Ok(Some(t)),
-        Err(SacdError::Malformed(_)) => Ok(None),  // missing-magic = no text, not fatal
+        Err(SacdError::Malformed(_)) => Ok(None), // missing-magic = no text, not fatal
         Err(e) => Err(e),
     }
 }
@@ -867,7 +918,8 @@ pub struct PlayTime {
 impl PlayTime {
     /// Total duration in seconds as f64 (frames are 1/75 sec each).
     pub fn total_seconds(&self) -> f64 {
-        self.minutes as f64 * 60.0 + self.seconds as f64
+        self.minutes as f64 * 60.0
+            + self.seconds as f64
             + self.frames as f64 / SACD_FRAME_RATE as f64
     }
 }
@@ -1064,9 +1116,15 @@ pub fn parse_area_toc_header(buf: &[u8]) -> Result<AreaTocHeader, SacdError> {
 /// the four `*_offset` fields in area_toc_t.
 fn read_optional_offset_str(buf: &[u8], off_pos: usize, charset: u8) -> Option<String> {
     let off = read_be_u16(buf, off_pos) as usize;
-    if off == 0 || off >= buf.len() { return None; }
+    if off == 0 || off >= buf.len() {
+        return None;
+    }
     let s = read_cstr_at(buf, off, charset);
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1188,7 +1246,11 @@ pub struct TrackText {
 /// Parse one SACDTTxt sector for the *primary* locale into a vector
 /// of `TrackText`, one per track (zero-indexed). Tracks with all
 /// position pointers set to 0 yield default (all-None) entries.
-pub fn parse_sacd_t_txt(buf: &[u8], track_count: u8, charset: u8) -> Result<Vec<TrackText>, SacdError> {
+pub fn parse_sacd_t_txt(
+    buf: &[u8],
+    track_count: u8,
+    charset: u8,
+) -> Result<Vec<TrackText>, SacdError> {
     if buf.len() < SECTOR_SIZE as usize {
         return Err(SacdError::Malformed("SACDTTxt sector too short".into()));
     }
@@ -1331,14 +1393,21 @@ pub fn parse_sacd_igl(buf: &[u8], track_count: u8) -> Result<Vec<TrackIsrcGenre>
         // ISRC: 12 ASCII bytes. Some discs use NUL pad, some space.
         let isrc_off = isrc_base + i * 12;
         let isrc_str = read_fixed_ascii(&buf[isrc_off..isrc_off + 12]);
-        let isrc = if isrc_str.is_empty() { None } else { Some(isrc_str) };
+        let isrc = if isrc_str.is_empty() {
+            None
+        } else {
+            Some(isrc_str)
+        };
 
         // Genre: 4 bytes (category, reserved u16, genre_code).
         let g_off = genre_base + i * 4;
         let category = buf[g_off];
         let genre_code = buf[g_off + 3];
         let genre = if category != 0 {
-            Some(Genre { category, genre: genre_code })
+            Some(Genre {
+                category,
+                genre: genre_code,
+            })
         } else {
             None
         };
@@ -1390,8 +1459,13 @@ impl SacdMetadata {
     /// True if either area is DST-encoded (audio extraction would
     /// need DST decoding).
     pub fn any_dst_encoded(&self) -> bool {
-        self.stereo.as_ref().is_some_and(|a| a.header.frame_format.is_dst_encoded())
-            || self.multi_channel.as_ref().is_some_and(|a| a.header.frame_format.is_dst_encoded())
+        self.stereo
+            .as_ref()
+            .is_some_and(|a| a.header.frame_format.is_dst_encoded())
+            || self
+                .multi_channel
+                .as_ref()
+                .is_some_and(|a| a.header.frame_format.is_dst_encoded())
     }
 }
 
@@ -1446,7 +1520,10 @@ pub fn read_master_toc_with_lsn(path: &Path) -> Result<(u64, MasterToc), SacdErr
 
     let min_size = MASTER_TOC_LSNS[0] * SECTOR_SIZE + MASTER_TOC_T_SIZE as u64;
     if size < min_size {
-        return Err(SacdError::TooSmall { size, required: min_size });
+        return Err(SacdError::TooSmall {
+            size,
+            required: min_size,
+        });
     }
 
     let mut last_malformed: Option<SacdError> = None;
@@ -1458,9 +1535,15 @@ pub fn read_master_toc_with_lsn(path: &Path) -> Result<(u64, MasterToc), SacdErr
         if offset + MASTER_TOC_T_SIZE as u64 > size {
             continue;
         }
-        if f.seek(SeekFrom::Start(offset)).is_err() { continue; }
-        if f.read_exact(&mut buf).is_err() { continue; }
-        if &buf[0..8] != MASTER_TOC_MAGIC { continue; }
+        if f.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        if f.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        if &buf[0..8] != MASTER_TOC_MAGIC {
+            continue;
+        }
         saw_any_magic = true;
         match parse_master_toc(&buf) {
             Ok(toc) => return Ok((lsn, toc)),
@@ -1468,9 +1551,13 @@ pub fn read_master_toc_with_lsn(path: &Path) -> Result<(u64, MasterToc), SacdErr
         }
     }
 
-    if let Some(e) = last_malformed { return Err(e); }
+    if let Some(e) = last_malformed {
+        return Err(e);
+    }
     if saw_any_magic {
-        return Err(SacdError::Malformed("master TOC: parse loop exited without result".into()));
+        return Err(SacdError::Malformed(
+            "master TOC: parse loop exited without result".into(),
+        ));
     }
     Err(SacdError::NotSacdIso)
 }
@@ -1541,11 +1628,15 @@ pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> 
         };
         match &buf[0..8] {
             m if m == SACD_TRL1_MAGIC => {
-                if let Ok(v) = parse_trl1(&buf, header.track_count) { starts = Some(v); }
+                if let Ok(v) = parse_trl1(&buf, header.track_count) {
+                    starts = Some(v);
+                }
                 i += 1;
             }
             m if m == SACD_TRL2_MAGIC => {
-                if let Ok(v) = parse_trl2(&buf, header.track_count) { times = Some(v); }
+                if let Ok(v) = parse_trl2(&buf, header.track_count) {
+                    times = Some(v);
+                }
                 i += 1;
             }
             m if m == SACD_T_TXT_MAGIC => {
@@ -1638,10 +1729,7 @@ mod tests {
 
     /// Build a synthetic ISO file at `path` with `MASTER_TOC_MAGIC`
     /// placed at the given LSNs. Other LSNs get zero bytes.
-    fn write_synthetic_iso(
-        path: &std::path::Path,
-        magic_at_lsns: &[u64],
-    ) -> std::io::Result<()> {
+    fn write_synthetic_iso(path: &std::path::Path, magic_at_lsns: &[u64]) -> std::io::Result<()> {
         // Build a file that covers up through the highest LSN that
         // any test might care about. We size it to cover LSN 530 + a
         // sector of slack.
@@ -1673,12 +1761,18 @@ mod tests {
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("b.iso");
         write_synthetic_iso(&path, &[520]).expect("write");
-        assert!(is_sacd_iso(&path), "should accept TOC at LSN 520 when 510 is bare");
+        assert!(
+            is_sacd_iso(&path),
+            "should accept TOC at LSN 520 when 510 is bare"
+        );
 
         // Only third copy present.
         let path = td.path().join("c.iso");
         write_synthetic_iso(&path, &[530]).expect("write");
-        assert!(is_sacd_iso(&path), "should accept TOC at LSN 530 when 510/520 are bare");
+        assert!(
+            is_sacd_iso(&path),
+            "should accept TOC at LSN 530 when 510/520 are bare"
+        );
     }
 
     #[test]
@@ -1695,7 +1789,10 @@ mod tests {
         let path = td.path().join("e.iso");
         let mut f = std::fs::File::create(&path).expect("create");
         f.write_all(MASTER_TOC_MAGIC).expect("write tiny file");
-        assert!(!is_sacd_iso(&path), "8-byte file is too small to host Master TOC");
+        assert!(
+            !is_sacd_iso(&path),
+            "8-byte file is too small to host Master TOC"
+        );
     }
 
     #[test]
@@ -1738,9 +1835,9 @@ mod tests {
     fn baseline_master_toc_buf() -> Vec<u8> {
         let mut b = vec![0u8; MASTER_TOC_T_SIZE];
         b[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        b[0x08] = 1;     // major
-        b[0x09] = 20;    // minor
-        // album_set_size = 1, sequence = 1
+        b[0x08] = 1; // major
+        b[0x09] = 20; // minor
+                      // album_set_size = 1, sequence = 1
         b[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
         b[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
         // 2-ch area at LSN 540, 1-sector TOC, backup at 541
@@ -1792,8 +1889,12 @@ mod tests {
         b[0x7b] = 15;
         // text_area_count = 2, locales[0]="en"/2 ISO-8859-1, [1]="ja"/3 Shift-JIS
         b[0x80] = 2;
-        b[0x88] = b'e'; b[0x89] = b'n'; b[0x8a] = 2;
-        b[0x8c] = b'j'; b[0x8d] = b'a'; b[0x8e] = 3;
+        b[0x88] = b'e';
+        b[0x89] = b'n';
+        b[0x8a] = 2;
+        b[0x8c] = b'j';
+        b[0x8d] = b'a';
+        b[0x8e] = 3;
 
         let toc = parse_master_toc(&b).expect("parse");
         assert_eq!(toc.album_catalog_number, "PROC-12345-D");
@@ -1806,7 +1907,14 @@ mod tests {
         assert_eq!(toc.album_genres[0].genre, 14);
         assert_eq!(toc.album_genres[0].name(), "Jazz");
         assert_eq!(toc.disc_genres[0].name(), "Rock");
-        assert_eq!(toc.disc_date, Some(DiscDate { year: 2003, month: 8, day: 15 }));
+        assert_eq!(
+            toc.disc_date,
+            Some(DiscDate {
+                year: 2003,
+                month: 8,
+                day: 15
+            })
+        );
         assert_eq!(toc.text_area_count, 2);
         assert_eq!(toc.locales[0].language_code, [b'e', b'n']);
         assert_eq!(toc.locales[0].character_set, 2);
@@ -1862,10 +1970,12 @@ mod tests {
         f.set_len(total).expect("set_len");
 
         // Corrupt master TOC at LSN 510 (wrong magic).
-        f.seek(SeekFrom::Start(MASTER_TOC_LSNS[0] * SECTOR_SIZE)).unwrap();
+        f.seek(SeekFrom::Start(MASTER_TOC_LSNS[0] * SECTOR_SIZE))
+            .unwrap();
         f.write_all(b"NOTSACD!").unwrap();
         // Valid master TOC at LSN 520.
-        f.seek(SeekFrom::Start(MASTER_TOC_LSNS[1] * SECTOR_SIZE)).unwrap();
+        f.seek(SeekFrom::Start(MASTER_TOC_LSNS[1] * SECTOR_SIZE))
+            .unwrap();
         f.write_all(&baseline_master_toc_buf()).unwrap();
         drop(f);
 
@@ -1895,7 +2005,10 @@ mod tests {
 
     #[test]
     fn sacd_error_display_messages() {
-        let e = SacdError::TooSmall { size: 100, required: 1_044_488 };
+        let e = SacdError::TooSmall {
+            size: 100,
+            required: 1_044_488,
+        };
         assert!(format!("{}", e).contains("100"));
         assert!(format!("{}", SacdError::NotSacdIso).contains("not a valid SACD"));
         assert!(format!("{}", SacdError::Io("test".into())).contains("test"));
@@ -1959,7 +2072,10 @@ mod tests {
     fn parse_sacd_text_rejects_wrong_magic() {
         let mut b = vec![0u8; SECTOR_SIZE as usize];
         b[0..8].copy_from_slice(b"NOTTEXT!");
-        assert!(matches!(parse_sacd_text(&b, 1), Err(SacdError::Malformed(_))));
+        assert!(matches!(
+            parse_sacd_text(&b, 1),
+            Err(SacdError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -1980,24 +2096,27 @@ mod tests {
     fn build_area_toc_sector(magic: &[u8; 8], track_count: u8, frame_format_nibble: u8) -> Vec<u8> {
         let mut b = vec![0u8; SECTOR_SIZE as usize];
         b[0..8].copy_from_slice(magic);
-        b[0x08] = 1; b[0x09] = 20; // version 1.20
+        b[0x08] = 1;
+        b[0x09] = 20; // version 1.20
         b[0x0a..0x0c].copy_from_slice(&3u16.to_be_bytes()); // size = 3 sectors (header + TRL1 + TRL2)
         b[0x10..0x14].copy_from_slice(&64_000u32.to_be_bytes()); // max_byte_rate
-        b[0x14] = 0x04;     // sample_frequency = DSD64
+        b[0x14] = 0x04; // sample_frequency = DSD64
         b[0x15] = frame_format_nibble & 0x0f; // frame_format
         b[0x20] = if magic == MULCH_TOC_MAGIC { 6 } else { 2 }; // channel_count
         b[0x21] = (5u8 << 3) | 0; // loudspeaker_config = 5 (5.1), extra_settings = 0
-        b[0x22] = b[0x20];  // max_available_channels
-        b[0x40] = 45;       // total_playtime: 45 minutes
-        b[0x41] = 12;       //                 12 seconds
-        b[0x42] = 30;       //                 30 frames
-        b[0x44] = 0;        // track_offset
+        b[0x22] = b[0x20]; // max_available_channels
+        b[0x40] = 45; // total_playtime: 45 minutes
+        b[0x41] = 12; //                 12 seconds
+        b[0x42] = 30; //                 30 frames
+        b[0x44] = 0; // track_offset
         b[0x45] = track_count;
         b[0x48..0x4c].copy_from_slice(&540u32.to_be_bytes()); // track_start LSN
         b[0x4c..0x50].copy_from_slice(&100_000u32.to_be_bytes()); // track_end
-        b[0x50] = 1;        // text_area_count
-        // locale 0: "en", charset 2 (Latin-1)
-        b[0x58] = b'e'; b[0x59] = b'n'; b[0x5a] = 2;
+        b[0x50] = 1; // text_area_count
+                     // locale 0: "en", charset 2 (Latin-1)
+        b[0x58] = b'e';
+        b[0x59] = b'n';
+        b[0x5a] = 2;
         // area description at offset 0x500 in the data region:
         // "5.1 Multi-channel"
         let desc_off = 0x500u16;
@@ -2023,8 +2142,17 @@ mod tests {
         assert_eq!(h.track_count, 12);
         assert_eq!(h.track_start_lsn, 540);
         assert_eq!(h.track_end_lsn, 100_000);
-        assert_eq!(h.total_playtime, PlayTime { minutes: 45, seconds: 12, frames: 30 });
-        assert!((h.total_playtime.total_seconds() - (45.0 * 60.0 + 12.0 + 30.0 / 75.0)).abs() < 1e-9);
+        assert_eq!(
+            h.total_playtime,
+            PlayTime {
+                minutes: 45,
+                seconds: 12,
+                frames: 30
+            }
+        );
+        assert!(
+            (h.total_playtime.total_seconds() - (45.0 * 60.0 + 12.0 + 30.0 / 75.0)).abs() < 1e-9
+        );
         assert_eq!(h.description.as_deref(), Some("5.1 Multi-channel"));
         assert_eq!(h.text_area_count, 1);
         assert_eq!(h.locales[0].language_code, [b'e', b'n']);
@@ -2052,14 +2180,20 @@ mod tests {
     fn parse_area_toc_header_rejects_wrong_magic() {
         let mut b = vec![0u8; SECTOR_SIZE as usize];
         b[0..8].copy_from_slice(b"NOTAREAS");
-        assert!(matches!(parse_area_toc_header(&b), Err(SacdError::Malformed(_))));
+        assert!(matches!(
+            parse_area_toc_header(&b),
+            Err(SacdError::Malformed(_))
+        ));
     }
 
     #[test]
     fn parse_area_toc_header_rejects_oversized_text_area_count() {
         let mut b = build_area_toc_sector(TWOCH_TOC_MAGIC, 1, 2);
         b[0x50] = 11;
-        assert!(matches!(parse_area_toc_header(&b), Err(SacdError::Malformed(_))));
+        assert!(matches!(
+            parse_area_toc_header(&b),
+            Err(SacdError::Malformed(_))
+        ));
     }
 
     fn build_trl1_sector(starts_lengths: &[(u32, u32)]) -> Vec<u8> {
@@ -2107,16 +2241,50 @@ mod tests {
     #[test]
     fn parse_trl2_decodes_track_times() {
         let times = vec![
-            (PlayTime { minutes: 0, seconds: 0, frames: 0 },
-             PlayTime { minutes: 3, seconds: 45, frames: 60 }),
-            (PlayTime { minutes: 3, seconds: 45, frames: 60 },
-             PlayTime { minutes: 4, seconds: 12, frames: 0 }),
+            (
+                PlayTime {
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                PlayTime {
+                    minutes: 3,
+                    seconds: 45,
+                    frames: 60,
+                },
+            ),
+            (
+                PlayTime {
+                    minutes: 3,
+                    seconds: 45,
+                    frames: 60,
+                },
+                PlayTime {
+                    minutes: 4,
+                    seconds: 12,
+                    frames: 0,
+                },
+            ),
         ];
         let b = build_trl2_sector(&times);
         let v = parse_trl2(&b, 2).expect("parse");
         assert_eq!(v.len(), 2);
-        assert_eq!(v[0].0, PlayTime { minutes: 0, seconds: 0, frames: 0 });
-        assert_eq!(v[0].1, PlayTime { minutes: 3, seconds: 45, frames: 60 });
+        assert_eq!(
+            v[0].0,
+            PlayTime {
+                minutes: 0,
+                seconds: 0,
+                frames: 0
+            }
+        );
+        assert_eq!(
+            v[0].1,
+            PlayTime {
+                minutes: 3,
+                seconds: 45,
+                frames: 60
+            }
+        );
         assert_eq!(v[1].1.total_seconds(), 4.0 * 60.0 + 12.0);
     }
 
@@ -2135,18 +2303,24 @@ mod tests {
         f.set_len(total_sectors * SECTOR_SIZE).expect("set_len");
         drop(f);
 
-        let mut f = std::fs::File::options().write(true).open(&path).expect("reopen");
+        let mut f = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen");
 
         // Master TOC at LSN 510 — area at LSN 540, size = 3 sectors.
         let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes()); // album_set_size
         mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes()); // album_seq
         mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes()); // 2-ch toc_1
-        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());   // 2-ch size
+        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes()); // 2-ch size
         mtoc[0x80] = 1; // text_area_count = 1
-        mtoc[0x88] = b'e'; mtoc[0x89] = b'n'; mtoc[0x8a] = 2; // locale "en"/Latin-1
+        mtoc[0x88] = b'e';
+        mtoc[0x89] = b'n';
+        mtoc[0x8a] = 2; // locale "en"/Latin-1
         f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
         f.write_all(&mtoc).unwrap();
 
@@ -2167,12 +2341,42 @@ mod tests {
 
         // SACDTRL2 at LSN 542.
         let trl2 = build_trl2_sector(&[
-            (PlayTime { minutes: 0, seconds: 0, frames: 0 },
-             PlayTime { minutes: 1, seconds: 30, frames: 0 }),
-            (PlayTime { minutes: 1, seconds: 30, frames: 0 },
-             PlayTime { minutes: 2, seconds: 15, frames: 0 }),
-            (PlayTime { minutes: 3, seconds: 45, frames: 0 },
-             PlayTime { minutes: 1, seconds: 0,  frames: 0 }),
+            (
+                PlayTime {
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                PlayTime {
+                    minutes: 1,
+                    seconds: 30,
+                    frames: 0,
+                },
+            ),
+            (
+                PlayTime {
+                    minutes: 1,
+                    seconds: 30,
+                    frames: 0,
+                },
+                PlayTime {
+                    minutes: 2,
+                    seconds: 15,
+                    frames: 0,
+                },
+            ),
+            (
+                PlayTime {
+                    minutes: 3,
+                    seconds: 45,
+                    frames: 0,
+                },
+                PlayTime {
+                    minutes: 1,
+                    seconds: 0,
+                    frames: 0,
+                },
+            ),
         ]);
         f.seek(SeekFrom::Start(542 * SECTOR_SIZE)).unwrap();
         f.write_all(&trl2).unwrap();
@@ -2240,10 +2444,7 @@ mod tests {
         buf[0x08..0x0a].copy_from_slice(&0x100u16.to_be_bytes());
         buf[0x0a..0x0c].copy_from_slice(&0x200u16.to_be_bytes());
         // Track 0: TITLE="Hello", PERFORMER="World"
-        let block0 = build_track_text_block(&[
-            (0x01, Some(b"Hello")),
-            (0x02, Some(b"World")),
-        ]);
+        let block0 = build_track_text_block(&[(0x01, Some(b"Hello")), (0x02, Some(b"World"))]);
         buf[0x100..0x100 + block0.len()].copy_from_slice(&block0);
         // Track 1: TITLE="Solo"
         let block1 = build_track_text_block(&[(0x01, Some(b"Solo"))]);
@@ -2310,7 +2511,10 @@ mod tests {
     fn parse_sacd_t_txt_rejects_wrong_magic() {
         let mut buf = vec![0u8; SECTOR_SIZE as usize];
         buf[0..8].copy_from_slice(b"WRONGTXT");
-        assert!(matches!(parse_sacd_t_txt(&buf, 1, 2), Err(SacdError::Malformed(_))));
+        assert!(matches!(
+            parse_sacd_t_txt(&buf, 1, 2),
+            Err(SacdError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -2319,9 +2523,8 @@ mod tests {
         buf[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
         buf[0x08..0x0a].copy_from_slice(&0x100u16.to_be_bytes());
         // "Beyoncé" = B(0x42) e(0x65) y(0x79) o(0x6f) n(0x6e) c(0x63) é(0xe9)
-        let block = build_track_text_block(&[
-            (0x02, Some(&[0x42, 0x65, 0x79, 0x6f, 0x6e, 0x63, 0xe9])),
-        ]);
+        let block =
+            build_track_text_block(&[(0x02, Some(&[0x42, 0x65, 0x79, 0x6f, 0x6e, 0x63, 0xe9]))]);
         buf[0x100..0x100 + block.len()].copy_from_slice(&block);
         let v = parse_sacd_t_txt(&buf, 1, 2).expect("parse");
         assert_eq!(v[0].performer.as_deref(), Some("Beyoncé"));
@@ -2368,14 +2571,20 @@ mod tests {
     #[test]
     fn parse_sacd_igl_rejects_short_buffer() {
         let buf = vec![0u8; 100];
-        assert!(matches!(parse_sacd_igl(&buf, 1), Err(SacdError::Malformed(_))));
+        assert!(matches!(
+            parse_sacd_igl(&buf, 1),
+            Err(SacdError::Malformed(_))
+        ));
     }
 
     #[test]
     fn parse_sacd_igl_rejects_wrong_magic() {
         let mut buf = vec![0u8; 2 * SECTOR_SIZE as usize];
         buf[0..8].copy_from_slice(b"NOTIGL!!");
-        assert!(matches!(parse_sacd_igl(&buf, 1), Err(SacdError::Malformed(_))));
+        assert!(matches!(
+            parse_sacd_igl(&buf, 1),
+            Err(SacdError::Malformed(_))
+        ));
     }
 
     /// End-to-end test: ISO with master TOC + SACDText + area TOC +
@@ -2392,20 +2601,26 @@ mod tests {
         f.set_len(total_sectors * SECTOR_SIZE).expect("set_len");
         drop(f);
 
-        let mut f = std::fs::File::options().write(true).open(&path).expect("reopen");
+        let mut f = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen");
 
         // Master TOC at LSN 510 — 2-ch area at LSN 540, size = 5 sectors
         // (header, TRL1, TRL2, TTxt, IGL[0]; IGL spans 2 so total 6 used,
         // but we set size to 6 and ensure scan covers all).
         let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
         mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
         mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
         mtoc[0x54..0x56].copy_from_slice(&7u16.to_be_bytes()); // 7 sectors
         mtoc[0x80] = 1;
-        mtoc[0x88] = b'e'; mtoc[0x89] = b'n'; mtoc[0x8a] = 2;
+        mtoc[0x88] = b'e';
+        mtoc[0x89] = b'n';
+        mtoc[0x8a] = 2;
         f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
         f.write_all(&mtoc).unwrap();
 
@@ -2421,14 +2636,36 @@ mod tests {
 
         // SACDTRL1 at 541, SACDTRL2 at 542 (2 tracks).
         f.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
-        f.write_all(&build_trl1_sector(&[(600, 100), (700, 200)])).unwrap();
+        f.write_all(&build_trl1_sector(&[(600, 100), (700, 200)]))
+            .unwrap();
         f.seek(SeekFrom::Start(542 * SECTOR_SIZE)).unwrap();
         f.write_all(&build_trl2_sector(&[
-            (PlayTime { minutes: 0, seconds: 0, frames: 0 },
-             PlayTime { minutes: 2, seconds: 0, frames: 0 }),
-            (PlayTime { minutes: 2, seconds: 0, frames: 0 },
-             PlayTime { minutes: 3, seconds: 30, frames: 0 }),
-        ])).unwrap();
+            (
+                PlayTime {
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                PlayTime {
+                    minutes: 2,
+                    seconds: 0,
+                    frames: 0,
+                },
+            ),
+            (
+                PlayTime {
+                    minutes: 2,
+                    seconds: 0,
+                    frames: 0,
+                },
+                PlayTime {
+                    minutes: 3,
+                    seconds: 30,
+                    frames: 0,
+                },
+            ),
+        ]))
+        .unwrap();
 
         // SACDTTxt at 543 — track 0: "Track One"/"Artist A",
         // track 1: "Track Two"/"Artist B".
@@ -2436,15 +2673,9 @@ mod tests {
         ttxt_buf[0..8].copy_from_slice(SACD_T_TXT_MAGIC);
         ttxt_buf[0x08..0x0a].copy_from_slice(&0x100u16.to_be_bytes());
         ttxt_buf[0x0a..0x0c].copy_from_slice(&0x200u16.to_be_bytes());
-        let b0 = build_track_text_block(&[
-            (0x01, Some(b"Track One")),
-            (0x02, Some(b"Artist A")),
-        ]);
+        let b0 = build_track_text_block(&[(0x01, Some(b"Track One")), (0x02, Some(b"Artist A"))]);
         ttxt_buf[0x100..0x100 + b0.len()].copy_from_slice(&b0);
-        let b1 = build_track_text_block(&[
-            (0x01, Some(b"Track Two")),
-            (0x02, Some(b"Artist B")),
-        ]);
+        let b1 = build_track_text_block(&[(0x01, Some(b"Track Two")), (0x02, Some(b"Artist B"))]);
         ttxt_buf[0x200..0x200 + b1.len()].copy_from_slice(&b1);
         f.seek(SeekFrom::Start(543 * SECTOR_SIZE)).unwrap();
         f.write_all(&ttxt_buf).unwrap();
@@ -2467,7 +2698,10 @@ mod tests {
         assert_eq!(stereo.tracks[0].text.title.as_deref(), Some("Track One"));
         assert_eq!(stereo.tracks[0].text.performer.as_deref(), Some("Artist A"));
         assert_eq!(stereo.tracks[0].isrc.as_deref(), Some("USAA10800001"));
-        assert_eq!(stereo.tracks[0].genre.as_ref().map(|g| g.name()), Some("Jazz"));
+        assert_eq!(
+            stereo.tracks[0].genre.as_ref().map(|g| g.name()),
+            Some("Jazz")
+        );
 
         // Track 1
         assert_eq!(stereo.tracks[1].start_lsn, 700);
@@ -2492,12 +2726,13 @@ mod tests {
         // Master TOC at LSN 510: area_1 toc_1 at 540 (corrupt), toc_2 at 550 (good).
         let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
         mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
         mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes()); // toc_1
         mtoc[0x44..0x48].copy_from_slice(&550u32.to_be_bytes()); // toc_2
-        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());   // size
+        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes()); // size
         let mut f = std::fs::File::options().write(true).open(&path).unwrap();
         f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
         f.write_all(&mtoc).unwrap();
@@ -2506,13 +2741,14 @@ mod tests {
         // Sector 550: write a valid TWOCHTOC.
         let mut area_buf = vec![0u8; SECTOR_SIZE as usize];
         area_buf[0..8].copy_from_slice(TWOCH_TOC_MAGIC);
-        area_buf[0x08] = 1; area_buf[0x09] = 20;
+        area_buf[0x08] = 1;
+        area_buf[0x09] = 20;
         area_buf[0x0a..0x0c].copy_from_slice(&1u16.to_be_bytes());
         area_buf[0x14] = 0x04;
         area_buf[0x15] = 2; // DSD3in14
         area_buf[0x20] = 2; // channels
         area_buf[0x40] = 30; // playtime
-        area_buf[0x45] = 1;  // track_count = 1
+        area_buf[0x45] = 1; // track_count = 1
         f.seek(SeekFrom::Start(550 * SECTOR_SIZE)).unwrap();
         f.write_all(&area_buf).unwrap();
         drop(f);
@@ -2535,7 +2771,8 @@ mod tests {
 
         let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
         mtoc[0x44..0x48].copy_from_slice(&550u32.to_be_bytes());
         mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
@@ -2567,7 +2804,8 @@ mod tests {
 
         let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
         // toc_2_start = 0
         mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
@@ -2578,7 +2816,10 @@ mod tests {
 
         // Sector 540 has no magic; toc_2=0 means no fallback.
         let strict = parse_sacd_iso_with_strictness(&path, true);
-        assert!(strict.is_err(), "should error when toc_1 fails and no toc_2");
+        assert!(
+            strict.is_err(),
+            "should error when toc_1 fails and no toc_2"
+        );
     }
 
     /// Real-world ISO fixture: only runs when
@@ -2590,7 +2831,9 @@ mod tests {
     /// validate parser correctness against real-world pressings.
     #[test]
     fn parse_real_sacd_iso_when_env_var_set() {
-        let Ok(path) = std::env::var("TONEPOET_SACD_FIXTURE_ISO") else { return; };
+        let Ok(path) = std::env::var("TONEPOET_SACD_FIXTURE_ISO") else {
+            return;
+        };
         let p = std::path::Path::new(&path);
         if !p.exists() {
             eprintln!("TONEPOET_SACD_FIXTURE_ISO='{}' not found — skipping", path);

@@ -225,7 +225,11 @@ impl SearchSort {
             Self::Date => Self::Size,
             Self::Size => Self::Extension,
             Self::Extension => {
-                if tag_mode { Self::Artist } else { Self::Score }
+                if tag_mode {
+                    Self::Artist
+                } else {
+                    Self::Score
+                }
             }
             Self::Artist => Self::Album,
             Self::Album => Self::Year,
@@ -536,11 +540,17 @@ pub struct ScanHandle {
 impl ScanHandle {
     pub fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        (Self { cancel: flag.clone() }, flag)
+        (
+            Self {
+                cancel: flag.clone(),
+            },
+            flag,
+        )
     }
 
     pub fn cancel(&self) {
-        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -906,8 +916,7 @@ impl BrowseState {
             } else {
                 let v = super::sacd::is_sacd_iso(&entry.path);
                 if let Some(m) = mtime {
-                    self.sacd_classify_cache
-                        .insert(entry.path.clone(), (m, v));
+                    self.sacd_classify_cache.insert(entry.path.clone(), (m, v));
                 }
                 v
             };
@@ -969,7 +978,10 @@ impl BrowseState {
     /// Apply the view layer while keeping the cursor on the same entry path
     /// (or clamping if it's been filtered out).
     fn apply_view_preserving_cursor(&mut self) {
-        let prev_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
+        let prev_path = self
+            .entries
+            .get(self.selected_index)
+            .map(|e| e.path.clone());
         self.apply_view();
         self.restore_cursor_on_path(prev_path);
     }
@@ -1091,8 +1103,7 @@ impl BrowseState {
             let input_str = input.to_string();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let final_path = resolved.canonicalize()
-                        .unwrap_or_else(|_| resolved.clone());
+                    let final_path = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
                     if final_path.is_dir() {
                         Ok(final_path)
                     } else {
@@ -1102,16 +1113,17 @@ impl BrowseState {
                 .await
                 .unwrap_or_else(|e| Err(format!("path check failed: {}", e)));
 
-                let _ = tx.send(super::message::AppMessage::PathValidationComplete {
-                    input: input_str,
-                    result,
-                }).await;
+                let _ = tx
+                    .send(super::message::AppMessage::PathValidationComplete {
+                        input: input_str,
+                        result,
+                    })
+                    .await;
             });
             Ok(()) // The actual navigation happens when the result arrives.
         } else {
             // Synchronous fallback.
-            let final_path = resolved.canonicalize()
-                .unwrap_or_else(|_| resolved.clone());
+            let final_path = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
             if !final_path.is_dir() {
                 return Err(format!("not a directory: {}", final_path.display()));
             }
@@ -1176,8 +1188,15 @@ impl BrowseState {
         let query = self.type_ahead_buffer.to_lowercase();
         // Priority 1: prefix match.
         // Priority 2: substring/contains match.
-        let idx = self.entries.iter().position(|e| e.name_lower.starts_with(&query))
-            .or_else(|| self.entries.iter().position(|e| e.name_lower.contains(&query)));
+        let idx = self
+            .entries
+            .iter()
+            .position(|e| e.name_lower.starts_with(&query))
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .position(|e| e.name_lower.contains(&query))
+            });
         if let Some(idx) = idx {
             self.selected_index = idx;
             self.ensure_visible();
@@ -1193,8 +1212,15 @@ impl BrowseState {
         } else {
             self.type_ahead_last_keystroke = Some(Instant::now());
             let query = self.type_ahead_buffer.to_lowercase();
-            let idx = self.entries.iter().position(|e| e.name_lower.starts_with(&query))
-                .or_else(|| self.entries.iter().position(|e| e.name_lower.contains(&query)));
+            let idx = self
+                .entries
+                .iter()
+                .position(|e| e.name_lower.starts_with(&query))
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .position(|e| e.name_lower.contains(&query))
+                });
             if let Some(idx) = idx {
                 self.selected_index = idx;
                 self.ensure_visible();
@@ -1222,7 +1248,8 @@ impl BrowseState {
 
     pub fn page_down(&mut self) {
         let jump = self.visible_height.max(1);
-        self.selected_index = (self.selected_index + jump).min(self.entries.len().saturating_sub(1));
+        self.selected_index =
+            (self.selected_index + jump).min(self.entries.len().saturating_sub(1));
         self.ensure_visible();
     }
 
@@ -1280,7 +1307,9 @@ impl BrowseState {
     /// Update the visual selection range from anchor to current cursor.
     /// Called after every cursor move while visual_mode is active.
     pub fn update_visual_selection(&mut self) {
-        let anchor_idx = self.multi_select_anchor.as_ref()
+        let anchor_idx = self
+            .multi_select_anchor
+            .as_ref()
             .and_then(|p| self.entries.iter().position(|e| e.path == *p))
             .unwrap_or(self.selected_index);
         let lo = anchor_idx.min(self.selected_index);
@@ -1407,7 +1436,10 @@ impl BrowseState {
 
     /// Execute a search. Non-recursive runs synchronously.
     /// Recursive spawns an async task and sends results via tx.
-    pub fn execute_search(&mut self, tx: Option<&tokio::sync::mpsc::Sender<super::message::AppMessage>>) {
+    pub fn execute_search(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<super::message::AppMessage>>,
+    ) {
         let query = self.search.input.text.trim().to_ascii_lowercase();
         if query.is_empty() {
             self.apply_view_preserving_cursor();
@@ -1428,9 +1460,15 @@ impl BrowseState {
     }
 
     /// Non-recursive search: filter current directory's entries.
-    fn execute_search_local(&mut self, query: &str, show_hidden: bool, audio_only: bool, mode: SearchMode) {
-        use fuzzy_matcher::FuzzyMatcher;
+    fn execute_search_local(
+        &mut self,
+        query: &str,
+        show_hidden: bool,
+        audio_only: bool,
+        mode: SearchMode,
+    ) {
         use fuzzy_matcher::skim::SkimMatcherV2;
+        use fuzzy_matcher::FuzzyMatcher;
 
         let matcher = SkimMatcherV2::default();
         let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
@@ -1440,9 +1478,15 @@ impl BrowseState {
 
         for entries_list in [&self.all_dirs, &self.all_files] {
             for e in entries_list {
-                if !show_hidden && e.name.starts_with('.') { continue; }
-                if audio_only && !matches!(e.kind, EntryKind::AudioFile(_))
-                    && !matches!(e.kind, EntryKind::Directory) { continue; }
+                if !show_hidden && e.name.starts_with('.') {
+                    continue;
+                }
+                if audio_only
+                    && !matches!(e.kind, EntryKind::AudioFile(_))
+                    && !matches!(e.kind, EntryKind::Directory)
+                {
+                    continue;
+                }
 
                 let mut best_score: Option<i64> = None;
 
@@ -1455,7 +1499,8 @@ impl BrowseState {
                 }
 
                 if search_tags && matches!(e.kind, EntryKind::AudioFile(_)) {
-                    let tag_str = build_tag_search_string_cached(&e.path, &mut self.search.tag_cache);
+                    let tag_str =
+                        build_tag_search_string_cached(&e.path, &mut self.search.tag_cache);
                     if !tag_str.is_empty() {
                         if let Some(s) = matcher.fuzzy_match(&tag_str, query) {
                             best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
@@ -1506,119 +1551,141 @@ impl BrowseState {
         let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
 
         tokio::spawn(async move {
-            let results = tokio::task::spawn_blocking(move || -> Option<Vec<(BrowseEntry, i64)>> {
-                use walkdir::WalkDir;
-                use fuzzy_matcher::FuzzyMatcher;
-                use fuzzy_matcher::skim::SkimMatcherV2;
+            let results =
+                tokio::task::spawn_blocking(move || -> Option<Vec<(BrowseEntry, i64)>> {
+                    use fuzzy_matcher::skim::SkimMatcherV2;
+                    use fuzzy_matcher::FuzzyMatcher;
+                    use walkdir::WalkDir;
 
-                let matcher = SkimMatcherV2::default();
-                let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
+                    let matcher = SkimMatcherV2::default();
+                    let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
 
-                // Open own DB connection for tag cache.
-                let db = crate::db::Database::open().ok();
+                    // Open own DB connection for tag cache.
+                    let db = crate::db::Database::open().ok();
 
-                for entry in WalkDir::new(&root)
-                    .min_depth(1)
-                    .follow_links(false)
-                    .into_iter()
-                    .filter_entry(|e| {
-                        if !show_hidden {
-                            if let Some(name) = e.file_name().to_str() {
-                                if name.starts_with('.') { return false; }
+                    for entry in WalkDir::new(&root)
+                        .min_depth(1)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_entry(|e| {
+                            if !show_hidden {
+                                if let Some(name) = e.file_name().to_str() {
+                                    if name.starts_with('.') {
+                                        return false;
+                                    }
+                                }
                             }
+                            true
+                        })
+                    {
+                        // Check cancel flag periodically.
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return None; // Cancelled — don't send results.
                         }
-                        true
-                    })
-                {
-                    // Check cancel flag periodically.
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        return None; // Cancelled — don't send results.
-                    }
 
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-
-                    if entry.file_type().is_dir() { continue; }
-
-                    if !show_hidden {
-                        if let Some(name) = entry.file_name().to_str() {
-                            if name.starts_with('.') { continue; }
-                        }
-                    }
-
-                    let path = entry.path().to_path_buf();
-                    let kind = classify_file(&path);
-
-                    if audio_only && !matches!(kind, EntryKind::AudioFile(_)) {
-                        continue;
-                    }
-
-                    let rel = path.strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .to_string();
-                    let rel_lower = rel.to_lowercase();
-
-                    let mut best_score: Option<i64> = None;
-
-                    if search_filename {
-                        if let Some(s) = matcher.fuzzy_match(&rel_lower, &query) {
-                            best_score = Some(s);
-                        }
-                    }
-
-                    if search_tags && matches!(kind, EntryKind::AudioFile(_)) {
-                        // Try DB cache first, then lofty.
-                        let tag_str = if let Some(ref db) = db {
-                            let path_str = path.display().to_string();
-                            let meta = std::fs::metadata(&path).ok();
-                            let mtime = meta.as_ref()
-                                .and_then(|m| m.modified().ok())
-                                .map(crate::db::systemtime_to_unix)
-                                .unwrap_or(0);
-                            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-
-                            if let Some((cached, ..)) = db.get_cached_tags(&path_str, mtime, size) {
-                                cached
-                            } else {
-                                let r = read_tags_from_file(&path);
-                                let _ = db.store_cached_tags(
-                                    &path_str, mtime, size,
-                                    r.title.as_deref(), r.artist.as_deref(),
-                                    r.album.as_deref(), r.genre.as_deref(),
-                                    r.year.as_deref(), &r.tag_string,
-                                );
-                                r.tag_string
-                            }
-                        } else {
-                            read_tags_from_file(&path).tag_string
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(_) => continue,
                         };
 
-                        if !tag_str.is_empty() {
-                            if let Some(s) = matcher.fuzzy_match(&tag_str, &query) {
-                                best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+                        if entry.file_type().is_dir() {
+                            continue;
+                        }
+
+                        if !show_hidden {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if name.starts_with('.') {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let path = entry.path().to_path_buf();
+                        let kind = classify_file(&path);
+
+                        if audio_only && !matches!(kind, EntryKind::AudioFile(_)) {
+                            continue;
+                        }
+
+                        let rel = path
+                            .strip_prefix(&root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string();
+                        let rel_lower = rel.to_lowercase();
+
+                        let mut best_score: Option<i64> = None;
+
+                        if search_filename {
+                            if let Some(s) = matcher.fuzzy_match(&rel_lower, &query) {
+                                best_score = Some(s);
+                            }
+                        }
+
+                        if search_tags && matches!(kind, EntryKind::AudioFile(_)) {
+                            // Try DB cache first, then lofty.
+                            let tag_str = if let Some(ref db) = db {
+                                let path_str = path.display().to_string();
+                                let meta = std::fs::metadata(&path).ok();
+                                let mtime = meta
+                                    .as_ref()
+                                    .and_then(|m| m.modified().ok())
+                                    .map(crate::db::systemtime_to_unix)
+                                    .unwrap_or(0);
+                                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+                                if let Some((cached, ..)) =
+                                    db.get_cached_tags(&path_str, mtime, size)
+                                {
+                                    cached
+                                } else {
+                                    let r = read_tags_from_file(&path);
+                                    let _ = db.store_cached_tags(
+                                        &path_str,
+                                        mtime,
+                                        size,
+                                        r.title.as_deref(),
+                                        r.artist.as_deref(),
+                                        r.album.as_deref(),
+                                        r.genre.as_deref(),
+                                        r.year.as_deref(),
+                                        &r.tag_string,
+                                    );
+                                    r.tag_string
+                                }
+                            } else {
+                                read_tags_from_file(&path).tag_string
+                            };
+
+                            if !tag_str.is_empty() {
+                                if let Some(s) = matcher.fuzzy_match(&tag_str, &query) {
+                                    best_score =
+                                        Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+                                }
+                            }
+                        }
+
+                        if let Some(score) = best_score {
+                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+                            scored.push((BrowseEntry::new(path, rel, kind, size, modified), score));
+
+                            if scored.len() >= 500 {
+                                break;
                             }
                         }
                     }
 
-                    if let Some(score) = best_score {
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        let modified = entry.metadata().ok()
-                            .and_then(|m| m.modified().ok());
-                        scored.push((BrowseEntry::new(path, rel, kind, size, modified), score));
-
-                        if scored.len() >= 500 { break; }
-                    }
-                }
-
-                Some(scored)
-            }).await.unwrap_or(None);
+                    Some(scored)
+                })
+                .await
+                .unwrap_or(None);
 
             // Only send results if not cancelled.
             if let Some(results) = results {
-                let _ = tx.send(super::message::AppMessage::SearchComplete { results }).await;
+                let _ = tx
+                    .send(super::message::AppMessage::SearchComplete { results })
+                    .await;
             }
         });
     }
@@ -1681,18 +1748,18 @@ impl BrowseState {
             if let Some(db) = db {
                 if let Some(mtime) = entry.modified {
                     let mtime_unix = crate::db::systemtime_to_unix(mtime);
-                    if let Some(row) = db.get_cached_probe(
-                        &path.display().to_string(),
-                        mtime_unix,
-                        entry.size,
-                    ) {
+                    if let Some(row) =
+                        db.get_cached_probe(&path.display().to_string(), mtime_unix, entry.size)
+                    {
                         if let Some(mut info) = row.to_cached_info(entry.size) {
                             // PE metadata check not stored in DB — run it now.
                             info.metadata.preemphasis_metadata =
                                 super::probe::preemphasis_metadata_check_pub(&path);
                             // HDCD info from analysis cache (if previously analyzed).
                             if let Some(analysis) = db.get_cached_analysis(
-                                &path.display().to_string(), mtime_unix, entry.size,
+                                &path.display().to_string(),
+                                mtime_unix,
+                                entry.size,
                             ) {
                                 if analysis.hdcd_detected == Some(true) {
                                     info.metadata.hdcd_detail = analysis.hdcd_detail;
@@ -1710,9 +1777,7 @@ impl BrowseState {
             spawn_audio_probe(path, tx.clone());
         } else if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) {
             let path = entry.path.clone();
-            if self.dir_stats_cache.contains_key(&path)
-                || self.dir_stats_pending.contains(&path)
-            {
+            if self.dir_stats_cache.contains_key(&path) || self.dir_stats_pending.contains(&path) {
                 return;
             }
             self.dir_stats_pending.insert(path.clone());
@@ -1743,15 +1808,12 @@ impl BrowseState {
 /// sends the result back to the main loop via `AudioProbeComplete`. The
 /// blocking probe (`probe_audio` + `read_metadata`) runs on `spawn_blocking`
 /// so it doesn't tie up an async worker thread.
-pub fn spawn_audio_probe(
-    path: PathBuf,
-    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
-) {
+pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::message::AppMessage>) {
     tokio::spawn(async move {
         let path_for_task = path.clone();
         let result: Result<CachedInfo, String> = tokio::task::spawn_blocking(move || {
-            let source = crate::tui::probe::probe_audio(&path_for_task)
-                .map_err(|e| format!("{}", e))?;
+            let source =
+                crate::tui::probe::probe_audio(&path_for_task).map_err(|e| format!("{}", e))?;
             let metadata = crate::tui::probe::read_metadata(&path_for_task).unwrap_or_default();
             Ok(CachedInfo { source, metadata })
         })
@@ -1773,10 +1835,7 @@ pub fn spawn_audio_probe(
 /// runs on `spawn_blocking` so it doesn't tie up an async worker thread —
 /// the original sync version was the source of the Phase 4d UI freeze on
 /// large directories like ~/Downloads.
-pub fn spawn_dir_stats(
-    path: PathBuf,
-    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
-) {
+pub fn spawn_dir_stats(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::message::AppMessage>) {
     tokio::spawn(async move {
         let path_for_task = path.clone();
         let stats = tokio::task::spawn_blocking(move || compute_dir_stats(&path_for_task))
@@ -1804,21 +1863,27 @@ pub fn spawn_dir_scan(
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || {
-                scan_directory_blocking(&scan_path, &cancel_flag)
-            }),
+            tokio::task::spawn_blocking(move || scan_directory_blocking(&scan_path, &cancel_flag)),
         )
         .await;
 
         let (parent_entry, dirs, files, error) = match result {
             Ok(Ok(Ok((parent, dirs, files)))) => (parent, dirs, files, None),
             Ok(Ok(Err(e))) => (None, Vec::new(), Vec::new(), Some(e)),
-            Ok(Err(join_err)) => {
-                (None, Vec::new(), Vec::new(), Some(format!("scan task panicked: {}", join_err)))
-            }
+            Ok(Err(join_err)) => (
+                None,
+                Vec::new(),
+                Vec::new(),
+                Some(format!("scan task panicked: {}", join_err)),
+            ),
             Err(_timeout) => {
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                (None, Vec::new(), Vec::new(), Some("scan timed out (30s)".into()))
+                (
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Some("scan timed out (30s)".into()),
+                )
             }
         };
 
@@ -1852,8 +1917,7 @@ fn scan_directory_blocking(
         )
     });
 
-    let read = fs::read_dir(dir)
-        .map_err(|e| format!("Cannot read directory: {}", e))?;
+    let read = fs::read_dir(dir).map_err(|e| format!("Cannot read directory: {}", e))?;
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -1895,7 +1959,13 @@ fn scan_directory_blocking(
         };
 
         let browse_entry = BrowseEntry::new_with_symlink(
-            path, name, kind.clone(), size, modified, is_symlink, is_broken_symlink,
+            path,
+            name,
+            kind.clone(),
+            size,
+            modified,
+            is_symlink,
+            is_broken_symlink,
         );
 
         if matches!(kind, EntryKind::Directory) {
@@ -1921,9 +1991,7 @@ fn entry_passes_view(
         return false;
     }
     // Format filter (only applies to non-directory entries)
-    if !matches!(entry.kind, EntryKind::Directory)
-        && !format_filter.allows(&entry.kind)
-    {
+    if !matches!(entry.kind, EntryKind::Directory) && !format_filter.allows(&entry.kind) {
         return false;
     }
     // Text filter (case-insensitive substring)
@@ -2037,13 +2105,7 @@ fn walk_dir_for_stats(
                 }
             }
         } else if file_type.is_dir() {
-            walk_dir_for_stats(
-                &entry.path(),
-                stats,
-                depth + 1,
-                max_depth,
-                max_files,
-            );
+            walk_dir_for_stats(&entry.path(), stats, depth + 1, max_depth, max_files);
             if stats.file_count >= max_files {
                 return;
             }
@@ -2068,7 +2130,10 @@ impl Default for BrowseState {
 /// Build a lowercase searchable string from an audio file's metadata tags.
 /// Uses the in-memory `tag_cache` if available, otherwise reads via lofty
 /// and populates the cache.
-fn build_tag_search_string_cached(path: &Path, tag_cache: &mut std::collections::HashMap<PathBuf, String>) -> String {
+fn build_tag_search_string_cached(
+    path: &Path,
+    tag_cache: &mut std::collections::HashMap<PathBuf, String>,
+) -> String {
     if let Some(cached) = tag_cache.get(path) {
         return cached.clone();
     }
@@ -2095,17 +2160,29 @@ fn read_tags_from_file(path: &Path) -> TagReadResult {
 
     let tagged = match lofty::read_from_path(path) {
         Ok(t) => t,
-        Err(_) => return TagReadResult {
-            tag_string: String::new(),
-            title: None, artist: None, album: None, genre: None, year: None,
-        },
+        Err(_) => {
+            return TagReadResult {
+                tag_string: String::new(),
+                title: None,
+                artist: None,
+                album: None,
+                genre: None,
+                year: None,
+            }
+        }
     };
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
         Some(t) => t,
-        None => return TagReadResult {
-            tag_string: String::new(),
-            title: None, artist: None, album: None, genre: None, year: None,
-        },
+        None => {
+            return TagReadResult {
+                tag_string: String::new(),
+                title: None,
+                artist: None,
+                album: None,
+                genre: None,
+                year: None,
+            }
+        }
     };
 
     let title = tag.title().map(|s| s.to_string());
@@ -2115,30 +2192,55 @@ fn read_tags_from_file(path: &Path) -> TagReadResult {
     let year = tag.year().map(|y| y.to_string());
 
     let mut parts: Vec<&str> = Vec::new();
-    if let Some(ref v) = title { parts.push(v); }
-    if let Some(ref v) = artist { parts.push(v); }
-    if let Some(ref v) = album { parts.push(v); }
-    if let Some(ref v) = genre { parts.push(v); }
-    if let Some(ref v) = year { parts.push(v); }
+    if let Some(ref v) = title {
+        parts.push(v);
+    }
+    if let Some(ref v) = artist {
+        parts.push(v);
+    }
+    if let Some(ref v) = album {
+        parts.push(v);
+    }
+    if let Some(ref v) = genre {
+        parts.push(v);
+    }
+    if let Some(ref v) = year {
+        parts.push(v);
+    }
 
     TagReadResult {
         tag_string: parts.join(" ").to_lowercase(),
-        title, artist, album, genre, year,
+        title,
+        artist,
+        album,
+        genre,
+        year,
     }
 }
 
 /// Sort scored search results by the given field and direction.
-pub(super) fn sort_search_results(scored: &mut Vec<(BrowseEntry, i64)>, sort: SearchSort, dir: SortDir) {
+pub(super) fn sort_search_results(
+    scored: &mut Vec<(BrowseEntry, i64)>,
+    sort: SearchSort,
+    dir: SortDir,
+) {
     // For tag-based sorts, pre-extract the sort key to avoid repeated lofty reads.
     if sort.is_tag_sort() {
-        let mut keyed: Vec<(String, usize)> = scored.iter().enumerate().map(|(i, (entry, _))| {
-            let key = extract_tag_sort_key(&entry.path, sort);
-            (key, i)
-        }).collect();
+        let mut keyed: Vec<(String, usize)> = scored
+            .iter()
+            .enumerate()
+            .map(|(i, (entry, _))| {
+                let key = extract_tag_sort_key(&entry.path, sort);
+                (key, i)
+            })
+            .collect();
 
         keyed.sort_by(|a, b| {
             let ord = a.0.cmp(&b.0);
-            match dir { SortDir::Asc => ord, SortDir::Desc => ord.reverse() }
+            match dir {
+                SortDir::Asc => ord,
+                SortDir::Desc => ord.reverse(),
+            }
         });
 
         let sorted: Vec<_> = keyed.iter().map(|(_, i)| scored[*i].clone()).collect();
@@ -2157,12 +2259,8 @@ pub(super) fn sort_search_results(scored: &mut Vec<(BrowseEntry, i64)>, sort: Se
             }
             SearchSort::Size => a.0.size.cmp(&b.0.size),
             SearchSort::Extension => {
-                let a_ext = a.0.path.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                let b_ext = b.0.path.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
+                let a_ext = a.0.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let b_ext = b.0.path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 a_ext.to_ascii_lowercase().cmp(&b_ext.to_ascii_lowercase())
             }
             _ => std::cmp::Ordering::Equal, // tag sorts handled above
@@ -2245,7 +2343,8 @@ fn is_queueable_file(path: &Path) -> bool {
     match kind {
         EntryKind::AudioFile(_) => true,
         EntryKind::Archive => {
-            let ext = path.extension()
+            let ext = path
+                .extension()
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_lowercase());
             match ext.as_deref() {
@@ -2281,19 +2380,16 @@ pub(super) fn classify_file(path: &Path) -> EntryKind {
         Some("mp3") => EntryKind::AudioFile(AudioFormat::Mp3),
         Some("m4a") | Some("mp4") | Some("aac") => EntryKind::AudioFile(AudioFormat::Aac),
         Some("opus") => EntryKind::AudioFile(AudioFormat::Opus),
-        Some("7z") | Some("zip") | Some("rar") | Some("tar") | Some("iso")
-        | Some("cab") | Some("dmg") | Some("tgz") | Some("tbz2") | Some("txz") => {
-            EntryKind::Archive
-        }
+        Some("7z") | Some("zip") | Some("rar") | Some("tar") | Some("iso") | Some("cab")
+        | Some("dmg") | Some("tgz") | Some("tbz2") | Some("txz") => EntryKind::Archive,
         _ => EntryKind::OtherFile,
     }
 }
 
 /// Text file extensions that can be viewed in the built-in viewer.
 const VIEWABLE_TEXT_EXTENSIONS: &[&str] = &[
-    "cue", "log", "nfo", "txt", "json", "html", "htm",
-    "xml", "md", "yaml", "yml", "toml", "ini", "cfg", "conf",
-    "m3u", "m3u8",
+    "cue", "log", "nfo", "txt", "json", "html", "htm", "xml", "md", "yaml", "yml", "toml", "ini",
+    "cfg", "conf", "m3u", "m3u8",
 ];
 
 /// Check if a file is a viewable text file (by extension).
@@ -2324,12 +2420,24 @@ fn archive_label(path: &Path) -> String {
         .map(|n| n.to_lowercase())
         .unwrap_or_default();
     // Check compound extensions first.
-    if name.ends_with(".tar.gz") { return "tar.gz".into(); }
-    if name.ends_with(".tar.bz2") { return "tar.bz2".into(); }
-    if name.ends_with(".tar.xz") { return "tar.xz".into(); }
-    if name.ends_with(".tar.zst") { return "tar.zst".into(); }
-    if name.ends_with(".tar.lz") { return "tar.lz".into(); }
-    if name.ends_with(".tar.lzma") { return "tar.lzma".into(); }
+    if name.ends_with(".tar.gz") {
+        return "tar.gz".into();
+    }
+    if name.ends_with(".tar.bz2") {
+        return "tar.bz2".into();
+    }
+    if name.ends_with(".tar.xz") {
+        return "tar.xz".into();
+    }
+    if name.ends_with(".tar.zst") {
+        return "tar.zst".into();
+    }
+    if name.ends_with(".tar.lz") {
+        return "tar.lz".into();
+    }
+    if name.ends_with(".tar.lzma") {
+        return "tar.lzma".into();
+    }
     // Single extension.
     path.extension()
         .and_then(|e| e.to_str())
@@ -2393,8 +2501,10 @@ mod tests {
         let total = (crate::tui::sacd::MASTER_TOC_LSNS[0] + 1) * crate::tui::sacd::SECTOR_SIZE;
         let mut f = std::fs::File::create(&path).unwrap();
         f.set_len(total).unwrap();
-        f.seek(SeekFrom::Start(crate::tui::sacd::MASTER_TOC_LSNS[0] * crate::tui::sacd::SECTOR_SIZE))
-            .unwrap();
+        f.seek(SeekFrom::Start(
+            crate::tui::sacd::MASTER_TOC_LSNS[0] * crate::tui::sacd::SECTOR_SIZE,
+        ))
+        .unwrap();
         f.write_all(crate::tui::sacd::MASTER_TOC_MAGIC).unwrap();
         drop(f);
 
@@ -2420,7 +2530,10 @@ mod tests {
         state.upgrade_iso_kinds();
         assert!(matches!(state.all_files[0].kind, EntryKind::Archive));
         // Cached negative result so we don't re-probe next refresh.
-        assert_eq!(state.sacd_classify_cache.get(&path).map(|(_, v)| *v), Some(false));
+        assert_eq!(
+            state.sacd_classify_cache.get(&path).map(|(_, v)| *v),
+            Some(false)
+        );
     }
 
     #[test]
@@ -2443,8 +2556,10 @@ mod tests {
         let total = (crate::tui::sacd::MASTER_TOC_LSNS[0] + 1) * crate::tui::sacd::SECTOR_SIZE;
         let mut f = std::fs::File::create(&path).unwrap();
         f.set_len(total).unwrap();
-        f.seek(SeekFrom::Start(crate::tui::sacd::MASTER_TOC_LSNS[0] * crate::tui::sacd::SECTOR_SIZE))
-            .unwrap();
+        f.seek(SeekFrom::Start(
+            crate::tui::sacd::MASTER_TOC_LSNS[0] * crate::tui::sacd::SECTOR_SIZE,
+        ))
+        .unwrap();
         f.write_all(crate::tui::sacd::MASTER_TOC_MAGIC).unwrap();
         drop(f);
 
@@ -2458,13 +2573,15 @@ mod tests {
 
     #[test]
     fn is_probeable_covers_audio_files_and_sacd_isos() {
-        let entry_with_kind = |kind: EntryKind| BrowseEntry::new(
-            std::path::PathBuf::from("/tmp/x"),
-            "x".to_string(),
-            kind,
-            0,
-            None,
-        );
+        let entry_with_kind = |kind: EntryKind| {
+            BrowseEntry::new(
+                std::path::PathBuf::from("/tmp/x"),
+                "x".to_string(),
+                kind,
+                0,
+                None,
+            )
+        };
 
         // Probeable: audio files (any format) and SACD ISOs.
         assert!(entry_with_kind(EntryKind::AudioFile(AudioFormat::Flac)).is_probeable());

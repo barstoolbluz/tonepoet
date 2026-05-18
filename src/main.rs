@@ -5,10 +5,12 @@ use tokio::sync::{broadcast, RwLock};
 
 use tonepoet::config::TonepoetConfig;
 use tonepoet::convert::{
-    ConversionQueue, ConversionItem, ConversionStatus,
-    ConversionProcessor, ProcessorConfig, ProgressUpdate,
-    formats::{AudioFormat, FileFormat, FormatDetector, ConversionOptions, QualitySettings,
-              Mp3BitrateMode, AacProfile},
+    formats::{
+        AacProfile, AudioFormat, ConversionOptions, FileFormat, FormatDetector, Mp3BitrateMode,
+        QualitySettings,
+    },
+    ConversionItem, ConversionProcessor, ConversionQueue, ConversionStatus, ProcessorConfig,
+    ProgressUpdate,
 };
 
 #[derive(Parser)]
@@ -87,7 +89,6 @@ enum Commands {
         generate_cue: bool,
 
         // ---- Pipeline flags (PR 10) ----
-
         /// Select single track by number (1-based)
         #[arg(long)]
         track: Option<u32>,
@@ -229,22 +230,59 @@ async fn main() -> anyhow::Result<()> {
             run_tui(config, paths).await?;
         }
         Commands::Convert {
-            paths, format, output, workers, replaygain,
-            archive_password, preset, compression_level, bitrate,
-            reencode_flac, merge, backend, append_lineage,
-            write_log, generate_cue,
-            track, track_range, area, no_cue, partial,
-            overwrite_output, naming, no_metadata, no_features,
+            paths,
+            format,
+            output,
+            workers,
+            replaygain,
+            archive_password,
+            preset,
+            compression_level,
+            bitrate,
+            reencode_flac,
+            merge,
+            backend,
+            append_lineage,
+            write_log,
+            generate_cue,
+            track,
+            track_range,
+            area,
+            no_cue,
+            partial,
+            overwrite_output,
+            naming,
+            no_metadata,
+            no_features,
         } => {
             run_convert(
-                paths, format, output, workers, replaygain,
-                archive_password, preset, compression_level, bitrate,
-                reencode_flac, merge, backend, append_lineage,
-                write_log, generate_cue,
-                track, track_range, area, no_cue, partial,
-                overwrite_output, naming, no_metadata, no_features,
+                paths,
+                format,
+                output,
+                workers,
+                replaygain,
+                archive_password,
+                preset,
+                compression_level,
+                bitrate,
+                reencode_flac,
+                merge,
+                backend,
+                append_lineage,
+                write_log,
+                generate_cue,
+                track,
+                track_range,
+                area,
+                no_cue,
+                partial,
+                overwrite_output,
+                naming,
+                no_metadata,
+                no_features,
                 &config,
-            ).await?;
+            )
+            .await?;
         }
         Commands::Wizard => {
             run_wizard(&config).await?;
@@ -256,13 +294,20 @@ async fn main() -> anyhow::Result<()> {
             run_config(show, reset, path, &config)?;
         }
         Commands::TagsMb {
-            paths, catno, year, query, release_id,
-            auto, dry_run, quiet, verbose,
+            paths,
+            catno,
+            year,
+            query,
+            release_id,
+            auto,
+            dry_run,
+            quiet,
+            verbose,
         } => {
             let exit_code = run_tags_mb(
-                paths, catno, year, query, release_id,
-                auto, dry_run, quiet, verbose,
-            ).await;
+                paths, catno, year, query, release_id, auto, dry_run, quiet, verbose,
+            )
+            .await;
             std::process::exit(exit_code);
         }
     }
@@ -274,9 +319,8 @@ async fn main() -> anyhow::Result<()> {
 /// `~/.cache/tonepoet/tonepoet.log` so they don't corrupt the ratatui display.
 /// In CLI mode, logs go to stderr as usual.
 fn init_logging(level: &str, is_tui: bool) {
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(level),
-    );
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level));
     builder.format_timestamp_secs();
 
     if is_tui {
@@ -312,7 +356,10 @@ fn parse_format(s: &str) -> anyhow::Result<AudioFormat> {
         "aac" | "m4a" => Ok(AudioFormat::Aac),
         "opus" => Ok(AudioFormat::Opus),
         "alac" => Ok(AudioFormat::Alac),
-        _ => anyhow::bail!("Unknown format: {}. Supported: flac, wav, aiff, wavpack, mp3, aac, opus, alac", s),
+        _ => anyhow::bail!(
+            "Unknown format: {}. Supported: flac, wav, aiff, wavpack, mp3, aac, opus, alac",
+            s
+        ),
     }
 }
 
@@ -359,7 +406,8 @@ async fn run_convert(
     let preset_options: Option<ConversionOptions> = if let Some(preset_name) = &preset {
         let preset_mgr = tonepoet_wizard::PresetManager::new()
             .map_err(|e| anyhow::anyhow!("Failed to initialize preset manager: {}", e))?;
-        let preset = preset_mgr.load_preset(preset_name)
+        let preset = preset_mgr
+            .load_preset(preset_name)
             .map_err(|e| anyhow::anyhow!("Failed to load preset '{}': {}", preset_name, e))?;
         Some(preset_to_options(&preset))
     } else {
@@ -376,12 +424,10 @@ async fn run_convert(
     };
 
     // Build conversion options
-    let mut options = preset_options.unwrap_or_else(|| {
-        ConversionOptions {
-            output_format,
-            quality: output_format.default_quality(),
-            ..ConversionOptions::default()
-        }
+    let mut options = preset_options.unwrap_or_else(|| ConversionOptions {
+        output_format,
+        quality: output_format.default_quality(),
+        ..ConversionOptions::default()
     });
 
     // Apply CLI overrides
@@ -404,7 +450,9 @@ async fn run_convert(
 
     if let Some(cl) = compression_level {
         if matches!(output_format, AudioFormat::Flac) {
-            options.quality = QualitySettings::Flac { compression_level: cl };
+            options.quality = QualitySettings::Flac {
+                compression_level: cl,
+            };
         }
     }
 
@@ -445,7 +493,8 @@ async fn run_convert(
             _ => Backend::FFmpeg,
         });
     }
-    options.append_lineage_to_comment = append_lineage || config.conversion.append_lineage_to_comment;
+    options.append_lineage_to_comment =
+        append_lineage || config.conversion.append_lineage_to_comment;
     options.write_log_file = write_log || config.conversion.write_log_file;
     options.generate_cue_files = generate_cue || config.conversion.generate_cue_files;
 
@@ -453,11 +502,21 @@ async fn run_convert(
     // If any pipeline-specific flags are set, we construct a PipelineRequest
     // and attach it to each ConversionItem so the processor uses it directly.
     let pipeline_request_template = build_pipeline_request_template(
-        &output, &options, output_format, merge,
-        &archive_password, &replaygain,
-        track, track_range.as_deref(), area.as_deref(),
-        no_cue, partial, overwrite_output,
-        naming.as_deref(), no_metadata, no_features,
+        &output,
+        &options,
+        output_format,
+        merge,
+        &archive_password,
+        &replaygain,
+        track,
+        track_range.as_deref(),
+        area.as_deref(),
+        no_cue,
+        partial,
+        overwrite_output,
+        naming.as_deref(),
+        no_metadata,
+        no_features,
     );
 
     // Build processor
@@ -465,7 +524,9 @@ async fn run_convert(
     let processor_config = ProcessorConfig {
         worker_count,
         tool_paths: std::collections::HashMap::new(),
-        default_destination_directory: options.output_dir.clone()
+        default_destination_directory: options
+            .output_dir
+            .clone()
             .or_else(|| config.conversion.default_destination.clone()),
         scratch_directory: config.conversion.scratch_directory.clone(),
     };
@@ -497,13 +558,27 @@ async fn run_convert(
                     let p = entry.path();
                     if p.is_file() {
                         if let Ok(format) = FormatDetector::detect(p) {
-                            add_item_to_queue(&mut q, p.to_path_buf(), format, &options, &archive_password, config);
+                            add_item_to_queue(
+                                &mut q,
+                                p.to_path_buf(),
+                                format,
+                                &options,
+                                &archive_password,
+                                config,
+                            );
                         }
                     }
                 }
             } else if path.is_file() {
                 if let Ok(format) = FormatDetector::detect(path) {
-                    add_item_to_queue(&mut q, path.clone(), format, &options, &archive_password, config);
+                    add_item_to_queue(
+                        &mut q,
+                        path.clone(),
+                        format,
+                        &options,
+                        &archive_password,
+                        config,
+                    );
                 } else {
                     eprintln!("Warning: unsupported file format: {}", path.display());
                 }
@@ -520,9 +595,8 @@ async fn run_convert(
                 req.job_id = format!("job-{}", item.id);
                 // Carry the item's archive password if set.
                 if let Some(ref pw) = item.archive_password {
-                    req.source.archive_password = Some(
-                        tonepoet::convert::pipeline::SecretString::new(pw.clone())
-                    );
+                    req.source.archive_password =
+                        Some(tonepoet::convert::pipeline::SecretString::new(pw.clone()));
                 }
                 item.pipeline_request = Some(req);
             }
@@ -532,7 +606,11 @@ async fn run_convert(
         if total == 0 {
             anyhow::bail!("No supported files found in the provided paths");
         }
-        println!("Queued {} item(s) for conversion to {}", total, output_format.name());
+        println!(
+            "Queued {} item(s) for conversion to {}",
+            total,
+            output_format.name()
+        );
     }
 
     // Spawn progress display task
@@ -543,7 +621,7 @@ async fn run_convert(
             indicatif::ProgressStyle::default_bar()
                 .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}% {msg}")
                 .unwrap()
-                .progress_chars("=>-")
+                .progress_chars("=>-"),
         );
 
         while let Ok(update) = progress_rx_owned.recv().await {
@@ -551,14 +629,22 @@ async fn run_convert(
             pb.set_position(pct);
             match &update.status {
                 ConversionStatus::Processing { message, phase, .. } => {
-                    let phase_name = phase.as_ref().map(|p| p.short_name()).unwrap_or("Processing");
+                    let phase_name = phase
+                        .as_ref()
+                        .map(|p| p.short_name())
+                        .unwrap_or("Processing");
                     let msg = message.as_deref().unwrap_or("");
                     pb.set_message(format!("{}: {}", phase_name, msg));
                 }
                 ConversionStatus::Completed { output_path, .. } => {
                     pb.println(format!("  Completed: {}", output_path.display()));
                 }
-                ConversionStatus::Partial { output_path, successful, failed, .. } => {
+                ConversionStatus::Partial {
+                    output_path,
+                    successful,
+                    failed,
+                    ..
+                } => {
                     pb.println(format!(
                         "  Partial ({}/{} ok): {}",
                         successful,
@@ -576,7 +662,9 @@ async fn run_convert(
     });
 
     // Run the conversion
-    let result = processor.process_queue_with_progress(queue.clone(), None).await;
+    let result = processor
+        .process_queue_with_progress(queue.clone(), None)
+        .await;
 
     // Wait for progress display to finish
     let _ = progress_handle.await;
@@ -587,7 +675,10 @@ async fn run_convert(
         let completed = q.completed_items();
         let failed = q.failed_items();
         let total = q.total_items();
-        println!("\nConversion complete: {}/{} succeeded, {} failed", completed, total, failed);
+        println!(
+            "\nConversion complete: {}/{} succeeded, {} failed",
+            completed, total, failed
+        );
     }
 
     result.map_err(|e| anyhow::anyhow!("{}", e))
@@ -604,13 +695,10 @@ fn add_item_to_queue(
     let mut item = ConversionItem::new(path.clone(), format, options.clone());
     if tonepoet::is_encrypted_archive_ext(&path) {
         // Password priority: CLI flag → config → keychain MRU → None.
-        item.archive_password = archive_password.clone()
+        item.archive_password = archive_password
+            .clone()
             .or_else(|| config.conversion.archive_password.clone())
-            .or_else(|| {
-                tonepoet::tui::keychain::load_keychain()
-                    .into_iter()
-                    .next()
-            });
+            .or_else(|| tonepoet::tui::keychain::load_keychain().into_iter().next());
     }
     item.status = ConversionStatus::Queued;
     queue.add_item_direct(item);
@@ -636,8 +724,8 @@ fn build_pipeline_request_template(
     no_metadata: bool,
     no_features: bool,
 ) -> Option<tonepoet::convert::pipeline::PipelineRequest> {
-    use tonepoet::convert::pipeline::*;
     use std::collections::BTreeSet;
+    use tonepoet::convert::pipeline::*;
 
     // Only build a PipelineRequest if pipeline-specific flags are set.
     let has_pipeline_flags = track.is_some()
@@ -689,11 +777,13 @@ fn build_pipeline_request_template(
     };
 
     Some(PipelineRequest {
-        job_id: String::new(),       // filled per-item
-        item_id: String::new(),      // filled per-item
-        container: PathBuf::new(),   // filled per-item
+        job_id: String::new(),     // filled per-item
+        item_id: String::new(),    // filled per-item
+        container: PathBuf::new(), // filled per-item
         source: SourceOptions {
-            archive_password: archive_password.as_ref().map(|p| SecretString::new(p.clone())),
+            archive_password: archive_password
+                .as_ref()
+                .map(|p| SecretString::new(p.clone())),
             sacd_area,
             cue_sidecar: cue_policy,
             track_selection,
@@ -737,9 +827,21 @@ fn build_pipeline_request_template(
             write_for_blocked: true,
         },
         stages: StagePolicy {
-            metadata: if no_metadata { StageRequirement::Disabled } else { StageRequirement::Enabled },
-            replaygain: if rg_enabled { StageRequirement::Enabled } else { StageRequirement::Disabled },
-            features: if no_features { StageRequirement::Disabled } else { StageRequirement::Enabled },
+            metadata: if no_metadata {
+                StageRequirement::Disabled
+            } else {
+                StageRequirement::Enabled
+            },
+            replaygain: if rg_enabled {
+                StageRequirement::Enabled
+            } else {
+                StageRequirement::Disabled
+            },
+            features: if no_features {
+                StageRequirement::Disabled
+            } else {
+                StageRequirement::Enabled
+            },
         },
         failure_policy: if partial {
             FailurePolicy::AllowPartialAlbum
@@ -766,8 +868,8 @@ fn preset_to_options(preset: &tonepoet_wizard::ConversionPreset) -> ConversionOp
     let quality = format.default_quality();
 
     let replaygain_mode = preset.replaygain_mode.as_ref().map(|mode| {
-        use tonepoet_wizard::ReplayGainMode as WizRG;
         use tonepoet::convert::simple_wizard::ReplayGainMode;
+        use tonepoet_wizard::ReplayGainMode as WizRG;
         match mode {
             WizRG::Track => ReplayGainMode::Track,
             WizRG::Album => ReplayGainMode::Album,
@@ -779,7 +881,9 @@ fn preset_to_options(preset: &tonepoet_wizard::ConversionPreset) -> ConversionOp
     ConversionOptions {
         output_format: format,
         quality,
-        calculate_replaygain: preset.replaygain_mode.as_ref()
+        calculate_replaygain: preset
+            .replaygain_mode
+            .as_ref()
             .map(|m| !matches!(m, tonepoet_wizard::ReplayGainMode::Off))
             .unwrap_or(false),
         replaygain_mode,
@@ -791,7 +895,7 @@ fn preset_to_options(preset: &tonepoet_wizard::ConversionPreset) -> ConversionOp
 
 async fn run_wizard(_config: &TonepoetConfig) -> anyhow::Result<()> {
     use crossterm::{
-        event::{self, Event, KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -817,7 +921,9 @@ async fn run_wizard(_config: &TonepoetConfig) -> anyhow::Result<()> {
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
                         break None;
                     }
                     wizard.handle_key(key);
@@ -841,13 +947,23 @@ async fn run_wizard(_config: &TonepoetConfig) -> anyhow::Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     if let Some(options) = result {
-        println!("Wizard completed. Format: {}, ReplayGain: {}",
+        println!(
+            "Wizard completed. Format: {}, ReplayGain: {}",
             options.output_format.name(),
-            if options.calculate_replaygain { "enabled" } else { "disabled" });
+            if options.calculate_replaygain {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         println!("Run conversion with: tonepoet convert <PATH> --preset <name>");
     } else {
         println!("Wizard cancelled.");
@@ -878,7 +994,11 @@ fn run_check_tools() {
                 ("7z", "Archive extraction (p7zip fallback)", vec![]),
                 ("opustags", "Opus metadata editing", vec!["--help"]),
                 ("wvtag", "WavPack metadata editing", vec!["--version"]),
-                ("AtomicParsley", "M4A/AAC metadata editing", vec!["--version"]),
+                (
+                    "AtomicParsley",
+                    "M4A/AAC metadata editing",
+                    vec!["--version"],
+                ),
                 ("ssrc", "High-quality resampling", vec![]),
             ];
 
@@ -900,8 +1020,10 @@ fn run_check_tools() {
             if availability.backend_functional {
                 println!("Backend: FUNCTIONAL");
             } else {
-                println!("Backend: NOT FUNCTIONAL - missing: {}",
-                    availability.missing_critical_tools.join(", "));
+                println!(
+                    "Backend: NOT FUNCTIONAL - missing: {}",
+                    availability.missing_critical_tools.join(", ")
+                );
             }
         }
         Err(e) => {
@@ -938,7 +1060,9 @@ fn run_config(show: bool, reset: bool, path: bool, config: &TonepoetConfig) -> a
 
 async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Result<()> {
     use crossterm::{
-        event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
+        event::{
+            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        },
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -949,7 +1073,12 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -962,7 +1091,10 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
         for msg in &recovered {
             log::warn!("Metadata recovery: {}", msg);
         }
-        app.set_status(&format!("Recovered {} file(s) from interrupted metadata writes", recovered.len()));
+        app.set_status(&format!(
+            "Recovered {} file(s) from interrupted metadata writes",
+            recovered.len()
+        ));
     }
 
     // Restore batch state from a previous session (if any).
@@ -992,7 +1124,12 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
 
     result.map_err(|e| anyhow::anyhow!("{}", e))
@@ -1032,18 +1169,27 @@ async fn run_tags_mb(
     // ── classify paths ──────────────────────────────────────────────
     let kind = match classify_tags_mb_paths(&paths) {
         Ok(k) => k,
-        Err(e) => { err!("tags-mb: {}", e); return 3; }
+        Err(e) => {
+            err!("tags-mb: {}", e);
+            return 3;
+        }
     };
 
     // ── build state ────────────────────────────────────────────────
     let mut state = match kind {
         PathKind::SacdIso(ref iso) => match build_sacd_state_for_cli(iso) {
             Ok(s) => s,
-            Err(e) => { err!("tags-mb: {}", e); return 3; }
+            Err(e) => {
+                err!("tags-mb: {}", e);
+                return 3;
+            }
         },
         PathKind::Audio(ref audio_paths) => match build_audio_state_for_cli(audio_paths) {
             Ok(s) => s,
-            Err(e) => { err!("tags-mb: {}", e); return 3; }
+            Err(e) => {
+                err!("tags-mb: {}", e);
+                return 3;
+            }
         },
     };
 
@@ -1061,20 +1207,33 @@ async fn run_tags_mb(
 
     let db = match tonepoet::db::Database::open() {
         Ok(d) => d,
-        Err(e) => { err!("tags-mb: open DB: {}", e); return 3; }
+        Err(e) => {
+            err!("tags-mb: open DB: {}", e);
+            return 3;
+        }
     };
 
     let release = match resolve_release(
-        &db, &state, &kind, n_tracks,
-        query.as_deref(), catno.as_deref(), year.as_deref(),
-        release_id.as_deref(), auto, quiet,
-    ).await {
+        &db,
+        &state,
+        &kind,
+        n_tracks,
+        query.as_deref(),
+        catno.as_deref(),
+        year.as_deref(),
+        release_id.as_deref(),
+        auto,
+        quiet,
+    )
+    .await
+    {
         Ok(Some(r)) => r,
         Ok(None) => return 1, // no-match status was already printed
         Err(rc) => return rc, // ambiguous (2), MB err (4), etc.
     };
 
-    say!("Matched: {} — {} ({})",
+    say!(
+        "Matched: {} — {} ({})",
         release.artist,
         release.title,
         release.year.as_deref().unwrap_or("?"),
@@ -1098,16 +1257,27 @@ async fn run_tags_mb(
     }
 
     if dry_run {
-        let count = state.entries.iter()
-            .filter(|e| e.value != e.original
-                || e.per_file_values.iter().zip(e.per_file_originals.iter())
-                    .any(|(v, o)| v != o))
+        let count = state
+            .entries
+            .iter()
+            .filter(|e| {
+                e.value != e.original
+                    || e.per_file_values
+                        .iter()
+                        .zip(e.per_file_originals.iter())
+                        .any(|(v, o)| v != o)
+            })
             .count();
-        say!("Dry run: {} editor entries differ from on-file values; no writes.", count);
+        say!(
+            "Dry run: {} editor entries differ from on-file values; no writes.",
+            count
+        );
         if verbose {
             for e in &state.entries {
                 let dirty = e.value != e.original
-                    || e.per_file_values.iter().zip(e.per_file_originals.iter())
+                    || e.per_file_values
+                        .iter()
+                        .zip(e.per_file_originals.iter())
                         .any(|(v, o)| v != o);
                 if dirty {
                     say!("  {}: \"{}\" → \"{}\"", e.display_key, e.original, e.value);
@@ -1141,30 +1311,47 @@ async fn run_tags_mb(
                     } else {
                         format!(
                             " (sibling area: {}/{} tracks mirrored)",
-                            outcome.mirror.mirrored_count,
-                            outcome.mirror.sibling_total,
+                            outcome.mirror.mirrored_count, outcome.mirror.sibling_total,
                         )
                     };
-                    say!("SACD sidecar {}: {}{}", verb, sidecar_path.display(), mirror_note);
+                    say!(
+                        "SACD sidecar {}: {}{}",
+                        verb,
+                        sidecar_path.display(),
+                        mirror_note
+                    );
                     0
                 }
-                Err(e) => { err!("tags-mb: sidecar save failed: {}", e); 3 }
+                Err(e) => {
+                    err!("tags-mb: sidecar save failed: {}", e);
+                    3
+                }
             }
         }
         PathKind::Audio(ref audio_paths) => {
-            let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> =
-                state.entries.iter().map(|e| (
-                    e.item_key.clone(),
-                    e.per_file_values.clone(),
-                    e.per_file_originals.clone(),
-                )).collect();
+            let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> = state
+                .entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.item_key.clone(),
+                        e.per_file_values.clone(),
+                        e.per_file_originals.clone(),
+                    )
+                })
+                .collect();
             let deleted: Vec<usize> = state.deleted.clone();
             let paths_owned = audio_paths.clone();
             let results = match tokio::task::spawn_blocking(move || {
                 probe::apply_audio_tag_changes(&paths_owned, &entries_snap, &deleted)
-            }).await {
+            })
+            .await
+            {
                 Ok(r) => r,
-                Err(e) => { err!("tags-mb: save task panic: {}", e); return 3; }
+                Err(e) => {
+                    err!("tags-mb: save task panic: {}", e);
+                    return 3;
+                }
             };
             let mut wrote = 0usize;
             let mut failed = 0usize;
@@ -1203,7 +1390,8 @@ fn classify_tags_mb_paths(paths: &[PathBuf]) -> Result<PathKind, String> {
     if paths.is_empty() {
         return Err("no paths supplied".to_string());
     }
-    let isos: Vec<&PathBuf> = paths.iter()
+    let isos: Vec<&PathBuf> = paths
+        .iter()
         .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")))
         .collect();
     if !isos.is_empty() {
@@ -1236,8 +1424,8 @@ fn build_audio_state_for_cli(
 ) -> Result<tonepoet::tui::app::MetadataEditorState, String> {
     use tonepoet::tui::{app, keybindings, probe};
     let mut paths = paths.to_vec();
-    let mut entries = probe::read_all_tags_merged(&paths)
-        .map_err(|e| format!("read tags: {}", e))?;
+    let mut entries =
+        probe::read_all_tags_merged(&paths).map_err(|e| format!("read tags: {}", e))?;
     if paths.len() == 1 {
         keybindings::inject_sidecar_cuesheet_if_present(&mut entries, &paths[0]);
         keybindings::apply_embedded_cuesheet_per_track(&mut entries);
@@ -1277,7 +1465,8 @@ fn build_sacd_state_for_cli(
     use tonepoet::tui::{keybindings, sacd, sacd_sidecar};
     let md = sacd::parse_sacd_iso(iso).map_err(|e| format!("parse SACD ISO: {}", e))?;
     let sidecar_path = sacd_sidecar::find_sidecar_for_iso(iso);
-    let sidecar = sidecar_path.as_ref()
+    let sidecar = sidecar_path
+        .as_ref()
         .and_then(|p| sacd_sidecar::parse_sidecar(p).ok());
     let (state, _label, _n) = keybindings::build_sacd_editor_state(iso, &md, sidecar.as_ref())
         .map_err(|e| format!("build SACD editor state: {}", e))?;
@@ -1306,8 +1495,12 @@ async fn resolve_release(
 
     if let Some(mbid) = release_id {
         let cached = db.get_cached_mb_search(&musicbrainz::detail_cache_key(mbid));
-        let outcome = musicbrainz::fetch_release_detail(mbid, n_tracks, cached).await
-            .map_err(|e| { eprintln!("tags-mb: fetch release: {}", e); 4 })?;
+        let outcome = musicbrainz::fetch_release_detail(mbid, n_tracks, cached)
+            .await
+            .map_err(|e| {
+                eprintln!("tags-mb: fetch release: {}", e);
+                4
+            })?;
         if let Some((k, v)) = outcome.cache_write {
             let _ = db.store_mb_search(&k, &v);
         }
@@ -1323,8 +1516,18 @@ async fn resolve_release(
             cached.insert(key, b);
         }
         let outcome = musicbrainz::search_releases_by_query(
-            "", query.unwrap_or(""), catno, year, n_tracks, cached,
-        ).await.map_err(|e| { eprintln!("tags-mb: search: {}", e); 4 })?;
+            "",
+            query.unwrap_or(""),
+            catno,
+            year,
+            n_tracks,
+            cached,
+        )
+        .await
+        .map_err(|e| {
+            eprintln!("tags-mb: search: {}", e);
+            4
+        })?;
         for (k, v) in &outcome.cache_writes {
             let _ = db.store_mb_search(k, v);
         }
@@ -1333,17 +1536,24 @@ async fn resolve_release(
 
     let sectors: Vec<u32> = match kind {
         PathKind::Audio(paths) => {
-            let dir = paths[0].parent().unwrap_or_else(|| std::path::Path::new("."));
+            let dir = paths[0]
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
             match tonepoet::tui::accuraterip::find_toc_offsets(dir) {
                 Some(s) => s,
                 None => {
                     let (sample_counts, sample_rate) =
-                        tonepoet::tui::accuraterip::collect_sample_counts(paths)
-                            .map_err(|e| { eprintln!("tags-mb: {}", e); 3 })?;
+                        tonepoet::tui::accuraterip::collect_sample_counts(paths).map_err(|e| {
+                            eprintln!("tags-mb: {}", e);
+                            3
+                        })?;
                     let samples_per_frame = (sample_rate / 75) as u64;
                     let mut s = Vec::with_capacity(sample_counts.len() + 1);
                     let mut frame: u64 = 150;
-                    for &c in &sample_counts { s.push(frame as u32); frame += c / samples_per_frame; }
+                    for &c in &sample_counts {
+                        s.push(frame as u32);
+                        frame += c / samples_per_frame;
+                    }
                     s.push(frame as u32);
                     s
                 }
@@ -1351,8 +1561,12 @@ async fn resolve_release(
         }
         PathKind::SacdIso(_) => {
             let durations = match state.sacd_area_kind {
-                Some(tonepoet::tui::sacd::AreaKind::Stereo) => state.sacd_stereo_durations.as_deref(),
-                Some(tonepoet::tui::sacd::AreaKind::MultiChannel) => state.sacd_multi_channel_durations.as_deref(),
+                Some(tonepoet::tui::sacd::AreaKind::Stereo) => {
+                    state.sacd_stereo_durations.as_deref()
+                }
+                Some(tonepoet::tui::sacd::AreaKind::MultiChannel) => {
+                    state.sacd_multi_channel_durations.as_deref()
+                }
                 None => None,
             };
             let durations = durations.ok_or_else(|| {
@@ -1362,12 +1576,18 @@ async fn resolve_release(
             tonepoet::tui::command::sacd_durations_to_sectors(durations)
         }
     };
-    let toc_string = musicbrainz::build_mb_toc(&sectors)
-        .ok_or_else(|| { eprintln!("tags-mb: TOC too short"); 3 })?;
+    let toc_string = musicbrainz::build_mb_toc(&sectors).ok_or_else(|| {
+        eprintln!("tags-mb: TOC too short");
+        3
+    })?;
     say!("TOC lookup ({} tracks)...", n_tracks);
     let cached = db.get_cached_mb_response(&toc_string);
-    let outcome = musicbrainz::lookup_release_by_toc(&sectors, cached).await
-        .map_err(|e| { eprintln!("tags-mb: TOC lookup: {}", e); 4 })?;
+    let outcome = musicbrainz::lookup_release_by_toc(&sectors, cached)
+        .await
+        .map_err(|e| {
+            eprintln!("tags-mb: TOC lookup: {}", e);
+            4
+        })?;
     if let Some(body) = outcome.cache_response {
         let _ = db.store_mb_response(&toc_string, &body);
     }
@@ -1420,11 +1640,14 @@ mod tags_mb_cli_tests {
         std::fs::write(&f2, b"").unwrap();
         match classify_tags_mb_paths(&[f1.clone(), f2.clone()]) {
             Ok(PathKind::Audio(v)) => assert_eq!(v, vec![f1, f2]),
-            other => panic!("expected Audio, got {:?}", match other {
-                Ok(PathKind::SacdIso(_)) => "SacdIso".to_string(),
-                Err(e) => format!("Err({})", e),
-                _ => "?".to_string(),
-            }),
+            other => panic!(
+                "expected Audio, got {:?}",
+                match other {
+                    Ok(PathKind::SacdIso(_)) => "SacdIso".to_string(),
+                    Err(e) => format!("Err({})", e),
+                    _ => "?".to_string(),
+                }
+            ),
         }
     }
 
@@ -1456,7 +1679,9 @@ fn disambiguate(
 ) -> Result<Option<tonepoet::tui::musicbrainz::MbRelease>, i32> {
     match releases.len() {
         0 => {
-            if !quiet { println!("No MusicBrainz release matched the {}.", source); }
+            if !quiet {
+                println!("No MusicBrainz release matched the {}.", source);
+            }
             Ok(None)
         }
         1 => Ok(Some(releases.into_iter().next().unwrap())),
@@ -1498,9 +1723,21 @@ mod pipeline_cli_tests {
     #[test]
     fn no_pipeline_flags_returns_none() {
         let result = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            None, None, None, false, false, false, None, false, false,
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
         );
         assert!(result.is_none());
     }
@@ -1508,10 +1745,23 @@ mod pipeline_cli_tests {
     #[test]
     fn track_flag_maps_to_set() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            Some(5), None, None, false, false, false, None, false, false,
-        ).unwrap();
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            Some(5),
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(matches!(req.source.track_selection,
             tonepoet::convert::pipeline::TrackSelection::Set(ref s) if s.contains(&5) && s.len() == 1
         ));
@@ -1520,11 +1770,25 @@ mod pipeline_cli_tests {
     #[test]
     fn track_range_flag_maps_to_range() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            None, Some("3-7"), None, false, false, false, None, false, false,
-        ).unwrap();
-        assert!(matches!(req.source.track_selection,
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            Some("3-7"),
+            None,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            req.source.track_selection,
             tonepoet::convert::pipeline::TrackSelection::Range { start: 3, end: 7 }
         ));
     }
@@ -1532,71 +1796,183 @@ mod pipeline_cli_tests {
     #[test]
     fn area_flag_maps_to_sacd_area() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            None, None, Some("multichannel"), false, false, false, None, false, false,
-        ).unwrap();
-        assert_eq!(req.source.sacd_area, Some(tonepoet::convert::pipeline::SacdArea::MultiChannel));
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            Some("multichannel"),
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            req.source.sacd_area,
+            Some(tonepoet::convert::pipeline::SacdArea::MultiChannel)
+        );
     }
 
     #[test]
     fn no_cue_flag_maps_to_ignore_cue() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            None, None, None, true, false, false, None, false, false,
-        ).unwrap();
-        assert_eq!(req.source.cue_sidecar, tonepoet::convert::pipeline::CueSidecarPolicy::IgnoreCue);
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            req.source.cue_sidecar,
+            tonepoet::convert::pipeline::CueSidecarPolicy::IgnoreCue
+        );
     }
 
     #[test]
     fn partial_flag_maps_to_allow_partial() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            None, None, None, false, true, false, None, false, false,
-        ).unwrap();
-        assert_eq!(req.failure_policy, tonepoet::convert::pipeline::FailurePolicy::AllowPartialAlbum);
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            req.failure_policy,
+            tonepoet::convert::pipeline::FailurePolicy::AllowPartialAlbum
+        );
     }
 
     #[test]
     fn overwrite_flag_maps_to_replace_with_backup() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            None, None, None, false, false, true, None, false, false,
-        ).unwrap();
-        assert_eq!(req.publish.overwrite, tonepoet::convert::pipeline::OverwritePolicy::ReplaceWithBackup);
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            req.publish.overwrite,
+            tonepoet::convert::pipeline::OverwritePolicy::ReplaceWithBackup
+        );
     }
 
     #[test]
     fn naming_flag_maps_to_template() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            None, None, None, false, false, false, Some("{nn} - {title}"), false, false,
-        ).unwrap();
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some("{nn} - {title}"),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(req.naming.template, "{nn} - {title}");
     }
 
     #[test]
     fn stage_flags_disable_stages() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &None,
-            None, None, None, false, false, false, None, true, true,
-        ).unwrap();
-        assert_eq!(req.stages.metadata, tonepoet::convert::pipeline::StageRequirement::Disabled);
-        assert_eq!(req.stages.features, tonepoet::convert::pipeline::StageRequirement::Disabled);
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            req.stages.metadata,
+            tonepoet::convert::pipeline::StageRequirement::Disabled
+        );
+        assert_eq!(
+            req.stages.features,
+            tonepoet::convert::pipeline::StageRequirement::Disabled
+        );
     }
 
     #[test]
     fn replaygain_off_disables_rg_stage() {
         let req = build_pipeline_request_template(
-            &None, &default_options(), AudioFormat::Flac, false,
-            &None, &Some("off".to_string()),
-            None, None, None, false, false, false, None, false, true,
-        ).unwrap();
-        assert_eq!(req.stages.replaygain, tonepoet::convert::pipeline::StageRequirement::Disabled);
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &Some("off".to_string()),
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            req.stages.replaygain,
+            tonepoet::convert::pipeline::StageRequirement::Disabled
+        );
     }
 }

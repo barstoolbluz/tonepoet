@@ -24,10 +24,7 @@ pub struct ArchiveEntry {
 impl ArchiveEntry {
     /// The filename (last component of the path).
     pub fn file_name(&self) -> &str {
-        self.path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&self.path)
+        self.path.rsplit('/').next().unwrap_or(&self.path)
     }
 
     /// The parent directory path inside the archive, or empty string for root.
@@ -119,12 +116,10 @@ impl ArchiveListing {
         }
 
         // Sort: dirs first (alphabetical), then files (alphabetical).
-        items.sort_by(|a, b| {
-            match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            }
+        items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         });
 
         items
@@ -154,8 +149,8 @@ pub async fn list_archive(
 ) -> Result<ArchiveListing, String> {
     use tokio::process::Command;
 
-    let bin = crate::detect_7z_binary()
-        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+    let bin =
+        crate::detect_7z_binary().ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
 
     let mut cmd = Command::new(bin);
     cmd.arg("l").arg("-slt").arg(archive);

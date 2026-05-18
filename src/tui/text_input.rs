@@ -517,7 +517,8 @@ mod tests {
     fn ctrl_a_moves_to_home() {
         let mut s = TextInputState::new("hello".to_string());
         s.cursor_end();
-        let consumed = handle_text_input_key(&mut s, &key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        let consumed =
+            handle_text_input_key(&mut s, &key(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert!(consumed);
         assert_eq!(s.cursor, 0);
     }
@@ -575,7 +576,8 @@ mod tests {
         // Pre-fix bug: Ctrl+X used to insert literal 'x'. Now it should be a no-op.
         let mut s = TextInputState::new("hi".to_string());
         s.cursor_end();
-        let consumed = handle_text_input_key(&mut s, &key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        let consumed =
+            handle_text_input_key(&mut s, &key(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert!(!consumed);
         assert_eq!(s.text, "hi");
     }
@@ -595,7 +597,10 @@ mod tests {
         s.cursor_end();
         handle_text_input_key(
             &mut s,
-            &key(KeyCode::Char('A'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            &key(
+                KeyCode::Char('A'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
         );
         assert_eq!(s.cursor, 0);
     }

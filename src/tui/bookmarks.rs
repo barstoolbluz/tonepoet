@@ -28,8 +28,14 @@ struct BookmarksFile {
 /// a captured path, or renaming an existing entry by index.
 #[derive(Debug, Clone)]
 pub enum BookmarkNaming {
-    Add { input: TextInputState, path: PathBuf },
-    Rename { input: TextInputState, idx: usize },
+    Add {
+        input: TextInputState,
+        path: PathBuf,
+    },
+    Rename {
+        input: TextInputState,
+        idx: usize,
+    },
 }
 
 /// In-memory bookmarks list plus overlay UI state.
@@ -95,7 +101,9 @@ impl BookmarksState {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = BookmarksFile { entries: self.entries.clone() };
+        let file = BookmarksFile {
+            entries: self.entries.clone(),
+        };
         let text = toml::to_string_pretty(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         fs::write(&path, text)
@@ -218,8 +226,8 @@ impl BookmarksState {
 
     pub fn overlay_page_down(&mut self) {
         let step = self.overlay_visible_rows.max(1);
-        self.overlay_selected = (self.overlay_selected + step)
-            .min(self.entries.len().saturating_sub(1));
+        self.overlay_selected =
+            (self.overlay_selected + step).min(self.entries.len().saturating_sub(1));
         self.ensure_visible();
     }
 

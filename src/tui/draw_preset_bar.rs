@@ -13,7 +13,12 @@ use super::button_map::{ButtonRenderMap, TuiButton};
 use super::theme;
 
 /// Draw the preset bar row and register clickable regions
-pub fn draw_preset_bar(f: &mut Frame, area: Rect, preset: &PresetState, buttons: &mut ButtonRenderMap) {
+pub fn draw_preset_bar(
+    f: &mut Frame,
+    area: Rect,
+    preset: &PresetState,
+    buttons: &mut ButtonRenderMap,
+) {
     if area.width < 20 {
         return;
     }
@@ -40,7 +45,12 @@ pub fn draw_preset_bar(f: &mut Frame, area: Rect, preset: &PresetState, buttons:
 
         if preset.modified {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled("(modified)", Style::default().fg(theme::TEXT_MUTED).add_modifier(Modifier::DIM)));
+            spans.push(Span::styled(
+                "(modified)",
+                Style::default()
+                    .fg(theme::TEXT_MUTED)
+                    .add_modifier(Modifier::DIM),
+            ));
         }
     } else {
         spans.push(Span::styled("none", Style::default().fg(theme::TEXT_DIM)));

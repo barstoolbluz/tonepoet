@@ -1,6 +1,6 @@
 //! Conversion wizard for guided configuration
 
-use super::formats::{AudioFormat, ConversionOptions, QualitySettings, Mp3BitrateMode};
+use super::formats::{AudioFormat, ConversionOptions, Mp3BitrateMode, QualitySettings};
 use serde::{Deserialize, Serialize};
 
 /// Steps in the conversion wizard
@@ -29,7 +29,7 @@ impl WizardStep {
             Self::Review => None,
         }
     }
-    
+
     /// Get the previous step
     pub fn previous(&self) -> Option<Self> {
         match self {
@@ -40,7 +40,7 @@ impl WizardStep {
             Self::Review => Some(Self::OutputOptions),
         }
     }
-    
+
     /// Get step title
     pub fn title(&self) -> &'static str {
         match self {
@@ -51,7 +51,7 @@ impl WizardStep {
             Self::Review => "Review & Start",
         }
     }
-    
+
     /// Get step description
     pub fn description(&self) -> &'static str {
         match self {
@@ -69,19 +69,19 @@ impl WizardStep {
 pub struct ConversionWizard {
     /// Current step
     pub current_step: WizardStep,
-    
+
     /// Options being configured
     pub options: ConversionOptions,
-    
+
     /// Selected format
     pub selected_format: AudioFormat,
-    
+
     /// Whether converting from downloads
     pub from_downloads: bool,
-    
+
     /// Custom output directory
     pub output_directory: Option<String>,
-    
+
     /// Whether to delete source files after conversion
     pub delete_source: bool,
 }
@@ -98,7 +98,7 @@ impl ConversionWizard {
             delete_source: false,
         }
     }
-    
+
     /// Move to the next step
     pub fn next_step(&mut self) -> bool {
         if let Some(next) = self.current_step.next() {
@@ -108,7 +108,7 @@ impl ConversionWizard {
             false
         }
     }
-    
+
     /// Move to the previous step
     pub fn previous_step(&mut self) -> bool {
         if let Some(prev) = self.current_step.previous() {
@@ -118,14 +118,14 @@ impl ConversionWizard {
             false
         }
     }
-    
+
     /// Set the selected format
     pub fn set_format(&mut self, format: AudioFormat) {
         self.selected_format = format;
         self.options.output_format = format;
         self.options.quality = format.default_quality();
     }
-    
+
     /// Get format options for selection
     pub fn format_options(&self) -> Vec<FormatOption> {
         AudioFormat::all()
@@ -139,7 +139,7 @@ impl ConversionWizard {
             })
             .collect()
     }
-    
+
     /// Get quality presets for the selected format
     pub fn quality_presets(&self) -> Vec<QualityPreset> {
         match self.selected_format {
@@ -147,17 +147,23 @@ impl ConversionWizard {
                 QualityPreset {
                     name: "Fast".to_string(),
                     description: "Fastest encoding, larger files".to_string(),
-                    settings: QualitySettings::Flac { compression_level: 0 },
+                    settings: QualitySettings::Flac {
+                        compression_level: 0,
+                    },
                 },
                 QualityPreset {
                     name: "Balanced".to_string(),
                     description: "Good compression/speed balance".to_string(),
-                    settings: QualitySettings::Flac { compression_level: 5 },
+                    settings: QualitySettings::Flac {
+                        compression_level: 5,
+                    },
                 },
                 QualityPreset {
                     name: "Best".to_string(),
                     description: "Best compression, slower encoding".to_string(),
-                    settings: QualitySettings::Flac { compression_level: 8 },
+                    settings: QualitySettings::Flac {
+                        compression_level: 8,
+                    },
                 },
             ],
             AudioFormat::Mp3 => vec![
@@ -190,29 +196,36 @@ impl ConversionWizard {
                 QualityPreset {
                     name: "High Quality".to_string(),
                     description: "256 kbps".to_string(),
-                    settings: QualitySettings::Opus { bitrate: 256, complexity: 10 },
+                    settings: QualitySettings::Opus {
+                        bitrate: 256,
+                        complexity: 10,
+                    },
                 },
                 QualityPreset {
                     name: "Standard".to_string(),
                     description: "128 kbps".to_string(),
-                    settings: QualitySettings::Opus { bitrate: 128, complexity: 10 },
+                    settings: QualitySettings::Opus {
+                        bitrate: 128,
+                        complexity: 10,
+                    },
                 },
                 QualityPreset {
                     name: "Low Bandwidth".to_string(),
                     description: "64 kbps".to_string(),
-                    settings: QualitySettings::Opus { bitrate: 64, complexity: 10 },
+                    settings: QualitySettings::Opus {
+                        bitrate: 64,
+                        complexity: 10,
+                    },
                 },
             ],
-            _ => vec![
-                QualityPreset {
-                    name: "Default".to_string(),
-                    description: "Default settings for this format".to_string(),
-                    settings: self.selected_format.default_quality(),
-                },
-            ],
+            _ => vec![QualityPreset {
+                name: "Default".to_string(),
+                description: "Default settings for this format".to_string(),
+                settings: self.selected_format.default_quality(),
+            }],
         }
     }
-    
+
     /// Get a summary of current settings
     pub fn get_summary(&self) -> WizardSummary {
         WizardSummary {
@@ -268,7 +281,8 @@ fn format_description(format: AudioFormat) -> String {
         AudioFormat::Aac => "Modern lossy format - Better than MP3 at same bitrate",
         AudioFormat::Opus => "Best lossy codec - Excellent quality at low bitrates",
         AudioFormat::Alac => "Apple Lossless Audio Codec - Lossless compression, Apple ecosystem",
-    }.to_string()
+    }
+    .to_string()
 }
 
 /// Get description for quality settings
@@ -277,30 +291,40 @@ fn quality_description(settings: &QualitySettings) -> String {
         QualitySettings::Flac { compression_level } => {
             format!("FLAC compression level {}", compression_level)
         }
-        QualitySettings::Wav { bit_depth, sample_rate } => {
+        QualitySettings::Wav {
+            bit_depth,
+            sample_rate,
+        } => {
             format!("{}-bit / {} Hz", bit_depth, sample_rate)
         }
-        QualitySettings::Aiff { bit_depth, sample_rate } => {
+        QualitySettings::Aiff {
+            bit_depth,
+            sample_rate,
+        } => {
             format!("{}-bit / {} Hz", bit_depth, sample_rate)
         }
-        QualitySettings::WavPack { compression_mode, hybrid_mode, .. } => {
-            format!("{:?} mode{}", compression_mode, if *hybrid_mode { " (hybrid)" } else { "" })
+        QualitySettings::WavPack {
+            compression_mode,
+            hybrid_mode,
+            ..
+        } => {
+            format!(
+                "{:?} mode{}",
+                compression_mode,
+                if *hybrid_mode { " (hybrid)" } else { "" }
+            )
         }
-        QualitySettings::Mp3 { bitrate_mode, .. } => {
-            match bitrate_mode {
-                Mp3BitrateMode::Cbr { bitrate } => format!("{} kbps CBR", bitrate),
-                Mp3BitrateMode::Vbr { quality } => format!("V{} VBR", quality),
-                Mp3BitrateMode::Abr { bitrate } => format!("{} kbps ABR", bitrate),
-            }
-        }
+        QualitySettings::Mp3 { bitrate_mode, .. } => match bitrate_mode {
+            Mp3BitrateMode::Cbr { bitrate } => format!("{} kbps CBR", bitrate),
+            Mp3BitrateMode::Vbr { quality } => format!("V{} VBR", quality),
+            Mp3BitrateMode::Abr { bitrate } => format!("{} kbps ABR", bitrate),
+        },
         QualitySettings::Aac { bitrate, profile } => {
             format!("{} kbps {:?}", bitrate, profile)
         }
         QualitySettings::Opus { bitrate, .. } => {
             format!("{} kbps", bitrate)
         }
-        QualitySettings::Alac => {
-            "Lossless (no configurable quality)".to_string()
-        }
+        QualitySettings::Alac => "Lossless (no configurable quality)".to_string(),
     }
 }

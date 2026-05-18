@@ -172,7 +172,10 @@ impl StubToolRunner {
 
     /// Queue a successful output for an upcoming `run` call.
     pub fn push_output(&self, output: ToolOutput) {
-        self.responses.lock().unwrap().push(StubResponse::Output(output));
+        self.responses
+            .lock()
+            .unwrap()
+            .push(StubResponse::Output(output));
     }
 
     /// Queue a `NonZeroExit` failure for an upcoming `run` call.

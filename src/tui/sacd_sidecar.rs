@@ -138,7 +138,10 @@ pub fn parse_sidecar_str(text: &str) -> Result<SidecarMetadata, SidecarError> {
                     .get("id")
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(0);
-                cur = Some(SidecarTrack { id, ..Default::default() });
+                cur = Some(SidecarTrack {
+                    id,
+                    ..Default::default()
+                });
             }
             Tag::Close { name } if name == "track" => {
                 if let Some(t) = cur.take() {
@@ -199,9 +202,17 @@ pub fn parse_sidecar_str(text: &str) -> Result<SidecarMetadata, SidecarError> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tag {
-    Open { name: String, attrs: BTreeMap<String, String> },
-    Close { name: String },
-    SelfClose { name: String, attrs: BTreeMap<String, String> },
+    Open {
+        name: String,
+        attrs: BTreeMap<String, String>,
+    },
+    Close {
+        name: String,
+    },
+    SelfClose {
+        name: String,
+        attrs: BTreeMap<String, String>,
+    },
 }
 
 fn iter_tags(text: &str) -> Result<Vec<Tag>, SidecarError> {
@@ -216,22 +227,25 @@ fn iter_tags(text: &str) -> Result<Vec<Tag>, SidecarError> {
         // Look for special openers we need to skip wholesale.
         if bytes[i..].starts_with(b"<!--") {
             // Comment: skip to next "-->"
-            let close = find_after(bytes, i + 4, b"-->")
-                .ok_or_else(|| SidecarError::Malformed(format!("unterminated comment at offset {}", i)))?;
+            let close = find_after(bytes, i + 4, b"-->").ok_or_else(|| {
+                SidecarError::Malformed(format!("unterminated comment at offset {}", i))
+            })?;
             i = close + 3;
             continue;
         }
         if bytes[i..].starts_with(b"<?") {
             // Processing instruction: skip to "?>"
-            let close = find_after(bytes, i + 2, b"?>")
-                .ok_or_else(|| SidecarError::Malformed(format!("unterminated PI at offset {}", i)))?;
+            let close = find_after(bytes, i + 2, b"?>").ok_or_else(|| {
+                SidecarError::Malformed(format!("unterminated PI at offset {}", i))
+            })?;
             i = close + 2;
             continue;
         }
         if bytes[i..].starts_with(b"<!") {
             // DOCTYPE/etc: skip to next ">"
-            let close = find_after(bytes, i + 2, b">")
-                .ok_or_else(|| SidecarError::Malformed(format!("unterminated declaration at offset {}", i)))?;
+            let close = find_after(bytes, i + 2, b">").ok_or_else(|| {
+                SidecarError::Malformed(format!("unterminated declaration at offset {}", i))
+            })?;
             i = close + 1;
             continue;
         }
@@ -243,7 +257,10 @@ fn iter_tags(text: &str) -> Result<Vec<Tag>, SidecarError> {
         i = close + 1;
 
         if inner.is_empty() {
-            return Err(SidecarError::Malformed(format!("empty tag at offset {}", close - 1)));
+            return Err(SidecarError::Malformed(format!(
+                "empty tag at offset {}",
+                close - 1
+            )));
         }
 
         if inner[0] == b'/' {
@@ -257,7 +274,11 @@ fn iter_tags(text: &str) -> Result<Vec<Tag>, SidecarError> {
         }
 
         let self_close = *inner.last().unwrap() == b'/';
-        let body = if self_close { &inner[..inner.len() - 1] } else { inner };
+        let body = if self_close {
+            &inner[..inner.len() - 1]
+        } else {
+            inner
+        };
         let body = std::str::from_utf8(body)
             .map_err(|e| SidecarError::Malformed(format!("utf8: {}", e)))?
             .trim();
@@ -462,7 +483,11 @@ pub fn serialize_sidecar(metadata: &SidecarMetadata) -> String {
     out.push_str("<store id=\"");
     out.push_str(&escape_xml(&metadata.store_id));
     out.push_str("\" type=\"SACD\" version=\"");
-    out.push_str(&escape_xml(if metadata.version.is_empty() { "1.1" } else { &metadata.version }));
+    out.push_str(&escape_xml(if metadata.version.is_empty() {
+        "1.1"
+    } else {
+        &metadata.version
+    }));
     out.push_str("\">");
 
     for track in &metadata.tracks {
@@ -596,49 +621,48 @@ pub fn seed_sidecar_from_scarletbook(md: &super::sacd::SacdMetadata) -> SidecarM
 
     let stereo_n = md.stereo.as_ref().map(|a| a.tracks.len()).unwrap_or(0);
 
-    let build_track = |id: u32, idx_in_area: usize, area_n: usize, t: &super::sacd::TrackEntry|
-        -> SidecarTrack
-    {
-        let mut meta: BTreeMap<String, String> = album_proto
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), v.clone()))
-            .collect();
+    let build_track =
+        |id: u32, idx_in_area: usize, area_n: usize, t: &super::sacd::TrackEntry| -> SidecarTrack {
+            let mut meta: BTreeMap<String, String> = album_proto
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect();
 
-        meta.insert("TRACKNUMBER".to_string(), (idx_in_area + 1).to_string());
-        meta.insert("TOTALTRACKS".to_string(), area_n.to_string());
+            meta.insert("TRACKNUMBER".to_string(), (idx_in_area + 1).to_string());
+            meta.insert("TOTALTRACKS".to_string(), area_n.to_string());
 
-        if let Some(title) = t.text.title.as_deref().filter(|s| !s.is_empty()) {
-            meta.insert("TITLE".to_string(), title.to_string());
-        }
-        let track_artist = t
-            .text
-            .performer
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| album_artist.clone());
-        if !track_artist.is_empty() {
-            meta.insert("ARTIST".to_string(), track_artist);
-        }
-        if let Some(c) = t.text.composer.as_deref().filter(|s| !s.is_empty()) {
-            meta.insert("COMPOSER".to_string(), c.to_string());
-        }
-        if let Some(sw) = t.text.songwriter.as_deref().filter(|s| !s.is_empty()) {
-            meta.insert("LYRICIST".to_string(), sw.to_string());
-        }
-        if let Some(arr) = t.text.arranger.as_deref().filter(|s| !s.is_empty()) {
-            meta.insert("ARRANGER".to_string(), arr.to_string());
-        }
-        if let Some(isrc) = t.isrc.as_deref().filter(|s| !s.is_empty()) {
-            meta.insert("ISRC".to_string(), isrc.to_string());
-        }
+            if let Some(title) = t.text.title.as_deref().filter(|s| !s.is_empty()) {
+                meta.insert("TITLE".to_string(), title.to_string());
+            }
+            let track_artist = t
+                .text
+                .performer
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| album_artist.clone());
+            if !track_artist.is_empty() {
+                meta.insert("ARTIST".to_string(), track_artist);
+            }
+            if let Some(c) = t.text.composer.as_deref().filter(|s| !s.is_empty()) {
+                meta.insert("COMPOSER".to_string(), c.to_string());
+            }
+            if let Some(sw) = t.text.songwriter.as_deref().filter(|s| !s.is_empty()) {
+                meta.insert("LYRICIST".to_string(), sw.to_string());
+            }
+            if let Some(arr) = t.text.arranger.as_deref().filter(|s| !s.is_empty()) {
+                meta.insert("ARRANGER".to_string(), arr.to_string());
+            }
+            if let Some(isrc) = t.isrc.as_deref().filter(|s| !s.is_empty()) {
+                meta.insert("ISRC".to_string(), isrc.to_string());
+            }
 
-        SidecarTrack {
-            id,
-            meta,
-            replaygain: BTreeMap::new(),
-        }
-    };
+            SidecarTrack {
+                id,
+                meta,
+                replaygain: BTreeMap::new(),
+            }
+        };
 
     let mut tracks: Vec<SidecarTrack> = Vec::new();
 
@@ -762,9 +786,18 @@ mod tests {
         let m = parse_sidecar_str(SAMPLE_SINGLE_AREA).expect("parse");
         let a1 = m.tracks_for_area(1);
         assert_eq!(a1.len(), 3);
-        assert_eq!(a1[0].meta.get("TITLE").map(String::as_str), Some("Track One"));
-        assert_eq!(a1[1].meta.get("TITLE").map(String::as_str), Some("Track Two"));
-        assert_eq!(a1[2].meta.get("TITLE").map(String::as_str), Some("Track Three"));
+        assert_eq!(
+            a1[0].meta.get("TITLE").map(String::as_str),
+            Some("Track One")
+        );
+        assert_eq!(
+            a1[1].meta.get("TITLE").map(String::as_str),
+            Some("Track Two")
+        );
+        assert_eq!(
+            a1[2].meta.get("TITLE").map(String::as_str),
+            Some("Track Three")
+        );
     }
 
     #[test]
@@ -786,7 +819,10 @@ mod tests {
         let m = parse_sidecar_str(xml).expect("parse");
         assert_eq!(m.tracks[0].meta.get("TITLE").map(String::as_str), Some("T"));
         assert_eq!(
-            m.tracks[0].replaygain.get("replaygain_track_gain").map(String::as_str),
+            m.tracks[0]
+                .replaygain
+                .get("replaygain_track_gain")
+                .map(String::as_str),
             Some("+5.00 dB"),
         );
     }
@@ -794,7 +830,10 @@ mod tests {
     #[test]
     fn parse_sidecar_rejects_non_metabase_xml() {
         let xml = r#"<root><nothing/></root>"#;
-        assert!(matches!(parse_sidecar_str(xml), Err(SidecarError::NotMetabase)));
+        assert!(matches!(
+            parse_sidecar_str(xml),
+            Err(SidecarError::NotMetabase)
+        ));
     }
 
     #[test]
@@ -880,9 +919,15 @@ mod tests {
         assert_eq!(parsed.store_id, m.store_id);
         assert_eq!(parsed.tracks.len(), 1);
         assert_eq!(parsed.tracks[0].id, 3);
-        assert_eq!(parsed.tracks[0].meta.get("TITLE").map(String::as_str), Some("My Track"));
         assert_eq!(
-            parsed.tracks[0].replaygain.get("replaygain_track_gain").map(String::as_str),
+            parsed.tracks[0].meta.get("TITLE").map(String::as_str),
+            Some("My Track")
+        );
+        assert_eq!(
+            parsed.tracks[0]
+                .replaygain
+                .get("replaygain_track_gain")
+                .map(String::as_str),
             Some("+5.00 dB"),
         );
     }
@@ -932,7 +977,10 @@ mod tests {
         let parsed = parse_sidecar_str(&xml).expect("parse");
         let pt = &parsed.tracks[0];
         assert_eq!(pt.meta.get("TITLE").map(String::as_str), Some("T"));
-        assert_eq!(pt.meta.get("DISCOGS_RELEASE_ID").map(String::as_str), Some("12345"));
+        assert_eq!(
+            pt.meta.get("DISCOGS_RELEASE_ID").map(String::as_str),
+            Some("12345")
+        );
         assert_eq!(pt.meta.get("DYNAMIC RANGE").map(String::as_str), Some("15"));
         assert_eq!(pt.meta.get("PUBLISHER").map(String::as_str), Some("Pub Co"));
     }
@@ -957,28 +1005,46 @@ mod tests {
         let parsed = parse_sidecar(&path).expect("parse what we wrote");
         assert_eq!(parsed.store_id, "NEW0000000000000000000000000000A");
         assert_eq!(parsed.tracks.len(), 1);
-        assert_eq!(parsed.tracks[0].meta.get("TITLE").map(String::as_str), Some("Hi"));
+        assert_eq!(
+            parsed.tracks[0].meta.get("TITLE").map(String::as_str),
+            Some("Hi")
+        );
 
         // Tmp file must have been cleaned up.
-        let leftovers: Vec<_> = std::fs::read_dir(td.path()).unwrap()
+        let leftovers: Vec<_> = std::fs::read_dir(td.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
                 e.file_name().to_string_lossy().starts_with('.')
                     && e.file_name().to_string_lossy().ends_with(".tmp")
             })
             .collect();
-        assert!(leftovers.is_empty(), "tmp file left behind: {:?}", leftovers);
+        assert!(
+            leftovers.is_empty(),
+            "tmp file left behind: {:?}",
+            leftovers
+        );
     }
 
-    fn make_track(title: Option<&str>, performer: Option<&str>, isrc: Option<&str>)
-        -> super::super::sacd::TrackEntry
-    {
+    fn make_track(
+        title: Option<&str>,
+        performer: Option<&str>,
+        isrc: Option<&str>,
+    ) -> super::super::sacd::TrackEntry {
         use super::super::sacd::{PlayTime, TrackEntry, TrackText};
         TrackEntry {
             start_lsn: 0,
             length_lsn: 0,
-            start_time: PlayTime { minutes: 0, seconds: 0, frames: 0 },
-            duration: PlayTime { minutes: 3, seconds: 30, frames: 0 },
+            start_time: PlayTime {
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            duration: PlayTime {
+                minutes: 3,
+                seconds: 30,
+                frames: 0,
+            },
             text: TrackText {
                 title: title.map(String::from),
                 performer: performer.map(String::from),
@@ -989,16 +1055,19 @@ mod tests {
         }
     }
 
-    fn make_area(kind: super::super::sacd::AreaKind, n_tracks: usize)
-        -> super::super::sacd::AreaInfo
-    {
+    fn make_area(
+        kind: super::super::sacd::AreaKind,
+        n_tracks: usize,
+    ) -> super::super::sacd::AreaInfo {
         use super::super::sacd::{AreaInfo, AreaTocHeader, FrameFormat, PlayTime};
         let tracks = (0..n_tracks)
-            .map(|i| make_track(
-                Some(&format!("Track {}", i + 1)),
-                Some("Track Artist"),
-                None,
-            ))
+            .map(|i| {
+                make_track(
+                    Some(&format!("Track {}", i + 1)),
+                    Some("Track Artist"),
+                    None,
+                )
+            })
             .collect();
         AreaInfo {
             header: AreaTocHeader {
@@ -1008,12 +1077,20 @@ mod tests {
                 max_byte_rate: 0,
                 sample_frequency: 4,
                 frame_format: FrameFormat::Dsd3In14,
-                channel_count: if matches!(kind, super::super::sacd::AreaKind::Stereo) { 2 } else { 6 },
+                channel_count: if matches!(kind, super::super::sacd::AreaKind::Stereo) {
+                    2
+                } else {
+                    6
+                },
                 loudspeaker_config: 0,
                 extra_settings: 0,
                 max_available_channels: 2,
                 area_mute_flags: 0,
-                total_playtime: PlayTime { minutes: 30, seconds: 0, frames: 0 },
+                total_playtime: PlayTime {
+                    minutes: 30,
+                    seconds: 0,
+                    frames: 0,
+                },
                 track_offset: 0,
                 track_count: n_tracks as u8,
                 track_start_lsn: 0,
@@ -1039,13 +1116,28 @@ mod tests {
                 album_set_size: 1,
                 album_sequence_number: 1,
                 album_catalog_number: "TEST-123".to_string(),
-                album_genres: vec![Genre { category: 1, genre: 14 }], // Jazz
-                two_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
-                multi_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
+                album_genres: vec![Genre {
+                    category: 1,
+                    genre: 14,
+                }], // Jazz
+                two_channel: AreaPointer {
+                    toc_1_start: 0,
+                    toc_2_start: 0,
+                    toc_size_sectors: 0,
+                },
+                multi_channel: AreaPointer {
+                    toc_1_start: 0,
+                    toc_2_start: 0,
+                    toc_size_sectors: 0,
+                },
                 disc_type_hybrid: stereo_n.is_some() && mch_n.is_some(),
                 disc_catalog_number: String::new(),
                 disc_genres: vec![],
-                disc_date: Some(DiscDate { year: 1965, month: 3, day: 1 }),
+                disc_date: Some(DiscDate {
+                    year: 1965,
+                    month: 3,
+                    day: 1,
+                }),
                 text_area_count: 1,
                 locales: vec![],
             },
@@ -1080,16 +1172,46 @@ mod tests {
         assert_eq!(s.tracks.len(), 3);
         assert_eq!(s.tracks[0].id, 1);
         assert_eq!(s.tracks[2].id, 3);
-        assert_eq!(s.tracks[0].meta.get("ALBUM").map(String::as_str), Some("Test Album"));
-        assert_eq!(s.tracks[0].meta.get("ALBUMARTIST").map(String::as_str), Some("Test Artist"));
-        assert_eq!(s.tracks[0].meta.get("DATE").map(String::as_str), Some("1965"));
-        assert_eq!(s.tracks[0].meta.get("CATALOGNUMBER").map(String::as_str), Some("TEST-123"));
-        assert_eq!(s.tracks[0].meta.get("GENRE").map(String::as_str), Some("Jazz"));
-        assert_eq!(s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
-        assert_eq!(s.tracks[0].meta.get("TOTALTRACKS").map(String::as_str), Some("3"));
-        assert_eq!(s.tracks[0].meta.get("TITLE").map(String::as_str), Some("Track 1"));
-        assert_eq!(s.tracks[2].meta.get("TITLE").map(String::as_str), Some("Track 3"));
-        assert!(s.store_id.is_empty(), "store_id is filled by caller, not seed");
+        assert_eq!(
+            s.tracks[0].meta.get("ALBUM").map(String::as_str),
+            Some("Test Album")
+        );
+        assert_eq!(
+            s.tracks[0].meta.get("ALBUMARTIST").map(String::as_str),
+            Some("Test Artist")
+        );
+        assert_eq!(
+            s.tracks[0].meta.get("DATE").map(String::as_str),
+            Some("1965")
+        );
+        assert_eq!(
+            s.tracks[0].meta.get("CATALOGNUMBER").map(String::as_str),
+            Some("TEST-123")
+        );
+        assert_eq!(
+            s.tracks[0].meta.get("GENRE").map(String::as_str),
+            Some("Jazz")
+        );
+        assert_eq!(
+            s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            s.tracks[0].meta.get("TOTALTRACKS").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            s.tracks[0].meta.get("TITLE").map(String::as_str),
+            Some("Track 1")
+        );
+        assert_eq!(
+            s.tracks[2].meta.get("TITLE").map(String::as_str),
+            Some("Track 3")
+        );
+        assert!(
+            s.store_id.is_empty(),
+            "store_id is filled by caller, not seed"
+        );
         assert_eq!(s.version, "1.1");
     }
 
@@ -1099,13 +1221,28 @@ mod tests {
         let s = seed_sidecar_from_scarletbook(&md);
         // stereo: ids 1, 2; mch: ids 3, 4, 5
         assert_eq!(s.tracks.len(), 5);
-        assert_eq!(s.tracks.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            s.tracks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
         // TOTALTRACKS is per-area
-        assert_eq!(s.tracks[0].meta.get("TOTALTRACKS").map(String::as_str), Some("2"));
-        assert_eq!(s.tracks[2].meta.get("TOTALTRACKS").map(String::as_str), Some("3"));
+        assert_eq!(
+            s.tracks[0].meta.get("TOTALTRACKS").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            s.tracks[2].meta.get("TOTALTRACKS").map(String::as_str),
+            Some("3")
+        );
         // TRACKNUMBER restarts per area
-        assert_eq!(s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
-        assert_eq!(s.tracks[2].meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
+        assert_eq!(
+            s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            s.tracks[2].meta.get("TRACKNUMBER").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
@@ -1119,8 +1256,16 @@ mod tests {
                 album_sequence_number: 1,
                 album_catalog_number: String::new(),
                 album_genres: vec![],
-                two_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
-                multi_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
+                two_channel: AreaPointer {
+                    toc_1_start: 0,
+                    toc_2_start: 0,
+                    toc_size_sectors: 0,
+                },
+                multi_channel: AreaPointer {
+                    toc_1_start: 0,
+                    toc_2_start: 0,
+                    toc_size_sectors: 0,
+                },
                 disc_type_hybrid: false,
                 disc_catalog_number: String::new(),
                 disc_genres: vec![],
@@ -1140,8 +1285,14 @@ mod tests {
         assert!(s.tracks[0].meta.get("CATALOGNUMBER").is_none());
         assert!(s.tracks[0].meta.get("GENRE").is_none());
         // Per-track defaults still emitted
-        assert_eq!(s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str), Some("1"));
-        assert_eq!(s.tracks[0].meta.get("TITLE").map(String::as_str), Some("Track 1"));
+        assert_eq!(
+            s.tracks[0].meta.get("TRACKNUMBER").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            s.tracks[0].meta.get("TITLE").map(String::as_str),
+            Some("Track 1")
+        );
     }
 
     #[test]
@@ -1153,7 +1304,10 @@ mod tests {
         let parsed = parse_sidecar_str(&xml).expect("seeded sidecar should round-trip");
         assert_eq!(parsed.store_id, s.store_id);
         assert_eq!(parsed.tracks.len(), 2);
-        assert_eq!(parsed.tracks[0].meta.get("TITLE").map(String::as_str), Some("Track 1"));
+        assert_eq!(
+            parsed.tracks[0].meta.get("TITLE").map(String::as_str),
+            Some("Track 1")
+        );
     }
 
     #[test]
@@ -1174,7 +1328,8 @@ mod tests {
         assert_eq!(a, b, "must be deterministic");
         assert_eq!(a.len(), 32);
         assert!(
-            a.chars().all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c)),
+            a.chars()
+                .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c)),
             "must be uppercase hex, got {}",
             a
         );
@@ -1199,11 +1354,14 @@ mod tests {
     /// also asserts the canonical disc id matches.
     #[test]
     fn seed_mint_serialize_reparse_against_real_iso_when_env_var_set() {
-        let Ok(path) = std::env::var("TONEPOET_SACD_FIXTURE_ISO") else { return };
+        let Ok(path) = std::env::var("TONEPOET_SACD_FIXTURE_ISO") else {
+            return;
+        };
         let p = std::path::Path::new(&path);
-        if !p.exists() { return; }
-        let md = super::super::sacd::parse_sacd_iso(p)
-            .expect("real SACD ISO should parse");
+        if !p.exists() {
+            return;
+        }
+        let md = super::super::sacd::parse_sacd_iso(p).expect("real SACD ISO should parse");
         let mut s = seed_sidecar_from_scarletbook(&md);
         s.store_id = mint_disc_id(p).expect("mint canonical disc id");
         let xml = serialize_sidecar(&s);
@@ -1211,10 +1369,13 @@ mod tests {
             .expect("seeded+minted XML should round-trip through parse_sidecar_str");
         assert_eq!(reparsed.store_id.len(), 32);
         assert_eq!(reparsed.store_id, s.store_id);
-        assert!(!reparsed.tracks.is_empty(), "seed should produce at least one track");
+        assert!(
+            !reparsed.tracks.is_empty(),
+            "seed should produce at least one track"
+        );
         if let Some(real_sc_path) = find_sidecar_for_iso(p) {
-            let real = parse_sidecar(&real_sc_path)
-                .expect("real sidecar alongside ISO should parse");
+            let real =
+                parse_sidecar(&real_sc_path).expect("real sidecar alongside ISO should parse");
             assert_eq!(
                 reparsed.store_id, real.store_id,
                 "Phase A minted id must match foobar2000's existing <store id>",
@@ -1268,7 +1429,11 @@ mod tests {
             panic!("parsing real fixture '{}' failed: {}", path, e);
         });
         assert!(!m.store_id.is_empty(), "store id should be non-empty");
-        assert!(m.store_id.len() == 32, "store id should be 32 hex chars: got {:?}", m.store_id);
+        assert!(
+            m.store_id.len() == 32,
+            "store id should be 32 hex chars: got {:?}",
+            m.store_id
+        );
         assert!(!m.tracks.is_empty(), "should have at least one track");
         assert!(
             m.tracks.iter().any(|t| t.meta.contains_key("TITLE")),

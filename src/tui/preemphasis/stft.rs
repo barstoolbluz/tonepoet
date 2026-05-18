@@ -46,14 +46,17 @@ pub fn compute_bin_ranges(sample_rate: u32) -> Vec<(usize, usize)> {
     let centers = band_centers();
     let factor = (2.0f64).powf(1.0 / 6.0); // half a 1/3 octave
 
-    centers.iter().map(|&fc| {
-        let lo_freq = fc / factor;
-        let hi_freq = fc * factor;
-        let lo_bin = (lo_freq / bin_width).ceil() as usize;
-        let hi_bin = (hi_freq / bin_width).floor() as usize;
-        let hi_bin = hi_bin.min(FFT_SIZE / 2 - 1);
-        (lo_bin.max(1), hi_bin)
-    }).collect()
+    centers
+        .iter()
+        .map(|&fc| {
+            let lo_freq = fc / factor;
+            let hi_freq = fc * factor;
+            let lo_bin = (lo_freq / bin_width).ceil() as usize;
+            let hi_bin = (hi_freq / bin_width).floor() as usize;
+            let hi_bin = hi_bin.min(FFT_SIZE / 2 - 1);
+            (lo_bin.max(1), hi_bin)
+        })
+        .collect()
 }
 
 /// Precompute Hann window of given size.
@@ -71,21 +74,21 @@ pub fn hann_window(size: usize) -> Vec<f64> {
 pub fn compute_band_spectra(path: &Path, sample_rate: u32) -> Result<StftResult, String> {
     use ffmpeg_next as ffmpeg;
     use ffmpeg_next::media::Type;
-    use rustfft::{FftPlanner, num_complex::Complex};
+    use rustfft::{num_complex::Complex, FftPlanner};
 
     crate::tui::probe::ensure_ffmpeg_init_pub();
 
-    let mut ictx = ffmpeg::format::input(&path)
-        .map_err(|e| format!("open failed: {}", e))?;
+    let mut ictx = ffmpeg::format::input(&path).map_err(|e| format!("open failed: {}", e))?;
 
-    let audio_stream = ictx.streams().best(Type::Audio)
-        .ok_or("no audio stream")?;
+    let audio_stream = ictx.streams().best(Type::Audio).ok_or("no audio stream")?;
     let stream_idx = audio_stream.index();
 
     let codec_params = audio_stream.parameters();
     let codec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)
         .map_err(|e| format!("codec params: {}", e))?;
-    let mut decoder = codec_ctx.decoder().audio()
+    let mut decoder = codec_ctx
+        .decoder()
+        .audio()
         .map_err(|e| format!("decoder: {}", e))?;
 
     let channels = decoder.channels() as usize;
@@ -105,7 +108,8 @@ pub fn compute_band_spectra(path: &Path, sample_rate: u32) -> Result<StftResult,
     let max_samples = (actual_rate as usize) * 600; // 10 minutes
 
     // Accumulate decoded samples into a mono buffer (capped).
-    let mut mono_samples: Vec<f64> = Vec::with_capacity(max_samples.min(actual_rate as usize * 300));
+    let mut mono_samples: Vec<f64> =
+        Vec::with_capacity(max_samples.min(actual_rate as usize * 300));
 
     let mut decoded_frame = ffmpeg::util::frame::Audio::empty();
 
@@ -114,15 +118,21 @@ pub fn compute_band_spectra(path: &Path, sample_rate: u32) -> Result<StftResult,
         if stream.index() != stream_idx {
             continue;
         }
-        decoder.send_packet(&packet).map_err(|e| format!("send packet: {}", e))?;
+        decoder
+            .send_packet(&packet)
+            .map_err(|e| format!("send packet: {}", e))?;
 
         while decoder.receive_frame(&mut decoded_frame).is_ok() {
             let n = decoded_frame.samples();
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
 
             let fmt = decoder.format();
             for i in 0..n {
-                if mono_samples.len() >= max_samples { break 'decode; }
+                if mono_samples.len() >= max_samples {
+                    break 'decode;
+                }
                 let mut sum = 0.0f64;
                 for ch in 0..channels {
                     let sample = extract_sample(&decoded_frame, fmt, ch, i);
@@ -138,10 +148,14 @@ pub fn compute_band_spectra(path: &Path, sample_rate: u32) -> Result<StftResult,
         decoder.send_eof().ok();
         while decoder.receive_frame(&mut decoded_frame).is_ok() {
             let n = decoded_frame.samples();
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
             let fmt = decoder.format();
             for i in 0..n {
-                if mono_samples.len() >= max_samples { break; }
+                if mono_samples.len() >= max_samples {
+                    break;
+                }
                 let mut sum = 0.0f64;
                 for ch in 0..channels {
                     let sample = extract_sample(&decoded_frame, fmt, ch, i);
@@ -235,13 +249,19 @@ fn extract_sample(
         }
         Sample::I32(SampleType::Planar) => {
             let plane = frame.plane::<i32>(channel);
-            plane.get(index).map(|&s| s as f64 / 2147483648.0).unwrap_or(0.0)
+            plane
+                .get(index)
+                .map(|&s| s as f64 / 2147483648.0)
+                .unwrap_or(0.0)
         }
         Sample::I32(SampleType::Packed) => {
             let plane = frame.plane::<i32>(0);
             let channels = frame.channels() as usize;
             let idx = index * channels + channel;
-            plane.get(idx).map(|&s| s as f64 / 2147483648.0).unwrap_or(0.0)
+            plane
+                .get(idx)
+                .map(|&s| s as f64 / 2147483648.0)
+                .unwrap_or(0.0)
         }
         Sample::F32(SampleType::Planar) => {
             let plane = frame.plane::<f32>(channel);

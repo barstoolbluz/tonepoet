@@ -18,11 +18,11 @@ pub struct TuiPreset {
     pub version: u32, // 2 = TUI preset
 
     // Format pane
-    pub format: String,       // "flac", "opus", etc.
+    pub format: String, // "flac", "opus", etc.
     pub sample_rate: u32,
-    pub bit_depth: String,    // "16", "24", "32", "32f", "64f"
-    pub dither: String,       // "tpdf", "none", "shaped"
-    pub replaygain: String,   // "album", "track", "both", "off"
+    pub bit_depth: String,  // "16", "24", "32", "32f", "64f"
+    pub dither: String,     // "tpdf", "none", "shaped"
+    pub replaygain: String, // "album", "track", "both", "off"
 
     // Output options pane
     pub folder_template: String,
@@ -119,26 +119,34 @@ impl TuiPreset {
             _ => "24", // default
         };
 
-        let dither = preset.dither_type.as_ref().map(|dt| {
-            use tonepoet_wizard::DitherType as WD;
-            match dt {
-                WD::None => "none",
-                WD::Tpdf => "tpdf",
-                WD::Shibata | WD::LowShibata | WD::HighShibata => "shaped",
-                WD::Gesemann => "shaped",
-                WD::SlopedTpdf => "tpdf",
-            }
-        }).unwrap_or("tpdf");
+        let dither = preset
+            .dither_type
+            .as_ref()
+            .map(|dt| {
+                use tonepoet_wizard::DitherType as WD;
+                match dt {
+                    WD::None => "none",
+                    WD::Tpdf => "tpdf",
+                    WD::Shibata | WD::LowShibata | WD::HighShibata => "shaped",
+                    WD::Gesemann => "shaped",
+                    WD::SlopedTpdf => "tpdf",
+                }
+            })
+            .unwrap_or("tpdf");
 
-        let replaygain = preset.replaygain_mode.as_ref().map(|rg| {
-            use tonepoet_wizard::ReplayGainMode as WR;
-            match rg {
-                WR::Track => "track",
-                WR::Album => "album",
-                WR::Both => "both",
-                WR::Off => "off",
-            }
-        }).unwrap_or("off");
+        let replaygain = preset
+            .replaygain_mode
+            .as_ref()
+            .map(|rg| {
+                use tonepoet_wizard::ReplayGainMode as WR;
+                match rg {
+                    WR::Track => "track",
+                    WR::Album => "album",
+                    WR::Both => "both",
+                    WR::Off => "off",
+                }
+            })
+            .unwrap_or("off");
 
         let merge = if preset.merge_to_single == Some(true) {
             "single-image"
@@ -169,7 +177,10 @@ pub fn presets_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         PathBuf::from(xdg).join("tonepoet").join("presets")
     } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".config").join("tonepoet").join("presets")
+        PathBuf::from(home)
+            .join(".config")
+            .join("tonepoet")
+            .join("presets")
     } else {
         PathBuf::from("./presets")
     }
@@ -263,12 +274,11 @@ pub fn load_preset(name: &str) -> Result<TuiPreset, String> {
 /// Save a preset to disk
 pub fn save_preset(preset: &TuiPreset) -> Result<(), String> {
     let dir = presets_dir();
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create presets directory: {}", e))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create presets directory: {}", e))?;
 
     let path = dir.join(format!("{}.toml", preset.name));
-    let contents = toml::to_string_pretty(preset)
-        .map_err(|e| format!("Failed to serialize preset: {}", e))?;
+    let contents =
+        toml::to_string_pretty(preset).map_err(|e| format!("Failed to serialize preset: {}", e))?;
 
     fs::write(&path, contents)
         .map_err(|e| format!("Failed to write preset '{}': {}", preset.name, e))?;
@@ -297,8 +307,7 @@ pub fn delete_preset(name: &str) -> Result<(), String> {
     let dir = presets_dir();
     let path = dir.join(format!("{}.toml", name));
 
-    fs::remove_file(&path)
-        .map_err(|e| format!("Failed to delete preset '{}': {}", name, e))?;
+    fs::remove_file(&path).map_err(|e| format!("Failed to delete preset '{}': {}", name, e))?;
 
     Ok(())
 }
@@ -356,7 +365,9 @@ pub fn import_presets_to_db(db: &crate::db::Database) {
 
 /// List presets grouped by format using the SQLite index.
 /// Falls back to the file-based scan if the DB is empty.
-pub fn list_presets_by_format_db(db: &crate::db::Database) -> Vec<(Option<AudioFormat>, Vec<String>)> {
+pub fn list_presets_by_format_db(
+    db: &crate::db::Database,
+) -> Vec<(Option<AudioFormat>, Vec<String>)> {
     let groups = db.list_presets_by_format();
     if groups.is_empty() {
         // Fall back to file-based scan (DB might not be populated yet).
@@ -383,7 +394,9 @@ pub fn list_presets_by_format_db(db: &crate::db::Database) -> Vec<(Option<AudioF
     }
     // Unknown formats at the end.
     for (fmt_str, names) in &groups {
-        let is_known = display_order.iter().any(|f| f.name().to_lowercase() == fmt_str.to_lowercase());
+        let is_known = display_order
+            .iter()
+            .any(|f| f.name().to_lowercase() == fmt_str.to_lowercase());
         if !is_known {
             result.push((None, names.clone()));
         }

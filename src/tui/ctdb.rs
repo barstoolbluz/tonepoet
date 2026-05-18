@@ -4,11 +4,11 @@
 //! The API returns per-track CRC32 values and parity data availability
 //! for future Reed-Solomon error repair.
 
-use std::path::{Path, PathBuf};
+use super::message::AppMessage;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
-use super::message::AppMessage;
 
 // ── Data structures ─────────────────────────────────────────────────
 
@@ -83,7 +83,8 @@ pub struct CtdbVerifyResult {
 /// CTDB expects colon-separated LBA values (without lead-in):
 /// `"0:16032:32072:47282:62810"` where the last value is the leadout.
 pub fn build_ctdb_toc(toc_sectors: &[u32]) -> String {
-    toc_sectors.iter()
+    toc_sectors
+        .iter()
         .map(|&s| s.saturating_sub(150).to_string())
         .collect::<Vec<_>>()
         .join(":")
@@ -123,7 +124,8 @@ pub async fn query_ctdb(toc: &str) -> Result<Option<CtdbResponse>, String> {
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .send()
         .await
         .map_err(|e| format!("CTDB query failed: {}", e))?;
@@ -132,7 +134,8 @@ pub async fn query_ctdb(toc: &str) -> Result<Option<CtdbResponse>, String> {
         return Err(format!("CTDB HTTP {}", resp.status()));
     }
 
-    let body = resp.text()
+    let body = resp
+        .text()
         .await
         .map_err(|e| format!("CTDB response error: {}", e))?;
 
@@ -179,9 +182,11 @@ fn parse_ctdb_response(xml: &str) -> Result<CtdbResponse, String> {
         let parity = extract_attr(trimmed, "parity");
         let syndrome = extract_attr(trimmed, "syndrome");
         let track_crcs: Vec<u32> = extract_attr(trimmed, "trackcrcs")
-            .map(|s| s.split_whitespace()
-                .filter_map(|h| u32::from_str_radix(h, 16).ok())
-                .collect())
+            .map(|s| {
+                s.split_whitespace()
+                    .filter_map(|h| u32::from_str_radix(h, 16).ok())
+                    .collect()
+            })
             .unwrap_or_default();
 
         entries.push(CtdbEntry {
@@ -240,21 +245,24 @@ pub fn compute_track_crc32(
     is_last: bool,
     suffix_skip_i16: usize, // pre-computed last-track skip (0 for non-last)
 ) -> u32 {
-    let start = if is_first { PREFIX_SKIP_I16.min(audio.len()) } else { 0 };
-    let end = if is_last { audio.len().saturating_sub(suffix_skip_i16) } else { audio.len() };
+    let start = if is_first {
+        PREFIX_SKIP_I16.min(audio.len())
+    } else {
+        0
+    };
+    let end = if is_last {
+        audio.len().saturating_sub(suffix_skip_i16)
+    } else {
+        audio.len()
+    };
     if start >= end {
         return 0;
     }
     let trimmed = &audio[start..end];
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            trimmed.as_ptr() as *const u8,
-            trimmed.len() * 2,
-        )
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(trimmed.as_ptr() as *const u8, trimmed.len() * 2) };
     crc32fast::hash(bytes)
 }
-
 
 // ── Reed-Solomon verification (CUETools-source-faithful translation) ──
 //
@@ -390,7 +398,8 @@ fn cuetools_payload_from_disc_image(audio: &[i16]) -> Option<&[i16]> {
 fn cuetools_middle_span_image_for_parity(audio: &[i16]) -> Option<Vec<i16>> {
     let stride = crate::ctdb_rs::STRIDE;
     let span = cuetools_disc_span(audio)?;
-    let payload = audio.get(span.payload_start..span.payload_start.checked_add(span.payload_len)?)?;
+    let payload =
+        audio.get(span.payload_start..span.payload_start.checked_add(span.payload_len)?)?;
 
     let protected_start = stride;
     let protected_len = span.stridecount.checked_mul(stride)?;
@@ -558,7 +567,9 @@ pub fn ctdb_probe_entry_offsets_with_parity(
         if let Some((sigma, count)) = crate::ctdb_rs::berlekamp_massey(gf, &delta, npar) {
             errors_found = Some(count);
             if count > 0 {
-                if let Some(found) = crate::ctdb_rs::chien_search(gf, &sigma, count, ctx.stridecount) {
+                if let Some(found) =
+                    crate::ctdb_rs::chien_search(gf, &sigma, count, ctx.stridecount)
+                {
                     chien_succeeds = found.len() == count;
                     positions = found;
                 }
@@ -682,12 +693,8 @@ fn cuetools_get_syndrome_row(
     let parity2syndrome_word_offset = -2_i64 * sample_offset as i64;
     let y1 = (part2 - parity2syndrome_word_offset).rem_euclid(stride_i64) as usize;
 
-    let mut syn = cuetools_parity_row_to_syndrome_row(
-        gf,
-        parity16.get(y1)?,
-        out_npar,
-        CUETOOLS_MAX_NPAR,
-    )?;
+    let mut syn =
+        cuetools_parity_row_to_syndrome_row(gf, parity16.get(y1)?, out_npar, CUETOOLS_MAX_NPAR)?;
 
     // matches CUETools.AccurateRip/AccurateRip.cs:2808
     let offset_words = 2_i64 * sample_offset as i64;
@@ -699,7 +706,9 @@ fn cuetools_get_syndrome_row(
         let part_usize = part as usize;
         for i in 0..out_npar {
             let mut syn_i = gf_mul_exp(gf, syn[i], i);
-            syn_i ^= *ctx.leadout.get(ctx.laststride.checked_sub(part_usize + 1)?)?;
+            syn_i ^= *ctx
+                .leadout
+                .get(ctx.laststride.checked_sub(part_usize + 1)?)?;
             let leadin_index = ctx.stride.checked_add(part_usize)?;
             let exp = (i * ctx.stridecount) % crate::ctdb_rs::galois::MAX;
             syn_i ^= gf_mul_exp(gf, *ctx.leadin.get(leadin_index)?, exp);
@@ -865,7 +874,10 @@ fn has_parity_material(entry: &CtdbEntry) -> bool {
 }
 
 fn verified_status(status: &CtdbTrackStatus) -> bool {
-    matches!(status, CtdbTrackStatus::Verified | CtdbTrackStatus::VerifiedRs)
+    matches!(
+        status,
+        CtdbTrackStatus::Verified | CtdbTrackStatus::VerifiedRs
+    )
 }
 
 fn assemble_ctdb_disc_image_from_tracks(decoded_tracks: &[Option<Vec<i16>>]) -> Option<Vec<i16>> {
@@ -971,9 +983,8 @@ fn verify_disc_via_rs_blocking_with_parity(
     let mut best_match: Option<RsVerifiedMatch> = None;
 
     for entry in entries {
-        let candidate = verify_entry_via_syndrome_fast_path(
-            gf, parity16, &ctx, entry, offset_lo, offset_hi,
-        );
+        let candidate =
+            verify_entry_via_syndrome_fast_path(gf, parity16, &ctx, entry, offset_lo, offset_hi);
 
         if let Some(candidate) = candidate {
             let replace = match best_match.as_ref() {
@@ -1022,7 +1033,6 @@ mod cuetools_translation_fixtures {
         let got = cuetools_bytes_to_syndrome_matrix(&bytes, 2, 2).unwrap();
         assert_eq!(got, vec![vec![0x1111, 0x2222], vec![0x3333, 0x4444]]);
     }
-
 
     #[test]
     fn cuetools_context_uses_middle_span_stridecount_and_real_payload_edges() {
@@ -1133,15 +1143,17 @@ pub async fn verify_ctdb(
         Ok(Some(resp)) => resp,
         Ok(None) => {
             return CtdbVerifyResult {
-                tracks: (0..n).map(|i| CtdbTrackResult {
-                    path: paths[i].clone(),
-                    track_number: (i + 1) as u32,
-                    status: CtdbTrackStatus::NoDiscInDatabase,
-                    confidence: None,
-                    computed_crc32: 0,
-                    expected_crc32: None,
-                    has_parity: false,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| CtdbTrackResult {
+                        path: paths[i].clone(),
+                        track_number: (i + 1) as u32,
+                        status: CtdbTrackStatus::NoDiscInDatabase,
+                        confidence: None,
+                        computed_crc32: 0,
+                        expected_crc32: None,
+                        has_parity: false,
+                    })
+                    .collect(),
                 toc,
                 npar: None,
                 stride: None,
@@ -1151,15 +1163,17 @@ pub async fn verify_ctdb(
         }
         Err(e) => {
             return CtdbVerifyResult {
-                tracks: (0..n).map(|i| CtdbTrackResult {
-                    path: paths[i].clone(),
-                    track_number: (i + 1) as u32,
-                    status: CtdbTrackStatus::Error(e.clone()),
-                    confidence: None,
-                    computed_crc32: 0,
-                    expected_crc32: None,
-                    has_parity: false,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| CtdbTrackResult {
+                        path: paths[i].clone(),
+                        track_number: (i + 1) as u32,
+                        status: CtdbTrackStatus::Error(e.clone()),
+                        confidence: None,
+                        computed_crc32: 0,
+                        expected_crc32: None,
+                        has_parity: false,
+                    })
+                    .collect(),
                 toc,
                 npar: None,
                 stride: None,
@@ -1173,15 +1187,17 @@ pub async fn verify_ctdb(
         Some(entry) => entry,
         None => {
             return CtdbVerifyResult {
-                tracks: (0..n).map(|i| CtdbTrackResult {
-                    path: paths[i].clone(),
-                    track_number: (i + 1) as u32,
-                    status: CtdbTrackStatus::NoDiscInDatabase,
-                    confidence: None,
-                    computed_crc32: 0,
-                    expected_crc32: None,
-                    has_parity: false,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| CtdbTrackResult {
+                        path: paths[i].clone(),
+                        track_number: (i + 1) as u32,
+                        status: CtdbTrackStatus::NoDiscInDatabase,
+                        confidence: None,
+                        computed_crc32: 0,
+                        expected_crc32: None,
+                        has_parity: false,
+                    })
+                    .collect(),
                 toc,
                 npar: None,
                 stride: None,
@@ -1222,7 +1238,8 @@ pub async fn verify_ctdb(
 
     // Cache-aware parity flow: use cached parity if supplied, else compute
     // fresh and stash for the caller to write back if cache_key is Some.
-    let (rs_match, parity_cache_write) = match assemble_ctdb_disc_image_from_tracks(&decoded_tracks) {
+    let (rs_match, parity_cache_write) = match assemble_ctdb_disc_image_from_tracks(&decoded_tracks)
+    {
         Some(image) => {
             // Resolve parity: from cache, or freshly computed.
             let parity_and_write: Option<(Vec<Vec<u16>>, Option<(String, Vec<Vec<u16>>)>)> =
@@ -1235,7 +1252,10 @@ pub async fn verify_ctdb(
                         let image_for_parity = image.clone();
                         let computed = tokio::task::spawn_blocking(move || {
                             compute_audio_parity16(&image_for_parity)
-                        }).await.ok().flatten();
+                        })
+                        .await
+                        .ok()
+                        .flatten();
                         computed.map(|p| {
                             let cache_write = cache_key.map(|k| (k, p.clone()));
                             (p, cache_write)
@@ -1250,7 +1270,8 @@ pub async fn verify_ctdb(
                         parity,
                         &db_response.entries,
                         CTDB_RS_OFFSET_WINDOW_SAMPLES,
-                    ).await;
+                    )
+                    .await;
                     (m, cache_write)
                 }
                 None => {
@@ -1350,14 +1371,22 @@ pub async fn verify_ctdb(
 /// Format a summary string for CTDB verification results.
 pub fn format_ctdb_summary(result: &CtdbVerifyResult) -> String {
     let total = result.tracks.len();
-    let verified = result.tracks.iter()
+    let verified = result
+        .tracks
+        .iter()
         .filter(|t| verified_status(&t.status))
         .count();
-    let rs_verified = result.tracks.iter()
+    let rs_verified = result
+        .tracks
+        .iter()
         .filter(|t| t.status == CtdbTrackStatus::VerifiedRs)
         .count();
 
-    if result.tracks.iter().any(|t| t.status == CtdbTrackStatus::NoDiscInDatabase) {
+    if result
+        .tracks
+        .iter()
+        .any(|t| t.status == CtdbTrackStatus::NoDiscInDatabase)
+    {
         return "Disc not in CUETools database".to_string();
     }
 
@@ -1365,7 +1394,9 @@ pub fn format_ctdb_summary(result: &CtdbVerifyResult) -> String {
         return format!("0/{} tracks verified", total);
     }
 
-    let max_conf = result.tracks.iter()
+    let max_conf = result
+        .tracks
+        .iter()
         .filter_map(|t| t.confidence)
         .max()
         .unwrap_or(0);
@@ -1399,20 +1430,25 @@ pub async fn verify_ctdb_single_image(
 
     // Build TOC from CUE INDEX timestamps.
     let toc = {
-        let toc_sectors = super::accuraterip::find_toc_offsets(
-            info.cue_path.parent().unwrap_or(Path::new(".")),
-        );
+        let toc_sectors =
+            super::accuraterip::find_toc_offsets(info.cue_path.parent().unwrap_or(Path::new(".")));
         if let Some(ref sectors) = toc_sectors {
             if sectors.len() == n + 1 {
                 build_ctdb_toc(sectors)
             } else {
-                let sample_counts: Vec<u64> = info.track_boundaries.iter()
-                    .map(|&(_, count)| count).collect();
+                let sample_counts: Vec<u64> = info
+                    .track_boundaries
+                    .iter()
+                    .map(|&(_, count)| count)
+                    .collect();
                 build_ctdb_toc_from_samples(&sample_counts, info.sample_rate)
             }
         } else {
-            let sample_counts: Vec<u64> = info.track_boundaries.iter()
-                .map(|&(_, count)| count).collect();
+            let sample_counts: Vec<u64> = info
+                .track_boundaries
+                .iter()
+                .map(|&(_, count)| count)
+                .collect();
             build_ctdb_toc_from_samples(&sample_counts, info.sample_rate)
         }
     };
@@ -1422,15 +1458,17 @@ pub async fn verify_ctdb_single_image(
         Ok(Some(resp)) => resp,
         Ok(None) => {
             return CtdbVerifyResult {
-                tracks: (0..n).map(|i| CtdbTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: CtdbTrackStatus::NoDiscInDatabase,
-                    confidence: None,
-                    computed_crc32: 0,
-                    expected_crc32: None,
-                    has_parity: false,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| CtdbTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: CtdbTrackStatus::NoDiscInDatabase,
+                        confidence: None,
+                        computed_crc32: 0,
+                        expected_crc32: None,
+                        has_parity: false,
+                    })
+                    .collect(),
                 toc,
                 npar: None,
                 stride: None,
@@ -1440,15 +1478,17 @@ pub async fn verify_ctdb_single_image(
         }
         Err(e) => {
             return CtdbVerifyResult {
-                tracks: (0..n).map(|i| CtdbTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: CtdbTrackStatus::Error(e.clone()),
-                    confidence: None,
-                    computed_crc32: 0,
-                    expected_crc32: None,
-                    has_parity: false,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| CtdbTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: CtdbTrackStatus::Error(e.clone()),
+                        confidence: None,
+                        computed_crc32: 0,
+                        expected_crc32: None,
+                        has_parity: false,
+                    })
+                    .collect(),
                 toc,
                 npar: None,
                 stride: None,
@@ -1462,15 +1502,17 @@ pub async fn verify_ctdb_single_image(
         Some(e) => e,
         None => {
             return CtdbVerifyResult {
-                tracks: (0..n).map(|i| CtdbTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: CtdbTrackStatus::NoDiscInDatabase,
-                    confidence: None,
-                    computed_crc32: 0,
-                    expected_crc32: None,
-                    has_parity: false,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| CtdbTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: CtdbTrackStatus::NoDiscInDatabase,
+                        confidence: None,
+                        computed_crc32: 0,
+                        expected_crc32: None,
+                        has_parity: false,
+                    })
+                    .collect(),
                 toc,
                 npar: None,
                 stride: None,
@@ -1485,21 +1527,24 @@ pub async fn verify_ctdb_single_image(
     let raw_result = tokio::task::spawn_blocking(move || {
         super::accuraterip::decode_track_to_raw_i16(&audio_path)
             .or_else(|_| super::accuraterip::decode_to_raw_i16_wvunpack(&audio_path))
-    }).await;
+    })
+    .await;
 
     let raw_i16 = match raw_result {
         Ok(Ok(data)) => data,
         Ok(Err(e)) => {
             return CtdbVerifyResult {
-                tracks: (0..n).map(|i| CtdbTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: CtdbTrackStatus::Error(e.clone()),
-                    confidence: None,
-                    computed_crc32: 0,
-                    expected_crc32: None,
-                    has_parity: false,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| CtdbTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: CtdbTrackStatus::Error(e.clone()),
+                        confidence: None,
+                        computed_crc32: 0,
+                        expected_crc32: None,
+                        has_parity: false,
+                    })
+                    .collect(),
                 toc,
                 npar: None,
                 stride: None,
@@ -1509,15 +1554,17 @@ pub async fn verify_ctdb_single_image(
         }
         Err(e) => {
             return CtdbVerifyResult {
-                tracks: (0..n).map(|i| CtdbTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: CtdbTrackStatus::Error(format!("decode failed: {}", e)),
-                    confidence: None,
-                    computed_crc32: 0,
-                    expected_crc32: None,
-                    has_parity: false,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| CtdbTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: CtdbTrackStatus::Error(format!("decode failed: {}", e)),
+                        confidence: None,
+                        computed_crc32: 0,
+                        expected_crc32: None,
+                        has_parity: false,
+                    })
+                    .collect(),
                 toc,
                 npar: None,
                 stride: None,
@@ -1538,9 +1585,11 @@ pub async fn verify_ctdb_single_image(
             }
             None => {
                 let image_for_parity = image.clone();
-                let computed = tokio::task::spawn_blocking(move || {
-                    compute_audio_parity16(&image_for_parity)
-                }).await.ok().flatten();
+                let computed =
+                    tokio::task::spawn_blocking(move || compute_audio_parity16(&image_for_parity))
+                        .await
+                        .ok()
+                        .flatten();
                 computed.map(|p| {
                     let cache_write = cache_key.map(|k| (k, p.clone()));
                     (p, cache_write)
@@ -1555,13 +1604,12 @@ pub async fn verify_ctdb_single_image(
                 parity,
                 &db_response.entries,
                 CTDB_RS_OFFSET_WINDOW_SAMPLES,
-            ).await;
+            )
+            .await;
             (m, cache_write)
         }
         None => {
-            log::warn!(
-                "CTDB RS: failed to compute parity matrix; skipping RS verification"
-            );
+            log::warn!("CTDB RS: failed to compute parity matrix; skipping RS verification");
             (None, None)
         }
     };
@@ -1656,7 +1704,8 @@ async fn download_parity(url: &str) -> Result<Vec<u8>, String> {
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let resp = client.get(url)
+    let resp = client
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("Parity download failed: {}", e))?;
@@ -1699,14 +1748,24 @@ pub async fn repair_album(
     }
 
     // 1. Download parity.
-    let _ = tx.send(AppMessage::StatusMessage("CTDB repair: downloading parity...".into())).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: downloading parity...".into(),
+        ))
+        .await;
     let parity_bytes = download_parity(parity_url).await?;
-    log::info!("CTDB repair: downloaded {} bytes of parity", parity_bytes.len());
+    log::info!(
+        "CTDB repair: downloaded {} bytes of parity",
+        parity_bytes.len()
+    );
 
     // 2. Decode all tracks to raw i16 (parallel decode, sequential concat).
-    let _ = tx.send(AppMessage::StatusMessage(
-        format!("CTDB repair: decoding {} tracks...", n),
-    )).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(format!(
+            "CTDB repair: decoding {} tracks...",
+            n
+        )))
+        .await;
 
     let mut decode_handles = Vec::with_capacity(n);
     for path in paths.iter() {
@@ -1719,7 +1778,8 @@ pub async fn repair_album(
 
     let mut track_pcm: Vec<Vec<i16>> = Vec::with_capacity(n);
     for (i, handle) in decode_handles.into_iter().enumerate() {
-        let data = handle.await
+        let data = handle
+            .await
             .map_err(|e| format!("Decode task {} failed: {}", i + 1, e))?
             .map_err(|e| format!("Track {} decode error: {}", i + 1, e))?;
         track_pcm.push(data);
@@ -1740,22 +1800,30 @@ pub async fn repair_album(
     drop(track_pcm); // free memory
 
     // 4. Run RS repair.
-    let _ = tx.send(AppMessage::StatusMessage("CTDB repair: running Reed-Solomon repair...".into())).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: running Reed-Solomon repair...".into(),
+        ))
+        .await;
 
     let parity_clone = parity_bytes;
     let repair_result = tokio::task::spawn_blocking(move || {
         repair_disc_via_rs_with_npar_blocking(&mut image, &parity_clone, npar, offset)
             .map(|r| (r, image))
-    }).await
-        .map_err(|e| format!("Repair task failed: {}", e))?;
+    })
+    .await
+    .map_err(|e| format!("Repair task failed: {}", e))?;
 
     let (result, repaired_image) = match repair_result {
         Ok((r, img)) => (r, img),
         Err(e) => return Err(format!("Repair failed: {}", e)),
     };
 
-    log::info!("CTDB repair: corrected {} samples at {} positions",
-        result.corrected_samples, result.error_positions.len());
+    log::info!(
+        "CTDB repair: corrected {} samples at {} positions",
+        result.corrected_samples,
+        result.error_positions.len()
+    );
 
     if result.corrected_samples == 0 {
         return Ok("No errors found — repair not needed".to_string());
@@ -1774,25 +1842,27 @@ pub async fn repair_album(
     // 6. Encode each track to a temp directory.
     let pid = std::process::id();
     let tmp_dir = PathBuf::from(format!("/tmp/tonepoet-ctdb-repair-{}", pid));
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
-    let _ = tx.send(AppMessage::StatusMessage(
-        format!("CTDB repair: re-encoding {} tracks...", n),
-    )).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(format!(
+            "CTDB repair: re-encoding {} tracks...",
+            n
+        )))
+        .await;
 
     for (i, (track_data, original_path)) in repaired_tracks.iter().zip(paths.iter()).enumerate() {
-        let out_path = tmp_dir.join(
-            original_path.file_name().unwrap_or_default(),
-        );
+        let out_path = tmp_dir.join(original_path.file_name().unwrap_or_default());
 
-        super::accuraterip::encode_corrected_track(track_data, &out_path, original_path).await
+        super::accuraterip::encode_corrected_track(track_data, &out_path, original_path)
+            .await
             .map_err(|e| {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 format!("Track {} encode failed: {}", i + 1, e)
             })?;
 
-        super::accuraterip::copy_metadata(original_path, &out_path).await
+        super::accuraterip::copy_metadata(original_path, &out_path)
+            .await
             .map_err(|e| {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 format!("Track {} metadata copy failed: {}", i + 1, e)
@@ -1800,7 +1870,11 @@ pub async fn repair_album(
     }
 
     // 7. Verify repaired files via CTDB CRC32.
-    let _ = tx.send(AppMessage::StatusMessage("CTDB repair: verifying repaired files...".into())).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: verifying repaired files...".into(),
+        ))
+        .await;
 
     let total_disc_samples = total_track_i16 as u64 / 2; // i16 count to stereo pairs
     let suffix_skip = compute_suffix_skip(total_disc_samples);
@@ -1816,30 +1890,36 @@ pub async fn repair_album(
                 return Err(format!(
                     "Track {} verification failed: repaired CRC {:08X} != expected {:08X}. \
                      Originals not modified.",
-                    i + 1, computed, expected,
+                    i + 1,
+                    computed,
+                    expected,
                 ));
             }
             log::info!(
                 "CTDB repair: track {} verified CRC32 = {:08X} ✓",
-                i + 1, computed,
+                i + 1,
+                computed,
             );
         } else {
             log::warn!(
                 "CTDB repair: track {} has no expected CRC, skipping verification (CRC = {:08X})",
-                i + 1, computed,
+                i + 1,
+                computed,
             );
         }
     }
 
     // 8. Replace originals with backup/restore pattern.
-    let _ = tx.send(AppMessage::StatusMessage("CTDB repair: replacing originals...".into())).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: replacing originals...".into(),
+        ))
+        .await;
 
     // Phase 1: backup originals to .bak.
     let mut backed_up: Vec<PathBuf> = Vec::with_capacity(n);
     for path in paths {
-        let orig_ext = path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let orig_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let bak = path.with_extension(format!("{}.bak", orig_ext));
         if let Err(e) = std::fs::copy(path, &bak) {
             for (j, bak_path) in backed_up.iter().enumerate() {
@@ -1875,7 +1955,9 @@ pub async fn repair_album(
 
     Ok(format!(
         "CTDB repair: corrected {} samples in {} positions across {} tracks",
-        result.corrected_samples, result.error_positions.len(), n,
+        result.corrected_samples,
+        result.error_positions.len(),
+        n,
     ))
 }
 
@@ -1901,30 +1983,40 @@ pub async fn repair_single_image(
     if expected_crcs.len() != n {
         return Err(format!(
             "Expected CRC count ({}) doesn't match track count ({})",
-            expected_crcs.len(), n,
+            expected_crcs.len(),
+            n,
         ));
     }
 
     // 1. Download parity.
-    let _ = tx.send(AppMessage::StatusMessage(
-        "CTDB repair: downloading parity...".into(),
-    )).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: downloading parity...".into(),
+        ))
+        .await;
     let parity_bytes = download_parity(parity_url).await?;
-    log::info!("CTDB repair: downloaded {} bytes of parity", parity_bytes.len());
+    log::info!(
+        "CTDB repair: downloaded {} bytes of parity",
+        parity_bytes.len()
+    );
 
     // 2. Decode the full image once. Try ffmpeg first, fall back to wvunpack
     //    for WavPack v4 files that ffmpeg can't read.
-    let _ = tx.send(AppMessage::StatusMessage(
-        format!("CTDB repair: decoding image ({} tracks)...", n),
-    )).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(format!(
+            "CTDB repair: decoding image ({} tracks)...",
+            n
+        )))
+        .await;
 
     let audio_path = info.audio_path.clone();
     let raw_i16 = tokio::task::spawn_blocking(move || {
         super::accuraterip::decode_track_to_raw_i16(&audio_path)
             .or_else(|_| super::accuraterip::decode_to_raw_i16_wvunpack(&audio_path))
-    }).await
-        .map_err(|e| format!("Decode task failed: {}", e))?
-        .map_err(|e| format!("Image decode error: {}", e))?;
+    })
+    .await
+    .map_err(|e| format!("Decode task failed: {}", e))?
+    .map_err(|e| format!("Image decode error: {}", e))?;
 
     let audio_len = raw_i16.len();
 
@@ -1938,23 +2030,29 @@ pub async fn repair_single_image(
     drop(raw_i16); // freed; reconstructed from `image` after repair
 
     // 4. Run RS repair.
-    let _ = tx.send(AppMessage::StatusMessage(
-        "CTDB repair: running Reed-Solomon repair...".into(),
-    )).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: running Reed-Solomon repair...".into(),
+        ))
+        .await;
 
     let repair_result = tokio::task::spawn_blocking(move || {
         repair_disc_via_rs_with_npar_blocking(&mut image, &parity_bytes, npar, offset)
             .map(|r| (r, image))
-    }).await
-        .map_err(|e| format!("Repair task failed: {}", e))?;
+    })
+    .await
+    .map_err(|e| format!("Repair task failed: {}", e))?;
 
     let (result, repaired_image) = match repair_result {
         Ok((r, img)) => (r, img),
         Err(e) => return Err(format!("Repair failed: {}", e)),
     };
 
-    log::info!("CTDB repair: corrected {} samples at {} positions",
-        result.corrected_samples, result.error_positions.len());
+    log::info!(
+        "CTDB repair: corrected {} samples at {} positions",
+        result.corrected_samples,
+        result.error_positions.len()
+    );
 
     if result.corrected_samples == 0 {
         return Ok("No errors found — repair not needed".to_string());
@@ -1967,33 +2065,40 @@ pub async fn repair_single_image(
     // 6. Encode the repaired audio as a single file in /tmp.
     let pid = std::process::id();
     let tmp_dir = PathBuf::from(format!("/tmp/tonepoet-ctdb-repair-{}", pid));
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
-    let filename = info.audio_path.file_name()
+    let filename = info
+        .audio_path
+        .file_name()
         .ok_or_else(|| "Audio path has no filename".to_string())?;
     let tmp_out = tmp_dir.join(filename);
 
-    let _ = tx.send(AppMessage::StatusMessage(
-        "CTDB repair: re-encoding image...".into(),
-    )).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: re-encoding image...".into(),
+        ))
+        .await;
 
-    super::accuraterip::encode_corrected_track(&repaired_audio, &tmp_out, &info.audio_path).await
+    super::accuraterip::encode_corrected_track(&repaired_audio, &tmp_out, &info.audio_path)
+        .await
         .map_err(|e| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             format!("Image encode failed: {}", e)
         })?;
 
-    super::accuraterip::copy_metadata(&info.audio_path, &tmp_out).await
+    super::accuraterip::copy_metadata(&info.audio_path, &tmp_out)
+        .await
         .map_err(|e| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             format!("Metadata copy failed: {}", e)
         })?;
 
     // 7. Verify per-track CRC32 using CUE boundaries.
-    let _ = tx.send(AppMessage::StatusMessage(
-        "CTDB repair: verifying repaired tracks...".into(),
-    )).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: verifying repaired tracks...".into(),
+        ))
+        .await;
 
     let suffix_skip = compute_suffix_skip(info.total_samples);
 
@@ -2005,7 +2110,9 @@ pub async fn repair_single_image(
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(format!(
                 "Track {} boundary {} starts beyond repaired audio (len {})",
-                i + 1, start, repaired_audio.len(),
+                i + 1,
+                start,
+                repaired_audio.len(),
             ));
         }
         let track_audio = &repaired_audio[start..end];
@@ -2018,19 +2125,24 @@ pub async fn repair_single_image(
             return Err(format!(
                 "Track {} verification failed: repaired CRC {:08X} != expected {:08X}. \
                  Original not modified.",
-                i + 1, computed, expected,
+                i + 1,
+                computed,
+                expected,
             ));
         }
         log::info!(
             "CTDB repair: track {} verified CRC32 = {:08X} ✓",
-            i + 1, computed,
+            i + 1,
+            computed,
         );
     }
 
     // 8. Replace the original image with backup/restore.
-    let _ = tx.send(AppMessage::StatusMessage(
-        "CTDB repair: replacing original...".into(),
-    )).await;
+    let _ = tx
+        .send(AppMessage::StatusMessage(
+            "CTDB repair: replacing original...".into(),
+        ))
+        .await;
 
     let orig = &info.audio_path;
     let orig_ext = orig.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -2057,6 +2169,8 @@ pub async fn repair_single_image(
 
     Ok(format!(
         "CTDB repair: corrected {} samples in {} positions ({} tracks, single-image)",
-        result.corrected_samples, result.error_positions.len(), n,
+        result.corrected_samples,
+        result.error_positions.len(),
+        n,
     ))
 }

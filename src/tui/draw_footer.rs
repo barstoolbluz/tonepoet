@@ -67,9 +67,7 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen, buttons: &mut But
                 .bg(theme::BLUE)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .fg(theme::TEXT_MUTED)
-                .bg(theme::BORDER_DIM)
+            Style::default().fg(theme::TEXT_MUTED).bg(theme::BORDER_DIM)
         };
 
         let label_style = if is_active {
@@ -90,8 +88,7 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen, buttons: &mut But
         spans.push(Span::raw(" ".repeat(pad_right)));
     }
 
-    let bar = Paragraph::new(Line::from(spans))
-        .style(Style::default().bg(theme::SURFACE));
+    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::SURFACE));
     f.render_widget(bar, area);
 }
 
@@ -109,7 +106,9 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_messag
         };
         let bar = Paragraph::new(Line::from(Span::styled(
             display,
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
         )));
         f.render_widget(bar, area);
         return;
@@ -148,8 +147,18 @@ struct Hint {
     priority: u8,
 }
 
-const fn h(key: &'static str, label: &'static str, color: ratatui::style::Color, priority: u8) -> Hint {
-    Hint { key, label, color, priority }
+const fn h(
+    key: &'static str,
+    label: &'static str,
+    color: ratatui::style::Color,
+    priority: u8,
+) -> Hint {
+    Hint {
+        key,
+        label,
+        color,
+        priority,
+    }
 }
 
 /// Hint groups per screen. Groups are separated by ` │ ` dividers when rendered.

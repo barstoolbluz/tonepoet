@@ -344,11 +344,8 @@ mod tests {
     #[tokio::test]
     async fn start_and_finish_unit_emit_messages() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker.start_unit(1, 2, "So What").await;
         tracker.finish_unit(1, 2, "So What").await;
@@ -362,11 +359,8 @@ mod tests {
     #[tokio::test]
     async fn high_frequency_same_key_updates_are_coalesced() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker.estimated(0.100, "Converting").await;
         tracker.estimated(0.102, "Converting").await;
@@ -377,11 +371,8 @@ mod tests {
     #[tokio::test]
     async fn material_key_change_emits_immediately() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker
             .estimated_with_key(0.100, "track-1", "Converting track 1")
@@ -396,11 +387,8 @@ mod tests {
     #[tokio::test]
     async fn volatile_display_message_does_not_bypass_stable_key_throttle() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker
             .measured_with_key(0.100, "ffmpeg-track-1", "frame 1 speed 1.0x")
@@ -415,11 +403,8 @@ mod tests {
     #[tokio::test]
     async fn lazy_message_builder_is_not_called_for_suppressed_updates() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
         let builds = Arc::new(AtomicUsize::new(0));
 
         let first_builds = Arc::clone(&builds);
@@ -445,11 +430,8 @@ mod tests {
     #[tokio::test]
     async fn progress_delta_emits_immediately() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker.estimated(0.100, "Converting").await;
         tracker.estimated(0.106, "Converting").await;
@@ -460,11 +442,8 @@ mod tests {
     #[tokio::test]
     async fn progress_decrease_is_monotonic_when_message_changes() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker.estimated(0.400, "Converting track 1").await;
         tracker.estimated(0.200, "Late duplicate for track 1").await;
@@ -476,11 +455,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_alive_does_not_advance_progress() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker.estimated(0.400, "Converting").await;
         tracker.unknown_alive("Still running").await;
@@ -492,27 +468,24 @@ mod tests {
     #[tokio::test]
     async fn failure_bypasses_throttle_and_preserves_progress() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker.estimated(0.250, "Converting").await;
         tracker.failure("Encoder failed").await;
 
         assert_eq!(progress_values(&reporter), vec![0.250, 0.250]);
-        assert_eq!(progress_messages(&reporter), vec!["Converting", "Encoder failed"]);
+        assert_eq!(
+            progress_messages(&reporter),
+            vec!["Converting", "Encoder failed"]
+        );
     }
 
     #[tokio::test]
     async fn cancel_requested_bypasses_throttle() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        );
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
 
         tracker.estimated(0.250, "Converting").await;
         tracker.cancel_requested().await;
@@ -524,12 +497,9 @@ mod tests {
     #[tokio::test]
     async fn elapsed_text_appears_after_threshold() {
         let reporter = RecordingReporter::new();
-        let mut tracker = OperationProgressTracker::new(
-            "item-1",
-            PipelineStage::Convert,
-            Some(&reporter),
-        )
-        .with_elapsed_threshold(Duration::from_secs(0));
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter))
+                .with_elapsed_threshold(Duration::from_secs(0));
 
         tracker.estimated(0.100, "Converting").await;
 

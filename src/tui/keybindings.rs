@@ -4,10 +4,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
-use crate::convert::{ConversionOptions, ConversionStatus};
 use super::app::*;
 use super::button_map::TuiButton;
 use super::message::AppMessage;
+use crate::convert::{ConversionOptions, ConversionStatus};
 
 /// Handle a key event, dispatching to the appropriate screen handler
 pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
@@ -40,7 +40,8 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
 
     // Browse filter input preempts global keys: while typing in the filter,
     // characters like `q`, `1`-`5`, `:` go to the input, not to global handlers.
-    if app.current_screen == AppScreen::Browse && app.browse.search.active
+    if app.current_screen == AppScreen::Browse
+        && app.browse.search.active
         && app.browse.search.focus != super::browse::SearchFocus::Results
     {
         handle_browse_search_key(app, key, tx);
@@ -82,7 +83,8 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 return;
             }
             // Command mode
-            (KeyCode::Char(':'), KeyModifiers::SHIFT) | (KeyCode::Char(':'), KeyModifiers::NONE) => {
+            (KeyCode::Char(':'), KeyModifiers::SHIFT)
+            | (KeyCode::Char(':'), KeyModifiers::NONE) => {
                 app.active_overlay = ActiveOverlay::CommandInput {
                     input: super::text_input::TextInputState::empty(),
                     completion: None,
@@ -118,8 +120,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             AppScreen::Library | AppScreen::Config => {
                 // Esc from a placeholder/settings screen returns to the user's
                 // configured default screen (home). Default: Browse.
-                app.current_screen =
-                    AppScreen::from_config_name(&app.config.ui.default_screen);
+                app.current_screen = AppScreen::from_config_name(&app.config.ui.default_screen);
                 if app.current_screen == AppScreen::Browse {
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                 }
@@ -131,8 +132,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             AppScreen::Queue => {
                 // Esc from Queue returns to the user's configured default
                 // screen (home). Default: Browse.
-                app.current_screen =
-                    AppScreen::from_config_name(&app.config.ui.default_screen);
+                app.current_screen = AppScreen::from_config_name(&app.config.ui.default_screen);
                 if app.current_screen == AppScreen::Browse {
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                 }
@@ -146,10 +146,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 if app.previous_screen.is_some() {
                     app.convert.source.mode = SourceMode::Empty;
                     app.convert.metadata = MetadataState::default();
-                    let origin = app
-                        .previous_screen
-                        .take()
-                        .unwrap_or(AppScreen::Browse);
+                    let origin = app.previous_screen.take().unwrap_or(AppScreen::Browse);
                     app.current_screen = origin;
                     if origin == AppScreen::Browse {
                         app.browse.probe_current_with_db(tx, Some(&app.db));
@@ -244,7 +241,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         // Within Source pane + MultiTrack: Up/Down moves track cursor, Space toggles selection
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source
-            && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+                && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
         {
             if let SourceMode::MultiTrack { cursor, scroll, .. } = &mut app.convert.source.mode {
                 if *cursor > 0 {
@@ -257,9 +254,15 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source
-            && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+                && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
         {
-            if let SourceMode::MultiTrack { cursor, scroll, tracks, .. } = &mut app.convert.source.mode {
+            if let SourceMode::MultiTrack {
+                cursor,
+                scroll,
+                tracks,
+                ..
+            } = &mut app.convert.source.mode
+            {
                 if *cursor + 1 < tracks.len() {
                     *cursor += 1;
                     // Keep cursor visible (max_visible = 6 in render)
@@ -271,9 +274,12 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         }
         (KeyCode::Char(' '), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source
-            && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+                && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
         {
-            if let SourceMode::MultiTrack { cursor, selected, .. } = &mut app.convert.source.mode {
+            if let SourceMode::MultiTrack {
+                cursor, selected, ..
+            } = &mut app.convert.source.mode
+            {
                 if let Some(sel) = selected.get_mut(*cursor) {
                     *sel = !*sel;
                 }
@@ -281,15 +287,21 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         }
 
         // Within Format pane: Up/Down moves between pill rows
-        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Format =>
+        {
             app.convert.format.field_focus = app.convert.format.field_focus.prev();
         }
-        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Format =>
+        {
             app.convert.format.field_focus = app.convert.format.field_focus.next();
         }
 
         // Within Format pane: Left/Right changes pill selection
-        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Format =>
+        {
             let was_format = app.convert.format.field_focus == FormatField::Format;
             app.convert.format.focused_pill_mut().select_prev();
             if was_format {
@@ -297,7 +309,9 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
             }
             app.preset.mark_modified();
         }
-        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::Format => {
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Format =>
+        {
             let was_format = app.convert.format.field_focus == FormatField::Format;
             app.convert.format.focused_pill_mut().select_next();
             if was_format {
@@ -307,21 +321,29 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         }
 
         // Within Output Options pane: Up/Down moves between fields
-        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions => {
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions =>
+        {
             app.convert.output_options.field_focus = app.convert.output_options.field_focus.prev();
         }
-        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions => {
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions =>
+        {
             app.convert.output_options.field_focus = app.convert.output_options.field_focus.next();
         }
 
         // Within Output Options: Left/Right on merge mode pill
-        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions
-            && app.convert.output_options.field_focus == OutputOptionsField::MergeMode => {
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && app.convert.output_options.field_focus == OutputOptionsField::MergeMode =>
+        {
             app.convert.output_options.merge.select_prev();
             app.preset.mark_modified();
         }
-        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) if app.convert.focus == ConvertFocus::OutputOptions
-            && app.convert.output_options.field_focus == OutputOptionsField::MergeMode => {
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && app.convert.output_options.field_focus == OutputOptionsField::MergeMode =>
+        {
             app.convert.output_options.merge.select_next();
             app.preset.mark_modified();
         }
@@ -352,22 +374,21 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         }
 
         // Advanced toggle (stub)
-        (KeyCode::Char('a'), KeyModifiers::NONE) => {
-            match app.convert.focus {
-                ConvertFocus::Source => {
-                    app.convert.source.advanced_open = !app.convert.source.advanced_open;
-                }
-                ConvertFocus::Metadata => {
-                    app.convert.metadata.advanced_open = !app.convert.metadata.advanced_open;
-                }
-                ConvertFocus::Format => {
-                    app.convert.format.advanced_open = !app.convert.format.advanced_open;
-                }
-                ConvertFocus::OutputOptions => {
-                    app.convert.output_options.advanced_open = !app.convert.output_options.advanced_open;
-                }
+        (KeyCode::Char('a'), KeyModifiers::NONE) => match app.convert.focus {
+            ConvertFocus::Source => {
+                app.convert.source.advanced_open = !app.convert.source.advanced_open;
             }
-        }
+            ConvertFocus::Metadata => {
+                app.convert.metadata.advanced_open = !app.convert.metadata.advanced_open;
+            }
+            ConvertFocus::Format => {
+                app.convert.format.advanced_open = !app.convert.format.advanced_open;
+            }
+            ConvertFocus::OutputOptions => {
+                app.convert.output_options.advanced_open =
+                    !app.convert.output_options.advanced_open;
+            }
+        },
 
         // Commit is now command-mode only: `:commit` (enqueue) or
         // `:Commit` (enqueue + start). No keyboard shortcuts — consistent
@@ -468,7 +489,12 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
         }
         KeyCode::Enter => {
             // Load selected preset
-            if let Some(name) = app.preset.overlay_list.get(app.preset.overlay_selected).cloned() {
+            if let Some(name) = app
+                .preset
+                .overlay_list
+                .get(app.preset.overlay_selected)
+                .cloned()
+            {
                 match super::presets::load_preset(&name) {
                     Ok(preset) => {
                         preset.apply_to_pills(
@@ -492,7 +518,12 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
         }
         KeyCode::Char('d') => {
             // Duplicate selected preset
-            if let Some(name) = app.preset.overlay_list.get(app.preset.overlay_selected).cloned() {
+            if let Some(name) = app
+                .preset
+                .overlay_list
+                .get(app.preset.overlay_selected)
+                .cloned()
+            {
                 match super::presets::load_preset(&name) {
                     Ok(mut preset) => {
                         let base = format!("{}-copy", name);
@@ -516,7 +547,12 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
         }
         KeyCode::Char('x') => {
             // Delete selected preset
-            if let Some(name) = app.preset.overlay_list.get(app.preset.overlay_selected).cloned() {
+            if let Some(name) = app
+                .preset
+                .overlay_list
+                .get(app.preset.overlay_selected)
+                .cloned()
+            {
                 match super::presets::delete_preset_with_db(&name, &app.db) {
                     Ok(_) => {
                         // If we deleted the active preset, clear it
@@ -553,32 +589,44 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         // Navigation (extends visual selection if V-mode is active)
         (KeyCode::Up, KeyModifiers::NONE) => {
             app.browse.move_up();
-            if app.browse.visual_mode { app.browse.update_visual_selection(); }
+            if app.browse.visual_mode {
+                app.browse.update_visual_selection();
+            }
             selection_may_have_changed = true;
         }
         (KeyCode::Down, KeyModifiers::NONE) => {
             app.browse.move_down();
-            if app.browse.visual_mode { app.browse.update_visual_selection(); }
+            if app.browse.visual_mode {
+                app.browse.update_visual_selection();
+            }
             selection_may_have_changed = true;
         }
         (KeyCode::Home, _) => {
             app.browse.move_top();
-            if app.browse.visual_mode { app.browse.update_visual_selection(); }
+            if app.browse.visual_mode {
+                app.browse.update_visual_selection();
+            }
             selection_may_have_changed = true;
         }
         (KeyCode::End, _) => {
             app.browse.move_bottom();
-            if app.browse.visual_mode { app.browse.update_visual_selection(); }
+            if app.browse.visual_mode {
+                app.browse.update_visual_selection();
+            }
             selection_may_have_changed = true;
         }
         (KeyCode::PageUp, _) => {
             app.browse.page_up();
-            if app.browse.visual_mode { app.browse.update_visual_selection(); }
+            if app.browse.visual_mode {
+                app.browse.update_visual_selection();
+            }
             selection_may_have_changed = true;
         }
         (KeyCode::PageDown, _) => {
             app.browse.page_down();
-            if app.browse.visual_mode { app.browse.update_visual_selection(); }
+            if app.browse.visual_mode {
+                app.browse.update_visual_selection();
+            }
             selection_may_have_changed = true;
         }
 
@@ -618,7 +666,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                 if entry.is_dir() {
                     if app.browse.is_in_archive() {
                         // Navigate into subdirectory inside archive.
-                        let item_name = entry.path.file_name()
+                        let item_name = entry
+                            .path
+                            .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
                         let inner = if let Some(ref arc) = app.browse.archive {
@@ -647,7 +697,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                                 app.browse.exit_archive();
                             }
                         } else {
-                            let item_name = entry.path.file_name()
+                            let item_name = entry
+                                .path
+                                .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_default();
                             let inner = if let Some(ref arc) = app.browse.archive {
@@ -670,7 +722,10 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                     EntryKind::Archive if !app.browse.is_in_archive() => {
                         // Open archive for browsing: async list contents.
                         let path = entry.path.clone();
-                        let password = app.archive_passwords.get(&path).cloned()
+                        let password = app
+                            .archive_passwords
+                            .get(&path)
+                            .cloned()
                             .or_else(|| {
                                 app.keychain.ensure_loaded();
                                 app.keychain.passwords.first().cloned()
@@ -679,14 +734,16 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                         let tx = tx.clone();
                         app.set_status("Loading archive...");
                         tokio::spawn(async move {
-                            let result = super::archive_listing::list_archive(
-                                &path, password.as_deref(),
-                            ).await;
-                            let _ = tx.send(AppMessage::ArchiveListingComplete {
-                                archive_path: path,
-                                result: Box::new(result),
-                                password,
-                            }).await;
+                            let result =
+                                super::archive_listing::list_archive(&path, password.as_deref())
+                                    .await;
+                            let _ = tx
+                                .send(AppMessage::ArchiveListingComplete {
+                                    archive_path: path,
+                                    result: Box::new(result),
+                                    password,
+                                })
+                                .await;
                         });
                     }
                     EntryKind::AudioFile(_) if app.browse.is_in_archive() => {
@@ -696,7 +753,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                             let archive_path = arc.listing.archive_path.clone();
                             let password = arc.password.clone();
                             // Derive inner path from the synthetic path.
-                            let inner = entry.path.strip_prefix(&archive_path)
+                            let inner = entry
+                                .path
+                                .strip_prefix(&archive_path)
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_default();
                             if !inner.is_empty() {
@@ -705,19 +764,25 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                                 app.set_status("Extracting from archive...");
                                 tokio::spawn(async move {
                                     let result = extract_from_archive(
-                                        &archive_path, &inner, password.as_deref(), scratch.as_deref(),
-                                    ).await;
-                                    let _ = tx.send(AppMessage::StatusMessage(
-                                        match &result {
+                                        &archive_path,
+                                        &inner,
+                                        password.as_deref(),
+                                        scratch.as_deref(),
+                                    )
+                                    .await;
+                                    let _ = tx
+                                        .send(AppMessage::StatusMessage(match &result {
                                             Ok(p) => format!("Extracted: {}", p.display()),
                                             Err(e) => format!("Extract failed: {}", e),
-                                        }
-                                    )).await;
+                                        }))
+                                        .await;
                                 });
                             }
                         }
                     }
-                    EntryKind::AudioFile(_) | EntryKind::Archive | EntryKind::SacdIso
+                    EntryKind::AudioFile(_)
+                    | EntryKind::Archive
+                    | EntryKind::SacdIso
                     | EntryKind::OtherFile => {
                         // Toggle selection — converting is via context menu or :queue.
                         app.browse.toggle_selection();
@@ -805,11 +870,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 
         // Type-ahead navigation: bare letter/number keys jump to the
         // first entry whose name starts with the accumulated prefix.
-        (KeyCode::Char(c), mods)
-            if mods.is_empty() || mods == KeyModifiers::SHIFT =>
-        {
+        (KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
             app.browse.type_ahead_push(c);
-            if app.browse.visual_mode { app.browse.update_visual_selection(); }
+            if app.browse.visual_mode {
+                app.browse.update_visual_selection();
+            }
             selection_may_have_changed = true;
         }
 
@@ -851,23 +916,33 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                 }
             }
         }
-        SearchFocus::Recursive => {
-            match key.code {
-                KeyCode::Esc => { app.browse.close_search(); }
-                KeyCode::Tab => { app.browse.search.focus = SearchFocus::Mode; }
-                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Input; }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    app.browse.search.recursive = !app.browse.search.recursive;
-                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
-                }
-                _ => {}
+        SearchFocus::Recursive => match key.code {
+            KeyCode::Esc => {
+                app.browse.close_search();
             }
-        }
+            KeyCode::Tab => {
+                app.browse.search.focus = SearchFocus::Mode;
+            }
+            KeyCode::BackTab => {
+                app.browse.search.focus = SearchFocus::Input;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                app.browse.search.recursive = !app.browse.search.recursive;
+                app.browse.search.last_keystroke = Some(std::time::Instant::now());
+            }
+            _ => {}
+        },
         SearchFocus::Mode => {
             match key.code {
-                KeyCode::Esc => { app.browse.close_search(); }
-                KeyCode::Tab => { app.browse.search.focus = SearchFocus::Sort; }
-                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Recursive; }
+                KeyCode::Esc => {
+                    app.browse.close_search();
+                }
+                KeyCode::Tab => {
+                    app.browse.search.focus = SearchFocus::Sort;
+                }
+                KeyCode::BackTab => {
+                    app.browse.search.focus = SearchFocus::Recursive;
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     app.browse.search.mode = app.browse.search.mode.cycle();
                     // If switching away from tags and a tag sort is active, reset to Score.
@@ -884,12 +959,20 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
         }
         SearchFocus::Sort => {
             match key.code {
-                KeyCode::Esc => { app.browse.close_search(); }
-                KeyCode::Tab => { app.browse.search.focus = SearchFocus::AudioOnly; }
-                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Mode; }
+                KeyCode::Esc => {
+                    app.browse.close_search();
+                }
+                KeyCode::Tab => {
+                    app.browse.search.focus = SearchFocus::AudioOnly;
+                }
+                KeyCode::BackTab => {
+                    app.browse.search.focus = SearchFocus::Mode;
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    let tag_mode = matches!(app.browse.search.mode,
-                        super::browse::SearchMode::Tags | super::browse::SearchMode::Both);
+                    let tag_mode = matches!(
+                        app.browse.search.mode,
+                        super::browse::SearchMode::Tags | super::browse::SearchMode::Both
+                    );
                     app.browse.search.sort = app.browse.search.sort.cycle_with_mode(tag_mode);
                     app.browse.search.sort_dir = match app.browse.search.sort {
                         super::browse::SearchSort::Score => super::browse::SortDir::Desc,
@@ -905,18 +988,22 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                 _ => {}
             }
         }
-        SearchFocus::AudioOnly => {
-            match key.code {
-                KeyCode::Esc => { app.browse.close_search(); }
-                KeyCode::Tab => { app.browse.search.focus = SearchFocus::Input; }
-                KeyCode::BackTab => { app.browse.search.focus = SearchFocus::Sort; }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    app.browse.search.audio_only = !app.browse.search.audio_only;
-                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
-                }
-                _ => {}
+        SearchFocus::AudioOnly => match key.code {
+            KeyCode::Esc => {
+                app.browse.close_search();
             }
-        }
+            KeyCode::Tab => {
+                app.browse.search.focus = SearchFocus::Input;
+            }
+            KeyCode::BackTab => {
+                app.browse.search.focus = SearchFocus::Sort;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                app.browse.search.audio_only = !app.browse.search.audio_only;
+                app.browse.search.last_keystroke = Some(std::time::Instant::now());
+            }
+            _ => {}
+        },
         SearchFocus::Results => {
             // Unreachable — Results focus skips this handler entirely.
         }
@@ -986,8 +1073,8 @@ async fn extract_from_archive(
 ) -> Result<std::path::PathBuf, String> {
     use tokio::process::Command;
 
-    let bin = crate::detect_7z_binary()
-        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+    let bin =
+        crate::detect_7z_binary().ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
 
     // Extract to a temp directory under scratch or system temp.
     let base = scratch
@@ -1000,8 +1087,7 @@ async fn extract_from_archive(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "archive".into())
     ));
-    std::fs::create_dir_all(&extract_dir)
-        .map_err(|e| format!("mkdir: {}", e))?;
+    std::fs::create_dir_all(&extract_dir).map_err(|e| format!("mkdir: {}", e))?;
 
     let mut cmd = Command::new(bin);
     cmd.arg("x")
@@ -1015,7 +1101,9 @@ async fn extract_from_archive(
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
 
-    let output = cmd.output().await
+    let output = cmd
+        .output()
+        .await
         .map_err(|e| format!("failed to run {}: {}", bin, e))?;
 
     if !output.status.success() {
@@ -1043,8 +1131,7 @@ fn load_browse_selection(
             // Probe and load into source pane
             match crate::tui::probe::probe_audio(&path) {
                 Ok(info) => {
-                    let metadata = crate::tui::probe::read_metadata(&path)
-                        .unwrap_or_default();
+                    let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
                     app.convert.metadata.title = metadata.title.clone();
                     app.convert.metadata.artist = metadata.artist.clone();
                     app.convert.metadata.album = metadata.album.clone();
@@ -1052,9 +1139,8 @@ fn load_browse_selection(
                     app.convert.metadata.year = metadata.year.clone();
                     // Browse Enter loads a single file — abandon any
                     // pending batch from a previous :queue.
-                    app.convert.source.mode = SourceMode::from_single(
-                        path.clone(), Some(info), metadata,
-                    );
+                    app.convert.source.mode =
+                        SourceMode::from_single(path.clone(), Some(info), metadata);
                     app.set_status(format!(
                         "Loaded: {}",
                         path.file_name().unwrap_or_default().to_string_lossy()
@@ -1144,9 +1230,8 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
         }
         (KeyCode::PageDown, _) => {
             let jump = app.visible_height.max(1);
-            app.selected_index = (app.selected_index + jump).min(
-                app.items_snapshot.len().saturating_sub(1),
-            );
+            app.selected_index =
+                (app.selected_index + jump).min(app.items_snapshot.len().saturating_sub(1));
             app.ensure_visible();
         }
 
@@ -1174,9 +1259,7 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
                         };
                     }
                     _ => {
-                        app.active_overlay = ActiveOverlay::ItemInfo {
-                            item: item.clone(),
-                        };
+                        app.active_overlay = ActiveOverlay::ItemInfo { item: item.clone() };
                     }
                 }
             }
@@ -1247,13 +1330,18 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
 
         // Clear completed
         (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
-            let finished_count = app.items_snapshot.iter()
-                .filter(|i| matches!(i.status,
-                    ConversionStatus::Completed { .. }
-                    | ConversionStatus::Partial { .. }
-                    | ConversionStatus::Failed { .. }
-                    | ConversionStatus::Cancelled
-                ))
+            let finished_count = app
+                .items_snapshot
+                .iter()
+                .filter(|i| {
+                    matches!(
+                        i.status,
+                        ConversionStatus::Completed { .. }
+                            | ConversionStatus::Partial { .. }
+                            | ConversionStatus::Failed { .. }
+                            | ConversionStatus::Cancelled
+                    )
+                })
                 .count();
             if finished_count > 0 {
                 app.manager.clear_finished();
@@ -1381,7 +1469,10 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
             app.active_overlay = ActiveOverlay::FileInput { input };
         }
-        ActiveOverlay::CommandInput { mut input, mut completion } => {
+        ActiveOverlay::CommandInput {
+            mut input,
+            mut completion,
+        } => {
             match key.code {
                 KeyCode::Enter => {
                     app.active_overlay = ActiveOverlay::None;
@@ -1434,7 +1525,11 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
             app.active_overlay = ActiveOverlay::CommandInput { input, completion };
         }
-        ActiveOverlay::TextEdit { mut input, target, label } => {
+        ActiveOverlay::TextEdit {
+            mut input,
+            target,
+            label,
+        } => {
             match key.code {
                 KeyCode::Enter => {
                     let text = input.text.clone();
@@ -1449,8 +1544,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     // If a BulkRename sub-edit was in progress, restore the overlay.
                     if matches!(
                         target,
-                        TextEditTarget::BulkRenameLine(_)
-                            | TextEditTarget::SaveRenameTemplate(_)
+                        TextEditTarget::BulkRenameLine(_) | TextEditTarget::SaveRenameTemplate(_)
                     ) {
                         if let Some(rename_state) = app.pending_bulk_rename.take() {
                             app.active_overlay = ActiveOverlay::BulkRename(rename_state);
@@ -1462,7 +1556,11 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {
                     super::text_input::handle_text_input_key(&mut input, &key);
                     // Only reach here when input was modified (no consuming ops).
-                    app.active_overlay = ActiveOverlay::TextEdit { input, target, label };
+                    app.active_overlay = ActiveOverlay::TextEdit {
+                        input,
+                        target,
+                        label,
+                    };
                 }
             }
         }
@@ -1498,7 +1596,10 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
-        ActiveOverlay::CueImportReview { mut scroll, ref changes } => {
+        ActiveOverlay::CueImportReview {
+            mut scroll,
+            ref changes,
+        } => {
             let changes = changes.clone(); // clone for use after overlay replace
             match key.code {
                 KeyCode::Enter => {
@@ -1535,7 +1636,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
-        ActiveOverlay::GnudbSelect { ref matches, mut selected, scroll, ref paths } => {
+        ActiveOverlay::GnudbSelect {
+            ref matches,
+            mut selected,
+            scroll,
+            ref paths,
+        } => {
             let matches = matches.clone();
             let paths = paths.clone();
             match key.code {
@@ -1544,13 +1650,23 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
-                    app.active_overlay = ActiveOverlay::GnudbSelect { matches, selected, scroll, paths };
+                    app.active_overlay = ActiveOverlay::GnudbSelect {
+                        matches,
+                        selected,
+                        scroll,
+                        paths,
+                    };
                 }
                 KeyCode::Down => {
                     if selected + 1 < matches.len() {
                         selected += 1;
                     }
-                    app.active_overlay = ActiveOverlay::GnudbSelect { matches, selected, scroll, paths };
+                    app.active_overlay = ActiveOverlay::GnudbSelect {
+                        matches,
+                        selected,
+                        scroll,
+                        paths,
+                    };
                 }
                 KeyCode::Enter => {
                     if let Some(m) = matches.get(selected) {
@@ -1562,9 +1678,13 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         let origin = matches.clone();
                         tokio::spawn(async move {
                             let result = super::gnudb::read_gnudb(&category, &disc_id).await;
-                            let _ = tx.send(AppMessage::GnudbReadComplete {
-                                result, paths, origin_matches: Some(origin),
-                            }).await;
+                            let _ = tx
+                                .send(AppMessage::GnudbReadComplete {
+                                    result,
+                                    paths,
+                                    origin_matches: Some(origin),
+                                })
+                                .await;
                         });
                     }
                 }
@@ -1588,14 +1708,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             let new_val = input.text.clone();
                             let page = &mut state.pages[state.active_page];
                             match &page.rows[state.cursor] {
-                                GnudbRowKind::AlbumField(field) => {
-                                    match *field {
-                                        "Album" => page.album = new_val,
-                                        "Year" => page.year = new_val,
-                                        "Genre" => page.genre = new_val,
-                                        _ => {}
-                                    }
-                                }
+                                GnudbRowKind::AlbumField(field) => match *field {
+                                    "Album" => page.album = new_val,
+                                    "Year" => page.year = new_val,
+                                    "Genre" => page.genre = new_val,
+                                    _ => {}
+                                },
                                 GnudbRowKind::TrackField { track_idx, field } => {
                                     let track = &mut page.tracks[*track_idx];
                                     match *field {
@@ -1662,9 +1780,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     (KeyCode::Up, _) => {
                         let mut nc = state.cursor;
                         loop {
-                            if nc == 0 { break; }
+                            if nc == 0 {
+                                break;
+                            }
                             nc -= 1;
-                            if !matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
+                            if !matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. }))
+                            {
                                 break;
                             }
                         }
@@ -1677,9 +1798,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     (KeyCode::Down, _) => {
                         let mut nc = state.cursor;
                         loop {
-                            if nc + 1 >= page_rows.len() { break; }
+                            if nc + 1 >= page_rows.len() {
+                                break;
+                            }
                             nc += 1;
-                            if !matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
+                            if !matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. }))
+                            {
                                 break;
                             }
                         }
@@ -1712,9 +1836,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             _ => None,
                         };
                         if let Some(val) = value {
-                            state.edit_input = Some(
-                                super::text_input::TextInputState::new(val),
-                            );
+                            state.edit_input = Some(super::text_input::TextInputState::new(val));
                         }
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
@@ -1724,9 +1846,16 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             .unwrap_or(20);
                         for _ in 0..jump {
                             let mut nc = state.cursor;
-                            if nc == 0 { break; }
+                            if nc == 0 {
+                                break;
+                            }
                             nc -= 1;
-                            while nc > 0 && matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
+                            while nc > 0
+                                && matches!(
+                                    page_rows.get(nc),
+                                    Some(GnudbRowKind::TrackHeader { .. })
+                                )
+                            {
                                 nc -= 1;
                             }
                             state.cursor = nc;
@@ -1742,9 +1871,16 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             .unwrap_or(20);
                         for _ in 0..jump {
                             let mut nc = state.cursor;
-                            if nc + 1 >= page_rows.len() { break; }
+                            if nc + 1 >= page_rows.len() {
+                                break;
+                            }
                             nc += 1;
-                            while nc + 1 < page_rows.len() && matches!(page_rows.get(nc), Some(GnudbRowKind::TrackHeader { .. })) {
+                            while nc + 1 < page_rows.len()
+                                && matches!(
+                                    page_rows.get(nc),
+                                    Some(GnudbRowKind::TrackHeader { .. })
+                                )
+                            {
                                 nc += 1;
                             }
                             state.cursor = nc;
@@ -1760,7 +1896,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     (KeyCode::Char('a'), _) => {
                         // Accept ALL pages.
                         super::keybindings::open_metadata_editor(app);
-                        if let ActiveOverlay::MetadataEditor(ref mut editor_state) = app.active_overlay {
+                        if let ActiveOverlay::MetadataEditor(ref mut editor_state) =
+                            app.active_overlay
+                        {
                             super::gnudb::populate_editor_from_review(editor_state, &state);
                             // Cache the review state for `:gnudb-back`
                             // — user can return to the per-track edit
@@ -1768,12 +1906,15 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             // gnudb requery.
                             editor_state.gnudb_back = Some(state.clone());
                             let first_page = &state.pages[0];
-                            let artist = first_page.tracks.first()
+                            let artist = first_page
+                                .tracks
+                                .first()
                                 .map(|t| t.artist.as_str())
                                 .unwrap_or("?");
                             app.set_status(format!(
                                 "Tags loaded — {} / {} ({} disc{})",
-                                artist, first_page.album,
+                                artist,
+                                first_page.album,
                                 state.pages.len(),
                                 if state.pages.len() == 1 { "" } else { "s" },
                             ));
@@ -1781,7 +1922,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     }
                     (KeyCode::Char('c'), _) => {
                         // Apply capitalization to current page.
-                        use crate::convert::renaming::{capitalize_title, capitalize_section};
+                        use crate::convert::renaming::{capitalize_section, capitalize_title};
                         let page = &mut state.pages[state.active_page];
                         page.album = capitalize_section(&page.album);
                         page.genre = capitalize_section(&page.genre);
@@ -1796,22 +1937,20 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
-        ActiveOverlay::Verify { mut scroll } => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    app.active_overlay = ActiveOverlay::None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
-                    app.active_overlay = ActiveOverlay::Verify { scroll };
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll += 1;
-                    app.active_overlay = ActiveOverlay::Verify { scroll };
-                }
-                _ => {}
+        ActiveOverlay::Verify { mut scroll } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.active_overlay = ActiveOverlay::None;
             }
-        }
+            KeyCode::Up | KeyCode::Char('k') => {
+                scroll = scroll.saturating_sub(1);
+                app.active_overlay = ActiveOverlay::Verify { scroll };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                scroll += 1;
+                app.active_overlay = ActiveOverlay::Verify { scroll };
+            }
+            _ => {}
+        },
         ActiveOverlay::MbSelect(mut state) => {
             // Picker has only two actions: accept the cursor's release
             // (Enter) or cancel (Esc). Both are navigation primitives,
@@ -1924,38 +2063,34 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
-        ActiveOverlay::BitCompare { mut scroll } => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    app.active_overlay = ActiveOverlay::None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
-                    app.active_overlay = ActiveOverlay::BitCompare { scroll };
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll += 1;
-                    app.active_overlay = ActiveOverlay::BitCompare { scroll };
-                }
-                _ => {}
+        ActiveOverlay::BitCompare { mut scroll } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.active_overlay = ActiveOverlay::None;
             }
-        }
-        ActiveOverlay::Preemphasis { mut scroll } => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    app.active_overlay = ActiveOverlay::None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
-                    app.active_overlay = ActiveOverlay::Preemphasis { scroll };
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll += 1;
-                    app.active_overlay = ActiveOverlay::Preemphasis { scroll };
-                }
-                _ => {}
+            KeyCode::Up | KeyCode::Char('k') => {
+                scroll = scroll.saturating_sub(1);
+                app.active_overlay = ActiveOverlay::BitCompare { scroll };
             }
-        }
+            KeyCode::Down | KeyCode::Char('j') => {
+                scroll += 1;
+                app.active_overlay = ActiveOverlay::BitCompare { scroll };
+            }
+            _ => {}
+        },
+        ActiveOverlay::Preemphasis { mut scroll } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.active_overlay = ActiveOverlay::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                scroll = scroll.saturating_sub(1);
+                app.active_overlay = ActiveOverlay::Preemphasis { scroll };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                scroll += 1;
+                app.active_overlay = ActiveOverlay::Preemphasis { scroll };
+            }
+            _ => {}
+        },
         ActiveOverlay::MetadataEditor(mut state) => {
             handle_metadata_editor_key(app, key, &mut state, tx);
             // If the handler didn't close or replace the overlay, put state back.
@@ -1990,7 +2125,10 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.active_overlay = ActiveOverlay::Help { screen, scroll: 0 };
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    app.active_overlay = ActiveOverlay::Help { screen, scroll: max_scroll };
+                    app.active_overlay = ActiveOverlay::Help {
+                        screen,
+                        scroll: max_scroll,
+                    };
                 }
                 KeyCode::PageUp => {
                     scroll = scroll.saturating_sub(15);
@@ -2170,9 +2308,8 @@ fn prefetch_current_mb_row(
     if row.release_id.is_empty() || state.prefetch.contains_key(&row.release_id) {
         return;
     }
-    let cached_body = db.get_cached_mb_search(
-        &super::musicbrainz::detail_cache_key(&row.release_id),
-    );
+    let cached_body =
+        db.get_cached_mb_search(&super::musicbrainz::detail_cache_key(&row.release_id));
     super::event_loop::spawn_mb_detail_prefetch(
         tx.clone(),
         row.release_id.clone(),
@@ -2429,9 +2566,7 @@ pub(super) fn metadata_editor_open_add(state: &mut super::app::MetadataEditorSta
 
 /// Mark the cursor row for deletion (renders strikethrough until save).
 pub(super) fn metadata_editor_delete_cursor(state: &mut super::app::MetadataEditorState) {
-    if state.cursor < state.entries.len()
-        && !state.deleted.contains(&state.cursor)
-    {
+    if state.cursor < state.entries.len() && !state.deleted.contains(&state.cursor) {
         state.deleted.push(state.cursor);
         recalc_dirty(state);
     }
@@ -2543,12 +2678,17 @@ pub(super) fn metadata_editor_save(
     state.phase = super::app::MetadataEditorPhase::Saving;
     let paths = state.paths.clone();
     let deleted = state.deleted.clone();
-    let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> =
-        state.entries.iter().map(|e| (
-            e.item_key.clone(),
-            e.per_file_values.clone(),
-            e.per_file_originals.clone(),
-        )).collect();
+    let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> = state
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                e.item_key.clone(),
+                e.per_file_values.clone(),
+                e.per_file_originals.clone(),
+            )
+        })
+        .collect();
 
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -2561,9 +2701,14 @@ pub(super) fn metadata_editor_save(
             // are returned, not panicked). If it does happen, surface
             // a single batch-level error rather than losing the
             // request silently.
-            vec![(std::path::PathBuf::new(), Err(format!("save task panic: {}", e)))]
+            vec![(
+                std::path::PathBuf::new(),
+                Err(format!("save task panic: {}", e)),
+            )]
         });
-        let _ = tx.send(AppMessage::MetadataEditorWriteComplete { results }).await;
+        let _ = tx
+            .send(AppMessage::MetadataEditorWriteComplete { results })
+            .await;
     });
 }
 
@@ -2628,9 +2773,9 @@ fn handle_metadata_editor_key(
                                 app.set_status("read-only editor (SACD ISO)");
                             } else {
                                 // Single value: inline edit.
-                                state.edit_input = Some(
-                                    super::text_input::TextInputState::new(entry.value.clone()),
-                                );
+                                state.edit_input = Some(super::text_input::TextInputState::new(
+                                    entry.value.clone(),
+                                ));
                                 state.phase = MetadataEditorPhase::InlineEdit;
                             }
                         }
@@ -2638,9 +2783,7 @@ fn handle_metadata_editor_key(
                         app.set_status("read-only editor (SACD ISO)");
                     } else {
                         // "Add field" row — start adding a new key.
-                        state.add_key_input = Some(
-                            super::text_input::TextInputState::empty(),
-                        );
+                        state.add_key_input = Some(super::text_input::TextInputState::empty());
                         state.phase = MetadataEditorPhase::AddingKey;
                     }
                 }
@@ -2661,7 +2804,10 @@ fn handle_metadata_editor_key(
         MetadataEditorPhase::InlineEdit => {
             let input = match state.edit_input.as_mut() {
                 Some(i) => i,
-                None => { state.phase = MetadataEditorPhase::Editing; return; }
+                None => {
+                    state.phase = MetadataEditorPhase::Editing;
+                    return;
+                }
             };
             match key.code {
                 KeyCode::Esc => {
@@ -2690,7 +2836,9 @@ fn handle_metadata_editor_key(
                     let char_count = input.text.chars().count();
                     // Compute val_max (must match draw_metadata_editor).
                     let area = crossterm::terminal::size().unwrap_or((80, 24));
-                    let w = ((area.0 as usize) * 85 / 100).max(50).min(area.0 as usize - 2);
+                    let w = ((area.0 as usize) * 85 / 100)
+                        .max(50)
+                        .min(area.0 as usize - 2);
                     let inner_w = w.saturating_sub(2);
                     let key_col_w = 22usize;
                     let vm = inner_w.saturating_sub(key_col_w + 1);
@@ -2705,8 +2853,13 @@ fn handle_metadata_editor_key(
                         {
                             let mut pcr = false;
                             for (bi, c) in input.text.char_indices() {
-                                if bi >= input.cursor { break; }
-                                if c == '\r' { pcr = true; continue; }
+                                if bi >= input.cursor {
+                                    break;
+                                }
+                                if c == '\r' {
+                                    pcr = true;
+                                    continue;
+                                }
                                 if pcr {
                                     sp += if c == '\n' { 1 } else { 2 };
                                     pcr = false;
@@ -2714,7 +2867,9 @@ fn handle_metadata_editor_key(
                                 }
                                 sp += 1;
                             }
-                            if pcr { sp += 1; }
+                            if pcr {
+                                sp += 1;
+                            }
                         }
 
                         // Map sanitized position to (row, col).
@@ -2723,11 +2878,18 @@ fn handle_metadata_editor_key(
                         {
                             let mut idx = 0usize;
                             for c in sanitized.chars() {
-                                if idx == sp { break; }
-                                if c == '\n' { cur_row += 1; cur_col = 0; }
-                                else {
+                                if idx == sp {
+                                    break;
+                                }
+                                if c == '\n' {
+                                    cur_row += 1;
+                                    cur_col = 0;
+                                } else {
                                     cur_col += 1;
-                                    if cur_col >= vm { cur_row += 1; cur_col = 0; }
+                                    if cur_col >= vm {
+                                        cur_row += 1;
+                                        cur_col = 0;
+                                    }
                                 }
                                 idx += 1;
                             }
@@ -2735,7 +2897,11 @@ fn handle_metadata_editor_key(
 
                         // Compute target row.
                         let target_row = if key.code == KeyCode::Up {
-                            if cur_row == 0 { 0 } else { cur_row - 1 }
+                            if cur_row == 0 {
+                                0
+                            } else {
+                                cur_row - 1
+                            }
                         } else {
                             cur_row + 1
                         };
@@ -2821,7 +2987,10 @@ fn handle_metadata_editor_key(
         MetadataEditorPhase::AddingKey => {
             let input = match state.add_key_input.as_mut() {
                 Some(i) => i,
-                None => { state.phase = MetadataEditorPhase::Editing; return; }
+                None => {
+                    state.phase = MetadataEditorPhase::Editing;
+                    return;
+                }
             };
             match key.code {
                 KeyCode::Esc => {
@@ -2847,9 +3016,7 @@ fn handle_metadata_editor_key(
                         });
                         state.cursor = state.entries.len() - 1;
                         state.add_key_input = None;
-                        state.edit_input = Some(
-                            super::text_input::TextInputState::empty(),
-                        );
+                        state.edit_input = Some(super::text_input::TextInputState::empty());
                         state.phase = MetadataEditorPhase::InlineEdit;
                         ensure_cursor_visible(state);
                     } else {
@@ -2868,7 +3035,9 @@ fn handle_metadata_editor_key(
             // (paths.len() == 1, per_file_values.len() == n_tracks)
             // these diverge.
             let field_idx = state.detail_field_idx;
-            let n_files = state.entries.get(field_idx)
+            let n_files = state
+                .entries
+                .get(field_idx)
                 .map(|e| e.per_file_values.len())
                 .unwrap_or(state.paths.len());
 
@@ -2883,8 +3052,10 @@ fn handle_metadata_editor_key(
                         if field_idx < state.entries.len() && state.detail_cursor < n_files {
                             state.entries[field_idx].per_file_values[state.detail_cursor] = new_val;
                             // Recalculate mixed state.
-                            let all_same = state.entries[field_idx].per_file_values
-                                .windows(2).all(|w| w[0] == w[1]);
+                            let all_same = state.entries[field_idx]
+                                .per_file_values
+                                .windows(2)
+                                .all(|w| w[0] == w[1]);
                             state.entries[field_idx].is_mixed = !all_same;
                             let new_display = if all_same {
                                 state.entries[field_idx].per_file_values[0].clone()
@@ -2923,10 +3094,9 @@ fn handle_metadata_editor_key(
                     if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
                     } else if field_idx < state.entries.len() && state.detail_cursor < n_files {
-                        let val = state.entries[field_idx].per_file_values[state.detail_cursor].clone();
-                        state.detail_edit = Some(
-                            super::text_input::TextInputState::new(val),
-                        );
+                        let val =
+                            state.entries[field_idx].per_file_values[state.detail_cursor].clone();
+                        state.detail_edit = Some(super::text_input::TextInputState::new(val));
                     }
                 }
                 _ => {}
@@ -2969,19 +3139,22 @@ pub fn regenerate_cuesheet_for_save(
 
     // Helpers indexed-by-display-key.
     let entry_idx = |key: &str| -> Option<usize> {
-        state.entries.iter().position(|e|
-            e.display_key.eq_ignore_ascii_case(key))
+        state
+            .entries
+            .iter()
+            .position(|e| e.display_key.eq_ignore_ascii_case(key))
     };
     let dirty_at = |idx: usize| -> bool {
         let e = &state.entries[idx];
         e.per_file_values != e.per_file_originals
     };
-    let is_per_track = |idx: usize| -> bool {
-        state.entries[idx].per_file_values.len() != n_paths
-    };
+    let is_per_track = |idx: usize| -> bool { state.entries[idx].per_file_values.len() != n_paths };
 
     // 1. Detect any per-track dirt or relevant album-level dirt.
-    let per_track_dirty = state.entries.iter().enumerate()
+    let per_track_dirty = state
+        .entries
+        .iter()
+        .enumerate()
         .any(|(i, _)| is_per_track(i) && dirty_at(i));
     let album_keys_dirty = ["ALBUM", "DATE", "GENRE", "CATALOGNUMBER"]
         .iter()
@@ -3019,7 +3192,7 @@ pub fn regenerate_cuesheet_for_save(
                     "save aborted: per-track edits without an embedded CUESHEET. \
                      Re-run :tags-mb on a per-track-eligible single-image rip to \
                      create one, or revert per-track changes."
-                        .to_string()
+                        .to_string(),
                 );
             }
             return Ok(false);
@@ -3033,7 +3206,7 @@ pub fn regenerate_cuesheet_for_save(
         return Err(
             "save aborted: per-track edits with CUESHEET marked deleted. \
              Undelete the CUESHEET row or revert per-track changes."
-                .to_string()
+                .to_string(),
         );
     }
 
@@ -3044,19 +3217,20 @@ pub fn regenerate_cuesheet_for_save(
     // an embedded CUESHEET, values[0] == originals[0] (no inline edit
     // — CUESHEET rows are is_binary), so parsing either yields the
     // same result.
-    let cue_text_template = state.entries[cue_idx].per_file_values
-        .first().cloned().unwrap_or_default();
+    let cue_text_template = state.entries[cue_idx]
+        .per_file_values
+        .first()
+        .cloned()
+        .unwrap_or_default();
     let mut parsed = super::cue_parser::parse_cue(&cue_text_template);
     if parsed.tracks.is_empty() {
         // No parsable tracks — malformed CUE or empty value. Per-track
         // edits have no structural anchor; album-only dirt is a no-op
         // (let the regular save handle normal tag writes).
         if per_track_dirty {
-            return Err(
-                "save aborted: CUESHEET anchor parses to zero tracks; \
+            return Err("save aborted: CUESHEET anchor parses to zero tracks; \
                  re-run :tags-mb to rebuild it from scratch."
-                    .to_string()
-            );
+                .to_string());
         }
         return Ok(false);
     }
@@ -3098,11 +3272,21 @@ pub fn regenerate_cuesheet_for_save(
             .and_then(|i| state.entries[i].per_file_values.first().cloned())
             .filter(|s| !s.is_empty())
     };
-    if let Some(s) = derive_album("ALBUM")        { parsed.title = Some(s); }
-    if let Some(s) = derive_album("ARTIST")       { parsed.performer = Some(s); }
-    if let Some(s) = derive_album("DATE")         { parsed.date = Some(s); }
-    if let Some(s) = derive_album("GENRE")        { parsed.genre = Some(s); }
-    if let Some(s) = derive_album("CATALOGNUMBER"){ parsed.catalog = Some(s); }
+    if let Some(s) = derive_album("ALBUM") {
+        parsed.title = Some(s);
+    }
+    if let Some(s) = derive_album("ARTIST") {
+        parsed.performer = Some(s);
+    }
+    if let Some(s) = derive_album("DATE") {
+        parsed.date = Some(s);
+    }
+    if let Some(s) = derive_album("GENRE") {
+        parsed.genre = Some(s);
+    }
+    if let Some(s) = derive_album("CATALOGNUMBER") {
+        parsed.catalog = Some(s);
+    }
 
     // 5. Build TrackOverride list. For each parsed track, pull
     //    title/performer/isrc from the matching per-track entry slot
@@ -3125,14 +3309,15 @@ pub fn regenerate_cuesheet_for_save(
 
     // 5. Regenerate. image_filename / format_tag come from the
     //    single-image audio file at paths[0].
-    let path = state.paths.first().ok_or_else(||
-        "save aborted: editor has no audio path".to_string())?;
-    let filename = path.file_name()
+    let path = state
+        .paths
+        .first()
+        .ok_or_else(|| "save aborted: editor has no audio path".to_string())?;
+    let filename = path
+        .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| "save aborted: audio path has no filename".to_string())?;
-    let ext = path.extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("flac");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("flac");
     let format_tag = super::cue_generate::cue_format_tag(ext);
     let new_cue = super::cue_generate::regenerate_cue_with_overrides(
         &parsed, &overrides, filename, format_tag,
@@ -3172,12 +3357,15 @@ pub fn inject_sidecar_cuesheet_if_present(
     entries: &mut Vec<super::probe::TagEntry>,
     audio_path: &std::path::Path,
 ) {
-    let already_has_cue = entries.iter()
+    let already_has_cue = entries
+        .iter()
         .any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"));
     if already_has_cue {
         return;
     }
-    let Some(sidecar) = super::cue_parser::find_sidecar_cue(audio_path) else { return; };
+    let Some(sidecar) = super::cue_parser::find_sidecar_cue(audio_path) else {
+        return;
+    };
     // Read raw bytes + lossy-decode UTF-8: many real-world `.cue` files
     // are Shift_JIS / Windows-1252 (Japanese rips, foreign-character
     // titles). String::from_utf8_lossy replaces invalid bytes with
@@ -3185,7 +3373,9 @@ pub fn inject_sidecar_cuesheet_if_present(
     // is wrong; CUE keywords (TITLE/PERFORMER/INDEX/etc.) are pure
     // ASCII so they parse correctly regardless. Mirrors the strategy
     // in cue_parser::parse_cue_file.
-    let Ok(raw) = std::fs::read(&sidecar) else { return; };
+    let Ok(raw) = std::fs::read(&sidecar) else {
+        return;
+    };
     let text = String::from_utf8_lossy(&raw).into_owned();
     let parsed = super::cue_parser::parse_cue(&text);
     if parsed.tracks.len() < 2 {
@@ -3195,7 +3385,11 @@ pub fn inject_sidecar_cuesheet_if_present(
     // re-embed against a single audio file — INDEX timestamps in those
     // sheets reset to 00:00:00 per file. Skip.
     let first_file = parsed.tracks.first().and_then(|t| t.file.as_deref());
-    if parsed.tracks.iter().any(|t| t.file.as_deref() != first_file) {
+    if parsed
+        .tracks
+        .iter()
+        .any(|t| t.file.as_deref() != first_file)
+    {
         return;
     }
     entries.push(super::probe::TagEntry {
@@ -3225,7 +3419,8 @@ pub fn inject_sidecar_cuesheet_if_present(
 pub fn apply_embedded_cuesheet_per_track(entries: &mut Vec<super::probe::TagEntry>) {
     use lofty::tag::ItemKey;
 
-    let cue_text = match entries.iter()
+    let cue_text = match entries
+        .iter()
         .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
         .and_then(|e| e.per_file_values.first())
         .filter(|s| !s.is_empty())
@@ -3239,13 +3434,19 @@ pub fn apply_embedded_cuesheet_per_track(entries: &mut Vec<super::probe::TagEntr
         return;
     }
 
-    let titles: Vec<String> = parsed.tracks.iter()
+    let titles: Vec<String> = parsed
+        .tracks
+        .iter()
         .map(|t| t.title.clone().unwrap_or_default())
         .collect();
-    let artists: Vec<String> = parsed.tracks.iter()
+    let artists: Vec<String> = parsed
+        .tracks
+        .iter()
         .map(|t| t.performer.clone().unwrap_or_default())
         .collect();
-    let isrcs: Vec<String> = parsed.tracks.iter()
+    let isrcs: Vec<String> = parsed
+        .tracks
+        .iter()
         .map(|t| t.isrc.clone().unwrap_or_default())
         .collect();
 
@@ -3276,8 +3477,9 @@ fn grow_or_create_per_track(
         values.first().cloned().unwrap_or_default()
     };
 
-    if let Some(idx) = entries.iter().position(|e|
-        e.display_key.eq_ignore_ascii_case(key))
+    if let Some(idx) = entries
+        .iter()
+        .position(|e| e.display_key.eq_ignore_ascii_case(key))
     {
         let entry = &mut entries[idx];
         entry.per_file_values = values.clone();
@@ -3333,7 +3535,7 @@ pub(super) fn fix_caps_for_state(
     state: &mut super::app::MetadataEditorState,
     focus: Option<usize>,
 ) -> FixCapsResult {
-    use crate::convert::renaming::{capitalize_title, capitalize_section};
+    use crate::convert::renaming::{capitalize_section, capitalize_title};
 
     let mut result = FixCapsResult {
         changed_values: 0,
@@ -3346,7 +3548,9 @@ pub(super) fn fix_caps_for_state(
     };
 
     for i in indices {
-        if i >= state.entries.len() { continue; }
+        if i >= state.entries.len() {
+            continue;
+        }
         // Deleted-skip applies to main-editor invocations only.
         // Detail-overlay invocations honor the user's explicit focus.
         if focus.is_none() && state.deleted.contains(&i) {
@@ -3389,8 +3593,10 @@ pub(super) fn fix_caps_for_state(
 /// overlay (only show for fields where fix-caps would actually do
 /// something).
 pub(super) fn is_fix_caps_applicable(display_key: &str) -> bool {
-    matches!(display_key.to_ascii_uppercase().as_str(),
-        "TITLE" | "ARTIST" | "ALBUM" | "ALBUMARTIST" | "PERFORMER")
+    matches!(
+        display_key.to_ascii_uppercase().as_str(),
+        "TITLE" | "ARTIST" | "ALBUM" | "ALBUMARTIST" | "PERFORMER"
+    )
 }
 
 /// Overlay per-track `values` onto an entry's `per_file_values`,
@@ -3416,8 +3622,9 @@ fn overlay_per_track_values(
         values.first().cloned().unwrap_or_default()
     };
 
-    if let Some(idx) = entries.iter().position(|e|
-        e.display_key.eq_ignore_ascii_case(key))
+    if let Some(idx) = entries
+        .iter()
+        .position(|e| e.display_key.eq_ignore_ascii_case(key))
     {
         // Overlay existing entry — even when `values` is all-empty
         // (sidecar deliberately cleared the field; user wants editor
@@ -3425,7 +3632,11 @@ fn overlay_per_track_values(
         // replicating the existing first slot, shrink by truncation.
         // Keeps len(values) == len(originals) invariant.
         let entry = &mut entries[idx];
-        let pad = entry.per_file_originals.first().cloned().unwrap_or_default();
+        let pad = entry
+            .per_file_originals
+            .first()
+            .cloned()
+            .unwrap_or_default();
         entry.per_file_originals.resize(dim, pad);
         entry.per_file_values = values;
         entry.is_mixed = is_mixed;
@@ -3472,29 +3683,41 @@ pub(super) fn reload_from_sidecar_cue(
     let audio = &state.paths[0];
     let sidecar = super::cue_parser::find_sidecar_cue(audio)
         .ok_or_else(|| ":tags-cue-sidecar: no .cue file found alongside audio".to_string())?;
-    let raw = std::fs::read(&sidecar)
-        .map_err(|e| format!(":tags-cue-sidecar: failed to read {}: {}",
-            sidecar.display(), e))?;
+    let raw = std::fs::read(&sidecar).map_err(|e| {
+        format!(
+            ":tags-cue-sidecar: failed to read {}: {}",
+            sidecar.display(),
+            e
+        )
+    })?;
     let text = String::from_utf8_lossy(&raw).into_owned();
     let parsed = super::cue_parser::parse_cue(&text);
     if parsed.tracks.len() < 2 {
         return Err(format!(
             ":tags-cue-sidecar: {} parses to {} tracks (need >= 2)",
-            sidecar.file_name().map(|s| s.to_string_lossy().into_owned())
+            sidecar
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| sidecar.display().to_string()),
             parsed.tracks.len(),
         ));
     }
     let first_file = parsed.tracks.first().and_then(|t| t.file.as_deref());
-    if parsed.tracks.iter().any(|t| t.file.as_deref() != first_file) {
+    if parsed
+        .tracks
+        .iter()
+        .any(|t| t.file.as_deref() != first_file)
+    {
         return Err(":tags-cue-sidecar: sidecar is track-by-track (multiple FILE refs); not safe to embed against a single image".to_string());
     }
 
     // Update or create the CUESHEET entry's per_file_values[0]
     // (preserving originals so revert restores the prior state).
     use lofty::tag::ItemKey;
-    if let Some(idx) = state.entries.iter().position(|e|
-        e.display_key.eq_ignore_ascii_case("CUESHEET"))
+    if let Some(idx) = state
+        .entries
+        .iter()
+        .position(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
     {
         let entry = &mut state.entries[idx];
         if entry.per_file_values.is_empty() {
@@ -3519,12 +3742,21 @@ pub(super) fn reload_from_sidecar_cue(
     }
 
     // Overlay per-track values, preserving originals.
-    let titles: Vec<String> = parsed.tracks.iter()
-        .map(|t| t.title.clone().unwrap_or_default()).collect();
-    let artists: Vec<String> = parsed.tracks.iter()
-        .map(|t| t.performer.clone().unwrap_or_default()).collect();
-    let isrcs: Vec<String> = parsed.tracks.iter()
-        .map(|t| t.isrc.clone().unwrap_or_default()).collect();
+    let titles: Vec<String> = parsed
+        .tracks
+        .iter()
+        .map(|t| t.title.clone().unwrap_or_default())
+        .collect();
+    let artists: Vec<String> = parsed
+        .tracks
+        .iter()
+        .map(|t| t.performer.clone().unwrap_or_default())
+        .collect();
+    let isrcs: Vec<String> = parsed
+        .tracks
+        .iter()
+        .map(|t| t.isrc.clone().unwrap_or_default())
+        .collect();
     overlay_per_track_values(&mut state.entries, "TITLE", ItemKey::TrackTitle, titles);
     overlay_per_track_values(&mut state.entries, "ARTIST", ItemKey::TrackArtist, artists);
     overlay_per_track_values(&mut state.entries, "ISRC", ItemKey::Isrc, isrcs);
@@ -3532,9 +3764,14 @@ pub(super) fn reload_from_sidecar_cue(
     state.dirty = super::probe::metadata_editor_has_changes(state);
 
     let n_tracks = parsed.tracks.len();
-    let name = sidecar.file_name().map(|s| s.to_string_lossy().into_owned())
+    let name = sidecar
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| sidecar.display().to_string());
-    Ok(format!(":tags-cue-sidecar: loaded {} tracks from {}", n_tracks, name))
+    Ok(format!(
+        ":tags-cue-sidecar: loaded {} tracks from {}",
+        n_tracks, name
+    ))
 }
 
 pub fn open_metadata_editor(app: &mut AppState) {
@@ -3571,10 +3808,12 @@ pub fn open_metadata_editor(app: &mut AppState) {
 
     let mut paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
         .into_iter()
-        .filter(|p| matches!(
-            super::browse::classify_file(p),
-            super::browse::EntryKind::AudioFile(_)
-        ))
+        .filter(|p| {
+            matches!(
+                super::browse::classify_file(p),
+                super::browse::EntryKind::AudioFile(_)
+            )
+        })
         .collect();
 
     if paths.is_empty() {
@@ -3617,10 +3856,12 @@ pub fn open_metadata_editor(app: &mut AppState) {
         let n = paths.len();
 
         // Find or create TRACKNUMBER entry.
-        let tn_idx = entries.iter().position(|e|
-            e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
-        let title_idx = entries.iter().position(|e|
-            e.display_key.to_ascii_uppercase() == "TITLE");
+        let tn_idx = entries
+            .iter()
+            .position(|e| e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
+        let title_idx = entries
+            .iter()
+            .position(|e| e.display_key.to_ascii_uppercase() == "TITLE");
 
         // Ensure TRACKNUMBER entry exists.
         let tn_idx = match tn_idx {
@@ -3664,9 +3905,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
 
         // Parse filenames and fill empty values.
         for i in 0..n {
-            let stem = paths[i].file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let stem = paths[i].file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let (parsed_track, parsed_title) = super::probe::parse_title_from_filename(stem);
 
             if entries[tn_idx].per_file_values[i].is_empty() {
@@ -3685,7 +3924,10 @@ pub fn open_metadata_editor(app: &mut AppState) {
 
         // Recalculate is_mixed and value for affected entries.
         for idx in [tn_idx, title_idx] {
-            let all_same = entries[idx].per_file_values.windows(2).all(|w| w[0] == w[1]);
+            let all_same = entries[idx]
+                .per_file_values
+                .windows(2)
+                .all(|w| w[0] == w[1]);
             entries[idx].is_mixed = !all_same;
             let new_val = if !all_same {
                 "<multiple values>".to_string()
@@ -3702,8 +3944,12 @@ pub fn open_metadata_editor(app: &mut AppState) {
             entries.sort_by(|a, b| {
                 let a_upper = a.display_key.to_ascii_uppercase();
                 let b_upper = b.display_key.to_ascii_uppercase();
-                let a_pos = super::probe::STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
-                let b_pos = super::probe::STANDARD_KEY_ORDER.iter().position(|&k| k == b_upper);
+                let a_pos = super::probe::STANDARD_KEY_ORDER
+                    .iter()
+                    .position(|&k| k == a_upper);
+                let b_pos = super::probe::STANDARD_KEY_ORDER
+                    .iter()
+                    .position(|&k| k == b_upper);
                 match (a_pos, b_pos) {
                     (Some(ai), Some(bi)) => ai.cmp(&bi),
                     (Some(_), None) => std::cmp::Ordering::Less,
@@ -3717,69 +3963,77 @@ pub fn open_metadata_editor(app: &mut AppState) {
     // Build per-file context labels from sorted paths/entries.
     // Short labels: "D1.01" or "01" or filename stem (fallback).
     let file_labels: Vec<String> = {
-        let track_entry = entries.iter().find(|e|
-            e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
-        let disc_entry = entries.iter().find(|e|
-            e.display_key.to_ascii_uppercase() == "DISCNUMBER");
+        let track_entry = entries
+            .iter()
+            .find(|e| e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
+        let disc_entry = entries
+            .iter()
+            .find(|e| e.display_key.to_ascii_uppercase() == "DISCNUMBER");
         let has_multi_disc = disc_entry
             .map(|e| {
-                let unique: std::collections::HashSet<&str> = e.per_file_values.iter()
+                let unique: std::collections::HashSet<&str> = e
+                    .per_file_values
+                    .iter()
                     .filter(|v| !v.is_empty())
-                    .map(|v| v.as_str()).collect();
+                    .map(|v| v.as_str())
+                    .collect();
                 unique.len() > 1
             })
             .unwrap_or(false);
 
-        paths.iter().enumerate().map(|(i, p)| {
-            let tn = track_entry
-                .and_then(|e| e.per_file_values.get(i))
-                .filter(|v| !v.is_empty());
-            let dn = if has_multi_disc {
-                disc_entry.and_then(|e| e.per_file_values.get(i))
-                    .filter(|v| !v.is_empty())
-            } else {
-                None
-            };
-            match (dn, tn) {
-                (Some(d), Some(t)) => format!("D{}.{:>02}", d, t),
-                (None, Some(t)) => format!("{:>02}", t),
-                _ => {
-                    // Fallback: filename stem, truncated.
-                    p.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("?")
-                        .to_string()
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let tn = track_entry
+                    .and_then(|e| e.per_file_values.get(i))
+                    .filter(|v| !v.is_empty());
+                let dn = if has_multi_disc {
+                    disc_entry
+                        .and_then(|e| e.per_file_values.get(i))
+                        .filter(|v| !v.is_empty())
+                } else {
+                    None
+                };
+                match (dn, tn) {
+                    (Some(d), Some(t)) => format!("D{}.{:>02}", d, t),
+                    (None, Some(t)) => format!("{:>02}", t),
+                    _ => {
+                        // Fallback: filename stem, truncated.
+                        p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("?")
+                            .to_string()
+                    }
                 }
-            }
-        }).collect()
+            })
+            .collect()
     };
 
-    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
-        super::app::MetadataEditorState {
-            paths,
-            entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: super::app::MetadataEditorPhase::Editing,
-            dirty: did_auto_populate,
-            deleted: Vec::new(),
-            file_labels,
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-        },
-    ));
+    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(super::app::MetadataEditorState {
+        paths,
+        entries,
+        cursor: 0,
+        scroll: 0,
+        last_click: None,
+        edit_input: None,
+        add_key_input: None,
+        phase: super::app::MetadataEditorPhase::Editing,
+        dirty: did_auto_populate,
+        deleted: Vec::new(),
+        file_labels,
+        detail_field_idx: 0,
+        detail_cursor: 0,
+        detail_scroll: 0,
+        detail_edit: None,
+        mb_back: None,
+        gnudb_back: None,
+        read_only: false,
+        sacd_sidecar_path: None,
+        sacd_area_kind: None,
+        sacd_stereo_durations: None,
+        sacd_multi_channel_durations: None,
+    }));
 }
 
 /// Open the metadata editor against a SACD ISO. Parses the ISO,
@@ -3803,20 +4057,16 @@ pub(super) fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::p
     // success status).
     let sidecar_path = super::sacd_sidecar::find_sidecar_for_iso(&iso_path);
     let mut sidecar_parse_error: Option<String> = None;
-    let sidecar = sidecar_path.as_ref().and_then(|p| {
-        match super::sacd_sidecar::parse_sidecar(p) {
+    let sidecar = sidecar_path
+        .as_ref()
+        .and_then(|p| match super::sacd_sidecar::parse_sidecar(p) {
             Ok(s) => Some(s),
             Err(e) => {
                 sidecar_parse_error = Some(format!("{}", e));
-                log::warn!(
-                    "SACD sidecar parse failed for '{}': {}",
-                    p.display(),
-                    e,
-                );
+                log::warn!("SACD sidecar parse failed for '{}': {}", p.display(), e,);
                 None
             }
-        }
-    });
+        });
 
     match build_sacd_editor_state(&iso_path, &md, sidecar.as_ref()) {
         Ok((state, area_label, n_tracks)) => {
@@ -3855,8 +4105,8 @@ pub fn build_sacd_editor_state(
     md: &super::sacd::SacdMetadata,
     sidecar: Option<&super::sacd_sidecar::SidecarMetadata>,
 ) -> Result<(super::app::MetadataEditorState, &'static str, usize), String> {
-    use lofty::tag::ItemKey;
     use super::probe::TagEntry;
+    use lofty::tag::ItemKey;
 
     let area = md
         .stereo
@@ -3923,34 +4173,31 @@ pub fn build_sacd_editor_state(
     let mut entries: Vec<TagEntry> = Vec::new();
 
     // Album-level (single value replicated across all tracks).
-    let push_album = |entries: &mut Vec<TagEntry>,
-                      display_key: &str,
-                      item_key: ItemKey,
-                      value: String| {
-        let vals = vec![value.clone(); n_tracks];
-        // Sidecar (or ScarletBook fallback) is the source of truth
-        // for the displayed value. Mirror it into `original` so the
-        // row-level revert pill restores to what the user originally
-        // saw, not to an empty string. (Previously `original:
-        // String::new()` made row-level revert show a blank cell.)
-        entries.push(TagEntry {
-            display_key: display_key.to_string(),
-            item_key,
-            value: value.clone(),
-            original: value,
-            is_binary: false,
-            is_mixed: false,
-            per_file_values: vals.clone(),
-            per_file_originals: vals,
-            mb_proposed_value: None,
-            mb_proposed_per_file: None,
-        });
-    };
+    let push_album =
+        |entries: &mut Vec<TagEntry>, display_key: &str, item_key: ItemKey, value: String| {
+            let vals = vec![value.clone(); n_tracks];
+            // Sidecar (or ScarletBook fallback) is the source of truth
+            // for the displayed value. Mirror it into `original` so the
+            // row-level revert pill restores to what the user originally
+            // saw, not to an empty string. (Previously `original:
+            // String::new()` made row-level revert show a blank cell.)
+            entries.push(TagEntry {
+                display_key: display_key.to_string(),
+                item_key,
+                value: value.clone(),
+                original: value,
+                is_binary: false,
+                is_mixed: false,
+                per_file_values: vals.clone(),
+                per_file_originals: vals,
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            });
+        };
 
     // ALBUM: sidecar wins, fallback to master_text.album_title.
-    let album = sidecar_album_value("ALBUM").or_else(|| {
-        md.master_text.as_ref().and_then(|t| t.album_title.clone())
-    });
+    let album = sidecar_album_value("ALBUM")
+        .or_else(|| md.master_text.as_ref().and_then(|t| t.album_title.clone()));
     if let Some(s) = album {
         push_album(&mut entries, "ALBUM", ItemKey::AlbumTitle, s);
     }
@@ -3963,8 +4210,8 @@ pub fn build_sacd_editor_state(
         push_album(&mut entries, "ALBUMARTIST", ItemKey::AlbumArtist, s);
     }
     // DATE: sidecar wins, fallback to disc_date.year.
-    let date = sidecar_album_value("DATE")
-        .or_else(|| md.master_toc.disc_date.map(|d| d.year.to_string()));
+    let date =
+        sidecar_album_value("DATE").or_else(|| md.master_toc.disc_date.map(|d| d.year.to_string()));
     if let Some(s) = date {
         push_album(&mut entries, "DATE", ItemKey::Year, s);
     }
@@ -3974,7 +4221,11 @@ pub fn build_sacd_editor_state(
         .or_else(|| sidecar_album_value("DISCOGS_CATALOG"))
         .or_else(|| {
             let c = md.master_toc.album_catalog_number.trim().to_string();
-            if c.is_empty() { None } else { Some(c) }
+            if c.is_empty() {
+                None
+            } else {
+                Some(c)
+            }
         });
     if let Some(s) = catalog {
         push_album(&mut entries, "CATALOGNUMBER", ItemKey::CatalogNumber, s);
@@ -4005,37 +4256,35 @@ pub fn build_sacd_editor_state(
     }
 
     // Per-track entries.
-    let push_per_track = |entries: &mut Vec<TagEntry>,
-                          display_key: &str,
-                          item_key: ItemKey,
-                          values: Vec<String>| {
-        if values.iter().all(|s| s.is_empty()) {
-            return;
-        }
-        let all_same = values.windows(2).all(|w| w[0] == w[1]);
-        let value = if all_same {
-            values.first().cloned().unwrap_or_default()
-        } else {
-            "<multiple values>".to_string()
+    let push_per_track =
+        |entries: &mut Vec<TagEntry>, display_key: &str, item_key: ItemKey, values: Vec<String>| {
+            if values.iter().all(|s| s.is_empty()) {
+                return;
+            }
+            let all_same = values.windows(2).all(|w| w[0] == w[1]);
+            let value = if all_same {
+                values.first().cloned().unwrap_or_default()
+            } else {
+                "<multiple values>".to_string()
+            };
+            // Mirror the displayed value into `original` so the row-level
+            // revert pill restores the sidecar/ScarletBook truth instead
+            // of an empty string. For mixed entries `value` is
+            // `<multiple values>`; storing that as `original` matches
+            // how `grow_or_create_per_track` handles the same case.
+            entries.push(TagEntry {
+                display_key: display_key.to_string(),
+                item_key,
+                value: value.clone(),
+                original: value,
+                is_binary: false,
+                is_mixed: !all_same,
+                per_file_originals: values.clone(),
+                per_file_values: values,
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            });
         };
-        // Mirror the displayed value into `original` so the row-level
-        // revert pill restores the sidecar/ScarletBook truth instead
-        // of an empty string. For mixed entries `value` is
-        // `<multiple values>`; storing that as `original` matches
-        // how `grow_or_create_per_track` handles the same case.
-        entries.push(TagEntry {
-            display_key: display_key.to_string(),
-            item_key,
-            value: value.clone(),
-            original: value,
-            is_binary: false,
-            is_mixed: !all_same,
-            per_file_originals: values.clone(),
-            per_file_values: values,
-            mb_proposed_value: None,
-            mb_proposed_per_file: None,
-        });
-    };
 
     // TRACKNUMBER: prefer sidecar's recorded TRACKNUMBER (may be
     // zero-padded like "01"); fallback to 1..N enumeration.
@@ -4076,7 +4325,12 @@ pub fn build_sacd_editor_state(
                 .unwrap_or_default()
         })
         .collect();
-    push_per_track(&mut entries, "PERFORMER", ItemKey::Performer, perf_secondary);
+    push_per_track(
+        &mut entries,
+        "PERFORMER",
+        ItemKey::Performer,
+        perf_secondary,
+    );
 
     let composers: Vec<String> = resolve_per_track("COMPOSER", &|i| {
         area.tracks
@@ -4103,7 +4357,10 @@ pub fn build_sacd_editor_state(
     push_per_track(&mut entries, "ARRANGER", ItemKey::Arranger, arrangers);
 
     let isrcs: Vec<String> = resolve_per_track("ISRC", &|i| {
-        area.tracks.get(i).and_then(|t| t.isrc.clone()).unwrap_or_default()
+        area.tracks
+            .get(i)
+            .and_then(|t| t.isrc.clone())
+            .unwrap_or_default()
     });
     push_per_track(&mut entries, "ISRC", ItemKey::Isrc, isrcs);
 
@@ -4142,7 +4399,12 @@ pub fn build_sacd_editor_state(
     // back uniformly through the album-level branch of
     // save_sacd_sidecar.
     if let Some(s) = sidecar_album_value("MUSICBRAINZ_ALBUMID") {
-        push_album(&mut entries, "MUSICBRAINZ_ALBUMID", ItemKey::MusicBrainzReleaseId, s);
+        push_album(
+            &mut entries,
+            "MUSICBRAINZ_ALBUMID",
+            ItemKey::MusicBrainzReleaseId,
+            s,
+        );
     }
     if let Some(s) = sidecar_album_value("MUSICBRAINZ_ALBUMARTISTID") {
         push_album(
@@ -4161,7 +4423,12 @@ pub fn build_sacd_editor_state(
         );
     }
     if let Some(s) = sidecar_album_value("ORIGINALDATE") {
-        push_album(&mut entries, "ORIGINALDATE", ItemKey::OriginalReleaseDate, s);
+        push_album(
+            &mut entries,
+            "ORIGINALDATE",
+            ItemKey::OriginalReleaseDate,
+            s,
+        );
     }
     if let Some(s) = sidecar_album_value("RELEASECOUNTRY") {
         push_album(
@@ -4195,7 +4462,10 @@ pub fn build_sacd_editor_state(
                 .and_then(|p| p.parent())
                 .map(is_dir_writable)
                 .unwrap_or(false);
-            (parent_writable, if parent_writable { candidate } else { None })
+            (
+                parent_writable,
+                if parent_writable { candidate } else { None },
+            )
         }
     };
     let sidecar_path_opt = sidecar_target;
@@ -4210,7 +4480,12 @@ pub fn build_sacd_editor_state(
         if a.tracks.is_empty() {
             None
         } else {
-            Some(a.tracks.iter().map(|t| t.duration.total_seconds()).collect())
+            Some(
+                a.tracks
+                    .iter()
+                    .map(|t| t.duration.total_seconds())
+                    .collect(),
+            )
         }
     };
     let sacd_stereo_durations = md.stereo.as_ref().and_then(&area_durations);
@@ -4318,8 +4593,9 @@ pub(super) fn switch_sacd_editor_area(
     // logged but don't abort the switch (editor rebuilds against
     // ScarletBook only).
     let sidecar_path = super::sacd_sidecar::find_sidecar_for_iso(iso_path);
-    let sidecar = sidecar_path.as_ref().and_then(|p| {
-        match super::sacd_sidecar::parse_sidecar(p) {
+    let sidecar = sidecar_path
+        .as_ref()
+        .and_then(|p| match super::sacd_sidecar::parse_sidecar(p) {
             Ok(s) => Some(s),
             Err(e) => {
                 log::warn!(
@@ -4329,8 +4605,7 @@ pub(super) fn switch_sacd_editor_area(
                 );
                 None
             }
-        }
-    });
+        });
 
     // Build a synthetic SacdMetadata that forces the parser's
     // area-selection (which prefers stereo) to pick the requested
@@ -4367,14 +4642,20 @@ fn find_single_sacd_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> 
     let mut found: Option<std::path::PathBuf> = None;
     for entry in read.flatten() {
         let path = entry.path();
-        if !path.is_file() { continue; }
+        if !path.is_file() {
+            continue;
+        }
         let is_iso = path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("iso"))
             .unwrap_or(false);
-        if !is_iso { continue; }
-        if !super::sacd::is_sacd_iso(&path) { continue; }
+        if !is_iso {
+            continue;
+        }
+        if !super::sacd::is_sacd_iso(&path) {
+            continue;
+        }
         if found.is_some() {
             // 2+ SACD ISOs in this directory — ambiguous selection.
             return None;
@@ -4385,10 +4666,7 @@ fn find_single_sacd_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> 
 }
 
 fn is_path_writable(path: &std::path::Path) -> bool {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .is_ok()
+    std::fs::OpenOptions::new().write(true).open(path).is_ok()
 }
 
 /// Probe whether a directory accepts new files. Used by the mint-on-
@@ -4627,11 +4905,7 @@ pub fn save_sacd_sidecar(
         } else {
             // Per-track: editor index i → sidecar id area_track_ids[i].
             for (i, tid) in area_track_ids.iter().enumerate() {
-                let new_val = entry
-                    .per_file_values
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_default();
+                let new_val = entry.per_file_values.get(i).cloned().unwrap_or_default();
                 if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *tid) {
                     if new_val.is_empty() {
                         track.meta.remove(sidecar_key);
@@ -4669,7 +4943,9 @@ pub fn save_sacd_sidecar(
         .tracks_for_area(sibling_area_idx)
         .iter()
         .map(|t| {
-            let tn = t.meta.get("TRACKNUMBER")
+            let tn = t
+                .meta
+                .get("TRACKNUMBER")
                 .and_then(|s| s.trim().parse::<u32>().ok());
             (t.id, tn)
         })
@@ -4691,19 +4967,14 @@ pub fn save_sacd_sidecar(
                 e.per_file_values
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, v)| {
-                        v.trim().parse::<u32>().ok().map(|n| (n, i))
-                    })
+                    .filter_map(|(i, v)| v.trim().parse::<u32>().ok().map(|n| (n, i)))
                     .collect()
             })
             .unwrap_or_default();
 
         let mut mirrored_count = 0usize;
         for (_sib_tid, sib_tn) in &sibling_track_info {
-            if sib_tn
-                .and_then(|tn| editor_tn_to_idx.get(&tn))
-                .is_some()
-            {
+            if sib_tn.and_then(|tn| editor_tn_to_idx.get(&tn)).is_some() {
                 mirrored_count += 1;
             }
         }
@@ -4729,8 +5000,7 @@ pub fn save_sacd_sidecar(
                 }
             } else {
                 for (sib_tid, sib_tn) in &sibling_track_info {
-                    let Some(editor_idx) = sib_tn
-                        .and_then(|tn| editor_tn_to_idx.get(&tn).copied())
+                    let Some(editor_idx) = sib_tn.and_then(|tn| editor_tn_to_idx.get(&tn).copied())
                     else {
                         continue;
                     };
@@ -4775,239 +5045,319 @@ fn handle_generic_overlay_mouse(
 
     // Determine which overlay is active and compute its popup rect.
     // Returns (popup_rect, pill_labels_for_footer, close_action).
-    let (popup, pills): (Rect, Vec<(&str, &str)>) =
-        if app.bookmarks.overlay_open {
-            let w: u16 = 64.min(area.0.saturating_sub(4));
-            let list_h = app.bookmarks.entries.len() as u16;
-            let h = (list_h + 5).min(area.1.saturating_sub(4)).max(8);
-            let x = (area.0.saturating_sub(w)) / 2;
-            let y = (area.1.saturating_sub(h)) / 2;
-            if app.bookmarks.naming.is_some() {
-                (Rect::new(x, y, w, h), vec![
-                    ("Enter save", "enter"), ("Esc cancel", "esc"),
-                ])
-            } else {
-                (Rect::new(x, y, w, h), vec![
-                    ("Enter cd", "enter"), ("a add", "a"),
-                    ("d delete", "d"), ("e rename", "e"), ("Esc close", "esc"),
-                ])
-            }
-        } else if app.recent.overlay_open {
-            let w: u16 = 72.min(area.0.saturating_sub(4));
-            let list_h = app.recent.entries.len() as u16;
-            let h = (list_h + 5).min(area.1.saturating_sub(4)).max(8);
-            let x = (area.0.saturating_sub(w)) / 2;
-            let y = (area.1.saturating_sub(h)) / 2;
-            (Rect::new(x, y, w, h), vec![
-                ("Enter load", "enter"), ("d delete", "d"), ("Esc close", "esc"),
-            ])
-        } else if app.preset.overlay_open {
-            let w: u16 = 36;
-            let list_h = app.preset.overlay_list.len() as u16;
-            let h = (list_h + 6).min(area.1.saturating_sub(4));
-            let x = area.0.saturating_sub(w + 2);
-            let y = area.1.saturating_sub(h + 3);
-            if app.preset.naming_input.is_some() {
-                (Rect::new(x, y, w, h), vec![
-                    ("Enter save", "enter"), ("Esc cancel", "esc"),
-                ])
-            } else {
-                (Rect::new(x, y, w, h), vec![
-                    ("n new", "n"), ("d dup", "d"), ("x del", "x"), ("Esc close", "esc"),
-                ])
-            }
+    let (popup, pills): (Rect, Vec<(&str, &str)>) = if app.bookmarks.overlay_open {
+        let w: u16 = 64.min(area.0.saturating_sub(4));
+        let list_h = app.bookmarks.entries.len() as u16;
+        let h = (list_h + 5).min(area.1.saturating_sub(4)).max(8);
+        let x = (area.0.saturating_sub(w)) / 2;
+        let y = (area.1.saturating_sub(h)) / 2;
+        if app.bookmarks.naming.is_some() {
+            (
+                Rect::new(x, y, w, h),
+                vec![("Enter save", "enter"), ("Esc cancel", "esc")],
+            )
         } else {
-            // ActiveOverlay-based overlays.
-            match &app.active_overlay {
-                ActiveOverlay::Analysis { .. } => {
-                    let w = ((area.0 as usize) * 80 / 100).max(50).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 80 / 100).max(12).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
+            (
+                Rect::new(x, y, w, h),
+                vec![
+                    ("Enter cd", "enter"),
+                    ("a add", "a"),
+                    ("d delete", "d"),
+                    ("e rename", "e"),
+                    ("Esc close", "esc"),
+                ],
+            )
+        }
+    } else if app.recent.overlay_open {
+        let w: u16 = 72.min(area.0.saturating_sub(4));
+        let list_h = app.recent.entries.len() as u16;
+        let h = (list_h + 5).min(area.1.saturating_sub(4)).max(8);
+        let x = (area.0.saturating_sub(w)) / 2;
+        let y = (area.1.saturating_sub(h)) / 2;
+        (
+            Rect::new(x, y, w, h),
+            vec![
+                ("Enter load", "enter"),
+                ("d delete", "d"),
+                ("Esc close", "esc"),
+            ],
+        )
+    } else if app.preset.overlay_open {
+        let w: u16 = 36;
+        let list_h = app.preset.overlay_list.len() as u16;
+        let h = (list_h + 6).min(area.1.saturating_sub(4));
+        let x = area.0.saturating_sub(w + 2);
+        let y = area.1.saturating_sub(h + 3);
+        if app.preset.naming_input.is_some() {
+            (
+                Rect::new(x, y, w, h),
+                vec![("Enter save", "enter"), ("Esc cancel", "esc")],
+            )
+        } else {
+            (
+                Rect::new(x, y, w, h),
+                vec![
+                    ("n new", "n"),
+                    ("d dup", "d"),
+                    ("x del", "x"),
+                    ("Esc close", "esc"),
+                ],
+            )
+        }
+    } else {
+        // ActiveOverlay-based overlays.
+        match &app.active_overlay {
+            ActiveOverlay::Analysis { .. } => {
+                let w = ((area.0 as usize) * 80 / 100)
+                    .max(50)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 80 / 100)
+                    .max(12)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (
+                    Rect::new(x, y, w, h),
+                    vec![
                         (":analyze!", ":analyze!"),
                         (":write-dr", ":write-dr"),
                         (":write-rg-track", ":write-rg-track"),
                         (":write-rg-album", ":write-rg-album"),
                         ("Esc close", "esc"),
-                    ])
-                }
-                ActiveOverlay::BulkRename(ref state) => {
-                    let w = ((area.0 as usize) * 85 / 100).max(60).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 85 / 100).max(16).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    if state.focus == super::app::BulkRenameFocus::Template {
-                        (Rect::new(x, y, w, h), vec![
-                            ("Tab list", "tab"), ("Enter commit", "enter"), ("Esc cancel", "esc"),
-                        ])
-                    } else {
-                        (Rect::new(x, y, w, h), vec![
-                            ("Tab tmpl", "tab"), ("e edit", "e"), ("c cue", "c"),
-                            ("C caps", "C"), ("Enter commit", "enter"), ("Esc cancel", "esc"),
-                        ])
-                    }
-                }
-                ActiveOverlay::BatchList { .. } => {
-                    let w = area.0.saturating_sub(8).min(100).max(40);
-                    let h = area.1.saturating_sub(6).min(30).max(10);
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("d remove", "d"), ("Esc close", "esc"),
-                    ])
-                }
-                ActiveOverlay::Help { .. } => {
-                    let w = ((area.0 as usize) * 70 / 100).max(50).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 80 / 100).max(12).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("Esc close", "esc"),
-                    ])
-                }
-                ActiveOverlay::ErrorDetail { .. } => {
-                    let w: u16 = 60; let h: u16 = 12;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
-                }
-                ActiveOverlay::ItemInfo { .. } => {
-                    let w: u16 = 70; let h: u16 = 16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
-                }
-                ActiveOverlay::FileInput { .. } => {
-                    let w: u16 = 60; let h: u16 = 7;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("Enter confirm", "enter"), ("Esc cancel", "esc"),
-                    ])
-                }
-                ActiveOverlay::TextEdit { .. } => {
-                    let w = area.0.saturating_sub(4).min(80);
-                    let h: u16 = 7;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("Enter save", "enter"), ("Esc cancel", "esc"),
-                    ])
-                }
-                ActiveOverlay::Verify { .. } => {
-                    let w = ((area.0 as usize) * 70 / 100).max(40).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("Esc close", "esc"),
-                    ])
-                }
-                ActiveOverlay::BitCompare { .. } => {
-                    let w = ((area.0 as usize) * 75 / 100).max(50).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("Esc close", "esc"),
-                    ])
-                }
-                ActiveOverlay::Preemphasis { .. } => {
-                    let w = ((area.0 as usize) * 75 / 100).max(50).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("Esc close", "esc"),
-                    ])
-                }
-                ActiveOverlay::CueImportReview { .. } => {
-                    let w = ((area.0 as usize) * 80 / 100).max(50).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 80 / 100).max(12).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("Enter accept", "enter"),
-                        ("Esc cancel", "esc"),
-                    ])
-                }
-                ActiveOverlay::GnudbSelect { .. } => {
-                    let w = ((area.0 as usize) * 70 / 100).max(40).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 60 / 100).max(8).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![
-                        ("Enter select", "enter"),
-                        ("Esc cancel", "esc"),
-                    ])
-                }
-                ActiveOverlay::GnudbReview(ref state) => {
-                    let w = ((area.0 as usize) * 85 / 100).max(50).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 85 / 100).max(14).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    if state.edit_input.is_some() {
-                        (Rect::new(x, y, w, h), vec![
-                            ("Enter confirm", "enter"),
+                    ],
+                )
+            }
+            ActiveOverlay::BulkRename(ref state) => {
+                let w = ((area.0 as usize) * 85 / 100)
+                    .max(60)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 85 / 100)
+                    .max(16)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                if state.focus == super::app::BulkRenameFocus::Template {
+                    (
+                        Rect::new(x, y, w, h),
+                        vec![
+                            ("Tab list", "tab"),
+                            ("Enter commit", "enter"),
                             ("Esc cancel", "esc"),
-                        ])
-                    } else {
-                        let mut pills = Vec::new();
-                        if state.origin_matches.is_some() {
-                            pills.push(("b back", "b"));
-                        }
-                        pills.extend_from_slice(&[
-                            ("Enter edit", "enter"),
-                            ("c fix-caps", "c"),
-                            ("a accept", "a"),
+                        ],
+                    )
+                } else {
+                    (
+                        Rect::new(x, y, w, h),
+                        vec![
+                            ("Tab tmpl", "tab"),
+                            ("e edit", "e"),
+                            ("c cue", "c"),
+                            ("C caps", "C"),
+                            ("Enter commit", "enter"),
                             ("Esc cancel", "esc"),
-                        ]);
-                        (Rect::new(x, y, w, h), pills)
-                    }
+                        ],
+                    )
                 }
-                ActiveOverlay::CtdbVerify(_) => {
-                    let w = ((area.0 as usize) * 70 / 100).max(50).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
-                }
-                ActiveOverlay::ArBatchReport { .. } => {
-                    let w = ((area.0 as usize) * 80 / 100).max(60).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 80 / 100).max(12).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
-                }
-                ActiveOverlay::AccurateRipVerify(ref state) => {
-                    let w = ((area.0 as usize) * 70 / 100).max(50).min(area.0 as usize - 2) as u16;
-                    let h = ((area.1 as usize) * 70 / 100).max(10).min(area.1 as usize - 2) as u16;
-                    let x = (area.0.saturating_sub(w)) / 2;
-                    let y = (area.1.saturating_sub(h)) / 2;
-                    let mut pills = vec![("Esc close", "esc")];
-                    let result = &state.pages[state.active_page].result;
-                    let has_unmatched = result.tracks.iter().any(|t|
-                        t.status == super::accuraterip::ArTrackStatus::Mismatch
-                    );
-                    if result.was_common_scan && has_unmatched {
-                        pills.push((":ar! full scan", ":ar!"));
+            }
+            ActiveOverlay::BatchList { .. } => {
+                let w = area.0.saturating_sub(8).min(100).max(40);
+                let h = area.1.saturating_sub(6).min(30).max(10);
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (
+                    Rect::new(x, y, w, h),
+                    vec![("d remove", "d"), ("Esc close", "esc")],
+                )
+            }
+            ActiveOverlay::Help { .. } => {
+                let w = ((area.0 as usize) * 70 / 100)
+                    .max(50)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 80 / 100)
+                    .max(12)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            }
+            ActiveOverlay::ErrorDetail { .. } => {
+                let w: u16 = 60;
+                let h: u16 = 12;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            }
+            ActiveOverlay::ItemInfo { .. } => {
+                let w: u16 = 70;
+                let h: u16 = 16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            }
+            ActiveOverlay::FileInput { .. } => {
+                let w: u16 = 60;
+                let h: u16 = 7;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (
+                    Rect::new(x, y, w, h),
+                    vec![("Enter confirm", "enter"), ("Esc cancel", "esc")],
+                )
+            }
+            ActiveOverlay::TextEdit { .. } => {
+                let w = area.0.saturating_sub(4).min(80);
+                let h: u16 = 7;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (
+                    Rect::new(x, y, w, h),
+                    vec![("Enter save", "enter"), ("Esc cancel", "esc")],
+                )
+            }
+            ActiveOverlay::Verify { .. } => {
+                let w = ((area.0 as usize) * 70 / 100)
+                    .max(40)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 70 / 100)
+                    .max(10)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            }
+            ActiveOverlay::BitCompare { .. } => {
+                let w = ((area.0 as usize) * 75 / 100)
+                    .max(50)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 70 / 100)
+                    .max(10)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            }
+            ActiveOverlay::Preemphasis { .. } => {
+                let w = ((area.0 as usize) * 75 / 100)
+                    .max(50)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 70 / 100)
+                    .max(10)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            }
+            ActiveOverlay::CueImportReview { .. } => {
+                let w = ((area.0 as usize) * 80 / 100)
+                    .max(50)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 80 / 100)
+                    .max(12)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (
+                    Rect::new(x, y, w, h),
+                    vec![("Enter accept", "enter"), ("Esc cancel", "esc")],
+                )
+            }
+            ActiveOverlay::GnudbSelect { .. } => {
+                let w = ((area.0 as usize) * 70 / 100)
+                    .max(40)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 60 / 100)
+                    .max(8)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (
+                    Rect::new(x, y, w, h),
+                    vec![("Enter select", "enter"), ("Esc cancel", "esc")],
+                )
+            }
+            ActiveOverlay::GnudbReview(ref state) => {
+                let w = ((area.0 as usize) * 85 / 100)
+                    .max(50)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 85 / 100)
+                    .max(14)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                if state.edit_input.is_some() {
+                    (
+                        Rect::new(x, y, w, h),
+                        vec![("Enter confirm", "enter"), ("Esc cancel", "esc")],
+                    )
+                } else {
+                    let mut pills = Vec::new();
+                    if state.origin_matches.is_some() {
+                        pills.push(("b back", "b"));
                     }
-                    if super::accuraterip::detect_uniform_offset(result).is_some() {
-                        pills.push((":ar-fix correct offset", ":ar-fix"));
-                    }
+                    pills.extend_from_slice(&[
+                        ("Enter edit", "enter"),
+                        ("c fix-caps", "c"),
+                        ("a accept", "a"),
+                        ("Esc cancel", "esc"),
+                    ]);
                     (Rect::new(x, y, w, h), pills)
                 }
-                ActiveOverlay::Confirmation { .. } => {
-                    // Already has button_map support — skip.
-                    return false;
-                }
-                _ => return false,
             }
-        };
+            ActiveOverlay::CtdbVerify(_) => {
+                let w = ((area.0 as usize) * 70 / 100)
+                    .max(50)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 70 / 100)
+                    .max(10)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            }
+            ActiveOverlay::ArBatchReport { .. } => {
+                let w = ((area.0 as usize) * 80 / 100)
+                    .max(60)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 80 / 100)
+                    .max(12)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            }
+            ActiveOverlay::AccurateRipVerify(ref state) => {
+                let w = ((area.0 as usize) * 70 / 100)
+                    .max(50)
+                    .min(area.0 as usize - 2) as u16;
+                let h = ((area.1 as usize) * 70 / 100)
+                    .max(10)
+                    .min(area.1 as usize - 2) as u16;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                let mut pills = vec![("Esc close", "esc")];
+                let result = &state.pages[state.active_page].result;
+                let has_unmatched = result
+                    .tracks
+                    .iter()
+                    .any(|t| t.status == super::accuraterip::ArTrackStatus::Mismatch);
+                if result.was_common_scan && has_unmatched {
+                    pills.push((":ar! full scan", ":ar!"));
+                }
+                if super::accuraterip::detect_uniform_offset(result).is_some() {
+                    pills.push((":ar-fix correct offset", ":ar-fix"));
+                }
+                (Rect::new(x, y, w, h), pills)
+            }
+            ActiveOverlay::Confirmation { .. } => {
+                // Already has button_map support — skip.
+                return false;
+            }
+            _ => return false,
+        }
+    };
 
-    let in_popup = mx >= popup.x && mx < popup.x + popup.width
-        && my >= popup.y && my < popup.y + popup.height;
+    let in_popup =
+        mx >= popup.x && mx < popup.x + popup.width && my >= popup.y && my < popup.y + popup.height;
 
     // Footer row = last row inside the popup border.
     let footer_y = popup.y + popup.height.saturating_sub(2);
@@ -5090,11 +5440,16 @@ fn handle_generic_overlay_mouse(
 
         // Left click in content area: GnudbSelect (click to select, double-click to confirm).
         MouseEventKind::Down(MouseButton::Left)
-            if in_popup && !on_footer
+            if in_popup
+                && !on_footer
                 && matches!(app.active_overlay, ActiveOverlay::GnudbSelect { .. }) =>
         {
-            if let ActiveOverlay::GnudbSelect { matches, mut selected, scroll, paths } =
-                std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+            if let ActiveOverlay::GnudbSelect {
+                matches,
+                mut selected,
+                scroll,
+                paths,
+            } = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
             {
                 let content_y = popup.y + 1;
                 if my >= content_y && my < footer_y {
@@ -5111,26 +5466,38 @@ fn handle_generic_overlay_mouse(
                             let origin = matches.clone();
                             tokio::spawn(async move {
                                 let result = super::gnudb::read_gnudb(&category, &disc_id).await;
-                                let _ = tx.send(AppMessage::GnudbReadComplete {
-                                    result, paths: paths_c, origin_matches: Some(origin),
-                                }).await;
+                                let _ = tx
+                                    .send(AppMessage::GnudbReadComplete {
+                                        result,
+                                        paths: paths_c,
+                                        origin_matches: Some(origin),
+                                    })
+                                    .await;
                             });
                             return true;
                         }
                         selected = clicked_row;
                     }
                 }
-                app.active_overlay = ActiveOverlay::GnudbSelect { matches, selected, scroll, paths };
+                app.active_overlay = ActiveOverlay::GnudbSelect {
+                    matches,
+                    selected,
+                    scroll,
+                    paths,
+                };
             }
             return true;
         }
 
         // Left click in content area: position cursor for GnudbReview.
         MouseEventKind::Down(MouseButton::Left)
-            if in_popup && !on_footer
+            if in_popup
+                && !on_footer
                 && matches!(app.active_overlay, ActiveOverlay::GnudbReview(_)) =>
         {
-            if let ActiveOverlay::GnudbReview(mut state) = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+            if let ActiveOverlay::GnudbReview(mut state) =
+                std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+            {
                 use super::app::GnudbRowKind;
                 let content_y = popup.y + 1; // below top border
                 let is_multi = state.pages.len() > 1;
@@ -5164,11 +5531,15 @@ fn handle_generic_overlay_mouse(
                         let clicked_row = (visual_row - row_offset) + state.scroll;
                         let page_rows = &state.pages[state.active_page].rows;
                         if clicked_row < page_rows.len()
-                            && !matches!(page_rows.get(clicked_row), Some(GnudbRowKind::TrackHeader { .. }))
+                            && !matches!(
+                                page_rows.get(clicked_row),
+                                Some(GnudbRowKind::TrackHeader { .. })
+                            )
                         {
                             // Double-click detection.
                             let now = std::time::Instant::now();
-                            let is_double = state.last_click
+                            let is_double = state
+                                .last_click
                                 .map(|(prev_row, prev_time)| {
                                     prev_row == clicked_row
                                         && now.duration_since(prev_time).as_millis() < 400
@@ -5198,9 +5569,8 @@ fn handle_generic_overlay_mouse(
                                     _ => None,
                                 };
                                 if let Some(val) = value {
-                                    state.edit_input = Some(
-                                        super::text_input::TextInputState::new(val),
-                                    );
+                                    state.edit_input =
+                                        Some(super::text_input::TextInputState::new(val));
                                 }
                                 state.last_click = None;
                             } else {
@@ -5216,7 +5586,8 @@ fn handle_generic_overlay_mouse(
 
         // Left click in content area: disc pill click for AccurateRipVerify.
         MouseEventKind::Down(MouseButton::Left)
-            if in_popup && !on_footer
+            if in_popup
+                && !on_footer
                 && matches!(app.active_overlay, ActiveOverlay::AccurateRipVerify(_)) =>
         {
             if let ActiveOverlay::AccurateRipVerify(mut state) =
@@ -5254,7 +5625,8 @@ fn handle_generic_overlay_mouse(
 
         // Left click in content area: disc pill click for CtdbVerify.
         MouseEventKind::Down(MouseButton::Left)
-            if in_popup && !on_footer
+            if in_popup
+                && !on_footer
                 && matches!(app.active_overlay, ActiveOverlay::CtdbVerify(_)) =>
         {
             if let ActiveOverlay::CtdbVerify(mut state) =
@@ -5328,7 +5700,9 @@ pub(super) fn build_metadata_row_context_menu(
 ) -> Vec<super::context_menu::ContextMenuEntry> {
     use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
     let mut entries: Vec<ContextMenuEntry> = Vec::new();
-    let is_synthetic = state.entries.get(row)
+    let is_synthetic = state
+        .entries
+        .get(row)
         .map(super::probe::is_synthetic_preview)
         .unwrap_or(false);
     if is_synthetic {
@@ -5339,7 +5713,9 @@ pub(super) fn build_metadata_row_context_menu(
             enabled: true,
         }));
     }
-    let pill = state.entries.get(row)
+    let pill = state
+        .entries
+        .get(row)
         .map(super::probe::mb_pill_state)
         .unwrap_or(super::probe::MbRevertPill::None);
     match pill {
@@ -5398,9 +5774,10 @@ pub(super) fn build_metadata_row_context_menu(
 /// Build the row-level context menu for CuePreview. `line_idx` is set
 /// when the right-click landed on a content line (0-based); it adds an
 /// "Edit this line" entry that carries the index in the action variant.
-fn build_cue_preview_context_menu(line_idx: Option<usize>, is_editing: bool)
-    -> Vec<super::context_menu::ContextMenuEntry>
-{
+fn build_cue_preview_context_menu(
+    line_idx: Option<usize>,
+    is_editing: bool,
+) -> Vec<super::context_menu::ContextMenuEntry> {
     use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
     let mut entries: Vec<ContextMenuEntry> = Vec::new();
     if is_editing {
@@ -5454,9 +5831,9 @@ fn build_cue_preview_context_menu(line_idx: Option<usize>, is_editing: bool)
 
 /// Build the context menu for the metadata-editor detail overlay
 /// (right-click while browsing per-file values).
-fn build_metadata_detail_context_menu(state: &super::app::MetadataEditorState)
-    -> Vec<super::context_menu::ContextMenuEntry>
-{
+fn build_metadata_detail_context_menu(
+    state: &super::app::MetadataEditorState,
+) -> Vec<super::context_menu::ContextMenuEntry> {
     use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
     let mut entries: Vec<ContextMenuEntry> = Vec::new();
     if let Some(entry) = state.entries.get(state.detail_field_idx) {
@@ -5494,11 +5871,7 @@ fn build_metadata_detail_context_menu(state: &super::app::MetadataEditorState)
 }
 
 /// Mouse handler for the CuePreview overlay.
-fn handle_cue_preview_mouse(
-    app: &mut AppState,
-    mouse: MouseEvent,
-    tx: &mpsc::Sender<AppMessage>,
-) {
+fn handle_cue_preview_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
     let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
         ActiveOverlay::CuePreview(s) => s,
         other => {
@@ -5510,8 +5883,12 @@ fn handle_cue_preview_mouse(
     let my = mouse.row;
 
     let area = crossterm::terminal::size().unwrap_or((80, 24));
-    let w = ((area.0 as u32 * 80 / 100) as u16).max(60).min(area.0.saturating_sub(2));
-    let h = ((area.1 as u32 * 80 / 100) as u16).max(15).min(area.1.saturating_sub(2));
+    let w = ((area.0 as u32 * 80 / 100) as u16)
+        .max(60)
+        .min(area.0.saturating_sub(2));
+    let h = ((area.1 as u32 * 80 / 100) as u16)
+        .max(15)
+        .min(area.1.saturating_sub(2));
     let x = (area.0.saturating_sub(w)) / 2;
     let y = (area.1.saturating_sub(h)) / 2;
     let in_popup = mx >= x && mx < x + w && my >= y && my < y + h;
@@ -5614,11 +5991,11 @@ fn handle_cue_preview_mouse(
                     let total = state.content.lines().count();
                     if idx < total {
                         let now = std::time::Instant::now();
-                        let is_double = state.last_click
+                        let is_double = state
+                            .last_click
                             .map(|(prev, t)| {
                                 prev == idx
-                                    && now.duration_since(t)
-                                        < std::time::Duration::from_millis(500)
+                                    && now.duration_since(t) < std::time::Duration::from_millis(500)
                             })
                             .unwrap_or(false);
                         if is_double {
@@ -5693,9 +6070,7 @@ fn handle_cue_preview_mouse(
 }
 
 /// Build the row-level context menu for the MbSelect picker.
-fn build_mb_select_context_menu()
-    -> Vec<super::context_menu::ContextMenuEntry>
-{
+fn build_mb_select_context_menu() -> Vec<super::context_menu::ContextMenuEntry> {
     use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
     vec![
         ContextMenuEntry::Item(ContextMenuItem {
@@ -5716,11 +6091,7 @@ fn build_mb_select_context_menu()
 /// Mouse handler for the MbSelect overlay. Handles row click (select),
 /// double-click (accept), right-click (context menu), footer pill clicks,
 /// and click-outside-to-cancel.
-fn handle_mb_select_mouse(
-    app: &mut AppState,
-    mouse: MouseEvent,
-    tx: &mpsc::Sender<AppMessage>,
-) {
+fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
     let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
         ActiveOverlay::MbSelect(s) => s,
         other => {
@@ -5733,8 +6104,12 @@ fn handle_mb_select_mouse(
 
     // Compute popup geometry (must mirror draw_mb_select).
     let area = crossterm::terminal::size().unwrap_or((80, 24));
-    let w = ((area.0 as u32 * 80 / 100) as u16).max(60).min(area.0.saturating_sub(2));
-    let h = ((area.1 as u32 * 70 / 100) as u16).max(12).min(area.1.saturating_sub(2));
+    let w = ((area.0 as u32 * 80 / 100) as u16)
+        .max(60)
+        .min(area.0.saturating_sub(2));
+    let h = ((area.1 as u32 * 70 / 100) as u16)
+        .max(12)
+        .min(area.1.saturating_sub(2));
     let x = (area.0.saturating_sub(w)) / 2;
     let y = (area.1.saturating_sub(h)) / 2;
     let in_popup = mx >= x && mx < x + w && my >= y && my < y + h;
@@ -5772,18 +6147,20 @@ fn handle_mb_select_mouse(
                     if idx < state.releases.len() {
                         // Double-click within ~500ms on the same row → accept.
                         let now = std::time::Instant::now();
-                        let is_double = state.last_click
+                        let is_double = state
+                            .last_click
                             .map(|(prev_idx, t)| {
                                 prev_idx == idx
-                                    && now.duration_since(t)
-                                        < std::time::Duration::from_millis(500)
+                                    && now.duration_since(t) < std::time::Duration::from_millis(500)
                             })
                             .unwrap_or(false);
                         state.selected = idx;
                         if is_double {
                             let releases = std::mem::take(&mut state.releases);
                             let paths = std::mem::take(&mut state.paths);
-                            super::event_loop::open_editor_with_mb_release(app, releases, idx, paths);
+                            super::event_loop::open_editor_with_mb_release(
+                                app, releases, idx, paths,
+                            );
                             return;
                         }
                         state.last_click = Some((idx, now));
@@ -5843,8 +6220,12 @@ fn handle_metadata_editor_mouse(
 
     // Compute overlay geometry (must match draw_metadata_editor).
     let area = crossterm::terminal::size().unwrap_or((80, 24));
-    let w = ((area.0 as usize) * 85 / 100).max(50).min(area.0 as usize - 2) as u16;
-    let h = ((area.1 as usize) * 85 / 100).max(14).min(area.1 as usize - 2) as u16;
+    let w = ((area.0 as usize) * 85 / 100)
+        .max(50)
+        .min(area.0 as usize - 2) as u16;
+    let h = ((area.1 as usize) * 85 / 100)
+        .max(14)
+        .min(area.1 as usize - 2) as u16;
     let popup_x = (area.0.saturating_sub(w)) / 2;
     let popup_y = (area.1.saturating_sub(h)) / 2;
     // Inner content area (inside border + footer).
@@ -5860,12 +6241,12 @@ fn handle_metadata_editor_mouse(
     let my = mouse.row;
 
     // Region checks.
-    let in_popup = mx >= popup_x && mx < popup_x + w
-        && my >= popup_y && my < popup_y + h;
-    let in_content = mx >= inner_x && mx < inner_x + inner_w
-        && my >= content_y && my < content_y + content_h as u16;
-    let in_footer = mx >= inner_x && mx < inner_x + inner_w
-        && my == footer_y;
+    let in_popup = mx >= popup_x && mx < popup_x + w && my >= popup_y && my < popup_y + h;
+    let in_content = mx >= inner_x
+        && mx < inner_x + inner_w
+        && my >= content_y
+        && my < content_y + content_h as u16;
+    let in_footer = mx >= inner_x && mx < inner_x + inner_w && my == footer_y;
 
     let overlay = app.active_overlay.clone();
     if let ActiveOverlay::MetadataEditor(mut state) = overlay {
@@ -5893,7 +6274,9 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
             MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::DetailEdit => {
-                let n = state.entries.get(state.detail_field_idx)
+                let n = state
+                    .entries
+                    .get(state.detail_field_idx)
                     .map(|e| e.per_file_values.len())
                     .unwrap_or(state.paths.len());
                 if state.detail_cursor + 1 < n {
@@ -5955,16 +6338,14 @@ fn handle_metadata_editor_mouse(
                         } else {
                             // Right-click on the "+ Add field..." line or
                             // empty space → simple add-field menu.
-                            let entries = vec![
-                                super::context_menu::ContextMenuEntry::Item(
-                                    super::context_menu::ContextMenuItem {
-                                        label: "Add new field".to_string(),
-                                        action: super::context_menu::ContextAction::MetadataAddField,
-                                        shortcut: None,
-                                        enabled: true,
-                                    },
-                                ),
-                            ];
+                            let entries = vec![super::context_menu::ContextMenuEntry::Item(
+                                super::context_menu::ContextMenuItem {
+                                    label: "Add new field".to_string(),
+                                    action: super::context_menu::ContextAction::MetadataAddField,
+                                    shortcut: None,
+                                    enabled: true,
+                                },
+                            )];
                             app.pending_metadata_editor = Some(state);
                             app.active_overlay = ActiveOverlay::ContextMenu {
                                 levels: vec![super::context_menu::MenuLevel::new(entries)],
@@ -6030,7 +6411,9 @@ fn handle_metadata_editor_mouse(
                     if detail_row >= header_offset {
                         let file_idx = detail_row - header_offset;
                         let field_idx = state.detail_field_idx;
-                        let n_files = state.entries.get(field_idx)
+                        let n_files = state
+                            .entries
+                            .get(field_idx)
                             .map(|e| e.per_file_values.len())
                             .unwrap_or(state.paths.len());
 
@@ -6038,9 +6421,12 @@ fn handle_metadata_editor_mouse(
                         if let Some(ref input) = state.detail_edit {
                             let new_val = input.text.clone();
                             if field_idx < state.entries.len() && state.detail_cursor < n_files {
-                                state.entries[field_idx].per_file_values[state.detail_cursor] = new_val;
-                                let all_same = state.entries[field_idx].per_file_values
-                                    .windows(2).all(|w| w[0] == w[1]);
+                                state.entries[field_idx].per_file_values[state.detail_cursor] =
+                                    new_val;
+                                let all_same = state.entries[field_idx]
+                                    .per_file_values
+                                    .windows(2)
+                                    .all(|w| w[0] == w[1]);
                                 state.entries[field_idx].is_mixed = !all_same;
                                 let new_display = if all_same {
                                     state.entries[field_idx].per_file_values[0].clone()
@@ -6056,16 +6442,19 @@ fn handle_metadata_editor_mouse(
                         if file_idx < n_files {
                             // Double-click detection.
                             let now = std::time::Instant::now();
-                            let is_double = state.last_click
-                                .map(|(prev, t)| prev == file_idx && now.duration_since(t).as_millis() < 400)
+                            let is_double = state
+                                .last_click
+                                .map(|(prev, t)| {
+                                    prev == file_idx && now.duration_since(t).as_millis() < 400
+                                })
                                 .unwrap_or(false);
 
                             if is_double && field_idx < state.entries.len() && !state.read_only {
                                 // Open inline edit for this file's value.
-                                let val = state.entries[field_idx].per_file_values[file_idx].clone();
-                                state.detail_edit = Some(
-                                    super::text_input::TextInputState::new(val),
-                                );
+                                let val =
+                                    state.entries[field_idx].per_file_values[file_idx].clone();
+                                state.detail_edit =
+                                    Some(super::text_input::TextInputState::new(val));
                                 state.detail_cursor = file_idx;
                                 state.last_click = None;
                             } else if is_double && state.read_only {
@@ -6124,7 +6513,8 @@ fn handle_metadata_editor_mouse(
                         // offset within the total display rows.
                         if let Some(ref mut input) = state.edit_input {
                             // Compute drop_scroll (must match draw_metadata_editor).
-                            let sanitized_tmp = input.text.replace("\r\n", "\n").replace('\r', "\n");
+                            let sanitized_tmp =
+                                input.text.replace("\r\n", "\n").replace('\r', "\n");
                             let mut cur_drow = 0usize;
                             let mut cur_dcol = 0usize;
                             // Map cursor to display row (simplified: walk sanitized).
@@ -6133,8 +6523,13 @@ fn handle_metadata_editor_mouse(
                                 // Compute sanitized cursor pos.
                                 let mut pcr = false;
                                 for (bi, c) in input.text.char_indices() {
-                                    if bi >= input.cursor { break; }
-                                    if c == '\r' { pcr = true; continue; }
+                                    if bi >= input.cursor {
+                                        break;
+                                    }
+                                    if c == '\r' {
+                                        pcr = true;
+                                        continue;
+                                    }
                                     if pcr {
                                         sp += if c == '\n' { 1 } else { 2 };
                                         pcr = false;
@@ -6142,23 +6537,35 @@ fn handle_metadata_editor_mouse(
                                     }
                                     sp += 1;
                                 }
-                                if pcr { sp += 1; }
+                                if pcr {
+                                    sp += 1;
+                                }
                                 let mut idx = 0usize;
                                 for c in sanitized_tmp.chars() {
-                                    if idx == sp { break; }
-                                    if c == '\n' { cur_drow += 1; cur_dcol = 0; }
-                                    else {
+                                    if idx == sp {
+                                        break;
+                                    }
+                                    if c == '\n' {
+                                        cur_drow += 1;
+                                        cur_dcol = 0;
+                                    } else {
                                         cur_dcol += 1;
-                                        if cur_dcol >= vm { cur_drow += 1; cur_dcol = 0; }
+                                        if cur_dcol >= vm {
+                                            cur_drow += 1;
+                                            cur_dcol = 0;
+                                        }
                                     }
                                     idx += 1;
                                 }
                             }
-                            let ds = if cur_drow < drop_rows { 0 } else { cur_drow - drop_rows + 1 };
+                            let ds = if cur_drow < drop_rows {
+                                0
+                            } else {
+                                cur_drow - drop_rows + 1
+                            };
                             let click_line = (click_visual_row - edit_visual_start) + ds;
-                            let click_col = (mx as usize).saturating_sub(
-                                inner_x as usize + key_col_w
-                            );
+                            let click_col =
+                                (mx as usize).saturating_sub(inner_x as usize + key_col_w);
                             // Walk the sanitized text to find which char position
                             // corresponds to (click_line, click_col).
                             let sanitized = input.text.replace("\r\n", "\n").replace('\r', "\n");
@@ -6229,7 +6636,8 @@ fn handle_metadata_editor_mouse(
 
                 // Double-click detection: same row within 400ms.
                 let now = std::time::Instant::now();
-                let is_double = state.last_click
+                let is_double = state
+                    .last_click
                     .map(|(prev_row, prev_time)| {
                         prev_row == row && now.duration_since(prev_time).as_millis() < 400
                     })
@@ -6253,9 +6661,8 @@ fn handle_metadata_editor_mouse(
                         } else if state.read_only {
                             app.set_status("read-only editor (SACD ISO)");
                         } else {
-                            state.edit_input = Some(
-                                super::text_input::TextInputState::new(entry.value.clone()),
-                            );
+                            state.edit_input =
+                                Some(super::text_input::TextInputState::new(entry.value.clone()));
                             state.phase = MetadataEditorPhase::InlineEdit;
                         }
                     }
@@ -6266,9 +6673,7 @@ fn handle_metadata_editor_mouse(
                     } else {
                         // Double-click on "+ Add field..."
                         state.cursor = state.entries.len();
-                        state.add_key_input = Some(
-                            super::text_input::TextInputState::empty(),
-                        );
+                        state.add_key_input = Some(super::text_input::TextInputState::empty());
                         state.phase = MetadataEditorPhase::AddingKey;
                     }
                     state.last_click = None;
@@ -6335,9 +6740,7 @@ fn handle_metadata_editor_mouse(
                     if state.detail_edit.is_none() {
                         match app.button_map.find_button_at(mx, my) {
                             Some(super::button_map::TuiButton::MetadataDetailRevert) => {
-                                if let Some(entry) =
-                                    state.entries.get_mut(state.detail_field_idx)
-                                {
+                                if let Some(entry) = state.entries.get_mut(state.detail_field_idx) {
                                     super::probe::toggle_mb_revert_field(entry);
                                 }
                                 state.dirty = super::probe::metadata_editor_has_changes(&state);
@@ -6345,9 +6748,7 @@ fn handle_metadata_editor_mouse(
                                 return;
                             }
                             Some(super::button_map::TuiButton::MetadataDetailRestore) => {
-                                if let Some(entry) =
-                                    state.entries.get_mut(state.detail_field_idx)
-                                {
+                                if let Some(entry) = state.entries.get_mut(state.detail_field_idx) {
                                     super::probe::restore_mb_proposed(entry);
                                 }
                                 state.dirty = super::probe::metadata_editor_has_changes(&state);
@@ -6371,7 +6772,8 @@ fn handle_metadata_editor_mouse(
                     }
                     if state.detail_edit.is_some() {
                         pills.extend_from_slice(&[
-                            ("Enter confirm", "enter"), ("Esc cancel", "esc"),
+                            ("Enter confirm", "enter"),
+                            ("Esc cancel", "esc"),
                         ]);
                     } else {
                         if let Some(entry) = state.entries.get(state.detail_field_idx) {
@@ -6379,9 +6781,7 @@ fn handle_metadata_editor_mouse(
                                 pills.push((":fix-caps", ":fix-caps"));
                             }
                         }
-                        pills.extend_from_slice(&[
-                            ("Enter edit", "enter"), ("Esc back", "esc"),
-                        ]);
+                        pills.extend_from_slice(&[("Enter edit", "enter"), ("Esc back", "esc")]);
                     }
                     // The renderer appends extra pills (revert/restore +
                     // a 4-char gap) after the dynamic pills when the
@@ -6404,10 +6804,18 @@ fn handle_metadata_editor_mouse(
                                 };
                                 // 4-char gap before the MB-action group + revert chunk + restore pill (" restore " = 9 chars)
                                 4 + revert_chunk + 9
-                            } else { 0 }
-                        } else { 0 }
-                    } else { 0 };
-                    if let Some(action) = footer_pill_hit_with_extra(&pills, extra_width, mx, inner_x, inner_w) {
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    if let Some(action) =
+                        footer_pill_hit_with_extra(&pills, extra_width, mx, inner_x, inner_w)
+                    {
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                             let cmd = super::command::parse_command(&action[1..]);
@@ -6417,7 +6825,10 @@ fn handle_metadata_editor_mouse(
                         let fake_key = match action {
                             "enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                             "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                            _ => { app.active_overlay = ActiveOverlay::MetadataEditor(state); return; }
+                            _ => {
+                                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                return;
+                            }
                         };
                         handle_metadata_editor_key(app, fake_key, &mut state, _tx);
                         if !matches!(app.active_overlay, ActiveOverlay::None) {
@@ -6428,10 +6839,8 @@ fn handle_metadata_editor_mouse(
                 } else if state.phase == MetadataEditorPhase::InlineEdit
                     || state.phase == MetadataEditorPhase::AddingKey
                 {
-                    let pills: &[(&str, &str)] = &[
-                        ("Enter confirm", "enter"),
-                        ("Esc cancel", "esc"),
-                    ];
+                    let pills: &[(&str, &str)] =
+                        &[("Enter confirm", "enter"), ("Esc cancel", "esc")];
                     if let Some(action) = footer_pill_hit(pills, mx, inner_x, inner_w) {
                         match action {
                             "enter" => {
@@ -6504,7 +6913,8 @@ fn footer_pill_hit_with_extra<'a>(
     row_w: u16,
 ) -> Option<&'a str> {
     // Total width matches what the renderer centers against.
-    let pills_w: usize = pills.iter()
+    let pills_w: usize = pills
+        .iter()
         .map(|(label, _)| label.chars().count() + 2)
         .sum::<usize>()
         + pills.len().saturating_sub(1);
@@ -6557,10 +6967,12 @@ fn ensure_detail_visible(state: &mut super::app::MetadataEditorState) {
 /// Recalculate the dirty flag by checking per-file values for changes.
 fn recalc_dirty(state: &mut super::app::MetadataEditorState) {
     state.dirty = !state.deleted.is_empty()
-        || state.entries.iter().any(|e|
-            e.per_file_values.iter().zip(e.per_file_originals.iter())
+        || state.entries.iter().any(|e| {
+            e.per_file_values
+                .iter()
+                .zip(e.per_file_originals.iter())
                 .any(|(v, o)| v != o)
-        );
+        });
 }
 
 /// Cascade direction for one level relative to its parent. Each level
@@ -6595,14 +7007,22 @@ fn choose_cascade_origin(
 
     match parent_dir {
         CascadeDir::Right => {
-            if fits_right { (right_x, CascadeDir::Right) }
-            else if fits_left { (left_x, CascadeDir::Left) }
-            else { (right_x, CascadeDir::Right) }
+            if fits_right {
+                (right_x, CascadeDir::Right)
+            } else if fits_left {
+                (left_x, CascadeDir::Left)
+            } else {
+                (right_x, CascadeDir::Right)
+            }
         }
         CascadeDir::Left => {
-            if fits_left { (left_x, CascadeDir::Left) }
-            else if fits_right { (right_x, CascadeDir::Right) }
-            else { (left_x, CascadeDir::Left) }
+            if fits_left {
+                (left_x, CascadeDir::Left)
+            } else if fits_right {
+                (right_x, CascadeDir::Right)
+            } else {
+                (left_x, CascadeDir::Left)
+            }
         }
     }
 }
@@ -6623,7 +7043,10 @@ pub fn context_menu_stack_rects<'a>(
     origin: (u16, u16),
     area_w: u16,
     area_h: u16,
-) -> (Vec<Rect>, Option<(&'a [super::context_menu::ContextMenuEntry], usize)>) {
+) -> (
+    Vec<Rect>,
+    Option<(&'a [super::context_menu::ContextMenuEntry], usize)>,
+) {
     use super::context_menu::{ContextMenuEntry, MAX_CONTEXT_MENU_DEPTH};
     let mut rects: Vec<Rect> = Vec::with_capacity(levels.len() + 1);
     if levels.is_empty() {
@@ -6648,7 +7071,8 @@ pub fn context_menu_stack_rects<'a>(
         let child_w = compute_menu_w(&levels[i].entries, area_w);
         let (child_x, dir) = choose_cascade_origin(parent_rect, child_w, area_w, parent_dir);
         let sub_y = parent_rect.y + sel_row + 1;
-        let r = context_menu_panel_rect(&levels[i].entries, (child_x, sub_y), area_w, area_h, false);
+        let r =
+            context_menu_panel_rect(&levels[i].entries, (child_x, sub_y), area_w, area_h, false);
         rects.push(r);
         dirs.push(dir);
     }
@@ -6660,7 +7084,9 @@ pub fn context_menu_stack_rects<'a>(
         let focused = &levels[levels.len() - 1];
         let entries = &focused.entries;
         let sel = focused.selected;
-        let selectable: Vec<usize> = entries.iter().enumerate()
+        let selectable: Vec<usize> = entries
+            .iter()
+            .enumerate()
             .filter_map(|(i, e)| match e {
                 ContextMenuEntry::Item(item) if item.enabled => Some(i),
                 ContextMenuEntry::Submenu { .. } => Some(i),
@@ -6673,9 +7099,11 @@ pub fn context_menu_stack_rects<'a>(
                 let parent_dir = *dirs.last().unwrap();
                 let sel_row = super::draw_overlays::selected_entry_row_pub(entries, sel);
                 let child_w = compute_menu_w(children, area_w);
-                let (pv_x, _pv_dir) = choose_cascade_origin(parent_rect, child_w, area_w, parent_dir);
+                let (pv_x, _pv_dir) =
+                    choose_cascade_origin(parent_rect, child_w, area_w, parent_dir);
                 let pv_y = parent_rect.y + sel_row + 1;
-                let pv_rect = context_menu_panel_rect(children, (pv_x, pv_y), area_w, area_h, false);
+                let pv_rect =
+                    context_menu_panel_rect(children, (pv_x, pv_y), area_w, area_h, false);
                 rects.push(pv_rect);
                 preview = Some((children.as_slice(), rects.len() - 1));
             }
@@ -6689,7 +7117,8 @@ pub fn context_menu_stack_rects<'a>(
     // — so the trigger looks at max(right) across all rects, not just
     // the deepest. The shift is bounded by min(x) across all rects so
     // no panel is pushed off-screen left.
-    let max_right = rects.iter()
+    let max_right = rects
+        .iter()
         .map(|r| r.x.saturating_add(r.width))
         .max()
         .unwrap_or(0);
@@ -6711,17 +7140,17 @@ pub fn context_menu_stack_rects<'a>(
 /// Mirrors the calculation inside [`context_menu_panel_rect`]; lifted
 /// so the directional cascade can know `child_w` before choosing the
 /// cascade origin.
-fn compute_menu_w(
-    entries: &[super::context_menu::ContextMenuEntry],
-    area_w: u16,
-) -> u16 {
+fn compute_menu_w(entries: &[super::context_menu::ContextMenuEntry], area_w: u16) -> u16 {
     use super::context_menu::ContextMenuEntry;
     let max_label_w: usize = entries
         .iter()
         .filter_map(|e| match e {
             ContextMenuEntry::Item(item) => {
-                let shortcut_w = item.shortcut.as_ref()
-                    .map(|s| s.chars().count() + 3).unwrap_or(0);
+                let shortcut_w = item
+                    .shortcut
+                    .as_ref()
+                    .map(|s| s.chars().count() + 3)
+                    .unwrap_or(0);
                 Some(item.label.chars().count() + shortcut_w)
             }
             ContextMenuEntry::Submenu { label, .. } => Some(label.chars().count() + 2),
@@ -6771,20 +7200,28 @@ fn context_menu_hit_test(
     let inner_y = panel.y + 1;
     let inner_w = panel.width.saturating_sub(2);
     let inner_h = panel.height.saturating_sub(2);
-    if mouse_x < inner_x || mouse_x >= inner_x + inner_w
-        || mouse_y < inner_y || mouse_y >= inner_y + inner_h
+    if mouse_x < inner_x
+        || mouse_x >= inner_x + inner_w
+        || mouse_y < inner_y
+        || mouse_y >= inner_y + inner_h
     {
         return None;
     }
     let row = (mouse_y - inner_y) as usize;
-    if row >= entries.len() { return None; }
+    if row >= entries.len() {
+        return None;
+    }
     // Check if this row is a selectable entry.
     let mut selectable_idx = 0usize;
     for (i, e) in entries.iter().enumerate() {
         let is_selectable = matches!(e, ContextMenuEntry::Item(item) if item.enabled)
             || matches!(e, ContextMenuEntry::Submenu { .. });
         if i == row {
-            return if is_selectable { Some(selectable_idx) } else { None };
+            return if is_selectable {
+                Some(selectable_idx)
+            } else {
+                None
+            };
         }
         if is_selectable {
             selectable_idx += 1;
@@ -6804,7 +7241,10 @@ fn context_menu_mouse_hover(app: &mut AppState, mx: u16, my: u16) {
         _ => return,
     };
 
-    let (rects, preview_owned): (Vec<Rect>, Option<(Vec<super::context_menu::ContextMenuEntry>, usize)>) = {
+    let (rects, preview_owned): (
+        Vec<Rect>,
+        Option<(Vec<super::context_menu::ContextMenuEntry>, usize)>,
+    ) = {
         let (r, p) = context_menu_stack_rects(&levels, origin, area.0, area.1);
         (r, p.map(|(es, idx)| (es.to_vec(), idx)))
     };
@@ -6874,7 +7314,9 @@ fn context_menu_mouse_click(
             let is_sel = matches!(e, ContextMenuEntry::Item(item) if item.enabled)
                 || matches!(e, ContextMenuEntry::Submenu { .. });
             if is_sel {
-                if count == selectable_idx { return Some(i); }
+                if count == selectable_idx {
+                    return Some(i);
+                }
                 count += 1;
             }
         }
@@ -6962,12 +7404,11 @@ fn handle_command_tab(
 
     // First Tab: compute candidates, pick an initial index that produces
     // a visible change (skipping any candidate identical to typed prefix).
-    let Some(mut state) = super::command::compute_completion(&input.text, input.cursor)
-    else {
+    let Some(mut state) = super::command::compute_completion(&input.text, input.cursor) else {
         return;
     };
-    let typed: String = input.text[state.prefix_start..input.cursor.min(input.text.len())]
-        .to_string();
+    let typed: String =
+        input.text[state.prefix_start..input.cursor.min(input.text.len())].to_string();
     let len = state.candidates.len();
     state.cursor = if direction >= 0 {
         // Forward: first candidate that isn't the typed prefix, else 0.
@@ -7089,8 +7530,7 @@ fn handle_bulk_rename_key(
                             .map(|i| (i + 1) % templates.len())
                             .unwrap_or(0);
                         let (name, tmpl) = &templates[idx];
-                        state.template_input =
-                            super::text_input::TextInputState::new(tmpl.clone());
+                        state.template_input = super::text_input::TextInputState::new(tmpl.clone());
                         state.rebuild_plan();
                         app.set_status(&format!("Template: {}", name));
                     }
@@ -7160,7 +7600,11 @@ fn execute_bulk_rename(
 ) {
     match crate::tui::rename_plan::execute_plan(&mut state.plan) {
         Ok(count) => {
-            app.set_status(&format!("Renamed {} file{}", count, if count == 1 { "" } else { "s" }));
+            app.set_status(&format!(
+                "Renamed {} file{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ));
             app.active_overlay = ActiveOverlay::None;
             // Refresh browse to reflect the renames.
             app.browse.refresh();
@@ -7377,16 +7821,14 @@ fn handle_batch_list_key(
 /// for the new file. The `cursor_info`/`cursor_metadata` fields are
 /// cleared immediately so the pane preview shows "probing…" until the
 /// `AudioProbeComplete` message arrives and refreshes them.
-fn move_batch_cursor(
-    app: &mut AppState,
-    new_cursor: usize,
-    _tx: &mpsc::Sender<AppMessage>,
-) {
+fn move_batch_cursor(app: &mut AppState, new_cursor: usize, _tx: &mpsc::Sender<AppMessage>) {
     let new_path = match &app.convert.source.mode {
         SourceMode::Batch { paths, .. } => paths.get(new_cursor).cloned(),
         _ => None,
     };
-    let Some(path) = new_path else { return; };
+    let Some(path) = new_path else {
+        return;
+    };
 
     if let SourceMode::Batch {
         cursor,
@@ -7421,9 +7863,13 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         _ => None,
     };
     let old_cursor_info = match &app.convert.source.mode {
-        SourceMode::Batch { cursor_info, cursor_metadata, .. } => {
-            cursor_info.as_ref().map(|info| (info.clone(), cursor_metadata.clone()))
-        }
+        SourceMode::Batch {
+            cursor_info,
+            cursor_metadata,
+            ..
+        } => cursor_info
+            .as_ref()
+            .map(|info| (info.clone(), cursor_metadata.clone())),
         _ => None,
     };
 
@@ -7447,14 +7893,14 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         // If this is the same file we already had info for, carry it over.
         if old_cursor_path.as_ref() == Some(&path) {
             if let Some((info, metadata)) = old_cursor_info {
-                app.convert.source.mode = SourceMode::from_single(
-                    path, Some(info), metadata,
-                );
+                app.convert.source.mode = SourceMode::from_single(path, Some(info), metadata);
                 return;
             }
         }
         app.convert.source.mode = SourceMode::from_single(
-            path.clone(), None, crate::tui::probe::SourceMetadata::default(),
+            path.clone(),
+            None,
+            crate::tui::probe::SourceMetadata::default(),
         );
         super::browse::spawn_audio_probe(path, tx.clone());
         return;
@@ -7466,7 +7912,10 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
 
     // If the cursor landed on the same file, carry over cached info.
     let need_probe = if let SourceMode::Batch {
-        cursor, cursor_info, cursor_metadata, ..
+        cursor,
+        cursor_info,
+        cursor_metadata,
+        ..
     } = &mut new_mode
     {
         *cursor = new_cursor;
@@ -7502,13 +7951,20 @@ fn apply_text_edit(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let trimmed = value.trim();
-    let value_opt = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+    let value_opt = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
 
     match target {
         TextEditTarget::DestPath => {
             // dest_path is not in the preset, don't mark modified
-            app.convert.output_options.dest_path =
-                if trimmed.is_empty() { None } else { Some(std::path::PathBuf::from(trimmed)) };
+            app.convert.output_options.dest_path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(trimmed))
+            };
         }
         TextEditTarget::FolderTemplate => {
             app.convert.output_options.folder_template = trimmed.to_string();
@@ -7565,10 +8021,10 @@ fn apply_text_edit(
                 app.set_status(format!("backup failed: {}", e));
                 return;
             }
-            if let Err(e) = app.db.begin_metadata_write(
-                &path.display().to_string(),
-                &backup.display().to_string(),
-            ) {
+            if let Err(e) = app
+                .db
+                .begin_metadata_write(&path.display().to_string(), &backup.display().to_string())
+            {
                 let _ = std::fs::remove_file(&backup);
                 app.set_status(format!("journal error: {}", e));
                 return;
@@ -7587,13 +8043,17 @@ fn apply_text_edit(
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::tui::probe::write_metadata_field(&write_path, write_field, &write_value)
-                }).await.unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
 
-                let _ = tx.send(AppMessage::MetadataWriteComplete {
-                    path,
-                    field: write_field,
-                    result,
-                }).await;
+                let _ = tx
+                    .send(AppMessage::MetadataWriteComplete {
+                        path,
+                        field: write_field,
+                        result,
+                    })
+                    .await;
             });
         }
         TextEditTarget::SaveRenameTemplate(template_str) => {
@@ -7619,8 +8079,7 @@ fn apply_text_edit(
                         Err(_) => {
                             // Bad path — keep original target, show error.
                             app.set_status("Invalid path (contains unsafe characters)");
-                            app.active_overlay =
-                                ActiveOverlay::BulkRename(rename_state);
+                            app.active_overlay = ActiveOverlay::BulkRename(rename_state);
                             return;
                         }
                     };
@@ -7662,11 +8121,7 @@ fn apply_text_edit(
 /// Public entry point for file ops triggered with a destination arg
 /// (`:cp /dest` or `:mv /dest`). Called from command.rs when the
 /// destination is provided inline rather than via the TextEdit picker.
-pub fn apply_file_op_pub(
-    app: &mut AppState,
-    target: TextEditTarget,
-    dest: &str,
-) {
+pub fn apply_file_op_pub(app: &mut AppState, target: TextEditTarget, dest: &str) {
     // We need a tx for probe_current after refresh, but we don't have
     // one in this context. Set a flag to probe on next event loop tick.
     match target {
@@ -7726,7 +8181,10 @@ fn do_file_op_inner(
         }
     }
     if !dest_dir.is_dir() {
-        app.set_status(format!("destination is not a directory: {}", dest_dir.display()));
+        app.set_status(format!(
+            "destination is not a directory: {}",
+            dest_dir.display()
+        ));
         return;
     }
 
@@ -7757,9 +8215,7 @@ fn do_file_op_inner(
             skipped += 1;
             continue;
         }
-        if let (Ok(src_canon), Ok(dst_canon)) =
-            (source.canonicalize(), target.canonicalize())
-        {
+        if let (Ok(src_canon), Ok(dst_canon)) = (source.canonicalize(), target.canonicalize()) {
             if src_canon == dst_canon {
                 skipped += 1;
                 continue;
@@ -7868,15 +8324,13 @@ fn move_path(source: &std::path::Path, target: &std::path::Path) -> Result<(), S
 
     // Verify: compare sizes (basic integrity check).
     if source.is_file() {
-        let src_size = std::fs::metadata(source)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let dst_size = std::fs::metadata(target)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let src_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+        let dst_size = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
         if src_size != dst_size {
             // Copy succeeded but sizes differ — don't delete original.
-            return Err("cross-device move: size mismatch after copy, original preserved".to_string());
+            return Err(
+                "cross-device move: size mismatch after copy, original preserved".to_string(),
+            );
         }
     }
 
@@ -7997,16 +8451,9 @@ fn handle_recent_overlay_key(app: &mut AppState, key: KeyEvent) {
             app.recent.close_overlay();
             // If the file no longer exists, drop it from history and report.
             if !path.exists() {
-                app.set_status(format!(
-                    "recent: file no longer exists: {}",
-                    path.display()
-                ));
+                app.set_status(format!("recent: file no longer exists: {}", path.display()));
                 // Drop the dead entry.
-                let idx = app
-                    .recent
-                    .entries
-                    .iter()
-                    .position(|e| e.path == path);
+                let idx = app.recent.entries.iter().position(|e| e.path == path);
                 if let Some(i) = idx {
                     app.recent.remove(i);
                 }
@@ -8128,9 +8575,8 @@ fn load_recent_as_source(app: &mut AppState, path: &std::path::Path) {
             app.convert.metadata.year = metadata.year.clone();
             // Loading from recent replaces the source — abandon any
             // pending batch from a previous :queue.
-            app.convert.source.mode = SourceMode::from_single(
-                path.to_path_buf(), Some(info), metadata,
-            );
+            app.convert.source.mode =
+                SourceMode::from_single(path.to_path_buf(), Some(info), metadata);
             app.set_status(format!(
                 "Loaded: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -8172,9 +8618,8 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
             app.convert.metadata.genre = metadata.genre.clone();
             app.convert.metadata.year = metadata.year.clone();
             // FileInput replaces the source — abandon any pending batch.
-            app.convert.source.mode = SourceMode::from_single(
-                path.to_path_buf(), Some(info), metadata,
-            );
+            app.convert.source.mode =
+                SourceMode::from_single(path.to_path_buf(), Some(info), metadata);
             app.set_status(format!(
                 "Loaded: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -8201,10 +8646,8 @@ fn execute_confirm_action(
             // Discard parked editor (and its edits); transition back
             // to MbSelect with the cached release list + paths.
             app.pending_metadata_editor = None;
-            let mut mb_state = super::app::MbSelectState::new(
-                cache.releases.clone(),
-                cache.paths.clone(),
-            );
+            let mut mb_state =
+                super::app::MbSelectState::new(cache.releases.clone(), cache.paths.clone());
             mb_state.selected = cache.selected;
             app.active_overlay = ActiveOverlay::MbSelect(Box::new(mb_state));
             app.set_status(":mb-back: pick a different release".to_string());
@@ -8273,13 +8716,20 @@ fn execute_confirm_action(
             let tx = tx.clone();
             app.set_status("Applying offset correction...".to_string());
             tokio::spawn(async move {
-                let result = super::accuraterip::apply_offset_correction(
-                    &paths, offset, tx.clone(),
-                ).await;
-                let _ = tx.send(AppMessage::OffsetCorrectionComplete { result }).await;
+                let result =
+                    super::accuraterip::apply_offset_correction(&paths, offset, tx.clone()).await;
+                let _ = tx
+                    .send(AppMessage::OffsetCorrectionComplete { result })
+                    .await;
             });
         }
-        ConfirmAction::CtdbRepair { paths, parity_url, npar, offset, expected_crcs } => {
+        ConfirmAction::CtdbRepair {
+            paths,
+            parity_url,
+            npar,
+            offset,
+            expected_crcs,
+        } => {
             let paths = paths.clone();
             let parity_url = parity_url.clone();
             let npar = *npar;
@@ -8289,12 +8739,24 @@ fn execute_confirm_action(
             app.set_status("CTDB repair: starting...".to_string());
             tokio::spawn(async move {
                 let result = super::ctdb::repair_album(
-                    &paths, &parity_url, npar, offset, &expected_crcs, tx.clone(),
-                ).await;
+                    &paths,
+                    &parity_url,
+                    npar,
+                    offset,
+                    &expected_crcs,
+                    tx.clone(),
+                )
+                .await;
                 let _ = tx.send(AppMessage::CtdbRepairComplete { result }).await;
             });
         }
-        ConfirmAction::CtdbRepairSingleImage { info, parity_url, npar, offset, expected_crcs } => {
+        ConfirmAction::CtdbRepairSingleImage {
+            info,
+            parity_url,
+            npar,
+            offset,
+            expected_crcs,
+        } => {
             let info = info.clone();
             let parity_url = parity_url.clone();
             let npar = *npar;
@@ -8304,8 +8766,14 @@ fn execute_confirm_action(
             app.set_status("CTDB repair: starting (single image)...".to_string());
             tokio::spawn(async move {
                 let result = super::ctdb::repair_single_image(
-                    &info, &parity_url, npar, offset, &expected_crcs, tx.clone(),
-                ).await;
+                    &info,
+                    &parity_url,
+                    npar,
+                    offset,
+                    &expected_crcs,
+                    tx.clone(),
+                )
+                .await;
                 let _ = tx.send(AppMessage::CtdbRepairComplete { result }).await;
             });
         }
@@ -8336,15 +8804,39 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
             if file_path.is_file() {
                 // Check compound tar extensions first, then single extensions.
                 let is_compound_tar = super::browse::is_tar_compound_pub(file_path);
-                let is_known = is_compound_tar || file_path.extension().map(|ext| {
-                    let e = ext.to_string_lossy().to_lowercase();
-                    matches!(e.as_str(),
-                        "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "tgz" | "tbz2" | "txz"
-                        | "flac" | "wav" | "aiff" | "aif" | "wv" | "mp3" | "m4a" | "aac" | "opus" | "ogg"
-                    )
-                }).unwrap_or(false);
+                let is_known = is_compound_tar
+                    || file_path
+                        .extension()
+                        .map(|ext| {
+                            let e = ext.to_string_lossy().to_lowercase();
+                            matches!(
+                                e.as_str(),
+                                "7z" | "zip"
+                                    | "rar"
+                                    | "tar"
+                                    | "iso"
+                                    | "cab"
+                                    | "tgz"
+                                    | "tbz2"
+                                    | "txz"
+                                    | "flac"
+                                    | "wav"
+                                    | "aiff"
+                                    | "aif"
+                                    | "wv"
+                                    | "mp3"
+                                    | "m4a"
+                                    | "aac"
+                                    | "opus"
+                                    | "ogg"
+                            )
+                        })
+                        .unwrap_or(false);
                 if is_known {
-                    match app.manager.add_file_blocking(file_path.to_path_buf(), options.clone()) {
+                    match app
+                        .manager
+                        .add_file_blocking(file_path.to_path_buf(), options.clone())
+                    {
                         Ok(_) => count += 1,
                         Err(_) => errors += 1,
                     }
@@ -8358,7 +8850,10 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
         }
     } else {
         match app.manager.add_file_blocking(path.to_path_buf(), options) {
-            Ok(_) => app.set_status(format!("Added: {}", path.file_name().unwrap_or_default().to_string_lossy())),
+            Ok(_) => app.set_status(format!(
+                "Added: {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )),
             Err(e) => app.set_status(format!("Error: {}", e)),
         }
     }
@@ -8368,11 +8863,15 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
 
 fn start_conversion(app: &mut AppState, tx: mpsc::Sender<AppMessage>) {
     // Check for not-configured items (queue-screen-specific message)
-    let not_configured = app.items_snapshot.iter()
+    let not_configured = app
+        .items_snapshot
+        .iter()
         .filter(|i| matches!(i.status, ConversionStatus::NotConfigured))
         .count();
     if not_configured > 0 {
-        let queued = app.items_snapshot.iter()
+        let queued = app
+            .items_snapshot
+            .iter()
             .filter(|i| matches!(i.status, ConversionStatus::Queued))
             .count();
         if queued == 0 {
@@ -8415,8 +8914,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // Generic overlay mouse: click-outside-to-close + footer pill clicks
     // for all overlays (except MetadataEditor which has its own handler,
     // and ContextMenu which has its own hover/click system).
-    if !matches!(app.active_overlay, ActiveOverlay::None | ActiveOverlay::ContextMenu { .. })
-        || app.preset.overlay_open
+    if !matches!(
+        app.active_overlay,
+        ActiveOverlay::None | ActiveOverlay::ContextMenu { .. }
+    ) || app.preset.overlay_open
         || app.recent.overlay_open
         || app.bookmarks.overlay_open
     {
@@ -8442,7 +8943,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     }
 
     // Scroll wheel: ignore while any overlay is open.
-    if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
         if !matches!(app.active_overlay, ActiveOverlay::None) {
             return;
         }
@@ -8562,7 +9066,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // If wizard is active, forward to wizard
     if app.current_screen == AppScreen::Wizard {
         if let Some(wizard) = &mut app.wizard {
-            let button_id = app.wizard_mouse_areas.as_ref()
+            let button_id = app
+                .wizard_mouse_areas
+                .as_ref()
                 .and_then(|areas| areas.get_button_at(x, y));
             wizard.handle_mouse(mouse, button_id);
 
@@ -8576,7 +9082,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 if let Ok(mut q) = queue.try_write() {
                     let has_selected = q.all_items().iter().any(|i| i.selected);
                     for item in q.all_items_mut() {
-                        if has_selected && !item.selected { continue; }
+                        if has_selected && !item.selected {
+                            continue;
+                        }
                         match item.status {
                             ConversionStatus::NotConfigured
                             | ConversionStatus::Queued
@@ -8644,19 +9152,17 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
 
             // ── Convert screen: tab bar ──
-            TuiButton::Tab(n) => {
-                match n {
-                    1 => {
-                        app.current_screen = AppScreen::Browse;
-                        app.browse.probe_current_with_db(tx, Some(&app.db));
-                    }
-                    2 => app.current_screen = AppScreen::Library,
-                    3 => app.current_screen = AppScreen::Convert,
-                    4 => app.current_screen = AppScreen::Queue,
-                    5 => app.current_screen = AppScreen::Config,
-                    _ => {}
+            TuiButton::Tab(n) => match n {
+                1 => {
+                    app.current_screen = AppScreen::Browse;
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                 }
-            }
+                2 => app.current_screen = AppScreen::Library,
+                3 => app.current_screen = AppScreen::Convert,
+                4 => app.current_screen = AppScreen::Queue,
+                5 => app.current_screen = AppScreen::Config,
+                _ => {}
+            },
 
             // ── Convert screen: preset bar ──
             TuiButton::PresetsButton => {
@@ -8690,7 +9196,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
             // ── Convert screen: editable text fields ──
             TuiButton::DestPathField => {
-                let initial = app.convert.output_options.dest_path
+                let initial = app
+                    .convert
+                    .output_options
+                    .dest_path
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
@@ -8947,14 +9456,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     // Detect double-click within the Ctrl path using last_browse_click.
                     const DCLICK_MS: u64 = 500;
                     let now = std::time::Instant::now();
-                    let is_ctrl_double = app.last_browse_click.as_ref()
+                    let is_ctrl_double = app
+                        .last_browse_click
+                        .as_ref()
                         .filter(|(p, _)| *p == clicked_path)
                         .map(|(_, t)| now.duration_since(*t).as_millis() < DCLICK_MS as u128)
                         .unwrap_or(false);
 
                     if is_ctrl_double {
                         // ── Ctrl+double-click: range-select from anchor to here ──
-                        let anchor_idx = app.browse.multi_select_anchor.as_ref()
+                        let anchor_idx = app
+                            .browse
+                            .multi_select_anchor
+                            .as_ref()
                             .and_then(|p| app.browse.entries.iter().position(|e| e.path == *p))
                             .unwrap_or(idx);
                         let lo = anchor_idx.min(idx);
@@ -9031,10 +9545,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                             // Schedule a rename for +OPEN_MS. A subsequent
                             // click within that window will cancel it (→ open).
                             // Don't schedule for ParentDir.
-                            if !matches!(
-                                app.browse.entries[idx].kind,
-                                EntryKind::ParentDir
-                            ) {
+                            if !matches!(app.browse.entries[idx].kind, EntryKind::ParentDir) {
                                 app.pending_browse_rename = Some((
                                     clicked_path.clone(),
                                     now + std::time::Duration::from_millis(OPEN_MS),
@@ -9097,8 +9608,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
             TuiButton::BrowseSearchSort => {
-                let tag_mode = matches!(app.browse.search.mode,
-                    super::browse::SearchMode::Tags | super::browse::SearchMode::Both);
+                let tag_mode = matches!(
+                    app.browse.search.mode,
+                    super::browse::SearchMode::Tags | super::browse::SearchMode::Both
+                );
                 app.browse.search.sort = app.browse.search.sort.cycle_with_mode(tag_mode);
                 app.browse.search.sort_dir = match app.browse.search.sort {
                     super::browse::SearchSort::Score => super::browse::SortDir::Desc,
@@ -9159,9 +9672,9 @@ mod phase4_tests {
     //! CUESHEET round-trip. The functions under test are private to
     //! this module, so the tests live inline.
 
-    use super::*;
+    use super::super::app::{MetadataEditorPhase, MetadataEditorState};
     use super::super::probe::TagEntry;
-    use super::super::app::{MetadataEditorState, MetadataEditorPhase};
+    use super::*;
     use lofty::tag::ItemKey;
 
     fn entry(key: &str, item_key: ItemKey, vals: &[&str], origs: &[&str]) -> TagEntry {
@@ -9170,7 +9683,9 @@ mod phase4_tests {
         let all_same = v.windows(2).all(|w| w[0] == w[1]);
         let value = if v.len() > 1 && !all_same {
             "<multiple values>".to_string()
-        } else { v.first().cloned().unwrap_or_default() };
+        } else {
+            v.first().cloned().unwrap_or_default()
+        };
         let original = o.first().cloned().unwrap_or_default();
         TagEntry {
             display_key: key.to_string(),
@@ -9215,8 +9730,7 @@ mod phase4_tests {
     }
 
     /// CUE template for a 3-track image used across regen tests.
-    const CUE_TEMPLATE: &str =
-        "TITLE \"Old Album\"\n\
+    const CUE_TEMPLATE: &str = "TITLE \"Old Album\"\n\
          PERFORMER \"Old Artist\"\n\
          REM DATE \"1977\"\n\
          FILE \"album.flac\" FLAC\n\
@@ -9237,24 +9751,37 @@ mod phase4_tests {
 
     #[test]
     fn apply_embedded_cuesheet_grows_title_to_per_track_dim() {
-        let mut entries = vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
-        ];
+        let mut entries = vec![entry(
+            "CUESHEET",
+            ItemKey::Unknown("CUESHEET".into()),
+            &[CUE_TEMPLATE],
+            &[CUE_TEMPLATE],
+        )];
         apply_embedded_cuesheet_per_track(&mut entries);
-        let t = entries.iter().find(|e| e.display_key == "TITLE").expect("TITLE created");
+        let t = entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .expect("TITLE created");
         assert_eq!(t.per_file_values, vec!["Track 1", "Track 2", "Track 3"]);
         assert_eq!(t.per_file_originals, vec!["Track 1", "Track 2", "Track 3"]);
-        assert!(t.is_mixed, "three differing per-track titles must mark mixed");
-        let a = entries.iter().find(|e| e.display_key == "ARTIST").expect("ARTIST created");
-        assert_eq!(a.per_file_values, vec!["Old Artist", "Old Artist", "Old Artist"]);
+        assert!(
+            t.is_mixed,
+            "three differing per-track titles must mark mixed"
+        );
+        let a = entries
+            .iter()
+            .find(|e| e.display_key == "ARTIST")
+            .expect("ARTIST created");
+        assert_eq!(
+            a.per_file_values,
+            vec!["Old Artist", "Old Artist", "Old Artist"]
+        );
         assert!(!a.is_mixed, "uniform per-track artists not mixed");
     }
 
     #[test]
     fn apply_embedded_cuesheet_skips_when_no_cuesheet_entry() {
-        let mut entries = vec![
-            entry("ALBUM", ItemKey::AlbumTitle, &["X"], &["X"]),
-        ];
+        let mut entries = vec![entry("ALBUM", ItemKey::AlbumTitle, &["X"], &["X"])];
         apply_embedded_cuesheet_per_track(&mut entries);
         // No TITLE / ARTIST / ISRC entries created.
         assert!(entries.iter().all(|e| e.display_key == "ALBUM"));
@@ -9263,9 +9790,12 @@ mod phase4_tests {
     #[test]
     fn apply_embedded_cuesheet_skips_single_track_cue() {
         let single_track = "TITLE \"X\"\nFILE \"a.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"X\"\n    INDEX 01 00:00:00\n";
-        let mut entries = vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[single_track], &[single_track]),
-        ];
+        let mut entries = vec![entry(
+            "CUESHEET",
+            ItemKey::Unknown("CUESHEET".into()),
+            &[single_track],
+            &[single_track],
+        )];
         apply_embedded_cuesheet_per_track(&mut entries);
         // Single-track CUE: no point growing TITLE per-track.
         assert!(entries.iter().find(|e| e.display_key == "TITLE").is_none());
@@ -9277,10 +9807,18 @@ mod phase4_tests {
     fn regen_skips_when_nothing_dirty() {
         // CUESHEET present, TITLE per-track but values match originals.
         let mut state = single_image_state(vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
-            entry("TITLE", ItemKey::TrackTitle,
+            entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[CUE_TEMPLATE],
+                &[CUE_TEMPLATE],
+            ),
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
                 &["Track 1", "Track 2", "Track 3"],
-                &["Track 1", "Track 2", "Track 3"]),
+                &["Track 1", "Track 2", "Track 3"],
+            ),
         ]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
         assert!(!result, "Nothing dirty → no regen");
@@ -9289,16 +9827,31 @@ mod phase4_tests {
     #[test]
     fn regen_per_track_edit_writes_new_cue() {
         let mut state = single_image_state(vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
-            entry("TITLE", ItemKey::TrackTitle,
+            entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[CUE_TEMPLATE],
+                &[CUE_TEMPLATE],
+            ),
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
                 &["Track 1", "EDITED", "Track 3"],
-                &["Track 1", "Track 2", "Track 3"]),
+                &["Track 1", "Track 2", "Track 3"],
+            ),
         ]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
         assert!(result, "per-track edit → regen ran");
-        let cue_idx = state.entries.iter().position(|e| e.display_key == "CUESHEET").unwrap();
+        let cue_idx = state
+            .entries
+            .iter()
+            .position(|e| e.display_key == "CUESHEET")
+            .unwrap();
         let new_cue = &state.entries[cue_idx].per_file_values[0];
-        assert!(new_cue.contains("TITLE \"EDITED\""), "regenerated CUE must include the edited title");
+        assert!(
+            new_cue.contains("TITLE \"EDITED\""),
+            "regenerated CUE must include the edited title"
+        );
         assert!(new_cue.contains("TITLE \"Track 1\""));
         assert!(new_cue.contains("TITLE \"Track 3\""));
         // INDEX timestamps must be preserved from the parsed template.
@@ -9312,14 +9865,26 @@ mod phase4_tests {
         // CUESHEET present (3-track template); ALBUM dirty (changed
         // from "Old Album" to "New Album"); no per-track dirt.
         let mut state = single_image_state(vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
+            entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[CUE_TEMPLATE],
+                &[CUE_TEMPLATE],
+            ),
             entry("ALBUM", ItemKey::AlbumTitle, &["New Album"], &["Old Album"]),
         ]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
         assert!(result, "album-level dirt with CUESHEET → regen ran");
-        let cue_idx = state.entries.iter().position(|e| e.display_key == "CUESHEET").unwrap();
+        let cue_idx = state
+            .entries
+            .iter()
+            .position(|e| e.display_key == "CUESHEET")
+            .unwrap();
         let new_cue = &state.entries[cue_idx].per_file_values[0];
-        assert!(new_cue.contains("TITLE \"New Album\""), "β re-derive must update CUE album title");
+        assert!(
+            new_cue.contains("TITLE \"New Album\""),
+            "β re-derive must update CUE album title"
+        );
         // Track titles preserved (no per-track override).
         assert!(new_cue.contains("TITLE \"Track 1\""));
         assert!(new_cue.contains("TITLE \"Track 2\""));
@@ -9329,11 +9894,12 @@ mod phase4_tests {
     fn regen_refuses_per_track_dirty_without_cuesheet() {
         // Per-track TITLE differs from originals, but no CUESHEET
         // anchor exists. Must refuse with status.
-        let mut state = single_image_state(vec![
-            entry("TITLE", ItemKey::TrackTitle,
-                &["a", "EDITED", "c"],
-                &["a", "b", "c"]),
-        ]);
+        let mut state = single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["a", "EDITED", "c"],
+            &["a", "b", "c"],
+        )]);
         let result = regenerate_cuesheet_for_save(&mut state);
         assert!(result.is_err(), "per-track dirt + no CUESHEET → Err");
         assert!(result.unwrap_err().contains("without an embedded CUESHEET"));
@@ -9343,21 +9909,35 @@ mod phase4_tests {
     fn regen_album_only_dirty_without_cuesheet_is_noop() {
         // No CUESHEET; only ALBUM dirty. Multi-file or single-file
         // editor without an embedded CUE — normal save path applies.
-        let mut state = single_image_state(vec![
-            entry("ALBUM", ItemKey::AlbumTitle, &["New"], &["Old"]),
-        ]);
+        let mut state = single_image_state(vec![entry(
+            "ALBUM",
+            ItemKey::AlbumTitle,
+            &["New"],
+            &["Old"],
+        )]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
-        assert!(!result, "album-only dirt without CUESHEET → Ok(false), normal save");
+        assert!(
+            !result,
+            "album-only dirt without CUESHEET → Ok(false), normal save"
+        );
     }
 
     #[test]
     fn regen_refuses_track_count_divergence() {
         // CUESHEET has 3 tracks, TITLE has dim 5 → divergence.
         let mut state = single_image_state(vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
-            entry("TITLE", ItemKey::TrackTitle,
+            entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[CUE_TEMPLATE],
+                &[CUE_TEMPLATE],
+            ),
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
                 &["t1", "t2", "t3", "t4", "t5"],
-                &["", "", "", "", ""]),
+                &["", "", "", "", ""],
+            ),
         ]);
         let result = regenerate_cuesheet_for_save(&mut state);
         assert!(result.is_err());
@@ -9369,10 +9949,18 @@ mod phase4_tests {
     #[test]
     fn regen_refuses_when_cuesheet_marked_deleted_with_per_track_dirty() {
         let mut state = single_image_state(vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
-            entry("TITLE", ItemKey::TrackTitle,
+            entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[CUE_TEMPLATE],
+                &[CUE_TEMPLATE],
+            ),
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
                 &["Track 1", "EDITED", "Track 3"],
-                &["Track 1", "Track 2", "Track 3"]),
+                &["Track 1", "Track 2", "Track 3"],
+            ),
         ]);
         state.deleted.push(0); // CUESHEET marked deleted
         let result = regenerate_cuesheet_for_save(&mut state);
@@ -9386,10 +9974,13 @@ mod phase4_tests {
         // a Phase-5-failure; user shouldn't normally see this state
         // but defensive check guards against silent data loss).
         let mut state = single_image_state(vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[""], &[""]),
-            entry("TITLE", ItemKey::TrackTitle,
-                &["a", "EDITED"],
-                &["a", "b"]),
+            entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[""],
+                &[""],
+            ),
+            entry("TITLE", ItemKey::TrackTitle, &["a", "EDITED"], &["a", "b"]),
         ]);
         let result = regenerate_cuesheet_for_save(&mut state);
         assert!(result.is_err());
@@ -9403,27 +9994,49 @@ mod phase4_tests {
         // function must parse VALUES, not ORIGINALS, otherwise it'd
         // see empty tracks and refuse on per-track dirt.
         let mut state = single_image_state(vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[""]),
-            entry("TITLE", ItemKey::TrackTitle,
+            entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[CUE_TEMPLATE],
+                &[""],
+            ),
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
                 &["Track 1", "EDITED", "Track 3"],
-                &["", "", ""]),
+                &["", "", ""],
+            ),
         ]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
-        assert!(result, "freshly-created CUESHEET (originals empty) → regen succeeds via values[0]");
+        assert!(
+            result,
+            "freshly-created CUESHEET (originals empty) → regen succeeds via values[0]"
+        );
     }
 
     #[test]
     fn regen_isrc_per_track_override_lands_in_cue() {
         let mut state = single_image_state(vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[CUE_TEMPLATE], &[CUE_TEMPLATE]),
-            entry("ISRC", ItemKey::Isrc,
+            entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[CUE_TEMPLATE],
+                &[CUE_TEMPLATE],
+            ),
+            entry(
+                "ISRC",
+                ItemKey::Isrc,
                 &["USRC0000001", "USRC0000002", "USRC0000003"],
-                &["", "", ""]),
+                &["", "", ""],
+            ),
         ]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
         assert!(result);
-        let new_cue = &state.entries.iter()
-            .find(|e| e.display_key == "CUESHEET").unwrap()
+        let new_cue = &state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
+            .unwrap()
             .per_file_values[0];
         assert!(new_cue.contains("ISRC USRC0000001"));
         assert!(new_cue.contains("ISRC USRC0000002"));
@@ -9439,8 +10052,7 @@ mod phase4_tests {
     }
 
     /// Multi-track single-image CUE used as the well-formed input.
-    const SIDECAR_3_TRACK_SINGLE_IMAGE: &str =
-        "TITLE \"Album\"\n\
+    const SIDECAR_3_TRACK_SINGLE_IMAGE: &str = "TITLE \"Album\"\n\
          FILE \"image.flac\" FLAC\n\
            TRACK 01 AUDIO\n\
              TITLE \"T1\"\n\
@@ -9458,14 +10070,18 @@ mod phase4_tests {
         write_sidecar(td.path(), "album.cue", SIDECAR_3_TRACK_SINGLE_IMAGE);
         let audio = td.path().join("album.flac");
 
-        let mut entries: Vec<TagEntry> = vec![
-            entry("ALBUM", ItemKey::AlbumTitle, &["Album"], &["Album"]),
-        ];
+        let mut entries: Vec<TagEntry> =
+            vec![entry("ALBUM", ItemKey::AlbumTitle, &["Album"], &["Album"])];
         inject_sidecar_cuesheet_if_present(&mut entries, &audio);
 
-        let cue = entries.iter().find(|e| e.display_key == "CUESHEET")
+        let cue = entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
             .expect("synthetic CUESHEET injected");
-        assert_eq!(cue.per_file_values, vec![SIDECAR_3_TRACK_SINGLE_IMAGE.to_string()]);
+        assert_eq!(
+            cue.per_file_values,
+            vec![SIDECAR_3_TRACK_SINGLE_IMAGE.to_string()]
+        );
         // originals=="" → save loop will write a fresh embedded tag.
         assert_eq!(cue.per_file_originals, vec!["".to_string()]);
         assert!(cue.is_binary);
@@ -9479,15 +10095,20 @@ mod phase4_tests {
         let audio = td.path().join("album.flac");
 
         let existing_embedded = "TITLE \"Embedded\"\nFILE \"x\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"E1\"\n    INDEX 01 00:00:00\n";
-        let mut entries: Vec<TagEntry> = vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()),
-                &[existing_embedded], &[existing_embedded]),
-        ];
+        let mut entries: Vec<TagEntry> = vec![entry(
+            "CUESHEET",
+            ItemKey::Unknown("CUESHEET".into()),
+            &[existing_embedded],
+            &[existing_embedded],
+        )];
         let before_len = entries.len();
         inject_sidecar_cuesheet_if_present(&mut entries, &audio);
         assert_eq!(entries.len(), before_len, "no entry added");
         // Existing CUESHEET unchanged.
-        let cue = entries.iter().find(|e| e.display_key == "CUESHEET").unwrap();
+        let cue = entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
+            .unwrap();
         assert_eq!(cue.per_file_values, vec![existing_embedded.to_string()]);
     }
 
@@ -9496,8 +10117,7 @@ mod phase4_tests {
         // Track-by-track structure: each TRACK has its own FILE,
         // INDEX 01 resets per file. Not safe to embed against a
         // single-image audio.
-        let track_by_track =
-            "TITLE \"Album\"\n\
+        let track_by_track = "TITLE \"Album\"\n\
              FILE \"track01.flac\" WAVE\n\
                TRACK 01 AUDIO\n\
                  INDEX 01 00:00:00\n\
@@ -9510,7 +10130,10 @@ mod phase4_tests {
 
         let mut entries: Vec<TagEntry> = vec![];
         inject_sidecar_cuesheet_if_present(&mut entries, &audio);
-        assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
+        assert!(entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
+            .is_none());
     }
 
     #[test]
@@ -9522,7 +10145,10 @@ mod phase4_tests {
 
         let mut entries: Vec<TagEntry> = vec![];
         inject_sidecar_cuesheet_if_present(&mut entries, &audio);
-        assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
+        assert!(entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
+            .is_none());
     }
 
     #[test]
@@ -9545,8 +10171,13 @@ mod phase4_tests {
         inject_sidecar_cuesheet_if_present(&mut entries, &audio);
         // Inject succeeded — Shift_JIS bytes lossy-decoded; CUE keywords
         // intact.
-        assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_some(),
-            "non-UTF-8 sidecar must still inject (lossy decode)");
+        assert!(
+            entries
+                .iter()
+                .find(|e| e.display_key == "CUESHEET")
+                .is_some(),
+            "non-UTF-8 sidecar must still inject (lossy decode)"
+        );
     }
 
     // -------- :tags-cue-sidecar (reload_from_sidecar_cue) --------
@@ -9558,9 +10189,10 @@ mod phase4_tests {
     /// Build a single-image MetadataEditorState whose paths[0] points
     /// at `dir/album.flac` (file doesn't have to exist on disk —
     /// reload_from_sidecar_cue only reads the sidecar).
-    fn state_for_sidecar_test(dir: &std::path::Path,
-        existing_entries: Vec<TagEntry>) -> MetadataEditorState
-    {
+    fn state_for_sidecar_test(
+        dir: &std::path::Path,
+        existing_entries: Vec<TagEntry>,
+    ) -> MetadataEditorState {
         MetadataEditorState {
             paths: vec![dir.join("album.flac")],
             entries: existing_entries,
@@ -9593,19 +10225,33 @@ mod phase4_tests {
         write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
         // Existing TITLE entry with prior values (e.g. from Phase 2
         // sidecar inject before the user edited the sidecar externally).
-        let mut state = state_for_sidecar_test(td.path(), vec![
-            entry("TITLE", ItemKey::TrackTitle,
-                &["Old1", "Old2", "Old3"], &["Old1", "Old2", "Old3"]),
-        ]);
+        let mut state = state_for_sidecar_test(
+            td.path(),
+            vec![entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["Old1", "Old2", "Old3"],
+                &["Old1", "Old2", "Old3"],
+            )],
+        );
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_ok(), "reload should succeed: {:?}", result);
 
-        let title = state.entries.iter()
-            .find(|e| e.display_key == "TITLE").unwrap();
-        assert_eq!(title.per_file_values, vec!["T1", "T2", "T3"],
-            "values overwritten with sidecar's");
-        assert_eq!(title.per_file_originals, vec!["Old1", "Old2", "Old3"],
-            "originals preserved (revert restores prior state)");
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .unwrap();
+        assert_eq!(
+            title.per_file_values,
+            vec!["T1", "T2", "T3"],
+            "values overwritten with sidecar's"
+        );
+        assert_eq!(
+            title.per_file_originals,
+            vec!["Old1", "Old2", "Old3"],
+            "originals preserved (revert restores prior state)"
+        );
         assert!(state.dirty, "values diverged from originals → dirty=true");
     }
 
@@ -9617,11 +10263,16 @@ mod phase4_tests {
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_ok());
 
-        let cue = state.entries.iter()
-            .find(|e| e.display_key == "CUESHEET").unwrap();
+        let cue = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
+            .unwrap();
         assert_eq!(cue.per_file_values[0], SIDECAR_3_TRACK_SINGLE_IMAGE);
-        assert_eq!(cue.per_file_originals[0], "",
-            "originals=\"\" so save writes a fresh embedded CUESHEET tag");
+        assert_eq!(
+            cue.per_file_originals[0], "",
+            "originals=\"\" so save writes a fresh embedded CUESHEET tag"
+        );
         assert!(cue.is_binary);
     }
 
@@ -9633,18 +10284,31 @@ mod phase4_tests {
         let td = tempfile::tempdir().expect("tempdir");
         write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
         let on_disk = "TITLE \"Old\"\nFILE \"x.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"OE1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"OE2\"\n    INDEX 01 00:00:50\n";
-        let mut state = state_for_sidecar_test(td.path(), vec![
-            entry("CUESHEET", ItemKey::Unknown("CUESHEET".into()), &[on_disk], &[on_disk]),
-        ]);
+        let mut state = state_for_sidecar_test(
+            td.path(),
+            vec![entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[on_disk],
+                &[on_disk],
+            )],
+        );
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_ok());
 
-        let cue = state.entries.iter()
-            .find(|e| e.display_key == "CUESHEET").unwrap();
-        assert_eq!(cue.per_file_values[0], SIDECAR_3_TRACK_SINGLE_IMAGE,
-            "CUESHEET value overridden with sidecar");
-        assert_eq!(cue.per_file_originals[0], on_disk,
-            "CUESHEET originals preserved (embedded on-disk value)");
+        let cue = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
+            .unwrap();
+        assert_eq!(
+            cue.per_file_values[0], SIDECAR_3_TRACK_SINGLE_IMAGE,
+            "CUESHEET value overridden with sidecar"
+        );
+        assert_eq!(
+            cue.per_file_originals[0], on_disk,
+            "CUESHEET originals preserved (embedded on-disk value)"
+        );
     }
 
     #[test]
@@ -9655,15 +10319,26 @@ mod phase4_tests {
         let td = tempfile::tempdir().expect("tempdir");
         write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
         // SIDECAR_3_TRACK_SINGLE_IMAGE has no ISRC lines.
-        let mut state = state_for_sidecar_test(td.path(), vec![
-            entry("ISRC", ItemKey::Isrc,
+        let mut state = state_for_sidecar_test(
+            td.path(),
+            vec![entry(
+                "ISRC",
+                ItemKey::Isrc,
                 &["USRC1", "USRC2", "USRC3"],
-                &["USRC1", "USRC2", "USRC3"]),
-        ]);
+                &["USRC1", "USRC2", "USRC3"],
+            )],
+        );
         reload_from_sidecar_cue(&mut state).expect("ok");
-        let isrc = state.entries.iter().find(|e| e.display_key == "ISRC").unwrap();
-        assert_eq!(isrc.per_file_values, vec!["", "", ""],
-            "existing ISRC entry overlaid with sidecar's empties");
+        let isrc = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ISRC")
+            .unwrap();
+        assert_eq!(
+            isrc.per_file_values,
+            vec!["", "", ""],
+            "existing ISRC entry overlaid with sidecar's empties"
+        );
         // Originals preserved → revert restores prior ISRCs.
         assert_eq!(isrc.per_file_originals, vec!["USRC1", "USRC2", "USRC3"]);
     }
@@ -9676,17 +10351,31 @@ mod phase4_tests {
         // (originals truncated). Otherwise the len-invariant breaks.
         let td = tempfile::tempdir().expect("tempdir");
         write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
-        let mut state = state_for_sidecar_test(td.path(), vec![
-            entry("TITLE", ItemKey::TrackTitle,
+        let mut state = state_for_sidecar_test(
+            td.path(),
+            vec![entry(
+                "TITLE",
+                ItemKey::TrackTitle,
                 &["A", "B", "C", "D", "E"],
-                &["A", "B", "C", "D", "E"]),
-        ]);
+                &["A", "B", "C", "D", "E"],
+            )],
+        );
         reload_from_sidecar_cue(&mut state).expect("ok");
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
-        assert_eq!(title.per_file_values.len(), 3,
-            "dim shrunk to sidecar's 3 tracks");
-        assert_eq!(title.per_file_originals.len(), 3,
-            "originals resized to match — len(values) == len(originals) invariant");
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .unwrap();
+        assert_eq!(
+            title.per_file_values.len(),
+            3,
+            "dim shrunk to sidecar's 3 tracks"
+        );
+        assert_eq!(
+            title.per_file_originals.len(),
+            3,
+            "originals resized to match — len(values) == len(originals) invariant"
+        );
         assert_eq!(title.per_file_values, vec!["T1", "T2", "T3"]);
     }
 
@@ -9702,8 +10391,7 @@ mod phase4_tests {
 
     #[test]
     fn reload_sidecar_refuses_track_by_track() {
-        let track_by_track =
-            "TITLE \"Album\"\n\
+        let track_by_track = "TITLE \"Album\"\n\
              FILE \"track01.flac\" WAVE\n  TRACK 01 AUDIO\nINDEX 01 00:00:00\n\
              FILE \"track02.flac\" WAVE\n  TRACK 02 AUDIO\nINDEX 01 00:00:00\n";
         let td = tempfile::tempdir().expect("tempdir");
@@ -9719,17 +10407,24 @@ mod phase4_tests {
         let td = tempfile::tempdir().expect("tempdir");
         write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
         let mut state = MetadataEditorState {
-            paths: vec![
-                td.path().join("a.flac"),
-                td.path().join("b.flac"),
-            ],
+            paths: vec![td.path().join("a.flac"), td.path().join("b.flac")],
             entries: vec![],
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: vec![],
+            dirty: false,
+            deleted: vec![],
             file_labels: vec!["01".into(), "02".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
             sacd_sidecar_path: None,
             sacd_area_kind: None,
             sacd_stereo_durations: None,
@@ -9755,31 +10450,60 @@ mod phase4_tests {
         // that in place, mixed entries can be safely capitalized
         // without leaking one track's value into the placeholder.
         let mut state = single_image_state(vec![
-            entry("ALBUM", ItemKey::AlbumTitle,
+            entry(
+                "ALBUM",
+                ItemKey::AlbumTitle,
                 &["the dark side of the moon"],
-                &["the dark side of the moon"]),
-            entry("TITLE", ItemKey::TrackTitle,
+                &["the dark side of the moon"],
+            ),
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
                 &["speak to me", "breathe", "on the run"],
-                &["speak to me", "breathe", "on the run"]),
+                &["speak to me", "breathe", "on the run"],
+            ),
         ]);
-        let title_idx = state.entries.iter().position(|e| e.display_key == "TITLE").unwrap();
+        let title_idx = state
+            .entries
+            .iter()
+            .position(|e| e.display_key == "TITLE")
+            .unwrap();
         state.entries[title_idx].is_mixed = true;
         state.entries[title_idx].value = "<multiple values>".to_string();
 
         let result = fix_caps_for_state(&mut state, None);
 
-        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
+        let album = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ALBUM")
+            .unwrap();
         assert_eq!(album.per_file_values, vec!["The Dark Side of the Moon"]);
 
         // TITLE per_file_values capitalized (visible in detail overlay).
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
-        assert_eq!(title.per_file_values, vec!["Speak to Me", "Breathe", "On the Run"],
-            "main-editor fix-caps capitalizes per-track values too");
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .unwrap();
+        assert_eq!(
+            title.per_file_values,
+            vec!["Speak to Me", "Breathe", "On the Run"],
+            "main-editor fix-caps capitalizes per-track values too"
+        );
         // Display stays "<multiple values>" since values still differ.
-        assert!(title.is_mixed, "is_mixed preserved (capitalization didn't merge)");
-        assert_eq!(title.value, "<multiple values>",
-            "main-grid display unchanged");
-        assert!(result.changed_values >= 4, "ALBUM + 3 TITLE values capitalized");
+        assert!(
+            title.is_mixed,
+            "is_mixed preserved (capitalization didn't merge)"
+        );
+        assert_eq!(
+            title.value, "<multiple values>",
+            "main-grid display unchanged"
+        );
+        assert!(
+            result.changed_values >= 4,
+            "ALBUM + 3 TITLE values capitalized"
+        );
     }
 
     #[test]
@@ -9791,12 +10515,23 @@ mod phase4_tests {
         // Mark ALBUM (idx 0) deleted.
         state.deleted.push(0);
         let result = fix_caps_for_state(&mut state, None);
-        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
-        assert_eq!(album.per_file_values, vec!["dark side"],
-            "deleted entries must be skipped — no point capitalizing a row about to be removed");
+        let album = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ALBUM")
+            .unwrap();
+        assert_eq!(
+            album.per_file_values,
+            vec!["dark side"],
+            "deleted entries must be skipped — no point capitalizing a row about to be removed"
+        );
         assert_eq!(result.skipped_deleted, 1);
         // TITLE still got capitalized.
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .unwrap();
         assert_eq!(title.per_file_values, vec!["Money"]);
     }
 
@@ -9804,21 +10539,39 @@ mod phase4_tests {
     fn fix_caps_detail_overlay_targets_focused_only() {
         let mut state = single_image_state(vec![
             entry("ALBUM", ItemKey::AlbumTitle, &["dark side"], &["dark side"]),
-            entry("TITLE", ItemKey::TrackTitle,
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
                 &["speak to me", "breathe", "on the run"],
-                &["speak to me", "breathe", "on the run"]),
+                &["speak to me", "breathe", "on the run"],
+            ),
         ]);
-        let title_idx = state.entries.iter().position(|e| e.display_key == "TITLE").unwrap();
+        let title_idx = state
+            .entries
+            .iter()
+            .position(|e| e.display_key == "TITLE")
+            .unwrap();
         state.entries[title_idx].is_mixed = true;
 
         // Detail overlay focused on TITLE.
         let result = fix_caps_for_state(&mut state, Some(title_idx));
 
         // TITLE's per-track values capitalized.
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
-        assert_eq!(title.per_file_values, vec!["Speak to Me", "Breathe", "On the Run"]);
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .unwrap();
+        assert_eq!(
+            title.per_file_values,
+            vec!["Speak to Me", "Breathe", "On the Run"]
+        );
         // ALBUM untouched.
-        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").unwrap();
+        let album = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ALBUM")
+            .unwrap();
         assert_eq!(album.per_file_values, vec!["dark side"]);
         assert_eq!(result.skipped_deleted, 0);
     }
@@ -9835,13 +10588,18 @@ mod phase4_tests {
         // happened to be correct here only because all_same was true.
         // The dim-bug would have surfaced if values diverged but
         // paths.len() == 1.
-        let mut state = single_image_state(vec![
-            entry("TITLE", ItemKey::TrackTitle,
-                &["foo", "foo", "foo"],
-                &["foo", "foo", "foo"]),
-        ]);
+        let mut state = single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["foo", "foo", "foo"],
+            &["foo", "foo", "foo"],
+        )]);
         let _ = fix_caps_for_state(&mut state, None);
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .unwrap();
         assert_eq!(title.per_file_values, vec!["Foo", "Foo", "Foo"]);
         assert_eq!(title.is_mixed, false);
         assert_eq!(title.value, "Foo");
@@ -9854,7 +10612,10 @@ mod phase4_tests {
         let audio = td.path().join("album.flac");
         let mut entries: Vec<TagEntry> = vec![];
         inject_sidecar_cuesheet_if_present(&mut entries, &audio);
-        assert!(entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
+        assert!(entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
+            .is_none());
     }
 
     // ---------- C5 tests: SACD editor surfacing ----------
@@ -9879,13 +10640,28 @@ mod phase4_tests {
             album_sequence_number: 1,
             album_catalog_number: catalog.unwrap_or("").to_string(),
             album_genres: vec![],
-            two_channel: AreaPointer { toc_1_start: 540, toc_2_start: 541, toc_size_sectors: 3 },
-            multi_channel: AreaPointer { toc_1_start: 0, toc_2_start: 0, toc_size_sectors: 0 },
+            two_channel: AreaPointer {
+                toc_1_start: 540,
+                toc_2_start: 541,
+                toc_size_sectors: 3,
+            },
+            multi_channel: AreaPointer {
+                toc_1_start: 0,
+                toc_2_start: 0,
+                toc_size_sectors: 0,
+            },
             disc_type_hybrid: false,
             disc_catalog_number: String::new(),
-            disc_genres: vec![Genre { category: 1, genre: 14 /* JAZZ */ }],
+            disc_genres: vec![Genre {
+                category: 1,
+                genre: 14, /* JAZZ */
+            }],
             disc_date: if disc_year > 0 {
-                Some(DiscDate { year: disc_year, month: 0, day: 0 })
+                Some(DiscDate {
+                    year: disc_year,
+                    month: 0,
+                    day: 0,
+                })
             } else {
                 None
             },
@@ -9911,10 +10687,19 @@ mod phase4_tests {
                 start_lsn: 600 + i as u32 * 100,
                 length_lsn: 100,
                 start_time: PlayTime::default(),
-                duration: PlayTime { minutes: 3, seconds: 0, frames: 0 },
+                duration: PlayTime {
+                    minutes: 3,
+                    seconds: 0,
+                    frames: 0,
+                },
                 text: TrackText {
-                    title: if track_titles[i].is_empty() { None } else { Some(track_titles[i].to_string()) },
-                    performer: track_performers.get(i)
+                    title: if track_titles[i].is_empty() {
+                        None
+                    } else {
+                        Some(track_titles[i].to_string())
+                    },
+                    performer: track_performers
+                        .get(i)
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                     ..Default::default()
@@ -9936,13 +10721,20 @@ mod phase4_tests {
             extra_settings: 0,
             max_available_channels: 2,
             area_mute_flags: 0,
-            total_playtime: PlayTime { minutes: 30, seconds: 0, frames: 0 },
+            total_playtime: PlayTime {
+                minutes: 30,
+                seconds: 0,
+                frames: 0,
+            },
             track_offset: 0,
             track_count: n as u8,
             track_start_lsn: 600,
             track_end_lsn: 10_000,
             text_area_count: 1,
-            locales: vec![Locale { language_code: [b'e', b'n'], character_set: 2 }],
+            locales: vec![Locale {
+                language_code: [b'e', b'n'],
+                character_set: 2,
+            }],
             description: None,
             description_phonetic: None,
             copyright: None,
@@ -9952,7 +10744,10 @@ mod phase4_tests {
         SacdMetadata {
             master_toc,
             master_text,
-            stereo: Some(AreaInfo { header: stereo_header, tracks }),
+            stereo: Some(AreaInfo {
+                header: stereo_header,
+                tracks,
+            }),
             multi_channel: None,
         }
     }
@@ -9985,10 +10780,19 @@ mod phase4_tests {
         assert!(state.paths.iter().all(|p| p == &path));
 
         let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
-        assert_eq!(by_key("ALBUM").map(|e| e.value.as_str()), Some("Kind of Blue"));
-        assert_eq!(by_key("ALBUMARTIST").map(|e| e.value.as_str()), Some("Miles Davis"));
+        assert_eq!(
+            by_key("ALBUM").map(|e| e.value.as_str()),
+            Some("Kind of Blue")
+        );
+        assert_eq!(
+            by_key("ALBUMARTIST").map(|e| e.value.as_str()),
+            Some("Miles Davis")
+        );
         assert_eq!(by_key("DATE").map(|e| e.value.as_str()), Some("1959"));
-        assert_eq!(by_key("CATALOGNUMBER").map(|e| e.value.as_str()), Some("PROC-001"));
+        assert_eq!(
+            by_key("CATALOGNUMBER").map(|e| e.value.as_str()),
+            Some("PROC-001")
+        );
         assert_eq!(by_key("GENRE").map(|e| e.value.as_str()), Some("Jazz"));
         // Album-level entries share one value across all tracks.
         for k in &["ALBUM", "ALBUMARTIST", "DATE", "CATALOGNUMBER", "GENRE"] {
@@ -10012,24 +10816,47 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/synthetic.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
 
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").expect("TITLE");
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .expect("TITLE");
         assert_eq!(title.per_file_values, vec!["Track A", "Track B", "Track C"]);
         assert!(title.is_mixed);
 
-        let artist = state.entries.iter().find(|e| e.display_key == "ARTIST").expect("ARTIST");
-        assert_eq!(artist.per_file_values, vec!["Artist X", "Artist X", "Artist Y"]);
+        let artist = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ARTIST")
+            .expect("ARTIST");
+        assert_eq!(
+            artist.per_file_values,
+            vec!["Artist X", "Artist X", "Artist Y"]
+        );
         assert!(artist.is_mixed);
 
-        let isrc = state.entries.iter().find(|e| e.display_key == "ISRC").expect("ISRC");
-        assert_eq!(isrc.per_file_values, vec!["USAA10800001", "USAA10800002", ""]);
+        let isrc = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ISRC")
+            .expect("ISRC");
+        assert_eq!(
+            isrc.per_file_values,
+            vec!["USAA10800001", "USAA10800002", ""]
+        );
     }
 
     #[test]
     fn build_sacd_editor_state_skips_per_track_field_when_all_empty() {
         // No performers anywhere → ARTIST entry should not be emitted.
         let md = synth_sacd_metadata(
-            Some("Album"), None, 0, None,
-            &["T1", "T2"], &["", ""], &[None, None],
+            Some("Album"),
+            None,
+            0,
+            None,
+            &["T1", "T2"],
+            &["", ""],
+            &[None, None],
         );
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
@@ -10040,12 +10867,21 @@ mod phase4_tests {
     #[test]
     fn build_sacd_editor_state_includes_tracknumber_always() {
         let md = synth_sacd_metadata(
-            None, None, 0, None,
-            &["t1", "t2", "t3"], &["", "", ""], &[None, None, None],
+            None,
+            None,
+            0,
+            None,
+            &["t1", "t2", "t3"],
+            &["", "", ""],
+            &[None, None, None],
         );
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
-        let tn = state.entries.iter().find(|e| e.display_key == "TRACKNUMBER").expect("TRACKNUMBER");
+        let tn = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TRACKNUMBER")
+            .expect("TRACKNUMBER");
         assert_eq!(tn.per_file_values, vec!["1", "2", "3"]);
         assert!(tn.is_mixed);
     }
@@ -10073,10 +10909,7 @@ mod phase4_tests {
     #[test]
     fn build_sacd_editor_state_falls_back_to_multi_channel_when_no_stereo() {
         use crate::tui::sacd::*;
-        let mut md = synth_sacd_metadata(
-            Some("MC Album"), None, 0, None,
-            &["t1"], &[""], &[None],
-        );
+        let mut md = synth_sacd_metadata(Some("MC Album"), None, 0, None, &["t1"], &[""], &[None]);
         // Move the stereo area into multi_channel slot and clear stereo.
         let mut info = md.stereo.take().unwrap();
         info.header.kind = AreaKind::MultiChannel;
@@ -10114,11 +10947,17 @@ mod phase4_tests {
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
 
         let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
-        assert_eq!(by_key("ALBUM").map(|e| e.value.as_str()), Some("Sidecar Album"));
+        assert_eq!(
+            by_key("ALBUM").map(|e| e.value.as_str()),
+            Some("Sidecar Album")
+        );
         let title = by_key("TITLE").expect("TITLE");
         assert_eq!(title.per_file_values, vec!["Sidecar T1", "Sidecar T2"]);
         let artist = by_key("ARTIST").expect("ARTIST");
-        assert_eq!(artist.per_file_values, vec!["Sidecar Artist", "Sidecar Artist"]);
+        assert_eq!(
+            artist.per_file_values,
+            vec!["Sidecar Artist", "Sidecar Artist"]
+        );
     }
 
     #[test]
@@ -10142,11 +10981,23 @@ mod phase4_tests {
 
         let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
         // ALBUM from sidecar
-        assert_eq!(by_key("ALBUM").map(|e| e.value.as_str()), Some("Sidecar Album"));
+        assert_eq!(
+            by_key("ALBUM").map(|e| e.value.as_str()),
+            Some("Sidecar Album")
+        );
         // TITLE/ARTIST/ISRC from ScarletBook fallback
-        assert_eq!(by_key("TITLE").map(|e| e.value.as_str()), Some("sb-track-1"));
-        assert_eq!(by_key("ARTIST").map(|e| e.value.as_str()), Some("sb-performer-1"));
-        assert_eq!(by_key("ISRC").map(|e| e.value.as_str()), Some("USAA10800001"));
+        assert_eq!(
+            by_key("TITLE").map(|e| e.value.as_str()),
+            Some("sb-track-1")
+        );
+        assert_eq!(
+            by_key("ARTIST").map(|e| e.value.as_str()),
+            Some("sb-performer-1")
+        );
+        assert_eq!(
+            by_key("ISRC").map(|e| e.value.as_str()),
+            Some("USAA10800001")
+        );
     }
 
     #[test]
@@ -10160,7 +11011,10 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
-        assert_eq!(pub_entry.map(|e| e.value.as_str()), Some("Sony Music Japan International Inc."));
+        assert_eq!(
+            pub_entry.map(|e| e.value.as_str()),
+            Some("Sony Music Japan International Inc.")
+        );
     }
 
     #[test]
@@ -10174,8 +11028,14 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
-        assert_eq!(by_key("ALBUMARTIST").map(|e| e.value.as_str()), Some("Composite Artist"));
-        assert_eq!(by_key("CATALOGNUMBER").map(|e| e.value.as_str()), Some("SICP 10083"));
+        assert_eq!(
+            by_key("ALBUMARTIST").map(|e| e.value.as_str()),
+            Some("Composite Artist")
+        );
+        assert_eq!(
+            by_key("CATALOGNUMBER").map(|e| e.value.as_str()),
+            Some("SICP 10083")
+        );
     }
 
     #[test]
@@ -10185,8 +11045,10 @@ mod phase4_tests {
         // but a later track still has it must NOT lock in the empty
         // value. The fix moves the non-empty filter inside find_map.
         let md = synth_sacd_metadata(
-            Some("SB Album"),  // ScarletBook fallback if sidecar misses everything
-            None, 0, None,
+            Some("SB Album"), // ScarletBook fallback if sidecar misses everything
+            None,
+            0,
+            None,
             &["t1", "t2", "t3"],
             &["", "", ""],
             &[None, None, None],
@@ -10199,7 +11061,11 @@ mod phase4_tests {
         let sidecar = parse_sidecar_for_test(xml);
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
-        let album = state.entries.iter().find(|e| e.display_key == "ALBUM").expect("ALBUM");
+        let album = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ALBUM")
+            .expect("ALBUM");
         // Should pick the non-empty later value, not lock onto track 1's empty.
         assert_eq!(album.value, "The Real Album");
     }
@@ -10209,10 +11075,7 @@ mod phase4_tests {
         // Sidecar absent or silent on PUBLISHER; ScarletBook
         // SACDText.album_publisher should be surfaced.
         use crate::tui::sacd::*;
-        let mut md = synth_sacd_metadata(
-            Some("Album"), None, 0, None,
-            &["t"], &[""], &[None],
-        );
+        let mut md = synth_sacd_metadata(Some("Album"), None, 0, None, &["t"], &[""], &[None]);
         md.master_text = Some(SacdText {
             album_title: Some("Album".into()),
             album_publisher: Some("ScarletBook Publisher".into()),
@@ -10222,17 +11085,17 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
         let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
-        assert_eq!(pub_entry.map(|e| e.value.as_str()), Some("ScarletBook Publisher"));
+        assert_eq!(
+            pub_entry.map(|e| e.value.as_str()),
+            Some("ScarletBook Publisher")
+        );
     }
 
     #[test]
     fn publisher_prefers_sidecar_over_scarletbook() {
         // Both have PUBLISHER — sidecar wins.
         use crate::tui::sacd::*;
-        let mut md = synth_sacd_metadata(
-            Some("Album"), None, 0, None,
-            &["t"], &[""], &[None],
-        );
+        let mut md = synth_sacd_metadata(Some("Album"), None, 0, None, &["t"], &[""], &[None]);
         md.master_text = Some(SacdText {
             album_title: Some("Album".into()),
             album_publisher: Some("ScarletBook Publisher".into()),
@@ -10246,7 +11109,10 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
-        assert_eq!(pub_entry.map(|e| e.value.as_str()), Some("Sidecar Publisher"));
+        assert_eq!(
+            pub_entry.map(|e| e.value.as_str()),
+            Some("Sidecar Publisher")
+        );
     }
 
     /// Helper for the save tests: write a sidecar XML to a tempfile
@@ -10277,8 +11143,8 @@ mod phase4_tests {
 
         let iso_path = td.path().join("disc.iso");
         std::fs::write(&iso_path, b"\0").unwrap();
-        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, Some(&sidecar))
-            .expect("build");
+        let (mut state, _, _) =
+            build_sacd_editor_state(&iso_path, &md, Some(&sidecar)).expect("build");
         // Force writability so the save path is reachable in tests.
         state.read_only = false;
         state.sacd_sidecar_path = Some(xml_path.clone());
@@ -10297,8 +11163,13 @@ mod phase4_tests {
         // surface in the editor; ScarletBook fallback is empty so
         // entries only appear when the sidecar carries them.
         let md = synth_sacd_metadata(
-            Some("Album"), None, 0, None,
-            &["t1", "t2"], &["", ""], &[None, None],
+            Some("Album"),
+            None,
+            0,
+            None,
+            &["t1", "t2"],
+            &["", ""],
+            &[None, None],
         );
         let xml = r#"<root><store id="X" type="SACD" version="1.1">
 <track id="1"><meta name="TITLE" value="t1"/><meta name="MUSICBRAINZ_TRACKID" value="rec-1"/><meta name="MUSICBRAINZ_RELEASETRACKID" value="trk-1"/><meta name="MUSICBRAINZ_ARTISTID" value="art-1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
@@ -10329,8 +11200,13 @@ mod phase4_tests {
         // tracks. Sidecar carries the value on track 1 only — the
         // album-level reader picks the first non-empty.
         let md = synth_sacd_metadata(
-            Some("Album"), None, 0, None,
-            &["t1", "t2"], &["", ""], &[None, None],
+            Some("Album"),
+            None,
+            0,
+            None,
+            &["t1", "t2"],
+            &["", ""],
+            &[None, None],
         );
         let xml = r#"<root><store id="X" type="SACD" version="1.1">
 <track id="1"><meta name="TITLE" value="t1"/><meta name="MUSICBRAINZ_ALBUMID" value="alb-1"/><meta name="MUSICBRAINZ_ALBUMARTISTID" value="aart-1"/><meta name="MUSICBRAINZ_RELEASEGROUPID" value="rg-1"/><meta name="ORIGINALDATE" value="1959"/><meta name="RELEASECOUNTRY" value="US"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
@@ -10340,11 +11216,26 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
-        assert_eq!(by_key("MUSICBRAINZ_ALBUMID").map(|e| e.value.as_str()), Some("alb-1"));
-        assert_eq!(by_key("MUSICBRAINZ_ALBUMARTISTID").map(|e| e.value.as_str()), Some("aart-1"));
-        assert_eq!(by_key("MUSICBRAINZ_RELEASEGROUPID").map(|e| e.value.as_str()), Some("rg-1"));
-        assert_eq!(by_key("ORIGINALDATE").map(|e| e.value.as_str()), Some("1959"));
-        assert_eq!(by_key("RELEASECOUNTRY").map(|e| e.value.as_str()), Some("US"));
+        assert_eq!(
+            by_key("MUSICBRAINZ_ALBUMID").map(|e| e.value.as_str()),
+            Some("alb-1")
+        );
+        assert_eq!(
+            by_key("MUSICBRAINZ_ALBUMARTISTID").map(|e| e.value.as_str()),
+            Some("aart-1")
+        );
+        assert_eq!(
+            by_key("MUSICBRAINZ_RELEASEGROUPID").map(|e| e.value.as_str()),
+            Some("rg-1")
+        );
+        assert_eq!(
+            by_key("ORIGINALDATE").map(|e| e.value.as_str()),
+            Some("1959")
+        );
+        assert_eq!(
+            by_key("RELEASECOUNTRY").map(|e| e.value.as_str()),
+            Some("US")
+        );
     }
 
     #[test]
@@ -10353,10 +11244,7 @@ mod phase4_tests {
         // case) → no rows surface for them. Critical because empty
         // rows would clutter the editor for the 99% of SACDs not yet
         // tagged via MB.
-        let md = synth_sacd_metadata(
-            Some("Album"), None, 0, None,
-            &["t1"], &[""], &[None],
-        );
+        let md = synth_sacd_metadata(Some("Album"), None, 0, None, &["t1"], &[""], &[None]);
         let xml = r#"<root><store id="X" type="SACD" version="1.1">
 <track id="1"><meta name="TITLE" value="t1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="1"/></track>
 </store></root>"#;
@@ -10364,13 +11252,19 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         for k in [
-            "MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ_ARTISTID",
-            "MUSICBRAINZ_ALBUMID", "MUSICBRAINZ_ALBUMARTISTID", "MUSICBRAINZ_RELEASEGROUPID",
-            "ORIGINALDATE", "RELEASECOUNTRY",
+            "MUSICBRAINZ_TRACKID",
+            "MUSICBRAINZ_RELEASETRACKID",
+            "MUSICBRAINZ_ARTISTID",
+            "MUSICBRAINZ_ALBUMID",
+            "MUSICBRAINZ_ALBUMARTISTID",
+            "MUSICBRAINZ_RELEASEGROUPID",
+            "ORIGINALDATE",
+            "RELEASECOUNTRY",
         ] {
             assert!(
                 state.entries.iter().all(|e| e.display_key != k),
-                "{} should not surface when sidecar carries no value", k,
+                "{} should not surface when sidecar carries no value",
+                k,
             );
         }
     }
@@ -10406,24 +11300,58 @@ mod phase4_tests {
 
         for tid in 1..=3 {
             let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
-            assert_eq!(t.meta.get("MUSICBRAINZ_ALBUMID").map(String::as_str), Some("alb-new"),
-                "tid={} album-level MB id replicated", tid);
-            assert_eq!(t.meta.get("MUSICBRAINZ_ARTISTID").map(String::as_str), Some(&*format!("art-{}", tid)),
-                "tid={} per-track MUSICBRAINZ_ARTISTID preserved", tid);
-            assert_eq!(t.meta.get("MUSICBRAINZ_RELEASETRACKID").map(String::as_str), Some(&*format!("trk-{}", tid)),
-                "tid={} MUSICBRAINZ_RELEASETRACKID preserved", tid);
-            assert_eq!(t.meta.get("MUSICBRAINZ_ALBUMARTISTID").map(String::as_str), Some("aart-old"),
-                "tid={} album-level MUSICBRAINZ_ALBUMARTISTID preserved", tid);
-            assert_eq!(t.meta.get("MUSICBRAINZ_RELEASEGROUPID").map(String::as_str), Some("rg-old"),
-                "tid={} album-level MUSICBRAINZ_RELEASEGROUPID preserved", tid);
-            assert_eq!(t.meta.get("ORIGINALDATE").map(String::as_str), Some("1959"),
-                "tid={} ORIGINALDATE preserved", tid);
-            assert_eq!(t.meta.get("RELEASECOUNTRY").map(String::as_str), Some("US"),
-                "tid={} RELEASECOUNTRY preserved", tid);
+            assert_eq!(
+                t.meta.get("MUSICBRAINZ_ALBUMID").map(String::as_str),
+                Some("alb-new"),
+                "tid={} album-level MB id replicated",
+                tid
+            );
+            assert_eq!(
+                t.meta.get("MUSICBRAINZ_ARTISTID").map(String::as_str),
+                Some(&*format!("art-{}", tid)),
+                "tid={} per-track MUSICBRAINZ_ARTISTID preserved",
+                tid
+            );
+            assert_eq!(
+                t.meta.get("MUSICBRAINZ_RELEASETRACKID").map(String::as_str),
+                Some(&*format!("trk-{}", tid)),
+                "tid={} MUSICBRAINZ_RELEASETRACKID preserved",
+                tid
+            );
+            assert_eq!(
+                t.meta.get("MUSICBRAINZ_ALBUMARTISTID").map(String::as_str),
+                Some("aart-old"),
+                "tid={} album-level MUSICBRAINZ_ALBUMARTISTID preserved",
+                tid
+            );
+            assert_eq!(
+                t.meta.get("MUSICBRAINZ_RELEASEGROUPID").map(String::as_str),
+                Some("rg-old"),
+                "tid={} album-level MUSICBRAINZ_RELEASEGROUPID preserved",
+                tid
+            );
+            assert_eq!(
+                t.meta.get("ORIGINALDATE").map(String::as_str),
+                Some("1959"),
+                "tid={} ORIGINALDATE preserved",
+                tid
+            );
+            assert_eq!(
+                t.meta.get("RELEASECOUNTRY").map(String::as_str),
+                Some("US"),
+                "tid={} RELEASECOUNTRY preserved",
+                tid
+            );
         }
         // Per-track MUSICBRAINZ_TRACKID also got the new values.
-        let by_tid_trackid = |tid: u32| reparsed.tracks.iter().find(|t| t.id == tid)
-            .and_then(|t| t.meta.get("MUSICBRAINZ_TRACKID")).map(String::as_str);
+        let by_tid_trackid = |tid: u32| {
+            reparsed
+                .tracks
+                .iter()
+                .find(|t| t.id == tid)
+                .and_then(|t| t.meta.get("MUSICBRAINZ_TRACKID"))
+                .map(String::as_str)
+        };
         assert_eq!(by_tid_trackid(1), Some("rec-new-1"));
         assert_eq!(by_tid_trackid(2), Some("rec-new-2"));
         assert_eq!(by_tid_trackid(3), Some("rec-new-3"));
@@ -10453,12 +11381,23 @@ mod phase4_tests {
 
         for tid in 1..=3 {
             let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
-            assert_eq!(t.meta.get("ARTIST").map(String::as_str), Some("New"),
-                "tid={} ARTIST", tid);
-            assert_eq!(t.meta.get("DISCOGS_RELEASE_ID").map(String::as_str), Some("12345"),
-                "tid={} DISCOGS_RELEASE_ID must survive", tid);
-            assert!(t.meta.contains_key("DYNAMIC RANGE"),
-                "tid={} DYNAMIC RANGE must survive", tid);
+            assert_eq!(
+                t.meta.get("ARTIST").map(String::as_str),
+                Some("New"),
+                "tid={} ARTIST",
+                tid
+            );
+            assert_eq!(
+                t.meta.get("DISCOGS_RELEASE_ID").map(String::as_str),
+                Some("12345"),
+                "tid={} DISCOGS_RELEASE_ID must survive",
+                tid
+            );
+            assert!(
+                t.meta.contains_key("DYNAMIC RANGE"),
+                "tid={} DYNAMIC RANGE must survive",
+                tid
+            );
         }
     }
 
@@ -10544,8 +11483,11 @@ mod phase4_tests {
         let reparsed = crate::tui::sacd_sidecar::parse_sidecar(&xml_path).unwrap();
         let t1 = reparsed.tracks.iter().find(|t| t.id == 1).unwrap();
         assert!(!t1.meta.contains_key("ARTIST"), "ARTIST should be removed");
-        assert_eq!(t1.meta.get("TITLE").map(String::as_str), Some("A"),
-            "TITLE should still be present");
+        assert_eq!(
+            t1.meta.get("TITLE").map(String::as_str),
+            Some("A"),
+            "TITLE should still be present"
+        );
     }
 
     #[test]
@@ -10560,7 +11502,15 @@ mod phase4_tests {
         let td = tempfile::tempdir().unwrap();
         let xml_path = td.path().join("disc.xml");
         std::fs::write(&xml_path, xml).unwrap();
-        let md = synth_sacd_metadata(None, None, 0, None, &["a", "b", "c"], &["", "", ""], &[None, None, None]);
+        let md = synth_sacd_metadata(
+            None,
+            None,
+            0,
+            None,
+            &["a", "b", "c"],
+            &["", "", ""],
+            &[None, None, None],
+        );
         let sidecar = crate::tui::sacd_sidecar::parse_sidecar(&xml_path).unwrap();
         let iso_path = td.path().join("disc.iso");
         std::fs::write(&iso_path, b"\0").unwrap();
@@ -10601,7 +11551,9 @@ mod phase4_tests {
     /// Simulate the :area target plumbing by calling
     /// switch_sacd_editor_area against an editor built from
     /// hybrid synthetic metadata.
-    fn switch_helper(target: super::super::command::SacdAreaTarget) -> (
+    fn switch_helper(
+        target: super::super::command::SacdAreaTarget,
+    ) -> (
         super::super::app::MetadataEditorState,
         Result<&'static str, String>,
     ) {
@@ -10615,7 +11567,10 @@ mod phase4_tests {
         let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
         // The fixture mirrors the synthetic md, so the editor lands
         // on the stereo area by default. Verify before switching.
-        assert_eq!(state.sacd_area_kind, Some(crate::tui::sacd::AreaKind::Stereo));
+        assert_eq!(
+            state.sacd_area_kind,
+            Some(crate::tui::sacd::AreaKind::Stereo)
+        );
 
         let res = switch_sacd_editor_area(&mut state, &iso_path, target);
         (state, res)
@@ -10626,12 +11581,9 @@ mod phase4_tests {
     /// stereo and MCH areas. The fixture is the minimum needed for
     /// switch_sacd_editor_area's parse step to succeed and yield the
     /// area-kind asserted in tests.
-    fn write_hybrid_iso_fixture(
-        path: &std::path::Path,
-        _md: &crate::tui::sacd::SacdMetadata,
-    ) {
-        use std::io::{Seek, SeekFrom, Write};
+    fn write_hybrid_iso_fixture(path: &std::path::Path, _md: &crate::tui::sacd::SacdMetadata) {
         use crate::tui::sacd::*;
+        use std::io::{Seek, SeekFrom, Write};
 
         let total_sectors = 700u64;
         let f = std::fs::File::create(path).unwrap();
@@ -10642,31 +11594,37 @@ mod phase4_tests {
         // Master TOC with BOTH areas declared.
         let mut mtoc = vec![0u8; 0xa8];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
         mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
         mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes()); // 2ch toc_1
-        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());   // 2ch size
+        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes()); // 2ch size
         mtoc[0x48..0x4c].copy_from_slice(&600u32.to_be_bytes()); // MC toc_1
-        mtoc[0x56..0x58].copy_from_slice(&3u16.to_be_bytes());   // MC size
+        mtoc[0x56..0x58].copy_from_slice(&3u16.to_be_bytes()); // MC size
         f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
         f.write_all(&mtoc).unwrap();
 
         let build_area = |magic: &[u8; 8], channels: u8, n_tracks: u8| -> Vec<u8> {
             let mut a = vec![0u8; SECTOR_SIZE as usize];
             a[0..8].copy_from_slice(magic);
-            a[0x08] = 1; a[0x09] = 20;
+            a[0x08] = 1;
+            a[0x09] = 20;
             a[0x0a..0x0c].copy_from_slice(&3u16.to_be_bytes());
             a[0x14] = 0x04;
             a[0x15] = 2;
             a[0x20] = channels;
             a[0x21] = if channels == 6 { 5u8 << 3 } else { 0 };
             a[0x22] = channels;
-            a[0x40] = 30; a[0x41] = 0; a[0x42] = 0;
+            a[0x40] = 30;
+            a[0x41] = 0;
+            a[0x42] = 0;
             a[0x45] = n_tracks;
             a[0x50] = 1;
             // locale 0: en / charset 2 (Latin-1).
-            a[0x58] = b'e'; a[0x59] = b'n'; a[0x5a] = 2;
+            a[0x58] = b'e';
+            a[0x59] = b'n';
+            a[0x5a] = 2;
             a
         };
         // SACDTTxt sector: track_text_position[i] (BE u16) at offset
@@ -10688,7 +11646,7 @@ mod phase4_tests {
                 s[pos_off..pos_off + 2].copy_from_slice(&(block_off as u16).to_be_bytes());
                 // Track block: 1 entry, 3 unk bytes, type=TITLE(0x01), 0x20, NUL-term string.
                 s[block_off] = 1; // track_amount
-                // 3 unknown bytes left as 0
+                                  // 3 unknown bytes left as 0
                 s[block_off + 4] = 0x01; // TITLE
                 s[block_off + 5] = 0x20;
                 let bytes = title.as_bytes();
@@ -10701,18 +11659,23 @@ mod phase4_tests {
         f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
         f.write_all(&build_area(TWOCH_TOC_MAGIC, 2, 2)).unwrap();
         f.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
-        f.write_all(&build_t_txt_sector(&["StereoT1", "StereoT2"])).unwrap();
+        f.write_all(&build_t_txt_sector(&["StereoT1", "StereoT2"]))
+            .unwrap();
         f.seek(SeekFrom::Start(600 * SECTOR_SIZE)).unwrap();
         f.write_all(&build_area(MULCH_TOC_MAGIC, 6, 2)).unwrap();
         f.seek(SeekFrom::Start(601 * SECTOR_SIZE)).unwrap();
-        f.write_all(&build_t_txt_sector(&["MCH T1", "MCH T2"])).unwrap();
+        f.write_all(&build_t_txt_sector(&["MCH T1", "MCH T2"]))
+            .unwrap();
     }
 
     #[test]
     fn switch_area_to_mch_lands_on_mch_area() {
         let (state, res) = switch_helper(super::super::command::SacdAreaTarget::MultiChannel);
         assert_eq!(res.unwrap(), "MCH");
-        assert_eq!(state.sacd_area_kind, Some(crate::tui::sacd::AreaKind::MultiChannel));
+        assert_eq!(
+            state.sacd_area_kind,
+            Some(crate::tui::sacd::AreaKind::MultiChannel)
+        );
     }
 
     #[test]
@@ -10720,7 +11683,10 @@ mod phase4_tests {
         let (state, res) = switch_helper(super::super::command::SacdAreaTarget::Toggle);
         // Starting on stereo → toggle → MCH.
         assert_eq!(res.unwrap(), "MCH");
-        assert_eq!(state.sacd_area_kind, Some(crate::tui::sacd::AreaKind::MultiChannel));
+        assert_eq!(
+            state.sacd_area_kind,
+            Some(crate::tui::sacd::AreaKind::MultiChannel)
+        );
     }
 
     #[test]
@@ -10743,7 +11709,8 @@ mod phase4_tests {
         let dummy_md = make_hybrid_md();
         write_hybrid_iso_fixture(&iso_path, &dummy_md);
         let parsed_md = crate::tui::sacd::parse_sacd_iso(&iso_path).expect("parse");
-        let (mut state, _, _) = build_sacd_editor_state(&iso_path, &parsed_md, None).expect("build");
+        let (mut state, _, _) =
+            build_sacd_editor_state(&iso_path, &parsed_md, None).expect("build");
 
         state.cursor = 1; // not row 0 — so a bug that resets to 0 is caught
         let entry_count_before = state.entries.len();
@@ -10784,8 +11751,8 @@ mod phase4_tests {
         // cursor=3 OOB, not because of an entry-count change across
         // areas. Either way, broken clamp logic (e.g. forgetting
         // the min) would leave cursor=3 and fail the assertion.
-        use std::io::{Seek, SeekFrom, Write};
         use crate::tui::sacd::*;
+        use std::io::{Seek, SeekFrom, Write};
 
         let td = tempfile::tempdir().expect("tempdir");
         let iso_path = td.path().join("uneven.iso");
@@ -10793,11 +11760,15 @@ mod phase4_tests {
         let f = std::fs::File::create(&iso_path).unwrap();
         f.set_len(total * SECTOR_SIZE).unwrap();
         drop(f);
-        let mut f = std::fs::File::options().write(true).open(&iso_path).unwrap();
+        let mut f = std::fs::File::options()
+            .write(true)
+            .open(&iso_path)
+            .unwrap();
 
         let mut mtoc = vec![0u8; 0xa8];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes()); // stereo: 5 tracks
         mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
         mtoc[0x48..0x4c].copy_from_slice(&600u32.to_be_bytes()); // MCH: 1 track
@@ -10808,9 +11779,11 @@ mod phase4_tests {
         let mut build_area = |magic: &[u8; 8], channels: u8, n_tracks: u8| {
             let mut a = vec![0u8; SECTOR_SIZE as usize];
             a[0..8].copy_from_slice(magic);
-            a[0x08] = 1; a[0x09] = 20;
+            a[0x08] = 1;
+            a[0x09] = 20;
             a[0x0a..0x0c].copy_from_slice(&1u16.to_be_bytes());
-            a[0x14] = 0x04; a[0x15] = 2;
+            a[0x14] = 0x04;
+            a[0x15] = 2;
             a[0x20] = channels;
             a[0x21] = if channels == 6 { 5u8 << 3 } else { 0 };
             a[0x22] = channels;
@@ -10863,7 +11836,10 @@ mod phase4_tests {
         assert!(res.is_err(), "function-level guard should refuse");
         assert!(res.unwrap_err().contains("unsaved edits"));
         // State unchanged.
-        assert_eq!(state.sacd_area_kind, Some(crate::tui::sacd::AreaKind::Stereo));
+        assert_eq!(
+            state.sacd_area_kind,
+            Some(crate::tui::sacd::AreaKind::Stereo)
+        );
     }
 
     #[test]
@@ -10873,16 +11849,20 @@ mod phase4_tests {
         // Single-area stereo.
         let td = tempfile::tempdir().unwrap();
         let iso_path = td.path().join("stereo_only.iso");
-        use std::io::{Seek, SeekFrom, Write};
         use crate::tui::sacd::*;
+        use std::io::{Seek, SeekFrom, Write};
         let f = std::fs::File::create(&iso_path).unwrap();
         f.set_len(700 * SECTOR_SIZE).unwrap();
         drop(f);
-        let mut f = std::fs::File::options().write(true).open(&iso_path).unwrap();
+        let mut f = std::fs::File::options()
+            .write(true)
+            .open(&iso_path)
+            .unwrap();
 
         let mut mtoc = vec![0u8; 0xa8];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
         mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
         f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
@@ -10890,10 +11870,13 @@ mod phase4_tests {
 
         let mut area = vec![0u8; SECTOR_SIZE as usize];
         area[0..8].copy_from_slice(TWOCH_TOC_MAGIC);
-        area[0x08] = 1; area[0x09] = 20;
+        area[0x08] = 1;
+        area[0x09] = 20;
         area[0x0a..0x0c].copy_from_slice(&1u16.to_be_bytes());
-        area[0x14] = 0x04; area[0x15] = 2;
-        area[0x20] = 2; area[0x22] = 2;
+        area[0x14] = 0x04;
+        area[0x15] = 2;
+        area[0x20] = 2;
+        area[0x22] = 2;
         area[0x40] = 5;
         area[0x45] = 1;
         f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
@@ -10915,7 +11898,15 @@ mod phase4_tests {
         // Stereo absent, MCH present. Sidecar has tracks for both areas
         // but we should pull from area 2 (tracks 3-4 by ID with
         // TOTALTRACKS=2).
-        let mut md = synth_sacd_metadata(None, None, 0, None, &["mcsb1", "mcsb2"], &["", ""], &[None, None]);
+        let mut md = synth_sacd_metadata(
+            None,
+            None,
+            0,
+            None,
+            &["mcsb1", "mcsb2"],
+            &["", ""],
+            &[None, None],
+        );
         let mut info = md.stereo.take().unwrap();
         info.header.kind = crate::tui::sacd::AreaKind::MultiChannel;
         info.header.channel_count = 6;
@@ -10931,7 +11922,11 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, label, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         assert_eq!(label, "MCH");
-        let title = state.entries.iter().find(|e| e.display_key == "TITLE").expect("TITLE");
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .expect("TITLE");
         assert_eq!(title.per_file_values, vec!["MCH T1", "MCH T2"]);
     }
 
@@ -10957,7 +11952,11 @@ mod phase4_tests {
     ) -> crate::tui::sacd::SacdMetadata {
         use crate::tui::sacd::*;
         let mut md = synth_sacd_metadata(
-            album_title, None, 0, None, stereo_titles,
+            album_title,
+            None,
+            0,
+            None,
+            stereo_titles,
             &vec![""; stereo_titles.len()],
             &vec![None; stereo_titles.len()],
         );
@@ -10969,7 +11968,11 @@ mod phase4_tests {
                 start_lsn: 5000 + i as u32 * 100,
                 length_lsn: 100,
                 start_time: PlayTime::default(),
-                duration: PlayTime { minutes: 3, seconds: 0, frames: 0 },
+                duration: PlayTime {
+                    minutes: 3,
+                    seconds: 0,
+                    frames: 0,
+                },
                 text: TrackText {
                     title: (!t.is_empty()).then(|| t.to_string()),
                     ..Default::default()
@@ -10982,7 +11985,10 @@ mod phase4_tests {
         mch_header.kind = AreaKind::MultiChannel;
         mch_header.channel_count = 6;
         mch_header.track_count = mch_titles.len() as u8;
-        md.multi_channel = Some(AreaInfo { header: mch_header, tracks: mch_tracks });
+        md.multi_channel = Some(AreaInfo {
+            header: mch_header,
+            tracks: mch_tracks,
+        });
         md
     }
 
@@ -11007,8 +12013,8 @@ mod phase4_tests {
         let sidecar = parse_sidecar(&xml_path).expect("parse");
         let iso_path = td.path().join("disc.iso");
         std::fs::write(&iso_path, b"\0").unwrap();
-        let (mut state, _, _) = build_sacd_editor_state(&iso_path, md, Some(&sidecar))
-            .expect("build");
+        let (mut state, _, _) =
+            build_sacd_editor_state(&iso_path, md, Some(&sidecar)).expect("build");
         state.read_only = false;
         state.sacd_sidecar_path = Some(xml_path.clone());
         state.sacd_area_kind = Some(area);
@@ -11031,14 +12037,18 @@ mod phase4_tests {
 
     #[test]
     fn save_sacd_sidecar_mirrors_album_level_edits_across_areas() {
-        let md = synth_hybrid_sacd_metadata(
-            Some("StereoAlbum"), &["St-1", "St-2"], &["MC-1", "MC-2"],
-        );
+        let md =
+            synth_hybrid_sacd_metadata(Some("StereoAlbum"), &["St-1", "St-2"], &["MC-1", "MC-2"]);
         let (_td, reparsed, outcome) = round_trip_hybrid_save(
-            SAMPLE_HYBRID_2X2, &md, crate::tui::sacd::AreaKind::Stereo,
+            SAMPLE_HYBRID_2X2,
+            &md,
+            crate::tui::sacd::AreaKind::Stereo,
             |state| {
-                let album = state.entries.iter_mut()
-                    .find(|e| e.display_key == "ALBUM").expect("ALBUM");
+                let album = state
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.display_key == "ALBUM")
+                    .expect("ALBUM");
                 album.value = "NewAlbum".into();
                 album.per_file_values = vec!["NewAlbum".into(), "NewAlbum".into()];
             },
@@ -11050,22 +12060,27 @@ mod phase4_tests {
         for tid in 1..=4 {
             let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
             assert_eq!(
-                t.meta.get("ALBUM").map(String::as_str), Some("NewAlbum"),
-                "tid={} album-level mirror should overwrite", tid,
+                t.meta.get("ALBUM").map(String::as_str),
+                Some("NewAlbum"),
+                "tid={} album-level mirror should overwrite",
+                tid,
             );
         }
     }
 
     #[test]
     fn save_sacd_sidecar_mirrors_per_track_edits_by_tracknumber() {
-        let md = synth_hybrid_sacd_metadata(
-            Some("Album"), &["St-1", "St-2"], &["MC-1", "MC-2"],
-        );
+        let md = synth_hybrid_sacd_metadata(Some("Album"), &["St-1", "St-2"], &["MC-1", "MC-2"]);
         let (_td, reparsed, outcome) = round_trip_hybrid_save(
-            SAMPLE_HYBRID_2X2, &md, crate::tui::sacd::AreaKind::Stereo,
+            SAMPLE_HYBRID_2X2,
+            &md,
+            crate::tui::sacd::AreaKind::Stereo,
             |state| {
-                let title = state.entries.iter_mut()
-                    .find(|e| e.display_key == "TITLE").expect("TITLE");
+                let title = state
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.display_key == "TITLE")
+                    .expect("TITLE");
                 // Edit track 1's title only.
                 title.per_file_values[0] = "NewTitle1".into();
                 title.is_mixed = true;
@@ -11086,12 +12101,18 @@ mod phase4_tests {
         // the existing sidecar value.
         let mc1 = reparsed.tracks.iter().find(|t| t.id == 3).expect("mc1");
         let mc2 = reparsed.tracks.iter().find(|t| t.id == 4).expect("mc2");
-        assert_eq!(mc1.meta.get("TITLE").map(String::as_str), Some("NewTitle1"),
-            "MCH track 1 (TN=01) should mirror NewTitle1");
+        assert_eq!(
+            mc1.meta.get("TITLE").map(String::as_str),
+            Some("NewTitle1"),
+            "MCH track 1 (TN=01) should mirror NewTitle1"
+        );
         // mc2 mirror: editor row 1 has TN=02 with stereo value "St-2";
         // the per-track mirror writes that to MCH track 2.
-        assert_eq!(mc2.meta.get("TITLE").map(String::as_str), Some("St-2"),
-            "MCH track 2 (TN=02) gets editor row 1's TITLE (which equals stereo's)");
+        assert_eq!(
+            mc2.meta.get("TITLE").map(String::as_str),
+            Some("St-2"),
+            "MCH track 2 (TN=02) gets editor row 1's TITLE (which equals stereo's)"
+        );
     }
 
     #[test]
@@ -11109,30 +12130,34 @@ mod phase4_tests {
 <track id="4"><meta name="TITLE" value="MC-1"/><meta name="ALBUM" value="Old"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
 <track id="5"><meta name="TITLE" value="MC-2"/><meta name="ALBUM" value="Old"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
 </store></root>"#;
-        let md = synth_hybrid_sacd_metadata(
-            Some("Old"),
-            &["St-1", "St-2", "St-3"],
-            &["MC-1", "MC-2"],
-        );
-        let (_td, reparsed, outcome) = round_trip_hybrid_save(
-            xml, &md, crate::tui::sacd::AreaKind::Stereo,
-            |state| {
-                let album = state.entries.iter_mut()
-                    .find(|e| e.display_key == "ALBUM").expect("ALBUM");
+        let md =
+            synth_hybrid_sacd_metadata(Some("Old"), &["St-1", "St-2", "St-3"], &["MC-1", "MC-2"]);
+        let (_td, reparsed, outcome) =
+            round_trip_hybrid_save(xml, &md, crate::tui::sacd::AreaKind::Stereo, |state| {
+                let album = state
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.display_key == "ALBUM")
+                    .expect("ALBUM");
                 album.value = "New".into();
                 album.per_file_values = vec!["New".into(); 3];
-            },
-        );
+            });
         assert!(outcome.mirror.sibling_present);
         assert_eq!(outcome.mirror.sibling_total, 2);
-        assert_eq!(outcome.mirror.mirrored_count, 2,
-            "both MCH tracks have TNs that exist in editor → both mirrored");
+        assert_eq!(
+            outcome.mirror.mirrored_count, 2,
+            "both MCH tracks have TNs that exist in editor → both mirrored"
+        );
         // All five tracks across both areas get the new album-level
         // value via the active-area replicate + sibling mirror.
         for tid in 1..=5 {
             let t = reparsed.tracks.iter().find(|t| t.id == tid).expect("track");
-            assert_eq!(t.meta.get("ALBUM").map(String::as_str), Some("New"),
-                "tid={} album-level should be New", tid);
+            assert_eq!(
+                t.meta.get("ALBUM").map(String::as_str),
+                Some("New"),
+                "tid={} album-level should be New",
+                tid
+            );
         }
         // Original per-track titles preserved (we only edited ALBUM).
         // MCH track with TN=03 doesn't exist; MCH tracks keep their
@@ -11142,4 +12167,3 @@ mod phase4_tests {
         // bound to the album-level path.).
     }
 }
-

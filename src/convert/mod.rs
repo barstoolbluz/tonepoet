@@ -6,40 +6,40 @@
 //! - Metadata preservation and ReplayGain calculation
 //! - 7z archive extraction and processing
 
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use serde::{Deserialize, Serialize};
 
-pub mod queue;
 pub mod formats;
-pub mod pipeline;
-pub mod processor;
-pub mod wizard;
-pub mod simple_wizard;
-pub mod wizard_integration;
-pub mod renaming;
 pub mod labels;
 pub mod metadata;
+pub mod pipeline;
+pub mod processor;
+pub mod queue;
+pub mod renaming;
+pub mod simple_wizard;
+pub mod wizard;
+pub mod wizard_integration;
 
-pub use queue::{ConversionQueue, ConversionItem, ConversionStatus, ConversionPhase};
-pub use formats::{AudioFormat, FileFormat, FormatDetector, ConversionOptions};
-pub use processor::{ConversionProcessor, ProcessorConfig, ProgressUpdate, process_item};
+pub use formats::{AudioFormat, ConversionOptions, FileFormat, FormatDetector};
+pub use labels::{detect_pressing_info, LabelInfo};
+pub use metadata::{extract_metadata_from_flac, extract_year_from_flac_files, FlacMetadata};
+pub use processor::{process_item, ConversionProcessor, ProcessorConfig, ProgressUpdate};
+pub use queue::{ConversionItem, ConversionPhase, ConversionQueue, ConversionStatus};
+pub use renaming::{
+    apply_all_tags, apply_folder_renaming, rename_audio_files, update_album_tags, update_title_tags,
+};
 pub use wizard::{ConversionWizard, WizardStep};
 pub use wizard_integration::{
-    extract_wizard_settings, 
-    apply_settings_to_queue, 
-    validate_conversion_ready,
+    apply_settings_to_queue, extract_wizard_settings, validate_conversion_ready,
     validate_wizard_selections,
 };
-pub use renaming::{apply_folder_renaming, rename_audio_files, update_album_tags, update_title_tags, apply_all_tags};
-pub use metadata::{extract_metadata_from_flac, extract_year_from_flac_files, FlacMetadata};
-pub use labels::{detect_pressing_info, LabelInfo};
 
 /// Tagging module alias for backward compatibility
 pub mod tagging {
-    pub use super::renaming::{update_album_tags, update_title_tags, apply_all_tags};
+    pub use super::renaming::{apply_all_tags, update_album_tags, update_title_tags};
 }
 
 /// Result type for conversion operations
@@ -50,19 +50,19 @@ pub type ConversionResult<T> = Result<T, ConversionError>;
 pub enum ConversionError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Format not supported: {0}")]
     UnsupportedFormat(String),
-    
+
     #[error("Conversion failed: {0}")]
     ConversionFailed(String),
-    
+
     #[error("Metadata error: {0}")]
     MetadataError(String),
-    
+
     #[error("External tool error: {0}")]
     ToolError(String),
-    
+
     #[error("Validation error: {0}")]
     ValidationError(String),
 }
@@ -81,22 +81,22 @@ pub struct ConversionManager {
 pub struct ConversionConfig {
     /// Default output format
     pub default_format: AudioFormat,
-    
+
     /// Default conversion options
     pub default_options: ConversionOptions,
-    
+
     /// Number of parallel workers
     pub worker_count: usize,
-    
+
     /// Output directory template
     pub output_template: String,
-    
+
     /// Whether to preserve folder structure
     pub preserve_structure: bool,
-    
+
     /// Calculate ReplayGain by default
     pub calculate_replaygain: bool,
-    
+
     /// Tool paths (if not in PATH)
     pub tool_paths: HashMap<String, PathBuf>,
 }
@@ -115,14 +115,16 @@ impl Default for ConversionConfig {
     }
 }
 
-
-
 fn status_progress_for_update(status: &ConversionStatus, progress_hint: f32) -> f32 {
     match status {
         ConversionStatus::Processing { progress, .. } => *progress,
         ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
-        ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => progress_hint.clamp(0.0, 100.0),
-        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => 0.0,
+        ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
+            progress_hint.clamp(0.0, 100.0)
+        }
+        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => {
+            0.0
+        }
     }
 }
 
@@ -135,7 +137,7 @@ impl ConversionManager {
             default_destination_directory: None,
             scratch_directory: None,
         });
-        
+
         Self {
             queue: Arc::new(RwLock::new(ConversionQueue::new())),
             processor,
@@ -144,9 +146,13 @@ impl ConversionManager {
             stop_requested: false,
         }
     }
-    
+
     /// Add files to the conversion queue
-    pub async fn add_files(&mut self, files: Vec<PathBuf>, options: ConversionOptions) -> ConversionResult<()> {
+    pub async fn add_files(
+        &mut self,
+        files: Vec<PathBuf>,
+        options: ConversionOptions,
+    ) -> ConversionResult<()> {
         let mut queue = self.queue.write().await;
         for file in files {
             let format = FormatDetector::detect(&file)?;
@@ -154,17 +160,21 @@ impl ConversionManager {
         }
         Ok(())
     }
-    
+
     /// Add a directory to the conversion queue
-    pub async fn add_directory(&mut self, dir: &Path, options: ConversionOptions) -> ConversionResult<()> {
+    pub async fn add_directory(
+        &mut self,
+        dir: &Path,
+        options: ConversionOptions,
+    ) -> ConversionResult<()> {
         let files = self.scan_directory(dir)?;
         self.add_files(files, options).await
     }
-    
+
     /// Scan a directory for audio files
     fn scan_directory(&self, dir: &Path) -> ConversionResult<Vec<PathBuf>> {
         let mut files = Vec::new();
-        
+
         for entry in walkdir::WalkDir::new(dir)
             .follow_links(true)
             .into_iter()
@@ -177,17 +187,17 @@ impl ConversionManager {
                 }
             }
         }
-        
+
         Ok(files)
     }
-    
+
     /// Start processing the conversion queue
     pub async fn start_processing(&mut self) -> ConversionResult<()> {
         // This method is deprecated - use the new shared queue approach in main.rs
         let mut queue = self.queue.write().await;
         self.processor.process_queue(&mut *queue).await
     }
-    
+
     /// Get current progress
     pub fn get_progress(&self) -> ConversionProgress {
         // Since this is called from UI thread and we need non-blocking access,
@@ -197,7 +207,7 @@ impl ConversionManager {
             let completed = queue.completed_items();
             let failed = queue.failed_items();
             let current = queue.current_item();
-            
+
             ConversionProgress {
                 total_files: total,
                 completed_files: completed,
@@ -220,13 +230,18 @@ impl ConversionManager {
             }
         }
     }
-    
+
     /// Add a single file synchronously (blocking) - for UI compatibility
-    pub fn add_file_blocking(&mut self, file: std::path::PathBuf, options: ConversionOptions) -> ConversionResult<()> {
+    pub fn add_file_blocking(
+        &mut self,
+        file: std::path::PathBuf,
+        options: ConversionOptions,
+    ) -> ConversionResult<()> {
         let format = FormatDetector::detect(&file)?;
         // Use try_write() instead of blocking_write() to avoid panic in async context
-        let mut queue = self.queue.try_write()
-            .map_err(|_| ConversionError::ConversionFailed("Queue is busy, try again".to_string()))?;
+        let mut queue = self.queue.try_write().map_err(|_| {
+            ConversionError::ConversionFailed("Queue is busy, try again".to_string())
+        })?;
         queue.add_item(file, format, options);
         Ok(())
     }
@@ -241,8 +256,9 @@ impl ConversionManager {
     ) -> ConversionResult<String> {
         let format = FormatDetector::detect(&file)?;
         // Use try_write() instead of blocking_write() to avoid panic in async context
-        let mut queue = self.queue.try_write()
-            .map_err(|_| ConversionError::ConversionFailed("Queue is busy, try again".to_string()))?;
+        let mut queue = self.queue.try_write().map_err(|_| {
+            ConversionError::ConversionFailed("Queue is busy, try again".to_string())
+        })?;
 
         // Create item and mark as Queued (ready for processing)
         let mut item = ConversionItem::new(file.clone(), format, options);
@@ -254,7 +270,7 @@ impl ConversionManager {
         log::info!("Added file ready for processing: {:?} (id: {})", file, id);
         Ok(id)
     }
-    
+
     /// Get queue size blocking - for UI compatibility
     pub fn queue_size(&self) -> usize {
         if let Ok(queue) = self.queue.try_read() {
@@ -279,15 +295,15 @@ impl ConversionManager {
             queue.clear();
         }
     }
-    
+
     /// Update item status by ID
     pub fn update_item_status(&self, id: &str, status: ConversionStatus, progress: f32) -> bool {
         if let Ok(mut queue) = self.queue.try_write() {
             if let Some(item) = queue.find_item_mut(id) {
                 // Just use the status as-is - it already has all the correct fields including phase
                 item.status = status.clone();
-                
-                // Update timestamps based on status  
+
+                // Update timestamps based on status
                 match &status {
                     ConversionStatus::Processing { .. } if item.started_at.is_none() => {
                         item.started_at = Some(chrono::Utc::now());
@@ -310,7 +326,7 @@ impl ConversionManager {
         }
         false
     }
-    
+
     /// Stop all conversions
     pub fn stop_all_conversions(&mut self) {
         self.stop_requested = true;
@@ -327,7 +343,7 @@ impl ConversionManager {
             }
         }
     }
-    
+
     /// Pause conversions
     pub fn pause_conversions(&mut self) {
         self.paused = true;
@@ -340,7 +356,7 @@ impl ConversionManager {
             }
         }
     }
-    
+
     /// Resume conversions  
     pub fn resume_conversions(&mut self) {
         self.paused = false;
@@ -353,17 +369,17 @@ impl ConversionManager {
             }
         }
     }
-    
+
     /// Check if conversions are paused
     pub fn is_paused(&self) -> bool {
         self.paused
     }
-    
+
     /// Check if stop has been requested
     pub fn is_stop_requested(&self) -> bool {
         self.stop_requested
     }
-    
+
     /// Clear stop request flag (call after processing stops)
     pub fn clear_stop_request(&mut self) {
         self.stop_requested = false;
@@ -380,7 +396,9 @@ impl ConversionManager {
 
     /// Clear all selections
     pub fn clear_selection(&mut self) {
-        log::warn!("⚠️  CLEARING ALL SELECTIONS IN CONVERT QUEUE - backtrace would be helpful here");
+        log::warn!(
+            "⚠️  CLEARING ALL SELECTIONS IN CONVERT QUEUE - backtrace would be helpful here"
+        );
         if let Ok(mut queue) = self.queue.try_write() {
             for item in queue.all_items_mut() {
                 log::warn!("  Clearing selection on item {}", item.id);
@@ -470,18 +488,25 @@ impl ConversionManager {
                 match serde_json::from_str::<Vec<ConversionItem>>(&content) {
                     Ok(items) => {
                         // Validate paths for security (prevent path traversal attacks)
-                        items.into_iter()
+                        items
+                            .into_iter()
                             .filter(|item| {
                                 // Filter out items with suspicious paths
                                 let path_str = item.input_path.to_string_lossy();
                                 if path_str.contains("..") {
-                                    log::warn!("Filtered out queue item with suspicious path: {:?}", item.input_path);
+                                    log::warn!(
+                                        "Filtered out queue item with suspicious path: {:?}",
+                                        item.input_path
+                                    );
                                     return false;
                                 }
 
                                 // Filter out items where file no longer exists
                                 if !item.input_path.exists() {
-                                    log::info!("Filtered out queue item - file no longer exists: {:?}", item.input_path);
+                                    log::info!(
+                                        "Filtered out queue item - file no longer exists: {:?}",
+                                        item.input_path
+                                    );
                                     return false;
                                 }
 
@@ -490,13 +515,21 @@ impl ConversionManager {
                             .collect()
                     }
                     Err(e) => {
-                        log::error!("Failed to parse conversion queue from {:?}: {}", queue_path, e);
+                        log::error!(
+                            "Failed to parse conversion queue from {:?}: {}",
+                            queue_path,
+                            e
+                        );
                         Vec::new()
                     }
                 }
             }
             Err(e) => {
-                log::error!("Failed to read conversion queue from {:?}: {}", queue_path, e);
+                log::error!(
+                    "Failed to read conversion queue from {:?}: {}",
+                    queue_path,
+                    e
+                );
                 Vec::new()
             }
         }
@@ -518,7 +551,8 @@ impl ConversionManager {
 
         // Collect items to save (filter by status)
         let items_to_save: Vec<ConversionItem> = if let Ok(queue) = self.queue.try_read() {
-            queue.all_items()
+            queue
+                .all_items()
                 .iter()
                 .filter(|item| {
                     // Save: NotConfigured, Queued, Paused, Completed, Failed
@@ -526,10 +560,10 @@ impl ConversionManager {
                     matches!(
                         item.status,
                         ConversionStatus::NotConfigured
-                        | ConversionStatus::Queued
-                        | ConversionStatus::Paused
-                        | ConversionStatus::Completed { .. }
-                        | ConversionStatus::Failed { .. }
+                            | ConversionStatus::Queued
+                            | ConversionStatus::Paused
+                            | ConversionStatus::Completed { .. }
+                            | ConversionStatus::Failed { .. }
                     )
                 })
                 .map(|&item| item.clone())

@@ -11,10 +11,10 @@
 //!      The covariance Σ handles ordinary non-PE variability.
 //!   5. Album pooling for the final "possible PE" flag.
 
-use super::stft::NUM_BANDS;
-use super::frame_select::SelectedFrames;
 use super::corpus::CorpusModel;
+use super::frame_select::SelectedFrames;
 use super::iir;
+use super::stft::NUM_BANDS;
 
 /// Result of the matched-filter scoring.
 #[derive(Debug, Clone)]
@@ -59,7 +59,9 @@ pub fn usable_band_mask(sample_rate: u32) -> [bool; NUM_BANDS] {
 
 /// Extract only usable bands from a full-size array.
 fn masked(values: &[f64; NUM_BANDS], mask: &[bool; NUM_BANDS]) -> Vec<f64> {
-    values.iter().zip(mask.iter())
+    values
+        .iter()
+        .zip(mask.iter())
         .filter(|(_, &m)| m)
         .map(|(&v, _)| v)
         .collect()
@@ -113,7 +115,8 @@ pub fn score_models(
     let pe_correlation = pearson_corr(&residual, &pe_residual);
 
     // Alpha stability from per-frame scores.
-    let alpha_stability = compute_z_stability(selected, stft, corpus, &mask, &pe_residual, &cov_masked);
+    let alpha_stability =
+        compute_z_stability(selected, stft, corpus, &mask, &pe_residual, &cov_masked);
 
     ModelScores {
         z_score,
@@ -147,8 +150,16 @@ fn whitened_matched_filter(
     let sigma_inv_s = solve_regularized(covariance, template, n);
     let sigma_inv_r = solve_regularized(covariance, residual, n);
 
-    let s_sigma_inv_r: f64 = template.iter().zip(sigma_inv_r.iter()).map(|(&a, &b)| a * b).sum();
-    let s_sigma_inv_s: f64 = template.iter().zip(sigma_inv_s.iter()).map(|(&a, &b)| a * b).sum();
+    let s_sigma_inv_r: f64 = template
+        .iter()
+        .zip(sigma_inv_r.iter())
+        .map(|(&a, &b)| a * b)
+        .sum();
+    let s_sigma_inv_s: f64 = template
+        .iter()
+        .zip(sigma_inv_s.iter())
+        .map(|(&a, &b)| a * b)
+        .sum();
 
     if s_sigma_inv_s > 1e-10 {
         s_sigma_inv_r / s_sigma_inv_s.sqrt()
@@ -196,7 +207,9 @@ fn gauss_solve(matrix: &[f64], rhs: &[f64], n: usize) -> Vec<f64> {
                 max_row = row;
             }
         }
-        if max_val < 1e-15 { continue; } // Skip singular column.
+        if max_val < 1e-15 {
+            continue;
+        } // Skip singular column.
 
         // Swap rows.
         if max_row != col {
@@ -237,7 +250,9 @@ fn gauss_solve(matrix: &[f64], rhs: &[f64], n: usize) -> Vec<f64> {
 /// The covariance handles ordinary spectral variation.
 fn remove_intercept_tilt(data: &[f64]) -> Vec<f64> {
     let n = data.len() as f64;
-    if n < 2.0 { return data.to_vec(); }
+    if n < 2.0 {
+        return data.to_vec();
+    }
 
     // Fit y = a + b*x via least squares.
     let mean_x = (n - 1.0) / 2.0;
@@ -252,7 +267,8 @@ fn remove_intercept_tilt(data: &[f64]) -> Vec<f64> {
     let slope = if den.abs() > 1e-12 { num / den } else { 0.0 };
     let intercept = mean_y - slope * mean_x;
 
-    data.iter().enumerate()
+    data.iter()
+        .enumerate()
         .map(|(i, &y)| y - slope * i as f64 - intercept)
         .collect()
 }
@@ -274,7 +290,9 @@ fn get_pe_template(corpus: &CorpusModel, mask: &[bool; NUM_BANDS]) -> Vec<f64> {
 
 /// Extract the submatrix of covariance for usable bands only.
 fn mask_covariance(covariance: &[f64], mask: &[bool; NUM_BANDS]) -> Vec<f64> {
-    let indices: Vec<usize> = mask.iter().enumerate()
+    let indices: Vec<usize> = mask
+        .iter()
+        .enumerate()
         .filter(|(_, &m)| m)
         .map(|(i, _)| i)
         .collect();
@@ -300,7 +318,9 @@ fn compute_z_stability(
     pe_template: &[f64],
     covariance: &[f64],
 ) -> f64 {
-    if selected.frames.len() < 10 { return f64::NAN; }
+    if selected.frames.len() < 10 {
+        return f64::NAN;
+    }
 
     let n_bands = mask.iter().filter(|&&m| m).count();
     let step = (selected.frames.len() / 30).max(1);
@@ -319,7 +339,9 @@ fn compute_z_stability(
         z_scores.push(z);
     }
 
-    if z_scores.is_empty() { return f64::NAN; }
+    if z_scores.is_empty() {
+        return f64::NAN;
+    }
     let mean = z_scores.iter().sum::<f64>() / z_scores.len() as f64;
     let var = z_scores.iter().map(|&z| (z - mean).powi(2)).sum::<f64>() / z_scores.len() as f64;
     var.sqrt()
@@ -327,13 +349,20 @@ fn compute_z_stability(
 
 // ── Utilities ──────────────────────────────────────────────────────
 
-fn compute_median_spectrum(selected: &SelectedFrames, stft: &super::stft::StftResult) -> [f64; NUM_BANDS] {
+fn compute_median_spectrum(
+    selected: &SelectedFrames,
+    stft: &super::stft::StftResult,
+) -> [f64; NUM_BANDS] {
     let n = selected.frames.len();
     let mut median = [0.0; NUM_BANDS];
-    if n == 0 { return median; }
+    if n == 0 {
+        return median;
+    }
 
     for k in 0..NUM_BANDS {
-        let mut values: Vec<f64> = selected.frames.iter()
+        let mut values: Vec<f64> = selected
+            .frames
+            .iter()
             .map(|&idx| stft.band_spectra[idx][k])
             .collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -352,7 +381,9 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 fn pearson_corr(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len() as f64;
-    if n < 2.0 { return 0.0; }
+    if n < 2.0 {
+        return 0.0;
+    }
     let mx = x.iter().sum::<f64>() / n;
     let my = y.iter().sum::<f64>() / n;
     let mut num = 0.0;
@@ -365,7 +396,11 @@ fn pearson_corr(x: &[f64], y: &[f64]) -> f64 {
         dx2 += dx * dx;
         dy2 += dy * dy;
     }
-    if dx2 * dy2 > 0.0 { num / (dx2 * dy2).sqrt() } else { 0.0 }
+    if dx2 * dy2 > 0.0 {
+        num / (dx2 * dy2).sqrt()
+    } else {
+        0.0
+    }
 }
 
 // ── Multi-summary per-frame alpha computation ──────────────────────
@@ -427,7 +462,9 @@ fn per_frame_alphas(
     let mut alphas = Vec::with_capacity(frame_indices.len());
 
     for &idx in frame_indices {
-        if idx >= stft_result.band_spectra.len() { continue; }
+        if idx >= stft_result.band_spectra.len() {
+            continue;
+        }
         let spectrum = &stft_result.band_spectra[idx];
 
         // Subtract corpus mean, mask to usable bands.
@@ -435,14 +472,22 @@ fn per_frame_alphas(
         for k in 0..NUM_BANDS {
             diff[k] = spectrum[k] - corpus.mean[k];
         }
-        let data: Vec<f64> = diff.iter().zip(mask.iter())
-            .filter(|(_, &m)| m).map(|(&v, _)| v).collect();
+        let data: Vec<f64> = diff
+            .iter()
+            .zip(mask.iter())
+            .filter(|(_, &m)| m)
+            .map(|(&v, _)| v)
+            .collect();
 
         // Remove intercept + tilt.
         let residual = remove_intercept_tilt(&data);
 
         // Project onto PE template.
-        let dot_rp: f64 = residual.iter().zip(pe_template.iter()).map(|(&r, &p)| r * p).sum();
+        let dot_rp: f64 = residual
+            .iter()
+            .zip(pe_template.iter())
+            .map(|(&r, &p)| r * p)
+            .sum();
         let dot_pp: f64 = pe_template.iter().map(|&p| p * p).sum();
         let alpha = if dot_pp > 1e-10 { dot_rp / dot_pp } else { 0.0 };
         alphas.push(alpha);
@@ -453,13 +498,19 @@ fn per_frame_alphas(
 
 /// Compute (median, p75, fraction_positive) from a vector of alpha values.
 fn alpha_distribution_stats(alphas: &[f64]) -> (f64, f64, f64) {
-    if alphas.is_empty() { return (0.0, 0.0, 0.0); }
+    if alphas.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
 
     let mut sorted = alphas.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = sorted.len();
 
-    let median = if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 };
+    let median = if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    };
     let p75 = sorted[3 * n / 4];
     let frac_pos = alphas.iter().filter(|&&a| a > 0.0).count() as f64 / n as f64;
 
@@ -483,34 +534,35 @@ pub struct TrackShapeFeatures {
 
 impl TrackShapeFeatures {
     /// Construct shape features from multi-alpha summary + model scores.
-    pub fn new(
-        multi_alpha: &TrackMultiAlpha,
-        pe_correlation: f64,
-        deemph_delta: f64,
-    ) -> Self {
+    pub fn new(multi_alpha: &TrackMultiAlpha, pe_correlation: f64, deemph_delta: f64) -> Self {
         let q50 = multi_alpha.quiet_median;
         let q75 = multi_alpha.quiet_p75;
         let spread = q75 - q50; // Key signal: large spread = intermittent PE.
         let frac_pos = multi_alpha.fraction_positive_quiet;
 
         Self {
-            features: [
-                q50,
-                q75,
-                spread,
-                frac_pos,
-                pe_correlation,
-                deemph_delta,
-            ],
+            features: [q50, q75, spread, frac_pos, pe_correlation, deemph_delta],
         }
     }
 
-    pub fn q50(&self) -> f64 { self.features[0] }
-    pub fn q75(&self) -> f64 { self.features[1] }
-    pub fn spread(&self) -> f64 { self.features[2] }
-    pub fn frac_pos(&self) -> f64 { self.features[3] }
-    pub fn pe_correlation(&self) -> f64 { self.features[4] }
-    pub fn deemph_delta(&self) -> f64 { self.features[5] }
+    pub fn q50(&self) -> f64 {
+        self.features[0]
+    }
+    pub fn q75(&self) -> f64 {
+        self.features[1]
+    }
+    pub fn spread(&self) -> f64 {
+        self.features[2]
+    }
+    pub fn frac_pos(&self) -> f64 {
+        self.features[3]
+    }
+    pub fn pe_correlation(&self) -> f64 {
+        self.features[4]
+    }
+    pub fn deemph_delta(&self) -> f64 {
+        self.features[5]
+    }
 }
 
 // get_pe_template is defined above in the matched-filter section.

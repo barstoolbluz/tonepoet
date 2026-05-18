@@ -3,7 +3,7 @@
 //! Parses a single-image CUE layout into `ImageSegment` track refs. Cutting
 //! is left to `realize_track`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,14 +11,15 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{MaterializeError, SourceDetectError, ToolRunnerError};
+use super::reporter::PipelineReporter;
 use super::stages::Materializer;
 use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 use crate::tui::cue_parser::{parse_cue, parse_cue_file, CueSheet};
 
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4", "aac",
-    "opus", "ogg", "ape", "w64", "rf64",
+    "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4", "aac", "opus", "ogg",
+    "ape", "w64", "rf64",
 ];
 
 #[derive(Debug, Clone)]
@@ -50,6 +51,8 @@ impl Materializer for CueImageMaterializer {
         req: &PipelineRequest,
         staging: &StagingDir,
         runner: &dyn ToolRunner,
+        _reporter: Option<&dyn PipelineReporter>,
+        _tool_paths: &HashMap<String, PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<PreparedSource, MaterializeError> {
         std::fs::create_dir_all(&staging.root)?;
@@ -127,25 +130,37 @@ fn resolve_cue_input(req: &PipelineRequest) -> Result<CueInput, MaterializeError
             "IgnoreCue must stay on the legacy single-file path".to_string(),
         )),
         CueSidecarPolicy::SidecarOnly => resolve_sidecar_cue(req),
-        CueSidecarPolicy::PreferSidecar => match find_valid_sidecar_cue_for_image(&req.container)? {
-            Some(cue_path) => read_sidecar_cue(req, cue_path),
-            None => resolve_embedded_cue(req),
-        },
+        CueSidecarPolicy::PreferSidecar => {
+            match find_valid_sidecar_cue_for_image(&req.container)? {
+                Some(cue_path) => read_sidecar_cue(req, cue_path),
+                None => resolve_embedded_cue(req),
+            }
+        }
         CueSidecarPolicy::EmbeddedOnly => resolve_embedded_cue(req),
     }
 }
 
 fn resolve_sidecar_cue(req: &PipelineRequest) -> Result<CueInput, MaterializeError> {
     let cue_path = find_valid_sidecar_cue_for_image(&req.container)?.ok_or_else(|| {
-        MaterializeError::Parse("SidecarOnly requested but no matching single-image CUE was found".to_string())
+        MaterializeError::Parse(
+            "SidecarOnly requested but no matching single-image CUE was found".to_string(),
+        )
     })?;
     read_sidecar_cue(req, cue_path)
 }
 
-fn read_sidecar_cue(req: &PipelineRequest, cue_path: PathBuf) -> Result<CueInput, MaterializeError> {
+fn read_sidecar_cue(
+    req: &PipelineRequest,
+    cue_path: PathBuf,
+) -> Result<CueInput, MaterializeError> {
     let raw_cue = read_text_lossy(&cue_path)?;
     let sheet = parse_cue_file(&cue_path).map_err(MaterializeError::Parse)?;
-    let image_path = resolve_single_image_path(&sheet, CueOrigin::Sidecar, cue_path.parent(), Some(&req.container))?;
+    let image_path = resolve_single_image_path(
+        &sheet,
+        CueOrigin::Sidecar,
+        cue_path.parent(),
+        Some(&req.container),
+    )?;
 
     if !same_existing_path(&image_path, &req.container) && !has_extension(&req.container, "cue") {
         return Err(MaterializeError::Parse(format!(
@@ -155,12 +170,18 @@ fn read_sidecar_cue(req: &PipelineRequest, cue_path: PathBuf) -> Result<CueInput
         )));
     }
 
-    Ok(CueInput { image_path, sheet, raw_cue })
+    Ok(CueInput {
+        image_path,
+        sheet,
+        raw_cue,
+    })
 }
 
 fn resolve_embedded_cue(req: &PipelineRequest) -> Result<CueInput, MaterializeError> {
     let raw_cue = read_embedded_cuesheet(&req.container)?.ok_or_else(|| {
-        MaterializeError::Parse("EmbeddedOnly requested but no embedded CUESHEET tag was found".to_string())
+        MaterializeError::Parse(
+            "EmbeddedOnly requested but no embedded CUESHEET tag was found".to_string(),
+        )
     })?;
     let sheet = parse_cue(&raw_cue);
     validate_single_image_layout(&sheet)?;
@@ -230,9 +251,12 @@ fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDe
         if validate_single_image_layout_detect(&sheet).is_err() {
             continue;
         }
-        if let Some(resolved) =
-            resolve_single_image_path_detect(&sheet, CueOrigin::Sidecar, cue_path.parent(), Some(image))
-        {
+        if let Some(resolved) = resolve_single_image_path_detect(
+            &sheet,
+            CueOrigin::Sidecar,
+            cue_path.parent(),
+            Some(image),
+        ) {
             if same_existing_path(&resolved, image) {
                 matching.push(cue_path);
             }
@@ -301,7 +325,10 @@ fn find_valid_sidecar_cue_for_image(image: &Path) -> Result<Option<PathBuf>, Mat
     }
 }
 
-fn validate_sidecar_cue_matches_image(cue_path: &Path, image: &Path) -> Result<(), MaterializeError> {
+fn validate_sidecar_cue_matches_image(
+    cue_path: &Path,
+    image: &Path,
+) -> Result<(), MaterializeError> {
     if sidecar_cue_matches_image(cue_path, image)? {
         Ok(())
     } else {
@@ -317,7 +344,8 @@ fn sidecar_cue_matches_image(cue_path: &Path, image: &Path) -> Result<bool, Mate
     let raw_cue = read_text_lossy(cue_path)?;
     let sheet = parse_cue(&raw_cue);
     validate_single_image_layout(&sheet)?;
-    let resolved = resolve_single_image_path(&sheet, CueOrigin::Sidecar, cue_path.parent(), Some(image))?;
+    let resolved =
+        resolve_single_image_path(&sheet, CueOrigin::Sidecar, cue_path.parent(), Some(image))?;
     Ok(same_existing_path(&resolved, image))
 }
 
@@ -325,7 +353,9 @@ fn source_detect_to_materialize(err: SourceDetectError) -> MaterializeError {
     match err {
         SourceDetectError::Io(io) => MaterializeError::Io(io),
         SourceDetectError::AmbiguousCue(message) => MaterializeError::Parse(message),
-        SourceDetectError::UnknownSource => MaterializeError::Parse("unknown CUE source".to_string()),
+        SourceDetectError::UnknownSource => {
+            MaterializeError::Parse("unknown CUE source".to_string())
+        }
     }
 }
 
@@ -406,7 +436,11 @@ fn validate_single_image_layout_detect(sheet: &CueSheet) -> Result<(), String> {
     if sheet.tracks.is_empty() {
         return Err("CUE sheet has no tracks".to_string());
     }
-    if !sheet.tracks.iter().all(|track| track.index01_frames.is_some()) {
+    if !sheet
+        .tracks
+        .iter()
+        .all(|track| track.index01_frames.is_some())
+    {
         return Err("single-image CUE requires INDEX 01 for every track".to_string());
     }
 
@@ -417,7 +451,9 @@ fn validate_single_image_layout_detect(sheet: &CueSheet) -> Result<(), String> {
             .iter()
             .all(|track| track.file.as_ref() == Some(file_ref));
         if !all_same {
-            return Err("track-per-file CUE layouts are not handled by CueImageMaterializer".to_string());
+            return Err(
+                "track-per-file CUE layouts are not handled by CueImageMaterializer".to_string(),
+            );
         }
     }
 
@@ -441,14 +477,18 @@ fn resolve_single_image_path(
 ) -> Result<PathBuf, MaterializeError> {
     validate_single_image_layout(sheet)?;
     if origin == CueOrigin::Embedded {
-        return fallback_image
-            .map(Path::to_path_buf)
-            .ok_or_else(|| MaterializeError::Parse("embedded CUE has no owning image".to_string()));
+        return fallback_image.map(Path::to_path_buf).ok_or_else(|| {
+            MaterializeError::Parse("embedded CUE has no owning image".to_string())
+        });
     }
 
-    let file_ref = sheet.tracks.iter().find_map(|track| track.file.as_ref()).ok_or_else(|| {
-        MaterializeError::Parse("sidecar CUE sheet has no FILE reference".to_string())
-    })?;
+    let file_ref = sheet
+        .tracks
+        .iter()
+        .find_map(|track| track.file.as_ref())
+        .ok_or_else(|| {
+            MaterializeError::Parse("sidecar CUE sheet has no FILE reference".to_string())
+        })?;
     resolve_audio_reference(cue_parent, file_ref, fallback_image)
 }
 
@@ -602,7 +642,6 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
         }
     }
 
-
     let duration_secs = stream
         .get("duration")
         .and_then(|value| value.as_str())
@@ -685,7 +724,10 @@ fn compute_track_boundaries(
                 sheet.tracks[idx].number
             )));
         }
-        if !exact_total && idx == starts.len() - 1 && total_samples.saturating_sub(start) < sample_rate as u64 / 20 {
+        if !exact_total
+            && idx == starts.len() - 1
+            && total_samples.saturating_sub(start) < sample_rate as u64 / 20
+        {
             return Err(MaterializeError::Parse(
                 "image sample count probe is too coarse for the final CUE segment".to_string(),
             ));
@@ -721,10 +763,16 @@ fn cue_track_metadata(
 
     TrackMetadata {
         title: cue_track.title.clone(),
-        artist: cue_track.performer.clone().or_else(|| sheet.performer.clone()),
+        artist: cue_track
+            .performer
+            .clone()
+            .or_else(|| sheet.performer.clone()),
         album_artist: sheet.performer.clone(),
         composer: None,
-        performer: cue_track.performer.clone().or_else(|| sheet.performer.clone()),
+        performer: cue_track
+            .performer
+            .clone()
+            .or_else(|| sheet.performer.clone()),
         genre: sheet.genre.clone(),
         date: sheet.date.clone(),
         track_number: Some(cue_track.number),
@@ -776,7 +824,9 @@ fn apply_track_selection(
             }
             Ok(tracks
                 .into_iter()
-                .filter(|track| track.id.source_ordinal >= *start && track.id.source_ordinal <= *end)
+                .filter(|track| {
+                    track.id.source_ordinal >= *start && track.id.source_ordinal <= *end
+                })
                 .collect())
         }
         TrackSelection::Set(indices) => {
@@ -814,13 +864,21 @@ impl CueAnnotations {
         let mut current_track: Option<u32> = None;
 
         for (idx, line) in raw.lines().enumerate() {
-            let line = if idx == 0 { line.trim_start_matches('\u{FEFF}') } else { line };
+            let line = if idx == 0 {
+                line.trim_start_matches('\u{FEFF}')
+            } else {
+                line
+            };
             let trimmed = line.trim();
             if let Some(track_no) = parse_track_number(trimmed) {
                 current_track = Some(track_no);
                 continue;
             }
-            if trimmed.starts_with("FLAGS") && trimmed.split_whitespace().any(|token| token.eq_ignore_ascii_case("PRE")) {
+            if trimmed.starts_with("FLAGS")
+                && trimmed
+                    .split_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("PRE"))
+            {
                 if let Some(track_no) = current_track {
                     annotations.pre_emphasis.push(track_no);
                 }

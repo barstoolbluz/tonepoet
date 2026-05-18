@@ -1,8 +1,8 @@
 //! Audio format detection and conversion options
 
-use std::path::{Path, PathBuf};
+use crate::convert::simple_wizard::{DitherType, NyquistTransition, ReplayGainMode};
 use serde::{Deserialize, Serialize};
-use crate::convert::simple_wizard::{ReplayGainMode, DitherType, NyquistTransition};
+use std::path::{Path, PathBuf};
 
 /// Supported file formats (archives and audio)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -65,7 +65,10 @@ impl AudioFormat {
 
     /// Check if this is a lossless format
     pub fn is_lossless(&self) -> bool {
-        matches!(self, Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac)
+        matches!(
+            self,
+            Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac
+        )
     }
 
     /// Get all supported output formats
@@ -107,13 +110,13 @@ impl std::fmt::Display for AudioFormat {
 pub struct ConversionOptions {
     /// Target output format
     pub output_format: AudioFormat,
-    
+
     /// Quality settings
     pub quality: QualitySettings,
-    
+
     /// Whether to preserve metadata
     pub preserve_metadata: bool,
-    
+
     /// Whether to calculate ReplayGain
     pub calculate_replaygain: bool,
 
@@ -122,13 +125,13 @@ pub struct ConversionOptions {
 
     /// Output naming template
     pub naming_template: Option<String>,
-    
+
     /// Whether to overwrite existing files
     pub overwrite: bool,
-    
+
     /// Output directory for converted files
     pub output_dir: Option<PathBuf>,
-    
+
     /// Resampling quality (0-4: LQ, MQ, HQ, VHQ, Ultra)
     pub resample_quality: Option<u8>,
 
@@ -150,7 +153,7 @@ pub struct ConversionOptions {
 
     /// Copy auxiliary files (txt, cue, log, etc.) - defaults to true
     pub copy_auxiliary_files: bool,
-    
+
     /// Copy subdirectories from source - defaults to true
     pub copy_subdirectories: bool,
 
@@ -204,14 +207,14 @@ impl Default for ConversionOptions {
             dither_type: None,
             target_sample_rate: None,
             target_bit_depth: None,
-            copy_auxiliary_files: true,  // Match wizard default
-            copy_subdirectories: true,   // Match wizard default
-            reencode_flac: false,  // Match wizard default (don't re-encode, copy is default)
+            copy_auxiliary_files: true, // Match wizard default
+            copy_subdirectories: true,  // Match wizard default
+            reencode_flac: false,       // Match wizard default (don't re-encode, copy is default)
             merge_to_single: false,
             preferred_backend: None,
             original_settings: None,
             ssrc_insane_mode: None,
-            append_lineage_to_comment: false,  // Default to off
+            append_lineage_to_comment: false, // Default to off
             write_log_file: false,
             generate_cue_files: false,
             cue_generation_mode: "IfMerging".to_string(),
@@ -224,35 +227,35 @@ impl Default for ConversionOptions {
 pub enum QualitySettings {
     /// FLAC compression level (0-8, where 8 is best compression)
     Flac { compression_level: u8 },
-    
+
     /// WAV settings
     Wav { bit_depth: u16, sample_rate: u32 },
 
     /// AIFF settings
     Aiff { bit_depth: u16, sample_rate: u32 },
-    
+
     /// WavPack settings
-    WavPack { 
+    WavPack {
         compression_mode: WavPackMode,
         hybrid_mode: bool,
         correction_file: bool,
     },
-    
+
     /// MP3 settings
-    Mp3 { 
+    Mp3 {
         bitrate_mode: Mp3BitrateMode,
         quality: u8, // 0-9, where 0 is best
     },
-    
+
     /// AAC settings
     Aac {
         bitrate: u32, // kbps
         profile: AacProfile,
     },
-    
+
     /// Opus settings
     Opus {
-        bitrate: u32, // 6-510 kbps
+        bitrate: u32,   // 6-510 kbps
         complexity: u8, // 0-10
     },
 
@@ -262,7 +265,9 @@ pub enum QualitySettings {
 
 impl Default for QualitySettings {
     fn default() -> Self {
-        Self::Flac { compression_level: 5 }
+        Self::Flac {
+            compression_level: 5,
+        }
     }
 }
 
@@ -305,7 +310,8 @@ impl FormatDetector {
     pub fn detect(path: &Path) -> Result<FileFormat, super::ConversionError> {
         // Check for compound tar extensions first (.tar.gz, .tar.bz2, etc.)
         // because Path::extension() only returns the last component.
-        let name_lower = path.file_name()
+        let name_lower = path
+            .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.to_lowercase())
             .unwrap_or_default();
@@ -324,15 +330,17 @@ impl FormatDetector {
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_lowercase())
             .ok_or_else(|| {
-                super::ConversionError::UnsupportedFormat(
-                    format!("No file extension found for: {}", path.display())
-                )
+                super::ConversionError::UnsupportedFormat(format!(
+                    "No file extension found for: {}",
+                    path.display()
+                ))
             })?;
 
         match extension.as_str() {
             // Archives — all handled by 7zz/7z extraction pipeline.
-            "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "dmg"
-            | "tgz" | "tbz2" | "txz" => Ok(FileFormat::SevenZip),
+            "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "dmg" | "tgz" | "tbz2" | "txz" => {
+                Ok(FileFormat::SevenZip)
+            }
             // Audio formats.
             "flac" => Ok(FileFormat::Audio(AudioFormat::Flac)),
             "wav" | "wave" => Ok(FileFormat::Audio(AudioFormat::Wav)),
@@ -342,22 +350,27 @@ impl FormatDetector {
             "m4a" | "mp4" => Ok(FileFormat::Audio(Self::detect_m4a_codec(path))),
             "aac" => Ok(FileFormat::Audio(AudioFormat::Aac)),
             "opus" => Ok(FileFormat::Audio(AudioFormat::Opus)),
-            _ => Err(super::ConversionError::UnsupportedFormat(
-                format!("Unsupported format: .{}", extension)
-            )),
+            _ => Err(super::ConversionError::UnsupportedFormat(format!(
+                "Unsupported format: .{}",
+                extension
+            ))),
         }
     }
-    
+
     /// Distinguish ALAC from AAC in .m4a/.mp4 containers using ffmpeg-next
     fn detect_m4a_codec(path: &Path) -> AudioFormat {
         // Ensure ffmpeg is initialized
         static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| { ffmpeg_next::init().ok(); });
+        INIT.call_once(|| {
+            ffmpeg_next::init().ok();
+        });
 
         // Try in-process ffmpeg probe to check the actual codec
         if let Ok(ctx) = ffmpeg_next::format::input(&path) {
             if let Some(stream) = ctx.streams().best(ffmpeg_next::media::Type::Audio) {
-                if let Ok(codec_ctx) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+                if let Ok(codec_ctx) =
+                    ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                {
                     if let Ok(audio) = codec_ctx.decoder().audio() {
                         if let Some(codec) = audio.codec() {
                             if codec.name() == "alac" {
@@ -377,11 +390,11 @@ impl FormatDetector {
         match Self::detect(path)? {
             FileFormat::Audio(format) => Ok(format),
             FileFormat::SevenZip => Err(super::ConversionError::UnsupportedFormat(
-                "Expected audio file, found archive".to_string()
+                "Expected audio file, found archive".to_string(),
             )),
         }
     }
-    
+
     /// Check if a file is a supported format
     pub fn is_supported(path: &Path) -> bool {
         Self::detect(path).is_ok()
@@ -392,14 +405,16 @@ impl FormatDetector {
 impl AudioFormat {
     pub fn default_quality(&self) -> QualitySettings {
         match self {
-            AudioFormat::Flac => QualitySettings::Flac { compression_level: 5 },
+            AudioFormat::Flac => QualitySettings::Flac {
+                compression_level: 5,
+            },
             AudioFormat::Wav => QualitySettings::Wav {
                 bit_depth: 16,
-                sample_rate: 44100
+                sample_rate: 44100,
             },
             AudioFormat::Aiff => QualitySettings::Aiff {
                 bit_depth: 16,
-                sample_rate: 44100
+                sample_rate: 44100,
             },
             AudioFormat::WavPack => QualitySettings::WavPack {
                 compression_mode: WavPackMode::Normal,

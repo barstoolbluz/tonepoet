@@ -48,8 +48,7 @@ pub struct CueTrack {
 
 /// Parse a CUE sheet from a file path.
 pub fn parse_cue_file(path: &Path) -> Result<CueSheet, String> {
-    let raw = std::fs::read(path)
-        .map_err(|e| format!("failed to read CUE file: {}", e))?;
+    let raw = std::fs::read(path).map_err(|e| format!("failed to read CUE file: {}", e))?;
     let content = String::from_utf8_lossy(&raw);
     Ok(parse_cue(&content))
 }
@@ -71,9 +70,11 @@ pub fn find_sidecar_cue(audio_path: &Path) -> Option<PathBuf> {
     let mut cues: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension()
-            .map(|ext| ext.to_ascii_lowercase() == "cue")
-            .unwrap_or(false))
+        .filter(|p| {
+            p.extension()
+                .map(|ext| ext.to_ascii_lowercase() == "cue")
+                .unwrap_or(false)
+        })
         .collect();
     cues.sort();
     cues.into_iter().next()
@@ -94,7 +95,11 @@ pub fn parse_cue(content: &str) -> CueSheet {
         // classify BOM as whitespace (post-Unicode-2018), so without
         // this `strip_prefix("TITLE")` etc. would silently fail on
         // the album-level header line.
-        let line = if i == 0 { line.trim_start_matches('\u{FEFF}') } else { line };
+        let line = if i == 0 {
+            line.trim_start_matches('\u{FEFF}')
+        } else {
+            line
+        };
         let trimmed = line.trim();
 
         // FILE "filename.ext" WAVE
@@ -146,8 +151,8 @@ pub fn parse_cue(content: &str) -> CueSheet {
 
         // REM DATE / REM YEAR / REM GENRE (album-level, before any TRACK).
         if current_track.is_none() {
-            if let Some(val) = parse_rem_field(trimmed, "DATE")
-                .or_else(|| parse_rem_field(trimmed, "YEAR"))
+            if let Some(val) =
+                parse_rem_field(trimmed, "DATE").or_else(|| parse_rem_field(trimmed, "YEAR"))
             {
                 sheet.date = Some(val);
                 continue;
@@ -244,7 +249,11 @@ fn parse_rem_field(line: &str, field: &str) -> Option<String> {
         extract_quoted(rest)
     } else {
         let val = rest.trim();
-        if val.is_empty() { None } else { Some(val.to_string()) }
+        if val.is_empty() {
+            None
+        } else {
+            Some(val.to_string())
+        }
     }
 }
 
@@ -299,7 +308,9 @@ pub fn detect_single_image(dir: &Path) -> Option<SingleImageInfo> {
 
     // Must be a single-image layout (all tracks share the same FILE).
     let first_file = sheet.tracks[0].file.as_ref()?;
-    let all_same_file = sheet.tracks.iter()
+    let all_same_file = sheet
+        .tracks
+        .iter()
         .all(|t| t.file.as_ref() == Some(first_file));
     if !all_same_file {
         return None;
@@ -309,7 +320,8 @@ pub fn detect_single_image(dir: &Path) -> Option<SingleImageInfo> {
     let audio_path = crate::tui::accuraterip::resolve_cue_file_reference(dir, first_file)?;
 
     // Probe for sample rate and total samples.
-    let (total_samples, sample_rate) = crate::tui::accuraterip::probe_sample_count(&audio_path).ok()?;
+    let (total_samples, sample_rate) =
+        crate::tui::accuraterip::probe_sample_count(&audio_path).ok()?;
     let samples_per_frame = (sample_rate / 75) as u64;
 
     // Compute per-track boundaries from INDEX 01 frames.
@@ -384,9 +396,14 @@ pub fn extract_single_image_tracks(
 
         let status = Command::new("ffmpeg")
             .args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", &format!("{:.6}", start_secs),
-                "-t", &format!("{:.6}", duration_secs),
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                &format!("{:.6}", start_secs),
+                "-t",
+                &format!("{:.6}", duration_secs),
                 "-i",
             ])
             .arg(&source_path)
@@ -503,7 +520,10 @@ FILE "02 - Second.flac" WAVE
 
     #[test]
     fn quoted_extraction() {
-        assert_eq!(extract_quoted("\"hello world\" extra"), Some("hello world".to_string()));
+        assert_eq!(
+            extract_quoted("\"hello world\" extra"),
+            Some("hello world".to_string())
+        );
         assert_eq!(extract_quoted("no quotes"), None);
         assert_eq!(extract_quoted("\"\""), Some("".to_string()));
     }
@@ -550,8 +570,11 @@ FILE \"03 - Wonderin.wav\" WAVE
         content.push('\u{FEFF}');
         content.push_str("TITLE \"My Album\"\nFILE \"album.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
         let sheet = parse_cue(&content);
-        assert_eq!(sheet.title.as_deref(), Some("My Album"),
-            "BOM-prefixed first line still yields album-level TITLE");
+        assert_eq!(
+            sheet.title.as_deref(),
+            Some("My Album"),
+            "BOM-prefixed first line still yields album-level TITLE"
+        );
         assert_eq!(sheet.tracks.len(), 1);
     }
 }

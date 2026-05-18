@@ -1,7 +1,7 @@
-use std::path::Path;
+use anyhow::{Context, Result};
 use metaflac::Tag;
-use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlacMetadata {
@@ -36,7 +36,7 @@ impl FlacMetadata {
             genre: None,
         }
     }
-    
+
     pub fn get_display_artist(&self) -> Option<&String> {
         self.album_artist.as_ref().or(self.artist.as_ref())
     }
@@ -45,28 +45,32 @@ impl FlacMetadata {
 pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
     let tag = Tag::read_from_path(file_path)
         .with_context(|| format!("Failed to read FLAC metadata from {:?}", file_path))?;
-    
+
     let mut metadata = FlacMetadata::new();
-    
+
     if let Some(vorbis) = tag.vorbis_comments() {
         // artist() returns Option<&Vec<String>>, so we need the first element
-        metadata.artist = vorbis.artist()
+        metadata.artist = vorbis
+            .artist()
             .and_then(|v| v.first())
             .map(|s| s.to_string());
-        
+
         // album_artist() returns Option<&Vec<String>>
-        metadata.album_artist = vorbis.album_artist()
+        metadata.album_artist = vorbis
+            .album_artist()
             .and_then(|v| v.first())
             .map(|s| s.to_string());
-        
-        metadata.album = vorbis.album()
+
+        metadata.album = vorbis
+            .album()
             .and_then(|v| v.first())
             .map(|s| s.to_string());
-        
-        metadata.title = vorbis.title()
+
+        metadata.title = vorbis
+            .title()
             .and_then(|v| v.first())
             .map(|s| s.to_string());
-        
+
         // get() returns Option<&Vec<String>>
         if let Some(date_vec) = vorbis.get("DATE") {
             if let Some(date) = date_vec.first() {
@@ -76,7 +80,7 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
                 }
             }
         }
-        
+
         if metadata.year.is_none() {
             if let Some(year_vec) = vorbis.get("YEAR") {
                 if let Some(year) = year_vec.first() {
@@ -84,10 +88,10 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
                 }
             }
         }
-        
+
         metadata.track_number = vorbis.track();
         metadata.total_tracks = vorbis.total_tracks();
-        
+
         if let Some(disc_vec) = vorbis.get("DISCNUMBER") {
             if let Some(disc) = disc_vec.first() {
                 if let Ok(disc_num) = disc.parse::<u32>() {
@@ -95,7 +99,7 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
                 }
             }
         }
-        
+
         if let Some(total_vec) = vorbis.get("TOTALDISCS") {
             if let Some(total) = total_vec.first() {
                 if let Ok(total_discs) = total.parse::<u32>() {
@@ -103,17 +107,18 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
                 }
             }
         }
-        
+
         // comments are stored in COMMENT field
         if let Some(comment_vec) = vorbis.get("COMMENT") {
             metadata.comment = comment_vec.first().map(|s| s.to_string());
         }
-        
-        metadata.genre = vorbis.genre()
+
+        metadata.genre = vorbis
+            .genre()
             .and_then(|v| v.first())
             .map(|s| s.to_string());
     }
-    
+
     Ok(metadata)
 }
 
@@ -147,8 +152,11 @@ mod tests {
         let mut metadata = FlacMetadata::new();
         metadata.artist = Some("Artist".to_string());
         assert_eq!(metadata.get_display_artist(), Some(&"Artist".to_string()));
-        
+
         metadata.album_artist = Some("Album Artist".to_string());
-        assert_eq!(metadata.get_display_artist(), Some(&"Album Artist".to_string()));
+        assert_eq!(
+            metadata.get_display_artist(),
+            Some(&"Album Artist".to_string())
+        );
     }
 }

@@ -22,7 +22,9 @@ pub async fn compare_files(ref_path: PathBuf, target_path: PathBuf) -> CompareRe
     let ref_info = match tokio::task::spawn_blocking({
         let p = ref_path.clone();
         move || crate::tui::probe::probe_audio(&p)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(info)) => info,
         Ok(Err(e)) => return incompatible(&ref_path, &target_path, &format!("probe ref: {}", e)),
         Err(e) => return incompatible(&ref_path, &target_path, &format!("probe ref: {}", e)),
@@ -31,29 +33,45 @@ pub async fn compare_files(ref_path: PathBuf, target_path: PathBuf) -> CompareRe
     let target_info = match tokio::task::spawn_blocking({
         let p = target_path.clone();
         move || crate::tui::probe::probe_audio(&p)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(info)) => info,
-        Ok(Err(e)) => return incompatible(&ref_path, &target_path, &format!("probe target: {}", e)),
+        Ok(Err(e)) => {
+            return incompatible(&ref_path, &target_path, &format!("probe target: {}", e))
+        }
         Err(e) => return incompatible(&ref_path, &target_path, &format!("probe target: {}", e)),
     };
 
     if ref_info.sample_rate != target_info.sample_rate {
-        return incompatible(&ref_path, &target_path, &format!(
-            "sample rate: {} vs {}",
-            ref_info.sample_rate, target_info.sample_rate,
-        ));
+        return incompatible(
+            &ref_path,
+            &target_path,
+            &format!(
+                "sample rate: {} vs {}",
+                ref_info.sample_rate, target_info.sample_rate,
+            ),
+        );
     }
     if ref_info.channels != target_info.channels {
-        return incompatible(&ref_path, &target_path, &format!(
-            "channels: {} vs {}",
-            ref_info.channels, target_info.channels,
-        ));
+        return incompatible(
+            &ref_path,
+            &target_path,
+            &format!(
+                "channels: {} vs {}",
+                ref_info.channels, target_info.channels,
+            ),
+        );
     }
     if ref_info.bit_depth != target_info.bit_depth {
-        return incompatible(&ref_path, &target_path, &format!(
-            "bit depth: {:?} vs {:?}",
-            ref_info.bit_depth, target_info.bit_depth,
-        ));
+        return incompatible(
+            &ref_path,
+            &target_path,
+            &format!(
+                "bit depth: {:?} vs {:?}",
+                ref_info.bit_depth, target_info.bit_depth,
+            ),
+        );
     }
 
     // Decode both to raw s32le PCM via ffmpeg pipes.
@@ -96,7 +114,8 @@ pub async fn compare_files(ref_path: PathBuf, target_path: PathBuf) -> CompareRe
         // Compare the common prefix.
         let common = ref_n.min(target_n);
         if common > 0 && ref_buf[..common] != target_buf[..common] {
-            let diff_pos = ref_buf[..common].iter()
+            let diff_pos = ref_buf[..common]
+                .iter()
                 .zip(target_buf[..common].iter())
                 .position(|(a, b)| a != b)
                 .unwrap_or(0);
@@ -125,7 +144,11 @@ pub async fn compare_files(ref_path: PathBuf, target_path: PathBuf) -> CompareRe
                 identical: false,
                 detail: format!(
                     "different length ({} is longer)",
-                    if ref_n > target_n { "reference" } else { "target" },
+                    if ref_n > target_n {
+                        "reference"
+                    } else {
+                        "target"
+                    },
                 ),
             };
         }

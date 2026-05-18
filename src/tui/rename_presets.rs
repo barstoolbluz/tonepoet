@@ -53,12 +53,10 @@ pub fn save_template(name: &str, template: &str) -> Result<(), String> {
     file.templates
         .insert(name.to_string(), template.to_string());
 
-    let toml_str =
-        toml::to_string_pretty(&file).map_err(|e| format!("serialize error: {}", e))?;
+    let toml_str = toml::to_string_pretty(&file).map_err(|e| format!("serialize error: {}", e))?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("mkdir error: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir error: {}", e))?;
     }
     std::fs::write(&path, toml_str).map_err(|e| format!("write error: {}", e))?;
 
@@ -77,8 +75,7 @@ pub fn delete_template(name: &str) -> Result<(), String> {
         return Err(format!("template '{}' not found", name));
     }
 
-    let toml_str =
-        toml::to_string_pretty(&file).map_err(|e| format!("serialize error: {}", e))?;
+    let toml_str = toml::to_string_pretty(&file).map_err(|e| format!("serialize error: {}", e))?;
     std::fs::write(&path, toml_str).map_err(|e| format!("write error: {}", e))?;
 
     Ok(())
@@ -93,8 +90,10 @@ mod tests {
         let mut file = TemplatesFile::default();
         file.templates
             .insert("standard".to_string(), "%NN% - %TITLE%".to_string());
-        file.templates
-            .insert("full".to_string(), "%ARTIST% - %ALBUM% - %NN% - %TITLE%".to_string());
+        file.templates.insert(
+            "full".to_string(),
+            "%ARTIST% - %ALBUM% - %NN% - %TITLE%".to_string(),
+        );
 
         let toml_str = toml::to_string_pretty(&file).unwrap();
         let parsed: TemplatesFile = toml::from_str(&toml_str).unwrap();

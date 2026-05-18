@@ -10,8 +10,8 @@ use ratatui::{
 
 use super::app::{AppScreen, AppState};
 use super::convert_screen::draw_convert_screen;
-use super::draw_queue::draw_queue_screen;
 use super::draw_overlays::draw_overlay;
+use super::draw_queue::draw_queue_screen;
 
 /// Main draw function dispatching to screen-specific renderers
 pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
@@ -30,12 +30,12 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(7),  // header banner
-                    Constraint::Length(1),  // blank
-                    Constraint::Length(1),  // stats strip
-                    Constraint::Length(1),  // blank
-                    Constraint::Min(10),    // content
-                    Constraint::Length(2),  // footer (tabs + context)
+                    Constraint::Length(7), // header banner
+                    Constraint::Length(1), // blank
+                    Constraint::Length(1), // stats strip
+                    Constraint::Length(1), // blank
+                    Constraint::Min(10),   // content
+                    Constraint::Length(2), // footer (tabs + context)
                 ])
                 .split(f.size());
 
@@ -43,7 +43,13 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
             super::draw_status::draw_queue_stats_strip(f, chunks[2], app);
             draw_queue_screen(f, chunks[4], app);
             let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
-            super::draw_footer::draw_footer(f, chunks[5], app.current_screen, &mut app.button_map, status_msg);
+            super::draw_footer::draw_footer(
+                f,
+                chunks[5],
+                app.current_screen,
+                &mut app.button_map,
+                status_msg,
+            );
         }
         AppScreen::Wizard => {
             draw_wizard_screen(f, app);
@@ -76,9 +82,9 @@ fn draw_wizard_screen(f: &mut Frame, app: &mut AppState) {
 
 /// Draw settings screen showing conversion configuration + password keychain
 fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut AppState) {
-    use ratatui::widgets::{Block, Borders};
-    use ratatui::style::Modifier;
     use super::theme;
+    use ratatui::style::Modifier;
+    use ratatui::widgets::{Block, Borders};
 
     // Ensure keychain is loaded on first visit.
     app.keychain.ensure_loaded();
@@ -88,8 +94,8 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(12), // conversion settings
-            Constraint::Min(6),    // keychain
-            Constraint::Length(2), // footer
+            Constraint::Min(6),     // keychain
+            Constraint::Length(2),  // footer
         ])
         .split(area);
 
@@ -104,17 +110,23 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
         .border_style(Style::default().fg(settings_border))
         .title(Span::styled(
             " Conversion Settings ",
-            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
         ));
     let settings_inner = settings_block.inner(chunks[0]);
     f.render_widget(settings_block, chunks[0]);
 
     let cfg = &app.config.conversion;
 
-    let dest_str = cfg.default_destination.as_ref()
+    let dest_str = cfg
+        .default_destination
+        .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(ask every time)".to_string());
-    let scratch_str = cfg.scratch_directory.as_ref()
+    let scratch_str = cfg
+        .scratch_directory
+        .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(system default)".to_string());
 
@@ -130,29 +142,61 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
         Line::from(vec![
             Span::styled("  ReplayGain:           ", theme::muted()),
             Span::styled(
-                if cfg.calculate_replaygain { "Enabled" } else { "Disabled" },
-                Style::default().fg(if cfg.calculate_replaygain { theme::GREEN } else { theme::TEXT_DIM }),
+                if cfg.calculate_replaygain {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                },
+                Style::default().fg(if cfg.calculate_replaygain {
+                    theme::GREEN
+                } else {
+                    theme::TEXT_DIM
+                }),
             ),
         ]),
         Line::from(vec![
             Span::styled("  CUE files:            ", theme::muted()),
             Span::styled(
-                if cfg.generate_cue_files { format!("Enabled ({})", cfg.cue_generation_mode) } else { "Disabled".to_string() },
-                Style::default().fg(if cfg.generate_cue_files { theme::GREEN } else { theme::TEXT_DIM }),
+                if cfg.generate_cue_files {
+                    format!("Enabled ({})", cfg.cue_generation_mode)
+                } else {
+                    "Disabled".to_string()
+                },
+                Style::default().fg(if cfg.generate_cue_files {
+                    theme::GREEN
+                } else {
+                    theme::TEXT_DIM
+                }),
             ),
         ]),
         Line::from(vec![
             Span::styled("  Log files:            ", theme::muted()),
             Span::styled(
-                if cfg.write_log_file { "Enabled" } else { "Disabled" },
-                Style::default().fg(if cfg.write_log_file { theme::GREEN } else { theme::TEXT_DIM }),
+                if cfg.write_log_file {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                },
+                Style::default().fg(if cfg.write_log_file {
+                    theme::GREEN
+                } else {
+                    theme::TEXT_DIM
+                }),
             ),
         ]),
         Line::from(vec![
             Span::styled("  Persist queue:        ", theme::muted()),
             Span::styled(
-                if cfg.persist_queue { "Enabled" } else { "Disabled" },
-                Style::default().fg(if cfg.persist_queue { theme::GREEN } else { theme::TEXT_DIM }),
+                if cfg.persist_queue {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                },
+                Style::default().fg(if cfg.persist_queue {
+                    theme::GREEN
+                } else {
+                    theme::TEXT_DIM
+                }),
             ),
         ]),
         Line::from(vec![
@@ -178,7 +222,9 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
         .border_style(Style::default().fg(kc_border))
         .title(Span::styled(
             " Archive Passwords ",
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
         ));
     let kc_inner = kc_block.inner(chunks[1]);
     f.render_widget(kc_block, chunks[1]);
@@ -187,10 +233,7 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
         // Too small to render anything.
     } else if app.keychain.passwords.is_empty() {
         let empty_lines = vec![
-            Line::from(Span::styled(
-                "  No saved passwords",
-                theme::muted(),
-            )),
+            Line::from(Span::styled("  No saved passwords", theme::muted())),
             Line::from(Span::styled(
                 "  Press 'a' to add a password",
                 theme::muted(),
@@ -232,19 +275,21 @@ fn draw_settings_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
                 Style::default().fg(theme::TEXT)
             };
 
-            let row_area = ratatui::layout::Rect::new(
-                kc_inner.x,
-                kc_inner.y + row as u16,
-                kc_inner.width,
-                1,
-            );
+            let row_area =
+                ratatui::layout::Rect::new(kc_inner.x, kc_inner.y + row as u16, kc_inner.width, 1);
             f.render_widget(Paragraph::new(Span::styled(display, style)), row_area);
         }
     }
 
     // Footer
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
-    super::draw_footer::draw_footer(f, chunks[2], app.current_screen, &mut app.button_map, status_msg);
+    super::draw_footer::draw_footer(
+        f,
+        chunks[2],
+        app.current_screen,
+        &mut app.button_map,
+        status_msg,
+    );
 }
 
 /// Draw a placeholder screen for unimplemented tabs
@@ -253,21 +298,22 @@ fn draw_placeholder_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(10),
-            Constraint::Length(2),
-        ])
+        .constraints([Constraint::Min(10), Constraint::Length(2)])
         .split(area);
 
     let label = app.current_screen.tab_label();
-    let msg = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!("  {} — coming soon", label),
-            theme::muted(),
-        ),
-    ]));
+    let msg = Paragraph::new(Line::from(vec![Span::styled(
+        format!("  {} — coming soon", label),
+        theme::muted(),
+    )]));
     f.render_widget(msg, chunks[0]);
 
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
-    super::draw_footer::draw_footer(f, chunks[1], app.current_screen, &mut app.button_map, status_msg);
+    super::draw_footer::draw_footer(
+        f,
+        chunks[1],
+        app.current_screen,
+        &mut app.button_map,
+        status_msg,
+    );
 }

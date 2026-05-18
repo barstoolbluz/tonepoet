@@ -11,15 +11,15 @@
 //!    on smoothed log-spectra from low-information frames. Only flags when M2
 //!    beats both M0 and M1 by a clear margin.
 
-pub mod metadata;
 pub mod catalog;
-pub mod iir;
-pub mod stft;
-pub mod frame_select;
-pub mod models;
-pub mod scoring;
 pub mod corpus;
 pub mod diag;
+pub mod frame_select;
+pub mod iir;
+pub mod metadata;
+pub mod models;
+pub mod scoring;
+pub mod stft;
 
 use std::path::PathBuf;
 
@@ -72,8 +72,8 @@ pub struct PreemphasisResult {
 /// then running the spectral model comparison scorer.
 pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
     // Phase 1: Check tag and file evidence (fast, authoritative).
-    let evidence = metadata::check_tag_evidence(&path)
-        .or_else(|| metadata::check_file_evidence(&path));
+    let evidence =
+        metadata::check_tag_evidence(&path).or_else(|| metadata::check_file_evidence(&path));
 
     // Metadata confirms the source disc had PE, but we can't verify
     // whether de-emphasis was applied during ripping. Report as Likely.
@@ -116,22 +116,20 @@ pub async fn detect_preemphasis(path: PathBuf) -> PreemphasisResult {
     // Phase 3: Spectral model comparison.
     match run_spectral_scorer(&path).await {
         Ok(result) => result,
-        Err(e) => {
-            PreemphasisResult {
-                path,
-                confidence: PreemphasisConfidence::Indeterminate,
-                cue_confirmed: false,
-                llr_m2_vs_m0: f64::NAN,
-                llr_m2_vs_m1: f64::NAN,
-                fitted_alpha: f64::NAN,
-                frames_scored: 0,
-                deemph_distance_delta: 0.0,
-                gates_fired: vec![],
-                detail: format!("spectral analysis failed: {}", e),
-                spectral_rms_error: f64::NAN,
-                crest_improvement: 0.0,
-            }
-        }
+        Err(e) => PreemphasisResult {
+            path,
+            confidence: PreemphasisConfidence::Indeterminate,
+            cue_confirmed: false,
+            llr_m2_vs_m0: f64::NAN,
+            llr_m2_vs_m1: f64::NAN,
+            fitted_alpha: f64::NAN,
+            frames_scored: 0,
+            deemph_distance_delta: 0.0,
+            gates_fired: vec![],
+            detail: format!("spectral analysis failed: {}", e),
+            spectral_rms_error: f64::NAN,
+            crest_improvement: 0.0,
+        },
     }
 }
 
@@ -141,9 +139,10 @@ async fn run_spectral_scorer(path: &PathBuf) -> Result<PreemphasisResult, String
     let info = tokio::task::spawn_blocking({
         let p = path.clone();
         move || crate::tui::probe::probe_audio(&p)
-    }).await
-        .map_err(|e| format!("probe task: {}", e))?
-        .map_err(|e| format!("probe: {}", e))?;
+    })
+    .await
+    .map_err(|e| format!("probe task: {}", e))?
+    .map_err(|e| format!("probe: {}", e))?;
 
     if info.sample_rate > 48000 {
         return Ok(PreemphasisResult {
@@ -189,9 +188,10 @@ async fn run_spectral_scorer(path: &PathBuf) -> Result<PreemphasisResult, String
     let stft_result = tokio::task::spawn_blocking({
         let p = path.clone();
         move || stft::compute_band_spectra(&p, sample_rate)
-    }).await
-        .map_err(|e| format!("stft task: {}", e))?
-        .map_err(|e| format!("stft: {}", e))?;
+    })
+    .await
+    .map_err(|e| format!("stft task: {}", e))?
+    .map_err(|e| format!("stft: {}", e))?;
 
     // Select low-information frames.
     let selected = frame_select::select_frames(&stft_result);
@@ -217,9 +217,8 @@ async fn run_spectral_scorer(path: &PathBuf) -> Result<PreemphasisResult, String
     let model_scores = models::score_models(&selected, &stft_result, &corpus);
 
     // Virtual de-emphasis test.
-    let deemph_delta = scoring::virtual_deemphasis_score(
-        &stft_result, &selected, &corpus, sample_rate,
-    );
+    let deemph_delta =
+        scoring::virtual_deemphasis_score(&stft_result, &selected, &corpus, sample_rate);
 
     // Try to load trained classifier; fall back to legacy alpha if unavailable.
     let classifier = crate::db::Database::open()
@@ -228,13 +227,15 @@ async fn run_spectral_scorer(path: &PathBuf) -> Result<PreemphasisResult, String
 
     let verdict = if let Some(ref clf) = classifier {
         scoring::compute_verdict_with_classifier(
-            &model_scores, deemph_delta, &selected, &corpus, clf,
+            &model_scores,
+            deemph_delta,
+            &selected,
+            &corpus,
+            clf,
         )
     } else {
         #[allow(deprecated)]
-        scoring::compute_verdict_legacy_alpha(
-            &model_scores, deemph_delta, &selected, &corpus,
-        )
+        scoring::compute_verdict_legacy_alpha(&model_scores, deemph_delta, &selected, &corpus)
     };
 
     // Diagnostic dump.
@@ -256,17 +257,20 @@ async fn run_spectral_scorer(path: &PathBuf) -> Result<PreemphasisResult, String
     // Log raw diagnostics for debugging (visible with RUST_LOG=debug).
     log::debug!(
         "spectral PE: z={:.2}, α={:.3}, r={:.3}, Δd={:.2}, frames={}, gates=[{}]",
-        model_scores.z_score, model_scores.alpha, model_scores.pe_correlation,
-        deemph_delta, selected.frames.len(),
+        model_scores.z_score,
+        model_scores.alpha,
+        model_scores.pe_correlation,
+        deemph_delta,
+        selected.frames.len(),
         verdict.gates_fired.join(", "),
     );
 
     // User-facing detail: concise verdict without raw numbers.
     let detail = match verdict.confidence {
-        PreemphasisConfidence::Possible | PreemphasisConfidence::StrongCandidate =>
-            "spectral analysis suggests pre-emphasis boost may be present".to_string(),
-        _ =>
-            "spectral analysis did not find pre-emphasis evidence".to_string(),
+        PreemphasisConfidence::Possible | PreemphasisConfidence::StrongCandidate => {
+            "spectral analysis suggests pre-emphasis boost may be present".to_string()
+        }
+        _ => "spectral analysis did not find pre-emphasis evidence".to_string(),
     };
 
     Ok(PreemphasisResult {

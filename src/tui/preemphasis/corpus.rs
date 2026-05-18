@@ -74,7 +74,8 @@ impl CorpusModel {
         // Residual variance (average of diagonal covariance as proxy).
         let residual_var: f64 = (0..NUM_BANDS)
             .filter_map(|k| self.covariance.get(k * NUM_BANDS + k).copied())
-            .sum::<f64>() / NUM_BANDS as f64;
+            .sum::<f64>()
+            / NUM_BANDS as f64;
         let residual_norm_sq: f64 = residual.iter().map(|&r| r * r).sum();
         d_sq += residual_norm_sq / residual_var.max(1e-6);
 
@@ -84,8 +85,7 @@ impl CorpusModel {
 
 /// Load the corpus model from the tonepoet database.
 pub fn load_corpus() -> Result<CorpusModel, String> {
-    let db = crate::db::Database::open()
-        .map_err(|e| format!("db open: {}", e))?;
+    let db = crate::db::Database::open().map_err(|e| format!("db open: {}", e))?;
 
     let model = db.load_preemph_corpus()?;
 
@@ -228,9 +228,9 @@ fn ledoit_wolf_shrinkage(sample_cov: &[f64], n_samples: u64) -> Vec<f64> {
     // alpha = min(1, (delta_frob_sq * (n-1)) / (n * (trace_sq - trace²/p + delta_frob_sq)))
     // Simplified form: alpha ≈ min(1, delta_frob_sq / (n * delta_frob_sq + trace² - trace²/p))
     // We use the simpler Ledoit-Wolf (2004) formula:
-    let trace_sq: f64 = (0..p).flat_map(|i| (0..p).map(move |j| {
-        sample_cov[i * p + j] * sample_cov[j * p + i]
-    })).sum();
+    let trace_sq: f64 = (0..p)
+        .flat_map(|i| (0..p).map(move |j| sample_cov[i * p + j] * sample_cov[j * p + i]))
+        .sum();
 
     let numerator = delta_frob_sq;
     let denominator = (n + 1.0 - 2.0 / p as f64) * (trace_sq - trace * trace / p as f64);
@@ -265,14 +265,18 @@ fn compute_pca(covariance: &[f64], k: usize) -> Vec<[f64; NUM_BANDS]> {
 
         // Check convergence: if the vector is near-zero, stop extracting.
         let norm: f64 = pc.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        if norm < 0.5 { break; } // Degenerate eigenvector, stop.
+        if norm < 0.5 {
+            break;
+        } // Degenerate eigenvector, stop.
 
         // Compute eigenvalue: lambda = pc^T * C * pc.
         let cpc = mat_vec_dot(&deflated, &pc);
         let lambda: f64 = pc.iter().zip(cpc.iter()).map(|(&p, &cp)| p * cp).sum();
 
         // Only keep components with meaningful eigenvalue.
-        if lambda < 1e-4 { break; }
+        if lambda < 1e-4 {
+            break;
+        }
 
         // Deflate: C = C - lambda * pc * pc^T.
         for i in 0..NUM_BANDS {
@@ -291,12 +295,16 @@ fn power_iteration(matrix: &[f64], max_iter: usize) -> [f64; NUM_BANDS] {
     let mut v = [0.0; NUM_BANDS];
     // Initialize with uniform vector.
     let init = 1.0 / (NUM_BANDS as f64).sqrt();
-    for x in v.iter_mut() { *x = init; }
+    for x in v.iter_mut() {
+        *x = init;
+    }
 
     for _ in 0..max_iter {
         let mv = mat_vec_dot(matrix, &v);
         let norm: f64 = mv.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        if norm < 1e-15 { break; }
+        if norm < 1e-15 {
+            break;
+        }
         for k in 0..NUM_BANDS {
             v[k] = mv[k] / norm;
         }
@@ -331,8 +339,7 @@ fn mat_vec_dot_safe(matrix: &[f64], vec: &[f64; NUM_BANDS]) -> [f64; NUM_BANDS] 
 
 /// Save corpus model to database.
 pub fn save_corpus(model: &CorpusModel) -> Result<(), String> {
-    let db = crate::db::Database::open()
-        .map_err(|e| format!("db open: {}", e))?;
+    let db = crate::db::Database::open().map_err(|e| format!("db open: {}", e))?;
 
     db.store_preemph_corpus(model)
 }
@@ -365,8 +372,11 @@ fn train_corpus_blocking(dir: &std::path::Path) -> Result<CorpusModel, String> {
 
     for entry in WalkDir::new(dir).follow_links(true).into_iter().flatten() {
         let path = entry.path().to_path_buf();
-        if !path.is_file() { continue; }
-        let ext = path.extension()
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
@@ -395,7 +405,9 @@ fn train_corpus_blocking(dir: &std::path::Path) -> Result<CorpusModel, String> {
 
     log::info!(
         "Corpus training: {} non-PE files from {} total in {}",
-        non_pe_files.len(), audio_files.len(), dir.display()
+        non_pe_files.len(),
+        audio_files.len(),
+        dir.display()
     );
 
     // Train: decode each file, compute STFT, select quiet frames.
@@ -406,8 +418,11 @@ fn train_corpus_blocking(dir: &std::path::Path) -> Result<CorpusModel, String> {
             Ok(frames_added) => {
                 if frames_added > 0 {
                     trainer.add_track();
-                    log::debug!("  {} frames from {:?}", frames_added,
-                        path.file_name().unwrap_or_default());
+                    log::debug!(
+                        "  {} frames from {:?}",
+                        frames_added,
+                        path.file_name().unwrap_or_default()
+                    );
                 }
             }
             Err(e) => {
@@ -418,7 +433,8 @@ fn train_corpus_blocking(dir: &std::path::Path) -> Result<CorpusModel, String> {
 
     log::info!(
         "Corpus training complete: {} tracks, {} frames",
-        trainer.track_count(), trainer.frame_count()
+        trainer.track_count(),
+        trainer.frame_count()
     );
 
     // Finalize model.
@@ -439,8 +455,7 @@ fn train_single_track(
     use super::frame_select;
 
     // Probe to get duration and sample rate.
-    let info = crate::tui::probe::probe_audio(path)
-        .map_err(|e| format!("probe: {}", e))?;
+    let info = crate::tui::probe::probe_audio(path).map_err(|e| format!("probe: {}", e))?;
 
     // Skip hi-res (>48 kHz) — corpus should represent CD-quality audio.
     if info.sample_rate > 48000 {
@@ -498,11 +513,16 @@ fn compute_empirical_template_blocking(
 
     // Collect PE FLAC files.
     let pe_files: Vec<std::path::PathBuf> = WalkDir::new(pe_dir)
-        .follow_links(true).into_iter().flatten()
+        .follow_links(true)
+        .into_iter()
+        .flatten()
         .filter(|e| {
-            e.path().is_file() &&
-            e.path().extension().and_then(|x| x.to_str())
-                .map(|x| x.eq_ignore_ascii_case("flac")).unwrap_or(false)
+            e.path().is_file()
+                && e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("flac"))
+                    .unwrap_or(false)
         })
         .map(|e| e.path().to_path_buf())
         .collect();
@@ -516,7 +536,9 @@ fn compute_empirical_template_blocking(
 
     for pe_path in &pe_files {
         // Find corresponding deemphasized file (same relative path).
-        let rel = pe_path.strip_prefix(pe_dir).map_err(|e| format!("strip: {}", e))?;
+        let rel = pe_path
+            .strip_prefix(pe_dir)
+            .map_err(|e| format!("strip: {}", e))?;
         let deemph_path = deemph_dir.join(rel);
 
         if !deemph_path.exists() {
@@ -527,7 +549,11 @@ fn compute_empirical_template_blocking(
         let pe_median = match compute_track_median(pe_path) {
             Ok(m) => m,
             Err(e) => {
-                log::warn!("  skip PE {:?}: {}", pe_path.file_name().unwrap_or_default(), e);
+                log::warn!(
+                    "  skip PE {:?}: {}",
+                    pe_path.file_name().unwrap_or_default(),
+                    e
+                );
                 continue;
             }
         };
@@ -535,7 +561,11 @@ fn compute_empirical_template_blocking(
         let deemph_median = match compute_track_median(&deemph_path) {
             Ok(m) => m,
             Err(e) => {
-                log::warn!("  skip deemph {:?}: {}", deemph_path.file_name().unwrap_or_default(), e);
+                log::warn!(
+                    "  skip deemph {:?}: {}",
+                    deemph_path.file_name().unwrap_or_default(),
+                    e
+                );
                 continue;
             }
         };
@@ -552,7 +582,10 @@ fn compute_empirical_template_blocking(
     }
 
     if pair_count < 10 {
-        return Err(format!("too few valid pairs ({}) for empirical template", pair_count));
+        return Err(format!(
+            "too few valid pairs ({}) for empirical template",
+            pair_count
+        ));
     }
 
     // Average.
@@ -565,8 +598,12 @@ fn compute_empirical_template_blocking(
         "Empirical PE template from {} pairs. Peak gain: {:.2} dB at band {}",
         pair_count,
         s_emp.iter().cloned().reduce(f64::max).unwrap_or(0.0),
-        s_emp.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i).unwrap_or(0),
+        s_emp
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0),
     );
 
     // Update corpus model and save.
@@ -579,18 +616,17 @@ fn compute_empirical_template_blocking(
 
 /// Compute the median quiet-frame spectrum for a single track.
 fn compute_track_median(path: &std::path::Path) -> Result<[f64; NUM_BANDS], String> {
-    use super::stft;
     use super::frame_select;
+    use super::stft;
 
-    let info = crate::tui::probe::probe_audio(path)
-        .map_err(|e| format!("probe: {}", e))?;
+    let info = crate::tui::probe::probe_audio(path).map_err(|e| format!("probe: {}", e))?;
 
     if info.sample_rate > 48000 {
         return Err("hi-res".into());
     }
 
-    let stft_result = stft::compute_band_spectra(path, info.sample_rate)
-        .map_err(|e| format!("stft: {}", e))?;
+    let stft_result =
+        stft::compute_band_spectra(path, info.sample_rate).map_err(|e| format!("stft: {}", e))?;
 
     let selected = frame_select::select_frames(&stft_result);
     if selected.frames.is_empty() {
@@ -601,7 +637,9 @@ fn compute_track_median(path: &std::path::Path) -> Result<[f64; NUM_BANDS], Stri
     let n = selected.frames.len();
     let mut median = [0.0f64; NUM_BANDS];
     for k in 0..NUM_BANDS {
-        let mut values: Vec<f64> = selected.frames.iter()
+        let mut values: Vec<f64> = selected
+            .frames
+            .iter()
             .map(|&idx| stft_result.band_spectra[idx][k])
             .collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -647,8 +685,8 @@ fn calibrate_blocking(
     pe_dir: &std::path::Path,
     non_pe_dir: &std::path::Path,
 ) -> Result<CalibrationResult, String> {
+    use super::{frame_select, models, scoring, stft};
     use walkdir::WalkDir;
-    use super::{stft, frame_select, models, scoring};
 
     // Ensure corpus is loaded.
     let corpus = load_corpus()
@@ -658,12 +696,17 @@ fn calibrate_blocking(
     let audio_extensions = ["flac", "wav", "aiff", "aif", "wv"];
 
     let collect_audio = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
-        WalkDir::new(dir).follow_links(true).into_iter().flatten()
+        WalkDir::new(dir)
+            .follow_links(true)
+            .into_iter()
+            .flatten()
             .filter(|e| {
-                e.path().is_file() &&
-                e.path().extension().and_then(|x| x.to_str())
-                    .map(|x| audio_extensions.contains(&x.to_ascii_lowercase().as_str()))
-                    .unwrap_or(false)
+                e.path().is_file()
+                    && e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| audio_extensions.contains(&x.to_ascii_lowercase().as_str()))
+                        .unwrap_or(false)
             })
             .map(|e| e.path().to_path_buf())
             .collect()
@@ -676,17 +719,25 @@ fn calibrate_blocking(
         return Err(format!("no audio files in PE dir: {}", pe_dir.display()));
     }
     if non_pe_files.is_empty() {
-        return Err(format!("no audio files in non-PE dir: {}", non_pe_dir.display()));
+        return Err(format!(
+            "no audio files in non-PE dir: {}",
+            non_pe_dir.display()
+        ));
     }
 
-    log::info!("Calibration: {} PE files, {} non-PE files", pe_files.len(), non_pe_files.len());
+    log::info!(
+        "Calibration: {} PE files, {} non-PE files",
+        pe_files.len(),
+        non_pe_files.len()
+    );
 
     // Compute features for all files.
     let mut samples: Vec<(scoring::TrackFeatures, bool, String)> = Vec::new();
 
-    let compute_features = |path: &std::path::Path, corpus: &CorpusModel| -> Result<(scoring::TrackFeatures, usize), String> {
-        let info = crate::tui::probe::probe_audio(path)
-            .map_err(|e| format!("probe: {}", e))?;
+    let compute_features = |path: &std::path::Path,
+                            corpus: &CorpusModel|
+     -> Result<(scoring::TrackFeatures, usize), String> {
+        let info = crate::tui::probe::probe_audio(path).map_err(|e| format!("probe: {}", e))?;
         if info.sample_rate > 48000 {
             return Err("hi-res".into());
         }
@@ -699,13 +750,11 @@ fn calibrate_blocking(
         }
 
         let model_scores = models::score_models(&selected, &stft_result, corpus);
-        let deemph_delta = scoring::virtual_deemphasis_score(
-            &stft_result, &selected, corpus, info.sample_rate,
-        );
+        let deemph_delta =
+            scoring::virtual_deemphasis_score(&stft_result, &selected, corpus, info.sample_rate);
 
-        let features = scoring::TrackFeatures::from_scores(
-            &model_scores, deemph_delta, selected.frames.len(),
-        );
+        let features =
+            scoring::TrackFeatures::from_scores(&model_scores, deemph_delta, selected.frames.len());
         Ok((features, selected.frames.len()))
     };
 
@@ -722,8 +771,11 @@ fn calibrate_blocking(
             Err(e) => {
                 pe_err += 1;
                 if pe_err <= 5 {
-                    log::warn!("  skip PE {:?}: {}",
-                        path.file_name().unwrap_or_default(), e);
+                    log::warn!(
+                        "  skip PE {:?}: {}",
+                        path.file_name().unwrap_or_default(),
+                        e
+                    );
                 }
             }
         }
@@ -745,19 +797,29 @@ fn calibrate_blocking(
             Err(e) => {
                 non_pe_err += 1;
                 if non_pe_err <= 5 {
-                    log::warn!("  skip non-PE {:?}: {}",
-                        path.file_name().unwrap_or_default(), e);
+                    log::warn!(
+                        "  skip non-PE {:?}: {}",
+                        path.file_name().unwrap_or_default(),
+                        e
+                    );
                 }
             }
         }
         if (non_pe_ok + non_pe_err) % 50 == 0 {
-            log::info!("  non-PE progress: {}/{}", non_pe_ok + non_pe_err, non_pe_files.len());
+            log::info!(
+                "  non-PE progress: {}/{}",
+                non_pe_ok + non_pe_err,
+                non_pe_files.len()
+            );
         }
     }
 
     log::info!(
         "Calibration features: {} PE ({} skipped), {} non-PE ({} skipped)",
-        pe_ok, pe_err, non_pe_ok, non_pe_err
+        pe_ok,
+        pe_err,
+        non_pe_ok,
+        non_pe_err
     );
 
     if pe_ok < 20 || non_pe_ok < 20 {
@@ -776,10 +838,15 @@ fn calibrate_blocking(
         groups.len()
     };
     let k_folds = 5.min(n_groups / 3).max(2);
-    log::info!("Training LDA classifier ({}-fold grouped CV, {} groups, target FPR=1%)...",
-        k_folds, n_groups);
+    log::info!(
+        "Training LDA classifier ({}-fold grouped CV, {} groups, target FPR=1%)...",
+        k_folds,
+        n_groups
+    );
     let (classifier, report) = scoring::grouped_cv_train_with_calibration_report(
-        &samples, k_folds, scoring::DEFAULT_TARGET_TRACK_FPR,
+        &samples,
+        k_folds,
+        scoring::DEFAULT_TARGET_TRACK_FPR,
     )?;
 
     let metrics = &report.metrics;
@@ -792,8 +859,7 @@ fn calibrate_blocking(
     );
 
     // Store classifier to DB.
-    let db = crate::db::Database::open()
-        .map_err(|e| format!("db open: {}", e))?;
+    let db = crate::db::Database::open().map_err(|e| format!("db open: {}", e))?;
     db.store_preemph_classifier(
         &classifier,
         metrics.track_accuracy,

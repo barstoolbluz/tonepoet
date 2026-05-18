@@ -28,7 +28,11 @@ impl DeemphasisCoeffs {
         let b0 = (1.0 + b) / (1.0 + a);
         let b1 = (1.0 - b) / (1.0 + a);
         let a1 = (1.0 - a) / (1.0 + a);
-        Self { b0, b1, a1_neg: -a1 }
+        Self {
+            b0,
+            b1,
+            a1_neg: -a1,
+        }
     }
 }
 
@@ -59,7 +63,8 @@ impl DeemphasisFilter {
     /// Process a single sample.
     #[inline]
     pub fn process_sample(&mut self, x: f64) -> f64 {
-        let y = self.coeffs.b0 * x + self.coeffs.b1 * self.x_prev + self.coeffs.a1_neg * self.y_prev;
+        let y =
+            self.coeffs.b0 * x + self.coeffs.b1 * self.x_prev + self.coeffs.a1_neg * self.y_prev;
         self.x_prev = x;
         self.y_prev = y;
         y

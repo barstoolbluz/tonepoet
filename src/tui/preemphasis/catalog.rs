@@ -166,7 +166,10 @@ fn is_probable_cd_year(token: &str) -> bool {
 }
 
 fn starts_with_ascii_digit(token: &str) -> bool {
-    token.as_bytes().first().map_or(false, |b| b.is_ascii_digit())
+    token
+        .as_bytes()
+        .first()
+        .map_or(false, |b| b.is_ascii_digit())
 }
 
 fn is_probable_space_separated_suffix(token: &str) -> bool {
@@ -312,7 +315,10 @@ fn push_candidate(
     }
 }
 
-fn extract_catalog_candidates_from_text(text: &str, source: CatalogSource) -> Vec<CatalogCandidate> {
+fn extract_catalog_candidates_from_text(
+    text: &str,
+    source: CatalogSource,
+) -> Vec<CatalogCandidate> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
@@ -964,7 +970,10 @@ mod tests {
 
     #[test]
     fn test_numeric_catalogs_must_be_known_exact_values() {
-        assert_eq!(normalized_candidates("Dire Straits 9252642"), vec!["9252642"]);
+        assert_eq!(
+            normalized_candidates("Dire Straits 9252642"),
+            vec!["9252642"]
+        );
         assert!(normalized_candidates("random remaster 1234567").is_empty());
     }
 

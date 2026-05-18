@@ -106,7 +106,8 @@ pub mod galois {
             if a == 0 {
                 0
             } else {
-                self.exp_tbl[self.log_tbl[a as usize] as usize + MAX - self.log_tbl[b as usize] as usize]
+                self.exp_tbl
+                    [self.log_tbl[a as usize] as usize + MAX - self.log_tbl[b as usize] as usize]
             }
         }
 
@@ -261,15 +262,12 @@ pub mod syndrome {
         // Each disc-image column is an independent LFSR — parallelize across
         // STRIDE columns. `gf`/`gx`/`audio` are shared immutable borrows, and
         // each thread mutates only its own `parity[col]`. No data races.
-        parity
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(col, wr)| {
-                for row in 0..rows {
-                    let idx = STRIDE + row * STRIDE + col;
-                    update_lfsr(gf, &gx, wr, i16_to_u16_bits(audio[idx]));
-                }
-            });
+        parity.par_iter_mut().enumerate().for_each(|(col, wr)| {
+            for row in 0..rows {
+                let idx = STRIDE + row * STRIDE + col;
+                update_lfsr(gf, &gx, wr, i16_to_u16_bits(audio[idx]));
+            }
+        });
 
         Ok(parity)
     }
@@ -285,15 +283,12 @@ pub mod syndrome {
         let gx = make_generator_poly(gf, npar)?;
         let mut parity = vec![vec![0u16; npar]; STRIDE];
 
-        parity
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(col, wr)| {
-                for row in 0..rows {
-                    let idx = STRIDE + row * STRIDE + col;
-                    update_lfsr(gf, &gx, wr, words[idx]);
-                }
-            });
+        parity.par_iter_mut().enumerate().for_each(|(col, wr)| {
+            for row in 0..rows {
+                let idx = STRIDE + row * STRIDE + col;
+                update_lfsr(gf, &gx, wr, words[idx]);
+            }
+        });
 
         Ok(parity)
     }
@@ -397,13 +392,7 @@ pub mod syndrome {
         stride: usize,
         sample_offset: i32,
     ) -> Result<Vec<Vec<u16>>, CtdbRsError> {
-        parity_to_syndrome_with_word_offset(
-            gf,
-            parity,
-            npar,
-            stride,
-            i64::from(sample_offset) * 2,
-        )
+        parity_to_syndrome_with_word_offset(gf, parity, npar, stride, i64::from(sample_offset) * 2)
     }
 
     pub fn xor_syndrome_matrices(lhs: &[Vec<u16>], rhs: &[Vec<u16>]) -> Vec<Vec<u16>> {
@@ -753,7 +742,8 @@ pub mod codec {
             npar: usize,
             word_offset: i64,
         ) -> Result<VerifyResult, RepairError> {
-            let syndromes = self.syndrome_delta_with_word_offset(audio, parity_bytes, npar, word_offset)?;
+            let syndromes =
+                self.syndrome_delta_with_word_offset(audio, parity_bytes, npar, word_offset)?;
             Ok(VerifyResult::from_syndromes(&syndromes))
         }
 
@@ -776,12 +766,7 @@ pub mod codec {
             npar: usize,
             sample_offset: i32,
         ) -> Result<RepairResult, RepairError> {
-            self.repair_with_word_offset(
-                audio,
-                parity_bytes,
-                npar,
-                i64::from(sample_offset) * 2,
-            )
+            self.repair_with_word_offset(audio, parity_bytes, npar, i64::from(sample_offset) * 2)
         }
 
         pub fn repair_with_word_offset(
@@ -793,7 +778,8 @@ pub mod codec {
         ) -> Result<RepairResult, RepairError> {
             syndrome::validate_npar(npar).map_err(RepairError::from)?;
             let stridecount = syndrome::data_row_count(audio.len()).map_err(RepairError::from)?;
-            let syndromes = self.syndrome_delta_with_word_offset(audio, parity_bytes, npar, word_offset)?;
+            let syndromes =
+                self.syndrome_delta_with_word_offset(audio, parity_bytes, npar, word_offset)?;
             let max_correctable = npar / 2;
 
             let mut all_corrections: Vec<(usize, usize, u16)> = Vec::new();
@@ -802,12 +788,14 @@ pub mod codec {
                     continue;
                 }
 
-                let (sigma, errors_found) = decoder::berlekamp_massey(&self.gf, column_syndromes, npar)
-                    .ok_or(RepairError::Uncorrectable {
-                        column,
-                        errors_found: 0,
-                        max_correctable,
-                    })?;
+                let (sigma, errors_found) =
+                    decoder::berlekamp_massey(&self.gf, column_syndromes, npar).ok_or(
+                        RepairError::Uncorrectable {
+                            column,
+                            errors_found: 0,
+                            max_correctable,
+                        },
+                    )?;
 
                 if errors_found == 0 || errors_found > max_correctable {
                     return Err(RepairError::Uncorrectable {
@@ -896,14 +884,9 @@ pub mod codec {
             let provided = syndrome::try_bytes_to_parity(parity_bytes, STRIDE, npar)
                 .map_err(RepairError::from)?;
 
-            let computed_syndrome = syndrome::parity_to_syndrome_with_word_offset(
-                &self.gf,
-                &computed,
-                npar,
-                STRIDE,
-                0,
-            )
-            .map_err(RepairError::from)?;
+            let computed_syndrome =
+                syndrome::parity_to_syndrome_with_word_offset(&self.gf, &computed, npar, STRIDE, 0)
+                    .map_err(RepairError::from)?;
             let provided_syndrome = syndrome::parity_to_syndrome_with_word_offset(
                 &self.gf,
                 &provided,
@@ -1115,8 +1098,8 @@ mod tests {
         column[119] = 0x3333;
         let parity = syndrome::compute_column_parity(&gf, &gx, &column, npar);
         let matrix = vec![parity];
-        let mut syn_matrix = syndrome::parity_to_syndrome_with_word_offset(&gf, &matrix, npar, 1, 0)
-            .unwrap();
+        let mut syn_matrix =
+            syndrome::parity_to_syndrome_with_word_offset(&gf, &matrix, npar, 1, 0).unwrap();
         let syn = syn_matrix.remove(0);
 
         let corrections = decoder::decode_column_syndromes(&gf, &syn, npar, rows).unwrap();

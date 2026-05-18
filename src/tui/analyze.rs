@@ -60,20 +60,18 @@ pub fn analyze_file(
 
     crate::tui::probe::ensure_ffmpeg_init_pub();
 
-    let mut ictx = ffmpeg::format::input(&path)
-        .map_err(|e| format!("open failed: {}", e))?;
+    let mut ictx = ffmpeg::format::input(&path).map_err(|e| format!("open failed: {}", e))?;
 
-    let audio_stream = ictx
-        .streams()
-        .best(Type::Audio)
-        .ok_or("no audio stream")?;
+    let audio_stream = ictx.streams().best(Type::Audio).ok_or("no audio stream")?;
     let stream_idx = audio_stream.index();
     let time_base = audio_stream.time_base();
 
     let codec_params = audio_stream.parameters();
     let codec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)
         .map_err(|e| format!("codec params: {}", e))?;
-    let mut decoder = codec_ctx.decoder().audio()
+    let mut decoder = codec_ctx
+        .decoder()
+        .audio()
         .map_err(|e| format!("decoder: {}", e))?;
 
     let sample_rate = decoder.rate();
@@ -84,7 +82,11 @@ pub fn analyze_file(
     let declared_bit_depth = unsafe {
         let params = audio_stream.parameters().as_ptr();
         let raw = (*params).bits_per_raw_sample;
-        if raw > 0 { Some(raw as u32) } else { None }
+        if raw > 0 {
+            Some(raw as u32)
+        } else {
+            None
+        }
     };
 
     // Duration: use max_samples if provided, otherwise stream metadata.
@@ -130,11 +132,15 @@ pub fn analyze_file(
             let raw_opt: Option<&[i32]> = $raw_i32.map(|v| v as &[i32]);
             for (i, &s) in $samples.iter().enumerate() {
                 let abs_val = s.abs();
-                if abs_val > peak_abs { peak_abs = abs_val; }
+                if abs_val > peak_abs {
+                    peak_abs = abs_val;
+                }
                 rms_sum += s * s;
                 dc_sum += s;
                 sample_count += 1;
-                if abs_val >= 0.9999695 { clipping_count += 1; }
+                if abs_val >= 0.9999695 {
+                    clipping_count += 1;
+                }
 
                 if is_integer_fmt {
                     if let Some(raw) = raw_opt {
@@ -155,7 +161,9 @@ pub fn analyze_file(
     macro_rules! process_frame {
         () => {
             let n = decoded.samples();
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
 
             // ── Extract per-channel samples + accumulate global stats ──
             for ch in 0..channels as usize {
@@ -169,7 +177,8 @@ pub fn analyze_file(
                     }
                     Sample::I32(SampleType::Planar) => {
                         let plane = decoded.plane::<i32>(ch);
-                        let floats: Vec<f64> = plane.iter().map(|&s| s as f64 / 2147483648.0).collect();
+                        let floats: Vec<f64> =
+                            plane.iter().map(|&s| s as f64 / 2147483648.0).collect();
                         accumulate_global!(floats, Some(plane));
                         ch_floats[ch] = floats;
                     }
@@ -191,50 +200,80 @@ pub fn analyze_file(
                     Sample::I16(SampleType::Packed) => {
                         let raw = decoded.data(0);
                         let full: &[i16] = unsafe {
-                            std::slice::from_raw_parts(raw.as_ptr() as *const i16, n * channels as usize)
+                            std::slice::from_raw_parts(
+                                raw.as_ptr() as *const i16,
+                                n * channels as usize,
+                            )
                         };
-                        let floats: Vec<f64> = full.iter()
-                            .skip(ch).step_by(channels as usize)
-                            .map(|&s| s as f64 / 32768.0).collect();
-                        let i32s: Vec<i32> = full.iter()
-                            .skip(ch).step_by(channels as usize)
-                            .map(|&s| (s as i32) << 16).collect();
+                        let floats: Vec<f64> = full
+                            .iter()
+                            .skip(ch)
+                            .step_by(channels as usize)
+                            .map(|&s| s as f64 / 32768.0)
+                            .collect();
+                        let i32s: Vec<i32> = full
+                            .iter()
+                            .skip(ch)
+                            .step_by(channels as usize)
+                            .map(|&s| (s as i32) << 16)
+                            .collect();
                         accumulate_global!(floats, Some(&i32s));
                         ch_floats[ch] = floats;
                     }
                     Sample::I32(SampleType::Packed) => {
                         let raw = decoded.data(0);
                         let full: &[i32] = unsafe {
-                            std::slice::from_raw_parts(raw.as_ptr() as *const i32, n * channels as usize)
+                            std::slice::from_raw_parts(
+                                raw.as_ptr() as *const i32,
+                                n * channels as usize,
+                            )
                         };
-                        let floats: Vec<f64> = full.iter()
-                            .skip(ch).step_by(channels as usize)
-                            .map(|&s| s as f64 / 2147483648.0).collect();
-                        let i32_ch: Vec<i32> = full.iter()
-                            .skip(ch).step_by(channels as usize)
-                            .copied().collect();
+                        let floats: Vec<f64> = full
+                            .iter()
+                            .skip(ch)
+                            .step_by(channels as usize)
+                            .map(|&s| s as f64 / 2147483648.0)
+                            .collect();
+                        let i32_ch: Vec<i32> = full
+                            .iter()
+                            .skip(ch)
+                            .step_by(channels as usize)
+                            .copied()
+                            .collect();
                         accumulate_global!(floats, Some(&i32_ch));
                         ch_floats[ch] = floats;
                     }
                     Sample::F32(SampleType::Packed) => {
                         let raw = decoded.data(0);
                         let full: &[f32] = unsafe {
-                            std::slice::from_raw_parts(raw.as_ptr() as *const f32, n * channels as usize)
+                            std::slice::from_raw_parts(
+                                raw.as_ptr() as *const f32,
+                                n * channels as usize,
+                            )
                         };
-                        let floats: Vec<f64> = full.iter()
-                            .skip(ch).step_by(channels as usize)
-                            .map(|&s| s as f64).collect();
+                        let floats: Vec<f64> = full
+                            .iter()
+                            .skip(ch)
+                            .step_by(channels as usize)
+                            .map(|&s| s as f64)
+                            .collect();
                         accumulate_global!(floats, None::<&[i32]>);
                         ch_floats[ch] = floats;
                     }
                     Sample::F64(SampleType::Packed) => {
                         let raw = decoded.data(0);
                         let full: &[f64] = unsafe {
-                            std::slice::from_raw_parts(raw.as_ptr() as *const f64, n * channels as usize)
+                            std::slice::from_raw_parts(
+                                raw.as_ptr() as *const f64,
+                                n * channels as usize,
+                            )
                         };
-                        let floats: Vec<f64> = full.iter()
-                            .skip(ch).step_by(channels as usize)
-                            .copied().collect();
+                        let floats: Vec<f64> = full
+                            .iter()
+                            .skip(ch)
+                            .step_by(channels as usize)
+                            .copied()
+                            .collect();
                         accumulate_global!(floats, None::<&[i32]>);
                         ch_floats[ch] = floats;
                     }
@@ -255,7 +294,9 @@ pub fn analyze_file(
                 for c in 0..channels as usize {
                     for &s in &ch_floats[c][offset..offset + chunk] {
                         let abs_val = s.abs();
-                        if abs_val > block_peaks[c] { block_peaks[c] = abs_val; }
+                        if abs_val > block_peaks[c] {
+                            block_peaks[c] = abs_val;
+                        }
                         block_rms_sums[c] += s * s;
                     }
                 }
@@ -294,7 +335,9 @@ pub fn analyze_file(
         if stream.index() != stream_idx {
             continue;
         }
-        decoder.send_packet(&packet).map_err(|e| format!("send_packet: {}", e))?;
+        decoder
+            .send_packet(&packet)
+            .map_err(|e| format!("send_packet: {}", e))?;
 
         while decoder.receive_frame(&mut decoded).is_ok() {
             process_frame!();
@@ -332,11 +375,19 @@ pub fn analyze_file(
         return Err("no audio samples decoded".into());
     }
 
-    let peak_db = if peak_abs > 0.0 { 20.0 * peak_abs.log10() } else { -120.0 };
+    let peak_db = if peak_abs > 0.0 {
+        20.0 * peak_abs.log10()
+    } else {
+        -120.0
+    };
     let rms_db = if sample_count > 0 {
         // AES-17 ×2 factor, matching foobar2000's foo_dr_meter display.
         let rms = (2.0 * rms_sum / sample_count as f64).sqrt();
-        if rms > 0.0 { 20.0 * rms.log10() } else { -120.0 }
+        if rms > 0.0 {
+            20.0 * rms.log10()
+        } else {
+            -120.0
+        }
     } else {
         -120.0
     };
@@ -394,7 +445,9 @@ fn compute_dr(
     for ch in 0..channels {
         let rms = &block_rms[ch];
         let peaks = &block_peak[ch];
-        if rms.is_empty() { continue; }
+        if rms.is_empty() {
+            continue;
+        }
 
         // Sort RMS descending, take top 20% (floor, at least 1).
         let mut sorted_rms: Vec<f64> = rms.clone();
@@ -453,12 +506,18 @@ pub async fn measure_loudness(path: &Path) -> Option<(f64, f64)> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Parse the -O format: File\tLoudness\tRange\tTrue_Peak\tTrue_Peak_dBTP\t...
     for line in stdout.lines() {
-        if line.starts_with("File\t") { continue; } // Header.
+        if line.starts_with("File\t") {
+            continue;
+        } // Header.
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() >= 5 {
-            let lufs = cols[1].trim().strip_suffix(" LUFS")
+            let lufs = cols[1]
+                .trim()
+                .strip_suffix(" LUFS")
                 .and_then(|s| s.parse::<f64>().ok())?;
-            let true_peak = cols[4].trim().strip_suffix(" dBTP")
+            let true_peak = cols[4]
+                .trim()
+                .strip_suffix(" dBTP")
                 .and_then(|s| s.parse::<f64>().ok())?;
             return Some((lufs, true_peak));
         }
@@ -537,13 +596,15 @@ fn parse_hdcd_output(stderr: &str) -> Option<HdcdResult> {
     let peak_extend = summary_line.contains("peak_extend: enabled");
     let transient_filter = summary_line.contains("transient_filter: detected");
 
-    let max_gain = summary_line.split("max_gain_adj:")
+    let max_gain = summary_line
+        .split("max_gain_adj:")
         .nth(1)
         .and_then(|s| s.split("dB").next())
         .and_then(|s| s.trim().parse::<f64>().ok())
         .unwrap_or(0.0);
 
-    let errors = summary_line.split("detectable errors:")
+    let errors = summary_line
+        .split("detectable errors:")
         .nth(1)
         .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|s| s.parse::<u64>().ok())

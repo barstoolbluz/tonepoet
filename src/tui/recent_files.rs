@@ -220,8 +220,8 @@ impl RecentFilesState {
     /// Page down — jump one visible page.
     pub fn overlay_page_down(&mut self) {
         let step = self.overlay_visible_rows.max(1);
-        self.overlay_selected = (self.overlay_selected + step)
-            .min(self.entries.len().saturating_sub(1));
+        self.overlay_selected =
+            (self.overlay_selected + step).min(self.entries.len().saturating_sub(1));
         self.ensure_visible();
     }
 
@@ -513,4 +513,3 @@ mod tests {
         assert_eq!(e.relative_time(), "just now");
     }
 }
-

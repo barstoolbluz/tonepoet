@@ -39,7 +39,10 @@ pub fn draw_header(f: &mut Frame, area: Rect) {
     let pad_r = " ".repeat(w.saturating_sub(2).saturating_sub(pad_left + art_width));
 
     let art3_with_ver = format!("{}{}    {}", pad_l, ART_LINE_3, version);
-    let art3_pad = " ".repeat(w.saturating_sub(2).saturating_sub(art3_with_ver.chars().count()));
+    let art3_pad = " ".repeat(
+        w.saturating_sub(2)
+            .saturating_sub(art3_with_ver.chars().count()),
+    );
 
     let lines = vec![
         Line::from(Span::styled(top, border)),

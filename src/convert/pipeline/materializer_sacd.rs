@@ -4,13 +4,14 @@
 //! references. It intentionally does not decode DSD audio; `realize_track`
 //! performs extraction later through the in-process `sacd-rs` crate.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{MaterializeError, SourceDetectError};
+use super::reporter::PipelineReporter;
 use super::stages::Materializer;
 use super::tool::ToolRunner;
 use super::types::*;
@@ -28,6 +29,8 @@ impl Materializer for SacdIsoMaterializer {
         req: &PipelineRequest,
         staging: &StagingDir,
         _runner: &dyn ToolRunner,
+        _reporter: Option<&dyn PipelineReporter>,
+        _tool_paths: &HashMap<String, PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<PreparedSource, MaterializeError> {
         std::fs::create_dir_all(&staging.root)?;
@@ -36,9 +39,8 @@ impl Materializer for SacdIsoMaterializer {
         }
 
         let explicit_sacd_request = explicit_sacd_requested(req);
-        let metadata = parse_sacd_iso(&req.container).map_err(|err| {
-            sacd_error_to_materialize(err, explicit_sacd_request)
-        })?;
+        let metadata = parse_sacd_iso(&req.container)
+            .map_err(|err| sacd_error_to_materialize(err, explicit_sacd_request))?;
         let requested_area = requested_sacd_area(req.source.sacd_area);
         let area = sacd_area_info(&metadata, requested_area).ok_or_else(|| {
             MaterializeError::InvalidTrackSelection(format!(
@@ -181,7 +183,11 @@ fn album_metadata(
     total_tracks: u32,
 ) -> AlbumMetadata {
     let mut extra = BTreeMap::new();
-    insert_nonempty(&mut extra, "sacd_area", sacd_area_label(requested_area).to_string());
+    insert_nonempty(
+        &mut extra,
+        "sacd_area",
+        sacd_area_label(requested_area).to_string(),
+    );
     insert_nonempty(
         &mut extra,
         "sacd_area_kind",
@@ -251,7 +257,11 @@ fn track_metadata(
     track_number: u32,
 ) -> TrackMetadata {
     let mut extra = BTreeMap::new();
-    insert_nonempty(&mut extra, "sacd_area", sacd_area_label(requested_area).to_string());
+    insert_nonempty(
+        &mut extra,
+        "sacd_area",
+        sacd_area_label(requested_area).to_string(),
+    );
     insert_nonempty(&mut extra, "sacd_start_lsn", entry.start_lsn.to_string());
     insert_nonempty(&mut extra, "sacd_length_lsn", entry.length_lsn.to_string());
     insert_nonempty(
@@ -309,7 +319,10 @@ fn track_metadata(
         album_artist: metadata.album_artist().map(str::to_string),
         composer: entry.text.composer.clone(),
         performer: entry.text.performer.clone(),
-        genre: entry.genre.map(genre_to_string).or_else(|| first_genre(metadata)),
+        genre: entry
+            .genre
+            .map(genre_to_string)
+            .or_else(|| first_genre(metadata)),
         date: format_disc_date(metadata.master_toc.disc_date),
         track_number: Some(track_number),
         disc_number: disc_number(metadata),
@@ -345,7 +358,10 @@ fn format_disc_date(date: Option<crate::tui::sacd::DiscDate>) -> Option<String> 
     } else if date.day == 0 {
         Some(format!("{:04}-{:02}", date.year, date.month))
     } else {
-        Some(format!("{:04}-{:02}-{:02}", date.year, date.month, date.day))
+        Some(format!(
+            "{:04}-{:02}-{:02}",
+            date.year, date.month, date.day
+        ))
     }
 }
 

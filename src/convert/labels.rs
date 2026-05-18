@@ -14,7 +14,7 @@ pub struct LabelInfo {
 lazy_static! {
     static ref LABEL_MAPPINGS: HashMap<&'static str, &'static str> = {
         let mut m = HashMap::new();
-        
+
         // Audiophile labels (no country prefix)
         m.insert("MFSL", "MFSL LP  24-96");
         m.insert("MFSL 45", "MFSL 45 RPM Reissue LP  24-96");
@@ -34,7 +34,7 @@ lazy_static! {
         m.insert("Impex", "Impex Records Reissue LP  24-96");
         m.insert("Intervention", "Intervention Records Reissue LP  24-96");
         m.insert("Friday Music", "Friday Music Reissue LP  24-96");
-        
+
         // UK variations
         m.insert("UK", "UK First-Press LP  24-96");
         m.insert("UK RL", "UK RL-Mastered LP  24-96");
@@ -75,7 +75,7 @@ lazy_static! {
         m.insert("UK Rough Trade", "UK Rough Trade First-Press LP  24-96");
         m.insert("UK Promo", "UK Promo LP  24-96");
         m.insert("UK Test Pressing", "UK Test Pressing LP  24-96");
-        
+
         // US variations
         m.insert("US", "US First-Press LP  24-96");
         m.insert("US RL", "US RL-Mastered LP  24-96");
@@ -146,7 +146,7 @@ lazy_static! {
         m.insert("Minimax", "US First-Press LP  24-96");
         m.insert("US Minimax", "US First-Press LP  24-96");
         m.insert("Quiex", "US Quiex II Pressing LP  24-96");
-        
+
         // Japanese variations
         m.insert("Japan", "Japan First-Press LP  24-96");
         m.insert("Japan Mono", "Japan Mono First-Press LP  24-96");
@@ -171,12 +171,12 @@ lazy_static! {
         m.insert("Japan Elektra", "Japan Elektra First-Press LP  24-96");
         m.insert("Japan London", "Japan London Records First-Press LP  24-96");
         m.insert("Japan Philips", "Japan Philips First-Press LP  24-96");
-        
+
         // German/West German
         m.insert("German", "German First-Press LP  24-96");  // Default to "German", will be adjusted based on year
         m.insert("West German", "West German First-Press LP  24-96");
         m.insert("DE", "DE First-Press LP  24-96");
-        
+
         // Other countries
         m.insert("Canada", "CA First-Press LP  24-96");
         m.insert("Canadian", "CA First-Press LP  24-96");
@@ -219,7 +219,7 @@ lazy_static! {
         m.insert("South African", "South Africa First-Press LP  24-96");
         m.insert("RSA", "South Africa First-Press LP  24-96");
         m.insert("EU", "EU Press LP  24-96");
-        
+
         // Reissues (various)
         m.insert("2022 Reissue", "2022 Reissue LP  24-96");
         m.insert("2023 Reissue", "2023 Reissue LP  24-96");
@@ -230,7 +230,7 @@ lazy_static! {
         m.insert("2018 Japan Reissue", "Japan 2018 Reissue LP  24-96");
         m.insert("2019 Japan Reissue", "Japan 2019 Reissue LP  24-96");
         m.insert("2025 Japan Reissue", "Japan 2025 Reissue LP  24-96");
-        
+
         // German/DE reissues (NEVER West German)
         m.insert("German 2022 Reissue", "German 2022 Reissue LP  24-96");
         m.insert("German 2023 Reissue", "German 2023 Reissue LP  24-96");
@@ -245,7 +245,7 @@ lazy_static! {
         m.insert("DE 2023 Reissue", "DE 2023 Reissue LP  24-96");
         m.insert("DE 2024 Reissue", "DE 2024 Reissue LP  24-96");
         m.insert("DE 2025 Reissue", "DE 2025 Reissue LP  24-96");
-        
+
         // UK reissues
         m.insert("UK 2022 Reissue", "UK 2022 Reissue LP  24-96");
         m.insert("UK 2023 Reissue", "UK 2023 Reissue LP  24-96");
@@ -258,7 +258,7 @@ lazy_static! {
         m.insert("2025 Rhino", "Rhino 2025 Reissue LP  24-96");
         m.insert("2025 45 RPM Reissue", "45 RPM Reissue LP  24-96");
         m.insert("45 RPM", "45 RPM LP  24-96");
-        
+
         // Special formats - using lowercase "7-inch" and "12-inch" without "Single"
         m.insert("7 Inch", "US 7-inch  24-96");
         m.insert("7 Inch UK", "UK 7-inch  24-96");
@@ -283,16 +283,16 @@ lazy_static! {
         m.insert("Box Set", "Box Set LP  24-96");
         m.insert("2012 Box Set", "2012 Box Set LP  24-96");
         m.insert("ACDC Box Set Volume 2", "Box Set Volume 2 LP  24-96");
-        
+
         m
     };
-    
+
     static ref AUDIOPHILE_LABELS: Vec<&'static str> = vec![
         "MFSL", "MOFI", "DCC", "AP", "Analogue Productions", "Tone Poet",
         "Music Matters", "Classic Records", "Speakers Corner", "ORG",
         "Impex", "Intervention", "Friday Music", "UHQR"
     ];
-    
+
     static ref REISSUE_KEYWORDS: Vec<&'static str> = vec![
         "Reissue", "Repress", "Remastered", "Anniversary", "Edition",
         "Box Set", "45 RPM", "UHQR", "VMP", "Rhino", "Atlantic 75"
@@ -307,7 +307,7 @@ pub fn detect_pressing_info(folder_name: &str, year: Option<&str>) -> LabelInfo 
         country: None,
         label: None,
     };
-    
+
     // Check for reissue keywords
     for keyword in REISSUE_KEYWORDS.iter() {
         if folder_name.contains(keyword) {
@@ -315,16 +315,16 @@ pub fn detect_pressing_info(folder_name: &str, year: Option<&str>) -> LabelInfo 
             break;
         }
     }
-    
+
     // Try to extract pressing info from parentheses
     let re = Regex::new(r"\(([^)]+)\)").unwrap();
     if let Some(caps) = re.captures(folder_name) {
         let content = caps.get(1).unwrap().as_str();
-        
+
         // First check for exact match
         if let Some(mapping) = LABEL_MAPPINGS.get(content) {
             info.pressing_info = mapping.to_string();
-            
+
             // Check if it's audiophile
             for label in AUDIOPHILE_LABELS.iter() {
                 if content.contains(label) {
@@ -332,7 +332,7 @@ pub fn detect_pressing_info(folder_name: &str, year: Option<&str>) -> LabelInfo 
                     break;
                 }
             }
-            
+
             // Handle German/West German based on year
             if content.contains("German") && !content.contains("West German") {
                 if let Some(year_str) = year {
@@ -341,13 +341,14 @@ pub fn detect_pressing_info(folder_name: &str, year: Option<&str>) -> LabelInfo 
                             // Pre-1990 German should be West German (unless it's a reissue)
                             // But only if "West German" isn't already in the pressing_info
                             if !info.pressing_info.contains("West German") {
-                                info.pressing_info = info.pressing_info.replace("German", "West German");
+                                info.pressing_info =
+                                    info.pressing_info.replace("German", "West German");
                             }
                         }
                     }
                 }
             }
-            
+
             // Extract country
             if info.pressing_info.starts_with("UK ") {
                 info.country = Some("UK".to_string());
@@ -357,14 +358,16 @@ pub fn detect_pressing_info(folder_name: &str, year: Option<&str>) -> LabelInfo 
                 info.country = Some("Japan".to_string());
             } else if info.pressing_info.starts_with("West German ") {
                 info.country = Some("West German".to_string());
-            } else if info.pressing_info.starts_with("DE ") || info.pressing_info.starts_with("German ") {
+            } else if info.pressing_info.starts_with("DE ")
+                || info.pressing_info.starts_with("German ")
+            {
                 info.country = Some("DE".to_string());
             } else if info.pressing_info.starts_with("Canada ") {
                 info.country = Some("Canada".to_string());
             } else if info.pressing_info.starts_with("FR ") {
                 info.country = Some("France".to_string());
             }
-            
+
             return info;
         }
 
@@ -447,37 +450,38 @@ pub fn detect_pressing_info(folder_name: &str, year: Option<&str>) -> LabelInfo 
             ("Japan", "Japan First-Press LP  24-96"),
             ("Japanese", "Japan First-Press LP  24-96"),
         ];
-        
+
         for (prefix, pressing) in country_prefixes {
             if content.starts_with(prefix) {
                 info.pressing_info = pressing.to_string();
-                
+
                 // Handle German/West German based on year
                 if prefix == "German" && !content.contains("West German") {
                     if let Some(year_str) = year {
                         if let Ok(year_num) = year_str.parse::<i32>() {
                             if year_num < 1990 && !info.is_reissue {
-                                info.pressing_info = info.pressing_info.replace("German", "West German");
+                                info.pressing_info =
+                                    info.pressing_info.replace("German", "West German");
                             }
                         }
                     }
                 }
-                
+
                 return info;
             }
         }
     }
-    
+
     // Try to extract from square brackets [source]
     let re = Regex::new(r"\[([^\]]+)\]").unwrap();
     if let Some(caps) = re.captures(folder_name) {
         let content = caps.get(1).unwrap().as_str();
-        
+
         if let Some(mapping) = LABEL_MAPPINGS.get(content) {
             info.pressing_info = mapping.to_string();
         }
     }
-    
+
     info
 }
 
@@ -504,7 +508,10 @@ fn parse_inch_format(content: &str) -> Option<String> {
         "West German"
     } else if content.contains("Australia") || content.contains("Australian") {
         "AUS"
-    } else if content.contains("Netherlands") || content.contains("Dutch") || content.contains("Holland") {
+    } else if content.contains("Netherlands")
+        || content.contains("Dutch")
+        || content.contains("Holland")
+    {
         "NL"
     } else if content.contains("Switzerland") || content.contains("Swiss") {
         "Swiss"
@@ -531,7 +538,7 @@ fn parse_inch_format(content: &str) -> Option<String> {
     } else if content.contains("US") {
         "US"
     } else {
-        "US"  // Default
+        "US" // Default
     };
 
     // Detect pre-format qualifiers (go before format)
@@ -582,26 +589,26 @@ mod tests {
         assert!(info.is_audiophile);
         assert_eq!(info.pressing_info, "MFSL LP  24-96");
     }
-    
+
     #[test]
     fn test_west_german_pre_1990() {
         let info = detect_pressing_info("Album (German)", Some("1985"));
         assert_eq!(info.pressing_info, "West German First-Press LP  24-96");
     }
-    
+
     #[test]
     fn test_german_post_1990() {
         let info = detect_pressing_info("Album (German)", Some("1995"));
         assert_eq!(info.pressing_info, "German First-Press LP  24-96"); // Post-1990 stays "German"
     }
-    
+
     #[test]
     fn test_reissue_detection() {
         let info = detect_pressing_info("Album (2022 Reissue)", None);
         assert!(info.is_reissue);
         assert_eq!(info.pressing_info, "2022 Reissue LP  24-96");
     }
-    
+
     #[test]
     fn test_uk_pressing() {
         let info = detect_pressing_info("Album (UK RL)", None);

@@ -45,7 +45,9 @@ pub struct RecordingReporter {
 
 impl RecordingReporter {
     pub fn new() -> Self {
-        Self { events: Mutex::new(Vec::new()) }
+        Self {
+            events: Mutex::new(Vec::new()),
+        }
     }
 
     /// All emitted events, in emission order.
@@ -456,9 +458,9 @@ mod broadcast_reporter_tests {
         let update = next_update(&mut rx).await;
         assert_eq!(update.progress, 50.0);
         match update.status {
-            crate::convert::ConversionStatus::Processing {
-                phase_progress, ..
-            } => assert_eq!(phase_progress, Some(50.0)),
+            crate::convert::ConversionStatus::Processing { phase_progress, .. } => {
+                assert_eq!(phase_progress, Some(50.0))
+            }
             other => panic!("expected processing update, got {other:?}"),
         }
     }
@@ -532,7 +534,6 @@ mod broadcast_reporter_tests {
         let terminal = next_update(&mut rx).await;
         assert_eq!(terminal.progress, 100.0);
     }
-
 
     #[tokio::test]
     async fn stage_finish_maps_to_window_end() {
@@ -637,4 +638,3 @@ mod broadcast_reporter_tests {
             .await;
     }
 }
-

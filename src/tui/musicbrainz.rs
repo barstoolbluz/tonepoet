@@ -171,8 +171,22 @@ pub(super) fn lucene_escape(s: &str) -> String {
         // Single-char reserved set.
         if matches!(
             c,
-            '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']'
-                | '^' | '"' | '~' | '*' | '?' | ':' | '\\' | '/'
+            '+' | '-'
+                | '!'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '^'
+                | '"'
+                | '~'
+                | '*'
+                | '?'
+                | ':'
+                | '\\'
+                | '/'
         ) {
             out.push('\\');
         }
@@ -243,11 +257,16 @@ pub async fn lookup_release_by_toc(
     // namespace, so this gate is one global token (see `mb_acquire`).
     mb_acquire().await;
 
-    let resp = client.get(&url).send().await
+    let resp = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| format!("MusicBrainz query failed: {}", e))?;
 
     let status = resp.status();
-    let body = resp.text().await
+    let body = resp
+        .text()
+        .await
         .map_err(|e| format!("MusicBrainz response error: {}", e))?;
 
     if status == reqwest::StatusCode::NOT_FOUND {
@@ -273,13 +292,10 @@ pub async fn lookup_release_by_toc(
 ///
 /// `n_tracks` is the track count implied by the queried TOC; it
 /// disambiguates the correct medium for multi-disc releases.
-pub fn parse_mb_response_all(
-    body: &str,
-    n_tracks: usize,
-) -> Result<Vec<MbRelease>, String> {
+pub fn parse_mb_response_all(body: &str, n_tracks: usize) -> Result<Vec<MbRelease>, String> {
     use serde_json::Value;
-    let v: Value = serde_json::from_str(body)
-        .map_err(|e| format!("MusicBrainz JSON parse error: {}", e))?;
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| format!("MusicBrainz JSON parse error: {}", e))?;
 
     // 404 body shape: {"error": "..."} → treat as miss.
     if v.get("error").is_some() {
@@ -306,10 +322,7 @@ pub fn parse_mb_response_all(
 
 /// Convenience wrapper that returns the highest-scoring release (or
 /// `None`). Used by `:cue-mb` and `:cue-fill` which auto-pick.
-pub fn parse_mb_response(
-    body: &str,
-    n_tracks: usize,
-) -> Result<Option<MbRelease>, String> {
+pub fn parse_mb_response(body: &str, n_tracks: usize) -> Result<Option<MbRelease>, String> {
     Ok(parse_mb_response_all(body, n_tracks)?.into_iter().next())
 }
 
@@ -355,7 +368,10 @@ pub async fn search_releases_by_query(
     let mut writes: Vec<(String, String)> = Vec::new();
     let first = fire_search_cached(&client, &with_catno, n_tracks, &cached, &mut writes).await?;
     if !first.is_empty() || catalog.is_none() {
-        return Ok(MbSearchOutcome { releases: first, cache_writes: writes });
+        return Ok(MbSearchOutcome {
+            releases: first,
+            cache_writes: writes,
+        });
     }
 
     // Catalog-first miss: retry without the catno clause. Covers
@@ -364,10 +380,17 @@ pub async fn search_releases_by_query(
     // pressing — see project_mb_on_sacd_plan.md.
     let without_catno = build_search_query(artist, album, None, year);
     if without_catno == with_catno {
-        return Ok(MbSearchOutcome { releases: first, cache_writes: writes });
+        return Ok(MbSearchOutcome {
+            releases: first,
+            cache_writes: writes,
+        });
     }
-    let second = fire_search_cached(&client, &without_catno, n_tracks, &cached, &mut writes).await?;
-    Ok(MbSearchOutcome { releases: second, cache_writes: writes })
+    let second =
+        fire_search_cached(&client, &without_catno, n_tracks, &cached, &mut writes).await?;
+    Ok(MbSearchOutcome {
+        releases: second,
+        cache_writes: writes,
+    })
 }
 
 /// Outcome of a Phase B-2 text/release search. `releases` is the parsed
@@ -391,7 +414,10 @@ pub fn search_cache_key(
     catalog: Option<&str>,
     year: Option<&str>,
 ) -> String {
-    format!("search:v1:{}", build_search_query(artist, album, catalog, year))
+    format!(
+        "search:v1:{}",
+        build_search_query(artist, album, catalog, year)
+    )
 }
 
 async fn fire_search_cached(
@@ -529,7 +555,10 @@ pub async fn fetch_release_detail(
         .map_err(|e| format!("MusicBrainz response error: {}", e))?;
 
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(MbDetailOutcome { release: None, cache_write: None });
+        return Ok(MbDetailOutcome {
+            release: None,
+            cache_write: None,
+        });
     }
     if !status.is_success() {
         return Err(format!("MusicBrainz returned HTTP {}", status));
@@ -564,13 +593,10 @@ pub fn detail_cache_key(mbid: &str) -> String {
 /// Parse a top-level MusicBrainz release object (detail endpoint).
 /// Distinct from `parse_mb_response_all` which expects the
 /// `{releases: [...]}` wrapper shape returned by search and TOC.
-pub fn parse_mb_detail_response(
-    body: &str,
-    n_tracks: usize,
-) -> Result<MbRelease, String> {
+pub fn parse_mb_detail_response(body: &str, n_tracks: usize) -> Result<MbRelease, String> {
     use serde_json::Value;
-    let v: Value = serde_json::from_str(body)
-        .map_err(|e| format!("MusicBrainz JSON parse error: {}", e))?;
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| format!("MusicBrainz JSON parse error: {}", e))?;
 
     if v.get("error").is_some() {
         return Err(format!(
@@ -586,8 +612,16 @@ pub fn parse_mb_detail_response(
 }
 
 fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
-    let release_id = rel.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let title = rel.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let release_id = rel
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let title = rel
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let artist = artist_credit_string(rel.get("artist-credit"));
     let artist_id = rel
         .get("artist-credit")
@@ -646,10 +680,14 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
     let pick_medium = media
         .iter()
         .find(|m| {
-            let count = m.get("track-count").and_then(|c| c.as_u64())
+            let count = m
+                .get("track-count")
+                .and_then(|c| c.as_u64())
                 .unwrap_or_else(|| {
-                    m.get("tracks").and_then(|t| t.as_array())
-                        .map(|a| a.len() as u64).unwrap_or(0)
+                    m.get("tracks")
+                        .and_then(|t| t.as_array())
+                        .map(|a| a.len() as u64)
+                        .unwrap_or(0)
                 });
             count == n_tracks as u64
         })
@@ -678,23 +716,30 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
 
 fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
     let position = t.get("position").and_then(|v| v.as_u64())? as u32;
-    let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let title = t
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let track_artist = artist_credit_string(t.get("artist-credit"));
     let artist = if track_artist.is_empty() {
         artist_credit_string(t.get("recording").and_then(|r| r.get("artist-credit")))
     } else {
         track_artist
     };
-    let track_id = t.get("id")
+    let track_id = t
+        .get("id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let recording_id = t.get("recording")
+    let recording_id = t
+        .get("recording")
         .and_then(|r| r.get("id"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let artist_id = t.get("artist-credit")
+    let artist_id = t
+        .get("artist-credit")
         .and_then(|v| v.as_array())
         .and_then(|a| a.first())
         .and_then(|c| c.get("artist"))
@@ -721,11 +766,14 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
     // Length in ms, preferring the track-level value (the disc-encoded
     // length); fall back to recording.length when the track doesn't
     // carry its own.
-    let length_ms = t.get("length")
+    let length_ms = t
+        .get("length")
         .and_then(|v| v.as_u64())
-        .or_else(|| t.get("recording")
-            .and_then(|r| r.get("length"))
-            .and_then(|v| v.as_u64()))
+        .or_else(|| {
+            t.get("recording")
+                .and_then(|r| r.get("length"))
+                .and_then(|v| v.as_u64())
+        })
         .map(|n| n as u32);
 
     Some(MbTrack {
@@ -760,8 +808,7 @@ pub fn populate_editor_mb_supplemental(
     // populate-time CUESHEET embed pre-Phase-5. When false on a
     // single_image rip we fall back to album-only writes for the
     // legacy MB-only IDs that have no per-track home.
-    let per_track_populate = single_image
-        && is_per_track_eligible(&state.paths, release, false);
+    let per_track_populate = single_image && is_per_track_eligible(&state.paths, release, false);
 
     fn find_or_create(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
@@ -769,7 +816,10 @@ pub fn populate_editor_mb_supplemental(
         item_key: ItemKey,
         dim: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+        if let Some(i) = entries
+            .iter()
+            .position(|e| e.display_key.eq_ignore_ascii_case(key))
+        {
             return i;
         }
         entries.push(crate::tui::probe::TagEntry {
@@ -803,72 +853,149 @@ pub fn populate_editor_mb_supplemental(
     // RELEASETRACKID / ARTISTID) have no CUESHEET field and a file's
     // tag system holds only one of each, so they stay album-only and
     // are gated on `!single_image`.
-    let any_isrc = (per_track_populate || !single_image) && release.tracks.iter()
-        .any(|t| t.isrc.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_recording = !single_image && release.tracks.iter()
-        .any(|t| t.recording_id.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_track = !single_image && release.tracks.iter()
-        .any(|t| t.track_id.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_track_artist = !single_image && release.tracks.iter()
-        .any(|t| t.artist_id.as_deref().is_some_and(|s| !s.is_empty()));
+    let any_isrc = (per_track_populate || !single_image)
+        && release
+            .tracks
+            .iter()
+            .any(|t| t.isrc.as_deref().is_some_and(|s| !s.is_empty()));
+    let any_recording = !single_image
+        && release
+            .tracks
+            .iter()
+            .any(|t| t.recording_id.as_deref().is_some_and(|s| !s.is_empty()));
+    let any_track = !single_image
+        && release
+            .tracks
+            .iter()
+            .any(|t| t.track_id.as_deref().is_some_and(|s| !s.is_empty()));
+    let any_track_artist = !single_image
+        && release
+            .tracks
+            .iter()
+            .any(|t| t.artist_id.as_deref().is_some_and(|s| !s.is_empty()));
 
     // ISRC dim: per-track when `per_track_populate`, per-file otherwise.
-    let isrc_dim = if per_track_populate { release.tracks.len() } else { n };
+    let isrc_dim = if per_track_populate {
+        release.tracks.len()
+    } else {
+        n
+    };
     let isrc_idx = if any_isrc {
-        Some(find_or_create(&mut state.entries, "ISRC", ItemKey::Isrc, isrc_dim))
-    } else { None };
+        Some(find_or_create(
+            &mut state.entries,
+            "ISRC",
+            ItemKey::Isrc,
+            isrc_dim,
+        ))
+    } else {
+        None
+    };
     // Pre-existing ISRC entry on a per-track-eligible single-image rip
     // (Phase 2 may have surfaced per-track ISRCs from the embedded
     // CUESHEET): grow / shrink to MB's track count, replicating the
     // first existing slot into padded positions so revert keeps the
     // pre-populate state.
     if per_track_populate {
-        if let Some(idx) = isrc_idx { crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], isrc_dim); }
+        if let Some(idx) = isrc_idx {
+            crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], isrc_dim);
+        }
     }
     let recording_idx = if any_recording {
         Some(find_or_create(
-            &mut state.entries, "MUSICBRAINZ_TRACKID", ItemKey::MusicBrainzRecordingId, n,
+            &mut state.entries,
+            "MUSICBRAINZ_TRACKID",
+            ItemKey::MusicBrainzRecordingId,
+            n,
         ))
-    } else { None };
+    } else {
+        None
+    };
     let track_idx = if any_track {
         Some(find_or_create(
-            &mut state.entries, "MUSICBRAINZ_RELEASETRACKID", ItemKey::MusicBrainzTrackId, n,
+            &mut state.entries,
+            "MUSICBRAINZ_RELEASETRACKID",
+            ItemKey::MusicBrainzTrackId,
+            n,
         ))
-    } else { None };
+    } else {
+        None
+    };
     let artist_idx = if any_track_artist {
         Some(find_or_create(
-            &mut state.entries, "MUSICBRAINZ_ARTISTID", ItemKey::MusicBrainzArtistId, n,
+            &mut state.entries,
+            "MUSICBRAINZ_ARTISTID",
+            ItemKey::MusicBrainzArtistId,
+            n,
         ))
-    } else { None };
+    } else {
+        None
+    };
 
     // Album-level — gate each entry on MB actually having a value.
-    let catalog_value = release.catalog.as_deref()
+    let catalog_value = release
+        .catalog
+        .as_deref()
         .or(release.barcode.as_deref())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let catalog_idx = if catalog_value.is_some() {
-        Some(find_or_create(&mut state.entries, "CATALOGNUMBER", ItemKey::CatalogNumber, n))
-    } else { None };
+        Some(find_or_create(
+            &mut state.entries,
+            "CATALOGNUMBER",
+            ItemKey::CatalogNumber,
+            n,
+        ))
+    } else {
+        None
+    };
     let album_id_idx = if !release.release_id.is_empty() {
         Some(find_or_create(
-            &mut state.entries, "MUSICBRAINZ_ALBUMID", ItemKey::MusicBrainzReleaseId, n,
+            &mut state.entries,
+            "MUSICBRAINZ_ALBUMID",
+            ItemKey::MusicBrainzReleaseId,
+            n,
         ))
-    } else { None };
+    } else {
+        None
+    };
     let album_artist_id_idx = if release.artist_id.as_deref().is_some_and(|s| !s.is_empty()) {
         Some(find_or_create(
-            &mut state.entries, "MUSICBRAINZ_ALBUMARTISTID", ItemKey::MusicBrainzReleaseArtistId, n,
+            &mut state.entries,
+            "MUSICBRAINZ_ALBUMARTISTID",
+            ItemKey::MusicBrainzReleaseArtistId,
+            n,
         ))
-    } else { None };
-    let release_group_idx = if release.release_group_id.as_deref().is_some_and(|s| !s.is_empty()) {
+    } else {
+        None
+    };
+    let release_group_idx = if release
+        .release_group_id
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+    {
         Some(find_or_create(
-            &mut state.entries, "MUSICBRAINZ_RELEASEGROUPID", ItemKey::MusicBrainzReleaseGroupId, n,
+            &mut state.entries,
+            "MUSICBRAINZ_RELEASEGROUPID",
+            ItemKey::MusicBrainzReleaseGroupId,
+            n,
         ))
-    } else { None };
-    let original_date_idx = if release.original_date.as_deref().is_some_and(|s| !s.is_empty()) {
+    } else {
+        None
+    };
+    let original_date_idx = if release
+        .original_date
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+    {
         Some(find_or_create(
-            &mut state.entries, "ORIGINALDATE", ItemKey::OriginalReleaseDate, n,
+            &mut state.entries,
+            "ORIGINALDATE",
+            ItemKey::OriginalReleaseDate,
+            n,
         ))
-    } else { None };
+    } else {
+        None
+    };
     let country_idx = if release.country.as_deref().is_some_and(|s| !s.is_empty()) {
         Some(find_or_create(
             &mut state.entries,
@@ -876,7 +1003,9 @@ pub fn populate_editor_mb_supplemental(
             ItemKey::Unknown("RELEASECOUNTRY".to_string()),
             n,
         ))
-    } else { None };
+    } else {
+        None
+    };
 
     // Per-track ISRC writes for per_track_populate: the CUESHEET-
     // friendly dim != paths.len() case, so the per-file loop below
@@ -886,7 +1015,9 @@ pub fn populate_editor_mb_supplemental(
         if let Some(idx) = isrc_idx {
             for mt in release.tracks.iter() {
                 let i = (mt.position as usize).saturating_sub(1);
-                if i >= state.entries[idx].per_file_values.len() { continue; }
+                if i >= state.entries[idx].per_file_values.len() {
+                    continue;
+                }
                 if let Some(s) = mt.isrc.as_deref().filter(|s| !s.is_empty()) {
                     state.entries[idx].per_file_values[i] = s.to_string();
                 }
@@ -897,24 +1028,26 @@ pub fn populate_editor_mb_supplemental(
     for i in 0..n {
         if let Some(mt) = release.tracks.iter().find(|m| m.position as usize == i + 1) {
             if !per_track_populate {
-                if let (Some(idx), Some(s)) = (
-                    isrc_idx, mt.isrc.as_deref().filter(|s| !s.is_empty()),
-                ) {
+                if let (Some(idx), Some(s)) =
+                    (isrc_idx, mt.isrc.as_deref().filter(|s| !s.is_empty()))
+                {
                     state.entries[idx].per_file_values[i] = s.to_string();
                 }
             }
             if let (Some(idx), Some(s)) = (
-                recording_idx, mt.recording_id.as_deref().filter(|s| !s.is_empty()),
+                recording_idx,
+                mt.recording_id.as_deref().filter(|s| !s.is_empty()),
             ) {
                 state.entries[idx].per_file_values[i] = s.to_string();
             }
-            if let (Some(idx), Some(s)) = (
-                track_idx, mt.track_id.as_deref().filter(|s| !s.is_empty()),
-            ) {
+            if let (Some(idx), Some(s)) =
+                (track_idx, mt.track_id.as_deref().filter(|s| !s.is_empty()))
+            {
                 state.entries[idx].per_file_values[i] = s.to_string();
             }
             if let (Some(idx), Some(s)) = (
-                artist_idx, mt.artist_id.as_deref().filter(|s| !s.is_empty()),
+                artist_idx,
+                mt.artist_id.as_deref().filter(|s| !s.is_empty()),
             ) {
                 state.entries[idx].per_file_values[i] = s.to_string();
             }
@@ -926,32 +1059,49 @@ pub fn populate_editor_mb_supplemental(
             state.entries[idx].per_file_values[i] = release.release_id.clone();
         }
         if let (Some(idx), Some(s)) = (
-            album_artist_id_idx, release.artist_id.as_deref().filter(|s| !s.is_empty()),
+            album_artist_id_idx,
+            release.artist_id.as_deref().filter(|s| !s.is_empty()),
         ) {
             state.entries[idx].per_file_values[i] = s.to_string();
         }
         if let (Some(idx), Some(s)) = (
-            release_group_idx, release.release_group_id.as_deref().filter(|s| !s.is_empty()),
+            release_group_idx,
+            release
+                .release_group_id
+                .as_deref()
+                .filter(|s| !s.is_empty()),
         ) {
             state.entries[idx].per_file_values[i] = s.to_string();
         }
         if let (Some(idx), Some(s)) = (
-            original_date_idx, release.original_date.as_deref().filter(|s| !s.is_empty()),
+            original_date_idx,
+            release.original_date.as_deref().filter(|s| !s.is_empty()),
         ) {
             state.entries[idx].per_file_values[i] = s.to_string();
         }
         if let (Some(idx), Some(s)) = (
-            country_idx, release.country.as_deref().filter(|s| !s.is_empty()),
+            country_idx,
+            release.country.as_deref().filter(|s| !s.is_empty()),
         ) {
             state.entries[idx].per_file_values[i] = s.to_string();
         }
     }
 
     for idx in [
-        isrc_idx, recording_idx, track_idx, artist_idx,
-        catalog_idx, album_id_idx, album_artist_id_idx, release_group_idx,
-        original_date_idx, country_idx,
-    ].iter().filter_map(|x| *x) {
+        isrc_idx,
+        recording_idx,
+        track_idx,
+        artist_idx,
+        catalog_idx,
+        album_id_idx,
+        album_artist_id_idx,
+        release_group_idx,
+        original_date_idx,
+        country_idx,
+    ]
+    .iter()
+    .filter_map(|x| *x)
+    {
         recompute_and_stamp_mb_proposed(&mut state.entries[idx], n);
     }
 
@@ -1046,7 +1196,8 @@ pub(super) fn per_track_skip_reason(
     // entry, so :tags-mb can populate per-track on top and Phase 4
     // can persist edits as an embedded CUESHEET tag. The sidecar on
     // disk is left untouched.
-    if let Some(reason) = paths.first()
+    if let Some(reason) = paths
+        .first()
         .and_then(|p| verify_single_image_matches_release(p, release))
     {
         return Some(format!("{} — album-level tags only", reason));
@@ -1074,11 +1225,7 @@ pub(super) fn per_track_skip_reason(
 /// This wrapper adds the not-applicable filter so the boolean stays
 /// faithful to its original semantics ("can per-track populate run?",
 /// not "is the situation eligible-or-irrelevant?").
-fn is_per_track_eligible(
-    paths: &[std::path::PathBuf],
-    release: &MbRelease,
-    verbose: bool,
-) -> bool {
+fn is_per_track_eligible(paths: &[std::path::PathBuf], release: &MbRelease, verbose: bool) -> bool {
     if paths.len() != 1 || release.tracks.len() <= 1 {
         return false;
     }
@@ -1095,10 +1242,7 @@ fn is_per_track_eligible(
 
 // `ensure_dim_replicate` moved to probe.rs so gnudb can share it.
 
-fn recompute_and_stamp_mb_proposed(
-    entry: &mut crate::tui::probe::TagEntry,
-    _n: usize,
-) {
+fn recompute_and_stamp_mb_proposed(entry: &mut crate::tui::probe::TagEntry, _n: usize) {
     let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
     let dim = entry.per_file_values.len();
     entry.is_mixed = !all_same && dim > 1;
@@ -1108,9 +1252,7 @@ fn recompute_and_stamp_mb_proposed(
         entry.per_file_values.first().cloned().unwrap_or_default()
     };
 
-    if entry.value != entry.original
-        || entry.per_file_values != entry.per_file_originals
-    {
+    if entry.value != entry.original || entry.per_file_values != entry.per_file_originals {
         entry.mb_proposed_value = Some(entry.value.clone());
         entry.mb_proposed_per_file = Some(entry.per_file_values.clone());
     }
@@ -1146,7 +1288,10 @@ pub fn populate_editor_from_mb(
         item_key: ItemKey,
         dim: usize,
     ) -> usize {
-        if let Some(i) = entries.iter().position(|e| e.display_key.eq_ignore_ascii_case(key)) {
+        if let Some(i) = entries
+            .iter()
+            .position(|e| e.display_key.eq_ignore_ascii_case(key))
+        {
             return i;
         }
         entries.push(crate::tui::probe::TagEntry {
@@ -1169,9 +1314,12 @@ pub fn populate_editor_from_mb(
     // is_per_track_eligible — multi-disc / sidecar .cue / unverifiable
     // identity all fall back to album-level).
     let single_image = n == 1 && release.tracks.len() > 1;
-    let per_track_populate = single_image
-        && is_per_track_eligible(&state.paths, release, true);
-    let track_dim = if per_track_populate { release.tracks.len() } else { n };
+    let per_track_populate = single_image && is_per_track_eligible(&state.paths, release, true);
+    let track_dim = if per_track_populate {
+        release.tracks.len()
+    } else {
+        n
+    };
 
     // Per-track presence pre-pass: only create entries when at least
     // one track in the release has data for that field.
@@ -1179,20 +1327,43 @@ pub fn populate_editor_from_mb(
     let any_artist = release.tracks.iter().any(|t| !t.artist.is_empty());
 
     let title_idx = if any_title {
-        Some(find_or_create(&mut state.entries, "TITLE", ItemKey::TrackTitle, track_dim))
-    } else { None };
+        Some(find_or_create(
+            &mut state.entries,
+            "TITLE",
+            ItemKey::TrackTitle,
+            track_dim,
+        ))
+    } else {
+        None
+    };
     let artist_idx = if any_artist {
-        Some(find_or_create(&mut state.entries, "ARTIST", ItemKey::TrackArtist, track_dim))
-    } else { None };
+        Some(find_or_create(
+            &mut state.entries,
+            "ARTIST",
+            ItemKey::TrackArtist,
+            track_dim,
+        ))
+    } else {
+        None
+    };
     let album_idx = if !release.title.is_empty() {
-        Some(find_or_create(&mut state.entries, "ALBUM", ItemKey::AlbumTitle, n))
-    } else { None };
+        Some(find_or_create(
+            &mut state.entries,
+            "ALBUM",
+            ItemKey::AlbumTitle,
+            n,
+        ))
+    } else {
+        None
+    };
     // TRACKNUMBER is always 1-based-by-file-position, computed locally —
     // doesn't depend on MB content. Always create.
     let tn_idx = find_or_create(&mut state.entries, "TRACKNUMBER", ItemKey::TrackNumber, n);
     let date_idx = if release.year.as_deref().is_some_and(|s| !s.is_empty()) {
         Some(find_or_create(&mut state.entries, "DATE", ItemKey::Year, n))
-    } else { None };
+    } else {
+        None
+    };
 
     // For pre-existing TITLE/ARTIST entries on a per-track-eligible
     // rip (Phase 2 may have parsed them from an embedded CUESHEET, or
@@ -1204,8 +1375,12 @@ pub fn populate_editor_from_mb(
     // Phase 2's CUESHEET dim and MB's track count is resolved in MB's
     // favor.
     if per_track_populate {
-        if let Some(idx) = title_idx { crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], track_dim); }
-        if let Some(idx) = artist_idx { crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], track_dim); }
+        if let Some(idx) = title_idx {
+            crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], track_dim);
+        }
+        if let Some(idx) = artist_idx {
+            crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], track_dim);
+        }
     }
 
     if per_track_populate {
@@ -1228,9 +1403,9 @@ pub fn populate_editor_from_mb(
             state.entries[idx].per_file_values[0] = release.title.clone();
         }
         state.entries[tn_idx].per_file_values[0] = "1".to_string();
-        if let (Some(idx), Some(year)) = (
-            date_idx, release.year.as_deref().filter(|s| !s.is_empty()),
-        ) {
+        if let (Some(idx), Some(year)) =
+            (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
+        {
             state.entries[idx].per_file_values[0] = year.to_string();
         }
     } else if single_image {
@@ -1254,9 +1429,9 @@ pub fn populate_editor_from_mb(
             state.entries[idx].per_file_values[0] = release.title.clone();
         }
         state.entries[tn_idx].per_file_values[0] = "1".to_string();
-        if let (Some(idx), Some(year)) = (
-            date_idx, release.year.as_deref().filter(|s| !s.is_empty()),
-        ) {
+        if let (Some(idx), Some(year)) =
+            (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
+        {
             state.entries[idx].per_file_values[0] = year.to_string();
         }
     } else {
@@ -1276,16 +1451,17 @@ pub fn populate_editor_from_mb(
                 state.entries[idx].per_file_values[i] = release.title.clone();
             }
             state.entries[tn_idx].per_file_values[i] = (i + 1).to_string();
-            if let (Some(idx), Some(year)) = (
-                date_idx, release.year.as_deref().filter(|s| !s.is_empty()),
-            ) {
+            if let (Some(idx), Some(year)) =
+                (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
+            {
                 state.entries[idx].per_file_values[i] = year.to_string();
             }
         }
     }
 
     for idx in [title_idx, artist_idx, album_idx, Some(tn_idx), date_idx]
-        .iter().filter_map(|x| *x)
+        .iter()
+        .filter_map(|x| *x)
     {
         recompute_and_stamp_mb_proposed(&mut state.entries[idx], n);
     }
@@ -1300,10 +1476,14 @@ pub fn populate_editor_from_mb(
     // Guard checks (multi-disc / sidecar / identity) live in
     // is_per_track_eligible, not duplicated here.
     if per_track_populate {
-        let has_cuesheet = state.entries.iter()
+        let has_cuesheet = state
+            .entries
+            .iter()
             .any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"));
         if !has_cuesheet {
-            if let Some(filename) = state.paths.first()
+            if let Some(filename) = state
+                .paths
+                .first()
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
             {
@@ -1313,8 +1493,10 @@ pub fn populate_editor_from_mb(
                     .unwrap_or("flac");
                 if let Ok(cue) = super::cue_generate::cue_from_mb_release(release, filename, ext) {
                     let cue_idx = find_or_create(
-                        &mut state.entries, "CUESHEET",
-                        ItemKey::Unknown("CUESHEET".to_string()), n,
+                        &mut state.entries,
+                        "CUESHEET",
+                        ItemKey::Unknown("CUESHEET".to_string()),
+                        n,
                     );
                     state.entries[cue_idx].per_file_values[0] = cue.clone();
                     // is_binary keeps inline edit blocked; the value
@@ -1366,8 +1548,12 @@ fn release_already_tagged_on_file(audio_path: &std::path::Path, release: &MbRele
     if release.release_id.is_empty() {
         return false;
     }
-    let Ok(tagged) = lofty::read_from_path(audio_path) else { return false; };
-    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else { return false; };
+    let Ok(tagged) = lofty::read_from_path(audio_path) else {
+        return false;
+    };
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return false;
+    };
     matches!(
         tag.get_string(&ItemKey::MusicBrainzReleaseId),
         Some(s) if s == release.release_id,
@@ -1393,7 +1579,9 @@ enum DurationCheck {
 }
 
 fn check_file_duration(audio_path: &std::path::Path, release: &MbRelease) -> DurationCheck {
-    let Some(release_total_ms) = release.tracks.iter()
+    let Some(release_total_ms) = release
+        .tracks
+        .iter()
         .map(|t| t.length_ms.map(|n| n as u64))
         .sum::<Option<u64>>()
     else {
@@ -1442,11 +1630,11 @@ fn verify_single_image_matches_release(
             file_ms, total_ms, DURATION_MISMATCH_TOLERANCE_MS,
         )),
         DurationCheck::Unverifiable => Some(
-            "can't verify file matches release (probe failed or no MUSICBRAINZ_ALBUMID tag)".to_string()
+            "can't verify file matches release (probe failed or no MUSICBRAINZ_ALBUMID tag)"
+                .to_string(),
         ),
     }
 }
-
 
 /// Render a MusicBrainz `artist-credit` array into a single performer
 /// string with `joinphrase` separators preserved.
@@ -1535,12 +1723,33 @@ mod tests {
             // already-escaped sequences. Spot-check: every `(` is
             // preceded by `\`.
             for (i, c) in escaped.char_indices() {
-                if matches!(c, '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']'
-                              | '^' | '"' | '~' | '*' | '?' | ':' | '/')
-                {
+                if matches!(
+                    c,
+                    '+' | '-'
+                        | '!'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '['
+                        | ']'
+                        | '^'
+                        | '"'
+                        | '~'
+                        | '*'
+                        | '?'
+                        | ':'
+                        | '/'
+                ) {
                     let prev = escaped[..i].chars().last();
-                    assert_eq!(prev, Some('\\'),
-                        "unescaped {} in {:?} (from {:?})", c, escaped, t);
+                    assert_eq!(
+                        prev,
+                        Some('\\'),
+                        "unescaped {} in {:?} (from {:?})",
+                        c,
+                        escaped,
+                        t
+                    );
                 }
             }
         }
@@ -1571,11 +1780,9 @@ mod tests {
         for w in stamps.windows(2) {
             let gap = w[1].duration_since(w[0]);
             assert_eq!(
-                gap,
-                MB_MIN_INTERVAL,
+                gap, MB_MIN_INTERVAL,
                 "expected exactly {:?} gap between consecutive MB calls; got {:?}",
-                MB_MIN_INTERVAL,
-                gap,
+                MB_MIN_INTERVAL, gap,
             );
         }
         // Total span across 5 calls = 4 * MB_MIN_INTERVAL.
@@ -1626,7 +1833,9 @@ mod tests {
     fn build_mb_toc_basic() {
         // 9 tracks, leadout at 293421 (matches our Allman SHM disc 1 TOC
         // before subtracting the 150-frame leadin).
-        let sectors = vec![150, 19515, 36358, 51913, 72407, 112096, 134447, 193500, 280413, 293571];
+        let sectors = vec![
+            150, 19515, 36358, 51913, 72407, 112096, 134447, 193500, 280413, 293571,
+        ];
         let toc = build_mb_toc(&sectors).unwrap();
         assert_eq!(
             toc,
@@ -1656,8 +1865,12 @@ mod tests {
 
     #[test]
     fn parse_mb_response_returns_none_on_empty() {
-        assert!(parse_mb_response(r#"{"releases":[]}"#, 0).unwrap().is_none());
-        assert!(parse_mb_response(r#"{"error":"not found"}"#, 0).unwrap().is_none());
+        assert!(parse_mb_response(r#"{"releases":[]}"#, 0)
+            .unwrap()
+            .is_none());
+        assert!(parse_mb_response(r#"{"error":"not found"}"#, 0)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1697,16 +1910,34 @@ mod tests {
     #[test]
     fn durations_consistent_within_tolerance() {
         assert!(durations_consistent(100_000, 100_000, 3000), "exact match");
-        assert!(durations_consistent(100_500, 100_000, 3000), "file slightly longer");
-        assert!(durations_consistent(99_500, 100_000, 3000), "file slightly shorter");
-        assert!(durations_consistent(100_000, 103_000, 3000), "exactly at tolerance");
+        assert!(
+            durations_consistent(100_500, 100_000, 3000),
+            "file slightly longer"
+        );
+        assert!(
+            durations_consistent(99_500, 100_000, 3000),
+            "file slightly shorter"
+        );
+        assert!(
+            durations_consistent(100_000, 103_000, 3000),
+            "exactly at tolerance"
+        );
     }
 
     #[test]
     fn durations_consistent_outside_tolerance() {
-        assert!(!durations_consistent(100_000, 60_000_000, 3000), "1 track of N: huge mismatch");
-        assert!(!durations_consistent(100_000, 103_001, 3000), "just past tolerance");
-        assert!(!durations_consistent(60_000_000, 100_000, 3000), "reversed direction also mismatches");
+        assert!(
+            !durations_consistent(100_000, 60_000_000, 3000),
+            "1 track of N: huge mismatch"
+        );
+        assert!(
+            !durations_consistent(100_000, 103_001, 3000),
+            "just past tolerance"
+        );
+        assert!(
+            !durations_consistent(60_000_000, 100_000, 3000),
+            "reversed direction also mismatches"
+        );
     }
 
     #[test]
@@ -1727,7 +1958,11 @@ mod tests {
         }"#;
         let r = parse_mb_response(body, 3).unwrap().unwrap();
         assert_eq!(r.tracks[0].length_ms, Some(240000), "track-level length");
-        assert_eq!(r.tracks[1].length_ms, Some(180000), "recording-level fallback");
+        assert_eq!(
+            r.tracks[1].length_ms,
+            Some(180000),
+            "recording-level fallback"
+        );
         assert_eq!(r.tracks[2].length_ms, None, "no length means None");
     }
 
@@ -1749,8 +1984,12 @@ mod tests {
 
     #[test]
     fn parse_mb_response_all_returns_empty_on_no_match() {
-        assert!(parse_mb_response_all(r#"{"releases":[]}"#, 0).unwrap().is_empty());
-        assert!(parse_mb_response_all(r#"{"error":"not found"}"#, 0).unwrap().is_empty());
+        assert!(parse_mb_response_all(r#"{"releases":[]}"#, 0)
+            .unwrap()
+            .is_empty());
+        assert!(parse_mb_response_all(r#"{"error":"not found"}"#, 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1848,7 +2087,8 @@ mod tests {
         let a = search_cache_key("Miles Davis", "Kind of Blue", None, Some("1959"));
         let b = search_cache_key("Miles Davis", "Kind of Blue", None, Some("1959"));
         assert_eq!(a, b);
-        let with_catno = search_cache_key("Miles Davis", "Kind of Blue", Some("CL 1355"), Some("1959"));
+        let with_catno =
+            search_cache_key("Miles Davis", "Kind of Blue", Some("CL 1355"), Some("1959"));
         assert_ne!(a, with_catno);
         assert!(a.starts_with("search:v1:"));
     }
@@ -1927,12 +2167,26 @@ mod tests {
         let state = MetadataEditorState {
             paths,
             entries: Vec::new(),
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: Vec::new(),
+            dirty: false,
+            deleted: Vec::new(),
             file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false, sacd_sidecar_path: None, sacd_area_kind: None, sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
         (state, td)
     }
@@ -1940,10 +2194,13 @@ mod tests {
     #[test]
     fn populate_sorts_entries_with_mb_keys_in_logical_positions() {
         let (mut state, _td) = empty_editor_state(2);
-        let mut release = rel("rid", vec![
-            trk(1, "T1", "A", Some("USRC1")),
-            trk(2, "T2", "A", Some("USRC2")),
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                trk(1, "T1", "A", Some("USRC1")),
+                trk(2, "T2", "A", Some("USRC2")),
+            ],
+        );
         release.title = "Album".into();
         release.year = Some("1971".into());
         release.original_date = Some("1969".into());
@@ -1977,24 +2234,37 @@ mod tests {
     fn populate_supplemental_skips_entries_for_fields_mb_didnt_supply() {
         let (mut state, _td) = empty_editor_state(2);
         // MB returns release_id only — no catalog/barcode/country/IDs/etc.
-        let release = rel("rid", vec![
-            trk(1, "T1", "A", None),
-            trk(2, "T2", "A", None),
-        ]);
+        let release = rel(
+            "rid",
+            vec![trk(1, "T1", "A", None), trk(2, "T2", "A", None)],
+        );
         populate_editor_mb_supplemental(&mut state, &release);
 
         // ALBUMID gets created because release_id is non-empty.
-        assert!(state.entries.iter().any(|e| e.display_key == "MUSICBRAINZ_ALBUMID"));
+        assert!(state
+            .entries
+            .iter()
+            .any(|e| e.display_key == "MUSICBRAINZ_ALBUMID"));
         // None of these MB-only entries should exist (MB had nothing).
         for absent in [
-            "ISRC", "MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RELEASETRACKID",
-            "MUSICBRAINZ_ARTISTID", "MUSICBRAINZ_ALBUMARTISTID",
-            "MUSICBRAINZ_RELEASEGROUPID", "ORIGINALDATE", "RELEASECOUNTRY",
+            "ISRC",
+            "MUSICBRAINZ_TRACKID",
+            "MUSICBRAINZ_RELEASETRACKID",
+            "MUSICBRAINZ_ARTISTID",
+            "MUSICBRAINZ_ALBUMARTISTID",
+            "MUSICBRAINZ_RELEASEGROUPID",
+            "ORIGINALDATE",
+            "RELEASECOUNTRY",
             "CATALOGNUMBER",
         ] {
             assert!(
-                state.entries.iter().find(|e| e.display_key == absent).is_none(),
-                "expected no {} entry but found one", absent,
+                state
+                    .entries
+                    .iter()
+                    .find(|e| e.display_key == absent)
+                    .is_none(),
+                "expected no {} entry but found one",
+                absent,
             );
         }
     }
@@ -2002,16 +2272,22 @@ mod tests {
     #[test]
     fn populate_stamps_mb_proposed_for_changed_fields() {
         let (mut state, _td) = empty_editor_state(2);
-        let mut release = rel("rid", vec![
-            trk(1, "Track 1", "Artist", Some("USRC1")),
-            trk(2, "Track 2", "Artist", None),
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                trk(1, "Track 1", "Artist", Some("USRC1")),
+                trk(2, "Track 2", "Artist", None),
+            ],
+        );
         release.title = "Album".into();
         release.year = Some("1971".into());
         populate_editor_from_mb(&mut state, &release);
 
-        let title_entry = state.entries.iter()
-            .find(|e| e.display_key == "TITLE").expect("TITLE entry");
+        let title_entry = state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .expect("TITLE entry");
         assert!(title_entry.mb_proposed_value.is_some());
         assert_eq!(
             title_entry.mb_proposed_per_file.as_ref().unwrap(),
@@ -2022,10 +2298,10 @@ mod tests {
     #[test]
     fn populate_supplemental_writes_isrc_catalog_and_mb_only_fields() {
         let (mut state, _td) = empty_editor_state(2);
-        let mut release = rel("rid", vec![
-            trk(1, "T1", "A", Some("USRC1")),
-            trk(2, "T2", "A", None),
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![trk(1, "T1", "A", Some("USRC1")), trk(2, "T2", "A", None)],
+        );
         release.year = Some("1971".into());
         release.catalog = Some("CAT-001".into());
         release.barcode = Some("BAR".into());
@@ -2040,7 +2316,9 @@ mod tests {
         populate_editor_mb_supplemental(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
-            state.entries.iter()
+            state
+                .entries
+                .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
                 .map(|e| e.per_file_values.clone())
                 .unwrap_or_default()
@@ -2056,18 +2334,33 @@ mod tests {
         assert_eq!(lookup("ORIGINALDATE"), vec!["1969", "1969"]);
         assert_eq!(lookup("RELEASECOUNTRY"), vec!["US", "US"]);
         // Helper does NOT write Title/Album/Artist/Date.
-        assert!(state.entries.iter().find(|e| e.display_key == "TITLE").is_none());
-        assert!(state.entries.iter().find(|e| e.display_key == "ALBUM").is_none());
-        assert!(state.entries.iter().find(|e| e.display_key == "DATE").is_none());
+        assert!(state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .is_none());
+        assert!(state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "ALBUM")
+            .is_none());
+        assert!(state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "DATE")
+            .is_none());
     }
 
     #[test]
     fn populate_editor_from_mb_fills_track_and_album_fields() {
         let (mut state, _td) = empty_editor_state(2);
-        let mut release = rel("x", vec![
-            trk(1, "Track 1", "Artist", Some("USRC17607839")),
-            trk(2, "Track 2", "Artist", None),
-        ]);
+        let mut release = rel(
+            "x",
+            vec![
+                trk(1, "Track 1", "Artist", Some("USRC17607839")),
+                trk(2, "Track 2", "Artist", None),
+            ],
+        );
         release.title = "Album".into();
         release.year = Some("1971".into());
         release.catalog = Some("UICY-94626".into());
@@ -2075,7 +2368,9 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
-            state.entries.iter()
+            state
+                .entries
+                .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
                 .map(|e| e.per_file_values.clone())
                 .unwrap_or_default()
@@ -2104,42 +2399,78 @@ mod tests {
         // are not created on single-image.
         let (mut state, _td) = empty_editor_state(1);
         install_silence_at(&state);
-        let mut release = rel("rid", vec![
-            {
-                let mut t = trk(1, "Lead-off Track", "Artist A", Some("USRC17607839"));
-                t.length_ms = Some(40);
-                t.recording_id = Some("rec1".into());
-                t.track_id = Some("tk1".into());
-                t.artist_id = Some("artid1".into());
-                t
-            },
-            { let mut t = trk(2, "Second Track", "Artist B", None); t.length_ms = Some(30); t },
-            { let mut t = trk(3, "Third Track", "Artist C", None);  t.length_ms = Some(30); t },
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "Lead-off Track", "Artist A", Some("USRC17607839"));
+                    t.length_ms = Some(40);
+                    t.recording_id = Some("rec1".into());
+                    t.track_id = Some("tk1".into());
+                    t.artist_id = Some("artid1".into());
+                    t
+                },
+                {
+                    let mut t = trk(2, "Second Track", "Artist B", None);
+                    t.length_ms = Some(30);
+                    t
+                },
+                {
+                    let mut t = trk(3, "Third Track", "Artist C", None);
+                    t.length_ms = Some(30);
+                    t
+                },
+            ],
+        );
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
         release.year = Some("1970".into());
         populate_editor_from_mb(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
-            state.entries.iter()
+            state
+                .entries
+                .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
                 .map(|e| e.per_file_values.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(lookup("TITLE"),
+        assert_eq!(
+            lookup("TITLE"),
             vec!["Lead-off Track", "Second Track", "Third Track"],
-            "TITLE must be per-track on per-track-eligible single-image");
-        assert_eq!(lookup("ARTIST"),
+            "TITLE must be per-track on per-track-eligible single-image"
+        );
+        assert_eq!(
+            lookup("ARTIST"),
             vec!["Artist A", "Artist B", "Artist C"],
-            "ARTIST must be per-track on per-track-eligible single-image");
-        assert_eq!(lookup("ALBUM"), vec!["Whole Album"], "ALBUM stays album-level dim 1");
+            "ARTIST must be per-track on per-track-eligible single-image"
+        );
+        assert_eq!(
+            lookup("ALBUM"),
+            vec!["Whole Album"],
+            "ALBUM stays album-level dim 1"
+        );
         assert_eq!(lookup("DATE"), vec!["1970"]);
-        assert_eq!(lookup("ISRC"), vec!["USRC17607839", "", ""],
-            "ISRC must be per-track on per-track-eligible single-image (Phase 1b)");
-        assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_TRACKID").is_none());
-        assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID").is_none());
-        assert!(state.entries.iter().find(|e| e.display_key == "MUSICBRAINZ_ARTISTID").is_none());
+        assert_eq!(
+            lookup("ISRC"),
+            vec!["USRC17607839", "", ""],
+            "ISRC must be per-track on per-track-eligible single-image (Phase 1b)"
+        );
+        assert!(state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "MUSICBRAINZ_TRACKID")
+            .is_none());
+        assert!(state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID")
+            .is_none());
+        assert!(state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "MUSICBRAINZ_ARTISTID")
+            .is_none());
     }
 
     #[test]
@@ -2148,22 +2479,45 @@ mod tests {
         // must return false for multi-file and single-track-release
         // cases. per_track_skip_reason returns None for those (no
         // status message needed), but the boolean must NOT be true.
-        let release = rel("rid", vec![
-            { let mut t = trk(1, "T", "A", None); t.length_ms = Some(50); t },
-            { let mut t = trk(2, "T", "A", None); t.length_ms = Some(50); t },
-        ]);
+        let release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "T", "A", None);
+                    t.length_ms = Some(50);
+                    t
+                },
+                {
+                    let mut t = trk(2, "T", "A", None);
+                    t.length_ms = Some(50);
+                    t
+                },
+            ],
+        );
         let paths_multi = vec![
             std::path::PathBuf::from("/tmp/a.flac"),
             std::path::PathBuf::from("/tmp/b.flac"),
         ];
-        assert!(!is_per_track_eligible(&paths_multi, &release, false),
-            "multi-file → not eligible");
-        let single_track = rel("rid", vec![
-            { let mut t = trk(1, "T", "A", None); t.length_ms = Some(100); t },
-        ]);
-        assert!(!is_per_track_eligible(&[std::path::PathBuf::from("/tmp/a.flac")],
-            &single_track, false),
-            "single-track release → not eligible");
+        assert!(
+            !is_per_track_eligible(&paths_multi, &release, false),
+            "multi-file → not eligible"
+        );
+        let single_track = rel(
+            "rid",
+            vec![{
+                let mut t = trk(1, "T", "A", None);
+                t.length_ms = Some(100);
+                t
+            }],
+        );
+        assert!(
+            !is_per_track_eligible(
+                &[std::path::PathBuf::from("/tmp/a.flac")],
+                &single_track,
+                false
+            ),
+            "single-track release → not eligible"
+        );
     }
 
     #[test]
@@ -2206,22 +2560,35 @@ mod tests {
         let state = MetadataEditorState {
             paths: vec![std::path::PathBuf::from("/tmp/x.flac")],
             entries: Vec::new(),
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: Vec::new(),
+            dirty: false,
+            deleted: Vec::new(),
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0,
-            detail_edit: None, mb_back: None, gnudb_back: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
             read_only: false,
-            sacd_sidecar_path: None, sacd_area_kind: None,
-            sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
-        let release = rel("rid", vec![
-            trk(1, "T1", "A", None),
-            trk(2, "T2", "A", None),
-            trk(3, "T3", "A", None),
-        ]);
+        let release = rel(
+            "rid",
+            vec![
+                trk(1, "T1", "A", None),
+                trk(2, "T2", "A", None),
+                trk(3, "T3", "A", None),
+            ],
+        );
         assert!(track_count_mismatch_message(&state, &release).is_none());
     }
 
@@ -2233,16 +2600,26 @@ mod tests {
         let state = MetadataEditorState {
             paths: vec![std::path::PathBuf::from("/tmp/x.flac")],
             entries: Vec::new(),
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: Vec::new(),
+            dirty: false,
+            deleted: Vec::new(),
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0,
-            detail_edit: None, mb_back: None, gnudb_back: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
             read_only: false,
-            sacd_sidecar_path: None, sacd_area_kind: None,
-            sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
         let release = rel("rid", vec![trk(1, "T", "A", None)]);
         assert!(track_count_mismatch_message(&state, &release).is_none());
@@ -2258,24 +2635,37 @@ mod tests {
                 std::path::PathBuf::from("/tmp/03.flac"),
             ],
             entries: Vec::new(),
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: Vec::new(),
+            dirty: false,
+            deleted: Vec::new(),
             file_labels: vec!["01".into(), "02".into(), "03".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0,
-            detail_edit: None, mb_back: None, gnudb_back: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
             read_only: false,
-            sacd_sidecar_path: None, sacd_area_kind: None,
-            sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
-        let release = rel("rid", vec![
-            trk(1, "T1", "A", None),
-            trk(2, "T2", "A", None),
-            trk(3, "T3", "A", None),
-            trk(4, "T4", "A", None),
-            trk(5, "T5", "A", None),
-        ]);
+        let release = rel(
+            "rid",
+            vec![
+                trk(1, "T1", "A", None),
+                trk(2, "T2", "A", None),
+                trk(3, "T3", "A", None),
+                trk(4, "T4", "A", None),
+                trk(5, "T5", "A", None),
+            ],
+        );
         let msg = track_count_mismatch_message(&state, &release).expect("warn");
         assert!(msg.contains("5 tracks"));
         assert!(msg.contains("editor has 3"));
@@ -2288,29 +2678,50 @@ mod tests {
             std::path::PathBuf::from("/tmp/a.flac"),
             std::path::PathBuf::from("/tmp/b.flac"),
         ];
-        let release = rel("rid", vec![
-            { let mut t = trk(1, "T", "A", None); t.length_ms = Some(50); t },
-            { let mut t = trk(2, "T", "A", None); t.length_ms = Some(50); t },
-        ]);
-        assert!(per_track_skip_reason(&paths_multi, &release).is_none(),
-            "multi-file: no per-track expectation, no skip message");
+        let release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "T", "A", None);
+                    t.length_ms = Some(50);
+                    t
+                },
+                {
+                    let mut t = trk(2, "T", "A", None);
+                    t.length_ms = Some(50);
+                    t
+                },
+            ],
+        );
+        assert!(
+            per_track_skip_reason(&paths_multi, &release).is_none(),
+            "multi-file: no per-track expectation, no skip message"
+        );
 
         let single_track_release = rel("rid", vec![trk(1, "T", "A", None)]);
-        assert!(per_track_skip_reason(&[std::path::PathBuf::from("/tmp/a.flac")],
-            &single_track_release).is_none(),
-            "single-track release: not a per-track-applicable case");
+        assert!(
+            per_track_skip_reason(
+                &[std::path::PathBuf::from("/tmp/a.flac")],
+                &single_track_release
+            )
+            .is_none(),
+            "single-track release: not a per-track-applicable case"
+        );
 
         // Multi-disc skip.
         let mut multi_disc = release.clone();
         multi_disc.disc_count = 2;
-        let r = per_track_skip_reason(
-            &[std::path::PathBuf::from("/tmp/a.flac")], &multi_disc).unwrap();
+        let r =
+            per_track_skip_reason(&[std::path::PathBuf::from("/tmp/a.flac")], &multi_disc).unwrap();
         assert!(r.contains("multi-disc"));
         assert!(r.contains("2 discs"));
 
         // Unverifiable skip (no fixture installed → probe fails).
         let r = per_track_skip_reason(
-            &[std::path::PathBuf::from("/tmp/nonexistent.flac")], &release).unwrap();
+            &[std::path::PathBuf::from("/tmp/nonexistent.flac")],
+            &release,
+        )
+        .unwrap();
         assert!(r.contains("can't verify") || r.contains("album-level"));
 
         // Missing-lengths skip (need a fixture for identity verification
@@ -2327,31 +2738,49 @@ mod tests {
         // TITLE gets the album title (not track 1's), ARTIST gets the
         // album artist, ISRC entry is not created at all.
         let (mut state, _td) = empty_editor_state(1);
-        let mut release = rel("rid", vec![
-            trk(1, "Lead-off Track", "Artist A", Some("USRC17607839")),
-            trk(2, "Second Track", "Artist B", None),
-            trk(3, "Third Track", "Artist C", None),
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                trk(1, "Lead-off Track", "Artist A", Some("USRC17607839")),
+                trk(2, "Second Track", "Artist B", None),
+                trk(3, "Third Track", "Artist C", None),
+            ],
+        );
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
         populate_editor_from_mb(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
-            state.entries.iter()
+            state
+                .entries
+                .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
                 .map(|e| e.per_file_values.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(lookup("TITLE"), vec!["Whole Album"],
-            "non-eligible single-image: TITLE falls back to album title");
+        assert_eq!(
+            lookup("TITLE"),
+            vec!["Whole Album"],
+            "non-eligible single-image: TITLE falls back to album title"
+        );
         assert_eq!(lookup("ARTIST"), vec!["Album Artist"]);
         assert_eq!(lookup("ALBUM"), vec!["Whole Album"]);
         // ISRC must NOT be created (no per-track CUESHEET home, and
         // album-level ISRC is meaningless).
-        assert!(state.entries.iter().find(|e| e.display_key == "ISRC").is_none(),
-            "non-eligible single-image: ISRC must not be created");
+        assert!(
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key == "ISRC")
+                .is_none(),
+            "non-eligible single-image: ISRC must not be created"
+        );
         // No CUESHEET embed either (per_track_populate gates that too).
-        assert!(state.entries.iter().find(|e| e.display_key == "CUESHEET").is_none());
+        assert!(state
+            .entries
+            .iter()
+            .find(|e| e.display_key == "CUESHEET")
+            .is_none());
     }
 
     #[test]
@@ -2366,15 +2795,28 @@ mod tests {
         // correctness is verified independently in cue_generate.rs.
         let (mut state, _td) = empty_editor_state(1);
         install_silence_at(&state);
-        let mut release = rel("rid", vec![
-            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(50);  t },
-            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(50);  t },
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "First", "Artist", None);
+                    t.length_ms = Some(50);
+                    t
+                },
+                {
+                    let mut t = trk(2, "Second", "Artist", None);
+                    t.length_ms = Some(50);
+                    t
+                },
+            ],
+        );
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
         populate_editor_from_mb(&mut state, &release);
 
-        let cue_entry = state.entries.iter()
+        let cue_entry = state
+            .entries
+            .iter()
             .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
             .expect("CUESHEET entry should be auto-created on single-image populate");
         assert!(cue_entry.is_binary, "CUESHEET row must block inline edit");
@@ -2390,16 +2832,23 @@ mod tests {
         // corruption is worse than a missing tag the user can request
         // manually later).
         let (mut state, _td) = empty_editor_state(1);
-        let mut release = rel("rid", vec![
-            trk(1, "First", "Artist", None),
-            trk(2, "Second", "Artist", None),
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                trk(1, "First", "Artist", None),
+                trk(2, "Second", "Artist", None),
+            ],
+        );
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+                .is_none(),
             "CUESHEET must not be created when track lengths are missing",
         );
     }
@@ -2407,8 +2856,8 @@ mod tests {
     /// Copy `tests/fixtures/silence.flac` into the test's tempdir at
     /// the path `state.paths[0]` points to. The fixture is 100ms.
     fn install_silence_at(state: &crate::tui::app::MetadataEditorState) {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/silence.flac");
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/silence.flac");
         let dst = &state.paths[0];
         std::fs::copy(&fixture, dst).expect("install silence.flac fixture");
     }
@@ -2419,20 +2868,36 @@ mod tests {
         // (60s) — far outside ±3s tolerance → skip.
         let (mut state, _td) = empty_editor_state(1);
         install_silence_at(&state);
-        let mut release = rel("rid", vec![
-            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(30_000); t },
-            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(30_000); t },
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "First", "Artist", None);
+                    t.length_ms = Some(30_000);
+                    t
+                },
+                {
+                    let mut t = trk(2, "Second", "Artist", None);
+                    t.length_ms = Some(30_000);
+                    t
+                },
+            ],
+        );
         release.title = "Whole Album".into();
         populate_editor_from_mb(&mut state, &release);
         assert!(
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+                .is_none(),
             "duration mismatch (100ms vs 60s) must skip CUESHEET embed",
         );
     }
 
     #[test]
-    fn populate_editor_from_mb_single_image_embeds_when_identity_matches_despite_duration_mismatch() {
+    fn populate_editor_from_mb_single_image_embeds_when_identity_matches_despite_duration_mismatch()
+    {
         // File is 100ms but carries MUSICBRAINZ_ALBUMID matching the
         // release. Identity is positive evidence the file belongs to
         // this release, so we embed even though duration check would
@@ -2460,18 +2925,34 @@ mod tests {
                 ItemKey::MusicBrainzReleaseId,
                 ItemValue::Text("matching-rid".to_string()),
             ));
-            tagged.save_to_path(path, WriteOptions::default()).expect("save tag");
+            tagged
+                .save_to_path(path, WriteOptions::default())
+                .expect("save tag");
         }
 
-        let mut release = rel("matching-rid", vec![
-            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(30_000); t },
-            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(30_000); t },
-        ]);
+        let mut release = rel(
+            "matching-rid",
+            vec![
+                {
+                    let mut t = trk(1, "First", "Artist", None);
+                    t.length_ms = Some(30_000);
+                    t
+                },
+                {
+                    let mut t = trk(2, "Second", "Artist", None);
+                    t.length_ms = Some(30_000);
+                    t
+                },
+            ],
+        );
         release.title = "Whole Album".into();
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state.entries.iter().any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")),
+            state
+                .entries
+                .iter()
+                .any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")),
             "matching MUSICBRAINZ_ALBUMID must override duration mismatch and embed CUESHEET",
         );
     }
@@ -2502,24 +2983,39 @@ mod tests {
                 ItemKey::MusicBrainzReleaseId,
                 ItemValue::Text("matching-rid".into()),
             ));
-            tagged.save_to_path(path, WriteOptions::default()).expect("save tag");
+            tagged
+                .save_to_path(path, WriteOptions::default())
+                .expect("save tag");
         }
         // Identity matches BUT no track lengths.
-        let mut release = rel("matching-rid", vec![
-            trk(1, "First", "Artist", None),
-            trk(2, "Second", "Artist", None),
-        ]);
+        let mut release = rel(
+            "matching-rid",
+            vec![
+                trk(1, "First", "Artist", None),
+                trk(2, "Second", "Artist", None),
+            ],
+        );
         release.title = "Whole Album".into();
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+                .is_none(),
             "no track lengths → no CUESHEET even with identity match",
         );
-        let title = state.entries.iter()
-            .find(|e| e.display_key.eq_ignore_ascii_case("TITLE")).unwrap();
-        assert_eq!(title.per_file_values, vec!["Whole Album"],
-            "album-level fallback: TITLE = album name, dim 1");
+        let title = state
+            .entries
+            .iter()
+            .find(|e| e.display_key.eq_ignore_ascii_case("TITLE"))
+            .unwrap();
+        assert_eq!(
+            title.per_file_values,
+            vec!["Whole Album"],
+            "album-level fallback: TITLE = album name, dim 1"
+        );
     }
 
     #[test]
@@ -2528,14 +3024,29 @@ mod tests {
         // tag (no identity anchor). Strict policy: refuse to embed.
         // Previously this case embedded permissively; now it doesn't.
         let (mut state, _td) = empty_editor_state(1);
-        let mut release = rel("rid", vec![
-            { let mut t = trk(1, "First", "Artist", None);  t.length_ms = Some(240_000); t },
-            { let mut t = trk(2, "Second", "Artist", None); t.length_ms = Some(180_000); t },
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "First", "Artist", None);
+                    t.length_ms = Some(240_000);
+                    t
+                },
+                {
+                    let mut t = trk(2, "Second", "Artist", None);
+                    t.length_ms = Some(180_000);
+                    t
+                },
+            ],
+        );
         release.title = "Whole Album".into();
         populate_editor_from_mb(&mut state, &release);
         assert!(
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+                .is_none(),
             "unverifiable file (no probe + no identity) must skip CUESHEET embed strictly",
         );
     }
@@ -2545,24 +3056,31 @@ mod tests {
         // disc_count > 1: don't embed (single file can't unambiguously
         // represent a multi-disc release).
         let (mut state, _td) = empty_editor_state(1);
-        let mut release = rel("rid", vec![
-            {
-                let mut t = trk(1, "First", "Artist", None);
-                t.length_ms = Some(240_000);
-                t
-            },
-            {
-                let mut t = trk(2, "Second", "Artist", None);
-                t.length_ms = Some(180_000);
-                t
-            },
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "First", "Artist", None);
+                    t.length_ms = Some(240_000);
+                    t
+                },
+                {
+                    let mut t = trk(2, "Second", "Artist", None);
+                    t.length_ms = Some(180_000);
+                    t
+                },
+            ],
+        );
         release.title = "Whole Album".into();
         release.disc_count = 2;
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+                .is_none(),
             "multi-disc release must not auto-embed CUESHEET",
         );
     }
@@ -2598,25 +3116,45 @@ mod tests {
             mb_proposed_per_file: None,
         });
 
-        let mut release = rel("rid", vec![
-            { let mut t = trk(1, "MB Track 1", "Artist", None); t.length_ms = Some(50); t },
-            { let mut t = trk(2, "MB Track 2", "Artist", None); t.length_ms = Some(50); t },
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "MB Track 1", "Artist", None);
+                    t.length_ms = Some(50);
+                    t
+                },
+                {
+                    let mut t = trk(2, "MB Track 2", "Artist", None);
+                    t.length_ms = Some(50);
+                    t
+                },
+            ],
+        );
         release.title = "Whole Album".into();
         populate_editor_from_mb(&mut state, &release);
 
         // CUESHEET preserved verbatim — populate did NOT rebuild it.
-        let cue = state.entries.iter()
+        let cue = state
+            .entries
+            .iter()
             .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
             .expect("CUESHEET still in state");
-        assert_eq!(cue.per_file_values[0], pre_existing,
-            "existing CUESHEET preserved by populate (not regenerated from MB)");
+        assert_eq!(
+            cue.per_file_values[0], pre_existing,
+            "existing CUESHEET preserved by populate (not regenerated from MB)"
+        );
         // Per-track populate from MB still ran on TITLE.
-        let title = state.entries.iter()
+        let title = state
+            .entries
+            .iter()
             .find(|e| e.display_key.eq_ignore_ascii_case("TITLE"))
             .expect("TITLE created");
-        assert_eq!(title.per_file_values, vec!["MB Track 1", "MB Track 2"],
-            "per-track populate fired despite an existing CUESHEET");
+        assert_eq!(
+            title.per_file_values,
+            vec!["MB Track 1", "MB Track 2"],
+            "per-track populate fired despite an existing CUESHEET"
+        );
     }
 
     #[test]
@@ -2624,33 +3162,43 @@ mod tests {
         // 2 files, 2 tracks → not single-image; CUESHEET shouldn't be
         // generated (it only applies to single-image rips).
         let (mut state, _td) = empty_editor_state(2);
-        let mut release = rel("rid", vec![
-            {
-                let mut t = trk(1, "First", "Artist", None);
-                t.length_ms = Some(240_000);
-                t
-            },
-            {
-                let mut t = trk(2, "Second", "Artist", None);
-                t.length_ms = Some(180_000);
-                t
-            },
-        ]);
+        let mut release = rel(
+            "rid",
+            vec![
+                {
+                    let mut t = trk(1, "First", "Artist", None);
+                    t.length_ms = Some(240_000);
+                    t
+                },
+                {
+                    let mut t = trk(2, "Second", "Artist", None);
+                    t.length_ms = Some(180_000);
+                    t
+                },
+            ],
+        );
         release.title = "Album".into();
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state.entries.iter().find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")).is_none(),
+            state
+                .entries
+                .iter()
+                .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
+                .is_none(),
             "CUESHEET should only fire on single-image rips",
         );
     }
 
     #[test]
     fn artist_credit_joinphrase_preserved() {
-        let v: serde_json::Value = serde_json::from_str(r#"[
+        let v: serde_json::Value = serde_json::from_str(
+            r#"[
             {"name": "Foo", "joinphrase": " & "},
             {"name": "Bar"}
-        ]"#).unwrap();
+        ]"#,
+        )
+        .unwrap();
         assert_eq!(artist_credit_string(Some(&v)), "Foo & Bar");
     }
 }

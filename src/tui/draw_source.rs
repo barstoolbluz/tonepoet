@@ -10,10 +10,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::convert::formats::AudioFormat;
 use super::app::{SourceMode, SourceState};
 use super::probe::SourceInfo;
 use super::theme;
+use crate::convert::formats::AudioFormat;
 
 /// Label shown on the clickable "browse files" pill on the source pane.
 pub const BROWSE_PILL_LABEL: &str = " browse files ";
@@ -41,7 +41,11 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
         return;
     }
 
-    let border_color = if focused { theme::AMBER } else { theme::TEXT_DIM };
+    let border_color = if focused {
+        theme::AMBER
+    } else {
+        theme::TEXT_DIM
+    };
     let w = area.width as usize;
 
     // Top border with title: ┌ source ─── advanced ┐
@@ -84,7 +88,18 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
             cursor,
             selected,
             ..
-        } => render_multi_track(border_color, w, path, tracks, area_label.as_deref(), album_title.as_deref(), album_artist.as_deref(), *scroll, *cursor, selected),
+        } => render_multi_track(
+            border_color,
+            w,
+            path,
+            tracks,
+            area_label.as_deref(),
+            album_title.as_deref(),
+            album_artist.as_deref(),
+            *scroll,
+            *cursor,
+            selected,
+        ),
         SourceMode::Batch {
             paths,
             cursor,
@@ -117,12 +132,14 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
 fn render_empty<'a>(border_color: ratatui::style::Color, w: usize) -> Vec<Line<'a>> {
     vec![
         bordered_line(border_color, w, vec![]),
-        bordered_line(border_color, w, vec![
-            Span::styled(
+        bordered_line(
+            border_color,
+            w,
+            vec![Span::styled(
                 "   press :browse or click the pill below to pick a source file",
                 theme::muted(),
-            ),
-        ]),
+            )],
+        ),
         bordered_line(border_color, w, vec![]),
         browse_pill_row(border_color, w),
     ]
@@ -139,13 +156,19 @@ fn render_single<'a>(
         // Path is known but probe hasn't completed yet — show a minimal
         // placeholder so the layout doesn't collapse.
         return vec![
-            bordered_line(border_color, w, vec![
-                Span::styled("   path      ", theme::muted()),
-                Span::styled(shorten_path(path, w.saturating_sub(16)), theme::bright()),
-            ]),
-            bordered_line(border_color, w, vec![
-                Span::styled("   probing…", theme::muted()),
-            ]),
+            bordered_line(
+                border_color,
+                w,
+                vec![
+                    Span::styled("   path      ", theme::muted()),
+                    Span::styled(shorten_path(path, w.saturating_sub(16)), theme::bright()),
+                ],
+            ),
+            bordered_line(
+                border_color,
+                w,
+                vec![Span::styled("   probing…", theme::muted())],
+            ),
             bordered_line(border_color, w, vec![]),
             browse_pill_row(border_color, w),
         ];
@@ -175,15 +198,23 @@ fn render_single<'a>(
     }
 
     vec![
-        bordered_line(border_color, w, vec![
-            Span::styled("   path      ", theme::muted()),
-            Span::styled(path_truncated, theme::bright()),
-        ]),
+        bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled("   path      ", theme::muted()),
+                Span::styled(path_truncated, theme::bright()),
+            ],
+        ),
         bordered_line(border_color, w, format_parts),
-        bordered_line(border_color, w, vec![
-            Span::styled("   duration  ", theme::muted()),
-            Span::styled(info.duration_display(), theme::text()),
-        ]),
+        bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled("   duration  ", theme::muted()),
+                Span::styled(info.duration_display(), theme::text()),
+            ],
+        ),
         two_pill_row(border_color, w, BROWSE_PILL_LABEL),
         enqueue_pill_row(border_color, w),
     ]
@@ -242,25 +273,48 @@ fn render_batch<'a>(
 
     let cursor_file = paths
         .get(cursor)
-        .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .map(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
         .unwrap_or_default();
 
-    let cursor_line = format!("[{}/{}] {} — {}", cursor + 1, n, cursor_file, cursor_info_str);
+    let cursor_line = format!(
+        "[{}/{}] {} — {}",
+        cursor + 1,
+        n,
+        cursor_file,
+        cursor_info_str
+    );
     let cursor_line_trunc = truncate_display(&cursor_line, w.saturating_sub(16));
 
     vec![
-        bordered_line(border_color, w, vec![
-            Span::styled("   batch     ", theme::muted()),
-            Span::styled(summary_line, theme::bold(theme::BLUE)),
-        ]),
-        bordered_line(border_color, w, vec![
-            Span::styled("   formats   ", theme::muted()),
-            Span::styled(hist_str, theme::text()),
-        ]),
-        bordered_line(border_color, w, vec![
-            Span::styled("   preview   ", theme::muted()),
-            Span::styled(cursor_line_trunc, theme::bright()),
-        ]),
+        bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled("   batch     ", theme::muted()),
+                Span::styled(summary_line, theme::bold(theme::BLUE)),
+            ],
+        ),
+        bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled("   formats   ", theme::muted()),
+                Span::styled(hist_str, theme::text()),
+            ],
+        ),
+        bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled("   preview   ", theme::muted()),
+                Span::styled(cursor_line_trunc, theme::bright()),
+            ],
+        ),
         two_pill_row(border_color, w, EXPAND_PILL_LABEL),
         enqueue_pill_row(border_color, w),
     ]
@@ -320,7 +374,6 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
 fn browse_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'static> {
     pill_row(border_color, width, BROWSE_PILL_LABEL)
 }
-
 
 /// Row with two pills: a primary pill (right-aligned) and an analyze pill
 /// to its left. Used when a file is loaded (Single/Batch).
@@ -384,10 +437,7 @@ fn pill_row(
 
 /// Row with enqueue + enqueue+start pills, right-aligned. Uses green
 /// background to distinguish from the browse/analyze pills above.
-fn enqueue_pill_row(
-    border_color: ratatui::style::Color,
-    width: usize,
-) -> Line<'static> {
+fn enqueue_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'static> {
     let enq_style = Style::default()
         .fg(theme::PILL_ACTIVE_FG)
         .bg(theme::GREEN)
@@ -428,10 +478,7 @@ fn bordered_line<'a>(
     let mut spans = vec![Span::styled("│", theme::border(border_color))];
     spans.extend(content);
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled(
-        "│",
-        theme::border(border_color),
-    ));
+    spans.push(Span::styled("│", theme::border(border_color)));
     Line::from(spans)
 }
 

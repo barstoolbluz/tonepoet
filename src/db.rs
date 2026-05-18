@@ -4,8 +4,8 @@
 //! WAL mode enabled for crash safety. Schema versioned via PRAGMA
 //! user_version with forward migrations on open.
 
+use rusqlite::{params, Connection};
 use std::path::PathBuf;
-use rusqlite::{Connection, params};
 
 /// Schema version — bump when adding migrations.
 const CURRENT_VERSION: u32 = 19;
@@ -61,8 +61,8 @@ impl Database {
                 .map_err(|e| format!("failed to create DB directory: {}", e))?;
         }
 
-        let conn = Connection::open(&path)
-            .map_err(|e| format!("failed to open database: {}", e))?;
+        let conn =
+            Connection::open(&path).map_err(|e| format!("failed to open database: {}", e))?;
 
         // WAL mode for crash safety + concurrent reads.
         conn.execute_batch("PRAGMA journal_mode = WAL;")
@@ -90,7 +90,8 @@ impl Database {
 
     /// Run forward migrations up to CURRENT_VERSION.
     fn migrate(&mut self) -> Result<(), String> {
-        let version: u32 = self.conn
+        let version: u32 = self
+            .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("read user_version: {}", e))?;
 
@@ -161,7 +162,9 @@ impl Database {
 
     /// v1: metadata journal, probe cache, recent files, bookmarks.
     fn migrate_v1(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS metadata_journal (
                 file_path   TEXT PRIMARY KEY,
                 backup_path TEXT NOT NULL,
@@ -206,14 +209,18 @@ impl Database {
                 path     TEXT NOT NULL,
                 position INTEGER NOT NULL
             );
-        ").map_err(|e| format!("v1 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v1 migration failed: {}", e))?;
 
         Ok(())
     }
 
     /// v2: presets table.
     fn migrate_v2(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS presets (
                 name            TEXT PRIMARY KEY,
                 description     TEXT,
@@ -228,13 +235,17 @@ impl Database {
                 version         INTEGER NOT NULL DEFAULT 2
             );
             CREATE INDEX IF NOT EXISTS idx_presets_format ON presets(format);
-        ").map_err(|e| format!("v2 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v2 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v3: conversion history table.
     fn migrate_v3(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS conversion_history (
                 id              INTEGER PRIMARY KEY,
                 input_path      TEXT NOT NULL,
@@ -257,13 +268,17 @@ impl Database {
                 ON conversion_history(completed_at);
             CREATE INDEX IF NOT EXISTS idx_history_input
                 ON conversion_history(input_path);
-        ").map_err(|e| format!("v3 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v3 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v4: batch state table for Convert screen recovery.
     fn migrate_v4(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS batch_state (
                 id          INTEGER PRIMARY KEY CHECK (id = 1),
                 paths_json  TEXT NOT NULL,
@@ -274,7 +289,9 @@ impl Database {
                 replaygain  TEXT,
                 saved_at    TEXT NOT NULL
             );
-        ").map_err(|e| format!("v4 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v4 migration failed: {}", e))?;
         Ok(())
     }
 
@@ -292,19 +309,30 @@ impl Database {
         replaygain: Option<&str>,
     ) -> Result<(), String> {
         let paths_json = serde_json::to_string(
-            &paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
-        ).map_err(|e| format!("paths serialize: {}", e))?;
+            &paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| format!("paths serialize: {}", e))?;
 
-        self.conn.execute(
-            "INSERT OR REPLACE INTO batch_state (
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO batch_state (
                 id, paths_json, format, sample_rate, bit_depth,
                 dither, replaygain, saved_at
             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                paths_json, format, sample_rate, bit_depth,
-                dither, replaygain, chrono::Utc::now().to_rfc3339(),
-            ],
-        ).map_err(|e| format!("batch state save: {}", e))?;
+                params![
+                    paths_json,
+                    format,
+                    sample_rate,
+                    bit_depth,
+                    dither,
+                    replaygain,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| format!("batch state save: {}", e))?;
         Ok(())
     }
 
@@ -312,60 +340,84 @@ impl Database {
     /// bit_depth, dither, replaygain).
     pub fn load_batch_state(
         &self,
-    ) -> Option<(Vec<std::path::PathBuf>, Option<String>, Option<u32>, Option<String>, Option<String>, Option<String>)> {
-        self.conn.query_row(
-            "SELECT paths_json, format, sample_rate, bit_depth, dither, replaygain
+    ) -> Option<(
+        Vec<std::path::PathBuf>,
+        Option<String>,
+        Option<u32>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        self.conn
+            .query_row(
+                "SELECT paths_json, format, sample_rate, bit_depth, dither, replaygain
              FROM batch_state WHERE id = 1",
-            [],
-            |row| {
-                let json: String = row.get(0)?;
-                let format: Option<String> = row.get(1)?;
-                let sample_rate: Option<u32> = row.get(2)?;
-                let bit_depth: Option<String> = row.get(3)?;
-                let dither: Option<String> = row.get(4)?;
-                let replaygain: Option<String> = row.get(5)?;
-                Ok((json, format, sample_rate, bit_depth, dither, replaygain))
-            },
-        ).ok().and_then(|(json, format, sr, bd, dither, rg)| {
-            let path_strs: Vec<String> = serde_json::from_str(&json).ok()?;
-            let paths: Vec<std::path::PathBuf> = path_strs.into_iter()
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.exists()) // Only restore paths that still exist
-                .collect();
-            if paths.is_empty() { return None; }
-            Some((paths, format, sr, bd, dither, rg))
-        })
+                [],
+                |row| {
+                    let json: String = row.get(0)?;
+                    let format: Option<String> = row.get(1)?;
+                    let sample_rate: Option<u32> = row.get(2)?;
+                    let bit_depth: Option<String> = row.get(3)?;
+                    let dither: Option<String> = row.get(4)?;
+                    let replaygain: Option<String> = row.get(5)?;
+                    Ok((json, format, sample_rate, bit_depth, dither, replaygain))
+                },
+            )
+            .ok()
+            .and_then(|(json, format, sr, bd, dither, rg)| {
+                let path_strs: Vec<String> = serde_json::from_str(&json).ok()?;
+                let paths: Vec<std::path::PathBuf> = path_strs
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.exists()) // Only restore paths that still exist
+                    .collect();
+                if paths.is_empty() {
+                    return None;
+                }
+                Some((paths, format, sr, bd, dither, rg))
+            })
     }
 
     /// Clear the saved batch state (after commit or explicit cancel).
     pub fn clear_batch_state(&self) -> Result<(), String> {
-        self.conn.execute("DELETE FROM batch_state WHERE id = 1", [])
+        self.conn
+            .execute("DELETE FROM batch_state WHERE id = 1", [])
             .map_err(|e| format!("batch state clear: {}", e))?;
         Ok(())
     }
 
     /// v5: add access_count to recent_files.
     fn migrate_v5(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             ALTER TABLE recent_files ADD COLUMN access_count INTEGER NOT NULL DEFAULT 1;
-        ").map_err(|e| format!("v5 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v5 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v6: conversion queue table.
     fn migrate_v6(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS conversion_queue (
                 id              TEXT PRIMARY KEY,
                 item_json       TEXT NOT NULL
             );
-        ").map_err(|e| format!("v6 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v6 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v7: analysis cache table.
     fn migrate_v7(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS analysis_cache (
                 file_path       TEXT PRIMARY KEY,
                 file_mtime      INTEGER NOT NULL,
@@ -384,14 +436,18 @@ impl Database {
                 true_peak_dbtp  REAL,
                 analyzed_at     TEXT NOT NULL
             );
-        ").map_err(|e| format!("v7 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v7 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v8: drop + recreate analysis_cache with algo_version column.
     /// Invalidates all v7 cached results (algorithm was buggy).
     fn migrate_v8(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             DROP TABLE IF EXISTS analysis_cache;
             CREATE TABLE analysis_cache (
                 file_path       TEXT PRIMARY KEY,
@@ -412,13 +468,17 @@ impl Database {
                 true_peak_dbtp  REAL,
                 analyzed_at     TEXT NOT NULL
             );
-        ").map_err(|e| format!("v8 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v8 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v9: search tag cache table.
     fn migrate_v9(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS search_tag_cache (
                 file_path       TEXT PRIMARY KEY,
                 file_mtime      INTEGER NOT NULL,
@@ -431,7 +491,9 @@ impl Database {
                 tag_string      TEXT NOT NULL,
                 last_accessed   TEXT NOT NULL
             );
-        ").map_err(|e| format!("v9 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v9 migration failed: {}", e))?;
         Ok(())
     }
 
@@ -439,16 +501,22 @@ impl Database {
     fn migrate_v10(&mut self) -> Result<(), String> {
         // Add column; existing rows have NULL which is fine — the algo
         // version bump means they won't be served from cache anyway.
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             ALTER TABLE analysis_cache ADD COLUMN preemphasis INTEGER;
             ALTER TABLE analysis_cache ADD COLUMN preemphasis_corr REAL;
-        ").map_err(|e| format!("v10 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v10 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v11: add preemph_corpus table for spectral scorer model storage.
     fn migrate_v11(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS preemph_corpus (
                 id          INTEGER PRIMARY KEY DEFAULT 1,
                 n_frames    INTEGER NOT NULL,
@@ -458,21 +526,29 @@ impl Database {
                 pca         BLOB NOT NULL,
                 updated_at  TEXT NOT NULL
             );
-        ").map_err(|e| format!("v11 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v11 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v12: add empirical PE template column to preemph_corpus.
     fn migrate_v12(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             ALTER TABLE preemph_corpus ADD COLUMN pe_template BLOB;
-        ").map_err(|e| format!("v12 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v12 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v13: add preemph_classifier table for trained LDA classifier storage.
     fn migrate_v13(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS preemph_classifier (
                 id              INTEGER PRIMARY KEY DEFAULT 1,
                 weights         BLOB NOT NULL,
@@ -486,30 +562,42 @@ impl Database {
                 cv_precision    REAL,
                 trained_at      TEXT NOT NULL
             );
-        ").map_err(|e| format!("v13 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v13 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v14: add preemphasis_detail column to analysis_cache.
     fn migrate_v14(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             ALTER TABLE analysis_cache ADD COLUMN preemphasis_detail TEXT;
-        ").map_err(|e| format!("v14 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v14 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v15: add HDCD columns to analysis_cache.
     fn migrate_v15(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             ALTER TABLE analysis_cache ADD COLUMN hdcd_detected INTEGER;
             ALTER TABLE analysis_cache ADD COLUMN hdcd_detail TEXT;
-        ").map_err(|e| format!("v15 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v15 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v16: AccurateRip result cache.
     fn migrate_v16(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS ar_cache (
                 file_path TEXT NOT NULL,
                 track_number INTEGER NOT NULL,
@@ -524,13 +612,17 @@ impl Database {
                 verified_at TEXT NOT NULL,
                 PRIMARY KEY (file_path, track_number)
             );
-        ").map_err(|e| format!("v16 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v16 migration failed: {}", e))?;
         Ok(())
     }
 
     /// v17: CTDB parity matrix cache (LRU by accessed_at).
     fn migrate_v17(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS ctdb_parity_cache (
                 cache_key TEXT NOT NULL,
                 npar INTEGER NOT NULL,
@@ -542,12 +634,16 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_ctdb_parity_accessed
                 ON ctdb_parity_cache (accessed_at);
-        ").map_err(|e| format!("v17 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v17 migration failed: {}", e))?;
         Ok(())
     }
 
     fn migrate_v18(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS musicbrainz_toc_cache (
                 toc_string TEXT PRIMARY KEY,
                 response_json TEXT NOT NULL,
@@ -556,7 +652,9 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_mb_accessed
                 ON musicbrainz_toc_cache (accessed_at);
-        ").map_err(|e| format!("v18 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v18 migration failed: {}", e))?;
         Ok(())
     }
 
@@ -565,7 +663,9 @@ impl Database {
     /// — text search rows churn faster than TOC rows since the same disc
     /// can produce many search-query keys but only one TOC.
     fn migrate_v19(&mut self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS musicbrainz_search_cache (
                 cache_key TEXT PRIMARY KEY,
                 response_json TEXT NOT NULL,
@@ -574,7 +674,9 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_mb_search_accessed
                 ON musicbrainz_search_cache (accessed_at);
-        ").map_err(|e| format!("v19 migration failed: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("v19 migration failed: {}", e))?;
         Ok(())
     }
 
@@ -588,16 +690,18 @@ impl Database {
         mtime: i64,
         size: u64,
     ) -> Option<Vec<crate::tui::accuraterip::ArTrackResult>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT track_number, status, confidence, ar_offset, crc_v1, crc_v2
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT track_number, status, confidence, ar_offset, crc_v1, crc_v2
              FROM ar_cache
              WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3
-             ORDER BY track_number"
-        ).ok()?;
+             ORDER BY track_number",
+            )
+            .ok()?;
 
-        let results: Vec<crate::tui::accuraterip::ArTrackResult> = stmt.query_map(
-            params![file_path, mtime, size as i64],
-            |row| {
+        let results: Vec<crate::tui::accuraterip::ArTrackResult> = stmt
+            .query_map(params![file_path, mtime, size as i64], |row| {
                 let track_number: u32 = row.get(0)?;
                 let status_str: String = row.get(1)?;
                 let confidence: Option<u8> = row.get(2)?;
@@ -621,10 +725,16 @@ impl Database {
                     crc_v1,
                     crc_v2,
                 })
-            },
-        ).ok()?.filter_map(|r| r.ok()).collect();
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
 
-        if results.is_empty() { None } else { Some(results) }
+        if results.is_empty() {
+            None
+        } else {
+            Some(results)
+        }
     }
 
     /// Store AR verification results in the cache.
@@ -637,10 +747,12 @@ impl Database {
         disc_id: &str,
     ) -> Result<(), String> {
         // Delete old entries for this file (might have different track count).
-        self.conn.execute(
-            "DELETE FROM ar_cache WHERE file_path = ?1",
-            params![file_path],
-        ).map_err(|e| format!("ar cache delete: {}", e))?;
+        self.conn
+            .execute(
+                "DELETE FROM ar_cache WHERE file_path = ?1",
+                params![file_path],
+            )
+            .map_err(|e| format!("ar cache delete: {}", e))?;
 
         let now = chrono::Utc::now().to_rfc3339();
         for t in results {
@@ -650,17 +762,27 @@ impl Database {
                 crate::tui::accuraterip::ArTrackStatus::NoDiscInDatabase => "not_in_db",
                 crate::tui::accuraterip::ArTrackStatus::Error(_) => "error",
             };
-            self.conn.execute(
-                "INSERT OR REPLACE INTO ar_cache (
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO ar_cache (
                     file_path, track_number, file_mtime, file_size,
                     disc_id, status, confidence, ar_offset, crc_v1, crc_v2, verified_at
                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                params![
-                    file_path, t.track_number, mtime, size as i64,
-                    disc_id, status_str, t.confidence, t.offset,
-                    t.crc_v1 as i64, t.crc_v2 as i64, now,
-                ],
-            ).map_err(|e| format!("ar cache store: {}", e))?;
+                    params![
+                        file_path,
+                        t.track_number,
+                        mtime,
+                        size as i64,
+                        disc_id,
+                        status_str,
+                        t.confidence,
+                        t.offset,
+                        t.crc_v1 as i64,
+                        t.crc_v2 as i64,
+                        now,
+                    ],
+                )
+                .map_err(|e| format!("ar cache store: {}", e))?;
         }
         Ok(())
     }
@@ -671,26 +793,25 @@ impl Database {
     /// content hash of the audio inputs. Returns the deserialized matrix
     /// on hit and updates the row's `accessed_at` so LRU eviction reflects
     /// recent use. Returns `None` on cache miss or any decode error.
-    pub fn get_cached_ctdb_parity(
-        &self,
-        cache_key: &str,
-        npar: u32,
-    ) -> Option<Vec<Vec<u16>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT stride, parity_blob FROM ctdb_parity_cache
-             WHERE cache_key = ?1 AND npar = ?2"
-        ).ok()?;
+    pub fn get_cached_ctdb_parity(&self, cache_key: &str, npar: u32) -> Option<Vec<Vec<u16>>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT stride, parity_blob FROM ctdb_parity_cache
+             WHERE cache_key = ?1 AND npar = ?2",
+            )
+            .ok()?;
 
-        let row: Option<(i64, Vec<u8>)> = stmt.query_row(
-            params![cache_key, npar as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).ok();
+        let row: Option<(i64, Vec<u8>)> = stmt
+            .query_row(params![cache_key, npar as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .ok();
 
         let (stride_i64, blob) = row?;
         let stride = stride_i64 as usize;
-        let parity = crate::ctdb_rs::syndrome::try_bytes_to_parity(
-            &blob, stride, npar as usize,
-        ).ok()?;
+        let parity =
+            crate::ctdb_rs::syndrome::try_bytes_to_parity(&blob, stride, npar as usize).ok()?;
 
         // Touch accessed_at so LRU treats this as recent. Failures here are
         // non-fatal — the cache hit is still valid; we just missed a bookkeeping
@@ -722,33 +843,38 @@ impl Database {
         let blob = crate::ctdb_rs::syndrome::parity_to_bytes(parity, stride, npar as usize);
 
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO ctdb_parity_cache
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO ctdb_parity_cache
                  (cache_key, npar, stride, parity_blob, cached_at, accessed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![cache_key, npar as i64, stride as i64, blob, now],
-        ).map_err(|e| format!("ctdb parity cache store: {}", e))?;
+                params![cache_key, npar as i64, stride as i64, blob, now],
+            )
+            .map_err(|e| format!("ctdb parity cache store: {}", e))?;
 
         // Eviction: only deletes when count exceeds the threshold, then
         // trims down to the target. Cheap on the common case (single
         // SELECT COUNT).
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM ctdb_parity_cache",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| format!("ctdb parity cache count: {}", e))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM ctdb_parity_cache", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| format!("ctdb parity cache count: {}", e))?;
 
         if (count as usize) > CTDB_PARITY_CACHE_EVICT_THRESHOLD {
             let to_remove = (count as usize) - CTDB_PARITY_CACHE_EVICT_TARGET;
-            self.conn.execute(
-                "DELETE FROM ctdb_parity_cache
+            self.conn
+                .execute(
+                    "DELETE FROM ctdb_parity_cache
                  WHERE rowid IN (
                      SELECT rowid FROM ctdb_parity_cache
                      ORDER BY accessed_at ASC
                      LIMIT ?1
                  )",
-                params![to_remove as i64],
-            ).map_err(|e| format!("ctdb parity cache evict: {}", e))?;
+                    params![to_remove as i64],
+                )
+                .map_err(|e| format!("ctdb parity cache evict: {}", e))?;
         }
 
         Ok(())
@@ -760,15 +886,17 @@ impl Database {
     /// JSON body on hit. Returns `None` on miss or when the entry is older
     /// than the 30-day TTL. Touches `accessed_at` on hit (LRU).
     pub fn get_cached_mb_response(&self, toc_string: &str) -> Option<String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT response_json, fetched_at FROM musicbrainz_toc_cache
-             WHERE toc_string = ?1"
-        ).ok()?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT response_json, fetched_at FROM musicbrainz_toc_cache
+             WHERE toc_string = ?1",
+            )
+            .ok()?;
 
-        let row: Option<(String, String)> = stmt.query_row(
-            params![toc_string],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).ok();
+        let row: Option<(String, String)> = stmt
+            .query_row(params![toc_string], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ok();
         let (json, fetched_at) = row?;
 
         // TTL check: parse RFC3339, drop entry if older than 30 days.
@@ -794,30 +922,35 @@ impl Database {
     /// `MB_CACHE_EVICT_TARGET`.
     pub fn store_mb_response(&self, toc_string: &str, response_json: &str) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO musicbrainz_toc_cache
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO musicbrainz_toc_cache
                  (toc_string, response_json, fetched_at, accessed_at)
              VALUES (?1, ?2, ?3, ?3)",
-            params![toc_string, response_json, now],
-        ).map_err(|e| format!("mb cache store: {}", e))?;
+                params![toc_string, response_json, now],
+            )
+            .map_err(|e| format!("mb cache store: {}", e))?;
 
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM musicbrainz_toc_cache",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| format!("mb cache count: {}", e))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM musicbrainz_toc_cache", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| format!("mb cache count: {}", e))?;
 
         if (count as usize) > MB_CACHE_EVICT_THRESHOLD {
             let to_remove = (count as usize) - MB_CACHE_EVICT_TARGET;
-            self.conn.execute(
-                "DELETE FROM musicbrainz_toc_cache
+            self.conn
+                .execute(
+                    "DELETE FROM musicbrainz_toc_cache
                  WHERE rowid IN (
                      SELECT rowid FROM musicbrainz_toc_cache
                      ORDER BY accessed_at ASC
                      LIMIT ?1
                  )",
-                params![to_remove as i64],
-            ).map_err(|e| format!("mb cache evict: {}", e))?;
+                    params![to_remove as i64],
+                )
+                .map_err(|e| format!("mb cache evict: {}", e))?;
         }
         Ok(())
     }
@@ -833,15 +966,17 @@ impl Database {
     /// or `musicbrainz::detail_cache_key` (release detail); both share
     /// this table to keep eviction simple.
     pub fn get_cached_mb_search(&self, cache_key: &str) -> Option<String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT response_json, fetched_at FROM musicbrainz_search_cache
-             WHERE cache_key = ?1"
-        ).ok()?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT response_json, fetched_at FROM musicbrainz_search_cache
+             WHERE cache_key = ?1",
+            )
+            .ok()?;
 
-        let row: Option<(String, String)> = stmt.query_row(
-            params![cache_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).ok();
+        let row: Option<(String, String)> = stmt
+            .query_row(params![cache_key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ok();
         let (json, fetched_at) = row?;
 
         // TTL check shared with TOC cache (30 days). Drop stale rows.
@@ -866,30 +1001,35 @@ impl Database {
     /// Triggers LRU eviction when row count exceeds the threshold.
     pub fn store_mb_search(&self, cache_key: &str, response_json: &str) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO musicbrainz_search_cache
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO musicbrainz_search_cache
                  (cache_key, response_json, fetched_at, accessed_at)
              VALUES (?1, ?2, ?3, ?3)",
-            params![cache_key, response_json, now],
-        ).map_err(|e| format!("mb search cache store: {}", e))?;
+                params![cache_key, response_json, now],
+            )
+            .map_err(|e| format!("mb search cache store: {}", e))?;
 
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM musicbrainz_search_cache",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| format!("mb search cache count: {}", e))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM musicbrainz_search_cache", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| format!("mb search cache count: {}", e))?;
 
         if (count as usize) > MB_SEARCH_CACHE_EVICT_THRESHOLD {
             let to_remove = (count as usize) - MB_SEARCH_CACHE_EVICT_TARGET;
-            self.conn.execute(
-                "DELETE FROM musicbrainz_search_cache
+            self.conn
+                .execute(
+                    "DELETE FROM musicbrainz_search_cache
                  WHERE rowid IN (
                      SELECT rowid FROM musicbrainz_search_cache
                      ORDER BY accessed_at ASC
                      LIMIT ?1
                  )",
-                params![to_remove as i64],
-            ).map_err(|e| format!("mb search cache evict: {}", e))?;
+                    params![to_remove as i64],
+                )
+                .map_err(|e| format!("mb search cache evict: {}", e))?;
         }
         Ok(())
     }
@@ -903,21 +1043,33 @@ impl Database {
         file_path: &str,
         mtime: i64,
         size: u64,
-    ) -> Option<(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> {
-        let row = self.conn.query_row(
-            "SELECT tag_string, title, artist, album, genre, year
+    ) -> Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT tag_string, title, artist, album, genre, year
              FROM search_tag_cache
              WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3",
-            params![file_path, mtime, size as i64],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            )),
-        ).ok()?;
+                params![file_path, mtime, size as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .ok()?;
 
         // Update last_accessed.
         let _ = self.conn.execute(
@@ -980,46 +1132,50 @@ impl Database {
         mtime: i64,
         size: u64,
     ) -> Option<crate::tui::analyze::AnalysisResult> {
-        self.conn.query_row(
-            "SELECT dr_value, peak_db, rms_db, clipping_count, dc_bias,
+        self.conn
+            .query_row(
+                "SELECT dr_value, peak_db, rms_db, clipping_count, dc_bias,
                     actual_bit_depth, declared_bit_depth, sample_rate, channels,
                     duration_secs, lufs, true_peak_dbtp, preemphasis, preemphasis_corr,
                     preemphasis_detail, hdcd_detected, hdcd_detail
              FROM analysis_cache
              WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3
                AND algo_version = ?4",
-            params![file_path, mtime, size as i64, Self::ANALYSIS_ALGO_VERSION],
-            |row| {
-                let preemph_int: Option<i32> = row.get(12)?;
-                let preemphasis = match preemph_int {
-                    Some(3) => Some(crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate),
-                    Some(2) => Some(crate::tui::preemphasis::PreemphasisConfidence::Detected),
-                    Some(1) => Some(crate::tui::preemphasis::PreemphasisConfidence::Possible),
-                    _ => None,
-                };
-                let hdcd_int: Option<i32> = row.get(15)?;
-                Ok(crate::tui::analyze::AnalysisResult {
-                    path: std::path::PathBuf::from(file_path),
-                    dr_value: row.get(0)?,
-                    peak_db: row.get(1)?,
-                    rms_db: row.get(2)?,
-                    clipping_count: row.get::<_, i64>(3)? as u64,
-                    dc_bias: row.get(4)?,
-                    actual_bit_depth: row.get(5)?,
-                    declared_bit_depth: row.get(6)?,
-                    sample_rate: row.get(7)?,
-                    channels: row.get(8)?,
-                    duration_secs: row.get(9)?,
-                    lufs: row.get(10)?,
-                    true_peak_dbtp: row.get(11)?,
-                    preemphasis,
-                    preemphasis_corr: row.get(13)?,
-                    preemphasis_detail: row.get(14)?,
-                    hdcd_detected: hdcd_int.map(|v| v != 0),
-                    hdcd_detail: row.get(16)?,
-                })
-            },
-        ).ok()
+                params![file_path, mtime, size as i64, Self::ANALYSIS_ALGO_VERSION],
+                |row| {
+                    let preemph_int: Option<i32> = row.get(12)?;
+                    let preemphasis = match preemph_int {
+                        Some(3) => {
+                            Some(crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate)
+                        }
+                        Some(2) => Some(crate::tui::preemphasis::PreemphasisConfidence::Detected),
+                        Some(1) => Some(crate::tui::preemphasis::PreemphasisConfidence::Possible),
+                        _ => None,
+                    };
+                    let hdcd_int: Option<i32> = row.get(15)?;
+                    Ok(crate::tui::analyze::AnalysisResult {
+                        path: std::path::PathBuf::from(file_path),
+                        dr_value: row.get(0)?,
+                        peak_db: row.get(1)?,
+                        rms_db: row.get(2)?,
+                        clipping_count: row.get::<_, i64>(3)? as u64,
+                        dc_bias: row.get(4)?,
+                        actual_bit_depth: row.get(5)?,
+                        declared_bit_depth: row.get(6)?,
+                        sample_rate: row.get(7)?,
+                        channels: row.get(8)?,
+                        duration_secs: row.get(9)?,
+                        lufs: row.get(10)?,
+                        true_peak_dbtp: row.get(11)?,
+                        preemphasis,
+                        preemphasis_corr: row.get(13)?,
+                        preemphasis_detail: row.get(14)?,
+                        hdcd_detected: hdcd_int.map(|v| v != 0),
+                        hdcd_detail: row.get(16)?,
+                    })
+                },
+            )
+            .ok()
     }
 
     /// Store an analysis result in the cache.
@@ -1065,19 +1221,22 @@ impl Database {
     /// Full sync: replace all queue rows with the current in-memory state.
     /// Runs in a transaction for atomicity.
     pub fn sync_queue(&self, items: &[&crate::convert::ConversionItem]) -> Result<(), String> {
-        let tx = self.conn.unchecked_transaction()
+        let tx = self
+            .conn
+            .unchecked_transaction()
             .map_err(|e| format!("queue tx begin: {}", e))?;
 
         tx.execute("DELETE FROM conversion_queue", [])
             .map_err(|e| format!("queue clear: {}", e))?;
 
         for item in items {
-            let json = serde_json::to_string(item)
-                .map_err(|e| format!("queue item serialize: {}", e))?;
+            let json =
+                serde_json::to_string(item).map_err(|e| format!("queue item serialize: {}", e))?;
             tx.execute(
                 "INSERT INTO conversion_queue (id, item_json) VALUES (?1, ?2)",
                 params![item.id, json],
-            ).map_err(|e| format!("queue item insert: {}", e))?;
+            )
+            .map_err(|e| format!("queue item insert: {}", e))?;
         }
 
         tx.commit().map_err(|e| format!("queue tx commit: {}", e))?;
@@ -1087,9 +1246,7 @@ impl Database {
     /// Load all queue items from SQLite. Returns deserialized items with
     /// path validation (same as the JSON loader).
     pub fn load_queue_items(&self) -> Vec<crate::convert::ConversionItem> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT item_json FROM conversion_queue"
-        ) {
+        let mut stmt = match self.conn.prepare("SELECT item_json FROM conversion_queue") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -1104,7 +1261,10 @@ impl Database {
             .filter(|item| {
                 let path_str = item.input_path.to_string_lossy();
                 if path_str.contains("..") {
-                    log::warn!("Filtered queue item with suspicious path: {:?}", item.input_path);
+                    log::warn!(
+                        "Filtered queue item with suspicious path: {:?}",
+                        item.input_path
+                    );
                     return false;
                 }
                 if !item.input_path.exists() {
@@ -1118,9 +1278,12 @@ impl Database {
 
     /// Check if the queue table has any rows.
     pub fn has_queue_items(&self) -> bool {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM conversion_queue", [], |row| row.get::<_, i64>(0)
-        ).unwrap_or(0) > 0
+        self.conn
+            .query_row("SELECT COUNT(*) FROM conversion_queue", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or(0)
+            > 0
     }
 
     // ── Conversion history ───────────────────────────────────────
@@ -1144,8 +1307,9 @@ impl Database {
         success: bool,
         error_message: Option<&str>,
     ) -> Result<(), String> {
-        self.conn.execute(
-            "INSERT INTO conversion_history (
+        self.conn
+            .execute(
+                "INSERT INTO conversion_history (
                 input_path, output_path, input_format, output_format,
                 sample_rate, bit_depth, dither, replaygain_mode,
                 source_size, output_size,
@@ -1155,29 +1319,40 @@ impl Database {
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15
             )",
-            params![
-                input_path, output_path, input_format, output_format,
-                sample_rate, bit_depth, dither, replaygain_mode,
-                source_size.map(|s| s as i64), output_size.map(|s| s as i64),
-                queued_at, started_at, completed_at,
-                success as i32, error_message,
-            ],
-        ).map_err(|e| format!("history insert: {}", e))?;
+                params![
+                    input_path,
+                    output_path,
+                    input_format,
+                    output_format,
+                    sample_rate,
+                    bit_depth,
+                    dither,
+                    replaygain_mode,
+                    source_size.map(|s| s as i64),
+                    output_size.map(|s| s as i64),
+                    queued_at,
+                    started_at,
+                    completed_at,
+                    success as i32,
+                    error_message,
+                ],
+            )
+            .map_err(|e| format!("history insert: {}", e))?;
         Ok(())
     }
 
     /// Check if a file (by path) has been successfully converted before.
     /// For dedup warnings.
-    pub fn was_previously_converted(
-        &self,
-        input_path: &str,
-    ) -> bool {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM conversion_history
+    pub fn was_previously_converted(&self, input_path: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversion_history
              WHERE input_path = ?1 AND success = 1",
-            params![input_path],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) > 0
+                params![input_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0
     }
 
     // ── Presets ───────────────────────────────────────────────────
@@ -1185,9 +1360,10 @@ impl Database {
     /// List all presets grouped by format. Returns (format, Vec<name>)
     /// sorted by format then name. Instant via indexed query.
     pub fn list_presets_by_format(&self) -> Vec<(String, Vec<String>)> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT name, format FROM presets ORDER BY format, name"
-        ) {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT name, format FROM presets ORDER BY format, name")
+        {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -1212,9 +1388,7 @@ impl Database {
 
     /// List all preset names (sorted).
     pub fn list_preset_names(&self) -> Vec<String> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT name FROM presets ORDER BY name"
-        ) {
+        let mut stmt = match self.conn.prepare("SELECT name FROM presets ORDER BY name") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -1238,69 +1412,88 @@ impl Database {
         filename_template: Option<&str>,
         merge: Option<&str>,
     ) -> Result<(), String> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO presets (
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO presets (
                 name, format, description, sample_rate, bit_depth,
                 dither, replaygain, folder_template, filename_template, merge
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                name, format, description, sample_rate, bit_depth,
-                dither, replaygain, folder_template, filename_template, merge,
-            ],
-        ).map_err(|e| format!("preset store: {}", e))?;
+                params![
+                    name,
+                    format,
+                    description,
+                    sample_rate,
+                    bit_depth,
+                    dither,
+                    replaygain,
+                    folder_template,
+                    filename_template,
+                    merge,
+                ],
+            )
+            .map_err(|e| format!("preset store: {}", e))?;
         Ok(())
     }
 
     /// Delete a preset by name.
     pub fn delete_preset(&self, name: &str) -> Result<(), String> {
-        self.conn.execute(
-            "DELETE FROM presets WHERE name = ?1",
-            params![name],
-        ).map_err(|e| format!("preset delete: {}", e))?;
+        self.conn
+            .execute("DELETE FROM presets WHERE name = ?1", params![name])
+            .map_err(|e| format!("preset delete: {}", e))?;
         Ok(())
     }
 
     /// Check if the presets table has any entries.
     pub fn has_presets(&self) -> bool {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM presets", [], |row| row.get::<_, i64>(0)
-        ).unwrap_or(0) > 0
+        self.conn
+            .query_row("SELECT COUNT(*) FROM presets", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or(0)
+            > 0
     }
 
     // ── Metadata journal ─────────────────────────────────────────
 
     /// Record an in-flight metadata write. Called BEFORE the actual write.
     pub fn begin_metadata_write(&self, file_path: &str, backup_path: &str) -> Result<(), String> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO metadata_journal (file_path, backup_path, started_at)
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO metadata_journal (file_path, backup_path, started_at)
              VALUES (?1, ?2, ?3)",
-            params![file_path, backup_path, chrono::Utc::now().to_rfc3339()],
-        ).map_err(|e| format!("journal insert: {}", e))?;
+                params![file_path, backup_path, chrono::Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| format!("journal insert: {}", e))?;
         Ok(())
     }
 
     /// Remove the journal entry after a successful write.
     pub fn complete_metadata_write(&self, file_path: &str) -> Result<(), String> {
-        self.conn.execute(
-            "DELETE FROM metadata_journal WHERE file_path = ?1",
-            params![file_path],
-        ).map_err(|e| format!("journal delete: {}", e))?;
+        self.conn
+            .execute(
+                "DELETE FROM metadata_journal WHERE file_path = ?1",
+                params![file_path],
+            )
+            .map_err(|e| format!("journal delete: {}", e))?;
         Ok(())
     }
 
     /// Get all stale journal entries (for crash recovery on startup).
     pub fn stale_metadata_writes(&self) -> Result<Vec<(String, String, String)>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT file_path, backup_path, started_at FROM metadata_journal"
-        ).map_err(|e| format!("journal query: {}", e))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, backup_path, started_at FROM metadata_journal")
+            .map_err(|e| format!("journal query: {}", e))?;
 
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        }).map_err(|e| format!("journal query: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("journal query: {}", e))?;
 
         let mut entries = Vec::new();
         for row in rows {
@@ -1321,33 +1514,37 @@ impl Database {
         current_mtime: i64,
         current_size: u64,
     ) -> Option<CachedProbeRow> {
-        self.conn.query_row(
-            "SELECT * FROM probe_cache WHERE file_path = ?1
+        self.conn
+            .query_row(
+                "SELECT * FROM probe_cache WHERE file_path = ?1
              AND file_mtime = ?2 AND file_size = ?3",
-            params![file_path, current_mtime, current_size as i64],
-            |row| Ok(CachedProbeRow {
-                format_name: row.get("format_name")?,
-                codec: row.get("codec")?,
-                bit_depth: row.get("bit_depth")?,
-                sample_rate: row.get("sample_rate")?,
-                channels: row.get("channels")?,
-                channel_layout: row.get("channel_layout")?,
-                duration_secs: row.get("duration_secs")?,
-                title: row.get("title")?,
-                artist: row.get("artist")?,
-                album: row.get("album")?,
-                genre: row.get("genre")?,
-                year: row.get("year")?,
-                track_number: row.get("track_number")?,
-                catalog_number: row.get("catalog_number")?,
-                rg_track_gain: row.get("rg_track_gain")?,
-                rg_track_peak: row.get("rg_track_peak")?,
-                rg_album_gain: row.get("rg_album_gain")?,
-                rg_album_peak: row.get("rg_album_peak")?,
-                r128_track_gain: row.get("r128_track_gain")?,
-                r128_album_gain: row.get("r128_album_gain")?,
-            }),
-        ).ok()
+                params![file_path, current_mtime, current_size as i64],
+                |row| {
+                    Ok(CachedProbeRow {
+                        format_name: row.get("format_name")?,
+                        codec: row.get("codec")?,
+                        bit_depth: row.get("bit_depth")?,
+                        sample_rate: row.get("sample_rate")?,
+                        channels: row.get("channels")?,
+                        channel_layout: row.get("channel_layout")?,
+                        duration_secs: row.get("duration_secs")?,
+                        title: row.get("title")?,
+                        artist: row.get("artist")?,
+                        album: row.get("album")?,
+                        genre: row.get("genre")?,
+                        year: row.get("year")?,
+                        track_number: row.get("track_number")?,
+                        catalog_number: row.get("catalog_number")?,
+                        rg_track_gain: row.get("rg_track_gain")?,
+                        rg_track_peak: row.get("rg_track_peak")?,
+                        rg_album_gain: row.get("rg_album_gain")?,
+                        rg_album_peak: row.get("rg_album_peak")?,
+                        r128_track_gain: row.get("r128_track_gain")?,
+                        r128_album_gain: row.get("r128_album_gain")?,
+                    })
+                },
+            )
+            .ok()
     }
 
     /// Store a probe result in the cache (upsert).
@@ -1358,8 +1555,9 @@ impl Database {
         size: u64,
         row: &CachedProbeRow,
     ) -> Result<(), String> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO probe_cache (
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO probe_cache (
                 file_path, file_mtime, file_size,
                 format_name, codec, bit_depth, sample_rate, channels,
                 channel_layout, duration_secs,
@@ -1372,26 +1570,45 @@ impl Database {
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                 ?18, ?19, ?20, ?21, ?22, ?23, ?24
             )",
-            params![
-                file_path, mtime, size as i64,
-                row.format_name, row.codec, row.bit_depth, row.sample_rate, row.channels,
-                row.channel_layout, row.duration_secs,
-                row.title, row.artist, row.album, row.genre, row.year,
-                row.track_number, row.catalog_number,
-                row.rg_track_gain, row.rg_track_peak, row.rg_album_gain, row.rg_album_peak,
-                row.r128_track_gain, row.r128_album_gain,
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        ).map_err(|e| format!("probe cache store: {}", e))?;
+                params![
+                    file_path,
+                    mtime,
+                    size as i64,
+                    row.format_name,
+                    row.codec,
+                    row.bit_depth,
+                    row.sample_rate,
+                    row.channels,
+                    row.channel_layout,
+                    row.duration_secs,
+                    row.title,
+                    row.artist,
+                    row.album,
+                    row.genre,
+                    row.year,
+                    row.track_number,
+                    row.catalog_number,
+                    row.rg_track_gain,
+                    row.rg_track_peak,
+                    row.rg_album_gain,
+                    row.rg_album_peak,
+                    row.r128_track_gain,
+                    row.r128_album_gain,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| format!("probe cache store: {}", e))?;
         Ok(())
     }
 
     /// Invalidate cache for a specific file (after metadata edit).
     pub fn invalidate_probe(&self, file_path: &str) -> Result<(), String> {
-        self.conn.execute(
-            "DELETE FROM probe_cache WHERE file_path = ?1",
-            params![file_path],
-        ).map_err(|e| format!("probe cache invalidate: {}", e))?;
+        self.conn
+            .execute(
+                "DELETE FROM probe_cache WHERE file_path = ?1",
+                params![file_path],
+            )
+            .map_err(|e| format!("probe cache invalidate: {}", e))?;
         Ok(())
     }
 
@@ -1512,13 +1729,9 @@ impl Database {
     /// hardlinks share the same inode, so in-place writes by lofty would
     /// corrupt both the original AND the "backup". A copy has its own
     /// inode and is immune to writes to the original.
-    fn create_backup(
-        original: &std::path::Path,
-        backup: &std::path::Path,
-    ) -> Result<(), String> {
+    fn create_backup(original: &std::path::Path, backup: &std::path::Path) -> Result<(), String> {
         let _ = std::fs::remove_file(backup); // Remove stale backup.
-        std::fs::copy(original, backup)
-            .map_err(|e| format!("backup failed: {}", e))?;
+        std::fs::copy(original, backup).map_err(|e| format!("backup failed: {}", e))?;
         Ok(())
     }
 
@@ -1535,27 +1748,34 @@ impl Database {
 
     /// Record a file access with a specific timestamp (for imports).
     pub fn record_recent_at(&self, file_path: &str, timestamp: i64) -> Result<(), String> {
-        self.conn.execute(
-            "INSERT INTO recent_files (file_path, accessed_at, access_count)
+        self.conn
+            .execute(
+                "INSERT INTO recent_files (file_path, accessed_at, access_count)
              VALUES (?1, ?2, 1)
              ON CONFLICT(file_path) DO UPDATE SET
                 accessed_at = ?2,
                 access_count = access_count + 1",
-            params![file_path, timestamp],
-        ).map_err(|e| format!("recent insert: {}", e))?;
+                params![file_path, timestamp],
+            )
+            .map_err(|e| format!("recent insert: {}", e))?;
         Ok(())
     }
 
     /// List recent files, most recent first, up to `limit`.
     pub fn list_recent(&self, limit: usize) -> Result<Vec<(String, i64)>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT file_path, accessed_at FROM recent_files
-             ORDER BY accessed_at DESC LIMIT ?1"
-        ).map_err(|e| format!("recent query: {}", e))?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT file_path, accessed_at FROM recent_files
+             ORDER BY accessed_at DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("recent query: {}", e))?;
 
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }).map_err(|e| format!("recent query: {}", e))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| format!("recent query: {}", e))?;
 
         let mut entries = Vec::new();
         for row in rows {
@@ -1570,13 +1790,20 @@ impl Database {
 
     /// List all bookmarks ordered by position.
     pub fn list_bookmarks(&self) -> Result<Vec<(i64, String, String)>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, path FROM bookmarks ORDER BY position ASC"
-        ).map_err(|e| format!("bookmarks query: {}", e))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, path FROM bookmarks ORDER BY position ASC")
+            .map_err(|e| format!("bookmarks query: {}", e))?;
 
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        }).map_err(|e| format!("bookmarks query: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("bookmarks query: {}", e))?;
 
         let mut entries = Vec::new();
         for row in rows {
@@ -1589,32 +1816,37 @@ impl Database {
 
     /// Add a bookmark at the end.
     pub fn add_bookmark(&self, name: &str, path: &str) -> Result<(), String> {
-        let max_pos: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(position), -1) FROM bookmarks",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(-1);
+        let max_pos: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(position), -1) FROM bookmarks",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
 
-        self.conn.execute(
-            "INSERT INTO bookmarks (name, path, position) VALUES (?1, ?2, ?3)",
-            params![name, path, max_pos + 1],
-        ).map_err(|e| format!("bookmark insert: {}", e))?;
+        self.conn
+            .execute(
+                "INSERT INTO bookmarks (name, path, position) VALUES (?1, ?2, ?3)",
+                params![name, path, max_pos + 1],
+            )
+            .map_err(|e| format!("bookmark insert: {}", e))?;
         Ok(())
     }
 
     /// Clear all bookmarks (for full sync from in-memory state).
     pub fn clear_bookmarks(&self) -> Result<(), String> {
-        self.conn.execute("DELETE FROM bookmarks", [])
+        self.conn
+            .execute("DELETE FROM bookmarks", [])
             .map_err(|e| format!("bookmarks clear: {}", e))?;
         Ok(())
     }
 
     /// Remove a bookmark by id.
     pub fn remove_bookmark(&self, id: i64) -> Result<(), String> {
-        self.conn.execute(
-            "DELETE FROM bookmarks WHERE id = ?1",
-            params![id],
-        ).map_err(|e| format!("bookmark delete: {}", e))?;
+        self.conn
+            .execute("DELETE FROM bookmarks WHERE id = ?1", params![id])
+            .map_err(|e| format!("bookmark delete: {}", e))?;
         Ok(())
     }
 }
@@ -1677,7 +1909,7 @@ impl CachedProbeRow {
                 r128_track_gain: self.r128_track_gain.clone(),
                 r128_album_gain: self.r128_album_gain.clone(),
                 preemphasis_metadata: None, // Not cached; re-detected on probe.
-                hdcd_detail: None, // Populated from analysis cache if available.
+                hdcd_detail: None,          // Populated from analysis cache if available.
                 isrc: None, // Not cached; re-read on full probe (only used by :cue).
             },
         })
@@ -1721,7 +1953,9 @@ pub fn systemtime_to_unix(t: std::time::SystemTime) -> i64 {
 
 impl Database {
     /// Load the pre-emphasis corpus model from the database.
-    pub fn load_preemph_corpus(&self) -> Result<crate::tui::preemphasis::corpus::CorpusModel, String> {
+    pub fn load_preemph_corpus(
+        &self,
+    ) -> Result<crate::tui::preemphasis::corpus::CorpusModel, String> {
         use crate::tui::preemphasis::stft::NUM_BANDS;
 
         let (n_frames, n_tracks, mean_blob, cov_blob, pca_blob, pe_tmpl_blob): (i64, i64, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>) =
@@ -1744,7 +1978,7 @@ impl Database {
         }
         let mut mean = [0.0f64; NUM_BANDS];
         for k in 0..NUM_BANDS {
-            mean[k] = f64::from_le_bytes(mean_blob[k*8..(k+1)*8].try_into().unwrap());
+            mean[k] = f64::from_le_bytes(mean_blob[k * 8..(k + 1) * 8].try_into().unwrap());
         }
 
         // Deserialize covariance (31x31 x f64 LE).
@@ -1754,7 +1988,7 @@ impl Database {
         }
         let mut covariance = vec![0.0f64; cov_size];
         for i in 0..cov_size {
-            covariance[i] = f64::from_le_bytes(cov_blob[i*8..(i+1)*8].try_into().unwrap());
+            covariance[i] = f64::from_le_bytes(cov_blob[i * 8..(i + 1) * 8].try_into().unwrap());
         }
 
         // Deserialize PCA components (N x 31 x f64 LE).
@@ -1768,17 +2002,23 @@ impl Database {
             let mut pc = [0.0f64; NUM_BANDS];
             let offset = c * pca_component_bytes;
             for k in 0..NUM_BANDS {
-                pc[k] = f64::from_le_bytes(pca_blob[offset + k*8..offset + (k+1)*8].try_into().unwrap());
+                pc[k] = f64::from_le_bytes(
+                    pca_blob[offset + k * 8..offset + (k + 1) * 8]
+                        .try_into()
+                        .unwrap(),
+                );
             }
             pca_components.push(pc);
         }
 
         // Deserialize empirical PE template if present.
         let empirical_pe_template = pe_tmpl_blob.and_then(|blob| {
-            if blob.len() != NUM_BANDS * 8 { return None; }
+            if blob.len() != NUM_BANDS * 8 {
+                return None;
+            }
             let mut tmpl = [0.0f64; NUM_BANDS];
             for k in 0..NUM_BANDS {
-                tmpl[k] = f64::from_le_bytes(blob[k*8..(k+1)*8].try_into().ok()?);
+                tmpl[k] = f64::from_le_bytes(blob[k * 8..(k + 1) * 8].try_into().ok()?);
             }
             Some(tmpl)
         });
@@ -1794,7 +2034,10 @@ impl Database {
     }
 
     /// Store (or replace) the pre-emphasis corpus model.
-    pub fn store_preemph_corpus(&self, model: &crate::tui::preemphasis::corpus::CorpusModel) -> Result<(), String> {
+    pub fn store_preemph_corpus(
+        &self,
+        model: &crate::tui::preemphasis::corpus::CorpusModel,
+    ) -> Result<(), String> {
         use crate::tui::preemphasis::stft::NUM_BANDS;
 
         // Serialize mean.
@@ -1844,24 +2087,36 @@ impl Database {
     }
 
     /// Load the trained pre-emphasis LDA classifier from the database.
-    pub fn load_preemph_classifier(&self) -> Result<crate::tui::preemphasis::scoring::LdaClassifier, String> {
+    pub fn load_preemph_classifier(
+        &self,
+    ) -> Result<crate::tui::preemphasis::scoring::LdaClassifier, String> {
         use crate::tui::preemphasis::scoring::NUM_FEATURES;
 
-        let (weights_blob, bias, threshold, impute_blob, means_blob, stds_blob):
-            (Vec<u8>, f64, f64, Vec<u8>, Vec<u8>, Vec<u8>) =
-            self.conn.query_row(
+        let (weights_blob, bias, threshold, impute_blob, means_blob, stds_blob): (
+            Vec<u8>,
+            f64,
+            f64,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+        ) = self
+            .conn
+            .query_row(
                 "SELECT weights, bias, threshold, feature_impute, feature_means, feature_stds
                  FROM preemph_classifier WHERE id = 1",
                 [],
-                |row| Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                )),
-            ).map_err(|_| "no trained classifier found (run :preemph-calibrate)".to_string())?;
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| "no trained classifier found (run :preemph-calibrate)".to_string())?;
 
         let expected_len = NUM_FEATURES * 8;
         if weights_blob.len() != expected_len
@@ -1878,10 +2133,12 @@ impl Database {
         let mut feature_stds = [0.0f64; NUM_FEATURES];
 
         for i in 0..NUM_FEATURES {
-            weights[i] = f64::from_le_bytes(weights_blob[i*8..(i+1)*8].try_into().unwrap());
-            feature_impute[i] = f64::from_le_bytes(impute_blob[i*8..(i+1)*8].try_into().unwrap());
-            feature_means[i] = f64::from_le_bytes(means_blob[i*8..(i+1)*8].try_into().unwrap());
-            feature_stds[i] = f64::from_le_bytes(stds_blob[i*8..(i+1)*8].try_into().unwrap());
+            weights[i] = f64::from_le_bytes(weights_blob[i * 8..(i + 1) * 8].try_into().unwrap());
+            feature_impute[i] =
+                f64::from_le_bytes(impute_blob[i * 8..(i + 1) * 8].try_into().unwrap());
+            feature_means[i] =
+                f64::from_le_bytes(means_blob[i * 8..(i + 1) * 8].try_into().unwrap());
+            feature_stds[i] = f64::from_le_bytes(stds_blob[i * 8..(i + 1) * 8].try_into().unwrap());
         }
 
         Ok(crate::tui::preemphasis::scoring::LdaClassifier {
@@ -1906,29 +2163,33 @@ impl Database {
 
         let serialize = |arr: &[f64; NUM_FEATURES]| -> Vec<u8> {
             let mut blob = Vec::with_capacity(NUM_FEATURES * 8);
-            for &v in arr { blob.extend_from_slice(&v.to_le_bytes()); }
+            for &v in arr {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
             blob
         };
 
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO preemph_classifier
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO preemph_classifier
              (id, weights, bias, threshold, feature_impute, feature_means, feature_stds,
               cv_accuracy, cv_fpr, cv_precision, trained_at)
              VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                serialize(&classifier.weights),
-                classifier.bias,
-                classifier.threshold,
-                serialize(&classifier.feature_impute),
-                serialize(&classifier.feature_means),
-                serialize(&classifier.feature_stds),
-                cv_accuracy,
-                cv_fpr,
-                cv_precision,
-                now,
-            ],
-        ).map_err(|e| format!("store classifier: {}", e))?;
+                params![
+                    serialize(&classifier.weights),
+                    classifier.bias,
+                    classifier.threshold,
+                    serialize(&classifier.feature_impute),
+                    serialize(&classifier.feature_means),
+                    serialize(&classifier.feature_stds),
+                    cv_accuracy,
+                    cv_fpr,
+                    cv_precision,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("store classifier: {}", e))?;
         Ok(())
     }
 }
@@ -1940,7 +2201,8 @@ mod tests {
     #[test]
     fn open_and_migrate() {
         let db = Database::open_memory().unwrap();
-        let version: u32 = db.conn
+        let version: u32 = db
+            .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
@@ -1949,9 +2211,13 @@ mod tests {
     #[test]
     fn ctdb_parity_cache_round_trip() {
         let db = Database::open_memory().unwrap();
-        let parity: Vec<Vec<u16>> = (0..10).map(|j| {
-            (0..16).map(|i| (j as u16 * 16 + i as u16).wrapping_mul(0x1357)).collect()
-        }).collect();
+        let parity: Vec<Vec<u16>> = (0..10)
+            .map(|j| {
+                (0..16)
+                    .map(|i| (j as u16 * 16 + i as u16).wrapping_mul(0x1357))
+                    .collect()
+            })
+            .collect();
 
         // Miss before store
         assert!(db.get_cached_ctdb_parity("test_key", 16).is_none());
@@ -1993,11 +2259,12 @@ mod tests {
             db.store_ctdb_parity(&key, 4, &parity).unwrap();
         }
 
-        let count_before: i64 = db.conn.query_row(
-            "SELECT COUNT(*) FROM ctdb_parity_cache",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM ctdb_parity_cache", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(
             count_before as usize, threshold,
             "expected count to be at threshold before eviction trigger",
@@ -2047,11 +2314,12 @@ mod tests {
             db.store_ctdb_parity(&key, 4, &parity).unwrap();
         }
 
-        let count: i64 = db.conn.query_row(
-            "SELECT COUNT(*) FROM ctdb_parity_cache",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM ctdb_parity_cache", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
 
         // Eviction trims to TARGET when the count exceeds THRESHOLD.
         // Between trims the count can climb back up toward THRESHOLD, so
@@ -2060,7 +2328,8 @@ mod tests {
         assert!(
             (count as usize) <= CTDB_PARITY_CACHE_EVICT_THRESHOLD,
             "expected count <= threshold ({}), got {}",
-            CTDB_PARITY_CACHE_EVICT_THRESHOLD, count
+            CTDB_PARITY_CACHE_EVICT_THRESHOLD,
+            count
         );
         // Also assert that an eviction has actually fired (we pushed past
         // the threshold and then some) — count must be below where we'd
@@ -2069,7 +2338,8 @@ mod tests {
         assert!(
             (count as usize) < n_inserted,
             "expected count < {} (no eviction would have fired), got {}",
-            n_inserted, count
+            n_inserted,
+            count
         );
 
         // The most recent insertions must still be present (LRU keeps
@@ -2087,7 +2357,8 @@ mod tests {
     #[test]
     fn metadata_journal_round_trip() {
         let db = Database::open_memory().unwrap();
-        db.begin_metadata_write("/music/song.flac", "/music/song.flac.tonepoet-bak").unwrap();
+        db.begin_metadata_write("/music/song.flac", "/music/song.flac.tonepoet-bak")
+            .unwrap();
 
         let stale = db.stale_metadata_writes().unwrap();
         assert_eq!(stale.len(), 1);
@@ -2112,7 +2383,8 @@ mod tests {
             ..Default::default()
         };
 
-        db.store_probe("/music/song.flac", 1000, 5000000, &row).unwrap();
+        db.store_probe("/music/song.flac", 1000, 5000000, &row)
+            .unwrap();
 
         // Hit: same mtime + size.
         let cached = db.get_cached_probe("/music/song.flac", 1000, 5000000);
@@ -2133,14 +2405,18 @@ mod tests {
     fn recent_files_round_trip() {
         let db = Database::open_memory().unwrap();
         // Insert with explicit timestamps to avoid same-second ordering issues.
-        db.conn.execute(
-            "INSERT INTO recent_files (file_path, accessed_at) VALUES (?1, ?2)",
-            params!["/music/a.flac", 1000i64],
-        ).unwrap();
-        db.conn.execute(
-            "INSERT INTO recent_files (file_path, accessed_at) VALUES (?1, ?2)",
-            params!["/music/b.flac", 2000i64],
-        ).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO recent_files (file_path, accessed_at) VALUES (?1, ?2)",
+                params!["/music/a.flac", 1000i64],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO recent_files (file_path, accessed_at) VALUES (?1, ?2)",
+                params!["/music/b.flac", 2000i64],
+            )
+            .unwrap();
 
         let recent = db.list_recent(10).unwrap();
         assert_eq!(recent.len(), 2);
@@ -2153,7 +2429,8 @@ mod tests {
     fn bookmarks_round_trip() {
         let db = Database::open_memory().unwrap();
         db.add_bookmark("Music", "/home/user/music").unwrap();
-        db.add_bookmark("Downloads", "/home/user/downloads").unwrap();
+        db.add_bookmark("Downloads", "/home/user/downloads")
+            .unwrap();
 
         let bm = db.list_bookmarks().unwrap();
         assert_eq!(bm.len(), 2);

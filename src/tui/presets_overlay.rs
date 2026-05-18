@@ -47,12 +47,10 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
         // Scrolled view: leave 2 cols for leading/trailing space
         let visible_width = (inner.width as usize).saturating_sub(2);
         let (view, cursor_col) = input.view(visible_width);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {} ", view),
-                Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE),
-            ),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {} ", view),
+            Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE),
+        )]));
         use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -108,10 +106,7 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
             ];
 
             if is_active {
-                spans.push(Span::styled(
-                    " active",
-                    Style::default().fg(theme::CYAN),
-                ));
+                spans.push(Span::styled(" active", Style::default().fg(theme::CYAN)));
             }
 
             lines.push(Line::from(spans));

@@ -70,7 +70,10 @@ mod tests {
                 overwrite: OverwritePolicy::FailIfExists,
                 same_filesystem_required: false,
             },
-            log: LogPolicy { root: PathBuf::from("/tmp/logs"), write_for_blocked: true },
+            log: LogPolicy {
+                root: PathBuf::from("/tmp/logs"),
+                write_for_blocked: true,
+            },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,
                 replaygain: StageRequirement::Enabled,
@@ -82,7 +85,11 @@ mod tests {
 
     fn track_record(ordinal: u32, ok: bool) -> TrackRecord {
         TrackRecord {
-            track_id: TrackId { source_ordinal: ordinal, disc_number: None, track_number: ordinal },
+            track_id: TrackId {
+                source_ordinal: ordinal,
+                disc_number: None,
+                track_number: ordinal,
+            },
             outcome: if ok {
                 TrackOutcome::Ok
             } else {
@@ -103,13 +110,20 @@ mod tests {
             container: PathBuf::from("/tmp/in.7z"),
             kind: SourceKind::SevenZip,
             tracks: vec![PreparedTrack {
-                id: TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
+                id: TrackId {
+                    source_ordinal: 1,
+                    disc_number: None,
+                    track_number: 1,
+                },
                 source_ref: TrackSourceRef::StagedFile(PathBuf::from("/s/1.flac")),
                 metadata: TrackMetadata::default(),
                 expected_samples: Some(1000),
                 sample_rate: 44_100,
             }],
-            album_metadata: AlbumMetadata { total_tracks: 1, ..AlbumMetadata::default() },
+            album_metadata: AlbumMetadata {
+                total_tracks: 1,
+                ..AlbumMetadata::default()
+            },
             provenance: ExtractionProvenance {
                 source_kind: SourceKind::SevenZip,
                 source_sha256: None,
@@ -122,7 +136,11 @@ mod tests {
     fn sample_artifacts() -> ArtifactSet {
         ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![TrackArtifact {
-                track_id: TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
+                track_id: TrackId {
+                    source_ordinal: 1,
+                    disc_number: None,
+                    track_number: 1,
+                },
                 staged_path: PathBuf::from("/stage/1.flac"),
                 final_path: PathBuf::from("/out/1.flac"),
                 samples: Some(1000),
@@ -155,9 +173,15 @@ mod tests {
     fn redacted_request_hides_password() {
         let req = sample_request();
         let redacted = RedactedPipelineRequest::from(&req);
-        assert_eq!(redacted.source.archive_password.as_deref(), Some("<redacted>"));
+        assert_eq!(
+            redacted.source.archive_password.as_deref(),
+            Some("<redacted>")
+        );
         let json = serde_json::to_string(&redacted).unwrap();
-        assert!(!json.contains("hunter2"), "redacted request leaked the secret");
+        assert!(
+            !json.contains("hunter2"),
+            "redacted request leaked the secret"
+        );
     }
 
     // ---- JSON roundtrips --------------------------------------------------
@@ -165,12 +189,18 @@ mod tests {
     #[test]
     fn contract_types_json_roundtrip() {
         assert!(roundtrips(&sample_request()));
-        assert!(roundtrips(&RedactedPipelineRequest::from(&sample_request())));
+        assert!(roundtrips(
+            &RedactedPipelineRequest::from(&sample_request())
+        ));
         assert!(roundtrips(&prepared_source()));
         assert!(roundtrips(&AlbumPlan {
             album_dir: PathBuf::from("/out/album"),
             entries: vec![PlannedTrackOutput {
-                track_id: TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
+                track_id: TrackId {
+                    source_ordinal: 1,
+                    disc_number: None,
+                    track_number: 1
+                },
                 final_path: PathBuf::from("/out/album/01.flac"),
             }],
         }));
@@ -178,7 +208,10 @@ mod tests {
         assert!(roundtrips(&track_record(1, true)));
         let outcome = AlbumOutcome::Complete {
             tracks: vec![track_record(1, true)],
-            stages: vec![StageRecord { stage: PipelineStage::Convert, outcome: StageOutcome::Ok }],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Convert,
+                outcome: StageOutcome::Ok,
+            }],
         };
         assert!(roundtrips(&outcome));
         let report = PipelineReport {
@@ -210,7 +243,10 @@ mod tests {
             plan: None,
             artifacts: None,
             published: None,
-            outcome: AlbumOutcome::Complete { tracks: vec![], stages: vec![] },
+            outcome: AlbumOutcome::Complete {
+                tracks: vec![],
+                stages: vec![],
+            },
             durable_log: None,
         };
         let report_json = serde_json::to_string(&report).unwrap();
@@ -238,7 +274,10 @@ mod tests {
         );
         assert!(matches!(
             out,
-            AlbumOutcome::Blocked { reason: BlockReason::TrackFailures, .. }
+            AlbumOutcome::Blocked {
+                reason: BlockReason::TrackFailures,
+                ..
+            }
         ));
     }
 
@@ -250,7 +289,9 @@ mod tests {
             FailurePolicy::AllowPartialAlbum,
         );
         match out {
-            AlbumOutcome::Partial { successful, failed, .. } => {
+            AlbumOutcome::Partial {
+                successful, failed, ..
+            } => {
                 assert_eq!(successful.len(), 1);
                 assert_eq!(failed.len(), 1);
             }
@@ -296,9 +337,16 @@ mod tests {
 
     #[test]
     fn map_complete_to_completed() {
-        let out = AlbumOutcome::Complete { tracks: vec![], stages: vec![] };
-        let published = PublishedAlbum { album_dir: PathBuf::from("/out/album"), entries: vec![] };
-        let status = map_album_outcome(&out, Some(&published), Some(&PathBuf::from("/logs/a.json")));
+        let out = AlbumOutcome::Complete {
+            tracks: vec![],
+            stages: vec![],
+        };
+        let published = PublishedAlbum {
+            album_dir: PathBuf::from("/out/album"),
+            entries: vec![],
+        };
+        let status =
+            map_album_outcome(&out, Some(&published), Some(&PathBuf::from("/logs/a.json")));
         assert!(matches!(status, ConversionStatus::Completed { .. }));
     }
 
@@ -309,10 +357,16 @@ mod tests {
             failed: vec![track_record(2, false)],
             stages: vec![],
         };
-        let published = PublishedAlbum { album_dir: PathBuf::from("/out/album"), entries: vec![] };
-        let status = map_album_outcome(&out, Some(&published), Some(&PathBuf::from("/logs/a.json")));
+        let published = PublishedAlbum {
+            album_dir: PathBuf::from("/out/album"),
+            entries: vec![],
+        };
+        let status =
+            map_album_outcome(&out, Some(&published), Some(&PathBuf::from("/logs/a.json")));
         match status {
-            ConversionStatus::Partial { successful, failed, .. } => {
+            ConversionStatus::Partial {
+                successful, failed, ..
+            } => {
                 assert_eq!(successful, 1);
                 assert_eq!(failed, 1);
             }
@@ -344,7 +398,11 @@ mod tests {
         let back: ConversionStatus = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             back,
-            ConversionStatus::Partial { successful: 9, failed: 2, .. }
+            ConversionStatus::Partial {
+                successful: 9,
+                failed: 2,
+                ..
+            }
         ));
     }
 
@@ -390,7 +448,10 @@ mod tests {
             timeout: Duration::from_secs(10),
         };
         let cancel = CancellationToken::new();
-        let err = runner.run(cmd, &cancel).await.expect_err("configured failure");
+        let err = runner
+            .run(cmd, &cancel)
+            .await
+            .expect_err("configured failure");
         assert!(matches!(err, ToolRunnerError::NonZeroExit { .. }));
     }
 
@@ -468,6 +529,7 @@ mod tests {
             &staging,
             &runner,
             &cancel,
+            None,
         )
         .await;
         // PR 4: StagedFile arm checks file exists — /s/1.flac doesn't, so TrackValidation error.
@@ -476,10 +538,17 @@ mod tests {
         // PR 4: plan_outputs validates template and source — just verify no panic.
         let _ = plan_outputs(&prepared_source(), &req);
 
-        let convert = convert_tracks(&prepared_source(), &AlbumPlan {
-            album_dir: PathBuf::from("/out"),
-            entries: vec![],
-        }, &req, &staging, &runner, &cancel)
+        let convert = convert_tracks(
+            &prepared_source(),
+            &AlbumPlan {
+                album_dir: PathBuf::from("/out"),
+                entries: vec![],
+            },
+            &req,
+            &staging,
+            &runner,
+            &cancel,
+        )
         .await;
         // PR 4: convert_tracks is real now — just verify no panic.
         let _ = convert.record.outcome;
@@ -490,19 +559,34 @@ mod tests {
         // req.merge is false in sample_request(), so Skipped.
         assert_eq!(merged.1.outcome, StageOutcome::Skipped);
 
-        let meta = apply_metadata(&sample_artifacts(), &prepared_source(), &req, &runner, &cancel)
-            .await
-            .expect("metadata");
+        let meta = apply_metadata(
+            &sample_artifacts(),
+            &prepared_source(),
+            &req,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("metadata");
         // metadata is Enabled in sample_request(); with stub runner it succeeds.
-        assert!(matches!(meta.outcome, StageOutcome::Ok | StageOutcome::Skipped));
+        assert!(matches!(
+            meta.outcome,
+            StageOutcome::Ok | StageOutcome::Skipped
+        ));
 
         let rg = apply_replaygain(&sample_artifacts(), &req, &runner, &cancel)
             .await
             .expect("replaygain");
         // replaygain is Enabled in sample_request(); with stub runner it succeeds.
-        assert!(matches!(rg.outcome, StageOutcome::Ok | StageOutcome::Skipped));
+        assert!(matches!(
+            rg.outcome,
+            StageOutcome::Ok | StageOutcome::Skipped
+        ));
 
-        let outcome = AlbumOutcome::Complete { tracks: vec![], stages: vec![] };
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![],
+            stages: vec![],
+        };
         let feats = run_features(
             sample_artifacts(),
             &outcome,
@@ -523,13 +607,12 @@ mod tests {
             std::env::temp_dir().join("tonepoet-pr1-publish-nonexistent"),
             "job-1".into(),
         );
-        let plan = PublishPlan { album_dir: PathBuf::from("/out"), entries: vec![] };
+        let plan = PublishPlan {
+            album_dir: PathBuf::from("/out"),
+            entries: vec![],
+        };
         // PR 4: publish_album_output has a real body — verify no panic.
-        let _ = publish_album_output(
-            publish_staging,
-            &plan,
-            req.publish.clone(),
-        );
+        let _ = publish_album_output(publish_staging, &plan, req.publish.clone());
 
         let report = PipelineReport {
             request: RedactedPipelineRequest::from(&req),
@@ -537,7 +620,10 @@ mod tests {
             plan: None,
             artifacts: None,
             published: None,
-            outcome: AlbumOutcome::Complete { tracks: vec![], stages: vec![] },
+            outcome: AlbumOutcome::Complete {
+                tracks: vec![],
+                stages: vec![],
+            },
             durable_log: None,
         };
         // write_durable_log now has a real body (PR 6) — it succeeds.
@@ -736,13 +822,19 @@ mod tests {
         // Full serialization must not contain either secret.
         let json = serde_json::to_string(record).unwrap();
         assert!(!json.contains("hunter2"), "password leaked in record JSON");
-        assert!(!json.contains("s3cr3t_v4lue"), "env secret leaked in record JSON");
+        assert!(
+            !json.contains("s3cr3t_v4lue"),
+            "env secret leaked in record JSON"
+        );
 
         // The error's Debug output must not contain secrets.
         if let Err(ref e) = result {
             let debug = format!("{e:?}");
             assert!(!debug.contains("hunter2"), "password leaked in error Debug");
-            assert!(!debug.contains("s3cr3t_v4lue"), "env secret leaked in error Debug");
+            assert!(
+                !debug.contains("s3cr3t_v4lue"),
+                "env secret leaked in error Debug"
+            );
         }
     }
 
@@ -780,9 +872,8 @@ mod tests {
         let runner = real_runner_with(vec![(ToolBinary::Ffmpeg, "/bin/sh")]);
         // Generate 128 KiB of output to stderr, then exit 1 so we
         // can inspect the stderr_tail on the error.
-        let script = format!(
-            "dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\0' 'X' >&2; exit 1"
-        );
+        let script =
+            format!("dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\0' 'X' >&2; exit 1");
         let cmd = sh_command(&script, 30);
         let cancel = CancellationToken::new();
 
@@ -795,7 +886,10 @@ mod tests {
                     stderr_tail.len()
                 );
                 // Should have captured data (not empty).
-                assert!(stderr_tail.len() > 1024, "expected substantial stderr capture");
+                assert!(
+                    stderr_tail.len() > 1024,
+                    "expected substantial stderr capture"
+                );
             }
             other => panic!("expected NonZeroExit, got {other:?}"),
         }
@@ -878,7 +972,10 @@ mod tests {
                 overwrite: OverwritePolicy::FailIfExists,
                 same_filesystem_required: false,
             },
-            log: LogPolicy { root: PathBuf::from("/tmp/logs"), write_for_blocked: true },
+            log: LogPolicy {
+                root: PathBuf::from("/tmp/logs"),
+                write_for_blocked: true,
+            },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,
                 replaygain: StageRequirement::Enabled,
@@ -968,7 +1065,10 @@ mod tests {
         let req = mat_request(PathBuf::from("/fake/archive.7z"), None);
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+        let source = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(source.kind, SourceKind::SevenZip);
         assert_eq!(source.tracks.len(), 3);
@@ -1000,9 +1100,11 @@ mod tests {
             command: CommandRecord {
                 binary: ToolBinary::SevenZip,
                 sanitized_args: vec![],
-                cwd: None, env_keys: vec![],
+                cwd: None,
+                env_keys: vec![],
                 exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(), stderr_tail: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
         });
@@ -1013,9 +1115,12 @@ mod tests {
             elapsed: Duration::ZERO,
             command: CommandRecord {
                 binary: ToolBinary::Ffprobe,
-                sanitized_args: vec![], cwd: None, env_keys: vec![],
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
                 exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(), stderr_tail: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
         });
@@ -1023,14 +1128,20 @@ mod tests {
         let req = mat_request(PathBuf::from("/fake/pw.7z"), Some("s3cretPW"));
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let _source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+        let _source = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap();
 
         // The 7z command record must have the password redacted.
         let transcript = runner.transcript();
         let sz_record = &transcript[0];
         assert_eq!(sz_record.binary, ToolBinary::SevenZip);
         let json = serde_json::to_string(sz_record).unwrap();
-        assert!(!json.contains("s3cretPW"), "password leaked in success record");
+        assert!(
+            !json.contains("s3cretPW"),
+            "password leaked in success record"
+        );
         drop(tmp);
     }
 
@@ -1046,14 +1157,20 @@ mod tests {
         let req = mat_request(PathBuf::from("/fake/pw.7z"), Some("badPW123"));
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        let err = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, MaterializeError::Encrypted));
         // Verify the command record on the error path doesn't leak the password.
         let transcript = runner.transcript();
         assert_eq!(transcript.len(), 1);
         let json = serde_json::to_string(&transcript[0]).unwrap();
-        assert!(!json.contains("badPW123"), "password leaked in failure record");
+        assert!(
+            !json.contains("badPW123"),
+            "password leaked in failure record"
+        );
         drop(tmp);
     }
 
@@ -1070,7 +1187,10 @@ mod tests {
         let req = mat_request(PathBuf::from("/fake/bad.7z"), None);
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        let err = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, MaterializeError::Extraction(_)));
         drop(tmp);
@@ -1090,7 +1210,10 @@ mod tests {
         let req = mat_request(PathBuf::from("/fake/empty.7z"), None);
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        let err = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(err, MaterializeError::Extraction(ref msg) if msg.contains("no audio")),
@@ -1116,13 +1239,17 @@ mod tests {
         // 7z success + 2 ffprobe calls (one per audio file).
         runner.push_output(ToolOutput {
             exit: ProcessExit::Code(0),
-            stdout_tail: String::new(), stderr_tail: String::new(),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
             elapsed: Duration::ZERO,
             command: CommandRecord {
-                binary: ToolBinary::SevenZip, sanitized_args: vec![],
-                cwd: None, env_keys: vec![],
+                binary: ToolBinary::SevenZip,
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
                 exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(), stderr_tail: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
         });
@@ -1133,10 +1260,13 @@ mod tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
                 command: CommandRecord {
-                    binary: ToolBinary::Ffprobe, sanitized_args: vec![],
-                    cwd: None, env_keys: vec![],
+                    binary: ToolBinary::Ffprobe,
+                    sanitized_args: vec![],
+                    cwd: None,
+                    env_keys: vec![],
                     exit: Some(ProcessExit::Code(0)),
-                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
                     elapsed: Duration::ZERO,
                 },
             });
@@ -1145,7 +1275,10 @@ mod tests {
         let req = mat_request(PathBuf::from("/fake/mixed.7z"), None);
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+        let source = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(source.tracks.len(), 2, "should only have audio tracks");
         drop(tmp);
@@ -1167,13 +1300,17 @@ mod tests {
         // 7z success + 3 ffprobe calls.
         runner.push_output(ToolOutput {
             exit: ProcessExit::Code(0),
-            stdout_tail: String::new(), stderr_tail: String::new(),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
             elapsed: Duration::ZERO,
             command: CommandRecord {
-                binary: ToolBinary::SevenZip, sanitized_args: vec![],
-                cwd: None, env_keys: vec![],
+                binary: ToolBinary::SevenZip,
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
                 exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(), stderr_tail: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
         });
@@ -1184,10 +1321,13 @@ mod tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
                 command: CommandRecord {
-                    binary: ToolBinary::Ffprobe, sanitized_args: vec![],
-                    cwd: None, env_keys: vec![],
+                    binary: ToolBinary::Ffprobe,
+                    sanitized_args: vec![],
+                    cwd: None,
+                    env_keys: vec![],
                     exit: Some(ProcessExit::Code(0)),
-                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
                     elapsed: Duration::ZERO,
                 },
             });
@@ -1196,7 +1336,10 @@ mod tests {
         let req = mat_request(PathBuf::from("/fake/multi.7z"), None);
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+        let source = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(source.tracks.len(), 3);
         // Tracks are sorted by path — CD1 before CD2.
@@ -1214,9 +1357,8 @@ mod tests {
 
     #[tokio::test]
     async fn materializer_track_selection_range_filters_correctly() {
-        let (tmp, mut staging) = setup_staging(&[
-            "01.flac", "02.flac", "03.flac", "04.flac", "05.flac",
-        ]);
+        let (tmp, mut staging) =
+            setup_staging(&["01.flac", "02.flac", "03.flac", "04.flac", "05.flac"]);
         staging.disarm();
 
         let runner = StubToolRunner::new();
@@ -1228,10 +1370,13 @@ mod tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
                 command: CommandRecord {
-                    binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
-                    cwd: None, env_keys: vec![],
+                    binary: ToolBinary::Ffmpeg,
+                    sanitized_args: vec![],
+                    cwd: None,
+                    env_keys: vec![],
                     exit: Some(ProcessExit::Code(0)),
-                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
                     elapsed: Duration::ZERO,
                 },
             });
@@ -1241,7 +1386,10 @@ mod tests {
         req.source.track_selection = TrackSelection::Range { start: 2, end: 4 };
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+        let source = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(source.tracks.len(), 3);
         let ordinals: Vec<u32> = source.tracks.iter().map(|t| t.id.source_ordinal).collect();
@@ -1253,9 +1401,7 @@ mod tests {
 
     #[tokio::test]
     async fn materializer_track_selection_set_filters_correctly() {
-        let (tmp, mut staging) = setup_staging(&[
-            "01.flac", "02.flac", "03.flac", "04.flac",
-        ]);
+        let (tmp, mut staging) = setup_staging(&["01.flac", "02.flac", "03.flac", "04.flac"]);
         staging.disarm();
 
         let runner = StubToolRunner::new();
@@ -1266,10 +1412,13 @@ mod tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
                 command: CommandRecord {
-                    binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
-                    cwd: None, env_keys: vec![],
+                    binary: ToolBinary::Ffmpeg,
+                    sanitized_args: vec![],
+                    cwd: None,
+                    env_keys: vec![],
                     exit: Some(ProcessExit::Code(0)),
-                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
                     elapsed: Duration::ZERO,
                 },
             });
@@ -1279,7 +1428,10 @@ mod tests {
         req.source.track_selection = TrackSelection::Set([1, 3].into_iter().collect());
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let source = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap();
+        let source = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(source.tracks.len(), 2);
         let ordinals: Vec<u32> = source.tracks.iter().map(|t| t.id.source_ordinal).collect();
@@ -1300,10 +1452,13 @@ mod tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
                 command: CommandRecord {
-                    binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
-                    cwd: None, env_keys: vec![],
+                    binary: ToolBinary::Ffmpeg,
+                    sanitized_args: vec![],
+                    cwd: None,
+                    env_keys: vec![],
                     exit: Some(ProcessExit::Code(0)),
-                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
                     elapsed: Duration::ZERO,
                 },
             });
@@ -1313,7 +1468,10 @@ mod tests {
         req.source.track_selection = TrackSelection::Range { start: 5, end: 10 };
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        let err = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap_err();
         assert!(matches!(err, MaterializeError::InvalidTrackSelection(_)));
         drop(tmp);
     }
@@ -1331,10 +1489,13 @@ mod tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
                 command: CommandRecord {
-                    binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
-                    cwd: None, env_keys: vec![],
+                    binary: ToolBinary::Ffmpeg,
+                    sanitized_args: vec![],
+                    cwd: None,
+                    env_keys: vec![],
                     exit: Some(ProcessExit::Code(0)),
-                    stdout_tail: String::new(), stderr_tail: String::new(),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
                     elapsed: Duration::ZERO,
                 },
             });
@@ -1344,7 +1505,10 @@ mod tests {
         req.source.track_selection = TrackSelection::Set([1, 99].into_iter().collect());
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        let err = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap_err();
         assert!(matches!(err, MaterializeError::InvalidTrackSelection(_)));
         drop(tmp);
     }
@@ -1371,12 +1535,18 @@ mod tests {
 
         let req = mat_request(PathBuf::from("/fake/archive.7z"), None);
         let mat = SevenZipMaterializer;
-        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        let err = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap_err();
         assert!(matches!(err, MaterializeError::Cancelled));
 
         // Drop the staging dir — it should clean up.
         drop(staging);
-        assert!(!staging_path.exists(), "staging dir should be deleted by RAII Drop");
+        assert!(
+            !staging_path.exists(),
+            "staging dir should be deleted by RAII Drop"
+        );
     }
 
     // 10. Permission-denied ---------------------------------------------
@@ -1387,16 +1557,24 @@ mod tests {
         staging.disarm();
 
         let runner = StubToolRunner::new();
-        runner.push_failure("ERROR: /protected/file : Can not open the file as [7z] archive\nPermission denied");
+        runner.push_failure(
+            "ERROR: /protected/file : Can not open the file as [7z] archive\nPermission denied",
+        );
 
         let req = mat_request(PathBuf::from("/protected/archive.7z"), None);
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
-        let err = mat.materialize(&req, &staging, &runner, &cancel).await.unwrap_err();
+        let err = mat
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .await
+            .unwrap_err();
 
         // Should be a structured error, not a panic.
         assert!(
-            matches!(err, MaterializeError::Extraction(_) | MaterializeError::Tool(_)),
+            matches!(
+                err,
+                MaterializeError::Extraction(_) | MaterializeError::Tool(_)
+            ),
             "expected structured error, got: {err:?}"
         );
         drop(tmp);
@@ -1463,9 +1641,11 @@ mod tests {
             command: CommandRecord {
                 binary: ToolBinary::Ffmpeg,
                 sanitized_args: vec![],
-                cwd: None, env_keys: vec![],
+                cwd: None,
+                env_keys: vec![],
                 exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(), stderr_tail: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
         });
@@ -1478,18 +1658,20 @@ mod tests {
             elapsed: Duration::ZERO,
             command: CommandRecord {
                 binary: ToolBinary::Ffprobe,
-                sanitized_args: vec![], cwd: None, env_keys: vec![],
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
                 exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(), stderr_tail: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
         });
 
         let cancel = CancellationToken::new();
-        let (result_artifacts, record) =
-            merge_tracks(artifacts, &req, &staging, &runner, &cancel)
-                .await
-                .expect("merge should succeed");
+        let (result_artifacts, record) = merge_tracks(artifacts, &req, &staging, &runner, &cancel)
+            .await
+            .expect("merge should succeed");
 
         assert_eq!(record.outcome, StageOutcome::Ok);
         match &result_artifacts.audio {
@@ -1526,13 +1708,17 @@ mod tests {
         // ffmpeg concat: success
         runner.push_output(ToolOutput {
             exit: ProcessExit::Code(0),
-            stdout_tail: String::new(), stderr_tail: String::new(),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
             elapsed: Duration::ZERO,
             command: CommandRecord {
-                binary: ToolBinary::Ffmpeg, sanitized_args: vec![],
-                cwd: None, env_keys: vec![],
+                binary: ToolBinary::Ffmpeg,
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
                 exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(), stderr_tail: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
         });
@@ -1543,10 +1729,13 @@ mod tests {
             stderr_tail: String::new(),
             elapsed: Duration::ZERO,
             command: CommandRecord {
-                binary: ToolBinary::Ffprobe, sanitized_args: vec![],
-                cwd: None, env_keys: vec![],
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
                 exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(), stderr_tail: String::new(),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
         });
@@ -1614,10 +1803,9 @@ mod tests {
 
         let runner = StubToolRunner::new();
         let cancel = CancellationToken::new();
-        let (result_artifacts, record) =
-            merge_tracks(artifacts, &req, &staging, &runner, &cancel)
-                .await
-                .expect("should pass through");
+        let (result_artifacts, record) = merge_tracks(artifacts, &req, &staging, &runner, &cancel)
+            .await
+            .expect("should pass through");
 
         assert_eq!(record.outcome, StageOutcome::Skipped);
         assert!(matches!(result_artifacts.audio, AudioArtifacts::Tracks(ref t) if t.len() == 2));
@@ -1635,10 +1823,9 @@ mod tests {
 
         let runner = StubToolRunner::new();
         let cancel = CancellationToken::new();
-        let (result_artifacts, record) =
-            merge_tracks(artifacts, &req, &staging, &runner, &cancel)
-                .await
-                .expect("should succeed");
+        let (result_artifacts, record) = merge_tracks(artifacts, &req, &staging, &runner, &cancel)
+            .await
+            .expect("should succeed");
 
         assert_eq!(record.outcome, StageOutcome::Ok);
         match &result_artifacts.audio {
@@ -1664,7 +1851,11 @@ mod tests {
         let mut source = prepared_source();
         source.tracks = vec![
             PreparedTrack {
-                id: TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
+                id: TrackId {
+                    source_ordinal: 1,
+                    disc_number: None,
+                    track_number: 1,
+                },
                 source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac")),
                 metadata: TrackMetadata {
                     title: Some("First Song".into()),
@@ -1675,7 +1866,11 @@ mod tests {
                 sample_rate: 44100,
             },
             PreparedTrack {
-                id: TrackId { source_ordinal: 2, disc_number: None, track_number: 2 },
+                id: TrackId {
+                    source_ordinal: 2,
+                    disc_number: None,
+                    track_number: 2,
+                },
                 source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/02.flac")),
                 metadata: TrackMetadata {
                     title: Some("Second Song".into()),
@@ -1703,7 +1898,10 @@ mod tests {
         assert_eq!(transcript[0].binary, ToolBinary::Metaflac);
         // Check tag values appear in args.
         let args_joined = transcript[0].sanitized_args.join(" ");
-        assert!(args_joined.contains("First Song"), "should contain track title");
+        assert!(
+            args_joined.contains("First Song"),
+            "should contain track title"
+        );
         assert!(args_joined.contains("The Band"), "should contain artist");
     }
 
@@ -1765,8 +1963,14 @@ mod tests {
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].binary, ToolBinary::Loudgain);
         let args = &transcript[0].sanitized_args;
-        assert!(args.contains(&"-a".to_string()), "should use album mode (-a)");
-        assert!(args.contains(&"-k".to_string()), "should prevent clipping (-k)");
+        assert!(
+            args.contains(&"-a".to_string()),
+            "should use album mode (-a)"
+        );
+        assert!(
+            args.contains(&"-k".to_string()),
+            "should prevent clipping (-k)"
+        );
     }
 
     #[tokio::test]
@@ -1776,9 +1980,11 @@ mod tests {
                 staged_path: PathBuf::from("/stage/merged.flac"),
                 final_path: PathBuf::from("/out/merged.flac"),
                 total_samples: 882000,
-                source_tracks: vec![
-                    TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
-                ],
+                source_tracks: vec![TrackId {
+                    source_ordinal: 1,
+                    disc_number: None,
+                    track_number: 1,
+                }],
             }),
             sidecars: vec![],
         };
@@ -1796,7 +2002,10 @@ mod tests {
         let transcript = runner.transcript();
         assert_eq!(transcript.len(), 1);
         let args = &transcript[0].sanitized_args;
-        assert!(!args.contains(&"-a".to_string()), "merged should NOT use album mode");
+        assert!(
+            !args.contains(&"-a".to_string()),
+            "merged should NOT use album mode"
+        );
         assert!(args.iter().any(|a| a.contains("merged.flac")));
     }
 
@@ -1839,24 +2048,35 @@ mod tests {
         let runner = StubToolRunner::new();
         let cancel = CancellationToken::new();
 
-        let (result, record) =
-            run_features(artifacts, &outcome, &source, &req, &staging, &runner, &cancel)
-                .await
-                .expect("should succeed");
+        let (result, record) = run_features(
+            artifacts, &outcome, &source, &req, &staging, &runner, &cancel,
+        )
+        .await
+        .expect("should succeed");
 
         assert_eq!(record.outcome, StageOutcome::Ok);
         // Should have at least a conversion log sidecar.
         assert!(
-            result.sidecars.iter().any(|s| s.kind == SidecarKind::ConversionLog),
+            result
+                .sidecars
+                .iter()
+                .any(|s| s.kind == SidecarKind::ConversionLog),
             "should have conversion log sidecar"
         );
         // The staged file written by run_features should exist on disk.
         // (merge_artifacts pre-populates a sidecar at /stage/log.txt which
         // doesn't exist; the real one is under the staging root.)
-        let log_sidecar = result.sidecars.iter()
-            .find(|s| s.kind == SidecarKind::ConversionLog && s.staged_path.starts_with(&staging.root))
+        let log_sidecar = result
+            .sidecars
+            .iter()
+            .find(|s| {
+                s.kind == SidecarKind::ConversionLog && s.staged_path.starts_with(&staging.root)
+            })
             .expect("should have a conversion log sidecar under staging root");
-        assert!(log_sidecar.staged_path.exists(), "log file should exist on disk");
+        assert!(
+            log_sidecar.staged_path.exists(),
+            "log file should exist on disk"
+        );
 
         let _ = std::fs::remove_dir_all(&staging.root);
     }
@@ -1864,7 +2084,10 @@ mod tests {
     #[tokio::test]
     async fn features_disabled_passes_through() {
         let artifacts = merge_artifacts(&[Some(441000)]);
-        let outcome = AlbumOutcome::Complete { tracks: vec![], stages: vec![] };
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![],
+            stages: vec![],
+        };
         let source = prepared_source();
         let mut req = sample_request();
         req.stages.features = StageRequirement::Disabled;
@@ -1873,10 +2096,11 @@ mod tests {
         let runner = StubToolRunner::new();
         let cancel = CancellationToken::new();
 
-        let (_, record) =
-            run_features(artifacts, &outcome, &source, &req, &staging, &runner, &cancel)
-                .await
-                .expect("should pass through");
+        let (_, record) = run_features(
+            artifacts, &outcome, &source, &req, &staging, &runner, &cancel,
+        )
+        .await
+        .expect("should pass through");
 
         assert_eq!(record.outcome, StageOutcome::Skipped);
     }
@@ -1915,8 +2139,8 @@ mod tests {
         assert!(path.exists(), "log file should exist");
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content)
-            .expect("should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("should be valid JSON");
 
         // Verify key fields are present.
         assert!(parsed.get("request").is_some(), "should have request");
@@ -1935,7 +2159,10 @@ mod tests {
             plan: None,
             artifacts: None,
             published: None,
-            outcome: AlbumOutcome::Complete { tracks: vec![], stages: vec![] },
+            outcome: AlbumOutcome::Complete {
+                tracks: vec![],
+                stages: vec![],
+            },
             durable_log: None,
         };
 
@@ -1948,7 +2175,10 @@ mod tests {
         let path = write_durable_log(&report, &policy).expect("should write");
         let content = std::fs::read_to_string(&path).unwrap();
 
-        assert!(!content.contains("hunter2"), "durable log must not contain password");
+        assert!(
+            !content.contains("hunter2"),
+            "durable log must not contain password"
+        );
     }
 
     #[test]
@@ -1956,8 +2186,14 @@ mod tests {
         let req = sample_request();
         let report = PipelineReport {
             request: RedactedPipelineRequest::from(&req),
-            source: None, plan: None, artifacts: None, published: None,
-            outcome: AlbumOutcome::Complete { tracks: vec![], stages: vec![] },
+            source: None,
+            plan: None,
+            artifacts: None,
+            published: None,
+            outcome: AlbumOutcome::Complete {
+                tracks: vec![],
+                stages: vec![],
+            },
             durable_log: None,
         };
 
@@ -2052,7 +2288,7 @@ FILE "{}" WAVE
         ));
 
         let mat = super::materializer_cue::CueImageMaterializer;
-        mat.materialize(&req, &staging, &runner, &CancellationToken::new())
+        mat.materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
             .await
             .unwrap()
     }
@@ -2064,23 +2300,54 @@ FILE "{}" WAVE
             assert_eq!(source.kind, SourceKind::CueImage);
             assert_eq!(source.tracks.len(), 2, "{image_name}");
             assert_eq!(source.album_metadata.album.as_deref(), Some("Album"));
-            assert_eq!(source.album_metadata.album_artist.as_deref(), Some("Artist"));
+            assert_eq!(
+                source.album_metadata.album_artist.as_deref(),
+                Some("Artist")
+            );
             assert_eq!(source.album_metadata.genre.as_deref(), Some("Rock"));
             assert_eq!(source.album_metadata.date.as_deref(), Some("1970"));
-            assert_eq!(source.album_metadata.extra.get("rem_comment").map(String::as_str), Some("matrix"));
+            assert_eq!(
+                source
+                    .album_metadata
+                    .extra
+                    .get("rem_comment")
+                    .map(String::as_str),
+                Some("matrix")
+            );
             assert!(source.tracks[0].metadata.pre_emphasis);
-            assert_eq!(source.tracks[0].metadata.isrc.as_deref(), Some("USAAA0000001"));
-            assert_eq!(source.tracks[1].metadata.extra.get("rem_note").map(String::as_str), Some("track-extra"));
+            assert_eq!(
+                source.tracks[0].metadata.isrc.as_deref(),
+                Some("USAAA0000001")
+            );
+            assert_eq!(
+                source.tracks[1]
+                    .metadata
+                    .extra
+                    .get("rem_note")
+                    .map(String::as_str),
+                Some("track-extra")
+            );
             match &source.tracks[0].source_ref {
-                TrackSourceRef::ImageSegment { image, start_sample, samples } => {
-                    assert_eq!(image.file_name().and_then(|value| value.to_str()), Some(image_name));
+                TrackSourceRef::ImageSegment {
+                    image,
+                    start_sample,
+                    samples,
+                } => {
+                    assert_eq!(
+                        image.file_name().and_then(|value| value.to_str()),
+                        Some(image_name)
+                    );
                     assert_eq!(*start_sample, 0);
                     assert_eq!(*samples, 44_100);
                 }
                 other => panic!("expected ImageSegment, got {other:?}"),
             }
             match &source.tracks[1].source_ref {
-                TrackSourceRef::ImageSegment { start_sample, samples, .. } => {
+                TrackSourceRef::ImageSegment {
+                    start_sample,
+                    samples,
+                    ..
+                } => {
                     assert_eq!(*start_sample, 44_100);
                     assert_eq!(*samples, 88_200);
                 }
@@ -2104,7 +2371,10 @@ FILE "{}" WAVE
         req.container = image_path.clone();
         req.source.archive_password = None;
         req.source.cue_sidecar = CueSidecarPolicy::PreferSidecar;
-        assert!(matches!(detect_source_kind(&req), Err(SourceDetectError::UnknownSource)));
+        assert!(matches!(
+            detect_source_kind(&req),
+            Err(SourceDetectError::UnknownSource)
+        ));
 
         std::fs::write(&cue_path, "not a cue sheet at all").unwrap();
         assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::CueImage);
@@ -2113,13 +2383,15 @@ FILE "{}" WAVE
         assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::CueImage);
 
         req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
-        assert!(matches!(detect_source_kind(&req), Err(SourceDetectError::UnknownSource)));
+        assert!(matches!(
+            detect_source_kind(&req),
+            Err(SourceDetectError::UnknownSource)
+        ));
 
         req.container = tmp.path().join("album.7z");
         assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::SevenZip);
         assert!(materializer_for(SourceKind::CueImage).is_ok());
     }
-
 
     #[tokio::test]
     async fn pr8_malformed_same_stem_sidecar_fails_in_materializer() {
@@ -2140,7 +2412,7 @@ FILE "{}" WAVE
         let runner = StubToolRunner::new();
         let mat = super::materializer_cue::CueImageMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, &CancellationToken::new())
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
             .await
             .expect_err("malformed same-stem sidecar should fail in materialization");
         assert!(matches!(err, MaterializeError::Parse(_)));
@@ -2163,14 +2435,14 @@ FILE "{}" WAVE
 
         req.source.cue_sidecar = CueSidecarPolicy::SidecarOnly;
         let err = mat
-            .materialize(&req, &staging, &runner, &CancellationToken::new())
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
             .await
             .expect_err("missing sidecar should fail");
         assert!(matches!(err, MaterializeError::Parse(_)));
 
         req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
         let err = mat
-            .materialize(&req, &staging, &runner, &CancellationToken::new())
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
             .await
             .expect_err("IgnoreCue must not materialize");
         assert!(matches!(err, MaterializeError::Parse(_)));
@@ -2197,7 +2469,9 @@ FILE "{}" WAVE
 
     impl CaptureFfmpegCutRunner {
         fn new() -> Self {
-            Self { ffmpeg_args: std::sync::Mutex::new(None) }
+            Self {
+                ffmpeg_args: std::sync::Mutex::new(None),
+            }
         }
 
         fn ffmpeg_args(&self) -> Vec<String> {
@@ -2247,7 +2521,7 @@ FILE "{}" WAVE
         let staging = StagingDir::new(tmp.path().join("stage"), "job-realize".to_string());
         let runner = CaptureFfmpegCutRunner::new();
 
-        let out = realize_track(&src, &req, &staging, &runner, &CancellationToken::new())
+        let out = realize_track(&src, &req, &staging, &runner, &CancellationToken::new(), None)
             .await
             .expect("realization should succeed");
         assert!(out.exists());
@@ -2274,7 +2548,9 @@ FILE "{}" WAVE
 
     impl FailingWavpackFallbackRunner {
         fn new() -> Self {
-            Self { ffmpeg_calls: std::sync::Mutex::new(0) }
+            Self {
+                ffmpeg_calls: std::sync::Mutex::new(0),
+            }
         }
     }
 
@@ -2320,14 +2596,15 @@ FILE "{}" WAVE
         }
     }
 
-
     struct CachingWavpackFallbackRunner {
         wvunpack_calls: std::sync::Mutex<u32>,
     }
 
     impl CachingWavpackFallbackRunner {
         fn new() -> Self {
-            Self { wvunpack_calls: std::sync::Mutex::new(0) }
+            Self {
+                wvunpack_calls: std::sync::Mutex::new(0),
+            }
         }
 
         fn wvunpack_calls(&self) -> u32 {
@@ -2391,7 +2668,7 @@ FILE "{}" WAVE
         let staging = StagingDir::new(tmp.path().join("stage"), "job-realize".to_string());
         let runner = FailingWavpackFallbackRunner::new();
 
-        let err = realize_track(&src, &req, &staging, &runner, &CancellationToken::new())
+        let err = realize_track(&src, &req, &staging, &runner, &CancellationToken::new(), None)
             .await
             .expect_err("fallback cut should fail");
         assert!(matches!(err, ConvertError::Tool(_)));
@@ -2406,10 +2683,15 @@ FILE "{}" WAVE
         } else {
             Vec::new()
         };
-        assert!(partial_outputs.is_empty(), "failed realization left partial track outputs: {partial_outputs:?}");
-        assert!(segment_dir.join("decoded-image-cache").exists(), "decoded cache should be retained for retry/reuse");
+        assert!(
+            partial_outputs.is_empty(),
+            "failed realization left partial track outputs: {partial_outputs:?}"
+        );
+        assert!(
+            segment_dir.join("decoded-image-cache").exists(),
+            "decoded cache should be retained for retry/reuse"
+        );
     }
-
 
     #[tokio::test]
     async fn pr8_wavpack_fallback_reuses_decoded_image_cache() {
@@ -2427,28 +2709,33 @@ FILE "{}" WAVE
                 start_sample,
                 samples: 44_100,
             };
-            let out = realize_track(&src, &req, &staging, &runner, &CancellationToken::new())
+            let out = realize_track(&src, &req, &staging, &runner, &CancellationToken::new(), None)
                 .await
                 .expect("fallback realization should succeed");
             assert!(out.exists());
         }
 
-        assert_eq!(runner.wvunpack_calls(), 1, "WavPack image should be decoded once per staging cache");
+        assert_eq!(
+            runner.wvunpack_calls(),
+            1,
+            "WavPack image should be decoded once per staging cache"
+        );
     }
-
 
     fn pr8_real_corpus_enabled() -> bool {
         std::env::var("TONEPOET_PR8_REAL_CORPUS").ok().as_deref() == Some("1")
     }
 
     fn pr8_command_available(program: &str) -> bool {
-        ["-version", "--version", "-h", "--help"].iter().any(|flag| {
-            std::process::Command::new(program)
-                .arg(flag)
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false)
-        })
+        ["-version", "--version", "-h", "--help"]
+            .iter()
+            .any(|flag| {
+                std::process::Command::new(program)
+                    .arg(flag)
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false)
+            })
     }
 
     fn pr8_run_command(program: &str, args: &[&str]) {
@@ -2558,9 +2845,8 @@ FILE "{image_name}" WAVE
         track_count: u32,
         seconds_per_track: u32,
     ) {
-        let mut text = format!(
-            "PERFORMER \"Corpus Artist\"\nTITLE \"{album}\"\nFILE \"{image_name}\" WAVE\n"
-        );
+        let mut text =
+            format!("PERFORMER \"Corpus Artist\"\nTITLE \"{album}\"\nFILE \"{image_name}\" WAVE\n");
         for track in 1..=track_count {
             let seconds = (track - 1) * seconds_per_track;
             let mm = seconds / 60;
@@ -2583,7 +2869,7 @@ FILE "{image_name}" WAVE
         let staging = StagingDir::new(tmp_root.join("stage"), "job-real-corpus".to_string());
         let runner = RealToolRunner::new(std::collections::HashMap::new());
         super::materializer_cue::CueImageMaterializer
-            .materialize(&req, &staging, &runner, &CancellationToken::new())
+            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
             .await
             .unwrap()
     }
@@ -2591,7 +2877,9 @@ FILE "{image_name}" WAVE
     #[tokio::test]
     async fn pr8_real_corpus_generated_images_when_enabled() {
         if !pr8_real_corpus_enabled() {
-            eprintln!("skipping generated real-corpus PR8 test; set TONEPOET_PR8_REAL_CORPUS=1 to run");
+            eprintln!(
+                "skipping generated real-corpus PR8 test; set TONEPOET_PR8_REAL_CORPUS=1 to run"
+            );
             return;
         }
         assert!(pr8_command_available("ffmpeg"), "ffmpeg is required");
@@ -2609,30 +2897,91 @@ FILE "{image_name}" WAVE
         pr8_run_command(
             "ffmpeg",
             &[
-                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                "sine=frequency=440:duration=3", "-ar", "44100", "-ac", "2", wav.to_str().unwrap(),
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=3",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                wav.to_str().unwrap(),
             ],
         );
-        pr8_run_command("ffmpeg", &["-y", "-hide_banner", "-loglevel", "error", "-i", wav.to_str().unwrap(), flac.to_str().unwrap()]);
-        pr8_run_command("wavpack", &["-y", "-q", wav.to_str().unwrap(), "-o", wv.to_str().unwrap()]);
-        pr8_run_command("ffmpeg", &["-y", "-hide_banner", "-loglevel", "error", "-i", wav.to_str().unwrap(), ape.to_str().unwrap()]);
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                wav.to_str().unwrap(),
+                flac.to_str().unwrap(),
+            ],
+        );
+        pr8_run_command(
+            "wavpack",
+            &[
+                "-y",
+                "-q",
+                wav.to_str().unwrap(),
+                "-o",
+                wv.to_str().unwrap(),
+            ],
+        );
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                wav.to_str().unwrap(),
+                ape.to_str().unwrap(),
+            ],
+        );
 
         for image in [&flac, &wv, &ape] {
             let cue = image.with_extension("cue");
-            pr8_write_cue(&cue, image.file_name().unwrap().to_str().unwrap(), "Corpus Album");
-            let source = pr8_materialize_real_cue(image.to_path_buf(), CueSidecarPolicy::PreferSidecar).await;
+            pr8_write_cue(
+                &cue,
+                image.file_name().unwrap().to_str().unwrap(),
+                "Corpus Album",
+            );
+            let source =
+                pr8_materialize_real_cue(image.to_path_buf(), CueSidecarPolicy::PreferSidecar)
+                    .await;
             assert_eq!(source.kind, SourceKind::CueImage);
             assert_eq!(source.tracks.len(), 3);
-            assert_eq!(source.tracks[0].metadata.album_artist.as_deref(), Some("Corpus Artist"));
+            assert_eq!(
+                source.tracks[0].metadata.album_artist.as_deref(),
+                Some("Corpus Artist")
+            );
             assert!(source.tracks[0].metadata.pre_emphasis);
             assert_eq!(source.tracks[0].sample_rate, 44_100);
             assert_eq!(source.tracks[0].expected_samples, Some(44_100));
-            assert!(matches!(source.tracks[0].source_ref, TrackSourceRef::ImageSegment { .. }));
+            assert!(matches!(
+                source.tracks[0].source_ref,
+                TrackSourceRef::ImageSegment { .. }
+            ));
         }
 
         let embedded_cue = root.join("embedded.cue");
-        pr8_write_cue(&embedded_cue, flac.file_name().unwrap().to_str().unwrap(), "Embedded Album");
-        pr8_run_command("metaflac", &["--remove-tag=CUESHEET", flac.to_str().unwrap()]);
+        pr8_write_cue(
+            &embedded_cue,
+            flac.file_name().unwrap().to_str().unwrap(),
+            "Embedded Album",
+        );
+        pr8_run_command(
+            "metaflac",
+            &["--remove-tag=CUESHEET", flac.to_str().unwrap()],
+        );
         pr8_run_command(
             "metaflac",
             &[
@@ -2641,12 +2990,22 @@ FILE "{image_name}" WAVE
             ],
         );
         let sidecar_cue = flac.with_extension("cue");
-        pr8_write_cue(&sidecar_cue, flac.file_name().unwrap().to_str().unwrap(), "Sidecar Album");
+        pr8_write_cue(
+            &sidecar_cue,
+            flac.file_name().unwrap().to_str().unwrap(),
+            "Sidecar Album",
+        );
 
         let prefer = pr8_materialize_real_cue(flac.clone(), CueSidecarPolicy::PreferSidecar).await;
-        assert_eq!(prefer.album_metadata.album.as_deref(), Some("Sidecar Album"));
+        assert_eq!(
+            prefer.album_metadata.album.as_deref(),
+            Some("Sidecar Album")
+        );
         let embedded = pr8_materialize_real_cue(flac.clone(), CueSidecarPolicy::EmbeddedOnly).await;
-        assert_eq!(embedded.album_metadata.album.as_deref(), Some("Embedded Album"));
+        assert_eq!(
+            embedded.album_metadata.album.as_deref(),
+            Some("Embedded Album")
+        );
     }
 
     #[tokio::test]
@@ -2716,7 +3075,7 @@ FILE "{image_name}" WAVE
             start_sample: 44_100,
             samples: 44_100,
         };
-        let realized = realize_track(&src, &req, &staging, &runner, &CancellationToken::new())
+        let realized = realize_track(&src, &req, &staging, &runner, &CancellationToken::new(), None)
             .await
             .expect("segment realization should succeed");
 
@@ -2734,9 +3093,7 @@ FILE "{image_name}" WAVE
     #[tokio::test]
     async fn pr8_real_long_image_many_tracks_benchmark_when_enabled() {
         if std::env::var("TONEPOET_PR8_LONG_IMAGE").ok().as_deref() != Some("1") {
-            eprintln!(
-                "skipping long-image PR8 benchmark; set TONEPOET_PR8_LONG_IMAGE=1 to run"
-            );
+            eprintln!("skipping long-image PR8 benchmark; set TONEPOET_PR8_LONG_IMAGE=1 to run");
             return;
         }
         assert!(pr8_command_available("ffmpeg"), "ffmpeg is required");
@@ -2812,6 +3169,7 @@ FILE "{image_name}" WAVE
                 &staging,
                 &runner,
                 &CancellationToken::new(),
+                None,
             )
             .await
             .expect("long-image segment realization should succeed");
@@ -2835,7 +3193,9 @@ FILE "{image_name}" WAVE
     #[tokio::test]
     async fn pr8_real_pipeline_end_to_end_when_enabled() {
         if !pr8_real_corpus_enabled() {
-            eprintln!("skipping generated end-to-end PR8 test; set TONEPOET_PR8_REAL_CORPUS=1 to run");
+            eprintln!(
+                "skipping generated end-to-end PR8 test; set TONEPOET_PR8_REAL_CORPUS=1 to run"
+            );
             return;
         }
         assert!(pr8_command_available("ffmpeg"), "ffmpeg is required");
@@ -2851,12 +3211,38 @@ FILE "{image_name}" WAVE
         pr8_run_command(
             "ffmpeg",
             &[
-                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                "sine=frequency=330:duration=3", "-ar", "44100", "-ac", "2", wav.to_str().unwrap(),
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=330:duration=3",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                wav.to_str().unwrap(),
             ],
         );
-        pr8_run_command("ffmpeg", &["-y", "-hide_banner", "-loglevel", "error", "-i", wav.to_str().unwrap(), flac.to_str().unwrap()]);
-        pr8_write_cue(&cue, flac.file_name().unwrap().to_str().unwrap(), "Pipeline Album");
+        pr8_run_command(
+            "ffmpeg",
+            &[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                wav.to_str().unwrap(),
+                flac.to_str().unwrap(),
+            ],
+        );
+        pr8_write_cue(
+            &cue,
+            flac.file_name().unwrap().to_str().unwrap(),
+            "Pipeline Album",
+        );
 
         let mut req = sample_request();
         req.job_id = "job-pr8-e2e".to_string();
@@ -2873,8 +3259,14 @@ FILE "{image_name}" WAVE
         let runner = RealToolRunner::new(std::collections::HashMap::new());
         let reporter = RecordingReporter::new();
         let report = run_pipeline_item(req, &runner, &reporter, &CancellationToken::new()).await;
-        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }), "unexpected outcome: {:?}", report.outcome);
-        let published = report.published.expect("end-to-end test should publish outputs");
+        assert!(
+            matches!(report.outcome, AlbumOutcome::Complete { .. }),
+            "unexpected outcome: {:?}",
+            report.outcome
+        );
+        let published = report
+            .published
+            .expect("end-to-end test should publish outputs");
         let audio_entries = published
             .entries
             .iter()
@@ -2889,7 +3281,11 @@ FILE "{image_name}" WAVE
             .collect();
         assert_eq!(audio_paths.len(), 3);
         for path in &audio_paths {
-            assert!(path.exists(), "published audio file is missing: {}", path.display());
+            assert!(
+                path.exists(),
+                "published audio file is missing: {}",
+                path.display()
+            );
             assert!(
                 pr8_flac_has_tag(path, "REPLAYGAIN_TRACK_GAIN"),
                 "published file lacks ReplayGain tag: {}",
@@ -2907,10 +3303,15 @@ FILE "{image_name}" WAVE
         assert!(pr8_flac_has_tag(first_track, "ISRC"));
         assert!(pr8_flac_has_tag(first_track, "PRE_EMPHASIS"));
         assert!(pr8_flac_has_tag(first_track, "CUE_FLAGS"));
-        assert!(published.entries.iter().any(|entry| matches!(entry.role, PublishRole::Sidecar(_))));
-        assert!(report.durable_log.as_ref().is_some_and(|path| path.exists()));
+        assert!(published
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.role, PublishRole::Sidecar(_))));
+        assert!(report
+            .durable_log
+            .as_ref()
+            .is_some_and(|path| path.exists()));
     }
-
 
     // ====================================================================
     // PR 9 — SACD materializer / realization wiring tests
@@ -2959,18 +3360,24 @@ FILE "{image_name}" WAVE
     fn pr9_detection_positive_only_for_sacd_master_toc_magic() {
         use crate::tui::sacd::DetectionResult;
 
-        assert!(materializer_sacd::test_support::detection_positive_for_test(
-            DetectionResult::HealthyAllRedundant
-        ));
-        assert!(materializer_sacd::test_support::detection_positive_for_test(
-            DetectionResult::HealthyPartialRedundant { good: 1 }
-        ));
-        assert!(!materializer_sacd::test_support::detection_positive_for_test(
-            DetectionResult::NotSacd
-        ));
-        assert!(!materializer_sacd::test_support::detection_positive_for_test(
-            DetectionResult::TooSmall
-        ));
+        assert!(
+            materializer_sacd::test_support::detection_positive_for_test(
+                DetectionResult::HealthyAllRedundant
+            )
+        );
+        assert!(
+            materializer_sacd::test_support::detection_positive_for_test(
+                DetectionResult::HealthyPartialRedundant { good: 1 }
+            )
+        );
+        assert!(
+            !materializer_sacd::test_support::detection_positive_for_test(DetectionResult::NotSacd)
+        );
+        assert!(
+            !materializer_sacd::test_support::detection_positive_for_test(
+                DetectionResult::TooSmall
+            )
+        );
     }
 
     #[test]
@@ -3000,7 +3407,9 @@ FILE "{image_name}" WAVE
         req.source.sacd_area = Some(SacdArea::Stereo);
 
         assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::SacdIso);
-        assert!(materializer_sacd::test_support::explicit_sacd_for_test(&req));
+        assert!(materializer_sacd::test_support::explicit_sacd_for_test(
+            &req
+        ));
     }
 
     #[test]
@@ -3020,7 +3429,10 @@ FILE "{image_name}" WAVE
         assert!(matches!(explicit, MaterializeError::Encrypted));
 
         let tiny = materializer_sacd::test_support::encrypted_mapping_for_test(
-            SacdError::TooSmall { size: 1, required: 2 },
+            SacdError::TooSmall {
+                size: 1,
+                required: 2,
+            },
             true,
         );
         assert!(matches!(tiny, MaterializeError::Parse(_)));
@@ -3116,5 +3528,4 @@ FILE "{image_name}" WAVE
             2_822_400
         );
     }
-
 }

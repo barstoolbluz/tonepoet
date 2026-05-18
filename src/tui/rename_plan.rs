@@ -84,10 +84,7 @@ pub fn sanitize_path(resolved: &str) -> Result<String, String> {
 
 impl RenamePlan {
     /// Build a plan from a list of (source, proposed_target_relative) pairs.
-    pub fn new(
-        base_dir: PathBuf,
-        items: Vec<(PathBuf, String)>,
-    ) -> Self {
+    pub fn new(base_dir: PathBuf, items: Vec<(PathBuf, String)>) -> Self {
         let ops = items
             .into_iter()
             .map(|(source, target_relative)| RenameOp {
@@ -106,7 +103,10 @@ impl RenamePlan {
 
     /// Number of ops that are still `Pending` after validation.
     pub fn pending_count(&self) -> usize {
-        self.ops.iter().filter(|op| op.status == OpStatus::Pending).count()
+        self.ops
+            .iter()
+            .filter(|op| op.status == OpStatus::Pending)
+            .count()
     }
 
     /// Number of ops with `Conflict` status.
@@ -310,9 +310,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "tonepoet_rename_test_{}_{}", std::process::id(), n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tonepoet_rename_test_{}_{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -358,10 +357,7 @@ mod tests {
         let file = dir.join("song.flac");
         fs::write(&file, b"test").unwrap();
 
-        let mut plan = RenamePlan::new(
-            dir.clone(),
-            vec![(file.clone(), "song.flac".to_string())],
-        );
+        let mut plan = RenamePlan::new(dir.clone(), vec![(file.clone(), "song.flac".to_string())]);
         let conflicts = validate_plan(&mut plan);
         assert_eq!(conflicts, 0);
         assert!(matches!(plan.ops[0].status, OpStatus::Skipped(_)));
@@ -379,10 +375,7 @@ mod tests {
 
         let mut plan = RenamePlan::new(
             dir.clone(),
-            vec![
-                (a, "same.flac".to_string()),
-                (b, "same.flac".to_string()),
-            ],
+            vec![(a, "same.flac".to_string()), (b, "same.flac".to_string())],
         );
         let conflicts = validate_plan(&mut plan);
         assert_eq!(conflicts, 2);
@@ -397,10 +390,7 @@ mod tests {
         let dir = tmp_dir();
         let missing = dir.join("gone.flac");
 
-        let mut plan = RenamePlan::new(
-            dir.clone(),
-            vec![(missing, "new.flac".to_string())],
-        );
+        let mut plan = RenamePlan::new(dir.clone(), vec![(missing, "new.flac".to_string())]);
         let conflicts = validate_plan(&mut plan);
         assert_eq!(conflicts, 0);
         assert!(matches!(plan.ops[0].status, OpStatus::Skipped(_)));
@@ -414,10 +404,7 @@ mod tests {
         let file = dir.join("old.flac");
         fs::write(&file, b"data").unwrap();
 
-        let mut plan = RenamePlan::new(
-            dir.clone(),
-            vec![(file.clone(), "new.flac".to_string())],
-        );
+        let mut plan = RenamePlan::new(dir.clone(), vec![(file.clone(), "new.flac".to_string())]);
         validate_plan(&mut plan);
         let result = execute_plan(&mut plan);
         assert!(result.is_ok());
@@ -501,18 +488,12 @@ mod tests {
         fs::write(&file, b"data").unwrap();
 
         // First run: rename old.flac → new.flac
-        let mut plan = RenamePlan::new(
-            dir.clone(),
-            vec![(file.clone(), "new.flac".to_string())],
-        );
+        let mut plan = RenamePlan::new(dir.clone(), vec![(file.clone(), "new.flac".to_string())]);
         validate_plan(&mut plan);
         execute_plan(&mut plan).unwrap();
 
         // Second run: same plan. Source is gone → skipped.
-        let mut plan2 = RenamePlan::new(
-            dir.clone(),
-            vec![(file.clone(), "new.flac".to_string())],
-        );
+        let mut plan2 = RenamePlan::new(dir.clone(), vec![(file.clone(), "new.flac".to_string())]);
         let conflicts = validate_plan(&mut plan2);
         assert_eq!(conflicts, 0);
         assert!(matches!(plan2.ops[0].status, OpStatus::Skipped(_)));

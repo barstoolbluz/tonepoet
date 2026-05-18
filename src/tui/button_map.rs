@@ -1,7 +1,7 @@
 //! Button position tracking for mouse click detection in the TUI
 
-use ratatui::layout::Rect;
 use super::app::ConvertFocus;
+use ratatui::layout::Rect;
 
 /// Which metadata field is being referenced (for clicks and edit overlays)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -239,9 +239,7 @@ impl ButtonRenderMap {
     pub fn find_button_at(&self, x: u16, y: u16) -> Option<TuiButton> {
         // Iterate in reverse so overlays/later-drawn elements take priority
         for (button, rect) in self.button_bounds.iter().rev() {
-            if x >= rect.x && x < rect.x + rect.width
-                && y >= rect.y && y < rect.y + rect.height
-            {
+            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
                 return Some(*button);
             }
         }

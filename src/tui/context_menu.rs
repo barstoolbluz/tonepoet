@@ -27,7 +27,10 @@ pub struct MenuLevel {
 
 impl MenuLevel {
     pub fn new(entries: Vec<ContextMenuEntry>) -> Self {
-        Self { entries, selected: 0 }
+        Self {
+            entries,
+            selected: 0,
+        }
     }
 }
 
@@ -266,9 +269,7 @@ fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
     ];
 
     // Flat preset list (one item per preset, no queue/start pairs).
-    let all_presets: Vec<String> = groups.iter()
-        .flat_map(|(_, names)| names.clone())
-        .collect();
+    let all_presets: Vec<String> = groups.iter().flat_map(|(_, names)| names.clone()).collect();
     if !all_presets.is_empty() {
         children.push(separator());
         for name in &all_presets {
@@ -285,9 +286,7 @@ fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
 /// Build the "File operations" submenu (Rename, Bulk Rename, Copy/Move,
 /// Trash). `include_bulk_rename` adds the Bulk Rename option for audio files.
 fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
-    let mut children = vec![
-        item("Rename", ContextAction::RenameEntry),
-    ];
+    let mut children = vec![item("Rename", ContextAction::RenameEntry)];
     if include_bulk_rename {
         children.push(item("Bulk Rename", ContextAction::BulkRename));
     }
@@ -313,11 +312,12 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
 /// entry below if the HTTP endpoint comes back, or migrate the
 /// client to CDDBP if a longer-term fix is wanted.
 fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
-    let mut children = vec![
-        item("Get tags from MusicBrainz", ContextAction::TagsFromMb),
-    ];
+    let mut children = vec![item("Get tags from MusicBrainz", ContextAction::TagsFromMb)];
     if has_cue {
-        children.push(item("Get tags from CUE", ContextAction::ImportCueFromBrowse));
+        children.push(item(
+            "Get tags from CUE",
+            ContextAction::ImportCueFromBrowse,
+        ));
     }
     ContextMenuEntry::Submenu {
         label: "Tagging".to_string(),
@@ -336,7 +336,10 @@ fn build_disk_tools_submenu() -> ContextMenuEntry {
                 label: "AccurateRip".to_string(),
                 children: vec![
                     item("Verify (common offsets)", ContextAction::VerifyAccurateRip),
-                    item("Verify (full offset scan)", ContextAction::AccurateRipFullScan),
+                    item(
+                        "Verify (full offset scan)",
+                        ContextAction::AccurateRipFullScan,
+                    ),
                     item("Batch verify directory", ContextAction::AccurateRipBatch),
                     separator(),
                     item("Fix offset", ContextAction::AccurateRipFixOffset),
@@ -357,19 +360,40 @@ fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     let mut children = vec![
         item("Verify integrity", ContextAction::Verify),
         separator(),
-        item("CUE sheet from tags (multi-file)", ContextAction::GenerateCueMultiFile),
-        item("CUE sheet from tags (single image)", ContextAction::GenerateCueSingleImage),
-        item("CUE sheet from MusicBrainz (multi-file)", ContextAction::GenerateCueMbMultiFile),
-        item("CUE sheet from MusicBrainz (single image)", ContextAction::GenerateCueMbSingleImage),
+        item(
+            "CUE sheet from tags (multi-file)",
+            ContextAction::GenerateCueMultiFile,
+        ),
+        item(
+            "CUE sheet from tags (single image)",
+            ContextAction::GenerateCueSingleImage,
+        ),
+        item(
+            "CUE sheet from MusicBrainz (multi-file)",
+            ContextAction::GenerateCueMbMultiFile,
+        ),
+        item(
+            "CUE sheet from MusicBrainz (single image)",
+            ContextAction::GenerateCueMbSingleImage,
+        ),
         item("Fill CUE from MusicBrainz", ContextAction::FillCueFromMb),
         separator(),
     ];
 
     if app.compare_reference.is_empty() {
-        children.push(item("Bit compare (mark reference)", ContextAction::MarkCompareReference));
+        children.push(item(
+            "Bit compare (mark reference)",
+            ContextAction::MarkCompareReference,
+        ));
     } else {
-        children.push(item("Bit compare with reference", ContextAction::BitCompareWithReference));
-        children.push(item("Clear reference", ContextAction::ClearCompareReference));
+        children.push(item(
+            "Bit compare with reference",
+            ContextAction::BitCompareWithReference,
+        ));
+        children.push(item(
+            "Clear reference",
+            ContextAction::ClearCompareReference,
+        ));
     }
 
     ContextMenuEntry::Submenu {
@@ -399,20 +423,28 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
             // Check if a CUE file exists in the directory.
-            let has_cue = entry.path.parent()
+            let has_cue = entry
+                .path
+                .parent()
                 .and_then(|d| std::fs::read_dir(d).ok())
-                .map(|entries| entries
-                    .filter_map(|e| e.ok())
-                    .any(|e| e.path().extension()
-                        .map(|ext| ext.to_ascii_lowercase() == "cue")
-                        .unwrap_or(false)))
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok()).any(|e| {
+                        e.path()
+                            .extension()
+                            .map(|ext| ext.to_ascii_lowercase() == "cue")
+                            .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
             items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(true));
-            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+            items.push(item(
+                "Copy path",
+                ContextAction::CopyPath(entry.path.clone()),
+            ));
         }
         EntryKind::Archive => {
             items.push(build_convert_submenu(app));
@@ -424,7 +456,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item("Set Password", ContextAction::SetArchivePassword));
             items.push(build_file_ops_submenu(false));
-            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+            items.push(item(
+                "Copy path",
+                ContextAction::CopyPath(entry.path.clone()),
+            ));
         }
         EntryKind::SacdIso => {
             // C5 surfaces ScarletBook metadata in a read-only editor;
@@ -445,7 +480,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(false));
-            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+            items.push(item(
+                "Copy path",
+                ContextAction::CopyPath(entry.path.clone()),
+            ));
         }
         EntryKind::Directory => {
             items.push(build_convert_submenu(app));
@@ -454,12 +492,16 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
             // Check if a CUE file exists inside the directory.
-            let has_cue = std::fs::read_dir(&entry.path).ok()
-                .map(|entries| entries
-                    .filter_map(|e| e.ok())
-                    .any(|e| e.path().extension()
-                        .map(|ext| ext.to_ascii_lowercase() == "cue")
-                        .unwrap_or(false)))
+            let has_cue = std::fs::read_dir(&entry.path)
+                .ok()
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok()).any(|e| {
+                        e.path()
+                            .extension()
+                            .map(|ext| ext.to_ascii_lowercase() == "cue")
+                            .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false);
             items.push(build_tagging_submenu(has_cue));
             items.push(build_disk_tools_submenu());
@@ -470,7 +512,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
             items.push(build_file_ops_submenu(false));
-            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+            items.push(item(
+                "Copy path",
+                ContextAction::CopyPath(entry.path.clone()),
+            ));
         }
         EntryKind::ParentDir => {
             items.push(item("Go up", ContextAction::OpenEntry));
@@ -492,7 +537,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
             items.push(build_file_ops_submenu(false));
-            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+            items.push(item(
+                "Copy path",
+                ContextAction::CopyPath(entry.path.clone()),
+            ));
         }
     }
 
@@ -627,9 +675,7 @@ pub fn execute_context_action(
             let cmd = super::command::Command::Queue { preset: None };
             super::command::execute_command(app, cmd, tx);
             if app.current_screen == AppScreen::Convert {
-                super::command::execute_command(
-                    app, super::command::Command::Commit { start }, tx,
-                );
+                super::command::execute_command(app, super::command::Command::Commit { start }, tx);
             }
         }
         ContextAction::ConvertWithPreset(name) => {
@@ -637,9 +683,7 @@ pub fn execute_context_action(
             let cmd = super::command::Command::Queue { preset: Some(name) };
             super::command::execute_command(app, cmd, tx);
             if app.current_screen == AppScreen::Convert {
-                super::command::execute_command(
-                    app, super::command::Command::Commit { start }, tx,
-                );
+                super::command::execute_command(app, super::command::Command::Commit { start }, tx);
             }
         }
         ContextAction::Select => {
@@ -650,7 +694,10 @@ pub fn execute_context_action(
         ContextAction::SelectAll => {
             if app.current_screen == AppScreen::Browse {
                 use super::browse::EntryKind;
-                let paths: Vec<std::path::PathBuf> = app.browse.entries.iter()
+                let paths: Vec<std::path::PathBuf> = app
+                    .browse
+                    .entries
+                    .iter()
                     .filter(|e| !matches!(e.kind, EntryKind::ParentDir))
                     .map(|e| e.path.clone())
                     .collect();
@@ -660,7 +707,10 @@ pub fn execute_context_action(
         ContextAction::SelectInverse => {
             if app.current_screen == AppScreen::Browse {
                 use super::browse::EntryKind;
-                let new_sel: Vec<std::path::PathBuf> = app.browse.entries.iter()
+                let new_sel: Vec<std::path::PathBuf> = app
+                    .browse
+                    .entries
+                    .iter()
                     .filter(|e| !matches!(e.kind, EntryKind::ParentDir))
                     .filter(|e| !app.browse.multi_selected.iter().any(|p| *p == e.path))
                     .map(|e| e.path.clone())
@@ -760,7 +810,9 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::GenerateCueMultiFile => {
-            let cmd = super::command::Command::GenerateCue { single_image: false };
+            let cmd = super::command::Command::GenerateCue {
+                single_image: false,
+            };
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::GenerateCueSingleImage => {
@@ -768,7 +820,9 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::GenerateCueMbMultiFile => {
-            let cmd = super::command::Command::GenerateCueMb { single_image: false };
+            let cmd = super::command::Command::GenerateCueMb {
+                single_image: false,
+            };
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::GenerateCueMbSingleImage => {
@@ -808,9 +862,8 @@ pub fn execute_context_action(
                 let cursor = state.cursor;
                 if let Some(entry) = state.entries.get(cursor) {
                     if !entry.is_binary {
-                        state.edit_input = Some(
-                            super::text_input::TextInputState::new(entry.value.clone()),
-                        );
+                        state.edit_input =
+                            Some(super::text_input::TextInputState::new(entry.value.clone()));
                         state.phase = super::app::MetadataEditorPhase::InlineEdit;
                     }
                 }
@@ -852,7 +905,9 @@ pub fn execute_context_action(
                 let entry = match state.entries.get(cursor) {
                     Some(e) if super::probe::is_synthetic_preview(e) => e,
                     _ => {
-                        app.set_status("View CUE: cursor row has no embedded CUE sheet".to_string());
+                        app.set_status(
+                            "View CUE: cursor row has no embedded CUE sheet".to_string(),
+                        );
                         app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                         return;
                     }
@@ -957,13 +1012,16 @@ pub fn execute_context_action(
         ContextAction::QueryGnudb => {
             // Collect audio file paths, group by disc, query GNUDB.
             let paths = super::command::collect_selection_for_file_ops(app);
-            let mut audio_paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&paths)
-                .into_iter()
-                .filter(|p| matches!(
-                    super::browse::classify_file(p),
-                    super::browse::EntryKind::AudioFile(_)
-                ))
-                .collect();
+            let mut audio_paths: Vec<std::path::PathBuf> =
+                super::browse::expand_paths_to_audio(&paths)
+                    .into_iter()
+                    .filter(|p| {
+                        matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        )
+                    })
+                    .collect();
             super::probe::sort_paths_by_track(&mut audio_paths);
 
             // Check for single-image CUE layout (one audio file + CUE sheet).
@@ -971,7 +1029,11 @@ pub fn execute_context_action(
                 let dir = if audio_paths.is_empty() {
                     let sel_dir = super::command::collect_selection_for_file_ops(app);
                     sel_dir.first().and_then(|p| {
-                        if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }
+                        if p.is_dir() {
+                            Some(p.clone())
+                        } else {
+                            p.parent().map(|d| d.to_path_buf())
+                        }
                     })
                 } else {
                     audio_paths[0].parent().map(|d| d.to_path_buf())
@@ -993,36 +1055,46 @@ pub fn execute_context_action(
             if disc_groups.len() == 1 {
                 // Single disc — original flow.
                 let (_, group_paths) = &disc_groups[0];
-                let durations = super::gnudb::collect_durations(
-                    group_paths, &app.browse.probe_cache,
-                );
+                let durations =
+                    super::gnudb::collect_durations(group_paths, &app.browse.probe_cache);
                 if durations.len() != group_paths.len() {
                     app.set_status("Probe all files first (some durations missing)");
                     return;
                 }
                 let disc_id = super::gnudb::compute_disc_id(&durations);
-                app.set_status(format!("Querying gnudb.org (disc ID: {})...", disc_id.disc_id));
+                app.set_status(format!(
+                    "Querying gnudb.org (disc ID: {})...",
+                    disc_id.disc_id
+                ));
                 let paths_for_editor = group_paths.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let result = super::gnudb::query_gnudb(&disc_id).await;
-                    let _ = tx.send(super::message::AppMessage::GnudbQueryComplete {
-                        result,
-                        paths: paths_for_editor,
-                    }).await;
+                    let _ = tx
+                        .send(super::message::AppMessage::GnudbQueryComplete {
+                            result,
+                            paths: paths_for_editor,
+                        })
+                        .await;
                 });
             } else {
                 // Multi-disc — query each disc sequentially in one task.
                 app.set_status(format!(
-                    "Querying gnudb.org ({} discs)...", disc_groups.len(),
+                    "Querying gnudb.org ({} discs)...",
+                    disc_groups.len(),
                 ));
                 // Pre-compute durations and disc IDs before spawning.
-                let mut disc_queries: Vec<(String, super::gnudb::DiscIdResult, Vec<std::path::PathBuf>)> = Vec::new();
+                let mut disc_queries: Vec<(
+                    String,
+                    super::gnudb::DiscIdResult,
+                    Vec<std::path::PathBuf>,
+                )> = Vec::new();
                 for (label, group_paths) in disc_groups {
-                    let durations = super::gnudb::collect_durations(
-                        &group_paths, &app.browse.probe_cache,
-                    );
-                    if durations.len() != group_paths.len() { continue; }
+                    let durations =
+                        super::gnudb::collect_durations(&group_paths, &app.browse.probe_cache);
+                    if durations.len() != group_paths.len() {
+                        continue;
+                    }
                     let disc_id = super::gnudb::compute_disc_id(&durations);
                     disc_queries.push((label, disc_id, group_paths));
                 }
@@ -1036,15 +1108,19 @@ pub fn execute_context_action(
                     for (label, disc_id, group_paths) in disc_queries {
                         if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
                             if let Some(m) = matches.first() {
-                                if let Ok(entry) = super::gnudb::read_gnudb(&m.category, &m.disc_id).await {
+                                if let Ok(entry) =
+                                    super::gnudb::read_gnudb(&m.category, &m.disc_id).await
+                                {
                                     all_entries.push((label, entry, group_paths));
                                 }
                             }
                         }
                     }
-                    let _ = tx.send(super::message::AppMessage::GnudbMultiDiscComplete {
-                        entries: all_entries,
-                    }).await;
+                    let _ = tx
+                        .send(super::message::AppMessage::GnudbMultiDiscComplete {
+                            entries: all_entries,
+                        })
+                        .await;
                 });
             }
         }
@@ -1058,20 +1134,26 @@ pub fn execute_context_action(
             let audio_paths: Vec<std::path::PathBuf> = paths
                 .into_iter()
                 .filter(|p| {
-                    app.browse.entries.iter().any(|e| {
-                        e.path == *p
-                            && matches!(e.kind, EntryKind::AudioFile(_))
-                    })
+                    app.browse
+                        .entries
+                        .iter()
+                        .any(|e| e.path == *p && matches!(e.kind, EntryKind::AudioFile(_)))
                 })
                 .collect();
             super::keybindings::open_bulk_rename(app, audio_paths);
         }
         ContextAction::CopyTo => {
-            let cmd = super::command::Command::Copy { dest: String::new(), force: false };
+            let cmd = super::command::Command::Copy {
+                dest: String::new(),
+                force: false,
+            };
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::MoveTo => {
-            let cmd = super::command::Command::Move { dest: String::new(), force: false };
+            let cmd = super::command::Command::Move {
+                dest: String::new(),
+                force: false,
+            };
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::Refresh => {
@@ -1235,21 +1317,28 @@ fn launch_single_image_gnudb(
     app: &mut AppState,
     tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
 ) {
-    let durations: Vec<f64> = info.track_boundaries.iter()
+    let durations: Vec<f64> = info
+        .track_boundaries
+        .iter()
         .map(|&(_, count)| count as f64 / info.sample_rate as f64)
         .collect();
     let disc_id = super::gnudb::compute_disc_id(&durations);
-    app.set_status(format!("Querying gnudb.org (single image, disc ID: {})...", disc_id.disc_id));
+    app.set_status(format!(
+        "Querying gnudb.org (single image, disc ID: {})...",
+        disc_id.disc_id
+    ));
     let paths_for_editor: Vec<std::path::PathBuf> = (0..info.sheet.tracks.len())
         .map(|_| info.audio_path.clone())
         .collect();
     let tx = tx.clone();
     tokio::spawn(async move {
         let result = super::gnudb::query_gnudb(&disc_id).await;
-        let _ = tx.send(super::message::AppMessage::GnudbQueryComplete {
-            result,
-            paths: paths_for_editor,
-        }).await;
+        let _ = tx
+            .send(super::message::AppMessage::GnudbQueryComplete {
+                result,
+                paths: paths_for_editor,
+            })
+            .await;
     });
 }
 
@@ -1274,21 +1363,24 @@ mod tests {
     }
 
     fn submenu(label: &str, children: Vec<ContextMenuEntry>) -> ContextMenuEntry {
-        ContextMenuEntry::Submenu { label: label.to_string(), children }
+        ContextMenuEntry::Submenu {
+            label: label.to_string(),
+            children,
+        }
     }
 
     /// Synthesize a 4-deep cascade: A > B > C > D.
     fn deep_4_menu() -> ContextMenuEntry {
-        submenu("A", vec![
-            submenu("B", vec![
-                submenu("C", vec![
-                    leaf("D-1"),
-                    leaf("D-2"),
-                ]),
-                leaf("C-leaf"),
-            ]),
-            leaf("B-leaf"),
-        ])
+        submenu(
+            "A",
+            vec![
+                submenu(
+                    "B",
+                    vec![submenu("C", vec![leaf("D-1"), leaf("D-2")]), leaf("C-leaf")],
+                ),
+                leaf("B-leaf"),
+            ],
+        )
     }
 
     #[test]
@@ -1326,11 +1418,13 @@ mod tests {
         let level1 = MenuLevel::new(vec![submenu("AA", vec![leaf("end")])]);
         let level2 = MenuLevel::new(vec![leaf("end")]);
         let levels = vec![level1, level2];
-        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
-            &levels, (5, 5), 200, 24,
-        );
+        let (rects, _preview) =
+            super::super::keybindings::context_menu_stack_rects(&levels, (5, 5), 200, 24);
         assert_eq!(rects[0].x, 5, "root should sit at its anchor");
-        assert!(rects[1].x >= rects[0].x, "level 2 should cascade right of root");
+        assert!(
+            rects[1].x >= rects[0].x,
+            "level 2 should cascade right of root"
+        );
     }
 
     #[test]
@@ -1340,14 +1434,14 @@ mod tests {
         let level1 = MenuLevel::new(vec![submenu("AAAAAAAAAA", vec![leaf("end")])]);
         let level2 = MenuLevel::new(vec![leaf("noop")]);
         let levels = vec![level1, level2];
-        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
-            &levels, (75, 5), 80, 24,
-        );
+        let (rects, _preview) =
+            super::super::keybindings::context_menu_stack_rects(&levels, (75, 5), 80, 24);
         assert!(rects[0].x + rects[0].width <= 80, "root must fit on screen");
         assert!(
             rects[1].x + rects[1].width <= rects[0].x + 1,
             "level 2 should be entirely left of root; got level2.right={}, root.x={}",
-            rects[1].x + rects[1].width, rects[0].x,
+            rects[1].x + rects[1].width,
+            rects[0].x,
         );
     }
 
@@ -1357,14 +1451,18 @@ mod tests {
         let level2 = MenuLevel::new(vec![submenu("BBBBBBBBBB", vec![leaf("end")])]);
         let level3 = MenuLevel::new(vec![leaf("end")]);
         let levels = vec![level1, level2, level3];
-        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
-            &levels, (75, 5), 80, 24,
+        let (rects, _preview) =
+            super::super::keybindings::context_menu_stack_rects(&levels, (75, 5), 80, 24);
+        assert!(
+            rects[1].x + rects[1].width <= rects[0].x + 1,
+            "level 2 should flip left at right edge"
         );
-        assert!(rects[1].x + rects[1].width <= rects[0].x + 1,
-            "level 2 should flip left at right edge");
-        assert!(rects[2].x + rects[2].width <= rects[1].x + 1,
+        assert!(
+            rects[2].x + rects[2].width <= rects[1].x + 1,
             "level 3 should inherit left direction (momentum); got level3.right={}, level2.x={}",
-            rects[2].x + rects[2].width, rects[1].x);
+            rects[2].x + rects[2].width,
+            rects[1].x
+        );
     }
 
     #[test]
@@ -1377,9 +1475,8 @@ mod tests {
         let level2 = MenuLevel::new(vec![submenu("BBBBBBBBBBBBBBBBBBBB", vec![leaf("end")])]);
         let level3 = MenuLevel::new(vec![leaf("end")]);
         let levels = vec![level1, level2, level3];
-        let (rects, _preview) = super::super::keybindings::context_menu_stack_rects(
-            &levels, (5, 5), 30, 24,
-        );
+        let (rects, _preview) =
+            super::super::keybindings::context_menu_stack_rects(&levels, (5, 5), 30, 24);
         // Sanity: function returned, rects are non-empty.
         assert!(!rects.is_empty());
     }
@@ -1393,8 +1490,10 @@ mod tests {
             TagEntry {
                 display_key: "TITLE".into(),
                 item_key: lofty::tag::ItemKey::TrackTitle,
-                value: "x".into(), original: "x".into(),
-                is_binary: false, is_mixed: false,
+                value: "x".into(),
+                original: "x".into(),
+                is_binary: false,
+                is_mixed: false,
                 per_file_values: vec!["x".into()],
                 per_file_originals: vec!["x".into()],
                 mb_proposed_value: None,
@@ -1405,7 +1504,8 @@ mod tests {
                 item_key: lofty::tag::ItemKey::Unknown("CUESHEET".into()),
                 value: "FILE \"a.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".into(),
                 original: "".into(),
-                is_binary: true, is_mixed: false,
+                is_binary: true,
+                is_mixed: false,
                 per_file_values: vec!["FILE \"a.flac\" FLAC\n".into()],
                 per_file_originals: vec!["".into()],
                 mb_proposed_value: None,
@@ -1415,12 +1515,26 @@ mod tests {
         let state = MetadataEditorState {
             paths: vec![std::path::PathBuf::from("/tmp/a.flac")],
             entries,
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: Vec::new(),
+            dirty: false,
+            deleted: Vec::new(),
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false, sacd_sidecar_path: None, sacd_area_kind: None, sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
 
         // Row 0 = TITLE: no View entry.
@@ -1437,8 +1551,11 @@ mod tests {
             ContextMenuEntry::Item(item) => Some(item.label.clone()),
             _ => None,
         });
-        assert_eq!(first_label.as_deref(), Some("View CUE sheet"),
-            "CUESHEET row's first entry must be View CUE sheet");
+        assert_eq!(
+            first_label.as_deref(),
+            Some("View CUE sheet"),
+            "CUESHEET row's first entry must be View CUE sheet"
+        );
     }
 
     #[test]
@@ -1448,7 +1565,12 @@ mod tests {
         let ContextMenuEntry::Submenu { children, .. } = v else {
             panic!("Disk Tools must be a Submenu");
         };
-        let has_nested = children.iter().any(|e| matches!(e, ContextMenuEntry::Submenu { .. }));
-        assert!(has_nested, "expected nested submenu inside Disk Tools (AccurateRip / CUETools DB)");
+        let has_nested = children
+            .iter()
+            .any(|e| matches!(e, ContextMenuEntry::Submenu { .. }));
+        assert!(
+            has_nested,
+            "expected nested submenu inside Disk Tools (AccurateRip / CUETools DB)"
+        );
     }
 }

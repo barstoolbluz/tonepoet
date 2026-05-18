@@ -199,14 +199,17 @@ impl LdaClassifier {
         let mut feature_stds = [0.0f64; NUM_FEATURES];
         let n = all_features.len() as f64;
         for i in 0..NUM_FEATURES {
-            let var: f64 = all_features.iter()
+            let var: f64 = all_features
+                .iter()
                 .map(|f| (f[i] - feature_means[i]).powi(2))
-                .sum::<f64>() / (n - 1.0);
+                .sum::<f64>()
+                / (n - 1.0);
             feature_stds[i] = var.sqrt().max(1e-10); // Floor to avoid div-by-zero.
         }
 
         // Standardize all features.
-        let standardized: Vec<([f64; NUM_FEATURES], bool)> = valid.iter()
+        let standardized: Vec<([f64; NUM_FEATURES], bool)> = valid
+            .iter()
             .map(|(f, label)| {
                 let mut z = [0.0; NUM_FEATURES];
                 for i in 0..NUM_FEATURES {
@@ -217,9 +220,15 @@ impl LdaClassifier {
             .collect();
 
         let pe_std: Vec<&[f64; NUM_FEATURES]> = standardized
-            .iter().filter(|(_, l)| *l).map(|(f, _)| f).collect();
+            .iter()
+            .filter(|(_, l)| *l)
+            .map(|(f, _)| f)
+            .collect();
         let non_pe_std: Vec<&[f64; NUM_FEATURES]> = standardized
-            .iter().filter(|(_, l)| !*l).map(|(f, _)| f).collect();
+            .iter()
+            .filter(|(_, l)| !*l)
+            .map(|(f, _)| f)
+            .collect();
 
         // Step 4: LDA on standardized features.
         let mu_pe = class_mean(&pe_std);
@@ -234,8 +243,8 @@ impl LdaClassifier {
 
         let mut pooled_cov = [0.0f64; NUM_FEATURES * NUM_FEATURES];
         for i in 0..NUM_FEATURES * NUM_FEATURES {
-            pooled_cov[i] = ((n_pe - 1.0) * cov_pe[i] + (n_non - 1.0) * cov_non_pe[i])
-                / (n_total - 2.0);
+            pooled_cov[i] =
+                ((n_pe - 1.0) * cov_pe[i] + (n_non - 1.0) * cov_non_pe[i]) / (n_total - 2.0);
         }
 
         let mut mu_diff = [0.0f64; NUM_FEATURES];
@@ -278,7 +287,11 @@ impl LdaClassifier {
 
         // Equal-prior boundary on standardized scores.
         let proj_pe: f64 = mu_pe.iter().zip(weights.iter()).map(|(&m, &w)| m * w).sum();
-        let proj_non: f64 = mu_non_pe.iter().zip(weights.iter()).map(|(&m, &w)| m * w).sum();
+        let proj_non: f64 = mu_non_pe
+            .iter()
+            .zip(weights.iter())
+            .map(|(&m, &w)| m * w)
+            .sum();
         let bias = -(proj_pe + proj_non) / 2.0;
 
         Ok(Self {
@@ -402,7 +415,11 @@ fn compute_feature_impute(samples: &[(TrackFeatures, bool)]) -> [f64; NUM_FEATUR
         }
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = values.len();
-        impute[i] = if n % 2 == 1 { values[n / 2] } else { (values[n / 2 - 1] + values[n / 2]) / 2.0 };
+        impute[i] = if n % 2 == 1 {
+            values[n / 2]
+        } else {
+            (values[n / 2 - 1] + values[n / 2]) / 2.0
+        };
     }
     impute
 }
@@ -769,7 +786,9 @@ impl CvCalibrationReport {
     /// Backward-compatible alias that preserves the historic "ungated" meaning:
     /// return the full held-out audit table without filtering on deployment
     /// gates.
-    #[deprecated(note = "use calibration_records for the full audit table, fit_calibration_records for calibrator fitting, or gate_passing_calibration_records for gate-filtered audit")]
+    #[deprecated(
+        note = "use calibration_records for the full audit table, fit_calibration_records for calibrator fitting, or gate_passing_calibration_records for gate-filtered audit"
+    )]
     pub fn ungated_calibration_records(&self) -> Vec<&CalibrationRecord> {
         self.calibration_records.iter().collect()
     }
@@ -793,7 +812,8 @@ pub fn grouped_cv_train(
     samples: &[(TrackFeatures, bool, String)],
     k_folds: usize,
 ) -> Result<(LdaClassifier, f64, f64), String> {
-    let (classifier, metrics) = grouped_cv_train_detailed(samples, k_folds, DEFAULT_TARGET_TRACK_FPR)?;
+    let (classifier, metrics) =
+        grouped_cv_train_detailed(samples, k_folds, DEFAULT_TARGET_TRACK_FPR)?;
     Ok((classifier, metrics.track_accuracy, metrics.track_fpr))
 }
 
@@ -808,11 +828,8 @@ pub fn grouped_cv_train_detailed(
     k_folds: usize,
     target_track_fpr: f64,
 ) -> Result<(LdaClassifier, CvMetrics), String> {
-    let (classifier, report) = grouped_cv_train_with_calibration_report(
-        samples,
-        k_folds,
-        target_track_fpr,
-    )?;
+    let (classifier, report) =
+        grouped_cv_train_with_calibration_report(samples, k_folds, target_track_fpr)?;
     Ok((classifier, report.metrics))
 }
 
@@ -841,12 +858,18 @@ pub fn grouped_cv_train_with_calibration_report(
 
     let groups = build_group_stats(samples);
     if groups.len() < k_folds {
-        return Err(format!("only {} groups for {} folds", groups.len(), k_folds));
+        return Err(format!(
+            "only {} groups for {} folds",
+            groups.len(),
+            k_folds
+        ));
     }
 
     let folds = assign_groups_to_folds(&groups, k_folds);
     if folds.iter().any(|fold| fold.groups.is_empty()) {
-        return Err(String::from("at least one fold ended up empty; need more balanced groups"));
+        return Err(String::from(
+            "at least one fold ended up empty; need more balanced groups",
+        ));
     }
     validate_assigned_folds(samples, &folds)?;
 
@@ -868,7 +891,9 @@ pub fn grouped_cv_train_with_calibration_report(
             .collect();
 
         if train.is_empty() || test.is_empty() {
-            return Err(String::from("encountered empty train/test partition during CV"));
+            return Err(String::from(
+                "encountered empty train/test partition during CV",
+            ));
         }
 
         let train_pos = train.iter().filter(|(_, label)| *label).count();
@@ -949,15 +974,18 @@ pub fn grouped_cv_train_with_calibration_report(
 }
 
 fn build_group_stats(samples: &[(TrackFeatures, bool, String)]) -> Vec<GroupStats> {
-    let mut by_group: std::collections::BTreeMap<String, GroupStats> = std::collections::BTreeMap::new();
+    let mut by_group: std::collections::BTreeMap<String, GroupStats> =
+        std::collections::BTreeMap::new();
     for (features, label, group_id) in samples {
-        let entry = by_group.entry(group_id.clone()).or_insert_with(|| GroupStats {
-            group_id: group_id.clone(),
-            pe_count: 0,
-            non_pe_count: 0,
-            eligible_pe_count: 0,
-            eligible_non_pe_count: 0,
-        });
+        let entry = by_group
+            .entry(group_id.clone())
+            .or_insert_with(|| GroupStats {
+                group_id: group_id.clone(),
+                pe_count: 0,
+                non_pe_count: 0,
+                eligible_pe_count: 0,
+                eligible_non_pe_count: 0,
+            });
         if *label {
             entry.pe_count += 1;
         } else {
@@ -991,10 +1019,12 @@ fn assign_groups_to_folds(groups: &[GroupStats], k_folds: usize) -> Vec<FoldStat
     // then round-robin assign within each class. This guarantees both
     // classes are distributed across all folds, which greedy assignment
     // can fail to do when groups are single-class (PE-only or non-PE-only).
-    let mut pe_groups: Vec<&GroupStats> = groups.iter()
+    let mut pe_groups: Vec<&GroupStats> = groups
+        .iter()
         .filter(|g| g.pe_count > g.non_pe_count)
         .collect();
-    let mut non_pe_groups: Vec<&GroupStats> = groups.iter()
+    let mut non_pe_groups: Vec<&GroupStats> = groups
+        .iter()
         .filter(|g| g.non_pe_count >= g.pe_count)
         .collect();
 
@@ -1104,9 +1134,7 @@ fn threshold_tuning_predictions(
     if eligible_pos < MIN_CLASS_SAMPLES || eligible_neg < MIN_CLASS_SAMPLES {
         return Err(format!(
             "too few threshold-tuning samples after gating: {} PE, {} non-PE (need {}+ each)",
-            eligible_pos,
-            eligible_neg,
-            MIN_CLASS_SAMPLES
+            eligible_pos, eligible_neg, MIN_CLASS_SAMPLES
         ));
     }
 
@@ -1139,7 +1167,10 @@ fn tune_threshold_for_target_fpr(predictions: &[OofPrediction], target_fpr: f64)
         return 0.0;
     }
 
-    let mut candidates: Vec<f64> = eligible_predictions.iter().map(|record| record.score).collect();
+    let mut candidates: Vec<f64> = eligible_predictions
+        .iter()
+        .map(|record| record.score)
+        .collect();
     candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     candidates.dedup_by(|a, b| (*a - *b).abs() <= SCORE_EPSILON);
 
@@ -1203,7 +1234,8 @@ fn evaluate_oof_predictions(
     let threshold_only_metrics = threshold_metrics_from_records(predictions, false);
     let gated_metrics = threshold_metrics_from_records(predictions, true);
 
-    let mut unique_thresholds: Vec<f64> = predictions.iter().map(|record| record.threshold).collect();
+    let mut unique_thresholds: Vec<f64> =
+        predictions.iter().map(|record| record.threshold).collect();
     unique_thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     unique_thresholds.dedup_by(|a, b| (*a - *b).abs() <= SCORE_EPSILON);
     let oof_unique_thresholds = unique_thresholds.len();
@@ -1335,8 +1367,8 @@ pub fn virtual_deemphasis_score(
     corpus: &CorpusModel,
     sample_rate: u32,
 ) -> f64 {
-    use rustfft::{num_complex::Complex, FftPlanner};
     use super::stft::FFT_SIZE;
+    use rustfft::{num_complex::Complex, FftPlanner};
 
     let window = hann_window(FFT_SIZE);
     let bin_ranges = compute_bin_ranges(sample_rate);
@@ -1373,7 +1405,11 @@ pub fn virtual_deemphasis_score(
                 continue;
             }
             let sum: f64 = power[lo..=hi].iter().sum();
-            bands[k] = if sum > 0.0 { 10.0 * sum.log10() } else { -120.0 };
+            bands[k] = if sum > 0.0 {
+                10.0 * sum.log10()
+            } else {
+                -120.0
+            };
         }
 
         let d_deemph = corpus.mahalanobis_distance(&bands);
@@ -1398,8 +1434,7 @@ fn track_gate_state(features: &TrackFeatures) -> (bool, bool, bool, bool) {
         || features.features[3] < (MIN_RELIABLE_FRAMES as f64).ln();
     let alpha_stability_missing = features.alpha_stability_missing;
     let alpha_unstable = !alpha_stability_missing
-        && (!features.features[4].is_finite()
-            || features.features[4] > features.alpha.abs() * 3.0);
+        && (!features.features[4].is_finite() || features.features[4] > features.alpha.abs() * 3.0);
 
     (
         alpha_negative,
@@ -1559,7 +1594,9 @@ impl TrackSummary {
             deemph_delta: features.features[2],
             quiet_p75_alpha: multi_alpha.map(|m| m.quiet_p75).unwrap_or(f64::NAN),
             all_p75_alpha: multi_alpha.map(|m| m.all_p75).unwrap_or(f64::NAN),
-            fraction_positive_quiet: multi_alpha.map(|m| m.fraction_positive_quiet).unwrap_or(f64::NAN),
+            fraction_positive_quiet: multi_alpha
+                .map(|m| m.fraction_positive_quiet)
+                .unwrap_or(f64::NAN),
             frame_count,
             score_scale_fingerprint,
             gates_fired: track_gates_from_features(features),
@@ -1635,7 +1672,9 @@ impl TrackSummary {
 
     /// Deprecated: this constructor cannot bind the score to a verified model
     /// scale, so album pooling will reject the resulting summary.
-    #[deprecated(note = "use from_classifier or from_verdict_and_classifier so album pooling can verify score-scale compatibility")]
+    #[deprecated(
+        note = "use from_classifier or from_verdict_and_classifier so album pooling can verify score-scale compatibility"
+    )]
     pub fn from_score_and_features(
         score: f64,
         features: &TrackFeatures,
@@ -1689,7 +1728,9 @@ impl TrackSummary {
 
     /// Deprecated: this constructor cannot bind the verdict score to a verified model scale,
     /// so album pooling will reject the resulting summary.
-    #[deprecated(note = "use from_verdict_and_classifier so album pooling can verify score-scale compatibility")]
+    #[deprecated(
+        note = "use from_verdict_and_classifier so album pooling can verify score-scale compatibility"
+    )]
     pub fn from_verdict_and_features(
         verdict: &Verdict,
         features: &TrackFeatures,
@@ -1799,7 +1840,9 @@ pub fn album_pool(
 #[deprecated(
     note = "legacy zero-threshold pooling; prefer album_pool or album_pool_with_threshold"
 )]
-pub fn album_pool_legacy_zero_threshold(tracks: &[TrackSummary]) -> Result<AlbumPoolResult, String> {
+pub fn album_pool_legacy_zero_threshold(
+    tracks: &[TrackSummary],
+) -> Result<AlbumPoolResult, String> {
     Ok(album_pool_checked(tracks, 0.0))
 }
 
@@ -1885,27 +1928,33 @@ pub struct AlbumFeatures {
 /// This is the recommended pooling path per reasoning model guidance.
 /// Every track with usable frames contributes; tracks with missing/weak
 /// stability are downweighted rather than excluded.
-pub fn album_pool_soft(
-    tracks: &[TrackSummary],
-) -> (PreemphasisConfidence, AlbumFeatures) {
+pub fn album_pool_soft(tracks: &[TrackSummary]) -> (PreemphasisConfidence, AlbumFeatures) {
     let min_frames = MIN_RELIABLE_FRAMES;
 
     // Collect usable tracks (have enough frames and finite score).
     // Do NOT gate on alpha_stability_missing — downweight instead.
-    let usable: Vec<&TrackSummary> = tracks.iter()
+    let usable: Vec<&TrackSummary> = tracks
+        .iter()
         .filter(|t| t.frame_count >= min_frames && t.score.is_finite())
         .collect();
 
     let total_count = tracks.len();
 
     if usable.len() < 3 {
-        return (PreemphasisConfidence::Indeterminate, AlbumFeatures {
-            median_alpha: f64::NAN, trimmed_mean_alpha: f64::NAN,
-            fraction_positive_alpha: 0.0, median_pe_correlation: f64::NAN,
-            median_deemph_delta: f64::NAN, usable_track_count: usable.len(),
-            total_track_count: total_count, fraction_missing_stability: 1.0,
-            alpha_iqr: f64::NAN,
-        });
+        return (
+            PreemphasisConfidence::Indeterminate,
+            AlbumFeatures {
+                median_alpha: f64::NAN,
+                trimmed_mean_alpha: f64::NAN,
+                fraction_positive_alpha: 0.0,
+                median_pe_correlation: f64::NAN,
+                median_deemph_delta: f64::NAN,
+                usable_track_count: usable.len(),
+                total_track_count: total_count,
+                fraction_missing_stability: 1.0,
+                alpha_iqr: f64::NAN,
+            },
+        );
     }
 
     // Compute soft-weighted alpha values.
@@ -1914,10 +1963,14 @@ pub fn album_pool_soft(
     let mut stability_missing_count = 0usize;
 
     for t in &usable {
-        let has_stability_issue = t.gates_fired().iter()
+        let has_stability_issue = t
+            .gates_fired()
+            .iter()
             .any(|g| g == "alpha_stability_missing" || g == "alpha_unstable");
         let weight = if has_stability_issue { 0.5 } else { 1.0 };
-        if has_stability_issue { stability_missing_count += 1; }
+        if has_stability_issue {
+            stability_missing_count += 1;
+        }
         // Weight by repeating: weight=1.0 contributes once, weight=0.5 contributes half.
         // For median, we use the raw alpha but track the count for features.
         weighted_alphas.push(t.alpha() * weight);
@@ -1939,8 +1992,8 @@ pub fn album_pool_soft(
         median_alpha
     };
 
-    let fraction_positive_alpha = usable.iter()
-        .filter(|t| t.alpha() > 0.0).count() as f64 / n as f64;
+    let fraction_positive_alpha =
+        usable.iter().filter(|t| t.alpha() > 0.0).count() as f64 / n as f64;
 
     // IQR of alpha.
     let q1 = alphas[n / 4];
@@ -1961,12 +2014,20 @@ pub fn album_pool_soft(
         trimmed_mean_alpha,
         fraction_positive_alpha,
         median_pe_correlation: {
-            let mut v: Vec<f64> = usable.iter().map(|t| t.pe_correlation).filter(|x| x.is_finite()).collect();
+            let mut v: Vec<f64> = usable
+                .iter()
+                .map(|t| t.pe_correlation)
+                .filter(|x| x.is_finite())
+                .collect();
             v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             median_f64(&v)
         },
         median_deemph_delta: {
-            let mut v: Vec<f64> = usable.iter().map(|t| t.deemph_delta).filter(|x| x.is_finite()).collect();
+            let mut v: Vec<f64> = usable
+                .iter()
+                .map(|t| t.deemph_delta)
+                .filter(|x| x.is_finite())
+                .collect();
             v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             median_f64(&v)
         },
@@ -1987,10 +2048,7 @@ pub fn album_pool_soft(
         && alpha_iqr < median_alpha.abs() * 4.0
     {
         PreemphasisConfidence::StrongCandidate
-    } else if median_alpha > 0.0
-        && fraction_positive_alpha >= 0.60
-        && n >= 3
-    {
+    } else if median_alpha > 0.0 && fraction_positive_alpha >= 0.60 && n >= 3 {
         PreemphasisConfidence::Possible
     } else {
         PreemphasisConfidence::NotDetected
@@ -2001,9 +2059,14 @@ pub fn album_pool_soft(
 
 fn median_f64(sorted: &[f64]) -> f64 {
     let n = sorted.len();
-    if n == 0 { return f64::NAN; }
-    if n % 2 == 1 { sorted[n / 2] }
-    else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 }
+    if n == 0 {
+        return f64::NAN;
+    }
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
 }
 
 // ── Album-level feature extraction ─────────────────────────────────
@@ -2020,11 +2083,14 @@ pub const NUM_ALBUM_FEATURES: usize = 5;
 /// 4. median(deemph_delta) — virtual de-emphasis evidence
 /// 5. fraction of tracks with quiet_p75 > 0 — consistency
 pub fn extract_album_features(tracks: &[TrackSummary]) -> Option<[f64; NUM_ALBUM_FEATURES]> {
-    let usable: Vec<&TrackSummary> = tracks.iter()
+    let usable: Vec<&TrackSummary> = tracks
+        .iter()
         .filter(|t| t.frame_count >= MIN_RELIABLE_FRAMES && t.alpha.is_finite())
         .collect();
 
-    if usable.len() < 3 { return None; }
+    if usable.len() < 3 {
+        return None;
+    }
     let n = usable.len();
 
     // Feature 1: median(quiet_median_alpha) — the alpha field IS the quiet-frame median.
@@ -2033,27 +2099,50 @@ pub fn extract_album_features(tracks: &[TrackSummary]) -> Option<[f64; NUM_ALBUM
     let median_alpha = median_f64(&alphas);
 
     // Feature 2: median(quiet_p75_alpha) — captures sparse PE.
-    let mut p75s: Vec<f64> = usable.iter().map(|t| t.quiet_p75_alpha)
-        .filter(|x| x.is_finite()).collect();
+    let mut p75s: Vec<f64> = usable
+        .iter()
+        .map(|t| t.quiet_p75_alpha)
+        .filter(|x| x.is_finite())
+        .collect();
     p75s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_p75 = if !p75s.is_empty() { median_f64(&p75s) } else { 0.0 };
+    let median_p75 = if !p75s.is_empty() {
+        median_f64(&p75s)
+    } else {
+        0.0
+    };
 
     // Feature 3: median(pe_correlation) — best single discriminator (gap 0.396).
-    let mut pe_corrs: Vec<f64> = usable.iter().map(|t| t.pe_correlation)
-        .filter(|x| x.is_finite()).collect();
+    let mut pe_corrs: Vec<f64> = usable
+        .iter()
+        .map(|t| t.pe_correlation)
+        .filter(|x| x.is_finite())
+        .collect();
     pe_corrs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_pe_corr = if !pe_corrs.is_empty() { median_f64(&pe_corrs) } else { 0.0 };
+    let median_pe_corr = if !pe_corrs.is_empty() {
+        median_f64(&pe_corrs)
+    } else {
+        0.0
+    };
 
     // Feature 4: median(deemph_delta) — strong discriminator (gap 0.262).
-    let mut deltas: Vec<f64> = usable.iter().map(|t| t.deemph_delta)
-        .filter(|x| x.is_finite()).collect();
+    let mut deltas: Vec<f64> = usable
+        .iter()
+        .map(|t| t.deemph_delta)
+        .filter(|x| x.is_finite())
+        .collect();
     deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_deemph = if !deltas.is_empty() { median_f64(&deltas) } else { 0.0 };
+    let median_deemph = if !deltas.is_empty() {
+        median_f64(&deltas)
+    } else {
+        0.0
+    };
 
     // Feature 5: fraction of tracks with quiet_p75 > 0.
-    let frac_p75_positive = usable.iter()
+    let frac_p75_positive = usable
+        .iter()
         .filter(|t| t.quiet_p75_alpha.is_finite() && t.quiet_p75_alpha > 0.0)
-        .count() as f64 / n as f64;
+        .count() as f64
+        / n as f64;
 
     Some([
         median_alpha,
@@ -2096,9 +2185,13 @@ impl AlbumClassifier {
         let n = samples.len() as f64;
         let mut means = [0.0f64; NUM_ALBUM_FEATURES];
         for (x, _) in samples {
-            for i in 0..NUM_ALBUM_FEATURES { means[i] += x[i]; }
+            for i in 0..NUM_ALBUM_FEATURES {
+                means[i] += x[i];
+            }
         }
-        for m in means.iter_mut() { *m /= n; }
+        for m in means.iter_mut() {
+            *m /= n;
+        }
 
         let mut stds = [0.0f64; NUM_ALBUM_FEATURES];
         for (x, _) in samples {
@@ -2106,9 +2199,12 @@ impl AlbumClassifier {
                 stds[i] += (x[i] - means[i]).powi(2);
             }
         }
-        for s in stds.iter_mut() { *s = (*s / (n - 1.0)).sqrt().max(1e-10); }
+        for s in stds.iter_mut() {
+            *s = (*s / (n - 1.0)).sqrt().max(1e-10);
+        }
 
-        let standardized: Vec<([f64; NUM_ALBUM_FEATURES], f64)> = samples.iter()
+        let standardized: Vec<([f64; NUM_ALBUM_FEATURES], f64)> = samples
+            .iter()
             .map(|(x, label)| {
                 let mut z = [0.0; NUM_ALBUM_FEATURES];
                 for i in 0..NUM_ALBUM_FEATURES {
@@ -2166,7 +2262,10 @@ impl AlbumClassifier {
         for i in 0..NUM_ALBUM_FEATURES {
             z[i] = (features[i] - self.feature_means[i]) / self.feature_stds[i];
         }
-        let logit = self.bias + (0..NUM_ALBUM_FEATURES).map(|i| self.weights[i] * z[i]).sum::<f64>();
+        let logit = self.bias
+            + (0..NUM_ALBUM_FEATURES)
+                .map(|i| self.weights[i] * z[i])
+                .sum::<f64>();
         logit
     }
 
@@ -2201,44 +2300,73 @@ pub fn train_album_classifier_cv(
     k_folds: usize,
     lambda: f64,
     target_fpr: f64,
-) -> Result<(AlbumClassifier, f64, f64, f64), String> { // (classifier, accuracy, fpr, precision)
-    if k_folds < 2 { return Err("need at least 2 folds".into()); }
-
-    // Split groups into PE and non-PE, round-robin assign.
-    let mut groups: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
-    for (_, label, group) in album_samples {
-        let e = groups.entry(group.clone()).or_default();
-        if *label { e.0 += 1; } else { e.1 += 1; }
+) -> Result<(AlbumClassifier, f64, f64, f64), String> {
+    // (classifier, accuracy, fpr, precision)
+    if k_folds < 2 {
+        return Err("need at least 2 folds".into());
     }
 
-    let mut pe_groups: Vec<String> = groups.iter().filter(|(_, (p, _))| *p > 0).map(|(g, _)| g.clone()).collect();
-    let mut np_groups: Vec<String> = groups.iter().filter(|(_, (_, n))| *n > 0).map(|(g, _)| g.clone()).collect();
+    // Split groups into PE and non-PE, round-robin assign.
+    let mut groups: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for (_, label, group) in album_samples {
+        let e = groups.entry(group.clone()).or_default();
+        if *label {
+            e.0 += 1;
+        } else {
+            e.1 += 1;
+        }
+    }
+
+    let mut pe_groups: Vec<String> = groups
+        .iter()
+        .filter(|(_, (p, _))| *p > 0)
+        .map(|(g, _)| g.clone())
+        .collect();
+    let mut np_groups: Vec<String> = groups
+        .iter()
+        .filter(|(_, (_, n))| *n > 0)
+        .map(|(g, _)| g.clone())
+        .collect();
     pe_groups.sort();
     np_groups.sort();
 
     if pe_groups.len() < k_folds || np_groups.len() < k_folds {
-        return Err(format!("not enough groups: {} PE, {} non-PE for {} folds",
-            pe_groups.len(), np_groups.len(), k_folds));
+        return Err(format!(
+            "not enough groups: {} PE, {} non-PE for {} folds",
+            pe_groups.len(),
+            np_groups.len(),
+            k_folds
+        ));
     }
 
     // Round-robin fold assignment.
-    let mut fold_for_group: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, g) in pe_groups.iter().enumerate() { fold_for_group.insert(g.clone(), i % k_folds); }
-    for (i, g) in np_groups.iter().enumerate() { fold_for_group.insert(g.clone(), i % k_folds); }
+    let mut fold_for_group: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (i, g) in pe_groups.iter().enumerate() {
+        fold_for_group.insert(g.clone(), i % k_folds);
+    }
+    for (i, g) in np_groups.iter().enumerate() {
+        fold_for_group.insert(g.clone(), i % k_folds);
+    }
 
     let mut oof_scores: Vec<(f64, bool)> = Vec::new();
 
     for fold in 0..k_folds {
-        let train: Vec<([f64; NUM_ALBUM_FEATURES], bool)> = album_samples.iter()
+        let train: Vec<([f64; NUM_ALBUM_FEATURES], bool)> = album_samples
+            .iter()
             .filter(|(_, _, g)| fold_for_group.get(g).copied() != Some(fold))
             .map(|(f, l, _)| (*f, *l))
             .collect();
-        let test: Vec<([f64; NUM_ALBUM_FEATURES], bool)> = album_samples.iter()
+        let test: Vec<([f64; NUM_ALBUM_FEATURES], bool)> = album_samples
+            .iter()
             .filter(|(_, _, g)| fold_for_group.get(g).copied() == Some(fold))
             .map(|(f, l, _)| (*f, *l))
             .collect();
 
-        if train.is_empty() || test.is_empty() { continue; }
+        if train.is_empty() || test.is_empty() {
+            continue;
+        }
 
         let clf = AlbumClassifier::train(&train, lambda)?;
         for (features, label) in &test {
@@ -2259,10 +2387,20 @@ pub fn train_album_classifier_cv(
     let mut best_tp = 0usize;
 
     for &threshold in &candidates {
-        let mut tp = 0; let mut fp = 0; let mut neg = 0;
+        let mut tp = 0;
+        let mut fp = 0;
+        let mut neg = 0;
         for &(score, label) in &oof_scores {
-            if label { if score >= threshold { tp += 1; } }
-            else { neg += 1; if score >= threshold { fp += 1; } }
+            if label {
+                if score >= threshold {
+                    tp += 1;
+                }
+            } else {
+                neg += 1;
+                if score >= threshold {
+                    fp += 1;
+                }
+            }
         }
         let fpr = if neg > 0 { fp as f64 / neg as f64 } else { 0.0 };
         if fpr <= target_fpr && tp > best_tp {
@@ -2272,7 +2410,10 @@ pub fn train_album_classifier_cv(
     }
 
     // Evaluate at chosen threshold.
-    let mut tp = 0; let mut tn = 0; let mut fp = 0; let mut fn_c = 0;
+    let mut tp = 0;
+    let mut tn = 0;
+    let mut fp = 0;
+    let mut fn_c = 0;
     for &(score, label) in &oof_scores {
         let pred = score >= best_threshold;
         match (pred, label) {
@@ -2283,13 +2424,25 @@ pub fn train_album_classifier_cv(
         }
     }
     let total = (tp + tn + fp + fn_c) as f64;
-    let accuracy = if total > 0.0 { (tp + tn) as f64 / total } else { 0.0 };
-    let fpr = if fp + tn > 0 { fp as f64 / (fp + tn) as f64 } else { 0.0 };
-    let precision = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 0.0 };
+    let accuracy = if total > 0.0 {
+        (tp + tn) as f64 / total
+    } else {
+        0.0
+    };
+    let fpr = if fp + tn > 0 {
+        fp as f64 / (fp + tn) as f64
+    } else {
+        0.0
+    };
+    let precision = if tp + fp > 0 {
+        tp as f64 / (tp + fp) as f64
+    } else {
+        0.0
+    };
 
     // Train final on all data.
-    let all: Vec<([f64; NUM_ALBUM_FEATURES], bool)> = album_samples.iter()
-        .map(|(f, l, _)| (*f, *l)).collect();
+    let all: Vec<([f64; NUM_ALBUM_FEATURES], bool)> =
+        album_samples.iter().map(|(f, l, _)| (*f, *l)).collect();
     let final_clf = AlbumClassifier::train(&all, lambda)?.with_threshold(best_threshold);
 
     Ok((final_clf, accuracy, fpr, precision))
@@ -2312,10 +2465,7 @@ pub struct TrackPeClassifier {
 
 impl TrackPeClassifier {
     /// Train via gradient descent with L2 regularization.
-    pub fn train(
-        samples: &[(TrackShapeFeatures, bool)],
-        lambda: f64,
-    ) -> Result<Self, String> {
+    pub fn train(samples: &[(TrackShapeFeatures, bool)], lambda: f64) -> Result<Self, String> {
         let nf = NUM_SHAPE_FEATURES;
         if samples.len() < 20 {
             return Err(format!("too few track samples: {}", samples.len()));
@@ -2330,19 +2480,30 @@ impl TrackPeClassifier {
         let n = samples.len() as f64;
         let mut means = vec![0.0f64; nf];
         for (x, _) in samples {
-            for i in 0..nf { means[i] += x.features[i]; }
+            for i in 0..nf {
+                means[i] += x.features[i];
+            }
         }
-        for m in means.iter_mut() { *m /= n; }
+        for m in means.iter_mut() {
+            *m /= n;
+        }
 
         let mut stds = vec![0.0f64; nf];
         for (x, _) in samples {
-            for i in 0..nf { stds[i] += (x.features[i] - means[i]).powi(2); }
+            for i in 0..nf {
+                stds[i] += (x.features[i] - means[i]).powi(2);
+            }
         }
-        for s in stds.iter_mut() { *s = (*s / (n - 1.0)).sqrt().max(1e-10); }
+        for s in stds.iter_mut() {
+            *s = (*s / (n - 1.0)).sqrt().max(1e-10);
+        }
 
-        let standardized: Vec<(Vec<f64>, f64)> = samples.iter()
+        let standardized: Vec<(Vec<f64>, f64)> = samples
+            .iter()
             .map(|(x, label)| {
-                let z: Vec<f64> = (0..nf).map(|i| (x.features[i] - means[i]) / stds[i]).collect();
+                let z: Vec<f64> = (0..nf)
+                    .map(|i| (x.features[i] - means[i]) / stds[i])
+                    .collect();
                 (z, if *label { 1.0 } else { 0.0 })
             })
             .collect();
@@ -2364,7 +2525,9 @@ impl TrackPeClassifier {
                 let p = sigmoid(logit);
                 let cw = if *y > 0.5 { w_pos } else { w_neg };
                 let err = (p - y) * cw;
-                for i in 0..nf { grad_w[i] += err * x[i]; }
+                for i in 0..nf {
+                    grad_w[i] += err * x[i];
+                }
                 grad_b += err;
             }
 
@@ -2375,7 +2538,13 @@ impl TrackPeClassifier {
             b -= lr * grad_b / n;
         }
 
-        Ok(Self { weights: w, bias: b, threshold: 0.0, feature_means: means, feature_stds: stds })
+        Ok(Self {
+            weights: w,
+            bias: b,
+            threshold: 0.0,
+            feature_means: means,
+            feature_stds: stds,
+        })
     }
 
     /// Score a track. Higher = more PE-like.
@@ -2409,11 +2578,17 @@ impl TrackPeClassifier {
 pub const NUM_POOLED_ALBUM_FEATURES: usize = 5;
 
 /// Extract album features from pooled track PE scores.
-pub fn extract_pooled_album_features(track_scores: &[f64]) -> Option<[f64; NUM_POOLED_ALBUM_FEATURES]> {
-    let mut scores: Vec<f64> = track_scores.iter().copied()
+pub fn extract_pooled_album_features(
+    track_scores: &[f64],
+) -> Option<[f64; NUM_POOLED_ALBUM_FEATURES]> {
+    let mut scores: Vec<f64> = track_scores
+        .iter()
+        .copied()
         .filter(|s| s.is_finite())
         .collect();
-    if scores.len() < 3 { return None; }
+    if scores.len() < 3 {
+        return None;
+    }
 
     scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = scores.len();
@@ -2425,7 +2600,9 @@ pub fn extract_pooled_album_features(track_scores: &[f64]) -> Option<[f64; NUM_P
     let top_q_start = 3 * n / 4;
     let top_q_mean = if top_q_start < n {
         scores[top_q_start..].iter().sum::<f64>() / (n - top_q_start) as f64
-    } else { median };
+    } else {
+        median
+    };
 
     // 3. fraction above 0
     let frac_positive = scores.iter().filter(|&&s| s > 0.0).count() as f64 / n as f64;
@@ -2455,10 +2632,7 @@ pub fn train_pooled_album_classifier_cv(
 
 // ── Legacy threshold-based album pooling (kept for reference) ──────
 
-fn album_pool_checked(
-    tracks: &[TrackSummary],
-    track_threshold: f64,
-) -> AlbumPoolResult {
+fn album_pool_checked(tracks: &[TrackSummary], track_threshold: f64) -> AlbumPoolResult {
     let reliable: Vec<&TrackSummary> = tracks
         .iter()
         .filter(|track| track.eligible_for_pooling())

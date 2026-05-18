@@ -110,7 +110,9 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
             let age = entry.relative_time();
 
             let name_style = if is_selected {
-                Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::TEXT_BRIGHT)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::TEXT)
             };

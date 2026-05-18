@@ -8,9 +8,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::convert::{ConversionItem, ConversionPhase, ConversionStatus};
 use super::app::AppState;
 use super::button_map::TuiButton;
+use crate::convert::{ConversionItem, ConversionPhase, ConversionStatus};
 
 /// Draw the queue content area (item list + action bar)
 pub fn draw_queue_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
@@ -40,12 +40,10 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
     f.render_widget(block, area);
 
     if app.items_snapshot.is_empty() {
-        let empty = Paragraph::new(Line::from(vec![
-            Span::styled(
-                "No files in queue. Press 'a' to add files or 'f' to add a folder.",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+        let empty = Paragraph::new(Line::from(vec![Span::styled(
+            "No files in queue. Press 'a' to add files or 'f' to add a folder.",
+            Style::default().fg(Color::DarkGray),
+        )]));
         f.render_widget(empty, inner);
         return;
     }
@@ -63,8 +61,16 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         let item_area = Rect::new(inner.x, y, inner.width, 1);
 
         let is_hovered = app.hover_target == Some(TuiButton::QueueItem(idx));
-        draw_queue_item(f, item_area, item, idx == app.selected_index, is_hovered, app);
-        app.button_map.record_button(TuiButton::QueueItem(idx), item_area);
+        draw_queue_item(
+            f,
+            item_area,
+            item,
+            idx == app.selected_index,
+            is_hovered,
+            app,
+        );
+        app.button_map
+            .record_button(TuiButton::QueueItem(idx), item_area);
     }
 }
 
@@ -82,15 +88,24 @@ fn draw_queue_item(
     }
 
     // Selection indicator
-    let sel_char = if item.selected { "*" } else if is_selected { ">" } else { " " };
+    let sel_char = if item.selected {
+        "*"
+    } else if is_selected {
+        ">"
+    } else {
+        " "
+    };
     let sel_style = if is_selected {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
     // File name (truncated)
-    let name = item.input_path
+    let name = item
+        .input_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
@@ -108,19 +123,25 @@ fn draw_queue_item(
     let format_str = format!("{:>5}", item.output_format.name());
 
     // Status rendering
-    let (status_spans, _status_style) = render_item_status(item, area.width.saturating_sub(max_name_len as u16 + 12));
+    let (status_spans, _status_style) =
+        render_item_status(item, area.width.saturating_sub(max_name_len as u16 + 12));
 
     let mut spans = vec![
         Span::styled(format!("{} ", sel_char), sel_style),
         Span::styled(
             display_name,
             if is_selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             },
         ),
-        Span::styled(format!("  {} ", format_str), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("  {} ", format_str),
+            Style::default().fg(Color::Cyan),
+        ),
     ];
     spans.extend(status_spans);
 
@@ -137,7 +158,10 @@ fn draw_queue_item(
     f.render_widget(line, area);
 
     // For processing items, draw a progress bar overlay if we have enough width
-    if let ConversionStatus::Processing { progress, phase, .. } = &item.status {
+    if let ConversionStatus::Processing {
+        progress, phase, ..
+    } = &item.status
+    {
         let progress_width = area.width.saturating_sub(max_name_len as u16 + 12);
         if progress_width > 10 {
             let overall = *progress;
@@ -146,12 +170,7 @@ fn draw_queue_item(
                 .map(|p| p.short_name())
                 .unwrap_or("Processing");
 
-            let gauge_area = Rect::new(
-                area.x + max_name_len as u16 + 9,
-                area.y,
-                progress_width,
-                1,
-            );
+            let gauge_area = Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
 
             let color = phase_color(phase.as_ref());
             let pct = (overall / 100.0).clamp(0.0, 1.0);
@@ -168,15 +187,23 @@ fn draw_queue_item(
 fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>, Style) {
     match &item.status {
         ConversionStatus::NotConfigured => (
-            vec![Span::styled("Not Configured", Style::default().fg(Color::DarkGray))],
+            vec![Span::styled(
+                "Not Configured",
+                Style::default().fg(Color::DarkGray),
+            )],
             Style::default(),
         ),
         ConversionStatus::Queued => (
             vec![Span::styled("Queued", Style::default().fg(Color::White))],
             Style::default(),
         ),
-        ConversionStatus::Processing { progress, phase, .. } => {
-            let phase_name = phase.as_ref().map(|p| p.short_name()).unwrap_or("Processing");
+        ConversionStatus::Processing {
+            progress, phase, ..
+        } => {
+            let phase_name = phase
+                .as_ref()
+                .map(|p| p.short_name())
+                .unwrap_or("Processing");
             (
                 vec![Span::styled(
                     format!("{:.0}% {}", progress, phase_name),
@@ -189,7 +216,9 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             vec![Span::styled("Completed", Style::default().fg(Color::Green))],
             Style::default(),
         ),
-        ConversionStatus::Partial { successful, failed, .. } => (
+        ConversionStatus::Partial {
+            successful, failed, ..
+        } => (
             vec![Span::styled(
                 format!("Partial {}/{}", successful, successful + failed),
                 Style::default().fg(Color::Yellow),
@@ -216,7 +245,10 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             Style::default(),
         ),
         ConversionStatus::Cancelled => (
-            vec![Span::styled("Cancelled", Style::default().fg(Color::DarkGray))],
+            vec![Span::styled(
+                "Cancelled",
+                Style::default().fg(Color::DarkGray),
+            )],
             Style::default(),
         ),
     }
@@ -264,7 +296,8 @@ fn draw_action_bar(f: &mut Frame, area: Rect, app: &mut AppState) {
         }
         let pill = footer_pill_pub(label, *color);
         let pill_width = (label.len() + 2) as u16; // " label " padding
-        app.button_map.record_button(*btn, Rect::new(x, area.y, pill_width, 1));
+        app.button_map
+            .record_button(*btn, Rect::new(x, area.y, pill_width, 1));
         x += pill_width;
         spans.push(pill);
     }

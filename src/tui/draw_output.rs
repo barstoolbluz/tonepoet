@@ -17,7 +17,11 @@ pub fn draw_format_pane(f: &mut Frame, area: Rect, format_state: &FormatState, f
         return;
     }
 
-    let border_color = if focused { theme::GREEN } else { theme::TEXT_DIM };
+    let border_color = if focused {
+        theme::GREEN
+    } else {
+        theme::TEXT_DIM
+    };
     let w = area.width as usize;
 
     // Top border with title
@@ -47,31 +51,46 @@ pub fn draw_format_pane(f: &mut Frame, area: Rect, format_state: &FormatState, f
     let is_rg_focused = focused && format_state.field_focus == FormatField::ReplayGain;
 
     let format_row = pill_row(
-        border_color, w, "format     ", "",
+        border_color,
+        w,
+        "format     ",
+        "",
         &render_pill_spans(&format_state.format, is_format_focused),
         is_format_focused,
     );
 
     let rate_row = pill_row(
-        border_color, w, "sample rate", "kHz",
+        border_color,
+        w,
+        "sample rate",
+        "kHz",
         &render_pill_spans(&format_state.sample_rate, is_rate_focused),
         is_rate_focused,
     );
 
     let depth_row = pill_row(
-        border_color, w, "bit depth  ", "bit",
+        border_color,
+        w,
+        "bit depth  ",
+        "bit",
         &render_pill_spans(&format_state.bit_depth, is_depth_focused),
         is_depth_focused,
     );
 
     let dither_row = pill_row(
-        border_color, w, "dither     ", "",
+        border_color,
+        w,
+        "dither     ",
+        "",
         &render_pill_spans(&format_state.dither, is_dither_focused),
         is_dither_focused,
     );
 
     let rg_row = pill_row(
-        border_color, w, "replaygain ", "",
+        border_color,
+        w,
+        "replaygain ",
+        "",
         &render_pill_spans(&format_state.replaygain, is_rg_focused),
         is_rg_focused,
     );
@@ -100,7 +119,11 @@ fn pill_row<'a>(
     pills: &[Span<'a>],
     focused: bool,
 ) -> Line<'a> {
-    let label_style = if focused { theme::bright() } else { theme::muted() };
+    let label_style = if focused {
+        theme::bright()
+    } else {
+        theme::muted()
+    };
 
     let mut spans = vec![
         Span::styled("│", theme::border(border_color)),
@@ -122,7 +145,11 @@ fn pill_row<'a>(
 }
 
 /// Create a line with │ content ... │ border
-fn bordered_line<'a>(border_color: ratatui::style::Color, width: usize, content: Vec<Span<'a>>) -> Line<'a> {
+fn bordered_line<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    content: Vec<Span<'a>>,
+) -> Line<'a> {
     let content_width: usize = content.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(2 + content_width);
 

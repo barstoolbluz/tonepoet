@@ -12,10 +12,18 @@
 
 pub mod confidence;
 pub mod elapsed;
+pub mod heartbeat;
 pub mod operation;
+pub mod probes;
+pub mod streaming;
 pub mod throttle;
 
 pub use confidence::{ProgressConfidence, ProgressScope};
 pub use elapsed::{append_elapsed, format_elapsed, DEFAULT_ELAPSED_THRESHOLD};
+pub use heartbeat::{run_with_heartbeat, DEFAULT_HEARTBEAT_INTERVAL};
 pub use operation::OperationProgressTracker;
+pub use streaming::{
+    resolve_binary_with_tool_paths, run_streaming_tool_with_probe,
+    run_streaming_tool_with_probe_with_tool_paths, ProbeUpdate, StreamSource, StreamingHeartbeat,
+};
 pub use throttle::{ProgressThrottle, DEFAULT_MIN_INTERVAL, DEFAULT_MIN_PROGRESS_DELTA};

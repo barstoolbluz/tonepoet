@@ -45,30 +45,15 @@ pub fn resolve_template(
     }
 
     // Text fields
-    result = result.replace(
-        "%TITLE%",
-        meta.title.as_deref().unwrap_or(original_stem),
-    );
+    result = result.replace("%TITLE%", meta.title.as_deref().unwrap_or(original_stem));
     result = result.replace(
         "%ARTIST%",
         meta.artist.as_deref().unwrap_or("Unknown Artist"),
     );
-    result = result.replace(
-        "%ALBUM%",
-        meta.album.as_deref().unwrap_or("Unknown Album"),
-    );
-    result = result.replace(
-        "%YEAR%",
-        meta.year.as_deref().unwrap_or(""),
-    );
-    result = result.replace(
-        "%GENRE%",
-        meta.genre.as_deref().unwrap_or(""),
-    );
-    result = result.replace(
-        "%CATALOG%",
-        meta.catalog_number.as_deref().unwrap_or(""),
-    );
+    result = result.replace("%ALBUM%", meta.album.as_deref().unwrap_or("Unknown Album"));
+    result = result.replace("%YEAR%", meta.year.as_deref().unwrap_or(""));
+    result = result.replace("%GENRE%", meta.genre.as_deref().unwrap_or(""));
+    result = result.replace("%CATALOG%", meta.catalog_number.as_deref().unwrap_or(""));
     result = result.replace("%EXT%", extension);
 
     result
@@ -97,7 +82,13 @@ mod tests {
 
     #[test]
     fn basic_template() {
-        let meta = meta_with(Some("Kind of Blue"), Some("Miles Davis"), None, Some("1959"), Some(3));
+        let meta = meta_with(
+            Some("Kind of Blue"),
+            Some("Miles Davis"),
+            None,
+            Some("1959"),
+            Some(3),
+        );
         let result = resolve_template("%NN% - %TITLE% (%YEAR%)", &meta, "original", "flac");
         assert_eq!(result, "03 - Kind of Blue (1959)");
     }

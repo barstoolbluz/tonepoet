@@ -92,9 +92,7 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
 
     // Verify cursor is still on this path.
     let still_current = match &app.convert.source.mode {
-        super::app::SourceMode::Batch { paths, cursor, .. } => {
-            paths.get(*cursor) == Some(&path)
-        }
+        super::app::SourceMode::Batch { paths, cursor, .. } => paths.get(*cursor) == Some(&path),
         _ => false,
     };
 
@@ -108,7 +106,10 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
 }
 
 /// Fire a debounced search if the user has stopped typing for 200ms.
-fn check_search_debounce(app: &mut AppState, tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>) {
+fn check_search_debounce(
+    app: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
     if !app.browse.search.active {
         return;
     }
@@ -130,8 +131,7 @@ fn check_pending_browse_rename(app: &mut AppState) {
     };
 
     // Cancel if the user left the browse screen or has an overlay open already.
-    if app.current_screen != AppScreen::Browse
-        || !matches!(app.active_overlay, ActiveOverlay::None)
+    if app.current_screen != AppScreen::Browse || !matches!(app.active_overlay, ActiveOverlay::None)
     {
         app.pending_browse_rename = None;
         return;
@@ -170,15 +170,23 @@ fn check_pending_browse_rename(app: &mut AppState) {
 /// Handle async messages from background tasks
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
-        AppMessage::ConversionProgress { item_id, progress, status } => {
+        AppMessage::ConversionProgress {
+            item_id,
+            progress,
+            status,
+        } => {
             // Capture terminal state info BEFORE the status is moved into the item.
             let history_data = match &status {
-                crate::convert::ConversionStatus::Completed { output_path, .. } => {
-                    Some((true, Some(output_path.display().to_string()), None::<String>))
-                }
-                crate::convert::ConversionStatus::Partial { output_path, .. } => {
-                    Some((true, Some(output_path.display().to_string()), None::<String>))
-                }
+                crate::convert::ConversionStatus::Completed { output_path, .. } => Some((
+                    true,
+                    Some(output_path.display().to_string()),
+                    None::<String>,
+                )),
+                crate::convert::ConversionStatus::Partial { output_path, .. } => Some((
+                    true,
+                    Some(output_path.display().to_string()),
+                    None::<String>,
+                )),
                 crate::convert::ConversionStatus::Failed { error, .. } => {
                     Some((false, None, Some(error.clone())))
                 }
@@ -195,7 +203,8 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 if let Some(item) = app.items_snapshot.iter().find(|i| i.id == item_id) {
                     let now = chrono::Utc::now().to_rfc3339();
                     let rg_mode = if item.options.calculate_replaygain {
-                        item.options.replaygain_mode
+                        item.options
+                            .replaygain_mode
                             .as_ref()
                             .map(|m| format!("{:?}", m))
                     } else {
@@ -207,8 +216,15 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         Some(&format!("{:?}", item.input_format)),
                         item.output_format.name(),
                         item.options.target_sample_rate,
-                        item.options.target_bit_depth.map(|d| format!("{}", d)).as_deref(),
-                        item.options.dither_type.as_ref().map(|d| format!("{:?}", d)).as_deref(),
+                        item.options
+                            .target_bit_depth
+                            .map(|d| format!("{}", d))
+                            .as_deref(),
+                        item.options
+                            .dither_type
+                            .as_ref()
+                            .map(|d| format!("{:?}", d))
+                            .as_deref(),
                         rg_mode.as_deref(),
                         Some(item.file_size),
                         None, // output_size computed later by log writer if enabled
@@ -267,11 +283,14 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     info.metadata.preemphasis_metadata =
                         super::probe::preemphasis_metadata_check_pub(&path);
                     if let Ok(meta) = std::fs::metadata(&path) {
-                        let mtime = meta.modified()
+                        let mtime = meta
+                            .modified()
                             .map(crate::db::systemtime_to_unix)
                             .unwrap_or(0);
                         if let Some(analysis) = app.db.get_cached_analysis(
-                            &path.display().to_string(), mtime, meta.len(),
+                            &path.display().to_string(),
+                            mtime,
+                            meta.len(),
                         ) {
                             if analysis.hdcd_detected == Some(true) {
                                 info.metadata.hdcd_detail = analysis.hdcd_detail;
@@ -286,7 +305,8 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
 
                     // Persist to SQLite probe cache for cross-session reuse.
                     if let Ok(meta) = std::fs::metadata(&path) {
-                        let mtime = meta.modified()
+                        let mtime = meta
+                            .modified()
                             .map(crate::db::systemtime_to_unix)
                             .unwrap_or(0);
                         let row = crate::db::CachedProbeRow::from_cached_info(&info);
@@ -375,7 +395,8 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 Ok(result) => {
                     // Persist to SQLite analysis cache for cross-session reuse.
                     if let Ok(meta) = std::fs::metadata(&result.path) {
-                        let mtime = meta.modified()
+                        let mtime = meta
+                            .modified()
                             .map(crate::db::systemtime_to_unix)
                             .unwrap_or(0);
                         if let Err(e) = app.db.store_analysis(
@@ -394,10 +415,9 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         if let Some(Some(cached)) = app.browse.probe_cache.get(&result.path) {
                             let mut info = (**cached).clone();
                             info.metadata.hdcd_detail = result.hdcd_detail.clone();
-                            app.browse.probe_cache.insert(
-                                result.path.clone(),
-                                Some(std::sync::Arc::new(info)),
-                            );
+                            app.browse
+                                .probe_cache
+                                .insert(result.path.clone(), Some(std::sync::Arc::new(info)));
                         }
                     }
 
@@ -405,23 +425,36 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     if app.analysis_pending == 0 {
                         // Sort results by disc/track for logical display order.
                         {
-                            let mut result_paths: Vec<std::path::PathBuf> = app.analysis_results
-                                .iter().map(|r| r.path.clone()).collect();
+                            let mut result_paths: Vec<std::path::PathBuf> = app
+                                .analysis_results
+                                .iter()
+                                .map(|r| r.path.clone())
+                                .collect();
                             crate::tui::probe::sort_paths_by_track(&mut result_paths);
                             app.analysis_results.sort_by(|a, b| {
-                                let ai = result_paths.iter().position(|p| *p == a.path).unwrap_or(usize::MAX);
-                                let bi = result_paths.iter().position(|p| *p == b.path).unwrap_or(usize::MAX);
+                                let ai = result_paths
+                                    .iter()
+                                    .position(|p| *p == a.path)
+                                    .unwrap_or(usize::MAX);
+                                let bi = result_paths
+                                    .iter()
+                                    .position(|p| *p == b.path)
+                                    .unwrap_or(usize::MAX);
                                 ai.cmp(&bi)
                             });
                         }
                         let count = app.analysis_results.len();
                         let last = &app.analysis_results[count - 1];
-                        let name = last.path.file_name()
+                        let name = last
+                            .path
+                            .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
                         app.set_status(format!(
                             "Analyzed: {} — DR{} ({})",
-                            name, last.dr_value, super::analyze::dr_label(last.dr_value),
+                            name,
+                            last.dr_value,
+                            super::analyze::dr_label(last.dr_value),
                         ));
                         app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
                     }
@@ -440,11 +473,19 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             if app.preemph_pending == 0 {
                 // Sort by path for consistent display.
                 app.preemph_results.sort_by(|a, b| a.path.cmp(&b.path));
-                let detected = app.preemph_results.iter()
-                    .filter(|r| r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Detected)
+                let detected = app
+                    .preemph_results
+                    .iter()
+                    .filter(|r| {
+                        r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Detected
+                    })
                     .count();
-                let possible = app.preemph_results.iter()
-                    .filter(|r| r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Possible)
+                let possible = app
+                    .preemph_results
+                    .iter()
+                    .filter(|r| {
+                        r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Possible
+                    })
                     .count();
                 let total = app.preemph_results.len();
                 if detected > 0 || possible > 0 {
@@ -453,27 +494,22 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         detected, possible, total,
                     ));
                 } else {
-                    app.set_status(format!(
-                        "Pre-emphasis: not detected in {} file(s)",
-                        total,
-                    ));
+                    app.set_status(format!("Pre-emphasis: not detected in {} file(s)", total,));
                 }
                 app.active_overlay = super::app::ActiveOverlay::Preemphasis { scroll: 0 };
             }
         }
-        AppMessage::CorpusTrainComplete { result } => {
-            match result {
-                Ok((n_tracks, n_frames)) => {
-                    app.set_status(format!(
-                        "Corpus trained: {} tracks, {} frames",
-                        n_tracks, n_frames,
-                    ));
-                }
-                Err(e) => {
-                    app.set_status(format!("Corpus training failed: {}", e));
-                }
+        AppMessage::CorpusTrainComplete { result } => match result {
+            Ok((n_tracks, n_frames)) => {
+                app.set_status(format!(
+                    "Corpus trained: {} tracks, {} frames",
+                    n_tracks, n_frames,
+                ));
             }
-        }
+            Err(e) => {
+                app.set_status(format!("Corpus training failed: {}", e));
+            }
+        },
         AppMessage::CalibrationComplete { result } => {
             match result {
                 Ok((n_pe, n_non_pe, accuracy, fpr, threshold)) => {
@@ -494,14 +530,13 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 let identical = app.compare_results.iter().filter(|r| r.identical).count();
                 let differ = app.compare_results.len() - identical;
                 if differ == 0 {
-                    app.set_status(format!(
-                        "Compared {} pair(s): all bit-identical",
-                        identical,
-                    ));
+                    app.set_status(format!("Compared {} pair(s): all bit-identical", identical,));
                 } else {
                     app.set_status(format!(
                         "Compared {} pair(s): {} identical, {} differ",
-                        identical + differ, identical, differ,
+                        identical + differ,
+                        identical,
+                        differ,
                     ));
                 }
                 app.active_overlay = super::app::ActiveOverlay::BitCompare { scroll: 0 };
@@ -516,12 +551,18 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             if app.verify_pending == 0 {
                 // Sort by disc/track for logical display order.
                 {
-                    let mut result_paths: Vec<std::path::PathBuf> = app.verify_results
-                        .iter().map(|r| r.path.clone()).collect();
+                    let mut result_paths: Vec<std::path::PathBuf> =
+                        app.verify_results.iter().map(|r| r.path.clone()).collect();
                     crate::tui::probe::sort_paths_by_track(&mut result_paths);
                     app.verify_results.sort_by(|a, b| {
-                        let ai = result_paths.iter().position(|p| *p == a.path).unwrap_or(usize::MAX);
-                        let bi = result_paths.iter().position(|p| *p == b.path).unwrap_or(usize::MAX);
+                        let ai = result_paths
+                            .iter()
+                            .position(|p| *p == a.path)
+                            .unwrap_or(usize::MAX);
+                        let bi = result_paths
+                            .iter()
+                            .position(|p| *p == b.path)
+                            .unwrap_or(usize::MAX);
                         ai.cmp(&bi)
                     });
                 }
@@ -532,25 +573,31 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 } else {
                     app.set_status(format!(
                         "Verified {} file(s): {} passed, {} failed",
-                        passed + failed, passed, failed,
+                        passed + failed,
+                        passed,
+                        failed,
                     ));
                 }
                 app.active_overlay = super::app::ActiveOverlay::Verify { scroll: 0 };
             }
         }
-        AppMessage::PathValidationComplete { input, result } => {
-            match result {
-                Ok(path) => {
-                    let display = path.display().to_string();
-                    app.browse.navigate_to(path);
-                    app.set_status(&format!("cd: {}", display));
-                }
-                Err(e) => {
-                    app.set_status(&format!(":cd {}: {}", input, e));
-                }
+        AppMessage::PathValidationComplete { input, result } => match result {
+            Ok(path) => {
+                let display = path.display().to_string();
+                app.browse.navigate_to(path);
+                app.set_status(&format!("cd: {}", display));
             }
-        }
-        AppMessage::DirScanComplete { path, parent_entry, dirs, files, error } => {
+            Err(e) => {
+                app.set_status(&format!(":cd {}: {}", input, e));
+            }
+        },
+        AppMessage::DirScanComplete {
+            path,
+            parent_entry,
+            dirs,
+            files,
+            error,
+        } => {
             // Race protection: discard if user has navigated elsewhere.
             if app.browse.current_dir != path {
                 return;
@@ -592,7 +639,11 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             // Probe the newly selected entry.
             app.browse.probe_current_with_db(tx, Some(&app.db));
         }
-        AppMessage::MetadataWriteComplete { path, field, result } => {
+        AppMessage::MetadataWriteComplete {
+            path,
+            field,
+            result,
+        } => {
             // Step 3 (main thread): cleanup journal + backup, invalidate caches.
             let path_str = path.display().to_string();
             let backup = crate::db::Database::backup_path_for(&path);
@@ -620,24 +671,27 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
-        AppMessage::ArchiveListingComplete { archive_path, result, password } => {
-            match *result {
-                Ok(listing) => {
-                    let count = listing.entries.len();
-                    app.browse.enter_archive(listing, password);
-                    app.set_status(&format!(
-                        "Opened {} ({} entries)",
-                        archive_path.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        count,
-                    ));
-                }
-                Err(e) => {
-                    app.set_status(&format!("Archive error: {}", e));
-                }
+        AppMessage::ArchiveListingComplete {
+            archive_path,
+            result,
+            password,
+        } => match *result {
+            Ok(listing) => {
+                let count = listing.entries.len();
+                app.browse.enter_archive(listing, password);
+                app.set_status(&format!(
+                    "Opened {} ({} entries)",
+                    archive_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    count,
+                ));
             }
-        }
+            Err(e) => {
+                app.set_status(&format!("Archive error: {}", e));
+            }
+        },
         AppMessage::SearchComplete { results } => {
             if !app.browse.search.active {
                 return; // Search was closed while task was running.
@@ -662,19 +716,20 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         }
         AppMessage::MetadataEditorWriteComplete { results } => {
             let total = results.len();
-            let failed: Vec<_> = results.iter()
-                .filter(|(_, r)| r.is_err())
-                .collect();
+            let failed: Vec<_> = results.iter().filter(|(_, r)| r.is_err()).collect();
             if failed.is_empty() {
                 app.set_status(format!(
                     "Metadata saved ({} file{})",
-                    total, if total == 1 { "" } else { "s" },
+                    total,
+                    if total == 1 { "" } else { "s" },
                 ));
             } else {
                 let first_err = failed[0].1.as_ref().unwrap_err();
                 app.set_status(format!(
                     "Metadata: {} saved, {} failed — {}",
-                    total - failed.len(), failed.len(), first_err,
+                    total - failed.len(),
+                    failed.len(),
+                    first_err,
                 ));
             }
             // Invalidate caches for all written files.
@@ -694,7 +749,13 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         let result = super::gnudb::read_gnudb(&m.category, &m.disc_id).await;
-                        let _ = tx.send(AppMessage::GnudbReadComplete { result, paths, origin_matches: None }).await;
+                        let _ = tx
+                            .send(AppMessage::GnudbReadComplete {
+                                result,
+                                paths,
+                                origin_matches: None,
+                            })
+                            .await;
                     });
                 }
                 Ok(matches) if matches.is_empty() => {
@@ -715,7 +776,11 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
-        AppMessage::GnudbReadComplete { result, paths, origin_matches } => {
+        AppMessage::GnudbReadComplete {
+            result,
+            paths,
+            origin_matches,
+        } => {
             match result {
                 Ok(entry) => {
                     // Open GNUDB review overlay for user editing before accept.
@@ -723,7 +788,9 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     review.origin_matches = origin_matches;
                     app.set_status(format!(
                         "GNUDB: {} / {} ({} tracks) — review and edit",
-                        entry.artist, entry.album, entry.tracks.len(),
+                        entry.artist,
+                        entry.album,
+                        entry.tracks.len(),
                     ));
                     app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
                 }
@@ -744,7 +811,9 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             let n_tracks: usize = entries.iter().map(|(_, e, _)| e.tracks.len()).sum();
             app.set_status(format!(
                 "GNUDB: {} disc{}, {} tracks — review and edit",
-                n_discs, if n_discs == 1 { "" } else { "s" }, n_tracks,
+                n_discs,
+                if n_discs == 1 { "" } else { "s" },
+                n_tracks,
             ));
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
@@ -769,18 +838,27 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
                 // Both byte-exact `Verified` and RS-equivalent `VerifiedRs` count
                 // as verified, consistent with format_ctdb_summary.
-                let verified: usize = pages.iter().map(|p|
-                    p.result.tracks.iter()
-                        .filter(|t| matches!(
-                            t.status,
-                            crate::tui::ctdb::CtdbTrackStatus::Verified
-                            | crate::tui::ctdb::CtdbTrackStatus::VerifiedRs
-                        ))
-                        .count()
-                ).sum();
+                let verified: usize = pages
+                    .iter()
+                    .map(|p| {
+                        p.result
+                            .tracks
+                            .iter()
+                            .filter(|t| {
+                                matches!(
+                                    t.status,
+                                    crate::tui::ctdb::CtdbTrackStatus::Verified
+                                        | crate::tui::ctdb::CtdbTrackStatus::VerifiedRs
+                                )
+                            })
+                            .count()
+                    })
+                    .sum();
                 app.set_status(format!(
                     "CUETools DB: {} discs, {}/{} tracks verified",
-                    pages.len(), verified, total,
+                    pages.len(),
+                    verified,
+                    total,
                 ));
             }
 
@@ -788,54 +866,54 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             // first page that actually has something to repair (mismatches
             // AND parity) and start the overlay there so the subsequent
             // :ctdb-repair re-dispatch operates on a repairable disc.
-            let auto_repair = std::mem::replace(
-                &mut app.auto_repair_on_ctdb_complete, false,
-            );
+            let auto_repair = std::mem::replace(&mut app.auto_repair_on_ctdb_complete, false);
             let active_page = if auto_repair {
-                pages.iter().position(|p| {
-                    p.result.parity_url.is_some()
-                        && p.result.tracks.iter().any(|t|
-                            t.status == crate::tui::ctdb::CtdbTrackStatus::Mismatch
-                        )
-                }).unwrap_or(0)
+                pages
+                    .iter()
+                    .position(|p| {
+                        p.result.parity_url.is_some()
+                            && p.result
+                                .tracks
+                                .iter()
+                                .any(|t| t.status == crate::tui::ctdb::CtdbTrackStatus::Mismatch)
+                    })
+                    .unwrap_or(0)
             } else {
                 0
             };
 
-            app.active_overlay = ActiveOverlay::CtdbVerify(
-                Box::new(crate::tui::app::CtdbVerifyState {
+            app.active_overlay =
+                ActiveOverlay::CtdbVerify(Box::new(crate::tui::app::CtdbVerifyState {
                     pages,
                     active_page,
                     scroll: 0,
-                }),
-            );
+                }));
 
             if auto_repair {
                 // Re-enter Command::CtdbRepair now that the overlay is up.
                 // The handler will validate parity/mismatches/CRCs and
                 // either pop the confirmation dialog, defer to AR, or
                 // emit a status message ("No mismatches detected", etc.).
-                super::command::execute_command(
-                    app, super::command::Command::CtdbRepair, tx,
-                );
+                super::command::execute_command(app, super::command::Command::CtdbRepair, tx);
             }
         }
         AppMessage::ArBatchComplete { result } => {
             let total = result.albums.len();
-            let verified = result.albums.iter()
+            let verified = result
+                .albums
+                .iter()
                 .filter(|a| a.verified == a.total_tracks && a.total_tracks > 0 && !a.not_in_db)
                 .count();
-            let report_msg = result.report_path.as_ref()
+            let report_msg = result
+                .report_path
+                .as_ref()
                 .map(|p| format!(" — report: {}", p.display()))
                 .unwrap_or_default();
             app.set_status(format!(
                 "Batch AR: {}/{} albums verified{}",
                 verified, total, report_msg,
             ));
-            app.active_overlay = ActiveOverlay::ArBatchReport {
-                result,
-                scroll: 0,
-            };
+            app.active_overlay = ActiveOverlay::ArBatchReport { result, scroll: 0 };
         }
         AppMessage::OffsetCorrectionComplete { result } => {
             match result {
@@ -850,24 +928,41 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
-        AppMessage::CtdbRepairComplete { result } => {
-            match result {
-                Ok(summary) => {
-                    app.set_status(summary);
-                    app.active_overlay = ActiveOverlay::None;
-                    app.browse.refresh();
-                }
-                Err(e) => {
-                    app.set_status(format!("CTDB repair failed: {}", e));
-                }
+        AppMessage::CtdbRepairComplete { result } => match result {
+            Ok(summary) => {
+                app.set_status(summary);
+                app.active_overlay = ActiveOverlay::None;
+                app.browse.refresh();
             }
-        }
-        AppMessage::CueMbComplete { outcome, paths, output_dir, single_image, toc_string } => {
+            Err(e) => {
+                app.set_status(format!("CTDB repair failed: {}", e));
+            }
+        },
+        AppMessage::CueMbComplete {
+            outcome,
+            paths,
+            output_dir,
+            single_image,
+            toc_string,
+        } => {
             handle_cue_mb_complete(
-                app, tx, outcome, paths, output_dir, single_image, toc_string,
+                app,
+                tx,
+                outcome,
+                paths,
+                output_dir,
+                single_image,
+                toc_string,
             );
         }
-        AppMessage::CueFillComplete { outcome, cue_path, album, tracks, layout, toc_string } => {
+        AppMessage::CueFillComplete {
+            outcome,
+            cue_path,
+            album,
+            tracks,
+            layout,
+            toc_string,
+        } => {
             handle_cue_fill_complete(
                 app, tx, outcome, cue_path, *album, tracks, layout, toc_string,
             );
@@ -899,30 +994,39 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         AppMessage::AccurateRipComplete { pages } => {
             // Aggregate summary across all discs.
             let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
-            let verified: usize = pages.iter().map(|p|
-                p.result.tracks.iter()
-                    .filter(|t| t.status == crate::tui::accuraterip::ArTrackStatus::Verified)
-                    .count()
-            ).sum();
+            let verified: usize = pages
+                .iter()
+                .map(|p| {
+                    p.result
+                        .tracks
+                        .iter()
+                        .filter(|t| t.status == crate::tui::accuraterip::ArTrackStatus::Verified)
+                        .count()
+                })
+                .sum();
             if pages.len() == 1 {
                 let summary = crate::tui::accuraterip::format_summary(&pages[0].result);
                 app.set_status(format!("AccurateRip: {}", summary));
             } else {
                 app.set_status(format!(
                     "AccurateRip: {} discs, {}/{} tracks verified",
-                    pages.len(), verified, total,
+                    pages.len(),
+                    verified,
+                    total,
                 ));
             }
             // Cache AR results per track (each track keyed by its own path).
             for page in &pages {
                 for t in &page.result.tracks {
                     if let Ok(meta) = std::fs::metadata(&t.path) {
-                        let mtime = meta.modified()
+                        let mtime = meta
+                            .modified()
                             .map(crate::db::systemtime_to_unix)
                             .unwrap_or(0);
                         if let Err(e) = app.db.store_ar(
                             &t.path.display().to_string(),
-                            mtime, meta.len(),
+                            mtime,
+                            meta.len(),
                             std::slice::from_ref(t),
                             &page.result.disc_id_str,
                         ) {
@@ -943,12 +1047,14 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             // manually for a different selection while the deferred repair
             // was still waiting on its own AR run); pending will be
             // consumed when its own AR run completes.
-            let matched_page_idx = app.pending_ctdb_repair.as_ref()
+            let matched_page_idx = app
+                .pending_ctdb_repair
+                .as_ref()
                 .and_then(|p| p.paths.first().cloned())
                 .and_then(|target| {
-                    pages.iter().position(|p|
-                        p.result.tracks.first().map(|t| &t.path) == Some(&target)
-                    )
+                    pages
+                        .iter()
+                        .position(|p| p.result.tracks.first().map(|t| &t.path) == Some(&target))
                 });
             if let Some(idx) = matched_page_idx {
                 let pending = app.pending_ctdb_repair.take().unwrap();
@@ -976,23 +1082,37 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                             }
                             let off = match t.offset {
                                 Some(o) => o,
-                                None => { all_ok = false; break; }
+                                None => {
+                                    all_ok = false;
+                                    break;
+                                }
                             };
                             match common {
-                                Some(prev) if prev != off => { all_ok = false; break; }
+                                Some(prev) if prev != off => {
+                                    all_ok = false;
+                                    break;
+                                }
                                 None => common = Some(off),
                                 _ => {}
                             }
                         }
-                        if all_ok { common } else { None }
+                        if all_ok {
+                            common
+                        } else {
+                            None
+                        }
                     }
                 };
 
                 let (offset, offset_note) = match resolved_offset {
                     Some(n) => (n, format!("offset: {:+} samples (from AR verification)", n)),
-                    None => (0, "offset: +0 (AR could not determine a drive offset — \
+                    None => (
+                        0,
+                        "offset: +0 (AR could not determine a drive offset — \
                                  proceeding at +0 may produce incorrect repairs if \
-                                 your drive has a real read offset)".to_string()),
+                                 your drive has a real read offset)"
+                            .to_string(),
+                    ),
                 };
 
                 let n_tracks = pending.paths.len();
@@ -1029,10 +1149,11 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             if app.auto_fix_on_complete {
                 app.auto_fix_on_complete = false;
                 for page in &pages {
-                    if let Some(offset) = crate::tui::accuraterip::detect_uniform_offset(&page.result) {
-                        let paths: Vec<std::path::PathBuf> = page.result.tracks.iter()
-                            .map(|t| t.path.clone())
-                            .collect();
+                    if let Some(offset) =
+                        crate::tui::accuraterip::detect_uniform_offset(&page.result)
+                    {
+                        let paths: Vec<std::path::PathBuf> =
+                            page.result.tracks.iter().map(|t| t.path.clone()).collect();
                         let n = paths.len();
                         app.active_overlay = ActiveOverlay::Confirmation {
                             message: format!(
@@ -1041,22 +1162,26 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                                  before replacing originals.",
                                 offset, n,
                             ),
-                            action: crate::tui::app::ConfirmAction::OffsetCorrection { paths, offset },
+                            action: crate::tui::app::ConfirmAction::OffsetCorrection {
+                                paths,
+                                offset,
+                            },
                         };
                         return;
                     }
                 }
                 // No fixable offset — show results normally.
-                app.set_status("No offset correction needed — showing verification results".to_string());
+                app.set_status(
+                    "No offset correction needed — showing verification results".to_string(),
+                );
             }
 
-            app.active_overlay = ActiveOverlay::AccurateRipVerify(
-                Box::new(crate::tui::app::ArVerifyState {
+            app.active_overlay =
+                ActiveOverlay::AccurateRipVerify(Box::new(crate::tui::app::ArVerifyState {
                     pages,
                     active_page: 0,
                     scroll: 0,
-                }),
-            );
+                }));
         }
     }
 }
@@ -1099,7 +1224,9 @@ fn handle_paste(app: &mut AppState, text: &str) {
                     }
                     crate::tui::rename_plan::validate_plan(&mut state.plan);
                     app.set_status(&format!(
-                        "Pasted {} name{}", applied, if applied == 1 { "" } else { "s" }
+                        "Pasted {} name{}",
+                        applied,
+                        if applied == 1 { "" } else { "s" }
                     ));
                 }
                 app.active_overlay = ActiveOverlay::BulkRename(state);
@@ -1113,18 +1240,29 @@ fn handle_paste(app: &mut AppState, text: &str) {
             // Insert each character at the cursor via the text input's insert_char.
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             match overlay {
-                ActiveOverlay::TextEdit { mut input, target, label } => {
+                ActiveOverlay::TextEdit {
+                    mut input,
+                    target,
+                    label,
+                } => {
                     for c in first_line.chars() {
                         input.insert_char(c);
                     }
-                    app.active_overlay = ActiveOverlay::TextEdit { input, target, label };
+                    app.active_overlay = ActiveOverlay::TextEdit {
+                        input,
+                        target,
+                        label,
+                    };
                 }
                 ActiveOverlay::CommandInput { mut input, .. } => {
                     for c in first_line.chars() {
                         input.insert_char(c);
                     }
                     // Clear completion — pasted text invalidates candidates.
-                    app.active_overlay = ActiveOverlay::CommandInput { input, completion: None };
+                    app.active_overlay = ActiveOverlay::CommandInput {
+                        input,
+                        completion: None,
+                    };
                 }
                 ActiveOverlay::FileInput { mut input } => {
                     for c in first_line.chars() {
@@ -1151,14 +1289,18 @@ fn handle_paste(app: &mut AppState, text: &str) {
                         let is_album = entry.display_key.eq_ignore_ascii_case("ALBUM");
 
                         if is_album {
-                            let val = lines.first().map(|l| l.trim().to_string())
+                            let val = lines
+                                .first()
+                                .map(|l| l.trim().to_string())
                                 .unwrap_or_default();
                             for v in &mut entry.per_file_values {
                                 *v = val.clone();
                             }
                         } else {
                             for (i, line) in lines.iter().enumerate() {
-                                if i >= n_files { break; }
+                                if i >= n_files {
+                                    break;
+                                }
                                 entry.per_file_values[i] = line.trim().to_string();
                             }
                         }
@@ -1167,8 +1309,7 @@ fn handle_paste(app: &mut AppState, text: &str) {
                         state.detail_edit = None;
 
                         // Update merged display value + mixed state.
-                        let all_same = entry.per_file_values.windows(2)
-                            .all(|w| w[0] == w[1]);
+                        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
                         entry.is_mixed = !all_same && n_files > 1;
                         entry.value = if entry.is_mixed {
                             "<multiple values>".to_string()
@@ -1179,7 +1320,8 @@ fn handle_paste(app: &mut AppState, text: &str) {
                         state.dirty = true;
                         let applied = lines.len().min(n_files);
                         app.set_status(format!(
-                            "Pasted {} value{}", applied,
+                            "Pasted {} value{}",
+                            applied,
                             if applied == 1 { "" } else { "s" },
                         ));
                     }
@@ -1247,7 +1389,10 @@ fn handle_cue_mb_complete(
 
     let cue_content = if single_image {
         let image_name = super::cue_generate::derive_image_filename(&album, &paths[0]);
-        let ext = paths[0].extension().and_then(|e| e.to_str()).unwrap_or("flac");
+        let ext = paths[0]
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("flac");
         let fmt = super::cue_generate::cue_format_tag(ext);
         super::cue_generate::generate_single_image_cue(&album, &tracks, &image_name, fmt)
     } else {
@@ -1257,10 +1402,18 @@ fn handle_cue_mb_complete(
     let cue_filename = super::cue_generate::cue_output_filename(&album);
     let cue_path = output_dir.join(&cue_filename);
 
-    let mode = if single_image { "single image" } else { "multi-file" };
+    let mode = if single_image {
+        "single image"
+    } else {
+        "multi-file"
+    };
     let pregaps = tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
     let pregap_note = if pregaps > 0 {
-        format!(", {} pregap{}", pregaps, if pregaps == 1 { "" } else { "s" })
+        format!(
+            ", {} pregap{}",
+            pregaps,
+            if pregaps == 1 { "" } else { "s" }
+        )
     } else {
         String::new()
     };
@@ -1269,9 +1422,11 @@ fn handle_cue_mb_complete(
         mode, album.title, pregap_note,
     );
     let _ = tx; // overlay handles save; nothing to dispatch here.
-    app.active_overlay = ActiveOverlay::CuePreview(Box::new(
-        super::app::CuePreviewState::new(cue_content, cue_path, summary.clone()),
-    ));
+    app.active_overlay = ActiveOverlay::CuePreview(Box::new(super::app::CuePreviewState::new(
+        cue_content,
+        cue_path,
+        summary.clone(),
+    )));
     app.set_status(summary);
 }
 
@@ -1302,10 +1457,16 @@ fn handle_tags_from_mb_complete(
 ) {
     use super::message::MbOutcome;
     match outcome {
-        MbOutcome::Toc { outcome, toc_string } => {
+        MbOutcome::Toc {
+            outcome,
+            toc_string,
+        } => {
             handle_mb_toc_outcome(app, tx, outcome, toc_string, ctx);
         }
-        MbOutcome::Search { outcome, query_label } => {
+        MbOutcome::Search {
+            outcome,
+            query_label,
+        } => {
             handle_mb_search_outcome(app, tx, outcome, query_label, ctx);
         }
     }
@@ -1334,11 +1495,12 @@ fn handle_mb_toc_outcome(
 
     match outcome.releases.len() {
         0 => match ctx.fallback_seed.clone() {
-            Some(seed) => spawn_tags_mb_text_search(app, tx, seed, ctx, TextSearchMode::TocFallback),
+            Some(seed) => {
+                spawn_tags_mb_text_search(app, tx, seed, ctx, TextSearchMode::TocFallback)
+            }
             None => {
                 app.set_status(
-                    ":tags-mb: no MusicBrainz release matched this disc TOC"
-                        .to_string(),
+                    ":tags-mb: no MusicBrainz release matched this disc TOC".to_string(),
                 );
             }
         },
@@ -1424,21 +1586,23 @@ pub(super) fn spawn_tags_mb_text_search(
     ctx: super::message::TagsMbContext,
     mode: TextSearchMode,
 ) {
-    let super::command::SacdMbSeed { artist, album, catalog, year } = seed;
+    let super::command::SacdMbSeed {
+        artist,
+        album,
+        catalog,
+        year,
+    } = seed;
     let n_tracks = ctx.paths.len();
 
-    let mut cached: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let key_with = super::musicbrainz::search_cache_key(
-        &artist, &album, catalog.as_deref(), year.as_deref(),
-    );
+    let mut cached: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let key_with =
+        super::musicbrainz::search_cache_key(&artist, &album, catalog.as_deref(), year.as_deref());
     if let Some(b) = app.db.get_cached_mb_search(&key_with) {
         cached.insert(key_with, b);
     }
     if catalog.is_some() {
-        let key_without = super::musicbrainz::search_cache_key(
-            &artist, &album, None, year.as_deref(),
-        );
+        let key_without =
+            super::musicbrainz::search_cache_key(&artist, &album, None, year.as_deref());
         if let Some(b) = app.db.get_cached_mb_search(&key_without) {
             cached.insert(key_without, b);
         }
@@ -1529,9 +1693,9 @@ fn open_mb_select_picker(
     app.set_status(status);
     let state = super::app::MbSelectState::new(releases, ctx.paths);
     if let Some(top) = state.releases.first() {
-        let cached_body = app.db.get_cached_mb_search(
-            &super::musicbrainz::detail_cache_key(&top.release_id),
-        );
+        let cached_body = app
+            .db
+            .get_cached_mb_search(&super::musicbrainz::detail_cache_key(&top.release_id));
         spawn_mb_detail_prefetch(
             tx.clone(),
             top.release_id.clone(),
@@ -1621,14 +1785,10 @@ pub(super) fn spawn_mb_detail_prefetch(
                 return;
             }
         }
-        let result = super::musicbrainz::fetch_release_detail(
-            &release_id, n_tracks, cached_body,
-        ).await;
+        let result =
+            super::musicbrainz::fetch_release_detail(&release_id, n_tracks, cached_body).await;
         let _ = tx
-            .send(crate::tui::message::AppMessage::MbDetailPrefetchComplete {
-                release_id,
-                result,
-            })
+            .send(crate::tui::message::AppMessage::MbDetailPrefetchComplete { release_id, result })
             .await;
     });
 }
@@ -1698,7 +1858,11 @@ pub(super) fn open_editor_with_mb_release(
     // CUESHEET tag, not in N files) so they don't false-warn.
     let track_count_warning = super::musicbrainz::track_count_mismatch_message(&state, release);
     super::musicbrainz::populate_editor_from_mb(&mut state, release);
-    let label = if release.title.is_empty() { "(untitled)" } else { &release.title };
+    let label = if release.title.is_empty() {
+        "(untitled)"
+    } else {
+        &release.title
+    };
     let mut msg = format!(":tags-mb: applied \"{}\" — review then save", label);
     if let Some(reason) = skip_reason {
         msg.push_str(&format!(" [{}]", reason));
@@ -1759,17 +1923,24 @@ fn handle_cue_fill_complete(
     if stats.is_empty() {
         app.set_status(format!(
             ":cue-fill: nothing to fill (CUE already complete) — {}",
-            cue_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+            cue_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
         ));
         return;
     }
 
     let cue_content = match layout {
-        super::message::CueFillLayout::SingleImage { image_filename, format_tag } => {
-            super::cue_generate::generate_single_image_cue(
-                &album, &tracks, &image_filename, &format_tag,
-            )
-        }
+        super::message::CueFillLayout::SingleImage {
+            image_filename,
+            format_tag,
+        } => super::cue_generate::generate_single_image_cue(
+            &album,
+            &tracks,
+            &image_filename,
+            &format_tag,
+        ),
         super::message::CueFillLayout::MultiFile => {
             super::cue_generate::generate_multifile_cue(&album, &tracks)
         }
@@ -1777,24 +1948,38 @@ fn handle_cue_fill_complete(
 
     let mut parts = Vec::new();
     if stats.titles_filled > 0 {
-        parts.push(format!("{} title{}", stats.titles_filled,
-            if stats.titles_filled == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} title{}",
+            stats.titles_filled,
+            if stats.titles_filled == 1 { "" } else { "s" }
+        ));
     }
     if stats.artists_filled > 0 {
-        parts.push(format!("{} performer{}", stats.artists_filled,
-            if stats.artists_filled == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} performer{}",
+            stats.artists_filled,
+            if stats.artists_filled == 1 { "" } else { "s" }
+        ));
     }
     if stats.isrcs_filled > 0 {
-        parts.push(format!("{} ISRC{}", stats.isrcs_filled,
-            if stats.isrcs_filled == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} ISRC{}",
+            stats.isrcs_filled,
+            if stats.isrcs_filled == 1 { "" } else { "s" }
+        ));
     }
-    if stats.year_filled { parts.push("date".to_string()); }
-    if stats.catalog_filled { parts.push("catalog".to_string()); }
+    if stats.year_filled {
+        parts.push("date".to_string());
+    }
+    if stats.catalog_filled {
+        parts.push("catalog".to_string());
+    }
     let summary = format!("Will fill: {}", parts.join(", "));
     let _ = tx;
-    app.active_overlay = ActiveOverlay::CuePreview(Box::new(
-        super::app::CuePreviewState::new(cue_content, cue_path, summary.clone()),
-    ));
+    app.active_overlay = ActiveOverlay::CuePreview(Box::new(super::app::CuePreviewState::new(
+        cue_content,
+        cue_path,
+        summary.clone(),
+    )));
     app.set_status(summary);
 }
-

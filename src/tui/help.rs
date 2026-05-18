@@ -26,7 +26,9 @@ pub fn help_content_for(screen: AppScreen) -> Vec<HelpSection> {
 pub fn line_count(sections: &[HelpSection]) -> usize {
     let mut count = 0;
     for (i, section) in sections.iter().enumerate() {
-        if i > 0 { count += 1; } // Blank separator.
+        if i > 0 {
+            count += 1;
+        } // Blank separator.
         count += 1; // Title line.
         count += section.entries.len();
     }
@@ -70,10 +72,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
             },
             HelpSection {
                 title: "Filtering",
-                entries: vec![
-                    (".", "Toggle hidden files"),
-                    ("/", "Open text filter"),
-                ],
+                entries: vec![(".", "Toggle hidden files"), ("/", "Open text filter")],
             },
             HelpSection {
                 title: "File Operations",
@@ -113,7 +112,10 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
             HelpSection {
                 title: "Pane Navigation",
                 entries: vec![
-                    ("Tab / Shift+Tab", "Cycle panes (Source/Metadata/Format/Output)"),
+                    (
+                        "Tab / Shift+Tab",
+                        "Cycle panes (Source/Metadata/Format/Output)",
+                    ),
                     ("Up/k, Down/j", "Navigate within pane"),
                     ("Left/h, Right/l", "Select option (pills) / toggle"),
                     ("e / Enter", "Edit field or expand batch"),
@@ -170,9 +172,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
         AppScreen::Config => vec![
             HelpSection {
                 title: "Config Screen",
-                entries: vec![
-                    ("Tab", "Switch focus: Settings / Keychain"),
-                ],
+                entries: vec![("Tab", "Switch focus: Settings / Keychain")],
             },
             HelpSection {
                 title: "Password Keychain",
@@ -213,7 +213,9 @@ fn flatten_to_lines(sections: &[HelpSection]) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(Span::styled(
             format!("  {}", section.title),
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
         )));
 
         for (key, desc) in &section.entries {
@@ -232,8 +234,12 @@ fn flatten_to_lines(sections: &[HelpSection]) -> Vec<Line<'static>> {
 /// Draw the help overlay.
 pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize) {
     let area = f.size();
-    let w = (area.width * 80 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 85 / 100).max(15).min(area.height.saturating_sub(2));
+    let w = (area.width * 80 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 85 / 100)
+        .max(15)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -246,7 +252,9 @@ pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize) {
         .border_style(Style::default().fg(theme::AMBER))
         .title(Span::styled(
             title,
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -269,16 +277,15 @@ pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize) {
     // Clamp scroll.
     let scroll = scroll.min(total.saturating_sub(visible));
 
-    let visible_lines: Vec<Line> = all_lines
-        .into_iter()
-        .skip(scroll)
-        .take(visible)
-        .collect();
+    let visible_lines: Vec<Line> = all_lines.into_iter().skip(scroll).take(visible).collect();
 
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer pill.
-    let footer = Line::from(super::draw_overlays::footer_pill_pub("Esc close", theme::PURPLE));
+    let footer = Line::from(super::draw_overlays::footer_pill_pub(
+        "Esc close",
+        theme::PURPLE,
+    ));
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],

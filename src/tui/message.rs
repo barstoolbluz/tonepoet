@@ -62,18 +62,11 @@ pub enum AppMessage {
         status: crate::convert::ConversionStatus,
     },
     /// All conversions completed
-    ConversionComplete {
-        completed: usize,
-        failed: usize,
-    },
+    ConversionComplete { completed: usize, failed: usize },
     /// A conversion error occurred
-    ConversionError {
-        message: String,
-    },
+    ConversionError { message: String },
     /// Files were scanned and should be added to the queue
-    FilesScanned {
-        paths: Vec<std::path::PathBuf>,
-    },
+    FilesScanned { paths: Vec<std::path::PathBuf> },
     /// Status message to show in the status bar
     StatusMessage(String),
     /// Force a redraw
@@ -167,7 +160,11 @@ pub enum AppMessage {
     /// Result of a multi-disc GNUDB query (sequential queries per disc).
     GnudbMultiDiscComplete {
         /// Per-disc results: (disc_label, entry, file_paths).
-        entries: Vec<(String, crate::tui::gnudb::GnudbEntry, Vec<std::path::PathBuf>)>,
+        entries: Vec<(
+            String,
+            crate::tui::gnudb::GnudbEntry,
+            Vec<std::path::PathBuf>,
+        )>,
     },
     /// Result of an async AccurateRip verification (one or more discs).
     AccurateRipComplete {
@@ -182,13 +179,9 @@ pub enum AppMessage {
         result: Box<crate::tui::accuraterip::ArBatchResult>,
     },
     /// Result of an async AR offset correction.
-    OffsetCorrectionComplete {
-        result: Result<String, String>,
-    },
+    OffsetCorrectionComplete { result: Result<String, String> },
     /// Result of an async CTDB Reed-Solomon repair.
-    CtdbRepairComplete {
-        result: Result<String, String>,
-    },
+    CtdbRepairComplete { result: Result<String, String> },
     /// Result of an async MusicBrainz disc-TOC lookup driving `:cue-mb`.
     /// `outcome` is `Err` when transport/parse failed; `Ok(None)` means
     /// no release matched. `paths`, `output_dir`, `single_image` carry
@@ -243,5 +236,8 @@ pub enum AppMessage {
 #[derive(Debug, Clone)]
 pub enum CueFillLayout {
     MultiFile,
-    SingleImage { image_filename: String, format_tag: String },
+    SingleImage {
+        image_filename: String,
+        format_tag: String,
+    },
 }

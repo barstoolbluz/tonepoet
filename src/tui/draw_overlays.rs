@@ -8,10 +8,13 @@ use ratatui::{
     Frame,
 };
 
-use crate::convert::ConversionStatus;
-use super::app::{ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState, MbSelectState, SourceMode};
+use super::app::{
+    ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState, MbSelectState,
+    SourceMode,
+};
 use super::button_map::TuiButton;
 use super::theme;
+use crate::convert::ConversionStatus;
 
 /// Render a pill-style footer button: ` label ` with colored background.
 /// Public alias for use from other modules (help.rs, etc.).
@@ -74,12 +77,19 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             let input = input.clone();
             draw_file_input(f, &input);
         }
-        ActiveOverlay::CommandInput { ref input, ref completion } => {
+        ActiveOverlay::CommandInput {
+            ref input,
+            ref completion,
+        } => {
             let input = input.clone();
             let completion = completion.clone();
             draw_command_input(f, &input, completion.as_ref());
         }
-        ActiveOverlay::TextEdit { ref input, ref label, .. } => {
+        ActiveOverlay::TextEdit {
+            ref input,
+            ref label,
+            ..
+        } => {
             let input = input.clone();
             let label = label.clone();
             draw_text_edit(f, &label, &input);
@@ -118,10 +128,18 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::Preemphasis { scroll } => {
             draw_preemphasis(f, &app.preemph_results, scroll);
         }
-        ActiveOverlay::CueImportReview { ref changes, scroll } => {
+        ActiveOverlay::CueImportReview {
+            ref changes,
+            scroll,
+        } => {
             draw_cue_import_review(f, changes, scroll);
         }
-        ActiveOverlay::GnudbSelect { ref matches, selected, scroll, .. } => {
+        ActiveOverlay::GnudbSelect {
+            ref matches,
+            selected,
+            scroll,
+            ..
+        } => {
             draw_gnudb_select(f, matches, selected, scroll);
         }
         ActiveOverlay::GnudbReview(ref state) => {
@@ -165,38 +183,27 @@ fn draw_context_menu_stack(
     levels: &[super::context_menu::MenuLevel],
     origin: (u16, u16),
 ) {
-    if levels.is_empty() { return; }
+    if levels.is_empty() {
+        return;
+    }
     let area = f.size();
 
     // Reuse the same geometry helper that hover/click use, so all three
     // paths agree on rect placement (incl. width-overflow shift).
-    let (rects, preview) = super::keybindings::context_menu_stack_rects(
-        levels, origin, area.width, area.height,
-    );
+    let (rects, preview) =
+        super::keybindings::context_menu_stack_rects(levels, origin, area.width, area.height);
 
     let focused_idx = levels.len() - 1;
     for (i, level) in levels.iter().enumerate() {
         let has_focus = i == focused_idx;
-        let _ = render_menu_panel_at(
-            f,
-            &level.entries,
-            level.selected,
-            rects[i],
-            has_focus,
-        );
+        let _ = render_menu_panel_at(f, &level.entries, level.selected, rects[i], has_focus);
     }
 
     if let Some((preview_entries, rect_idx)) = preview {
         // Preview is unfocused and has no selection — pass usize::MAX
         // so neither the focus highlight nor the is-expanded breadcrumb
         // highlight fires on any row.
-        let _ = render_menu_panel_at(
-            f,
-            preview_entries,
-            usize::MAX,
-            rects[rect_idx],
-            false,
-        );
+        let _ = render_menu_panel_at(f, preview_entries, usize::MAX, rects[rect_idx], false);
     }
 }
 
@@ -209,10 +216,7 @@ pub fn selected_entry_row_pub(
     selected_entry_row(entries, selected)
 }
 
-fn selected_entry_row(
-    entries: &[super::context_menu::ContextMenuEntry],
-    selected: usize,
-) -> u16 {
+fn selected_entry_row(entries: &[super::context_menu::ContextMenuEntry], selected: usize) -> u16 {
     use super::context_menu::ContextMenuEntry;
     let mut count = 0usize;
     for (i, e) in entries.iter().enumerate() {
@@ -248,7 +252,11 @@ fn render_menu_panel_at(
     }
 
     f.render_widget(Clear, popup);
-    let border_color = if has_focus { theme::AMBER } else { theme::BORDER_DIM };
+    let border_color = if has_focus {
+        theme::AMBER
+    } else {
+        theme::BORDER_DIM
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
@@ -363,9 +371,7 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
         // Defensive: an empty Batch shouldn't exist (from_paths returns
         // Empty for 0 paths, remove collapses to Empty/Single), but if
         // somehow it did we'd panic on paths[scroll..end] below. Bail.
-        SourceMode::Batch { paths, cursor, .. } if !paths.is_empty() => {
-            (paths.clone(), *cursor)
-        }
+        SourceMode::Batch { paths, cursor, .. } if !paths.is_empty() => (paths.clone(), *cursor),
         _ => return,
     };
     // Additional cursor clamp in case source.mode was mutated with an
@@ -383,7 +389,9 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
         .border_style(Style::default().fg(theme::AMBER))
         .title(Span::styled(
             format!(" batch · {} files ", paths.len()),
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -391,10 +399,7 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
     // Split into list area and hint bar at the bottom
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
     // Clamp `stored_scroll` to the range that keeps the cursor in
@@ -452,7 +457,8 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
         footer_pill("d remove", theme::RED),
         pill_gap(),
         footer_pill("Esc close", theme::PURPLE),
-    ])).alignment(Alignment::Center);
+    ]))
+    .alignment(Alignment::Center);
     f.render_widget(hint, chunks[1]);
 }
 
@@ -465,7 +471,12 @@ fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::AMBER))
-        .title(Span::styled(" Confirm ", Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Confirm ",
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -517,16 +528,16 @@ fn draw_error_detail(f: &mut Frame, error: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
-        .title(Span::styled(" Error Detail ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Error Detail ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
     let error_text = Paragraph::new(error.to_string())
@@ -534,10 +545,8 @@ fn draw_error_detail(f: &mut Frame, error: &str) {
         .style(Style::default().fg(Color::Red));
     f.render_widget(error_text, chunks[0]);
 
-    let hint = Paragraph::new(Line::from(vec![
-        footer_pill("Esc close", theme::PURPLE),
-    ]))
-    .alignment(Alignment::Center);
+    let hint = Paragraph::new(Line::from(vec![footer_pill("Esc close", theme::PURPLE)]))
+        .alignment(Alignment::Center);
     f.render_widget(hint, chunks[1]);
 }
 
@@ -550,23 +559,42 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" Item Info ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Item Info ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let name = item.input_path.file_name().unwrap_or_default().to_string_lossy();
+    let name = item
+        .input_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
     let size = humansize::format_size(item.file_size, humansize::BINARY);
     let status_str = match &item.status {
         ConversionStatus::NotConfigured => "Not Configured".to_string(),
         ConversionStatus::Queued => "Queued".to_string(),
-        ConversionStatus::Processing { progress, phase, .. } => {
-            let phase_name = phase.as_ref().map(|p| p.display_name()).unwrap_or("Processing");
+        ConversionStatus::Processing {
+            progress, phase, ..
+        } => {
+            let phase_name = phase
+                .as_ref()
+                .map(|p| p.display_name())
+                .unwrap_or("Processing");
             format!("{:.1}% - {}", progress, phase_name)
         }
         ConversionStatus::Completed { output_path, .. } => {
             format!("Completed -> {}", output_path.display())
         }
-        ConversionStatus::Partial { output_path, successful, failed, .. } => {
+        ConversionStatus::Partial {
+            output_path,
+            successful,
+            failed,
+            ..
+        } => {
             format!(
                 "Partial ({}/{} ok) -> {}",
                 successful,
@@ -586,9 +614,13 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
 
     // Extract durable log path from terminal status variants.
     let log_path_str = match &item.status {
-        ConversionStatus::Completed { log_path: Some(p), .. } => Some(p.display().to_string()),
+        ConversionStatus::Completed {
+            log_path: Some(p), ..
+        } => Some(p.display().to_string()),
         ConversionStatus::Partial { log_path, .. } => Some(log_path.display().to_string()),
-        ConversionStatus::Failed { log_path: Some(p), .. } => Some(p.display().to_string()),
+        ConversionStatus::Failed {
+            log_path: Some(p), ..
+        } => Some(p.display().to_string()),
         _ => None,
     };
 
@@ -600,7 +632,11 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
         Line::from(vec![
             Span::styled("Path: ", Style::default().fg(Color::Gray)),
             Span::styled(
-                item.input_path.parent().unwrap_or(&item.input_path).display().to_string(),
+                item.input_path
+                    .parent()
+                    .unwrap_or(&item.input_path)
+                    .display()
+                    .to_string(),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -610,11 +646,17 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
         ]),
         Line::from(vec![
             Span::styled("Input: ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:?}", item.input_format), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{:?}", item.input_format),
+                Style::default().fg(Color::Cyan),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Output: ", Style::default().fg(Color::Gray)),
-            Span::styled(item.output_format.name().to_string(), Style::default().fg(Color::Green)),
+            Span::styled(
+                item.output_format.name().to_string(),
+                Style::default().fg(Color::Green),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Status: ", Style::default().fg(Color::Gray)),
@@ -646,7 +688,12 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue))
-        .title(Span::styled(" Add File/Folder Path ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Add File/Folder Path ",
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -659,18 +706,24 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
         ])
         .split(inner);
 
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled("Enter a file or folder path:", Style::default().fg(Color::Gray)),
-    ]));
+    let hint = Paragraph::new(Line::from(vec![Span::styled(
+        "Enter a file or folder path:",
+        Style::default().fg(Color::Gray),
+    )]));
     f.render_widget(hint, chunks[0]);
 
     // Scrolled view of the input
     let visible_width = chunks[1].width as usize;
     let (view, cursor_col) = input.view(visible_width);
-    let display_input = if view.is_empty() { " ".to_string() } else { view };
-    let input_widget = Paragraph::new(Line::from(vec![
-        Span::styled(display_input, Style::default().fg(Color::White)),
-    ]))
+    let display_input = if view.is_empty() {
+        " ".to_string()
+    } else {
+        view
+    };
+    let input_widget = Paragraph::new(Line::from(vec![Span::styled(
+        display_input,
+        Style::default().fg(Color::White),
+    )]))
     .style(Style::default().bg(Color::Rgb(40, 40, 40)));
     f.render_widget(input_widget, chunks[1]);
 
@@ -680,7 +733,8 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
         footer_pill("Enter confirm", theme::GREEN),
         pill_gap(),
         footer_pill("Esc cancel", theme::PURPLE),
-    ])).alignment(Alignment::Center);
+    ]))
+    .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
 
@@ -698,7 +752,9 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
         .border_style(Style::default().fg(Color::Blue))
         .title(Span::styled(
             format!(" Edit {} ", label),
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -712,17 +768,19 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
         ])
         .split(inner);
 
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!("Enter new {}:", label),
-            Style::default().fg(Color::Gray),
-        ),
-    ]));
+    let hint = Paragraph::new(Line::from(vec![Span::styled(
+        format!("Enter new {}:", label),
+        Style::default().fg(Color::Gray),
+    )]));
     f.render_widget(hint, chunks[0]);
 
     let visible_width = chunks[1].width as usize;
     let (view, cursor_col) = input.view(visible_width);
-    let display_input = if view.is_empty() { " ".to_string() } else { view };
+    let display_input = if view.is_empty() {
+        " ".to_string()
+    } else {
+        view
+    };
     let input_widget = Paragraph::new(Line::from(vec![Span::styled(
         display_input,
         Style::default().fg(Color::White),
@@ -736,7 +794,8 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
         footer_pill("Enter save", theme::GREEN),
         pill_gap(),
         footer_pill("Esc cancel", theme::PURPLE),
-    ])).alignment(Alignment::Center);
+    ]))
+    .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
 
@@ -750,9 +809,7 @@ fn draw_command_input(
     // Command line occupies the very last row; when completion is
     // active with multiple candidates, the row above shows match count
     // and a preview of the next few candidates.
-    let has_multi_matches = completion
-        .map(|c| c.candidates.len() > 1)
-        .unwrap_or(false);
+    let has_multi_matches = completion.map(|c| c.candidates.len() > 1).unwrap_or(false);
 
     let cmd_row = area.y + area.height.saturating_sub(1);
     let cmd_area = Rect::new(area.x, cmd_row, area.width, 1);
@@ -770,8 +827,7 @@ fn draw_command_input(
         Span::styled(view, Style::default().fg(Color::Rgb(192, 202, 245))), // bright
     ]);
 
-    let cmd = Paragraph::new(line)
-        .style(Style::default().bg(Color::Rgb(26, 27, 38))); // BG color
+    let cmd = Paragraph::new(line).style(Style::default().bg(Color::Rgb(26, 27, 38))); // BG color
     f.render_widget(cmd, cmd_area);
 
     // Optional hint row above the command line when cycling matches.
@@ -798,10 +854,12 @@ fn draw_command_input(
         let hint_line = Line::from(vec![
             Span::styled(count, Style::default().fg(Color::Rgb(187, 154, 247))), // purple
             Span::styled(preview, Style::default().fg(Color::Rgb(169, 177, 214))), // muted bright
-            Span::styled(elided.to_string(), Style::default().fg(Color::Rgb(86, 95, 137))), // dim
+            Span::styled(
+                elided.to_string(),
+                Style::default().fg(Color::Rgb(86, 95, 137)),
+            ), // dim
         ]);
-        let hint = Paragraph::new(hint_line)
-            .style(Style::default().bg(Color::Rgb(26, 27, 38)));
+        let hint = Paragraph::new(hint_line).style(Style::default().bg(Color::Rgb(26, 27, 38)));
         f.render_widget(hint, hint_area);
     }
 
@@ -815,8 +873,12 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
 
     let area = f.size();
     // Use ~85% of screen, bounded to reasonable limits.
-    let w = (area.width * 85 / 100).max(60).min(area.width.saturating_sub(2));
-    let h = (area.height * 85 / 100).max(16).min(area.height.saturating_sub(2));
+    let w = (area.width * 85 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 85 / 100)
+        .max(16)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -828,7 +890,9 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
         .border_style(Style::default().fg(theme::AMBER))
         .title(Span::styled(
             " Bulk Rename -- Template ",
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -854,7 +918,9 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     // ── Template input ───────────────────────────────────────────
     let template_focused = state.focus == BulkRenameFocus::Template;
     let label_style = if template_focused {
-        Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme::AMBER)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme::TEXT_MUTED)
     };
@@ -886,12 +952,18 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     let total = state.plan.ops.len();
     let pending = state.plan.pending_count();
     let conflicts = state.plan.conflict_count();
-    let failed = state.plan.ops.iter()
+    let failed = state
+        .plan
+        .ops
+        .iter()
         .filter(|op| matches!(op.status, OpStatus::Failed(_)))
         .count();
     let skipped = total.saturating_sub(pending + conflicts + failed);
     let mut summary_spans = vec![
-        Span::styled(format!("{} files", total), Style::default().fg(theme::TEXT_BRIGHT)),
+        Span::styled(
+            format!("{} files", total),
+            Style::default().fg(theme::TEXT_BRIGHT),
+        ),
         Span::styled(" · ", Style::default().fg(theme::TEXT_MUTED)),
         Span::styled(
             format!("{} pending", pending),
@@ -906,7 +978,11 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     }
     if conflicts > 0 {
         summary_spans.push(Span::styled(
-            format!(" · {} conflict{}", conflicts, if conflicts == 1 { "" } else { "s" }),
+            format!(
+                " · {} conflict{}",
+                conflicts,
+                if conflicts == 1 { "" } else { "s" }
+            ),
             Style::default().fg(theme::RED),
         ));
     }
@@ -977,14 +1053,20 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
             // Truncate names to fit columns (char-safe).
             let target_chars: usize = target_name.chars().count();
             let target_display: String = if target_chars > target_w {
-                let truncated: String = target_name.chars().take(target_w.saturating_sub(1)).collect();
+                let truncated: String = target_name
+                    .chars()
+                    .take(target_w.saturating_sub(1))
+                    .collect();
                 format!("{}~", truncated)
             } else {
                 format!("{:<width$}", target_name, width = target_w)
             };
             let source_chars: usize = source_name.chars().count();
             let source_display: String = if source_chars > source_w {
-                let truncated: String = source_name.chars().take(source_w.saturating_sub(1)).collect();
+                let truncated: String = source_name
+                    .chars()
+                    .take(source_w.saturating_sub(1))
+                    .collect();
                 format!("{}~", truncated)
             } else {
                 format!("{:<width$}", source_name, width = source_w)
@@ -1005,12 +1087,7 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
                 Span::styled(source_display, Style::default().fg(theme::TEXT_MUTED)),
             ]);
 
-            let row_area = Rect::new(
-                list_area.x,
-                list_area.y + row as u16,
-                list_area.width,
-                1,
-            );
+            let row_area = Rect::new(list_area.x, list_area.y + row as u16, list_area.width, 1);
 
             if is_selected {
                 let sel_style = Style::default()
@@ -1054,16 +1131,16 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
 }
 
 /// Draw the analysis results overlay.
-fn draw_analysis(
-    f: &mut Frame,
-    results: &[super::analyze::AnalysisResult],
-    scroll: usize,
-) {
+fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scroll: usize) {
     use super::analyze::dr_label;
 
     let area = f.size();
-    let w = (area.width * 80 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 80 / 100).max(12).min(area.height.saturating_sub(2));
+    let w = (area.width * 80 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 80 / 100)
+        .max(12)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -1075,7 +1152,9 @@ fn draw_analysis(
         .border_style(Style::default().fg(theme::PURPLE))
         .title(Span::styled(
             " Analysis Results ",
-            Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::PURPLE)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -1097,12 +1176,16 @@ fn draw_analysis(
         if i > 0 {
             lines.push(Line::from(""));
         }
-        let name = r.path.file_name()
+        let name = r
+            .path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| r.path.display().to_string());
         lines.push(Line::from(Span::styled(
             format!("  {}", name),
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
         )));
 
         let dr_color = match r.dr_value {
@@ -1113,32 +1196,69 @@ fn draw_analysis(
         };
 
         let entries: Vec<(&str, String, Color)> = vec![
-            ("Dynamic Range", format!("DR{} ({})", r.dr_value, dr_label(r.dr_value)), dr_color),
-            ("Sample Peak", format!("{:.1} dBFS", r.peak_db), theme::TEXT_BRIGHT),
-            ("RMS Level", format!("{:.1} dBFS", r.rms_db), theme::TEXT_BRIGHT),
-            ("Clipping", if r.clipping_count == 0 {
-                "None".into()
-            } else {
-                format!("{} samples", r.clipping_count)
-            }, if r.clipping_count == 0 { theme::GREEN } else { theme::RED }),
-            ("DC Bias", if r.dc_bias.abs() < 0.001 {
-                format!("{:.6} (negligible)", r.dc_bias)
-            } else {
-                format!("{:.6} (significant!)", r.dc_bias)
-            }, if r.dc_bias.abs() < 0.001 { theme::TEXT_MUTED } else { theme::AMBER }),
-            ("Bit Depth", format!(
-                "{}-bit{}",
-                r.actual_bit_depth,
-                r.declared_bit_depth.map(|d| if d != r.actual_bit_depth {
-                    format!(" ({} declared)", d)
+            (
+                "Dynamic Range",
+                format!("DR{} ({})", r.dr_value, dr_label(r.dr_value)),
+                dr_color,
+            ),
+            (
+                "Sample Peak",
+                format!("{:.1} dBFS", r.peak_db),
+                theme::TEXT_BRIGHT,
+            ),
+            (
+                "RMS Level",
+                format!("{:.1} dBFS", r.rms_db),
+                theme::TEXT_BRIGHT,
+            ),
+            (
+                "Clipping",
+                if r.clipping_count == 0 {
+                    "None".into()
                 } else {
-                    String::new()
-                }).unwrap_or_default()
-            ), if r.declared_bit_depth.map(|d| d != r.actual_bit_depth).unwrap_or(false) {
-                theme::AMBER
-            } else {
-                theme::TEXT_BRIGHT
-            }),
+                    format!("{} samples", r.clipping_count)
+                },
+                if r.clipping_count == 0 {
+                    theme::GREEN
+                } else {
+                    theme::RED
+                },
+            ),
+            (
+                "DC Bias",
+                if r.dc_bias.abs() < 0.001 {
+                    format!("{:.6} (negligible)", r.dc_bias)
+                } else {
+                    format!("{:.6} (significant!)", r.dc_bias)
+                },
+                if r.dc_bias.abs() < 0.001 {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::AMBER
+                },
+            ),
+            (
+                "Bit Depth",
+                format!(
+                    "{}-bit{}",
+                    r.actual_bit_depth,
+                    r.declared_bit_depth
+                        .map(|d| if d != r.actual_bit_depth {
+                            format!(" ({} declared)", d)
+                        } else {
+                            String::new()
+                        })
+                        .unwrap_or_default()
+                ),
+                if r.declared_bit_depth
+                    .map(|d| d != r.actual_bit_depth)
+                    .unwrap_or(false)
+                {
+                    theme::AMBER
+                } else {
+                    theme::TEXT_BRIGHT
+                },
+            ),
         ];
 
         // LUFS + true peak (if available).
@@ -1171,7 +1291,10 @@ fn draw_analysis(
 
         for (label, value, color) in entries.iter().chain(extra.iter()) {
             lines.push(Line::from(vec![
-                Span::styled(format!("    {:<width$}", label, width = label_w), theme::muted()),
+                Span::styled(
+                    format!("    {:<width$}", label, width = label_w),
+                    theme::muted(),
+                ),
                 Span::styled(value.clone(), Style::default().fg(*color)),
             ]));
         }
@@ -1179,15 +1302,27 @@ fn draw_analysis(
         // HDCD — "HDCD" in value text rendered gold.
         if let Some(true) = r.hdcd_detected {
             if let Some(ref detail) = r.hdcd_detail {
-                let mut spans = vec![
-                    Span::styled(format!("    {:<width$}", "HDCD", width = label_w), theme::muted()),
-                ];
+                let mut spans = vec![Span::styled(
+                    format!("    {:<width$}", "HDCD", width = label_w),
+                    theme::muted(),
+                )];
                 // Split "HDCD (details...)" into gold "HDCD" + normal rest.
                 if let Some(rest) = detail.strip_prefix("HDCD") {
-                    spans.push(Span::styled("HDCD", Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)));
-                    spans.push(Span::styled(rest.to_string(), Style::default().fg(theme::TEXT_BRIGHT)));
+                    spans.push(Span::styled(
+                        "HDCD",
+                        Style::default()
+                            .fg(theme::AMBER)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        rest.to_string(),
+                        Style::default().fg(theme::TEXT_BRIGHT),
+                    ));
                 } else {
-                    spans.push(Span::styled(detail.clone(), Style::default().fg(theme::TEXT_BRIGHT)));
+                    spans.push(Span::styled(
+                        detail.clone(),
+                        Style::default().fg(theme::TEXT_BRIGHT),
+                    ));
                 }
                 lines.push(Line::from(spans));
             }
@@ -1262,8 +1397,12 @@ fn draw_metadata_editor(
     use super::app::MetadataEditorPhase;
 
     let area = f.size();
-    let w = (area.width * 85 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 85 / 100).max(14).min(area.height.saturating_sub(2));
+    let w = (area.width * 85 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 85 / 100)
+        .max(14)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -1271,15 +1410,26 @@ fn draw_metadata_editor(
     f.render_widget(Clear, popup);
 
     let title = editor_title(state);
-    let border_color = if state.dirty { theme::AMBER } else { theme::CYAN };
+    let border_color = if state.dirty {
+        theme::AMBER
+    } else {
+        theme::CYAN
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .title(Span::styled(title, Style::default().fg(border_color).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    if inner.height < 3 { return; }
+    if inner.height < 3 {
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1291,7 +1441,9 @@ fn draw_metadata_editor(
 
     // Detail edit mode: show per-file values for one field.
     if state.phase == MetadataEditorPhase::DetailEdit {
-        draw_metadata_detail(f, state, chunks[0], chunks[1], inner_w, content_h, button_map);
+        draw_metadata_detail(
+            f, state, chunks[0], chunks[1], inner_w, content_h, button_map,
+        );
         return;
     }
 
@@ -1306,9 +1458,13 @@ fn draw_metadata_editor(
     for (i, entry) in state.entries.iter().enumerate() {
         let is_cursor = i == state.cursor;
         let is_deleted = state.deleted.contains(&i);
-        let is_dirty = !is_deleted && (entry.value != entry.original
-            || entry.per_file_values.iter().zip(entry.per_file_originals.iter())
-                .any(|(v, o)| v != o));
+        let is_dirty = !is_deleted
+            && (entry.value != entry.original
+                || entry
+                    .per_file_values
+                    .iter()
+                    .zip(entry.per_file_originals.iter())
+                    .any(|(v, o)| v != o));
 
         // Key label.
         let key_display = if entry.display_key.len() > key_col_w - 2 {
@@ -1318,9 +1474,13 @@ fn draw_metadata_editor(
         };
 
         let key_style = if is_deleted {
-            Style::default().fg(theme::TEXT_DIM).add_modifier(Modifier::CROSSED_OUT)
+            Style::default()
+                .fg(theme::TEXT_DIM)
+                .add_modifier(Modifier::CROSSED_OUT)
         } else if is_cursor {
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD)
         } else {
             theme::muted()
         };
@@ -1364,7 +1524,9 @@ fn draw_metadata_editor(
                     {
                         let mut prev_was_cr = false;
                         for (byte_idx, c) in input.text.char_indices() {
-                            if byte_idx >= cursor_byte { break; }
+                            if byte_idx >= cursor_byte {
+                                break;
+                            }
                             if c == '\r' {
                                 // Check if next char is \n (CRLF → single \n).
                                 prev_was_cr = true;
@@ -1437,12 +1599,16 @@ fn draw_metadata_editor(
                         let prefix = if row == drop_scroll {
                             Span::styled(key_display.clone(), key_style)
                         } else {
-                            Span::styled(" ".repeat(key_chars), Style::default().bg(Color::Rgb(30, 30, 46)))
+                            Span::styled(
+                                " ".repeat(key_chars),
+                                Style::default().bg(Color::Rgb(30, 30, 46)),
+                            )
                         };
 
                         if row == cursor_row {
                             let col = cursor_col_in_row;
-                            let before: String = row_chars[..col.min(row_chars.len())].iter().collect();
+                            let before: String =
+                                row_chars[..col.min(row_chars.len())].iter().collect();
                             let cur_ch: String = if col < row_chars.len() {
                                 row_chars[col].to_string()
                             } else {
@@ -1458,15 +1624,24 @@ fn draw_metadata_editor(
                             lines.push(Line::from(vec![
                                 prefix,
                                 Span::styled(before, drop_bg.fg(theme::TEXT_BRIGHT)),
-                                Span::styled(cur_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
-                                Span::styled(format!("{}{}", after, " ".repeat(pad)), drop_bg.fg(theme::TEXT_BRIGHT)),
+                                Span::styled(
+                                    cur_ch,
+                                    Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                                ),
+                                Span::styled(
+                                    format!("{}{}", after, " ".repeat(pad)),
+                                    drop_bg.fg(theme::TEXT_BRIGHT),
+                                ),
                             ]));
                         } else {
                             let text: String = row_chars.iter().collect();
                             let pad = val_max.saturating_sub(row_chars.len());
                             lines.push(Line::from(vec![
                                 prefix,
-                                Span::styled(format!("{}{}", text, " ".repeat(pad)), drop_bg.fg(theme::TEXT_BRIGHT)),
+                                Span::styled(
+                                    format!("{}{}", text, " ".repeat(pad)),
+                                    drop_bg.fg(theme::TEXT_BRIGHT),
+                                ),
                             ]));
                         }
                     }
@@ -1477,7 +1652,8 @@ fn draw_metadata_editor(
                 // Replace newlines with ↵ so they don't cause terminal line breaks.
                 let (visible, cursor_col) = input.view(val_max);
                 let cp = cursor_col as usize;
-                let chars: Vec<char> = visible.chars()
+                let chars: Vec<char> = visible
+                    .chars()
                     .map(|c| if c == '\n' || c == '\r' { '↵' } else { c })
                     .collect();
                 let before: String = chars[..cp.min(chars.len())].iter().collect();
@@ -1494,7 +1670,10 @@ fn draw_metadata_editor(
                 lines.push(Line::from(vec![
                     Span::styled(key_display, key_style),
                     Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
-                    Span::styled(cursor_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                    Span::styled(
+                        cursor_ch,
+                        Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                    ),
                     Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
                 ]));
                 continue;
@@ -1513,11 +1692,15 @@ fn draw_metadata_editor(
         };
 
         let val_style = if is_deleted {
-            Style::default().fg(theme::RED).add_modifier(Modifier::CROSSED_OUT)
+            Style::default()
+                .fg(theme::RED)
+                .add_modifier(Modifier::CROSSED_OUT)
         } else if is_dirty {
             Style::default().fg(theme::GREEN)
         } else if entry.is_mixed {
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::ITALIC)
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::ITALIC)
         } else if entry.is_binary {
             Style::default().fg(theme::TEXT_DIM)
         } else {
@@ -1553,12 +1736,12 @@ fn draw_metadata_editor(
         let val_truncated = truncate_to_chars(&value_display, val_for_pill);
 
         let pill_style = match pill {
-            super::probe::MbRevertPill::Revert => {
-                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
-            }
-            super::probe::MbRevertPill::UseMb => {
-                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)
-            }
+            super::probe::MbRevertPill::Revert => Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
+            super::probe::MbRevertPill::UseMb => Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
             super::probe::MbRevertPill::None => Style::default(),
         };
 
@@ -1576,7 +1759,9 @@ fn draw_metadata_editor(
             if view_w > 0 {
                 spans.push(Span::styled(
                     view_text.to_string(),
-                    Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::BLUE)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
             if pill_w > 0 {
@@ -1588,17 +1773,11 @@ fn draw_metadata_editor(
             // register but the click handler will reject by row range.
             if i >= scroll && i < scroll + content_h {
                 let visible_row = (i - scroll) as u16;
-                let view_screen_x = chunks[0].x
-                    + (key_chars + val_for_pill) as u16;
+                let view_screen_x = chunks[0].x + (key_chars + val_for_pill) as u16;
                 if view_w > 0 {
                     button_map.record_button(
                         super::button_map::TuiButton::MetadataEntryView(i),
-                        Rect::new(
-                            view_screen_x,
-                            chunks[0].y + visible_row,
-                            view_w as u16,
-                            1,
-                        ),
+                        Rect::new(view_screen_x, chunks[0].y + visible_row, view_w as u16, 1),
                     );
                 }
                 if pill_w > 0 {
@@ -1637,15 +1816,25 @@ fn draw_metadata_editor(
                 String::new()
             };
             lines.push(Line::from(vec![
-                Span::styled(" + ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " + ",
+                    Style::default()
+                        .fg(theme::GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
-                Span::styled(cursor_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                Span::styled(
+                    cursor_ch,
+                    Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                ),
                 Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
             ]));
         }
     } else {
         let add_style = if is_cursor_add {
-            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme::TEXT_DIM)
         };
@@ -1702,15 +1891,19 @@ fn draw_metadata_editor(
             pill_gap(),
             footer_pill("Esc cancel", theme::PURPLE),
         ]),
-        MetadataEditorPhase::Saving => Line::from(
-            Span::styled(" Saving... ", Style::default().fg(theme::AMBER)),
-        ),
+        MetadataEditorPhase::Saving => Line::from(Span::styled(
+            " Saving... ",
+            Style::default().fg(theme::AMBER),
+        )),
         MetadataEditorPhase::DetailEdit => {
             // Unreachable — DetailEdit returns early above.
             Line::from("")
         }
     };
-    f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), chunks[1]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[1],
+    );
 }
 
 /// Render the per-file detail view within the metadata editor.
@@ -1733,13 +1926,16 @@ fn draw_metadata_detail(
     // CUESHEET) carry more values than `state.file_labels` has labels
     // for. Synthesize "Track NN" labels in that case so the detail
     // overlay numbers each row instead of falling through to "?".
-    let synthesize_track_labels =
-        entry.per_file_values.len() != state.file_labels.len();
+    let synthesize_track_labels = entry.per_file_values.len() != state.file_labels.len();
     let label_for = |i: usize| -> String {
         if synthesize_track_labels {
             format!("Track {:>02}", i + 1)
         } else {
-            state.file_labels.get(i).cloned().unwrap_or_else(|| "?".to_string())
+            state
+                .file_labels
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| "?".to_string())
         }
     };
 
@@ -1748,9 +1944,13 @@ fn draw_metadata_detail(
     // or the "Track NN" synthesis (8) when surfacing per-track CUESHEET rows.
     let max_label = if synthesize_track_labels {
         // "Track NN" is 8 chars; cap by the largest synthesized index.
-        format!("Track {:>02}", entry.per_file_values.len()).chars().count()
+        format!("Track {:>02}", entry.per_file_values.len())
+            .chars()
+            .count()
     } else {
-        state.file_labels.iter()
+        state
+            .file_labels
+            .iter()
             .map(|l| l.chars().count())
             .max()
             .unwrap_or(6)
@@ -1759,7 +1959,9 @@ fn draw_metadata_detail(
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         format!("  {}", entry.display_key),
-        Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::CYAN)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
 
@@ -1770,7 +1972,9 @@ fn draw_metadata_detail(
         let label_display = format!("  {:<width$}  ", label, width = label_col_w - 4);
 
         let label_style = if is_cursor {
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD)
         } else {
             theme::muted()
         };
@@ -1784,7 +1988,8 @@ fn draw_metadata_detail(
                 let (visible, cursor_col) = input.view(detail_val_max);
                 let cp = cursor_col as usize;
                 // Replace newlines with ↵ to prevent terminal line breaks.
-                let chars: Vec<char> = visible.chars()
+                let chars: Vec<char> = visible
+                    .chars()
                     .map(|c| if c == '\n' || c == '\r' { '↵' } else { c })
                     .collect();
                 let before: String = chars[..cp.min(chars.len())].iter().collect();
@@ -1801,14 +2006,19 @@ fn draw_metadata_detail(
                 lines.push(Line::from(vec![
                     Span::styled(label_display.clone(), label_style),
                     Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
-                    Span::styled(cursor_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                    Span::styled(
+                        cursor_ch,
+                        Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                    ),
                     Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
                 ]));
                 continue;
             }
         }
 
-        let changed = entry.per_file_originals.get(i)
+        let changed = entry
+            .per_file_originals
+            .get(i)
             .map(|o| o != val)
             .unwrap_or(false);
         let val_style = if changed {
@@ -1916,12 +2126,13 @@ fn draw_metadata_detail(
             }
         }
         let footer_line = Line::from(pills);
-        let total_chars = footer_line.spans.iter()
+        let total_chars = footer_line
+            .spans
+            .iter()
             .map(|s| s.content.chars().count())
             .sum::<usize>() as u16;
         // Center the line manually so we can compute pill rects.
-        let render_x = footer_area.x
-            + (footer_area.width.saturating_sub(total_chars)) / 2;
+        let render_x = footer_area.x + (footer_area.width.saturating_sub(total_chars)) / 2;
         f.render_widget(
             Paragraph::new(footer_line),
             Rect::new(render_x, footer_area.y, total_chars, 1),
@@ -1940,18 +2151,21 @@ fn draw_metadata_detail(
         }
         return;
     };
-    f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), footer_area);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        footer_area,
+    );
 }
 
 /// Draw the verify results overlay.
-fn draw_verify(
-    f: &mut Frame,
-    results: &[super::verify::VerifyResult],
-    scroll: usize,
-) {
+fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: usize) {
     let area = f.size();
-    let w = (area.width * 70 / 100).max(40).min(area.width.saturating_sub(2));
-    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let w = (area.width * 70 / 100)
+        .max(40)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -1963,7 +2177,9 @@ fn draw_verify(
         .border_style(Style::default().fg(theme::GREEN))
         .title(Span::styled(
             " Verify Results ",
-            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -1987,7 +2203,9 @@ fn draw_verify(
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("{} passed", passed),
-                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]
     } else {
@@ -2009,7 +2227,9 @@ fn draw_verify(
 
     // Per-file results.
     for r in results {
-        let name = r.path.file_name()
+        let name = r
+            .path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| r.path.display().to_string());
 
@@ -2020,7 +2240,10 @@ fn draw_verify(
         };
 
         lines.push(Line::from(vec![
-            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                icon,
+                Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(name, Style::default().fg(theme::TEXT_BRIGHT)),
         ]));
         lines.push(Line::from(vec![
@@ -2037,9 +2260,7 @@ fn draw_verify(
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer pill.
-    let footer = Line::from(vec![
-        footer_pill("Esc close", theme::GREEN),
-    ]);
+    let footer = Line::from(vec![footer_pill("Esc close", theme::GREEN)]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
@@ -2047,14 +2268,14 @@ fn draw_verify(
 }
 
 /// Draw the bit-compare results overlay.
-fn draw_bit_compare(
-    f: &mut Frame,
-    results: &[super::bit_compare::CompareResult],
-    scroll: usize,
-) {
+fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult], scroll: usize) {
     let area = f.size();
-    let w = (area.width * 75 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let w = (area.width * 75 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -2066,7 +2287,9 @@ fn draw_bit_compare(
         .border_style(Style::default().fg(theme::CYAN))
         .title(Span::styled(
             " Bit Compare Results ",
-            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -2090,7 +2313,9 @@ fn draw_bit_compare(
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("{} pair(s): all bit-identical", identical),
-                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]
     } else {
@@ -2112,10 +2337,14 @@ fn draw_bit_compare(
 
     // Per-pair results.
     for r in results {
-        let ref_name = r.ref_path.file_name()
+        let ref_name = r
+            .ref_path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| r.ref_path.display().to_string());
-        let target_name = r.target_path.file_name()
+        let target_name = r
+            .target_path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| r.target_path.display().to_string());
 
@@ -2126,7 +2355,10 @@ fn draw_bit_compare(
         };
 
         lines.push(Line::from(vec![
-            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                icon,
+                Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(ref_name, Style::default().fg(theme::TEXT_BRIGHT)),
             Span::styled("  vs  ", theme::muted()),
             Span::styled(target_name, Style::default().fg(theme::TEXT_BRIGHT)),
@@ -2135,7 +2367,11 @@ fn draw_bit_compare(
             Span::styled("   ", Style::default()),
             Span::styled(
                 r.detail.clone(),
-                Style::default().fg(if r.identical { theme::TEXT_DIM } else { theme::RED }),
+                Style::default().fg(if r.identical {
+                    theme::TEXT_DIM
+                } else {
+                    theme::RED
+                }),
             ),
         ]));
     }
@@ -2148,9 +2384,7 @@ fn draw_bit_compare(
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer pill.
-    let footer = Line::from(vec![
-        footer_pill("Esc close", theme::CYAN),
-    ]);
+    let footer = Line::from(vec![footer_pill("Esc close", theme::CYAN)]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
@@ -2166,8 +2400,12 @@ fn draw_preemphasis(
     use super::preemphasis::PreemphasisConfidence;
 
     let area = f.size();
-    let w = (area.width * 75 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let w = (area.width * 75 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -2179,7 +2417,9 @@ fn draw_preemphasis(
         .border_style(Style::default().fg(theme::PURPLE))
         .title(Span::styled(
             " Pre-emphasis Detection ",
-            Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::PURPLE)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -2193,18 +2433,28 @@ fn draw_preemphasis(
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let detected = results.iter().filter(|r| r.confidence == PreemphasisConfidence::Detected).count();
-    let possible = results.iter().filter(|r| r.confidence == PreemphasisConfidence::Possible).count();
+    let detected = results
+        .iter()
+        .filter(|r| r.confidence == PreemphasisConfidence::Detected)
+        .count();
+    let possible = results
+        .iter()
+        .filter(|r| r.confidence == PreemphasisConfidence::Possible)
+        .count();
     let mut lines: Vec<Line> = Vec::new();
 
     let summary = if detected > 0 || possible > 0 {
         vec![
             Span::styled("  ", Style::default()),
-            Span::styled(format!("{} detected", detected),
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} detected", detected),
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(", ", theme::muted()),
-            Span::styled(format!("{} possible", possible),
-                Style::default().fg(theme::AMBER)),
+            Span::styled(
+                format!("{} possible", possible),
+                Style::default().fg(theme::AMBER),
+            ),
             Span::styled(format!("  ({} total)", results.len()), theme::muted()),
         ]
     } else {
@@ -2220,7 +2470,9 @@ fn draw_preemphasis(
     lines.push(Line::from(""));
 
     for r in results {
-        let name = r.path.file_name()
+        let name = r
+            .path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| r.path.display().to_string());
 
@@ -2241,7 +2493,10 @@ fn draw_preemphasis(
         };
 
         lines.push(Line::from(vec![
-            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                icon,
+                Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(name, Style::default().fg(theme::TEXT_BRIGHT)),
             if !conf_label.is_empty() {
                 Span::styled(format!("  {}", conf_label), Style::default().fg(icon_color))
@@ -2262,9 +2517,7 @@ fn draw_preemphasis(
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
-    let footer = Line::from(vec![
-        footer_pill("Esc close", theme::PURPLE),
-    ]);
+    let footer = Line::from(vec![footer_pill("Esc close", theme::PURPLE)]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
@@ -2272,30 +2525,40 @@ fn draw_preemphasis(
 }
 
 /// Draw the CUE import review overlay showing proposed changes.
-fn draw_cue_import_review(
-    f: &mut Frame,
-    changes: &[super::app::CueImportChange],
-    scroll: usize,
-) {
+fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange], scroll: usize) {
     let area = f.size();
-    let w = (area.width * 80 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 80 / 100).max(12).min(area.height.saturating_sub(2));
+    let w = (area.width * 80 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 80 / 100)
+        .max(12)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, popup);
 
-    let title = format!(" CUE Import Review — {} change{} ",
-        changes.len(), if changes.len() == 1 { "" } else { "s" });
+    let title = format!(
+        " CUE Import Review — {} change{} ",
+        changes.len(),
+        if changes.len() == 1 { "" } else { "s" }
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::CYAN))
-        .title(Span::styled(title, Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    if inner.height < 3 { return; }
+    if inner.height < 3 {
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2316,7 +2579,9 @@ fn draw_cue_import_review(
             }
             lines.push(Line::from(Span::styled(
                 format!("  {}", change.filename),
-                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::AMBER)
+                    .add_modifier(Modifier::BOLD),
             )));
             current_file = Some(&change.filename);
         }
@@ -2365,24 +2630,38 @@ fn draw_gnudb_select(
     scroll: usize,
 ) {
     let area = f.size();
-    let w = (area.width * 70 / 100).max(40).min(area.width.saturating_sub(2));
-    let h = (area.height * 60 / 100).max(8).min(area.height.saturating_sub(2));
+    let w = (area.width * 70 / 100)
+        .max(40)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 60 / 100)
+        .max(8)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, popup);
 
-    let title = format!(" GNUDB — {} match{} ",
-        matches.len(), if matches.len() == 1 { "" } else { "es" });
+    let title = format!(
+        " GNUDB — {} match{} ",
+        matches.len(),
+        if matches.len() == 1 { "" } else { "es" }
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::CYAN))
-        .title(Span::styled(title, Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    if inner.height < 3 { return; }
+    if inner.height < 3 {
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2396,12 +2675,16 @@ fn draw_gnudb_select(
         let is_sel = i == selected;
         let prefix = if is_sel { " ► " } else { "   " };
         let style = if is_sel {
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme::TEXT_BRIGHT)
         };
         let cat_style = if is_sel {
-            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD)
         } else {
             theme::muted()
         };
@@ -2435,15 +2718,21 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
     let page = &state.pages[state.active_page];
 
     let area = f.size();
-    let w = (area.width * 85 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 85 / 100).max(14).min(area.height.saturating_sub(2));
+    let w = (area.width * 85 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 85 / 100)
+        .max(14)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, popup);
 
-    let artist = page.tracks.first()
+    let artist = page
+        .tracks
+        .first()
         .map(|t| t.artist.as_str())
         .unwrap_or("Unknown");
     let prefix = match state.source {
@@ -2455,11 +2744,18 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::CYAN))
-        .title(Span::styled(title, Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    if inner.height < 3 { return; }
+    if inner.height < 3 {
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2484,7 +2780,10 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
             if i == state.active_page {
                 spans.push(Span::styled(
                     format!(" {} ", label),
-                    Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::CYAN).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::PILL_ACTIVE_FG)
+                        .bg(theme::CYAN)
+                        .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::styled(
@@ -2511,7 +2810,9 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                     _ => "",
                 };
                 let label_style = if is_cursor {
-                    Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme::AMBER)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     theme::muted()
                 };
@@ -2523,12 +2824,26 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                         let cp = cursor_col as usize;
                         let chars: Vec<char> = visible.chars().collect();
                         let before: String = chars[..cp.min(chars.len())].iter().collect();
-                        let cur_ch: String = if cp < chars.len() { chars[cp].to_string() } else { " ".to_string() };
-                        let after: String = if cp + 1 < chars.len() { chars[cp + 1..].iter().collect() } else { String::new() };
+                        let cur_ch: String = if cp < chars.len() {
+                            chars[cp].to_string()
+                        } else {
+                            " ".to_string()
+                        };
+                        let after: String = if cp + 1 < chars.len() {
+                            chars[cp + 1..].iter().collect()
+                        } else {
+                            String::new()
+                        };
                         lines.push(Line::from(vec![
-                            Span::styled(format!("    {:<w$}", field, w = label_w - 4), label_style),
+                            Span::styled(
+                                format!("    {:<w$}", field, w = label_w - 4),
+                                label_style,
+                            ),
                             Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
-                            Span::styled(cur_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                            Span::styled(
+                                cur_ch,
+                                Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                            ),
                             Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
                         ]));
                         continue;
@@ -2559,7 +2874,9 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                     _ => "",
                 };
                 let label_style = if is_cursor {
-                    Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme::AMBER)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     theme::muted()
                 };
@@ -2571,12 +2888,26 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                         let cp = cursor_col as usize;
                         let chars: Vec<char> = visible.chars().collect();
                         let before: String = chars[..cp.min(chars.len())].iter().collect();
-                        let cur_ch: String = if cp < chars.len() { chars[cp].to_string() } else { " ".to_string() };
-                        let after: String = if cp + 1 < chars.len() { chars[cp + 1..].iter().collect() } else { String::new() };
+                        let cur_ch: String = if cp < chars.len() {
+                            chars[cp].to_string()
+                        } else {
+                            " ".to_string()
+                        };
+                        let after: String = if cp + 1 < chars.len() {
+                            chars[cp + 1..].iter().collect()
+                        } else {
+                            String::new()
+                        };
                         lines.push(Line::from(vec![
-                            Span::styled(format!("    {:<w$}", field, w = label_w - 4), label_style),
+                            Span::styled(
+                                format!("    {:<w$}", field, w = label_w - 4),
+                                label_style,
+                            ),
                             Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
-                            Span::styled(cur_ch, Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT)),
+                            Span::styled(
+                                cur_ch,
+                                Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                            ),
                             Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
                         ]));
                         continue;
@@ -2628,15 +2959,16 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
 
 // ── AccurateRip verification results overlay ────────────────────────
 
-fn draw_accuraterip_verify(
-    f: &mut Frame,
-    state: &super::app::ArVerifyState,
-) {
+fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
     use super::accuraterip::ArTrackStatus;
 
     let area = f.size();
-    let w = (area.width * 70 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let w = (area.width * 70 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -2647,7 +2979,9 @@ fn draw_accuraterip_verify(
     let result = &page.result;
 
     let n_tracks = result.tracks.len();
-    let verified = result.tracks.iter()
+    let verified = result
+        .tracks
+        .iter()
         .filter(|t| t.status == ArTrackStatus::Verified)
         .count();
     let border_color = if verified == n_tracks && n_tracks > 0 {
@@ -2661,12 +2995,23 @@ fn draw_accuraterip_verify(
     let title = if state.pages.len() > 1 {
         // Multi-disc: aggregate stats in title.
         let total_all: usize = state.pages.iter().map(|p| p.result.tracks.len()).sum();
-        let verified_all: usize = state.pages.iter().map(|p|
-            p.result.tracks.iter()
-                .filter(|t| t.status == ArTrackStatus::Verified)
-                .count()
-        ).sum();
-        format!(" AccurateRip — {} discs, {}/{} verified ", state.pages.len(), verified_all, total_all)
+        let verified_all: usize = state
+            .pages
+            .iter()
+            .map(|p| {
+                p.result
+                    .tracks
+                    .iter()
+                    .filter(|t| t.status == ArTrackStatus::Verified)
+                    .count()
+            })
+            .sum();
+        format!(
+            " AccurateRip — {} discs, {}/{} verified ",
+            state.pages.len(),
+            verified_all,
+            total_all
+        )
     } else {
         format!(" AccurateRip Verification — {} tracks ", n_tracks)
     };
@@ -2676,7 +3021,9 @@ fn draw_accuraterip_verify(
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             title,
-            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -2704,7 +3051,10 @@ fn draw_accuraterip_verify(
             if i == state.active_page {
                 spans.push(Span::styled(
                     format!(" {} ", label),
-                    Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::CYAN).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::PILL_ACTIVE_FG)
+                        .bg(theme::CYAN)
+                        .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::styled(
@@ -2722,7 +3072,12 @@ fn draw_accuraterip_verify(
     let summary = super::accuraterip::format_summary(result);
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
-        Span::styled(summary, Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            summary,
+            Style::default()
+                .fg(theme::TEXT_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]));
     // Disc ID for diagnostics.
     lines.push(Line::from(vec![
@@ -2733,7 +3088,9 @@ fn draw_accuraterip_verify(
 
     // Per-track results.
     for t in &result.tracks {
-        let name = t.path.file_name()
+        let name = t
+            .path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| t.path.display().to_string());
 
@@ -2741,33 +3098,30 @@ fn draw_accuraterip_verify(
             ArTrackStatus::Verified => {
                 let conf = t.confidence.unwrap_or(0);
                 let off = t.offset.unwrap_or(0);
-                let offset_str = if off >= 0 { format!("+{}", off) } else { format!("{}", off) };
+                let offset_str = if off >= 0 {
+                    format!("+{}", off)
+                } else {
+                    format!("{}", off)
+                };
                 (
                     " ✓ ",
                     theme::GREEN,
                     format!("AR confidence {} (offset {})", conf, offset_str),
                 )
             }
-            ArTrackStatus::Mismatch => (
-                " ✗ ",
-                theme::RED,
-                "CRC mismatch".to_string(),
-            ),
-            ArTrackStatus::NoDiscInDatabase => (
-                " ? ",
-                theme::AMBER,
-                "disc not in database".to_string(),
-            ),
-            ArTrackStatus::Error(e) => (
-                " ! ",
-                theme::RED,
-                format!("error: {}", e),
-            ),
+            ArTrackStatus::Mismatch => (" ✗ ", theme::RED, "CRC mismatch".to_string()),
+            ArTrackStatus::NoDiscInDatabase => {
+                (" ? ", theme::AMBER, "disc not in database".to_string())
+            }
+            ArTrackStatus::Error(e) => (" ! ", theme::RED, format!("error: {}", e)),
         };
 
         let track_label = format!("{:02} - {}", t.track_number, name);
         lines.push(Line::from(vec![
-            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                icon,
+                Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(track_label, Style::default().fg(theme::TEXT_BRIGHT)),
         ]));
         lines.push(Line::from(vec![
@@ -2784,10 +3138,11 @@ fn draw_accuraterip_verify(
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer pills.
-    let mut pills = vec![
-        footer_pill("Esc close", theme::GREEN),
-    ];
-    let has_unmatched = result.tracks.iter().any(|t| t.status == ArTrackStatus::Mismatch);
+    let mut pills = vec![footer_pill("Esc close", theme::GREEN)];
+    let has_unmatched = result
+        .tracks
+        .iter()
+        .any(|t| t.status == ArTrackStatus::Mismatch);
     if result.was_common_scan && has_unmatched {
         pills.push(pill_gap());
         pills.push(footer_pill(":ar! full scan", theme::BLUE));
@@ -2806,14 +3161,14 @@ fn draw_accuraterip_verify(
 
 // ── AR batch report overlay ─────────────────────────────────────────
 
-fn draw_ar_batch_report(
-    f: &mut Frame,
-    result: &super::accuraterip::ArBatchResult,
-    scroll: usize,
-) {
+fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResult, scroll: usize) {
     let area = f.size();
-    let w = (area.width * 80 / 100).max(60).min(area.width.saturating_sub(2));
-    let h = (area.height * 80 / 100).max(12).min(area.height.saturating_sub(2));
+    let w = (area.width * 80 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 80 / 100)
+        .max(12)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -2821,7 +3176,9 @@ fn draw_ar_batch_report(
     f.render_widget(Clear, popup);
 
     let total = result.albums.len();
-    let verified = result.albums.iter()
+    let verified = result
+        .albums
+        .iter()
         .filter(|a| a.verified == a.total_tracks && a.total_tracks > 0 && !a.not_in_db)
         .count();
 
@@ -2842,7 +3199,9 @@ fn draw_ar_batch_report(
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             title,
-            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -2860,18 +3219,30 @@ fn draw_ar_batch_report(
 
     // Summary header.
     let not_in_db = result.albums.iter().filter(|a| a.not_in_db).count();
-    let mismatched = result.albums.iter().filter(|a| a.mismatched > 0 && !a.not_in_db).count();
+    let mismatched = result
+        .albums
+        .iter()
+        .filter(|a| a.mismatched > 0 && !a.not_in_db)
+        .count();
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
         Span::styled(
-            format!("{} verified, {} not in DB, {} mismatch", verified, not_in_db, mismatched),
-            Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD),
+            format!(
+                "{} verified, {} not in DB, {} mismatch",
+                verified, not_in_db, mismatched
+            ),
+            Style::default()
+                .fg(theme::TEXT_BRIGHT)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     if let Some(ref rp) = result.report_path {
         lines.push(Line::from(vec![
             Span::styled("  Report: ", Style::default().fg(theme::TEXT_DIM)),
-            Span::styled(rp.display().to_string(), Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(
+                rp.display().to_string(),
+                Style::default().fg(theme::TEXT_DIM),
+            ),
         ]));
     }
     lines.push(Line::from(""));
@@ -2891,7 +3262,10 @@ fn draw_ar_batch_report(
         };
 
         lines.push(Line::from(vec![
-            Span::styled(icon, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                icon,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(&a.album_name, Style::default().fg(theme::TEXT_BRIGHT)),
         ]));
 
@@ -2924,9 +3298,7 @@ fn draw_ar_batch_report(
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
-    let footer = Line::from(vec![
-        footer_pill("Esc close", theme::GREEN),
-    ]);
+    let footer = Line::from(vec![footer_pill("Esc close", theme::GREEN)]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
@@ -2935,15 +3307,16 @@ fn draw_ar_batch_report(
 
 // ── CTDB verification results overlay ───────────────────────────────
 
-fn draw_ctdb_verify(
-    f: &mut Frame,
-    state: &super::app::CtdbVerifyState,
-) {
+fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
     use super::ctdb::CtdbTrackStatus;
 
     let area = f.size();
-    let w = (area.width * 70 / 100).max(50).min(area.width.saturating_sub(2));
-    let h = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(2));
+    let w = (area.width * 70 / 100)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100)
+        .max(10)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -2956,8 +3329,15 @@ fn draw_ctdb_verify(
     let n_tracks = result.tracks.len();
     // Count both byte-exact `Verified` and RS-equivalent `VerifiedRs` as
     // verified; consistent with `format_ctdb_summary` and CUETools' own UX.
-    let verified = result.tracks.iter()
-        .filter(|t| matches!(t.status, CtdbTrackStatus::Verified | CtdbTrackStatus::VerifiedRs))
+    let verified = result
+        .tracks
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.status,
+                CtdbTrackStatus::Verified | CtdbTrackStatus::VerifiedRs
+            )
+        })
         .count();
     let border_color = if verified == n_tracks && n_tracks > 0 {
         theme::GREEN
@@ -2969,12 +3349,28 @@ fn draw_ctdb_verify(
 
     let title = if state.pages.len() > 1 {
         let total_all: usize = state.pages.iter().map(|p| p.result.tracks.len()).sum();
-        let verified_all: usize = state.pages.iter().map(|p|
-            p.result.tracks.iter()
-                .filter(|t| matches!(t.status, CtdbTrackStatus::Verified | CtdbTrackStatus::VerifiedRs))
-                .count()
-        ).sum();
-        format!(" CUETools DB — {} discs, {}/{} verified ", state.pages.len(), verified_all, total_all)
+        let verified_all: usize = state
+            .pages
+            .iter()
+            .map(|p| {
+                p.result
+                    .tracks
+                    .iter()
+                    .filter(|t| {
+                        matches!(
+                            t.status,
+                            CtdbTrackStatus::Verified | CtdbTrackStatus::VerifiedRs
+                        )
+                    })
+                    .count()
+            })
+            .sum();
+        format!(
+            " CUETools DB — {} discs, {}/{} verified ",
+            state.pages.len(),
+            verified_all,
+            total_all
+        )
     } else {
         format!(" CUETools DB Verification — {} tracks ", n_tracks)
     };
@@ -2984,7 +3380,9 @@ fn draw_ctdb_verify(
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             title,
-            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -3012,7 +3410,10 @@ fn draw_ctdb_verify(
             if i == state.active_page {
                 spans.push(Span::styled(
                     format!(" {} ", label),
-                    Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::CYAN).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::PILL_ACTIVE_FG)
+                        .bg(theme::CYAN)
+                        .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::styled(
@@ -3029,12 +3430,19 @@ fn draw_ctdb_verify(
     let summary = super::ctdb::format_ctdb_summary(result);
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
-        Span::styled(summary, Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            summary,
+            Style::default()
+                .fg(theme::TEXT_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]));
     lines.push(Line::from(""));
 
     for t in &result.tracks {
-        let name = t.path.file_name()
+        let name = t
+            .path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| t.path.display().to_string());
 
@@ -3042,7 +3450,11 @@ fn draw_ctdb_verify(
             CtdbTrackStatus::Verified => {
                 let conf = t.confidence.unwrap_or(0);
                 let parity = if t.has_parity { " [parity]" } else { "" };
-                (" ✓ ", theme::GREEN, format!("CTDB confidence {}{}", conf, parity))
+                (
+                    " ✓ ",
+                    theme::GREEN,
+                    format!("CTDB confidence {}{}", conf, parity),
+                )
             }
             CtdbTrackStatus::VerifiedRs => {
                 // RS verification passed against the matched entry, but our
@@ -3053,25 +3465,36 @@ fn draw_ctdb_verify(
                 (
                     " ✓ ",
                     theme::GREEN,
-                    format!("CTDB RS-verified, confidence {} (CRC differs: {:08X})",
-                        conf, t.computed_crc32),
+                    format!(
+                        "CTDB RS-verified, confidence {} (CRC differs: {:08X})",
+                        conf, t.computed_crc32
+                    ),
                 )
             }
             CtdbTrackStatus::Mismatch => {
-                let parity = if t.has_parity { " [repair available]" } else { "" };
-                (" ✗ ", theme::RED, format!("CRC mismatch (computed {:08X}){}", t.computed_crc32, parity))
+                let parity = if t.has_parity {
+                    " [repair available]"
+                } else {
+                    ""
+                };
+                (
+                    " ✗ ",
+                    theme::RED,
+                    format!("CRC mismatch (computed {:08X}){}", t.computed_crc32, parity),
+                )
             }
             CtdbTrackStatus::NoDiscInDatabase => {
                 (" ? ", theme::AMBER, "disc not in database".to_string())
             }
-            CtdbTrackStatus::Error(e) => {
-                (" ! ", theme::RED, format!("error: {}", e))
-            }
+            CtdbTrackStatus::Error(e) => (" ! ", theme::RED, format!("error: {}", e)),
         };
 
         let track_label = format!("{:02} - {}", t.track_number, name);
         lines.push(Line::from(vec![
-            Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                icon,
+                Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(track_label, Style::default().fg(theme::TEXT_BRIGHT)),
         ]));
         lines.push(Line::from(vec![
@@ -3087,9 +3510,10 @@ fn draw_ctdb_verify(
     f.render_widget(Paragraph::new(visible_lines), chunks_v[0]);
 
     // Build footer with conditional repair pill.
-    let has_mismatch = result.tracks.iter().any(|t| {
-        t.status == CtdbTrackStatus::Mismatch
-    });
+    let has_mismatch = result
+        .tracks
+        .iter()
+        .any(|t| t.status == CtdbTrackStatus::Mismatch);
     let has_parity = result.tracks.iter().any(|t| t.has_parity);
 
     let mut footer_spans = vec![footer_pill("Esc close", theme::GREEN)];
@@ -3110,15 +3534,21 @@ fn draw_cue_preview(
     button_map: &mut super::button_map::ButtonRenderMap,
 ) {
     let area = f.size();
-    let w = (area.width * 80 / 100).max(60).min(area.width.saturating_sub(2));
-    let h = (area.height * 80 / 100).max(15).min(area.height.saturating_sub(2));
+    let w = (area.width * 80 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 80 / 100)
+        .max(15)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, popup);
 
-    let title_name = state.write_path.file_name()
+    let title_name = state
+        .write_path
+        .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| state.write_path.display().to_string());
 
@@ -3127,7 +3557,9 @@ fn draw_cue_preview(
         .border_style(Style::default().fg(theme::AMBER))
         .title(Span::styled(
             format!(" CUE preview · {} ", title_name),
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -3152,7 +3584,10 @@ fn draw_cue_preview(
         state.summary.as_str()
     };
     f.render_widget(
-        Paragraph::new(Span::styled(summary, Style::default().fg(theme::TEXT_BRIGHT))),
+        Paragraph::new(Span::styled(
+            summary,
+            Style::default().fg(theme::TEXT_BRIGHT),
+        )),
         chunks[0],
     );
 
@@ -3173,7 +3608,8 @@ fn draw_cue_preview(
     let editing_line = state.cursor;
     let edit_text = state.edit.as_ref().map(|i| i.text.as_str());
 
-    let lines: Vec<Line> = state.content
+    let lines: Vec<Line> = state
+        .content
         .lines()
         .enumerate()
         .skip(scroll)
@@ -3195,7 +3631,9 @@ fn draw_cue_preview(
                 Style::default().fg(theme::TEXT)
             };
             let gutter_style = if on_edit {
-                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::AMBER)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 theme::muted()
             };
@@ -3229,7 +3667,9 @@ fn draw_cue_preview(
         let footer = Line::from(vec![
             Span::styled(
                 commit_label,
-                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 cancel_label,
@@ -3260,11 +3700,15 @@ fn draw_cue_preview(
             ),
             Span::styled(
                 top_label,
-                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 bot_label,
-                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  read-only  ", theme::muted()),
             Span::styled(format!("    {}", pos), theme::muted()),
@@ -3295,7 +3739,9 @@ fn draw_cue_preview(
         let footer = Line::from(vec![
             Span::styled(
                 save_label,
-                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 cancel_label,
@@ -3303,11 +3749,15 @@ fn draw_cue_preview(
             ),
             Span::styled(
                 top_label,
-                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 bot_label,
-                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  double-click line to edit  ", theme::muted()),
             Span::styled(format!("    {}", pos), theme::muted()),
@@ -3342,8 +3792,12 @@ fn draw_mb_select(
     button_map: &mut super::button_map::ButtonRenderMap,
 ) {
     let area = f.size();
-    let w = (area.width * 80 / 100).max(60).min(area.width.saturating_sub(2));
-    let h = (area.height * 70 / 100).max(12).min(area.height.saturating_sub(2));
+    let w = (area.width * 80 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 70 / 100)
+        .max(12)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -3355,7 +3809,9 @@ fn draw_mb_select(
         .border_style(Style::default().fg(theme::PURPLE))
         .title(Span::styled(
             format!(" MusicBrainz · {} matches ", state.releases.len()),
-            Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::PURPLE)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -3379,7 +3835,9 @@ fn draw_mb_select(
     f.render_widget(
         Paragraph::new(Span::styled(
             "  #  Title · Year · Catalog · Score",
-            Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT_BRIGHT)
+                .add_modifier(Modifier::BOLD),
         )),
         chunks[0],
     );
@@ -3394,12 +3852,14 @@ fn draw_mb_select(
     let visible_height = chunks[2].height as usize;
     let max_scroll = state.releases.len().saturating_sub(visible_height);
     // Auto-scroll to keep cursor visible.
-    let scroll = state.scroll
-        .min(max_scroll)
-        .min(state.selected)
-        .max(state.selected.saturating_sub(visible_height.saturating_sub(1)));
+    let scroll = state.scroll.min(max_scroll).min(state.selected).max(
+        state
+            .selected
+            .saturating_sub(visible_height.saturating_sub(1)),
+    );
 
-    let lines: Vec<Line> = state.releases
+    let lines: Vec<Line> = state
+        .releases
         .iter()
         .enumerate()
         .skip(scroll)
@@ -3408,17 +3868,19 @@ fn draw_mb_select(
             let is_cursor = i == state.selected;
             let prefix = if is_cursor { "▸ " } else { "  " };
             let n = format!("{:>2}", i + 1);
-            let title = if r.title.is_empty() { "(untitled)" } else { &r.title };
+            let title = if r.title.is_empty() {
+                "(untitled)"
+            } else {
+                &r.title
+            };
             let year = r.year.as_deref().unwrap_or("—");
-            let cat = r.catalog.as_deref()
-                .or(r.barcode.as_deref())
-                .unwrap_or("—");
-            let body = format!(
-                "{}{}  {}  ·  {}  ·  {}",
-                prefix, n, title, year, cat,
-            );
+            let cat = r.catalog.as_deref().or(r.barcode.as_deref()).unwrap_or("—");
+            let body = format!("{}{}  {}  ·  {}  ·  {}", prefix, n, title, year, cat,);
             let style = if is_cursor {
-                Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::TEXT_BRIGHT)
+                    .bg(theme::SURFACE)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::TEXT)
             };
@@ -3450,7 +3912,9 @@ fn draw_mb_select(
     let footer = Line::from(vec![
         Span::styled(
             accept_label,
-            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             cancel_label,
@@ -3508,7 +3972,11 @@ fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect) {
         .iter()
         .take(visible.saturating_sub(if total > visible { 1 } else { 0 }))
         .map(|t| {
-            let title = if t.title.is_empty() { "(untitled)" } else { t.title.as_str() };
+            let title = if t.title.is_empty() {
+                "(untitled)"
+            } else {
+                t.title.as_str()
+            };
             Line::from(Span::styled(
                 format!("  {:>2}. {}", t.position, title),
                 Style::default().fg(theme::TEXT),
@@ -3528,11 +3996,10 @@ fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::app::{MetadataEditorPhase, MetadataEditorState};
+    use super::*;
     use std::path::PathBuf;
 
     /// Minimal MetadataEditorState fixture for title tests. Caller
@@ -3622,8 +4089,20 @@ mod tests {
         s.file_labels = vec!["01".into()];
         s.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
         let t = editor_title(&s);
-        assert!(t.contains("SACD"), "single-track SACD must show SACD marker: {}", t);
-        assert!(t.contains("[stereo]"), "single-track SACD must show area: {}", t);
-        assert!(!t.starts_with(" Metadata:"), "must not fall into non-SACD branch: {}", t);
+        assert!(
+            t.contains("SACD"),
+            "single-track SACD must show SACD marker: {}",
+            t
+        );
+        assert!(
+            t.contains("[stereo]"),
+            "single-track SACD must show area: {}",
+            t
+        );
+        assert!(
+            !t.starts_with(" Metadata:"),
+            "must not fall into non-SACD branch: {}",
+            t
+        );
     }
 }

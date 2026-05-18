@@ -38,7 +38,9 @@ fn format_one_report(results: &[&AnalysisResult]) -> String {
         (Some(a), Some(b)) => format!("{} / {}", a, b),
         (Some(a), None) => a.to_string(),
         (None, Some(b)) => b.to_string(),
-        (None, None) => results[0].path.parent()
+        (None, None) => results[0]
+            .path
+            .parent()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "Unknown".to_string()),
@@ -52,9 +54,10 @@ fn format_one_report(results: &[&AnalysisResult]) -> String {
     let codec = detect_codec(&results[0].path);
 
     // Compute average bitrate across all tracks.
-    let total_size: u64 = results.iter().filter_map(|r| {
-        std::fs::metadata(&r.path).ok().map(|m| m.len())
-    }).sum();
+    let total_size: u64 = results
+        .iter()
+        .filter_map(|r| std::fs::metadata(&r.path).ok().map(|m| m.len()))
+        .sum();
     let total_duration: f64 = results.iter().map(|r| r.duration_secs).sum();
     let avg_bitrate = if total_duration > 0.0 {
         ((total_size as f64 * 8.0) / total_duration / 1000.0).round() as u64
@@ -89,7 +92,9 @@ fn format_one_report(results: &[&AnalysisResult]) -> String {
 
     // Per-track rows
     for r in results {
-        let filename = r.path.file_stem()
+        let filename = r
+            .path
+            .file_stem()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let mins = r.duration_secs as u64 / 60;
@@ -129,7 +134,8 @@ fn read_artist_album(path: &Path) -> (Option<String>, Option<String>) {
 
 /// Detect codec name from file extension.
 fn detect_codec(path: &Path) -> String {
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     match ext.as_str() {

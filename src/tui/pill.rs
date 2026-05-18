@@ -103,10 +103,7 @@ impl<T: Clone + PartialEq> PillState<T> {
 }
 
 /// Render a pill row as a Vec of Spans
-pub fn render_pill_spans<T: Clone>(
-    state: &PillState<T>,
-    row_focused: bool,
-) -> Vec<Span<'static>> {
+pub fn render_pill_spans<T: Clone>(state: &PillState<T>, row_focused: bool) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
     for (i, opt) in state.options.iter().enumerate() {

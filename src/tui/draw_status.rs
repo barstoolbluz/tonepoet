@@ -21,16 +21,25 @@ pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState) {
     let items = &app.items_snapshot;
 
     let total = items.len();
-    let completed = items.iter()
+    let completed = items
+        .iter()
         .filter(|i| matches!(i.status, crate::convert::ConversionStatus::Completed { .. }))
         .count();
-    let failed = items.iter()
+    let failed = items
+        .iter()
         .filter(|i| matches!(i.status, crate::convert::ConversionStatus::Failed { .. }))
         .count();
-    let processing = items.iter()
-        .filter(|i| matches!(i.status, crate::convert::ConversionStatus::Processing { .. }))
+    let processing = items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.status,
+                crate::convert::ConversionStatus::Processing { .. }
+            )
+        })
         .count();
-    let queued = items.iter()
+    let queued = items
+        .iter()
         .filter(|i| matches!(i.status, crate::convert::ConversionStatus::Queued))
         .count();
 
@@ -45,11 +54,17 @@ pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState) {
         ));
         if failed > 0 {
             spans.push(Span::raw(" | "));
-            spans.push(Span::styled(format!("{} failed", failed), Style::default().fg(theme::RED)));
+            spans.push(Span::styled(
+                format!("{} failed", failed),
+                Style::default().fg(theme::RED),
+            ));
         }
         if processing > 0 {
             spans.push(Span::raw(" | "));
-            spans.push(Span::styled(format!("{} processing", processing), Style::default().fg(theme::CYAN)));
+            spans.push(Span::styled(
+                format!("{} processing", processing),
+                Style::default().fg(theme::CYAN),
+            ));
         }
         if queued > 0 {
             spans.push(Span::raw(" | "));
@@ -69,13 +84,17 @@ pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState) {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(
                 "PAUSED",
-                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::AMBER)
+                    .add_modifier(Modifier::BOLD),
             ));
         } else {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(
                 "CONVERTING",
-                Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
     }

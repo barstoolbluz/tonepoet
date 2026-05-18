@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::convert::formats::AudioFormat;
-use crate::convert::simple_wizard::DitherType;
 use super::app::*;
 use super::message::AppMessage;
+use crate::convert::formats::AudioFormat;
+use crate::convert::simple_wizard::DitherType;
 
 /// Full list of command-mode tokens (including aliases) recognised by
 /// `parse_command`. Used by the tab-completion machinery.
@@ -14,58 +14,122 @@ use super::message::AppMessage;
 /// Ordered so more-typed commands come first — matters for UX because
 /// the first match is what Tab shows initially before the user cycles.
 pub const COMMAND_NAMES: &[&str] = &[
-    "q", "quit", "exit",
-    "w", "write", "save",
+    "q",
+    "quit",
+    "exit",
+    "w",
+    "write",
+    "save",
     "wq",
-    "e", "edit",
-    "o", "output",
+    "e",
+    "edit",
+    "o",
+    "output",
     "cd",
-    "queue", "queue!", "qa", "qa!",
-    "c", "convert",
-    "commit", "Commit",
-    "go", "start",
-    "expand", "x",
+    "queue",
+    "queue!",
+    "qa",
+    "qa!",
+    "c",
+    "convert",
+    "commit",
+    "Commit",
+    "go",
+    "start",
+    "expand",
+    "x",
     "batch",
-    "preset", "presets", "saveas",
+    "preset",
+    "presets",
+    "saveas",
     "set",
-    "fx", "effects",
+    "fx",
+    "effects",
     "info",
     "tools",
-    "h", "help",
-    "sort", "sortdir",
+    "h",
+    "help",
+    "sort",
+    "sortdir",
     "filter",
     "rename",
-    "del", "delete", "trash",
-    "cp", "cp!", "copy", "copy!",
-    "mv", "mv!", "move", "move!",
-    "browse", "b",
-    "recent", "recents",
-    "bookmarks", "bm",
-    "rename-all", "renameall", "bulk-rename",
-    "password", "pw",
-    "analyze", "analyze!", "analysis", "dr",
-    "write-dr", "writedr",
-    "write-rg-track", "write-rg-album",
-    "import-cue", "cue", "cue!", "cue-mb", "cue-mb!", "cue-fill", "cue-enrich", "cue-view",
-    "tags-mb", "mb-tags", "musicbrainz-tags",
+    "del",
+    "delete",
+    "trash",
+    "cp",
+    "cp!",
+    "copy",
+    "copy!",
+    "mv",
+    "mv!",
+    "move",
+    "move!",
+    "browse",
+    "b",
+    "recent",
+    "recents",
+    "bookmarks",
+    "bm",
+    "rename-all",
+    "renameall",
+    "bulk-rename",
+    "password",
+    "pw",
+    "analyze",
+    "analyze!",
+    "analysis",
+    "dr",
+    "write-dr",
+    "writedr",
+    "write-rg-track",
+    "write-rg-album",
+    "import-cue",
+    "cue",
+    "cue!",
+    "cue-mb",
+    "cue-mb!",
+    "cue-fill",
+    "cue-enrich",
+    "cue-view",
+    "tags-mb",
+    "mb-tags",
+    "musicbrainz-tags",
     "revert",
     "restore",
-    "g", "G", "top", "bot", "bottom",
-    "fix-caps", "fixcaps",
-    "search", "s", "rs", "rsearch",
-    "context", "menu",
-    "ar", "ar!", "accuraterip", "accuraterip!",
-    "ar-fix", "ar-batch",
-    "ctdb", "ctdb-repair", "cuetools", "cuetools-repair",
-    "view", "cat", "edit-file", "ef",
+    "g",
+    "G",
+    "top",
+    "bot",
+    "bottom",
+    "fix-caps",
+    "fixcaps",
+    "search",
+    "s",
+    "rs",
+    "rsearch",
+    "context",
+    "menu",
+    "ar",
+    "ar!",
+    "accuraterip",
+    "accuraterip!",
+    "ar-fix",
+    "ar-batch",
+    "ctdb",
+    "ctdb-repair",
+    "cuetools",
+    "cuetools-repair",
+    "view",
+    "cat",
+    "edit-file",
+    "ef",
 ];
 
 /// Commands that take a preset name as their argument. Used by the
 /// completion machinery to decide whether the word after the command
 /// should be completed against preset file names.
-pub const PRESET_TAKING_COMMANDS: &[&str] = &[
-    "queue", "queue!", "qa", "qa!", "c", "convert", "preset",
-];
+pub const PRESET_TAKING_COMMANDS: &[&str] =
+    &["queue", "queue!", "qa", "qa!", "c", "convert", "preset"];
 
 /// Compute tab-completion candidates from a CommandInput's current text
 /// and cursor position. Returns `None` if no completion is applicable
@@ -80,10 +144,7 @@ pub const PRESET_TAKING_COMMANDS: &[&str] = &[
 ///   prefix match.
 ///
 /// Returns a `CompletionState` with `cursor = 0` (first candidate).
-pub fn compute_completion(
-    text: &str,
-    cursor: usize,
-) -> Option<CompletionState> {
+pub fn compute_completion(text: &str, cursor: usize) -> Option<CompletionState> {
     let before_cursor = &text[..cursor.min(text.len())];
 
     // Start of the word being completed: just after the last whitespace,
@@ -173,7 +234,9 @@ pub fn apply_completion_to_input(
 ) {
     let candidate = &state.candidates[state.cursor];
     let prefix_end = input.cursor.min(input.text.len());
-    input.text.replace_range(state.prefix_start..prefix_end, candidate);
+    input
+        .text
+        .replace_range(state.prefix_start..prefix_end, candidate);
     input.cursor = state.prefix_start + candidate.len();
 }
 
@@ -201,11 +264,15 @@ pub enum Command {
     /// browse selection if any. Triggered by `:queue`, `:queue!`, `:qa`,
     /// `:qa!`, `:convert`, `:c`. Optional preset name is loaded into the
     /// format pills before review.
-    Queue { preset: Option<String> },
+    Queue {
+        preset: Option<String>,
+    },
     /// Commit the currently-reviewed file/batch from the Convert screen to
     /// the queue. `:commit` (lowercase) enqueues only; `:Commit` (capital)
     /// enqueues AND starts processing, jumping to the Queue screen.
-    Commit { start: bool },
+    Commit {
+        start: bool,
+    },
     /// Start processing whatever's already in the queue. No new batch.
     /// Triggered by `:go` / `:start`.
     Go,
@@ -235,10 +302,16 @@ pub enum Command {
     Delete,
     /// Copy selected file(s) to a destination. Empty arg opens a TextEdit
     /// picker. `:cp!` variant replaces existing files.
-    Copy { dest: String, force: bool },
+    Copy {
+        dest: String,
+        force: bool,
+    },
     /// Move selected file(s) to a destination. Empty arg opens picker.
     /// `:mv!` replaces existing. Falls back to copy+delete across filesystems.
-    Move { dest: String, force: bool },
+    Move {
+        dest: String,
+        force: bool,
+    },
     /// Switch to the browse screen. On the convert screen, sets
     /// the return target so a selected file loads back into the source pane.
     Browse,
@@ -252,7 +325,9 @@ pub enum Command {
     BulkRename,
     /// Analyze selected audio file(s) — DR, peak, clipping, etc.
     /// `force`: if true, skip cache and re-analyze.
-    Analyze { force: bool },
+    Analyze {
+        force: bool,
+    },
     /// Write DR analysis report to each album directory.
     WriteDr,
     /// Write ReplayGain track tags via loudgain.
@@ -267,11 +342,15 @@ pub enum Command {
     Verify,
     /// Generate a CUE sheet from the selected audio files.
     /// `single_image`: false = multi-file, true = single image with cumulative timestamps.
-    GenerateCue { single_image: bool },
+    GenerateCue {
+        single_image: bool,
+    },
     /// Generate a CUE sheet driven by a MusicBrainz disc-TOC lookup. Title,
     /// performer, ISRC, catalog, barcode all come from MB; durations and
     /// pregaps come from local probe + EAC log.
-    GenerateCueMb { single_image: bool },
+    GenerateCueMb {
+        single_image: bool,
+    },
     /// Read a colocated CUE, fill empty/absent fields from a MusicBrainz
     /// disc-TOC lookup, write back. Preserves the existing CUE form
     /// (single-image vs multi-file) and user-typed values.
@@ -349,22 +428,34 @@ pub enum Command {
     /// Clear the stored bit-compare reference.
     ClearCompareRef,
     /// Direct comparison of two explicit paths (`:compare path1 path2`).
-    ComparePaths { path1: String, path2: String },
+    ComparePaths {
+        path1: String,
+        path2: String,
+    },
     /// Detect CD pre-emphasis on selected audio file(s).
     DetectPreemphasis,
     /// Train the pre-emphasis corpus model from a directory of non-PE audio.
-    TrainPreemphCorpus { path: String },
+    TrainPreemphCorpus {
+        path: String,
+    },
     /// Calibrate the pre-emphasis LDA classifier from labeled PE and non-PE directories.
-    CalibratePreemphasis { pe_dir: String, non_pe_dir: String },
+    CalibratePreemphasis {
+        pe_dir: String,
+        non_pe_dir: String,
+    },
     /// Open the search panel.
-    Search { recursive: bool },
+    Search {
+        recursive: bool,
+    },
     /// Set an archive password for the selected archive in Browse.
     Password,
     /// Open the context menu at the current selection.
     ContextMenu,
     /// AccurateRip verification on selected audio files/folder.
     /// `force`: if true, full offset scan (-1200 to +1200).
-    AccurateRip { force: bool },
+    AccurateRip {
+        force: bool,
+    },
     /// Apply AccurateRip offset correction.
     ArFix,
     /// Batch AccurateRip verification of current browse directory.
@@ -417,8 +508,9 @@ pub fn parse_command(input: &str) -> Command {
         "area" | "sacd-area" => {
             let target = match args.trim().to_ascii_lowercase().as_str() {
                 "stereo" | "2ch" | "two-channel" | "2.0" => SacdAreaTarget::Stereo,
-                "mch" | "mc" | "multi-channel" | "multichannel" | "5.1" =>
-                    SacdAreaTarget::MultiChannel,
+                "mch" | "mc" | "multi-channel" | "multichannel" | "5.1" => {
+                    SacdAreaTarget::MultiChannel
+                }
                 "" | "toggle" => SacdAreaTarget::Toggle,
                 other => {
                     return Command::Unknown(format!(":area unknown target '{}'", other));
@@ -476,15 +568,31 @@ pub fn parse_command(input: &str) -> Command {
         }
         "sortdir" => Command::SortDir,
         "filter" => {
-            let arg = if args.is_empty() { None } else { Some(args.to_string()) };
+            let arg = if args.is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            };
             Command::Filter(arg)
         }
         "del" | "delete" | "trash" => Command::Delete,
         "rename" => Command::Rename(args.to_string()),
-        "cp" | "copy" => Command::Copy { dest: args.to_string(), force: false },
-        "cp!" | "copy!" => Command::Copy { dest: args.to_string(), force: true },
-        "mv" | "move" => Command::Move { dest: args.to_string(), force: false },
-        "mv!" | "move!" => Command::Move { dest: args.to_string(), force: true },
+        "cp" | "copy" => Command::Copy {
+            dest: args.to_string(),
+            force: false,
+        },
+        "cp!" | "copy!" => Command::Copy {
+            dest: args.to_string(),
+            force: true,
+        },
+        "mv" | "move" => Command::Move {
+            dest: args.to_string(),
+            force: false,
+        },
+        "mv!" | "move!" => Command::Move {
+            dest: args.to_string(),
+            force: true,
+        },
         "browse" | "b" => Command::Browse,
         "recent" | "recents" => Command::Recent,
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
@@ -492,9 +600,13 @@ pub fn parse_command(input: &str) -> Command {
         "analyze" | "analysis" | "dr" => Command::Analyze { force: false },
         "analyze!" => Command::Analyze { force: true },
         "verify" | "test" => Command::Verify,
-        "cue" => Command::GenerateCue { single_image: false },
+        "cue" => Command::GenerateCue {
+            single_image: false,
+        },
         "cue!" => Command::GenerateCue { single_image: true },
-        "cue-mb" => Command::GenerateCueMb { single_image: false },
+        "cue-mb" => Command::GenerateCueMb {
+            single_image: false,
+        },
         "cue-mb!" => Command::GenerateCueMb { single_image: true },
         "cue-fill" | "cue-enrich" => Command::CueFill,
         "cue-view" => Command::CueView,
@@ -537,7 +649,10 @@ pub fn parse_command(input: &str) -> Command {
             } else if p2.is_empty() {
                 Command::Unknown(format!("compare: need two paths (got one: {})", p1))
             } else {
-                Command::ComparePaths { path1: p1, path2: p2 }
+                Command::ComparePaths {
+                    path1: p1,
+                    path2: p2,
+                }
             }
         }
         "search" | "s" => Command::Search { recursive: false },
@@ -561,8 +676,7 @@ pub fn parse_command(input: &str) -> Command {
     }
 }
 
-const TAGS_MB_USAGE: &str =
-    "usage: :tags-mb [--catno VALUE] [--year YYYY] [text query]";
+const TAGS_MB_USAGE: &str = "usage: :tags-mb [--catno VALUE] [--year YYYY] [text query]";
 
 /// Tokenize a `:tags-mb` arg string into whitespace-separated tokens,
 /// respecting double-quoted strings (no escapes). Catalog numbers
@@ -609,7 +723,11 @@ fn tokenize_tags_mb_args(input: &str) -> Result<Vec<String>, String> {
 fn parse_tags_mb_args(args: &str) -> Command {
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        return Command::TagsFromMb { query: None, catno: None, year: None };
+        return Command::TagsFromMb {
+            query: None,
+            catno: None,
+            year: None,
+        };
     }
     let tokens = match tokenize_tags_mb_args(trimmed) {
         Ok(t) => t,
@@ -624,44 +742,51 @@ fn parse_tags_mb_args(args: &str) -> Command {
         match tok.as_str() {
             "--catno" => {
                 let Some(val) = iter.next() else {
-                    return Command::Unknown(
-                        format!(":tags-mb: --catno requires a value — {}", TAGS_MB_USAGE),
-                    );
+                    return Command::Unknown(format!(
+                        ":tags-mb: --catno requires a value — {}",
+                        TAGS_MB_USAGE
+                    ));
                 };
                 if val.is_empty() {
-                    return Command::Unknown(
-                        format!(":tags-mb: --catno value must be non-empty — {}", TAGS_MB_USAGE),
-                    );
+                    return Command::Unknown(format!(
+                        ":tags-mb: --catno value must be non-empty — {}",
+                        TAGS_MB_USAGE
+                    ));
                 }
                 if catno.is_some() {
-                    return Command::Unknown(
-                        format!(":tags-mb: --catno specified twice — {}", TAGS_MB_USAGE),
-                    );
+                    return Command::Unknown(format!(
+                        ":tags-mb: --catno specified twice — {}",
+                        TAGS_MB_USAGE
+                    ));
                 }
                 catno = Some(val);
             }
             "--year" => {
                 let Some(val) = iter.next() else {
-                    return Command::Unknown(
-                        format!(":tags-mb: --year requires a value — {}", TAGS_MB_USAGE),
-                    );
+                    return Command::Unknown(format!(
+                        ":tags-mb: --year requires a value — {}",
+                        TAGS_MB_USAGE
+                    ));
                 };
                 if val.is_empty() {
-                    return Command::Unknown(
-                        format!(":tags-mb: --year value must be non-empty — {}", TAGS_MB_USAGE),
-                    );
+                    return Command::Unknown(format!(
+                        ":tags-mb: --year value must be non-empty — {}",
+                        TAGS_MB_USAGE
+                    ));
                 }
                 if year.is_some() {
-                    return Command::Unknown(
-                        format!(":tags-mb: --year specified twice — {}", TAGS_MB_USAGE),
-                    );
+                    return Command::Unknown(format!(
+                        ":tags-mb: --year specified twice — {}",
+                        TAGS_MB_USAGE
+                    ));
                 }
                 year = Some(val);
             }
             s if s.starts_with("--") => {
-                return Command::Unknown(
-                    format!(":tags-mb: unknown flag '{}' — {}", s, TAGS_MB_USAGE),
-                );
+                return Command::Unknown(format!(
+                    ":tags-mb: unknown flag '{}' — {}",
+                    s, TAGS_MB_USAGE
+                ));
             }
             _ => text_parts.push(tok),
         }
@@ -695,10 +820,16 @@ where
 {
     let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
         parked
-    } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
+    } else if matches!(
+        app.active_overlay,
+        super::app::ActiveOverlay::MetadataEditor(_)
+    ) {
         let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
-        if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
-        else { unreachable!() }
+        if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
+            s
+        } else {
+            unreachable!()
+        }
     } else {
         app.set_status("metadata-editor command requires the editor to be active");
         return;
@@ -711,20 +842,22 @@ where
 
 /// Like `with_editor_state` but also threads `app` and `tx` into the
 /// closure. Used by `:w` save which needs both.
-fn with_editor_state_and_tx<F>(
-    app: &mut AppState,
-    tx: &mpsc::Sender<AppMessage>,
-    mut f: F,
-)
+fn with_editor_state_and_tx<F>(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, mut f: F)
 where
     F: FnMut(&mut AppState, &mut super::app::MetadataEditorState, &mpsc::Sender<AppMessage>),
 {
     let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
         parked
-    } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
+    } else if matches!(
+        app.active_overlay,
+        super::app::ActiveOverlay::MetadataEditor(_)
+    ) {
         let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
-        if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
-        else { unreachable!() }
+        if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
+            s
+        } else {
+            unreachable!()
+        }
     } else {
         app.set_status("metadata-editor command requires the editor to be active");
         return;
@@ -735,11 +868,7 @@ where
     }
 }
 
-pub fn execute_command(
-    app: &mut AppState,
-    cmd: Command,
-    tx: &mpsc::Sender<AppMessage>,
-) {
+pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMessage>) {
     match cmd {
         Command::Quit => {
             // If a CUE preview is parked, :q just cancels the preview
@@ -755,10 +884,14 @@ pub fn execute_command(
             // tags (Phase 4 regen + per-file lofty write) via
             // metadata_editor_save (extracted helper in keybindings.rs).
             if app.pending_metadata_editor.is_some()
-                || matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_))
+                || matches!(
+                    app.active_overlay,
+                    super::app::ActiveOverlay::MetadataEditor(_)
+                )
             {
-                with_editor_state_and_tx(app, tx, |app, state, tx|
-                    super::keybindings::metadata_editor_save(app, state, tx));
+                with_editor_state_and_tx(app, tx, |app, state, tx| {
+                    super::keybindings::metadata_editor_save(app, state, tx)
+                });
                 return;
             }
             // If a CUE preview is parked, :w writes the previewed CUE.
@@ -771,7 +904,8 @@ pub fn execute_command(
                 let path = state.write_path.clone();
                 match std::fs::write(&path, &state.content) {
                     Ok(()) => {
-                        let name = path.file_name()
+                        let name = path
+                            .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| path.display().to_string());
                         app.set_status(format!("CUE written: {}", name));
@@ -790,7 +924,9 @@ pub fn execute_command(
             }
             if let Some(name) = &app.preset.active_preset.clone() {
                 let preset = super::presets::TuiPreset::from_pill_state(
-                    name, &app.convert.format, &app.convert.output_options,
+                    name,
+                    &app.convert.format,
+                    &app.convert.output_options,
                 );
                 match super::presets::save_preset_with_db(&preset, &app.db) {
                     Ok(_) => {
@@ -815,7 +951,8 @@ pub fn execute_command(
                 let path = state.write_path.clone();
                 match std::fs::write(&path, &state.content) {
                     Ok(()) => {
-                        let name = path.file_name()
+                        let name = path
+                            .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| path.display().to_string());
                         app.set_status(format!("CUE written: {}", name));
@@ -833,7 +970,9 @@ pub fn execute_command(
             }
             if let Some(name) = &app.preset.active_preset.clone() {
                 let preset = super::presets::TuiPreset::from_pill_state(
-                    name, &app.convert.format, &app.convert.output_options,
+                    name,
+                    &app.convert.format,
+                    &app.convert.output_options,
                 );
                 super::presets::save_preset_with_db(&preset, &app.db).ok();
             }
@@ -890,9 +1029,7 @@ pub fn execute_command(
             app.convert.metadata.genre = metadata.genre.clone();
             app.convert.metadata.year = metadata.year.clone();
 
-            app.convert.source.mode = SourceMode::from_single(
-                p.clone(), Some(info), metadata,
-            );
+            app.convert.source.mode = SourceMode::from_single(p.clone(), Some(info), metadata);
             app.set_status(format!(
                 "Loaded: {}",
                 p.file_name().unwrap_or_default().to_string_lossy()
@@ -976,7 +1113,9 @@ pub fn execute_command(
                 app.set_status("Usage: :saveas <name>");
             } else {
                 let preset = super::presets::TuiPreset::from_pill_state(
-                    &name, &app.convert.format, &app.convert.output_options,
+                    &name,
+                    &app.convert.format,
+                    &app.convert.output_options,
                 );
                 match super::presets::save_preset_with_db(&preset, &app.db) {
                     Ok(_) => {
@@ -1103,10 +1242,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 AppScreen::Convert => app.convert.source.mode.all_paths(),
@@ -1119,7 +1260,11 @@ pub fn execute_command(
                 let dir = if paths.is_empty() {
                     let sel = collect_selection_for_file_ops(app);
                     sel.first().and_then(|p| {
-                        if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }
+                        if p.is_dir() {
+                            Some(p.clone())
+                        } else {
+                            p.parent().map(|d| d.to_path_buf())
+                        }
                     })
                 } else {
                     paths[0].parent().map(|d| d.to_path_buf())
@@ -1128,20 +1273,25 @@ pub fn execute_command(
                     if let Some(info) = super::cue_parser::detect_single_image(dir) {
                         let n = info.track_boundaries.len();
                         let can_seek = super::cue_parser::can_ffmpeg_read(&info.audio_path);
-                        app.set_status(format!(
-                            "Analyzing {} tracks (single image)...", n,
-                        ));
+                        app.set_status(format!("Analyzing {} tracks (single image)...", n,));
                         app.analysis_results.clear();
                         app.analysis_pending = n;
 
                         // Build display names from CUE metadata.
-                        let display_paths: Vec<std::path::PathBuf> = info.sheet.tracks.iter()
+                        let display_paths: Vec<std::path::PathBuf> = info
+                            .sheet
+                            .tracks
+                            .iter()
                             .map(|t| {
-                                let name = format!("{:02} - {}.flac",
+                                let name = format!(
+                                    "{:02} - {}.flac",
                                     t.number,
                                     t.title.as_deref().unwrap_or("Track"),
                                 );
-                                info.audio_path.parent().unwrap_or(std::path::Path::new(".")).join(name)
+                                info.audio_path
+                                    .parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join(name)
                             })
                             .collect();
 
@@ -1159,9 +1309,17 @@ pub fn execute_command(
                                     let dur = count as f64 / info.sample_rate as f64;
                                     let (pcm_result, hdcd_result) = tokio::join!(
                                         tokio::task::spawn_blocking(move || {
-                                            super::analyze::analyze_file(&pcm_path, Some(start), Some(count))
+                                            super::analyze::analyze_file(
+                                                &pcm_path,
+                                                Some(start),
+                                                Some(count),
+                                            )
                                         }),
-                                        super::analyze::detect_hdcd(&audio_path, Some(seek), Some(dur)),
+                                        super::analyze::detect_hdcd(
+                                            &audio_path,
+                                            Some(seek),
+                                            Some(dur)
+                                        ),
                                     );
                                     // LUFS: skip for seek-based (loudgain needs a real file per track).
 
@@ -1171,7 +1329,10 @@ pub fn execute_command(
 
                                             let pe_evidence = super::preemphasis::metadata::check_tag_evidence(&original_path)
                                                 .or_else(|| super::preemphasis::metadata::check_file_evidence(&original_path));
-                                            let catalog_match = super::preemphasis::catalog::check_catalog_evidence(&original_path);
+                                            let catalog_match =
+                                                super::preemphasis::catalog::check_catalog_evidence(
+                                                    &original_path,
+                                                );
 
                                             if let Some(ev) = pe_evidence {
                                                 result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
@@ -1188,7 +1349,8 @@ pub fn execute_command(
                                             }
 
                                             if result.declared_bit_depth == Some(16)
-                                                || (result.declared_bit_depth.is_none() && result.actual_bit_depth <= 16)
+                                                || (result.declared_bit_depth.is_none()
+                                                    && result.actual_bit_depth <= 16)
                                             {
                                                 if let Some(hdcd) = hdcd_result {
                                                     result.hdcd_detected = Some(hdcd.detected);
@@ -1203,32 +1365,41 @@ pub fn execute_command(
                                         Ok(Err(e)) => Err(format!("track {}: {}", i + 1, e)),
                                         Err(e) => Err(format!("task panicked: {}", e)),
                                     };
-                                    let _ = tx.send(AppMessage::AnalysisComplete {
-                                        result: final_result,
-                                    }).await;
+                                    let _ = tx
+                                        .send(AppMessage::AnalysisComplete {
+                                            result: final_result,
+                                        })
+                                        .await;
                                 });
                             }
                         } else {
                             // Slow path: extract to temp files (WavPack v4, etc.).
-                            let tmp_dir = std::env::temp_dir().join(
-                                format!("tonepoet-analyze-{}", std::process::id()),
-                            );
+                            let tmp_dir = std::env::temp_dir()
+                                .join(format!("tonepoet-analyze-{}", std::process::id()));
                             app.analysis_temp_dir = Some(tmp_dir.clone());
                             let tx = tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
                                     for _ in 0..n {
-                                        let _ = tx.send(AppMessage::AnalysisComplete {
-                                            result: Err(format!("temp dir failed: {}", e)),
-                                        }).await;
+                                        let _ = tx
+                                            .send(AppMessage::AnalysisComplete {
+                                                result: Err(format!("temp dir failed: {}", e)),
+                                            })
+                                            .await;
                                     }
                                     return;
                                 }
                                 let track_paths = match tokio::task::spawn_blocking({
                                     let info = info.clone();
                                     let tmp_dir = tmp_dir.clone();
-                                    move || super::cue_parser::extract_single_image_tracks(&info, &tmp_dir)
-                                }).await {
+                                    move || {
+                                        super::cue_parser::extract_single_image_tracks(
+                                            &info, &tmp_dir,
+                                        )
+                                    }
+                                })
+                                .await
+                                {
                                     Ok(Ok(paths)) => paths,
                                     result => {
                                         let msg = match result {
@@ -1237,9 +1408,11 @@ pub fn execute_command(
                                             _ => unreachable!(),
                                         };
                                         for _ in 0..n {
-                                            let _ = tx.send(AppMessage::AnalysisComplete {
-                                                result: Err(msg.clone()),
-                                            }).await;
+                                            let _ = tx
+                                                .send(AppMessage::AnalysisComplete {
+                                                    result: Err(msg.clone()),
+                                                })
+                                                .await;
                                         }
                                         return;
                                     }
@@ -1283,7 +1456,8 @@ pub fn execute_command(
                                                     ));
                                                 }
                                                 if result.declared_bit_depth == Some(16)
-                                                    || (result.declared_bit_depth.is_none() && result.actual_bit_depth <= 16)
+                                                    || (result.declared_bit_depth.is_none()
+                                                        && result.actual_bit_depth <= 16)
                                                 {
                                                     if let Some(hdcd) = hdcd_result {
                                                         result.hdcd_detected = Some(hdcd.detected);
@@ -1297,9 +1471,11 @@ pub fn execute_command(
                                             Ok(Err(e)) => Err(format!("track {}: {}", i + 1, e)),
                                             Err(e) => Err(format!("task panicked: {}", e)),
                                         };
-                                        let _ = tx.send(AppMessage::AnalysisComplete {
-                                            result: final_result,
-                                        }).await;
+                                        let _ = tx
+                                            .send(AppMessage::AnalysisComplete {
+                                                result: final_result,
+                                            })
+                                            .await;
                                     });
                                 }
                             });
@@ -1321,11 +1497,14 @@ pub fn execute_command(
                 } else {
                     for path in &paths {
                         let cached = std::fs::metadata(path).ok().and_then(|meta| {
-                            let mtime = meta.modified()
+                            let mtime = meta
+                                .modified()
                                 .map(crate::db::systemtime_to_unix)
                                 .unwrap_or(0);
                             app.db.get_cached_analysis(
-                                &path.display().to_string(), mtime, meta.len(),
+                                &path.display().to_string(),
+                                mtime,
+                                meta.len(),
                             )
                         });
                         if let Some(result) = cached {
@@ -1340,12 +1519,16 @@ pub fn execute_command(
                     // All results served from cache — show overlay immediately.
                     let count = app.analysis_results.len();
                     let last = &app.analysis_results[count - 1];
-                    let name = last.path.file_name()
+                    let name = last
+                        .path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     app.set_status(format!(
                         "Analyzed: {} — DR{} ({}) [cached]",
-                        name, last.dr_value, super::analyze::dr_label(last.dr_value),
+                        name,
+                        last.dr_value,
+                        super::analyze::dr_label(last.dr_value),
                     ));
                     app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
                 } else {
@@ -1376,9 +1559,17 @@ pub fn execute_command(
 
                                     // Fast pre-emphasis detection (metadata + catalog only, no spectral).
                                     let pe_path = result.path.clone();
-                                    let pe_evidence = super::preemphasis::metadata::check_tag_evidence(&pe_path)
-                                        .or_else(|| super::preemphasis::metadata::check_file_evidence(&pe_path));
-                                    let catalog_match = super::preemphasis::catalog::check_catalog_evidence(&pe_path);
+                                    let pe_evidence =
+                                        super::preemphasis::metadata::check_tag_evidence(&pe_path)
+                                            .or_else(|| {
+                                                super::preemphasis::metadata::check_file_evidence(
+                                                    &pe_path,
+                                                )
+                                            });
+                                    let catalog_match =
+                                        super::preemphasis::catalog::check_catalog_evidence(
+                                            &pe_path,
+                                        );
 
                                     if let Some(ev) = pe_evidence {
                                         result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
@@ -1396,7 +1587,8 @@ pub fn execute_command(
 
                                     // HDCD detection (only meaningful for 16-bit sources).
                                     if result.declared_bit_depth == Some(16)
-                                        || (result.declared_bit_depth.is_none() && result.actual_bit_depth <= 16)
+                                        || (result.declared_bit_depth.is_none()
+                                            && result.actual_bit_depth <= 16)
                                     {
                                         if let Some(hdcd) = hdcd_result {
                                             result.hdcd_detected = Some(hdcd.detected);
@@ -1409,16 +1601,19 @@ pub fn execute_command(
                                     Ok(Box::new(result))
                                 }
                                 Ok(Err(e)) => {
-                                    let name = lufs_path.file_name()
+                                    let name = lufs_path
+                                        .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_default();
                                     Err(format!("{}: {}", name, e))
                                 }
                                 Err(e) => Err(format!("task panicked: {}", e)),
                             };
-                            let _ = tx.send(AppMessage::AnalysisComplete {
-                                result: final_result,
-                            }).await;
+                            let _ = tx
+                                .send(AppMessage::AnalysisComplete {
+                                    result: final_result,
+                                })
+                                .await;
                         });
                     }
                 }
@@ -1430,10 +1625,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 AppScreen::Convert => app.convert.source.mode.all_paths(),
@@ -1460,10 +1657,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 _ => Vec::new(),
@@ -1481,21 +1680,22 @@ pub fn execute_command(
                     if sel.len() == 1 && sel[0].is_dir() {
                         sel[0].clone()
                     } else {
-                        paths[0].parent()
+                        paths[0]
+                            .parent()
                             .unwrap_or_else(|| std::path::Path::new("."))
                             .to_path_buf()
                     }
                 } else {
-                    paths[0].parent()
+                    paths[0]
+                        .parent()
                         .unwrap_or_else(|| std::path::Path::new("."))
                         .to_path_buf()
                 };
 
                 match super::cue_generate::gather_cue_info(&paths, &output_dir) {
                     Ok((album, tracks)) => {
-                        let pregap_count = tracks.iter()
-                            .filter(|t| t.pregap_frames.is_some())
-                            .count();
+                        let pregap_count =
+                            tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
                         let cue_content = if single_image {
                             let image_name =
                                 super::cue_generate::derive_image_filename(&album, &paths[0]);
@@ -1505,7 +1705,10 @@ pub fn execute_command(
                                 .unwrap_or("flac");
                             let fmt = super::cue_generate::cue_format_tag(ext);
                             super::cue_generate::generate_single_image_cue(
-                                &album, &tracks, &image_name, fmt,
+                                &album,
+                                &tracks,
+                                &image_name,
+                                fmt,
                             )
                         } else {
                             super::cue_generate::generate_multifile_cue(&album, &tracks)
@@ -1516,10 +1719,17 @@ pub fn execute_command(
 
                         match std::fs::write(&cue_path, &cue_content) {
                             Ok(()) => {
-                                let mode = if single_image { "single image" } else { "multi-file" };
+                                let mode = if single_image {
+                                    "single image"
+                                } else {
+                                    "multi-file"
+                                };
                                 let pregap_note = if pregap_count > 0 {
-                                    format!(", with {} EAC pregap{}", pregap_count,
-                                        if pregap_count == 1 { "" } else { "s" })
+                                    format!(
+                                        ", with {} EAC pregap{}",
+                                        pregap_count,
+                                        if pregap_count == 1 { "" } else { "s" }
+                                    )
                                 } else {
                                     String::new()
                                 };
@@ -1550,10 +1760,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 _ => Vec::new(),
@@ -1567,12 +1779,14 @@ pub fn execute_command(
                     if sel.len() == 1 && sel[0].is_dir() {
                         sel[0].clone()
                     } else {
-                        paths[0].parent()
+                        paths[0]
+                            .parent()
                             .unwrap_or_else(|| std::path::Path::new("."))
                             .to_path_buf()
                     }
                 } else {
-                    paths[0].parent()
+                    paths[0]
+                        .parent()
                         .unwrap_or_else(|| std::path::Path::new("."))
                         .to_path_buf()
                 };
@@ -1609,10 +1823,15 @@ pub fn execute_command(
                     }
                 };
                 let cached = app.db.get_cached_mb_response(&toc_string);
-                let n_cached = if cached.is_some() { "cached" } else { "fetching" };
+                let n_cached = if cached.is_some() {
+                    "cached"
+                } else {
+                    "fetching"
+                };
                 app.set_status(format!(
                     "MusicBrainz CUE: {} disc TOC ({} tracks)…",
-                    n_cached, sectors.len() - 1,
+                    n_cached,
+                    sectors.len() - 1,
                 ));
 
                 let tx = tx.clone();
@@ -1620,16 +1839,16 @@ pub fn execute_command(
                 let paths_for_msg = paths.clone();
                 let output_dir_for_msg = output_dir.clone();
                 tokio::spawn(async move {
-                    let outcome = super::musicbrainz::lookup_release_by_toc(
-                        &sectors, cached,
-                    ).await;
-                    let _ = tx.send(AppMessage::CueMbComplete {
-                        outcome,
-                        paths: paths_for_msg,
-                        output_dir: output_dir_for_msg,
-                        single_image,
-                        toc_string: toc_for_msg,
-                    }).await;
+                    let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await;
+                    let _ = tx
+                        .send(AppMessage::CueMbComplete {
+                            outcome,
+                            paths: paths_for_msg,
+                            output_dir: output_dir_for_msg,
+                            single_image,
+                            toc_string: toc_for_msg,
+                        })
+                        .await;
                 });
             }
         }
@@ -1642,12 +1861,18 @@ pub fn execute_command(
             // (operates on per_file_values vs the MB-proposed set).
             // Outside, it's the cursor-row value-based toggle.
             let in_detail = state.phase == super::app::MetadataEditorPhase::DetailEdit;
-            let target_idx = if in_detail { state.detail_field_idx } else { state.cursor };
+            let target_idx = if in_detail {
+                state.detail_field_idx
+            } else {
+                state.cursor
+            };
             if let Some(entry) = state.entries.get_mut(target_idx) {
                 if in_detail {
                     let pill_before = super::probe::mb_pill_state_field(entry);
                     if matches!(pill_before, super::probe::MbRevertPill::None) {
-                        app.set_status(":revert: field was not changed by MusicBrainz, or has manual edits");
+                        app.set_status(
+                            ":revert: field was not changed by MusicBrainz, or has manual edits",
+                        );
                     } else {
                         super::probe::toggle_mb_revert_field(entry);
                         let after = super::probe::mb_pill_state_field(entry);
@@ -1689,7 +1914,11 @@ pub fn execute_command(
             // in the main editor we use the cursor row, so the user can
             // restore a non-mixed row that doesn't surface the bulk pill.
             let in_detail = state.phase == super::app::MetadataEditorPhase::DetailEdit;
-            let target_idx = if in_detail { state.detail_field_idx } else { state.cursor };
+            let target_idx = if in_detail {
+                state.detail_field_idx
+            } else {
+                state.cursor
+            };
             if let Some(entry) = state.entries.get_mut(target_idx) {
                 if !super::probe::entry_has_mb_proposed(entry) {
                     app.set_status(":restore: field was not populated from MusicBrainz");
@@ -1703,16 +1932,24 @@ pub fn execute_command(
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
         Command::MetaAdd => {
-            with_editor_state(app, |state| super::keybindings::metadata_editor_open_add(state));
+            with_editor_state(app, |state| {
+                super::keybindings::metadata_editor_open_add(state)
+            });
         }
         Command::MetaDelete => {
-            with_editor_state(app, |state| super::keybindings::metadata_editor_delete_cursor(state));
+            with_editor_state(app, |state| {
+                super::keybindings::metadata_editor_delete_cursor(state)
+            });
         }
         Command::MetaUndelete => {
-            with_editor_state(app, |state| super::keybindings::metadata_editor_undelete_cursor(state));
+            with_editor_state(app, |state| {
+                super::keybindings::metadata_editor_undelete_cursor(state)
+            });
         }
         Command::MetaDetail => {
-            with_editor_state(app, |state| super::keybindings::metadata_editor_open_detail(state));
+            with_editor_state(app, |state| {
+                super::keybindings::metadata_editor_open_detail(state)
+            });
         }
         Command::MbBack => {
             // Editor state may be in pending (colon command from
@@ -1720,16 +1957,25 @@ pub fn execute_command(
             // restored before dispatching). Take from either.
             let state = if let Some(parked) = app.pending_metadata_editor.take() {
                 parked
-            } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
-                let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
-                if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
-                else { unreachable!() }
+            } else if matches!(
+                app.active_overlay,
+                super::app::ActiveOverlay::MetadataEditor(_)
+            ) {
+                let prev =
+                    std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+                if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
+                    s
+                } else {
+                    unreachable!()
+                }
             } else {
                 app.set_status(":mb-back only works in the metadata editor");
                 return;
             };
             let Some(cache) = state.mb_back.clone() else {
-                app.set_status(":mb-back: no MB lookup to return to (run :tags-mb first)".to_string());
+                app.set_status(
+                    ":mb-back: no MB lookup to return to (run :tags-mb first)".to_string(),
+                );
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                 return;
             };
@@ -1755,16 +2001,25 @@ pub fn execute_command(
             // Mirror of Command::MbBack for the gnudb flow.
             let state = if let Some(parked) = app.pending_metadata_editor.take() {
                 parked
-            } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
-                let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
-                if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
-                else { unreachable!() }
+            } else if matches!(
+                app.active_overlay,
+                super::app::ActiveOverlay::MetadataEditor(_)
+            ) {
+                let prev =
+                    std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+                if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
+                    s
+                } else {
+                    unreachable!()
+                }
             } else {
                 app.set_status(":gnudb-back only works in the metadata editor");
                 return;
             };
             let Some(review) = state.gnudb_back.clone() else {
-                app.set_status(":gnudb-back: no gnudb review to return to (run :tags-gnudb first)".to_string());
+                app.set_status(
+                    ":gnudb-back: no gnudb review to return to (run :tags-gnudb first)".to_string(),
+                );
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                 return;
             };
@@ -1783,10 +2038,17 @@ pub fn execute_command(
         Command::SacdSwitchArea(target) => {
             let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
                 parked
-            } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
-                let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
-                if let super::app::ActiveOverlay::MetadataEditor(s) = prev { s }
-                else { unreachable!() }
+            } else if matches!(
+                app.active_overlay,
+                super::app::ActiveOverlay::MetadataEditor(_)
+            ) {
+                let prev =
+                    std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+                if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
+                    s
+                } else {
+                    unreachable!()
+                }
             } else {
                 app.set_status(":area only works in the metadata editor");
                 return;
@@ -1806,7 +2068,9 @@ pub fn execute_command(
                 }
             };
             if state.dirty {
-                app.set_status(":area: editor has unsaved edits — save (:w) or discard (:q!) first");
+                app.set_status(
+                    ":area: editor has unsaved edits — save (:w) or discard (:q!) first",
+                );
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                 return;
             }
@@ -1880,26 +2144,28 @@ pub fn execute_command(
             // on an ISO surfaces the editor-first hint instead of
             // doing what the user asked.
             if app.current_screen == AppScreen::Browse
-                && !matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_))
+                && !matches!(
+                    app.active_overlay,
+                    super::app::ActiveOverlay::MetadataEditor(_)
+                )
                 && app.pending_metadata_editor.is_none()
             {
                 let sel = collect_selection_for_file_ops(app);
                 let sacd_isos: Vec<std::path::PathBuf> = sel
                     .iter()
-                    .filter(|p| p.extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("iso")))
+                    .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")))
                     .filter(|p| super::sacd::is_sacd_iso(p))
                     .cloned()
                     .collect();
-                let has_audio = sel.iter().any(|p| matches!(
-                    super::browse::classify_file(p),
-                    super::browse::EntryKind::AudioFile(_)
-                ));
+                let has_audio = sel.iter().any(|p| {
+                    matches!(
+                        super::browse::classify_file(p),
+                        super::browse::EntryKind::AudioFile(_)
+                    )
+                });
 
                 if sacd_isos.len() > 1 {
-                    app.set_status(
-                        ":tags-mb: multiple SACD ISOs selected — select one at a time",
-                    );
+                    app.set_status(":tags-mb: multiple SACD ISOs selected — select one at a time");
                     return;
                 }
                 if !sacd_isos.is_empty() && has_audio {
@@ -1930,9 +2196,7 @@ pub fn execute_command(
             // `Some` when the user supplied explicit args — the
             // in-editor dispatch then skips TOC and goes straight to
             // text search.
-            if let Some(dispatched) =
-                try_dispatch_in_editor_tags_mb(app, tx, direct_seed.clone())
-            {
+            if let Some(dispatched) = try_dispatch_in_editor_tags_mb(app, tx, direct_seed.clone()) {
                 if dispatched {
                     return;
                 }
@@ -1943,10 +2207,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 _ => Vec::new(),
@@ -1979,7 +2245,8 @@ pub fn execute_command(
                 return;
             }
 
-            let dir = paths[0].parent()
+            let dir = paths[0]
+                .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
 
@@ -2011,12 +2278,7 @@ pub fn execute_command(
                 }
             };
             spawn_tags_mb_toc_lookup(
-                app,
-                tx,
-                sectors,
-                toc_string,
-                paths,
-                /* editor_park */ false,
+                app, tx, sectors, toc_string, paths, /* editor_park */ false,
                 /* fallback_seed */ None,
             );
         }
@@ -2026,10 +2288,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 _ => Vec::new(),
@@ -2044,12 +2308,14 @@ pub fn execute_command(
                 if sel.len() == 1 && sel[0].is_dir() {
                     sel[0].clone()
                 } else {
-                    paths[0].parent()
+                    paths[0]
+                        .parent()
                         .unwrap_or_else(|| std::path::Path::new("."))
                         .to_path_buf()
                 }
             } else {
-                paths[0].parent()
+                paths[0]
+                    .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf()
             };
@@ -2057,7 +2323,9 @@ pub fn execute_command(
             let cue_path = match super::accuraterip::find_cue_file(&output_dir) {
                 Some(p) => p,
                 None => {
-                    app.set_status(":cue-fill: no .cue file in directory (use :cue-mb to generate one)");
+                    app.set_status(
+                        ":cue-fill: no .cue file in directory (use :cue-mb to generate one)",
+                    );
                     return;
                 }
             };
@@ -2076,7 +2344,9 @@ pub fn execute_command(
             // Detect layout. Single-image = unique audio files in CUE == 1
             // and multiple tracks. We pass either 1 or N audio paths into
             // the bridge accordingly.
-            let unique_files: std::collections::HashSet<&str> = sheet.tracks.iter()
+            let unique_files: std::collections::HashSet<&str> = sheet
+                .tracks
+                .iter()
                 .filter_map(|t| t.file.as_deref())
                 .collect();
             let single_image = unique_files.len() == 1 && sheet.tracks.len() > 1;
@@ -2086,7 +2356,8 @@ pub fn execute_command(
                 if paths.len() != sheet.tracks.len() {
                     app.set_status(format!(
                         ":cue-fill: CUE has {} tracks but {} audio files in selection",
-                        sheet.tracks.len(), paths.len(),
+                        sheet.tracks.len(),
+                        paths.len(),
                     ));
                     return;
                 }
@@ -2099,8 +2370,10 @@ pub fn execute_command(
                     .unwrap_or(&bridge_paths[0])
                     .to_string_lossy()
                     .to_string();
-                let ext = bridge_paths[0].extension()
-                    .and_then(|e| e.to_str()).unwrap_or("flac");
+                let ext = bridge_paths[0]
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("flac");
                 super::message::CueFillLayout::SingleImage {
                     image_filename,
                     format_tag: super::cue_generate::cue_format_tag(ext).to_string(),
@@ -2110,7 +2383,9 @@ pub fn execute_command(
             };
 
             let (album, tracks) = match super::cue_generate::cue_sheet_to_track_info(
-                &sheet, &bridge_paths, &output_dir,
+                &sheet,
+                &bridge_paths,
+                &output_dir,
             ) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -2154,26 +2429,31 @@ pub fn execute_command(
                 }
             };
             let cached = app.db.get_cached_mb_response(&toc_string);
-            let n_cached = if cached.is_some() { "cached" } else { "fetching" };
+            let n_cached = if cached.is_some() {
+                "cached"
+            } else {
+                "fetching"
+            };
             app.set_status(format!(
                 ":cue-fill: {} disc TOC ({} tracks)…",
-                n_cached, sectors.len() - 1,
+                n_cached,
+                sectors.len() - 1,
             ));
 
             let tx = tx.clone();
             let toc_for_msg = toc_string.clone();
             tokio::spawn(async move {
-                let outcome = super::musicbrainz::lookup_release_by_toc(
-                    &sectors, cached,
-                ).await;
-                let _ = tx.send(AppMessage::CueFillComplete {
-                    outcome,
-                    cue_path,
-                    album: Box::new(album),
-                    tracks,
-                    layout,
-                    toc_string: toc_for_msg,
-                }).await;
+                let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await;
+                let _ = tx
+                    .send(AppMessage::CueFillComplete {
+                        outcome,
+                        cue_path,
+                        album: Box::new(album),
+                        tracks,
+                        layout,
+                        toc_string: toc_for_msg,
+                    })
+                    .await;
             });
         }
         Command::CueScrollTop => {
@@ -2202,9 +2482,7 @@ pub fn execute_command(
             } else {
                 let total = state.line_count();
                 app.pending_cue_preview = Some(state);
-                app.set_status(format!(
-                    "line {} out of range (1..={})", line_1based, total,
-                ));
+                app.set_status(format!("line {} out of range (1..={})", line_1based, total,));
             }
         }
         Command::MarkCompareRef => {
@@ -2214,10 +2492,12 @@ pub fn execute_command(
                 let sel = collect_selection_for_file_ops(app);
                 let mut paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
                     .into_iter()
-                    .filter(|p| matches!(
-                        super::browse::classify_file(p),
-                        super::browse::EntryKind::AudioFile(_)
-                    ))
+                    .filter(|p| {
+                        matches!(
+                            super::browse::classify_file(p),
+                            super::browse::EntryKind::AudioFile(_)
+                        )
+                    })
                     .collect();
                 if paths.is_empty() {
                     app.set_status("No audio files to mark as reference");
@@ -2225,10 +2505,7 @@ pub fn execute_command(
                     super::probe::sort_paths_by_track(&mut paths);
                     let count = paths.len();
                     app.compare_reference = paths;
-                    app.set_status(format!(
-                        "Marked {} file(s) as compare reference",
-                        count,
-                    ));
+                    app.set_status(format!("Marked {} file(s) as compare reference", count,));
                 }
             }
         }
@@ -2247,13 +2524,16 @@ pub fn execute_command(
                 app.set_status(":compare only works on the browse screen");
             } else {
                 let sel = collect_selection_for_file_ops(app);
-                let mut targets: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
-                    .into_iter()
-                    .filter(|p| matches!(
-                        super::browse::classify_file(p),
-                        super::browse::EntryKind::AudioFile(_)
-                    ))
-                    .collect();
+                let mut targets: Vec<std::path::PathBuf> =
+                    super::browse::expand_paths_to_audio(&sel)
+                        .into_iter()
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
+                        .collect();
                 if targets.is_empty() {
                     app.set_status("No audio files selected for comparison");
                 } else {
@@ -2262,7 +2542,8 @@ pub fn execute_command(
                     if refs.len() != targets.len() {
                         app.set_status(format!(
                             "Reference has {} file(s) but target has {} — counts must match",
-                            refs.len(), targets.len(),
+                            refs.len(),
+                            targets.len(),
                         ));
                     } else {
                         app.compare_results.clear();
@@ -2276,10 +2557,7 @@ pub fn execute_command(
                                 let _ = tx.send(AppMessage::CompareComplete { result }).await;
                             });
                         }
-                        app.set_status(format!(
-                            "Comparing {} pair(s)...",
-                            app.compare_pending,
-                        ));
+                        app.set_status(format!("Comparing {} pair(s)...", app.compare_pending,));
                     }
                 }
             }
@@ -2308,10 +2586,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 _ => Vec::new(),
@@ -2342,10 +2622,13 @@ pub fn execute_command(
                 let tx = tx.clone();
                 app.set_status(format!("Training corpus from {}...", path));
                 tokio::spawn(async move {
-                    let result = super::preemphasis::corpus::train_corpus_from_dir(&scan_path).await;
-                    let _ = tx.send(super::message::AppMessage::CorpusTrainComplete {
-                        result: result.map(|m| (m.n_tracks, m.n_frames)),
-                    }).await;
+                    let result =
+                        super::preemphasis::corpus::train_corpus_from_dir(&scan_path).await;
+                    let _ = tx
+                        .send(super::message::AppMessage::CorpusTrainComplete {
+                            result: result.map(|m| (m.n_tracks, m.n_frames)),
+                        })
+                        .await;
                 });
             }
         }
@@ -2360,10 +2643,15 @@ pub fn execute_command(
                 let tx = tx.clone();
                 app.set_status(format!("Calibrating pre-emphasis detector..."));
                 tokio::spawn(async move {
-                    let result = super::preemphasis::corpus::calibrate(&pe_path, &non_pe_path).await;
-                    let _ = tx.send(super::message::AppMessage::CalibrationComplete {
-                        result: result.map(|r| (r.n_pe, r.n_non_pe, r.cv_accuracy, r.cv_fpr, r.threshold)),
-                    }).await;
+                    let result =
+                        super::preemphasis::corpus::calibrate(&pe_path, &non_pe_path).await;
+                    let _ = tx
+                        .send(super::message::AppMessage::CalibrationComplete {
+                            result: result.map(|r| {
+                                (r.n_pe, r.n_non_pe, r.cv_accuracy, r.cv_fpr, r.threshold)
+                            }),
+                        })
+                        .await;
                 });
             }
         }
@@ -2384,8 +2672,7 @@ pub fn execute_command(
                     .into_iter()
                     .filter(|p| {
                         app.browse.entries.iter().any(|e| {
-                            e.path == *p
-                                && matches!(e.kind, super::browse::EntryKind::AudioFile(_))
+                            e.path == *p && matches!(e.kind, super::browse::EntryKind::AudioFile(_))
                         })
                     })
                     .collect();
@@ -2394,23 +2681,22 @@ pub fn execute_command(
         }
         Command::WriteRgTrack | Command::WriteRgAlbum => {
             let album = matches!(cmd, Command::WriteRgAlbum);
-            let paths: Vec<std::path::PathBuf> = app.analysis_results
-                .iter().map(|r| r.path.clone()).collect();
+            let paths: Vec<std::path::PathBuf> = app
+                .analysis_results
+                .iter()
+                .map(|r| r.path.clone())
+                .collect();
             if paths.is_empty() {
                 app.set_status("No analysis results — run :analyze first");
             } else {
                 let tx = tx.clone();
-                let db_paths: Vec<String> = paths.iter()
-                    .map(|p| p.display().to_string()).collect();
+                let db_paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
                 app.set_status(format!(
                     "Writing {} ReplayGain tags...",
                     if album { "album + track" } else { "track" },
                 ));
                 tokio::spawn(async move {
-                    let mut args = vec![
-                        "-s".to_string(), "i".to_string(),
-                        "-k".to_string(),
-                    ];
+                    let mut args = vec!["-s".to_string(), "i".to_string(), "-k".to_string()];
                     if album {
                         args.push("-a".to_string());
                     } else {
@@ -2425,17 +2711,24 @@ pub fn execute_command(
                         .await;
                     let msg = match output {
                         Ok(o) if o.status.success() => {
-                            format!("ReplayGain tags written ({} file{})",
+                            format!(
+                                "ReplayGain tags written ({} file{})",
                                 db_paths.len(),
-                                if db_paths.len() == 1 { "" } else { "s" })
+                                if db_paths.len() == 1 { "" } else { "s" }
+                            )
                         }
                         Ok(o) => {
                             let stderr = String::from_utf8_lossy(&o.stderr);
-                            format!("loudgain failed: {}", stderr.lines().next().unwrap_or("unknown error"))
+                            format!(
+                                "loudgain failed: {}",
+                                stderr.lines().next().unwrap_or("unknown error")
+                            )
                         }
                         Err(e) => format!("loudgain not found: {}", e),
                     };
-                    let _ = tx.send(super::message::AppMessage::StatusMessage(msg)).await;
+                    let _ = tx
+                        .send(super::message::AppMessage::StatusMessage(msg))
+                        .await;
                 });
                 // Invalidate probe cache for the written files.
                 for r in &app.analysis_results {
@@ -2460,10 +2753,7 @@ pub fn execute_command(
                 }
                 if errors.is_empty() {
                     if written.len() == 1 {
-                        app.set_status(format!(
-                            "DR report written to {}",
-                            written[0].display(),
-                        ));
+                        app.set_status(format!("DR report written to {}", written[0].display(),));
                     } else {
                         app.set_status(format!(
                             "DR reports written to {} directories",
@@ -2471,10 +2761,7 @@ pub fn execute_command(
                         ));
                     }
                 } else {
-                    app.set_status(format!(
-                        "DR report errors: {}",
-                        errors.join("; "),
-                    ));
+                    app.set_status(format!("DR report errors: {}", errors.join("; "),));
                 }
             }
         }
@@ -2485,10 +2772,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 _ => Vec::new(),
@@ -2548,7 +2837,9 @@ pub fn execute_command(
                 let review = super::gnudb::build_multi_disc_review_state_from_cue(&entries);
                 app.set_status(format!(
                     "CUE import: {} disc{}, {} tracks",
-                    n_discs, if n_discs == 1 { "" } else { "s" }, n_tracks,
+                    n_discs,
+                    if n_discs == 1 { "" } else { "s" },
+                    n_tracks,
                 ));
                 app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
             }
@@ -2577,11 +2868,15 @@ pub fn execute_command(
                 if result.changed_values > 0 {
                     state.dirty = true;
                 }
-                let mut msg = format!("Capitalization applied ({} values changed",
-                    result.changed_values);
+                let mut msg = format!(
+                    "Capitalization applied ({} values changed",
+                    result.changed_values
+                );
                 if result.skipped_deleted > 0 {
-                    msg.push_str(&format!("; {} deleted entries skipped",
-                        result.skipped_deleted));
+                    msg.push_str(&format!(
+                        "; {} deleted entries skipped",
+                        result.skipped_deleted
+                    ));
                 }
                 msg.push(')');
                 app.set_status(msg);
@@ -2596,10 +2891,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 AppScreen::Convert => app.convert.source.mode.all_paths(),
@@ -2611,7 +2908,11 @@ pub fn execute_command(
                 let dir = if paths.is_empty() {
                     let sel = collect_selection_for_file_ops(app);
                     sel.first().and_then(|p| {
-                        if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }
+                        if p.is_dir() {
+                            Some(p.clone())
+                        } else {
+                            p.parent().map(|d| d.to_path_buf())
+                        }
                     })
                 } else {
                     paths[0].parent().map(|d| d.to_path_buf())
@@ -2622,18 +2923,20 @@ pub fn execute_command(
                         let full_scan = force;
                         let tx = tx.clone();
                         app.set_status(format!(
-                            "AccurateRip: verifying {} tracks (single image)...", n,
+                            "AccurateRip: verifying {} tracks (single image)...",
+                            n,
                         ));
                         tokio::spawn(async move {
-                            let result = super::accuraterip::verify_single_image(
-                                &info, full_scan,
-                            ).await;
-                            let _ = tx.send(AppMessage::AccurateRipComplete {
-                                pages: vec![super::app::ArVerifyPage {
-                                    label: String::new(),
-                                    result,
-                                }],
-                            }).await;
+                            let result =
+                                super::accuraterip::verify_single_image(&info, full_scan).await;
+                            let _ = tx
+                                .send(AppMessage::AccurateRipComplete {
+                                    pages: vec![super::app::ArVerifyPage {
+                                        label: String::new(),
+                                        result,
+                                    }],
+                                })
+                                .await;
                         });
                         return;
                     }
@@ -2658,18 +2961,25 @@ pub fn execute_command(
                         }
                         Ok((sample_counts, sample_rate)) => {
                             app.set_status(format!(
-                                "AccurateRip: verifying {} tracks...", n_tracks,
+                                "AccurateRip: verifying {} tracks...",
+                                n_tracks,
                             ));
                             tokio::spawn(async move {
                                 let result = super::accuraterip::verify_album(
-                                    &group_paths, &sample_counts, sample_rate, full_scan,
-                                ).await;
-                                let _ = tx.send(AppMessage::AccurateRipComplete {
-                                    pages: vec![super::app::ArVerifyPage {
-                                        label: String::new(),
-                                        result,
-                                    }],
-                                }).await;
+                                    &group_paths,
+                                    &sample_counts,
+                                    sample_rate,
+                                    full_scan,
+                                )
+                                .await;
+                                let _ = tx
+                                    .send(AppMessage::AccurateRipComplete {
+                                        pages: vec![super::app::ArVerifyPage {
+                                            label: String::new(),
+                                            result,
+                                        }],
+                                    })
+                                    .await;
                             });
                         }
                     }
@@ -2682,16 +2992,18 @@ pub fn execute_command(
                     tokio::spawn(async move {
                         let mut pages = Vec::with_capacity(n_groups);
                         for (label, group_paths) in groups {
-                            let sample_data = super::accuraterip::collect_sample_counts(&group_paths);
+                            let sample_data =
+                                super::accuraterip::collect_sample_counts(&group_paths);
                             match sample_data {
                                 Ok((sample_counts, sample_rate)) => {
                                     let result = super::accuraterip::verify_album(
-                                        &group_paths, &sample_counts, sample_rate, full_scan,
-                                    ).await;
-                                    pages.push(super::app::ArVerifyPage {
-                                        label,
-                                        result,
-                                    });
+                                        &group_paths,
+                                        &sample_counts,
+                                        sample_rate,
+                                        full_scan,
+                                    )
+                                    .await;
+                                    pages.push(super::app::ArVerifyPage { label, result });
                                 }
                                 Err(e) => {
                                     log::warn!("AccurateRip: skipping disc '{}': {}", label, e);
@@ -2710,9 +3022,8 @@ pub fn execute_command(
             if let ActiveOverlay::AccurateRipVerify(ref state) = app.active_overlay {
                 let page = &state.pages[state.active_page];
                 if let Some(offset) = super::accuraterip::detect_uniform_offset(&page.result) {
-                    let paths: Vec<std::path::PathBuf> = page.result.tracks.iter()
-                        .map(|t| t.path.clone())
-                        .collect();
+                    let paths: Vec<std::path::PathBuf> =
+                        page.result.tracks.iter().map(|t| t.path.clone()).collect();
                     let n = paths.len();
                     app.active_overlay = ActiveOverlay::Confirmation {
                         message: format!(
@@ -2724,7 +3035,9 @@ pub fn execute_command(
                         action: super::app::ConfirmAction::OffsetCorrection { paths, offset },
                     };
                 } else {
-                    app.set_status("No uniform non-zero offset detected — correction not applicable");
+                    app.set_status(
+                        "No uniform non-zero offset detected — correction not applicable",
+                    );
                 }
             } else {
                 // No overlay open — run verification first, then auto-fix.
@@ -2739,10 +3052,12 @@ pub fn execute_command(
                     let sel = collect_selection_for_file_ops(app);
                     super::browse::expand_paths_to_audio(&sel)
                         .into_iter()
-                        .filter(|p| matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        ))
+                        .filter(|p| {
+                            matches!(
+                                super::browse::classify_file(p),
+                                super::browse::EntryKind::AudioFile(_)
+                            )
+                        })
                         .collect()
                 }
                 _ => Vec::new(),
@@ -2753,7 +3068,11 @@ pub fn execute_command(
                 let dir = if paths.is_empty() {
                     let sel = collect_selection_for_file_ops(app);
                     sel.first().and_then(|p| {
-                        if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }
+                        if p.is_dir() {
+                            Some(p.clone())
+                        } else {
+                            p.parent().map(|d| d.to_path_buf())
+                        }
                     })
                 } else {
                     paths[0].parent().map(|d| d.to_path_buf())
@@ -2763,23 +3082,30 @@ pub fn execute_command(
                         let n = info.track_boundaries.len();
                         let tx = tx.clone();
                         app.set_status(format!(
-                            "CUETools DB: verifying {} tracks (single image)...", n,
+                            "CUETools DB: verifying {} tracks (single image)...",
+                            n,
                         ));
                         // Cache lookup before spawn (needs &app.db on main thread).
                         let cache_paths = vec![info.audio_path.clone()];
                         let cache_key = super::ctdb::compute_ctdb_parity_cache_key(&cache_paths);
-                        let cached_parity = cache_key.as_deref()
+                        let cached_parity = cache_key
+                            .as_deref()
                             .and_then(|k| app.db.get_cached_ctdb_parity(k, 16));
                         tokio::spawn(async move {
                             let result = super::ctdb::verify_ctdb_single_image(
-                                &info, cache_key, cached_parity,
-                            ).await;
-                            let _ = tx.send(AppMessage::CtdbComplete {
-                                pages: vec![super::app::CtdbVerifyPage {
-                                    label: String::new(),
-                                    result,
-                                }],
-                            }).await;
+                                &info,
+                                cache_key,
+                                cached_parity,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(AppMessage::CtdbComplete {
+                                    pages: vec![super::app::CtdbVerifyPage {
+                                        label: String::new(),
+                                        result,
+                                    }],
+                                })
+                                .await;
                         });
                         return;
                     }
@@ -2803,22 +3129,31 @@ pub fn execute_command(
                         }
                         Ok((sample_counts, sample_rate)) => {
                             app.set_status(format!(
-                                "CUETools DB: verifying {} tracks...", n_tracks,
+                                "CUETools DB: verifying {} tracks...",
+                                n_tracks,
                             ));
-                            let cache_key = super::ctdb::compute_ctdb_parity_cache_key(&group_paths);
-                            let cached_parity = cache_key.as_deref()
+                            let cache_key =
+                                super::ctdb::compute_ctdb_parity_cache_key(&group_paths);
+                            let cached_parity = cache_key
+                                .as_deref()
                                 .and_then(|k| app.db.get_cached_ctdb_parity(k, 16));
                             tokio::spawn(async move {
                                 let result = super::ctdb::verify_ctdb(
-                                    &group_paths, &sample_counts, sample_rate,
-                                    cache_key, cached_parity,
-                                ).await;
-                                let _ = tx.send(AppMessage::CtdbComplete {
-                                    pages: vec![super::app::CtdbVerifyPage {
-                                        label: String::new(),
-                                        result,
-                                    }],
-                                }).await;
+                                    &group_paths,
+                                    &sample_counts,
+                                    sample_rate,
+                                    cache_key,
+                                    cached_parity,
+                                )
+                                .await;
+                                let _ = tx
+                                    .send(AppMessage::CtdbComplete {
+                                        pages: vec![super::app::CtdbVerifyPage {
+                                            label: String::new(),
+                                            result,
+                                        }],
+                                    })
+                                    .await;
                             });
                         }
                     }
@@ -2836,9 +3171,14 @@ pub fn execute_command(
                             } else {
                                 label.clone()
                             };
-                            let _ = tx.send(AppMessage::StatusMessage(
-                                format!("CUETools DB: verifying {}/{}  — {}...", idx + 1, n_groups, disc_name),
-                            )).await;
+                            let _ = tx
+                                .send(AppMessage::StatusMessage(format!(
+                                    "CUETools DB: verifying {}/{}  — {}...",
+                                    idx + 1,
+                                    n_groups,
+                                    disc_name
+                                )))
+                                .await;
                             super::probe::sort_paths_by_track(&mut group_paths);
                             let dir = group_paths[0]
                                 .parent()
@@ -2851,18 +3191,27 @@ pub fn execute_command(
                             // the cache from each result's parity_cache_write after
                             // the spawn completes; the cache helps subsequent
                             // single-disc verifies.
-                            let result = if let Some(info) = super::cue_parser::detect_single_image(&dir) {
+                            let result = if let Some(info) =
+                                super::cue_parser::detect_single_image(&dir)
+                            {
                                 let cache_paths = vec![info.audio_path.clone()];
-                                let cache_key = super::ctdb::compute_ctdb_parity_cache_key(&cache_paths);
+                                let cache_key =
+                                    super::ctdb::compute_ctdb_parity_cache_key(&cache_paths);
                                 super::ctdb::verify_ctdb_single_image(&info, cache_key, None).await
                             } else {
                                 match super::accuraterip::collect_sample_counts(&group_paths) {
                                     Ok((sample_counts, sample_rate)) => {
-                                        let cache_key = super::ctdb::compute_ctdb_parity_cache_key(&group_paths);
+                                        let cache_key = super::ctdb::compute_ctdb_parity_cache_key(
+                                            &group_paths,
+                                        );
                                         super::ctdb::verify_ctdb(
-                                            &group_paths, &sample_counts, sample_rate,
-                                            cache_key, None,
-                                        ).await
+                                            &group_paths,
+                                            &sample_counts,
+                                            sample_rate,
+                                            cache_key,
+                                            None,
+                                        )
+                                        .await
                                     }
                                     Err(e) => {
                                         log::warn!("CTDB: skipping disc '{}': {}", label, e);
@@ -2905,22 +3254,24 @@ pub fn execute_command(
                 };
 
                 // Check if any tracks have mismatches.
-                let has_mismatch = result.tracks.iter().any(|t| {
-                    t.status == super::ctdb::CtdbTrackStatus::Mismatch
-                });
+                let has_mismatch = result
+                    .tracks
+                    .iter()
+                    .any(|t| t.status == super::ctdb::CtdbTrackStatus::Mismatch);
                 if !has_mismatch {
                     app.set_status("No mismatches detected — repair not needed");
                     return;
                 }
 
-                let paths: Vec<std::path::PathBuf> = result.tracks.iter()
-                    .map(|t| t.path.clone())
-                    .collect();
+                let paths: Vec<std::path::PathBuf> =
+                    result.tracks.iter().map(|t| t.path.clone()).collect();
                 let n = paths.len();
 
                 // Extract expected CRCs from the CTDB entry for post-repair
                 // verification. These come from the database, not our computation.
-                let expected_crcs: Vec<u32> = result.tracks.iter()
+                let expected_crcs: Vec<u32> = result
+                    .tracks
+                    .iter()
                     .filter_map(|t| t.expected_crc32)
                     .collect();
                 if expected_crcs.len() != n {
@@ -2931,19 +3282,20 @@ pub fn execute_command(
                 // Detect single-image CUE layout: all tracks point at the
                 // same file. Repair flow is different (decode once, repair
                 // whole image, re-encode single file).
-                let single_image: Option<Box<super::cue_parser::SingleImageInfo>> =
-                    if n > 1 && paths.iter().all(|p| p == &paths[0]) {
-                        let dir = paths[0].parent().unwrap_or(std::path::Path::new("."));
-                        match super::cue_parser::detect_single_image(dir) {
-                            Some(info) => Some(Box::new(info)),
-                            None => {
-                                app.set_status("Single-image CTDB repair: failed to detect CUE layout");
-                                return;
-                            }
+                let single_image: Option<Box<super::cue_parser::SingleImageInfo>> = if n > 1
+                    && paths.iter().all(|p| p == &paths[0])
+                {
+                    let dir = paths[0].parent().unwrap_or(std::path::Path::new("."));
+                    match super::cue_parser::detect_single_image(dir) {
+                        Some(info) => Some(Box::new(info)),
+                        None => {
+                            app.set_status("Single-image CTDB repair: failed to detect CUE layout");
+                            return;
                         }
-                    } else {
-                        None
-                    };
+                    }
+                } else {
+                    None
+                };
 
                 // For single-image, the path list seen by AR is the same
                 // file repeated N times. We want to query AR cache by the
@@ -2974,10 +3326,18 @@ pub fn execute_command(
 
                         let action = match single_image {
                             Some(info) => super::app::ConfirmAction::CtdbRepairSingleImage {
-                                info, parity_url, npar, offset, expected_crcs,
+                                info,
+                                parity_url,
+                                npar,
+                                offset,
+                                expected_crcs,
                             },
                             None => super::app::ConfirmAction::CtdbRepair {
-                                paths, parity_url, npar, offset, expected_crcs,
+                                paths,
+                                parity_url,
+                                npar,
+                                offset,
+                                expected_crcs,
                             },
                         };
 
@@ -2987,7 +3347,11 @@ pub fn execute_command(
                         // No usable AR cache — defer the repair until AR
                         // verification completes and gives us an offset.
                         app.pending_ctdb_repair = Some(super::app::PendingCtdbRepair {
-                            paths, parity_url, npar, expected_crcs, single_image,
+                            paths,
+                            parity_url,
+                            npar,
+                            expected_crcs,
+                            single_image,
                         });
                         app.set_status(
                             "No AR offset cached — running AccurateRip to detect drive offset...",
@@ -3002,9 +3366,7 @@ pub fn execute_command(
                 // CtdbComplete handler to re-dispatch :ctdb-repair once
                 // the verification overlay is installed.
                 app.auto_repair_on_ctdb_complete = true;
-                app.set_status(
-                    "Running CUETools DB verification first to detect mismatches...",
-                );
+                app.set_status("Running CUETools DB verification first to detect mismatches...");
                 execute_command(app, Command::Ctdb, tx);
             }
         }
@@ -3015,17 +3377,20 @@ pub fn execute_command(
             }
             // Use the selected entry if it's a directory, otherwise
             // use the current browse directory.
-            let scan_dir = app.browse.selected_entry()
+            let scan_dir = app
+                .browse
+                .selected_entry()
                 .filter(|e| e.path.is_dir())
                 .map(|e| e.path.clone())
                 .unwrap_or_else(|| app.browse.current_dir.clone());
-            app.set_status(format!("AccurateRip batch: scanning {}...", scan_dir.display()));
+            app.set_status(format!(
+                "AccurateRip batch: scanning {}...",
+                scan_dir.display()
+            ));
 
             let tx = tx.clone();
             tokio::spawn(async move {
-                let result = super::accuraterip::batch_verify(
-                    &scan_dir, tx.clone(),
-                ).await;
+                let result = super::accuraterip::batch_verify(&scan_dir, tx.clone()).await;
                 let _ = tx.send(AppMessage::ArBatchComplete { result }).await;
             });
         }
@@ -3039,14 +3404,22 @@ pub fn execute_command(
                 let entry = app.browse.selected_entry();
                 match entry {
                     Some(e) if super::browse::is_viewable_text_file(&e.path) => e.path.clone(),
-                    Some(_) => { app.set_status("Selected file is not a viewable text file"); return; }
-                    None => { app.set_status("No file selected"); return; }
+                    Some(_) => {
+                        app.set_status("Selected file is not a viewable text file");
+                        return;
+                    }
+                    None => {
+                        app.set_status("No file selected");
+                        return;
+                    }
                 }
             } else {
                 path
             };
             match super::external_editor::open_in_viewer(&target) {
-                Ok(_) => { app.force_redraw = true; }
+                Ok(_) => {
+                    app.force_redraw = true;
+                }
                 Err(e) => app.set_status(format!("View error: {}", e)),
             }
         }
@@ -3063,35 +3436,46 @@ pub fn execute_command(
                         app.set_status("Cannot edit log files — use :view instead");
                         return;
                     }
-                    Some(_) => { app.set_status("Selected file is not an editable text file"); return; }
-                    None => { app.set_status("No file selected"); return; }
+                    Some(_) => {
+                        app.set_status("Selected file is not an editable text file");
+                        return;
+                    }
+                    None => {
+                        app.set_status("No file selected");
+                        return;
+                    }
                 }
             } else {
-                if !super::browse::is_editable_text_file(&path) && super::browse::is_viewable_text_file(&path) {
+                if !super::browse::is_editable_text_file(&path)
+                    && super::browse::is_viewable_text_file(&path)
+                {
                     app.set_status("Cannot edit log files — use :view instead");
                     return;
                 }
                 path
             };
             match super::external_editor::open_in_editor(&target) {
-                Ok(_) => { app.force_redraw = true; }
+                Ok(_) => {
+                    app.force_redraw = true;
+                }
                 Err(e) => app.set_status(format!("Edit error: {}", e)),
             }
         }
         Command::ContextMenu => {
             let origin = match app.current_screen {
-                AppScreen::Browse => {
-                    app.button_map.find_button_rect(
-                        &super::button_map::TuiButton::BrowseEntry(app.browse.selected_index),
-                    ).map(|r| (r.x + 2, r.y))
-                }
-                AppScreen::Queue => {
-                    app.button_map.find_button_rect(
-                        &super::button_map::TuiButton::QueueItem(app.selected_index),
-                    ).map(|r| (r.x + 2, r.y))
-                }
+                AppScreen::Browse => app
+                    .button_map
+                    .find_button_rect(&super::button_map::TuiButton::BrowseEntry(
+                        app.browse.selected_index,
+                    ))
+                    .map(|r| (r.x + 2, r.y)),
+                AppScreen::Queue => app
+                    .button_map
+                    .find_button_rect(&super::button_map::TuiButton::QueueItem(app.selected_index))
+                    .map(|r| (r.x + 2, r.y)),
                 _ => None,
-            }.unwrap_or_else(|| {
+            }
+            .unwrap_or_else(|| {
                 crossterm::terminal::size()
                     .map(|(w, h)| (w / 3, h / 3))
                     .unwrap_or((20, 10))
@@ -3265,20 +3649,13 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
 /// Phase 6b limitation: multi-file selections are rejected with a message
 /// directing the user to deselect extras. Real batch support (summary +
 /// expand overlay + bulk commit) arrives in Phase 6c/6d.
-fn execute_queue(
-    app: &mut AppState,
-    _tx: &mpsc::Sender<AppMessage>,
-    preset: Option<String>,
-) {
+fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Option<String>) {
     // Helper: load a named preset into the format/output-options pills.
     // Returns Ok(()) on success, Err(status_message) on failure.
     let load_preset_into_pills = |app: &mut AppState, name: &str| -> Result<(), String> {
         match super::presets::load_preset(name) {
             Ok(p) => {
-                p.apply_to_pills(
-                    &mut app.convert.format,
-                    &mut app.convert.output_options,
-                );
+                p.apply_to_pills(&mut app.convert.format, &mut app.convert.output_options);
                 app.preset.active_preset = Some(name.to_string());
                 app.preset.modified = false;
                 Ok(())
@@ -3333,15 +3710,27 @@ fn execute_queue(
             // Populate the first-file probe result into the appropriate
             // variant so the user sees immediate info on landing.
             match &mut mode {
-                SourceMode::Single { info: slot, metadata: meta_slot, .. } => {
+                SourceMode::Single {
+                    info: slot,
+                    metadata: meta_slot,
+                    ..
+                } => {
                     *slot = Some(info);
                     *meta_slot = metadata;
                 }
-                SourceMode::Batch { cursor_info, cursor_metadata, .. } => {
+                SourceMode::Batch {
+                    cursor_info,
+                    cursor_metadata,
+                    ..
+                } => {
                     *cursor_info = Some(info);
                     *cursor_metadata = metadata;
                 }
-                SourceMode::MultiTrack { info: slot, metadata: meta_slot, .. } => {
+                SourceMode::MultiTrack {
+                    info: slot,
+                    metadata: meta_slot,
+                    ..
+                } => {
                     *slot = Some(info);
                     *meta_slot = metadata;
                 }
@@ -3354,9 +3743,9 @@ fn execute_queue(
 
             // Persist batch state for crash recovery.
             let batch_paths = app.convert.source.mode.all_paths();
-            let _ = app.db.save_batch_state(
-                &batch_paths, None, None, None, None, None,
-            );
+            let _ = app
+                .db
+                .save_batch_state(&batch_paths, None, None, None, None, None);
 
             // Remember where we came from, switch to Convert for review.
             app.previous_screen = Some(AppScreen::Browse);
@@ -3420,11 +3809,7 @@ fn execute_queue(
 /// Single, N for Batch. The pill state (options) is applied uniformly
 /// to all files in the commit — the whole point of reviewing once per
 /// batch.
-fn execute_commit(
-    app: &mut AppState,
-    tx: &mpsc::Sender<AppMessage>,
-    start: bool,
-) {
+fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool) {
     if app.current_screen != AppScreen::Convert {
         app.set_status(":commit only works on the Convert screen");
         return;
@@ -3474,7 +3859,13 @@ fn execute_commit(
 
     // For MultiTrack sources with deselected tracks, attach a PipelineRequest
     // with TrackSelection::Set to the just-enqueued item.
-    if let SourceMode::MultiTrack { tracks, selected, path, .. } = &app.convert.source.mode {
+    if let SourceMode::MultiTrack {
+        tracks,
+        selected,
+        path,
+        ..
+    } = &app.convert.source.mode
+    {
         let has_deselected = selected.iter().any(|s| !s);
         if has_deselected {
             use std::collections::BTreeSet;
@@ -3488,8 +3879,11 @@ fn execute_commit(
             if !selected_numbers.is_empty() {
                 // Build a minimal PipelineRequest with the track selection.
                 use crate::convert::pipeline::*;
-                let output_root = options.output_dir.clone()
-                    .unwrap_or_else(|| path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+                let output_root = options.output_dir.clone().unwrap_or_else(|| {
+                    path.parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf()
+                });
                 let rg_enabled = options.calculate_replaygain;
 
                 let req = PipelineRequest {
@@ -3526,7 +3920,11 @@ fn execute_commit(
                     },
                     stages: StagePolicy {
                         metadata: StageRequirement::Enabled,
-                        replaygain: if rg_enabled { StageRequirement::Enabled } else { StageRequirement::Disabled },
+                        replaygain: if rg_enabled {
+                            StageRequirement::Enabled
+                        } else {
+                            StageRequirement::Disabled
+                        },
                         features: StageRequirement::Enabled,
                     },
                     failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
@@ -3539,7 +3937,8 @@ fn execute_commit(
                             item_req.item_id = item.id.clone();
                             item_req.job_id = format!("job-{}", item.id);
                             if let Some(ref pw) = item.archive_password {
-                                item_req.source.archive_password = Some(SecretString::new(pw.clone()));
+                                item_req.source.archive_password =
+                                    Some(SecretString::new(pw.clone()));
                             }
                             item.pipeline_request = Some(item_req);
                         }
@@ -3673,9 +4072,11 @@ fn execute_file_op(app: &mut AppState, dest: &str, force: bool, is_move: bool) {
         // No destination arg — open picker pre-filled with current dir.
         let initial = app.browse.current_dir.display().to_string();
         app.active_overlay = ActiveOverlay::TextEdit {
-            input: super::text_input::TextInputState::new(
-                if initial.ends_with('/') { initial } else { format!("{}/", initial) },
-            ),
+            input: super::text_input::TextInputState::new(if initial.ends_with('/') {
+                initial
+            } else {
+                format!("{}/", initial)
+            }),
             target,
             label: label.to_string(),
         };
@@ -3722,9 +4123,7 @@ pub struct SacdMbSeed {
 /// DATE yields a usable value (all empty or all mixed). MB's text
 /// search can be partial — having only an album title still produces
 /// results — so any single non-empty term is enough.
-pub(super) fn seed_sacd_mb_query(
-    state: &super::app::MetadataEditorState,
-) -> Option<SacdMbSeed> {
+pub(super) fn seed_sacd_mb_query(state: &super::app::MetadataEditorState) -> Option<SacdMbSeed> {
     let entry_value = |k: &str| -> Option<String> {
         state
             .entries
@@ -3745,7 +4144,12 @@ pub(super) fn seed_sacd_mb_query(
     if artist.is_empty() && album.is_empty() && catalog.is_none() && year.is_none() {
         return None;
     }
-    Some(SacdMbSeed { artist, album, catalog, year })
+    Some(SacdMbSeed {
+        artist,
+        album,
+        catalog,
+        year,
+    })
 }
 
 /// Convert per-track SACD durations (seconds) to a sector vector
@@ -3794,7 +4198,11 @@ pub(super) fn spawn_tags_mb_toc_lookup(
     fallback_seed: Option<SacdMbSeed>,
 ) {
     let cached = app.db.get_cached_mb_response(&toc_string);
-    let n_cached = if cached.is_some() { "cached" } else { "fetching" };
+    let n_cached = if cached.is_some() {
+        "cached"
+    } else {
+        "fetching"
+    };
     let n_tracks = sectors.len().saturating_sub(1);
     app.set_status(format!(
         ":tags-mb: {} disc TOC ({} tracks)…",
@@ -3810,16 +4218,16 @@ pub(super) fn spawn_tags_mb_toc_lookup(
     };
 
     tokio::spawn(async move {
-        let outcome = super::musicbrainz::lookup_release_by_toc(
-            &sectors, cached,
-        ).await;
-        let _ = tx.send(AppMessage::TagsFromMbComplete {
-            outcome: super::message::MbOutcome::Toc {
-                outcome,
-                toc_string: toc_for_msg,
-            },
-            ctx,
-        }).await;
+        let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await;
+        let _ = tx
+            .send(AppMessage::TagsFromMbComplete {
+                outcome: super::message::MbOutcome::Toc {
+                    outcome,
+                    toc_string: toc_for_msg,
+                },
+                ctx,
+            })
+            .await;
     });
 }
 
@@ -3903,7 +4311,8 @@ fn try_dispatch_in_editor_tags_mb(
             app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
             app.set_status(
                 ":tags-mb: no per-track durations for this SACD area — \
-                 ISO TRL sectors may be malformed".to_string(),
+                 ISO TRL sectors may be malformed"
+                    .to_string(),
             );
             return Some(true);
         };
@@ -4100,19 +4509,34 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         // Show current value
         match key {
             "f" | "format" => {
-                app.set_status(format!("format = {}", app.convert.format.format.selected_label()));
+                app.set_status(format!(
+                    "format = {}",
+                    app.convert.format.format.selected_label()
+                ));
             }
             "r" | "rate" => {
-                app.set_status(format!("rate = {}", app.convert.format.sample_rate.selected_label()));
+                app.set_status(format!(
+                    "rate = {}",
+                    app.convert.format.sample_rate.selected_label()
+                ));
             }
             "d" | "depth" => {
-                app.set_status(format!("depth = {}", app.convert.format.bit_depth.selected_label()));
+                app.set_status(format!(
+                    "depth = {}",
+                    app.convert.format.bit_depth.selected_label()
+                ));
             }
             "dither" => {
-                app.set_status(format!("dither = {}", app.convert.format.dither.selected_label()));
+                app.set_status(format!(
+                    "dither = {}",
+                    app.convert.format.dither.selected_label()
+                ));
             }
             "rg" | "replaygain" => {
-                app.set_status(format!("replaygain = {}", app.convert.format.replaygain.selected_label()));
+                app.set_status(format!(
+                    "replaygain = {}",
+                    app.convert.format.replaygain.selected_label()
+                ));
             }
             _ => {
                 app.set_status(format!("Unknown setting: {}", key));
@@ -4140,7 +4564,10 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.preset.mark_modified();
                 app.set_status(format!("format = {}", f.name()));
             } else {
-                app.set_status(format!("Unknown format: {}. Try: flac, opus, aac, mp3, alac, wav, wavpack, aiff", value));
+                app.set_status(format!(
+                    "Unknown format: {}. Try: flac, opus, aac, mp3, alac, wav, wavpack, aiff",
+                    value
+                ));
             }
         }
         "r" | "rate" => {
@@ -4162,7 +4589,10 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.preset.mark_modified();
                 app.set_status(format!("rate = {} kHz", value));
             } else {
-                app.set_status(format!("Unknown rate: {}. Try: 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, 768", value));
+                app.set_status(format!(
+                    "Unknown rate: {}. Try: 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, 768",
+                    value
+                ));
             }
         }
         "d" | "depth" => {
@@ -4179,7 +4609,10 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.preset.mark_modified();
                 app.set_status(format!("depth = {}", value));
             } else {
-                app.set_status(format!("Unknown depth: {}. Try: 16, 24, 32, 32f, 64f", value));
+                app.set_status(format!(
+                    "Unknown depth: {}. Try: 16, 24, 32, 32f, 64f",
+                    value
+                ));
             }
         }
         "dither" => {
@@ -4194,7 +4627,10 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.preset.mark_modified();
                 app.set_status(format!("dither = {}", value));
             } else {
-                app.set_status(format!("Unknown dither: {}. Try: tpdf, none, shaped", value));
+                app.set_status(format!(
+                    "Unknown dither: {}. Try: tpdf, none, shaped",
+                    value
+                ));
             }
         }
         "rg" | "replaygain" => {
@@ -4210,11 +4646,17 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.preset.mark_modified();
                 app.set_status(format!("replaygain = {}", value));
             } else {
-                app.set_status(format!("Unknown rg mode: {}. Try: album, track, both, off", value));
+                app.set_status(format!(
+                    "Unknown rg mode: {}. Try: album, track, both, off",
+                    value
+                ));
             }
         }
         _ => {
-            app.set_status(format!("Unknown setting: {}. Try: format, rate, depth, dither, rg", key));
+            app.set_status(format!(
+                "Unknown setting: {}. Try: format, rate, depth, dither, rg",
+                key
+            ));
         }
     }
 }
@@ -4233,7 +4675,8 @@ fn detect_ar_offset_from_cache(db: &crate::db::Database, paths: &[PathBuf]) -> O
 
     for path in paths {
         let meta = std::fs::metadata(path).ok()?;
-        let mtime = meta.modified()
+        let mtime = meta
+            .modified()
             .map(crate::db::systemtime_to_unix)
             .unwrap_or(0);
         let size = meta.len();
@@ -4277,8 +4720,7 @@ const CUE_IMPORTABLE_FIELDS: &[&str] = &["TITLE", "ARTIST", "ALBUM", "TRACKNUMBE
 /// Check if a tag field has corresponding CUE data.
 pub fn is_cue_importable(field: &str) -> bool {
     let upper = field.to_ascii_uppercase();
-    CUE_IMPORTABLE_FIELDS.iter().any(|&f| f == upper)
-        || upper == "PERFORMER"
+    CUE_IMPORTABLE_FIELDS.iter().any(|&f| f == upper) || upper == "PERFORMER"
 }
 
 #[allow(dead_code)] // Legacy CUE diff flow; will be removed in cleanup.
@@ -4294,14 +4736,18 @@ fn build_cue_diff(
     let filter_upper = field_filter.map(|f| f.to_ascii_uppercase());
 
     for (i, path) in state.paths.iter().enumerate() {
-        let stem = path.file_name()
+        let stem = path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let filename = path.file_stem()
+        let filename = path
+            .file_stem()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| stem.clone());
 
-        let track = sheet.tracks.iter()
+        let track = sheet
+            .tracks
+            .iter()
             .find(|t| t.file.as_deref() == Some(stem.as_str()))
             .or_else(|| sheet.tracks.get(i));
 
@@ -4327,12 +4773,16 @@ fn build_cue_diff(
             if let Some(ref filter) = filter_upper {
                 let field_upper = field.to_ascii_uppercase();
                 // PERFORMER filter matches ARTIST CUE data.
-                let matches = field_upper == *filter
-                    || (filter == "PERFORMER" && field_upper == "ARTIST");
-                if !matches { continue; }
+                let matches =
+                    field_upper == *filter || (filter == "PERFORMER" && field_upper == "ARTIST");
+                if !matches {
+                    continue;
+                }
             }
 
-            let old_value = state.entries.iter()
+            let old_value = state
+                .entries
+                .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(field))
                 .map(|e| e.per_file_values.get(i).cloned().unwrap_or_default())
                 .unwrap_or_default();
@@ -4361,8 +4811,10 @@ pub fn apply_cue_changes(
 
     for change in changes {
         // Find or create the entry for this field.
-        let idx = match state.entries.iter().position(|e|
-            e.display_key.eq_ignore_ascii_case(&change.field))
+        let idx = match state
+            .entries
+            .iter()
+            .position(|e| e.display_key.eq_ignore_ascii_case(&change.field))
         {
             Some(i) => i,
             None => {
@@ -4584,30 +5036,44 @@ mod sacd_seed_tests {
         // shape doesn't matter for seed extraction — it only reads
         // `value` and `is_mixed`/empty checks via `value`.
         use lofty::tag::ItemKey;
-        let entries: Vec<TagEntry> = entries.into_iter().map(|(k, v, mixed)| TagEntry {
-            display_key: k.to_string(),
-            item_key: ItemKey::Unknown(k.to_string()),
-            value: v.to_string(),
-            original: String::new(),
-            is_binary: false,
-            is_mixed: mixed,
-            per_file_values: vec![v.to_string()],
-            per_file_originals: vec![v.to_string()],
-            mb_proposed_value: None,
-            mb_proposed_per_file: None,
-        }).collect();
+        let entries: Vec<TagEntry> = entries
+            .into_iter()
+            .map(|(k, v, mixed)| TagEntry {
+                display_key: k.to_string(),
+                item_key: ItemKey::Unknown(k.to_string()),
+                value: v.to_string(),
+                original: String::new(),
+                is_binary: false,
+                is_mixed: mixed,
+                per_file_values: vec![v.to_string()],
+                per_file_originals: vec![v.to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            })
+            .collect();
         MetadataEditorState {
             paths: vec![std::path::PathBuf::from("/tmp/x.iso")],
             entries,
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: Vec::new(),
+            dirty: false,
+            deleted: Vec::new(),
             file_labels: vec!["01".to_string()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None,
-            mb_back: None, gnudb_back: None, read_only: false,
-            sacd_sidecar_path: None, sacd_area_kind: None,
-            sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         }
     }
 
@@ -4682,9 +5148,7 @@ mod sacd_seed_tests {
         // ScarletBook strings sometimes carry trailing whitespace
         // from padding in the binary header; the seed should strip
         // those before they reach Lucene escape.
-        let state = editor_with(vec![
-            ("ALBUM", "  Padded Album  ", false),
-        ]);
+        let state = editor_with(vec![("ALBUM", "  Padded Album  ", false)]);
         let seed = seed_sacd_mb_query(&state).expect("seed");
         assert_eq!(seed.album, "Padded Album");
     }
@@ -4693,9 +5157,7 @@ mod sacd_seed_tests {
     fn seed_treats_only_catalog_as_sufficient() {
         // MB search with only `catno:` is valid and useful (some
         // pressings have nothing else reliable).
-        let state = editor_with(vec![
-            ("CATALOGNUMBER", "SRGS 4520", false),
-        ]);
+        let state = editor_with(vec![("CATALOGNUMBER", "SRGS 4520", false)]);
         let seed = seed_sacd_mb_query(&state).expect("seed");
         assert_eq!(seed.artist, "");
         assert_eq!(seed.album, "");
@@ -4706,10 +5168,7 @@ mod sacd_seed_tests {
     fn seed_empty_value_is_treated_as_absent() {
         // An entry that exists but has empty value (e.g., user
         // cleared the row) shouldn't make catalog Some("").
-        let state = editor_with(vec![
-            ("ALBUM", "X", false),
-            ("CATALOGNUMBER", "", false),
-        ]);
+        let state = editor_with(vec![("ALBUM", "X", false), ("CATALOGNUMBER", "", false)]);
         let seed = seed_sacd_mb_query(&state).expect("seed");
         assert_eq!(seed.catalog, None);
     }
@@ -4943,7 +5402,9 @@ mod tags_mb_args_tests {
 
     #[test]
     fn unterminated_quote_errors() {
-        assert!(matches!(parse(r#"--catno "SRGS 4520"#), Command::Unknown(_)));
+        assert!(matches!(
+            parse(r#"--catno "SRGS 4520"#),
+            Command::Unknown(_)
+        ));
     }
 }
-

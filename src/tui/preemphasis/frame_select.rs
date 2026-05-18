@@ -41,7 +41,11 @@ pub struct SelectedFrames {
 pub fn select_frames(stft: &StftResult) -> SelectedFrames {
     let n = stft.band_spectra.len();
     if n == 0 {
-        return SelectedFrames { frames: vec![], tonalness: vec![], rms_values: vec![] };
+        return SelectedFrames {
+            frames: vec![],
+            tonalness: vec![],
+            rms_values: vec![],
+        };
     }
 
     // Score each frame.
@@ -103,9 +107,16 @@ fn compute_hf_metrics(bands: &[f64; NUM_BANDS]) -> (f64, f64) {
     let hf = &bands[HF_BAND_START..];
 
     // Convert from dB to linear power for flatness computation.
-    let linear: Vec<f64> = hf.iter().map(|&db| {
-        if db <= -120.0 { 1e-12 } else { 10.0f64.powf(db / 10.0) }
-    }).collect();
+    let linear: Vec<f64> = hf
+        .iter()
+        .map(|&db| {
+            if db <= -120.0 {
+                1e-12
+            } else {
+                10.0f64.powf(db / 10.0)
+            }
+        })
+        .collect();
 
     let n = linear.len() as f64;
 
@@ -116,7 +127,11 @@ fn compute_hf_metrics(bands: &[f64; NUM_BANDS]) -> (f64, f64) {
     // Arithmetic mean.
     let arith_mean = linear.iter().sum::<f64>() / n;
 
-    let flatness = if arith_mean > 0.0 { geo_mean / arith_mean } else { 0.0 };
+    let flatness = if arith_mean > 0.0 {
+        geo_mean / arith_mean
+    } else {
+        0.0
+    };
 
     // Tonalness: max - median in dB (on the original dB values).
     let mut sorted_db: Vec<f64> = hf.to_vec();

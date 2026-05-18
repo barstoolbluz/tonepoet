@@ -17,7 +17,11 @@ pub fn draw_metadata_pane(f: &mut Frame, area: Rect, metadata: &MetadataState, f
         return;
     }
 
-    let border_color = if focused { theme::PURPLE } else { theme::TEXT_DIM };
+    let border_color = if focused {
+        theme::PURPLE
+    } else {
+        theme::TEXT_DIM
+    };
     let w = area.width as usize;
 
     // Top border
@@ -49,10 +53,14 @@ pub fn draw_metadata_pane(f: &mut Frame, area: Rect, metadata: &MetadataState, f
     };
 
     // Row 1: title
-    let title_row = bordered_line(border_color, w, vec![
-        Span::styled("   title   ", theme::muted()),
-        field_or_dash(&metadata.title),
-    ]);
+    let title_row = bordered_line(
+        border_color,
+        w,
+        vec![
+            Span::styled("   title   ", theme::muted()),
+            field_or_dash(&metadata.title),
+        ],
+    );
 
     // Row 2: artist + album (side by side)
     let half_w = w.saturating_sub(8) / 2;
@@ -62,13 +70,17 @@ pub fn draw_metadata_pane(f: &mut Frame, area: Rect, metadata: &MetadataState, f
     let artist_width = 11 + artist_val.width(); // "   artist  " + value
     let gap = half_w.saturating_sub(artist_width);
 
-    let row2 = bordered_line(border_color, w, vec![
-        Span::styled("   artist  ", theme::muted()),
-        artist_val,
-        Span::raw(" ".repeat(gap)),
-        Span::styled("album  ", theme::muted()),
-        album_val,
-    ]);
+    let row2 = bordered_line(
+        border_color,
+        w,
+        vec![
+            Span::styled("   artist  ", theme::muted()),
+            artist_val,
+            Span::raw(" ".repeat(gap)),
+            Span::styled("album  ", theme::muted()),
+            album_val,
+        ],
+    );
 
     // Row 3: genre + year (side by side)
     let genre_val = field_or_dash(&metadata.genre);
@@ -77,13 +89,17 @@ pub fn draw_metadata_pane(f: &mut Frame, area: Rect, metadata: &MetadataState, f
     let genre_width = 11 + genre_val.width();
     let gap2 = half_w.saturating_sub(genre_width);
 
-    let row3 = bordered_line(border_color, w, vec![
-        Span::styled("   genre   ", theme::muted()),
-        genre_val,
-        Span::raw(" ".repeat(gap2)),
-        Span::styled("year   ", theme::muted()),
-        year_val,
-    ]);
+    let row3 = bordered_line(
+        border_color,
+        w,
+        vec![
+            Span::styled("   genre   ", theme::muted()),
+            genre_val,
+            Span::raw(" ".repeat(gap2)),
+            Span::styled("year   ", theme::muted()),
+            year_val,
+        ],
+    );
 
     let lines = vec![top_line, title_row, row2, row3, bot_line];
 
@@ -92,7 +108,11 @@ pub fn draw_metadata_pane(f: &mut Frame, area: Rect, metadata: &MetadataState, f
 }
 
 /// Create a line with │ content ... │ border
-fn bordered_line<'a>(border_color: ratatui::style::Color, width: usize, content: Vec<Span<'a>>) -> Line<'a> {
+fn bordered_line<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    content: Vec<Span<'a>>,
+) -> Line<'a> {
     let content_width: usize = content.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(2 + content_width);
 
@@ -102,4 +122,3 @@ fn bordered_line<'a>(border_color: ratatui::style::Color, width: usize, content:
     spans.push(Span::styled("│", theme::border(border_color)));
     Line::from(spans)
 }
-

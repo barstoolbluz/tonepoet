@@ -225,7 +225,8 @@ pub fn probe_sample_count(path: &std::path::Path) -> Result<(u64, u32), String> 
     }
 
     // Fallback: format-specific native tools for files ffmpeg can't handle.
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -241,8 +242,7 @@ fn probe_sample_count_ffmpeg(path: &std::path::Path) -> Result<(u64, u32), Strin
 
     crate::tui::probe::ensure_ffmpeg_init_pub();
 
-    let ctx = ffmpeg::format::input(&path)
-        .map_err(|e| format!("open failed: {}", e))?;
+    let ctx = ffmpeg::format::input(&path).map_err(|e| format!("open failed: {}", e))?;
 
     let stream = ctx
         .streams()
@@ -255,7 +255,9 @@ fn probe_sample_count_ffmpeg(path: &std::path::Path) -> Result<(u64, u32), Strin
     let codec_params = stream.parameters();
     let codec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)
         .map_err(|e| format!("codec params: {}", e))?;
-    let audio = codec_ctx.decoder().audio()
+    let audio = codec_ctx
+        .decoder()
+        .audio()
         .map_err(|e| format!("decoder: {}", e))?;
     let sample_rate = audio.rate();
 
@@ -354,7 +356,9 @@ pub fn collect_sample_counts(paths: &[PathBuf]) -> Result<(Vec<u64>, u32), Strin
             if r != sr {
                 return Err(format!(
                     "mixed sample rates: {} vs {} in {}",
-                    r, sr, path.display(),
+                    r,
+                    sr,
+                    path.display(),
                 ));
             }
         } else {
@@ -383,7 +387,8 @@ pub fn find_toc_offsets(dir: &Path) -> Option<Vec<u32>> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let ext = path.extension()
+            let ext = path
+                .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
@@ -405,7 +410,8 @@ pub fn find_toc_offsets(dir: &Path) -> Option<Vec<u32>> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let ext = path.extension()
+            let ext = path
+                .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
@@ -444,7 +450,8 @@ fn parse_eac_log_toc(path: &Path) -> Option<Vec<u32>> {
     // Handle UTF-16LE BOM (0xFF 0xFE).
     let content = if raw.starts_with(&[0xFF, 0xFE]) {
         // UTF-16LE: decode pairs of bytes.
-        let u16s: Vec<u16> = raw[2..].chunks_exact(2)
+        let u16s: Vec<u16> = raw[2..]
+            .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&u16s)
@@ -527,7 +534,8 @@ fn find_first_with_ext(dir: &Path, ext: &str) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension()
+        if path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case(ext))
             .unwrap_or(false)
@@ -701,7 +709,9 @@ pub fn resolve_cue_file_reference(dir: &Path, filename: &str) -> Option<PathBuf>
 
     // Try alternative lossless extensions.
     let stem = Path::new(filename).file_stem()?.to_str()?;
-    for ext in &["flac", "wav", "wave", "ape", "wv", "aiff", "aif", "m4a", "alac"] {
+    for ext in &[
+        "flac", "wav", "wave", "ape", "wv", "aiff", "aif", "m4a", "alac",
+    ] {
         let alt = dir.join(format!("{}.{}", stem, ext));
         if alt.exists() {
             return Some(alt);
@@ -729,11 +739,7 @@ pub fn ar_url(disc_id: &ArDiscId) -> String {
 
     format!(
         "http://www.accuraterip.com/accuraterip/{}/{}/{}/dBAR-{:03}-{:08x}-{:08x}-{:08x}.bin",
-        c0, c1, c2,
-        disc_id.track_count,
-        disc_id.id1,
-        disc_id.id2,
-        disc_id.freedb_id,
+        c0, c1, c2, disc_id.track_count, disc_id.id1, disc_id.id2, disc_id.freedb_id,
     )
 }
 
@@ -750,7 +756,8 @@ pub async fn fetch_ar_data(disc_id: &ArDiscId) -> Result<Option<ArDiscResponse>,
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .send()
         .await
         .map_err(|e| format!("AccurateRip fetch failed: {}", e))?;
@@ -765,7 +772,8 @@ pub async fn fetch_ar_data(disc_id: &ArDiscId) -> Result<Option<ArDiscResponse>,
         return Err(format!("AccurateRip HTTP {}", status));
     }
 
-    let data = resp.bytes()
+    let data = resp
+        .bytes()
         .await
         .map_err(|e| format!("AccurateRip read failed: {}", e))?;
 
@@ -790,9 +798,14 @@ pub fn parse_ar_response(data: &[u8]) -> Result<ArDiscResponse, String> {
         }
 
         let track_count = data[pos];
-        let id1 = u32::from_le_bytes([data[pos+1], data[pos+2], data[pos+3], data[pos+4]]);
-        let id2 = u32::from_le_bytes([data[pos+5], data[pos+6], data[pos+7], data[pos+8]]);
-        let freedb_id = u32::from_le_bytes([data[pos+9], data[pos+10], data[pos+11], data[pos+12]]);
+        let id1 = u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+        let id2 = u32::from_le_bytes([data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8]]);
+        let freedb_id = u32::from_le_bytes([
+            data[pos + 9],
+            data[pos + 10],
+            data[pos + 11],
+            data[pos + 12],
+        ]);
         pos += 13;
 
         // Per-track data: 9 bytes each (1 + 4 + 4)
@@ -804,10 +817,16 @@ pub fn parse_ar_response(data: &[u8]) -> Result<ArDiscResponse, String> {
         let mut tracks = Vec::with_capacity(track_count as usize);
         for _ in 0..track_count {
             let confidence = data[pos];
-            let crc = u32::from_le_bytes([data[pos+1], data[pos+2], data[pos+3], data[pos+4]]);
-            let offset_crc = u32::from_le_bytes([data[pos+5], data[pos+6], data[pos+7], data[pos+8]]);
+            let crc =
+                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+            let offset_crc =
+                u32::from_le_bytes([data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8]]);
             pos += 9;
-            tracks.push(ArTrackEntry { confidence, crc, offset_crc });
+            tracks.push(ArTrackEntry {
+                confidence,
+                crc,
+                offset_crc,
+            });
         }
 
         pressings.push(ArPressing {
@@ -842,18 +861,18 @@ const SKIP_DWORDS: usize = SKIP_SECTORS * SAMPLES_PER_SECTOR; // 2940
 /// sample skipping per the AR spec.
 ///
 /// Returns `(crc_v1, crc_v2)`.
-pub fn compute_ar_crcs(
-    dwords: &[u32],
-    is_first: bool,
-    is_last: bool,
-) -> (u32, u32) {
+pub fn compute_ar_crcs(dwords: &[u32], is_first: bool, is_last: bool) -> (u32, u32) {
     let n = dwords.len();
     if n == 0 {
         return (0, 0);
     }
 
     // 1-indexed position range to include in the CRC.
-    let check_from: u32 = if is_first { (SKIP_DWORDS + 1) as u32 } else { 1 };
+    let check_from: u32 = if is_first {
+        (SKIP_DWORDS + 1) as u32
+    } else {
+        1
+    };
     let check_to: u32 = if is_last {
         n.saturating_sub(SKIP_DWORDS) as u32
     } else {
@@ -931,24 +950,25 @@ pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
 
     crate::tui::probe::ensure_ffmpeg_init_pub();
 
-    let mut ictx = ffmpeg::format::input(&path)
-        .map_err(|e| format!("open failed: {}", e))?;
+    let mut ictx = ffmpeg::format::input(&path).map_err(|e| format!("open failed: {}", e))?;
 
-    let audio_stream = ictx
-        .streams()
-        .best(Type::Audio)
-        .ok_or("no audio stream")?;
+    let audio_stream = ictx.streams().best(Type::Audio).ok_or("no audio stream")?;
     let stream_idx = audio_stream.index();
 
     let codec_params = audio_stream.parameters();
     let codec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)
         .map_err(|e| format!("codec params: {}", e))?;
-    let mut decoder = codec_ctx.decoder().audio()
+    let mut decoder = codec_ctx
+        .decoder()
+        .audio()
         .map_err(|e| format!("decoder: {}", e))?;
 
     let channels = decoder.channels() as usize;
     if channels != 2 {
-        return Err(format!("AccurateRip requires stereo audio, got {} channels", channels));
+        return Err(format!(
+            "AccurateRip requires stereo audio, got {} channels",
+            channels
+        ));
     }
 
     let sample_fmt = decoder.format();
@@ -958,7 +978,9 @@ pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
     macro_rules! decode_frame {
         () => {
             let n = decoded.samples();
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
 
             match sample_fmt {
                 Sample::I16(SampleType::Planar) => {
@@ -971,9 +993,8 @@ pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
                 }
                 Sample::I16(SampleType::Packed) => {
                     let data = decoded.data(0);
-                    let interleaved: &[i16] = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const i16, n * 2)
-                    };
+                    let interleaved: &[i16] =
+                        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i16, n * 2) };
                     raw_i16.extend_from_slice(interleaved);
                 }
                 Sample::I32(SampleType::Planar) => {
@@ -986,9 +1007,8 @@ pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
                 }
                 Sample::I32(SampleType::Packed) => {
                     let data = decoded.data(0);
-                    let full: &[i32] = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const i32, n * 2)
-                    };
+                    let full: &[i32] =
+                        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n * 2) };
                     for i in 0..n {
                         raw_i16.push((full[i * 2] >> 16) as i16);
                         raw_i16.push((full[i * 2 + 1] >> 16) as i16);
@@ -1004,9 +1024,8 @@ pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
                 }
                 Sample::F32(SampleType::Packed) => {
                     let data = decoded.data(0);
-                    let full: &[f32] = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const f32, n * 2)
-                    };
+                    let full: &[f32] =
+                        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n * 2) };
                     for i in 0..n {
                         raw_i16.push(float_to_i16(full[i * 2] as f64));
                         raw_i16.push(float_to_i16(full[i * 2 + 1] as f64));
@@ -1022,9 +1041,8 @@ pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
                 }
                 Sample::F64(SampleType::Packed) => {
                     let data = decoded.data(0);
-                    let full: &[f64] = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const f64, n * 2)
-                    };
+                    let full: &[f64] =
+                        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n * 2) };
                     for i in 0..n {
                         raw_i16.push(float_to_i16(full[i * 2]));
                         raw_i16.push(float_to_i16(full[i * 2 + 1]));
@@ -1041,7 +1059,9 @@ pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
         if stream.index() != stream_idx {
             continue;
         }
-        decoder.send_packet(&packet).map_err(|e| format!("send_packet: {}", e))?;
+        decoder
+            .send_packet(&packet)
+            .map_err(|e| format!("send_packet: {}", e))?;
         while decoder.receive_frame(&mut decoded).is_ok() {
             decode_frame!();
         }
@@ -1058,10 +1078,7 @@ pub fn decode_track_to_raw_i16(path: &Path) -> Result<Vec<i16>, String> {
 ///
 /// Wraps `decode_track_to_raw_i16` and converts to DWORDs with
 /// leading/trailing silence margin for offset scanning.
-pub fn decode_track_to_dwords(
-    path: &Path,
-    margin: usize,
-) -> Result<(Vec<u32>, usize), String> {
+pub fn decode_track_to_dwords(path: &Path, margin: usize) -> Result<(Vec<u32>, usize), String> {
     let raw_i16 = decode_track_to_raw_i16(path)?;
 
     let track_len = raw_i16.len() / 2; // number of stereo sample pairs
@@ -1101,27 +1118,9 @@ fn float_to_i16(v: f64) -> i16 {
 /// Common drive read offsets (in samples) covering >95% of drives.
 /// Source: AccurateRip drive offset database, sorted by frequency.
 pub static COMMON_OFFSETS: &[i32] = &[
-    0,
-    6, -6,
-    12, -12,
-    48, -48,
-    97, -97,
-    102, -102,
-    103, -103,
-    116, -116,
-    120, -120,
-    294, -294,
-    355, -355,
-    587, -587,
-    588, -588,
-    594, -594,
-    667, -667,
-    685, -685,
-    691, -691,
-    694, -694,
-    738, -738,
-    1164, -1164,
-    1194, -1194,
+    0, 6, -6, 12, -12, 48, -48, 97, -97, 102, -102, 103, -103, 116, -116, 120, -120, 294, -294,
+    355, -355, 587, -587, 588, -588, 594, -594, 667, -667, 685, -685, 691, -691, 694, -694, 738,
+    -738, 1164, -1164, 1194, -1194,
 ];
 
 /// Try to match a track's CRCs against the database at a set of offsets.
@@ -1138,9 +1137,9 @@ pub fn try_offsets(
     offsets: &[i32],
 ) -> Option<(i32, u8)> {
     for &offset in offsets {
-        if let Some((v1, v2)) = compute_ar_crcs_at_offset(
-            full_dwords, track_len, margin, offset, is_first, is_last,
-        ) {
+        if let Some((v1, v2)) =
+            compute_ar_crcs_at_offset(full_dwords, track_len, margin, offset, is_first, is_last)
+        {
             // Check against all pressings.
             for pressing in db_pressings {
                 if track_idx < pressing.tracks.len() {
@@ -1207,7 +1206,11 @@ pub async fn verify_album(
     };
 
     let disc_id = if let Some(ref toc_sectors) = toc {
-        log::info!("AccurateRip: found TOC with {} entries: {:?}", toc_sectors.len(), toc_sectors);
+        log::info!(
+            "AccurateRip: found TOC with {} entries: {:?}",
+            toc_sectors.len(),
+            toc_sectors
+        );
         if toc_sectors.len() == n + 1 {
             compute_ar_disc_id_from_toc(toc_sectors)
         } else {
@@ -1232,15 +1235,19 @@ pub async fn verify_album(
         Ok(None) => {
             // Disc not in database.
             return ArVerifyResult {
-                tracks: paths.iter().enumerate().map(|(i, p)| ArTrackResult {
-                    path: p.clone(),
-                    track_number: (i + 1) as u32,
-                    status: ArTrackStatus::NoDiscInDatabase,
-                    confidence: None,
-                    offset: None,
-                    crc_v1: 0,
-                    crc_v2: 0,
-                }).collect(),
+                tracks: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| ArTrackResult {
+                        path: p.clone(),
+                        track_number: (i + 1) as u32,
+                        status: ArTrackStatus::NoDiscInDatabase,
+                        confidence: None,
+                        offset: None,
+                        crc_v1: 0,
+                        crc_v2: 0,
+                    })
+                    .collect(),
                 was_common_scan: !full_scan,
                 disc_id_str,
                 url,
@@ -1248,15 +1255,19 @@ pub async fn verify_album(
         }
         Err(e) => {
             return ArVerifyResult {
-                tracks: paths.iter().enumerate().map(|(i, p)| ArTrackResult {
-                    path: p.clone(),
-                    track_number: (i + 1) as u32,
-                    status: ArTrackStatus::Error(e.clone()),
-                    confidence: None,
-                    offset: None,
-                    crc_v1: 0,
-                    crc_v2: 0,
-                }).collect(),
+                tracks: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| ArTrackResult {
+                        path: p.clone(),
+                        track_number: (i + 1) as u32,
+                        status: ArTrackStatus::Error(e.clone()),
+                        confidence: None,
+                        offset: None,
+                        crc_v1: 0,
+                        crc_v2: 0,
+                    })
+                    .collect(),
                 was_common_scan: !full_scan,
                 disc_id_str,
                 url,
@@ -1271,9 +1282,15 @@ pub async fn verify_album(
         COMMON_OFFSETS.to_vec()
     };
 
-    let margin = if full_scan { MAX_OFFSET } else {
+    let margin = if full_scan {
+        MAX_OFFSET
+    } else {
         // Margin must cover the largest absolute offset we'll try.
-        COMMON_OFFSETS.iter().map(|o| o.unsigned_abs() as usize).max().unwrap_or(0)
+        COMMON_OFFSETS
+            .iter()
+            .map(|o| o.unsigned_abs() as usize)
+            .max()
+            .unwrap_or(0)
     };
 
     // Decode all tracks in parallel. Decoding is CPU-bound (ffmpeg FFI),
@@ -1298,7 +1315,10 @@ pub async fn verify_album(
             Ok(result) => decoded_tracks.push(result),
             Err(e) => {
                 // JoinError — shouldn't happen, but handle gracefully.
-                decoded_tracks.push((decoded_tracks.len(), Err(format!("decode task failed: {}", e))));
+                decoded_tracks.push((
+                    decoded_tracks.len(),
+                    Err(format!("decode task failed: {}", e)),
+                ));
             }
         }
     }
@@ -1329,7 +1349,10 @@ pub async fn verify_album(
                 // are not part of the AR CRC. We detect this by comparing
                 // the file's decoded length against the TOC-derived track
                 // duration. Only trim if the file is longer than expected.
-                let (eff_margin, eff_track_len) = if is_first && track1_pregap_frames > 0 && track1_toc_duration_frames > 0 {
+                let (eff_margin, eff_track_len) = if is_first
+                    && track1_pregap_frames > 0
+                    && track1_toc_duration_frames > 0
+                {
                     let pregap_dwords = track1_pregap_frames * SAMPLES_PER_SECTOR;
                     let toc_dwords = track1_toc_duration_frames * SAMPLES_PER_SECTOR;
                     let file_frames = track_len / SAMPLES_PER_SECTOR;
@@ -1357,9 +1380,13 @@ pub async fn verify_album(
 
                 // Try matching at all offsets.
                 match try_offsets(
-                    &full_dwords, eff_track_len, eff_margin,
-                    is_first, is_last,
-                    &pressings, i,
+                    &full_dwords,
+                    eff_track_len,
+                    eff_margin,
+                    is_first,
+                    is_last,
+                    &pressings,
+                    i,
                     &offsets,
                 ) {
                     Some((offset, confidence)) => {
@@ -1400,11 +1427,17 @@ pub async fn verify_album(
 /// Summary string for display (e.g., "9/10 verified, confidence 14, offset +0").
 pub fn format_summary(result: &ArVerifyResult) -> String {
     let total = result.tracks.len();
-    let verified = result.tracks.iter()
+    let verified = result
+        .tracks
+        .iter()
         .filter(|t| t.status == ArTrackStatus::Verified)
         .count();
 
-    if result.tracks.iter().any(|t| t.status == ArTrackStatus::NoDiscInDatabase) {
+    if result
+        .tracks
+        .iter()
+        .any(|t| t.status == ArTrackStatus::NoDiscInDatabase)
+    {
         return "Disc not in AccurateRip database".to_string();
     }
 
@@ -1413,12 +1446,16 @@ pub fn format_summary(result: &ArVerifyResult) -> String {
     }
 
     // Find the most common confidence and offset among verified tracks.
-    let max_confidence = result.tracks.iter()
+    let max_confidence = result
+        .tracks
+        .iter()
         .filter_map(|t| t.confidence)
         .max()
         .unwrap_or(0);
 
-    let common_offset = result.tracks.iter()
+    let common_offset = result
+        .tracks
+        .iter()
         .filter_map(|t| t.offset)
         .next()
         .unwrap_or(0);
@@ -1464,7 +1501,10 @@ pub async fn batch_verify(
     let mut albums: Vec<ArBatchAlbumResult> = Vec::with_capacity(total_albums);
 
     for (idx, (label, group_paths)) in groups.into_iter().enumerate() {
-        let dir = group_paths[0].parent().unwrap_or(Path::new(".")).to_path_buf();
+        let dir = group_paths[0]
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
         let album_name = if !label.is_empty() {
             label.clone()
         } else {
@@ -1474,9 +1514,14 @@ pub async fn batch_verify(
                 .to_string()
         };
 
-        let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
-            format!("Batch AR: {}/{} — {}...", idx + 1, total_albums, album_name),
-        )).await;
+        let _ = tx
+            .send(crate::tui::message::AppMessage::StatusMessage(format!(
+                "Batch AR: {}/{} — {}...",
+                idx + 1,
+                total_albums,
+                album_name
+            )))
+            .await;
 
         // Check for single-image layout.
         let result = if let Some(info) = super::cue_parser::detect_single_image(&dir) {
@@ -1505,20 +1550,22 @@ pub async fn batch_verify(
         };
 
         // Summarize this album.
-        let verified = result.tracks.iter()
+        let verified = result
+            .tracks
+            .iter()
             .filter(|t| t.status == ArTrackStatus::Verified)
             .count();
-        let mismatched = result.tracks.iter()
+        let mismatched = result
+            .tracks
+            .iter()
             .filter(|t| t.status == ArTrackStatus::Mismatch)
             .count();
-        let not_in_db = result.tracks.iter()
+        let not_in_db = result
+            .tracks
+            .iter()
             .any(|t| t.status == ArTrackStatus::NoDiscInDatabase);
-        let max_conf = result.tracks.iter()
-            .filter_map(|t| t.confidence)
-            .max();
-        let common_offset = result.tracks.iter()
-            .filter_map(|t| t.offset)
-            .next();
+        let max_conf = result.tracks.iter().filter_map(|t| t.confidence).max();
+        let common_offset = result.tracks.iter().filter_map(|t| t.offset).next();
 
         albums.push(ArBatchAlbumResult {
             dir,
@@ -1554,23 +1601,51 @@ pub async fn batch_verify(
 /// Format a text report from batch verification results.
 fn format_batch_report(albums: &[ArBatchAlbumResult], scan_dir: &Path) -> String {
     let total = albums.len();
-    let fully_verified = albums.iter().filter(|a| a.verified == a.total_tracks && a.total_tracks > 0 && !a.not_in_db).count();
-    let partial = albums.iter().filter(|a| a.verified > 0 && a.verified < a.total_tracks && !a.not_in_db).count();
+    let fully_verified = albums
+        .iter()
+        .filter(|a| a.verified == a.total_tracks && a.total_tracks > 0 && !a.not_in_db)
+        .count();
+    let partial = albums
+        .iter()
+        .filter(|a| a.verified > 0 && a.verified < a.total_tracks && !a.not_in_db)
+        .count();
     let not_in_db = albums.iter().filter(|a| a.not_in_db).count();
-    let mismatch_only = albums.iter().filter(|a| a.mismatched > 0 && a.verified == 0 && !a.not_in_db).count();
+    let mismatch_only = albums
+        .iter()
+        .filter(|a| a.mismatched > 0 && a.verified == 0 && !a.not_in_db)
+        .count();
     let errors = albums.iter().filter(|a| a.error.is_some()).count();
 
     let mut out = String::new();
     out.push_str("AccurateRip Batch Verification Report\n");
-    out.push_str(&format!("Generated: {}\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+    out.push_str(&format!(
+        "Generated: {}\n",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    ));
     out.push_str(&format!("Directory: {}\n\n", scan_dir.display()));
 
     out.push_str(&format!("Summary:\n"));
     out.push_str(&format!("  Albums scanned:    {:>5}\n", total));
-    out.push_str(&format!("  Fully verified:    {:>5} ({:.1}%)\n", fully_verified, fully_verified as f64 / total.max(1) as f64 * 100.0));
-    out.push_str(&format!("  Partial match:     {:>5} ({:.1}%)\n", partial, partial as f64 / total.max(1) as f64 * 100.0));
-    out.push_str(&format!("  Not in database:   {:>5} ({:.1}%)\n", not_in_db, not_in_db as f64 / total.max(1) as f64 * 100.0));
-    out.push_str(&format!("  CRC mismatch:      {:>5} ({:.1}%)\n", mismatch_only, mismatch_only as f64 / total.max(1) as f64 * 100.0));
+    out.push_str(&format!(
+        "  Fully verified:    {:>5} ({:.1}%)\n",
+        fully_verified,
+        fully_verified as f64 / total.max(1) as f64 * 100.0
+    ));
+    out.push_str(&format!(
+        "  Partial match:     {:>5} ({:.1}%)\n",
+        partial,
+        partial as f64 / total.max(1) as f64 * 100.0
+    ));
+    out.push_str(&format!(
+        "  Not in database:   {:>5} ({:.1}%)\n",
+        not_in_db,
+        not_in_db as f64 / total.max(1) as f64 * 100.0
+    ));
+    out.push_str(&format!(
+        "  CRC mismatch:      {:>5} ({:.1}%)\n",
+        mismatch_only,
+        mismatch_only as f64 / total.max(1) as f64 * 100.0
+    ));
     if errors > 0 {
         out.push_str(&format!("  Errors:            {:>5}\n", errors));
     }
@@ -1637,13 +1712,17 @@ pub async fn verify_single_image(
                 compute_ar_disc_id_from_toc(toc_sectors)
             } else {
                 // Fallback: compute from track durations.
-                let sample_counts: Vec<u64> = info.track_boundaries.iter()
+                let sample_counts: Vec<u64> = info
+                    .track_boundaries
+                    .iter()
                     .map(|&(_, count)| count)
                     .collect();
                 compute_ar_disc_id(&sample_counts, info.sample_rate)
             }
         } else {
-            let sample_counts: Vec<u64> = info.track_boundaries.iter()
+            let sample_counts: Vec<u64> = info
+                .track_boundaries
+                .iter()
                 .map(|&(_, count)| count)
                 .collect();
             compute_ar_disc_id(&sample_counts, info.sample_rate)
@@ -1660,15 +1739,17 @@ pub async fn verify_single_image(
         Ok(Some(resp)) => resp,
         Ok(None) => {
             return ArVerifyResult {
-                tracks: (0..n).map(|i| ArTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: ArTrackStatus::NoDiscInDatabase,
-                    confidence: None,
-                    offset: None,
-                    crc_v1: 0,
-                    crc_v2: 0,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| ArTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: ArTrackStatus::NoDiscInDatabase,
+                        confidence: None,
+                        offset: None,
+                        crc_v1: 0,
+                        crc_v2: 0,
+                    })
+                    .collect(),
                 was_common_scan: !full_scan,
                 disc_id_str,
                 url,
@@ -1676,15 +1757,17 @@ pub async fn verify_single_image(
         }
         Err(e) => {
             return ArVerifyResult {
-                tracks: (0..n).map(|i| ArTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: ArTrackStatus::Error(e.clone()),
-                    confidence: None,
-                    offset: None,
-                    crc_v1: 0,
-                    crc_v2: 0,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| ArTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: ArTrackStatus::Error(e.clone()),
+                        confidence: None,
+                        offset: None,
+                        crc_v1: 0,
+                        crc_v2: 0,
+                    })
+                    .collect(),
                 was_common_scan: !full_scan,
                 disc_id_str,
                 url,
@@ -1696,23 +1779,25 @@ pub async fn verify_single_image(
     // wvunpack for WavPack v4 files.
     let audio_path = info.audio_path.clone();
     let raw_result = tokio::task::spawn_blocking(move || {
-        decode_track_to_raw_i16(&audio_path)
-            .or_else(|_| decode_to_raw_i16_wvunpack(&audio_path))
-    }).await;
+        decode_track_to_raw_i16(&audio_path).or_else(|_| decode_to_raw_i16_wvunpack(&audio_path))
+    })
+    .await;
 
     let raw_i16 = match raw_result {
         Ok(Ok(data)) => data,
         Ok(Err(e)) => {
             return ArVerifyResult {
-                tracks: (0..n).map(|i| ArTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: ArTrackStatus::Error(e.clone()),
-                    confidence: None,
-                    offset: None,
-                    crc_v1: 0,
-                    crc_v2: 0,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| ArTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: ArTrackStatus::Error(e.clone()),
+                        confidence: None,
+                        offset: None,
+                        crc_v1: 0,
+                        crc_v2: 0,
+                    })
+                    .collect(),
                 was_common_scan: !full_scan,
                 disc_id_str,
                 url,
@@ -1720,15 +1805,17 @@ pub async fn verify_single_image(
         }
         Err(e) => {
             return ArVerifyResult {
-                tracks: (0..n).map(|i| ArTrackResult {
-                    path: info.audio_path.clone(),
-                    track_number: (i + 1) as u32,
-                    status: ArTrackStatus::Error(format!("decode task failed: {}", e)),
-                    confidence: None,
-                    offset: None,
-                    crc_v1: 0,
-                    crc_v2: 0,
-                }).collect(),
+                tracks: (0..n)
+                    .map(|i| ArTrackResult {
+                        path: info.audio_path.clone(),
+                        track_number: (i + 1) as u32,
+                        status: ArTrackStatus::Error(format!("decode task failed: {}", e)),
+                        confidence: None,
+                        offset: None,
+                        crc_v1: 0,
+                        crc_v2: 0,
+                    })
+                    .collect(),
                 was_common_scan: !full_scan,
                 disc_id_str,
                 url,
@@ -1753,8 +1840,14 @@ pub async fn verify_single_image(
     } else {
         COMMON_OFFSETS.to_vec()
     };
-    let margin = if full_scan { MAX_OFFSET } else {
-        COMMON_OFFSETS.iter().map(|o| o.unsigned_abs() as usize).max().unwrap_or(0)
+    let margin = if full_scan {
+        MAX_OFFSET
+    } else {
+        COMMON_OFFSETS
+            .iter()
+            .map(|o| o.unsigned_abs() as usize)
+            .max()
+            .unwrap_or(0)
     };
 
     // Verify each track by slicing the DWORDs buffer.
@@ -1784,9 +1877,13 @@ pub async fn verify_single_image(
 
         // Try matching at all offsets.
         match try_offsets(
-            track_slice, count_dw, eff_margin,
-            is_first, is_last,
-            pressings, i,
+            track_slice,
+            count_dw,
+            eff_margin,
+            is_first,
+            is_last,
+            pressings,
+            i,
             &offsets,
         ) {
             Some((offset, confidence)) => {
@@ -1853,7 +1950,8 @@ pub fn decode_to_raw_i16_wvunpack(path: &Path) -> Result<Vec<i16>, String> {
     if pcm_data.len() % 2 != 0 {
         return Err("wvunpack output has odd byte count".into());
     }
-    let samples: Vec<i16> = pcm_data.chunks_exact(2)
+    let samples: Vec<i16> = pcm_data
+        .chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
 
@@ -1866,7 +1964,8 @@ fn find_wav_data_offset(wav: &[u8]) -> Option<usize> {
     let mut pos = 12; // skip RIFF header (12 bytes)
     while pos + 8 <= wav.len() {
         let chunk_id = &wav[pos..pos + 4];
-        let chunk_size = u32::from_le_bytes([wav[pos+4], wav[pos+5], wav[pos+6], wav[pos+7]]) as usize;
+        let chunk_size =
+            u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]) as usize;
         if chunk_id == b"data" {
             return Some(pos + 8); // payload starts after chunk header
         }
@@ -1927,11 +2026,11 @@ pub async fn apply_offset_correction(
 
     // Create temp directory.
     let tmp_dir = std::env::temp_dir().join(format!("tonepoet-offset-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
     // Run the pipeline; clean up temp dir regardless of outcome.
-    let result = offset_correction_inner(paths, offset, abs_offset, sample_shift, n, &tmp_dir, &tx).await;
+    let result =
+        offset_correction_inner(paths, offset, abs_offset, sample_shift, n, &tmp_dir, &tx).await;
 
     // Always clean up temp dir.
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1951,7 +2050,8 @@ async fn offset_correction_inner(
     tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) -> Result<String, String> {
     // Check required tools for the input format.
-    let format_ext = paths[0].extension()
+    let format_ext = paths[0]
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -1968,7 +2068,10 @@ async fn offset_correction_inner(
         }
         "m4a" | "mp4" | "alac" | "wav" | "wave" | "aiff" | "aif" | "wv" => {} // ffmpeg handles these
         other => {
-            return Err(format!("Offset correction not supported for .{} files", other));
+            return Err(format!(
+                "Offset correction not supported for .{} files",
+                other
+            ));
         }
     }
 
@@ -1977,7 +2080,11 @@ async fn offset_correction_inner(
     if let Ok(entries) = std::fs::read_dir(orig_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
             if ext == "log" || ext == "cue" {
                 let dest = tmp_dir.join(p.file_name().unwrap());
                 let _ = std::fs::copy(&p, &dest);
@@ -1988,21 +2095,26 @@ async fn offset_correction_inner(
     // Decode all tracks first (needed for both shift directions).
     let mut all_raw: Vec<Vec<i16>> = Vec::with_capacity(n);
     for (i, path) in paths.iter().enumerate() {
-        let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
-            format!("Offset correction: decoding track {}/{}...", i + 1, n),
-        )).await;
+        let _ = tx
+            .send(crate::tui::message::AppMessage::StatusMessage(format!(
+                "Offset correction: decoding track {}/{}...",
+                i + 1,
+                n
+            )))
+            .await;
 
         let path_clone = path.clone();
-        let raw = tokio::task::spawn_blocking(move || {
-            decode_track_to_raw_i16(&path_clone)
-        }).await
+        let raw = tokio::task::spawn_blocking(move || decode_track_to_raw_i16(&path_clone))
+            .await
             .map_err(|e| format!("decode task failed: {}", e))?
             .map_err(|e| format!("decode failed for {}: {}", path.display(), e))?;
 
         if raw.len() < sample_shift {
             return Err(format!(
                 "Track {} too short ({} samples) for offset correction of {} samples",
-                i + 1, raw.len() / 2, abs_offset,
+                i + 1,
+                raw.len() / 2,
+                abs_offset,
             ));
         }
         all_raw.push(raw);
@@ -2048,7 +2160,9 @@ async fn offset_correction_inner(
         if corrected.len() != raw.len() {
             return Err(format!(
                 "Internal error: corrected track {} has {} samples, expected {}",
-                i + 1, corrected.len() / 2, raw.len() / 2,
+                i + 1,
+                corrected.len() / 2,
+                raw.len() / 2,
             ));
         }
 
@@ -2056,20 +2170,27 @@ async fn offset_correction_inner(
         let out_name = path.file_name().unwrap_or_default();
         let out_path = tmp_dir.join(out_name);
 
-        let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
-            format!("Offset correction: encoding track {}/{}...", i + 1, n),
-        )).await;
+        let _ = tx
+            .send(crate::tui::message::AppMessage::StatusMessage(format!(
+                "Offset correction: encoding track {}/{}...",
+                i + 1,
+                n
+            )))
+            .await;
 
         encode_corrected_track(&corrected, &out_path, path).await?;
         copy_metadata(path, &out_path).await?;
     }
 
     // 4. Verify corrected files at offset 0.
-    let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
-        "Offset correction: verifying corrected files...".into(),
-    )).await;
+    let _ = tx
+        .send(crate::tui::message::AppMessage::StatusMessage(
+            "Offset correction: verifying corrected files...".into(),
+        ))
+        .await;
 
-    let corrected_paths: Vec<PathBuf> = paths.iter()
+    let corrected_paths: Vec<PathBuf> = paths
+        .iter()
         .map(|p| tmp_dir.join(p.file_name().unwrap_or_default()))
         .collect();
 
@@ -2103,9 +2224,11 @@ async fn offset_correction_inner(
     // Safety: back up each original to .bak BEFORE overwriting. If any
     // copy fails mid-loop, restore all .bak files so the album is never
     // left in a partially-corrected state.
-    let _ = tx.send(crate::tui::message::AppMessage::StatusMessage(
-        "Offset correction: replacing originals...".into(),
-    )).await;
+    let _ = tx
+        .send(crate::tui::message::AppMessage::StatusMessage(
+            "Offset correction: replacing originals...".into(),
+        ))
+        .await;
 
     // Phase A: create backups.
     let mut backed_up: Vec<(PathBuf, PathBuf)> = Vec::new(); // (original, backup)
@@ -2132,7 +2255,11 @@ async fn offset_correction_inner(
             for (o, b) in &backed_up {
                 let _ = std::fs::rename(b, o);
             }
-            return Err(format!("Failed to write corrected {}: {}. All originals restored.", orig.display(), e));
+            return Err(format!(
+                "Failed to write corrected {}: {}. All originals restored.",
+                orig.display(),
+                e
+            ));
         }
     }
 
@@ -2166,11 +2293,10 @@ pub async fn encode_corrected_track(
 ) -> Result<(), String> {
     use tokio::process::Command as TokioCommand;
 
-    let raw_bytes: Vec<u8> = corrected.iter()
-        .flat_map(|&s| s.to_le_bytes())
-        .collect();
+    let raw_bytes: Vec<u8> = corrected.iter().flat_map(|&s| s.to_le_bytes()).collect();
 
-    let ext = src_path.extension()
+    let ext = src_path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -2212,9 +2338,20 @@ async fn encode_via_ffmpeg(
     use tokio::process::Command as TokioCommand;
 
     let mut cmd = TokioCommand::new("ffmpeg");
-    cmd.args(["-y", "-hide_banner", "-loglevel", "error",
-              "-f", "s16le", "-ar", "44100", "-ac", "2",
-              "-i", "pipe:0"]);
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "s16le",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-i",
+        "pipe:0",
+    ]);
     for arg in codec_args {
         cmd.arg(arg);
     }
@@ -2223,17 +2360,22 @@ async fn encode_via_ffmpeg(
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        stdin.write_all(raw_bytes).await
+        stdin
+            .write_all(raw_bytes)
+            .await
             .map_err(|e| format!("Failed to write to ffmpeg stdin: {}", e))?;
         drop(stdin);
     }
 
-    let output = child.wait_with_output().await
+    let output = child
+        .wait_with_output()
+        .await
         .map_err(|e| format!("ffmpeg failed: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2244,7 +2386,8 @@ async fn encode_via_ffmpeg(
 
 /// Copy metadata from source to destination, format-aware.
 pub async fn copy_metadata(src: &Path, dst: &Path) -> Result<(), String> {
-    let ext = src.extension()
+    let ext = src
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -2287,15 +2430,23 @@ async fn copy_metadata_metaflac(src: &Path, dst: &Path) -> Result<(), String> {
 
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
-            stdin.write_all(&export.stdout).await
+            stdin
+                .write_all(&export.stdout)
+                .await
                 .map_err(|e| format!("metaflac import write failed: {}", e))?;
             drop(stdin);
         }
-        let output = child.wait_with_output().await
+        let output = child
+            .wait_with_output()
+            .await
             .map_err(|e| format!("metaflac import failed: {}", e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("metaflac tag import failed for {}: {}", dst.display(), stderr));
+            return Err(format!(
+                "metaflac tag import failed for {}: {}",
+                dst.display(),
+                stderr
+            ));
         }
     }
 
@@ -2331,8 +2482,8 @@ async fn copy_metadata_metaflac(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// Copy tags and pictures via lofty (for WavPack and APE).
 fn copy_tags_via_lofty(src: &Path, dst: &Path) -> Result<(), String> {
-    use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
 
     let src_tagged = lofty::read_from_path(src)
         .map_err(|e| format!("Failed to read tags from {}: {}", src.display(), e))?;
@@ -2365,7 +2516,8 @@ fn copy_tags_via_lofty(src: &Path, dst: &Path) -> Result<(), String> {
         }
     }
 
-    dst_tagged.save_to_path(dst, WriteOptions::default())
+    dst_tagged
+        .save_to_path(dst, WriteOptions::default())
         .map_err(|e| format!("Failed to write tags to {}: {}", dst.display(), e))?;
 
     Ok(())

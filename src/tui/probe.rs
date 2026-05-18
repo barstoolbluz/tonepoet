@@ -184,8 +184,11 @@ fn friendly_format_name(name: &str) -> String {
         "dsf" => "DSF".to_string(),
         "iff" | "dff" => "DFF".to_string(),
         "matroska" | "webm" => {
-            if name.contains("webm") { "WebM".to_string() }
-            else { "MKA".to_string() }
+            if name.contains("webm") {
+                "WebM".to_string()
+            } else {
+                "MKA".to_string()
+            }
         }
         "w64" => "W64".to_string(),
         "rf64" => "RF64".to_string(),
@@ -235,9 +238,7 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
 
     ensure_ffmpeg_init();
 
-    let file_size = std::fs::metadata(path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
     let ctx = ffmpeg_next::format::input(&path)
         .map_err(|e| format!("Failed to open '{}': {}", path.display(), e))?;
@@ -256,7 +257,9 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     let codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(codec_params)
         .map_err(|e| format!("Failed to read codec parameters: {}", e))?;
 
-    let audio = codec_ctx.decoder().audio()
+    let audio = codec_ctx
+        .decoder()
+        .audio()
         .map_err(|e| format!("Failed to create audio decoder context: {}", e))?;
 
     let codec_name = audio
@@ -451,9 +454,7 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
             meta.track_number = tag.track();
         }
         if meta.isrc.is_none() {
-            meta.isrc = tag
-                .get_string(&ItemKey::Isrc)
-                .map(|s| s.to_string());
+            meta.isrc = tag.get_string(&ItemKey::Isrc).map(|s| s.to_string());
         }
         if meta.catalog_number.is_none() {
             // CATALOGNUMBER is a Vorbis comment convention; also used in
@@ -492,14 +493,10 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
 
         // R128 (Q7.8 fixed-point integer converted to dB on read)
         if meta.r128_track_gain.is_none() {
-            meta.r128_track_gain = tag
-                .get_string(&r128_track_key)
-                .and_then(r128_raw_to_db);
+            meta.r128_track_gain = tag.get_string(&r128_track_key).and_then(r128_raw_to_db);
         }
         if meta.r128_album_gain.is_none() {
-            meta.r128_album_gain = tag
-                .get_string(&r128_album_key)
-                .and_then(r128_raw_to_db);
+            meta.r128_album_gain = tag.get_string(&r128_album_key).and_then(r128_raw_to_db);
         }
     }
 
@@ -550,20 +547,23 @@ fn read_metadata_sacd(path: &Path) -> Result<SourceMetadata, String> {
 
     let mut meta = SourceMetadata::default();
 
-    meta.album = from_sidecar("ALBUM").or_else(|| {
-        md.master_text.as_ref().and_then(|t| t.album_title.clone())
-    });
+    meta.album = from_sidecar("ALBUM")
+        .or_else(|| md.master_text.as_ref().and_then(|t| t.album_title.clone()));
     meta.artist = from_sidecar("ARTIST")
         .or_else(|| from_sidecar("ALBUMARTIST"))
         .or_else(|| from_sidecar("ALBUM ARTIST"))
         .or_else(|| md.master_text.as_ref().and_then(|t| t.album_artist.clone()));
-    meta.year = from_sidecar("DATE")
-        .or_else(|| md.master_toc.disc_date.map(|d| d.year.to_string()));
+    meta.year =
+        from_sidecar("DATE").or_else(|| md.master_toc.disc_date.map(|d| d.year.to_string()));
     meta.catalog_number = from_sidecar("CATALOGNUMBER")
         .or_else(|| from_sidecar("DISCOGS_CATALOG"))
         .or_else(|| {
             let c = md.master_toc.album_catalog_number.trim().to_string();
-            if c.is_empty() { None } else { Some(c) }
+            if c.is_empty() {
+                None
+            } else {
+                Some(c)
+            }
         });
     meta.genre = from_sidecar("GENRE").or_else(|| {
         md.master_toc
@@ -587,8 +587,8 @@ pub fn preemphasis_metadata_check_pub(path: &Path) -> Option<String> {
 /// spectral analysis). Checks tags, CUE/log files in the same directory,
 /// and catalog number against the known PE disc database.
 fn preemphasis_metadata_check(path: &Path) -> Option<String> {
-    use super::preemphasis::metadata::{check_tag_evidence, check_file_evidence};
     use super::preemphasis::catalog::check_catalog_evidence;
+    use super::preemphasis::metadata::{check_file_evidence, check_tag_evidence};
 
     // Tags (fastest).
     if let Some(ev) = check_tag_evidence(path) {
@@ -632,7 +632,13 @@ impl MetadataField {
 
     /// All fields in display order.
     pub fn all() -> &'static [MetadataField] {
-        &[Self::Title, Self::Artist, Self::Album, Self::Genre, Self::Year]
+        &[
+            Self::Title,
+            Self::Artist,
+            Self::Album,
+            Self::Genre,
+            Self::Year,
+        ]
     }
 }
 
@@ -643,11 +649,7 @@ impl MetadataField {
 ///
 /// Year values must be valid u32; non-numeric input returns an error.
 /// Empty strings clear the field (set to None).
-pub fn write_metadata_field(
-    path: &Path,
-    field: MetadataField,
-    value: &str,
-) -> Result<(), String> {
+pub fn write_metadata_field(path: &Path, field: MetadataField, value: &str) -> Result<(), String> {
     use lofty::config::WriteOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::Accessor;
@@ -787,17 +789,21 @@ pub fn ensure_dim_replicate(entry: &mut TagEntry, target_dim: usize) {
         return;
     }
     let pad_v = entry.per_file_values.first().cloned().unwrap_or_default();
-    let pad_o = entry.per_file_originals.first().cloned().unwrap_or_default();
+    let pad_o = entry
+        .per_file_originals
+        .first()
+        .cloned()
+        .unwrap_or_default();
     entry.per_file_values.resize(target_dim, pad_v);
     entry.per_file_originals.resize(target_dim, pad_o);
 }
 
 pub fn metadata_editor_has_changes(state: &super::app::MetadataEditorState) -> bool {
     !state.deleted.is_empty()
-        || state.entries.iter().any(|e|
-            e.value != e.original
-            || e.per_file_values != e.per_file_originals
-        )
+        || state
+            .entries
+            .iter()
+            .any(|e| e.value != e.original || e.per_file_values != e.per_file_originals)
 }
 
 /// State of the per-row revert toggle pill in the metadata editor.
@@ -902,7 +908,9 @@ pub fn mb_pill_state_field(entry: &TagEntry) -> MbRevertPill {
 /// `is_mixed`. No-op when MB never touched this field, or the user has
 /// manually edited (state isn't either endpoint).
 pub fn toggle_mb_revert_field(entry: &mut TagEntry) {
-    let Some(ref proposed) = entry.mb_proposed_value else { return; };
+    let Some(ref proposed) = entry.mb_proposed_value else {
+        return;
+    };
     let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
         Some(v) => v.clone(),
         None => vec![proposed.clone(); entry.per_file_values.len()],
@@ -924,7 +932,9 @@ pub fn toggle_mb_revert_field(entry: &mut TagEntry) {
 /// proposal. Broadcasts `mb_proposed_value` when `mb_proposed_per_file`
 /// is None. No-op when MB never touched the field.
 pub fn restore_mb_proposed(entry: &mut TagEntry) {
-    let Some(ref proposed) = entry.mb_proposed_value else { return; };
+    let Some(ref proposed) = entry.mb_proposed_value else {
+        return;
+    };
     let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
         Some(v) => v.clone(),
         None => vec![proposed.clone(); entry.per_file_values.len()],
@@ -976,7 +986,8 @@ pub fn extract_track_from_filename(stem: &str) -> u32 {
 /// Matches patterns like "Disc 01", "CD2", "Disk 1", "d01".
 /// Returns 1 if no disc pattern found (default single-disc).
 pub fn extract_disc_from_path(path: &std::path::Path) -> u32 {
-    let parent_name = path.parent()
+    let parent_name = path
+        .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("");
@@ -1031,16 +1042,26 @@ pub fn parse_title_from_filename(stem: &str) -> (Option<u32>, Option<String>) {
     if digit_end == 0 {
         // No digits — entire stem is the title.
         let title = s.trim();
-        return (None, if title.is_empty() { None } else { Some(title.to_string()) });
+        return (
+            None,
+            if title.is_empty() {
+                None
+            } else {
+                Some(title.to_string())
+            },
+        );
     }
     let track: u32 = s[..digit_end].parse().unwrap_or(0);
     let track = if track > 0 { Some(track) } else { None };
     // Strip separator after digits.
-    let rest = s[digit_end..].trim_start_matches(|c: char| {
-        c == ' ' || c == '-' || c == '.' || c == '_'
-    });
+    let rest =
+        s[digit_end..].trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.' || c == '_');
     let title = rest.trim();
-    let title = if title.is_empty() { None } else { Some(title.to_string()) };
+    let title = if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    };
     (track, title)
 }
 
@@ -1076,32 +1097,36 @@ pub fn sort_paths_and_entries_by_track(
         return;
     }
 
-    let disc_entry = entries.iter().find(|e|
-        e.display_key.to_ascii_uppercase() == "DISCNUMBER");
-    let track_entry = entries.iter().find(|e|
-        e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
+    let disc_entry = entries
+        .iter()
+        .find(|e| e.display_key.to_ascii_uppercase() == "DISCNUMBER");
+    let track_entry = entries
+        .iter()
+        .find(|e| e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
 
-    let sort_keys: Vec<(u32, u32, String)> = (0..n).map(|i| {
-        let tag_disc = disc_entry
-            .and_then(|e| e.per_file_values.get(i))
-            .filter(|v| !v.is_empty())
-            .map(|v| parse_track_disc_tag(v));
-        let tag_track = track_entry
-            .and_then(|e| e.per_file_values.get(i))
-            .filter(|v| !v.is_empty())
-            .map(|v| parse_track_disc_tag(v));
+    let sort_keys: Vec<(u32, u32, String)> = (0..n)
+        .map(|i| {
+            let tag_disc = disc_entry
+                .and_then(|e| e.per_file_values.get(i))
+                .filter(|v| !v.is_empty())
+                .map(|v| parse_track_disc_tag(v));
+            let tag_track = track_entry
+                .and_then(|e| e.per_file_values.get(i))
+                .filter(|v| !v.is_empty())
+                .map(|v| parse_track_disc_tag(v));
 
-        let disc = tag_disc.unwrap_or_else(|| extract_disc_from_path(&paths[i]));
-        let track = tag_track.unwrap_or_else(|| {
-            let stem = paths[i].file_stem()
-                .and_then(|s| s.to_str()).unwrap_or("");
-            extract_track_from_filename(stem)
-        });
-        let filename = paths[i].file_name()
-            .map(|n| n.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        (disc, track, filename)
-    }).collect();
+            let disc = tag_disc.unwrap_or_else(|| extract_disc_from_path(&paths[i]));
+            let track = tag_track.unwrap_or_else(|| {
+                let stem = paths[i].file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                extract_track_from_filename(stem)
+            });
+            let filename = paths[i]
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            (disc, track, filename)
+        })
+        .collect();
 
     let mut perm: Vec<usize> = (0..n).collect();
     perm.sort_by(|&a, &b| sort_keys[a].cmp(&sort_keys[b]));
@@ -1111,8 +1136,14 @@ pub fn sort_paths_and_entries_by_track(
 
     for entry in entries.iter_mut() {
         if entry.per_file_values.len() == n {
-            let sv: Vec<_> = perm.iter().map(|&i| entry.per_file_values[i].clone()).collect();
-            let so: Vec<_> = perm.iter().map(|&i| entry.per_file_originals[i].clone()).collect();
+            let sv: Vec<_> = perm
+                .iter()
+                .map(|&i| entry.per_file_values[i].clone())
+                .collect();
+            let so: Vec<_> = perm
+                .iter()
+                .map(|&i| entry.per_file_originals[i].clone())
+                .collect();
             entry.per_file_values = sv;
             entry.per_file_originals = so;
         }
@@ -1130,29 +1161,36 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
         return;
     }
 
-    let sort_keys: Vec<(u32, u32, String)> = paths.iter().map(|p| {
-        // Try reading disc/track from tags.
-        let (tag_disc, tag_track) = lofty::read_from_path(p).ok()
-            .and_then(|tagged| {
-                let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
-                let disc = tag.get_string(&ItemKey::DiscNumber)
-                    .map(|s| parse_track_disc_tag(s));
-                let track = tag.get_string(&ItemKey::TrackNumber)
-                    .map(|s| parse_track_disc_tag(s));
-                Some((disc, track))
-            })
-            .unwrap_or((None, None));
+    let sort_keys: Vec<(u32, u32, String)> = paths
+        .iter()
+        .map(|p| {
+            // Try reading disc/track from tags.
+            let (tag_disc, tag_track) = lofty::read_from_path(p)
+                .ok()
+                .and_then(|tagged| {
+                    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+                    let disc = tag
+                        .get_string(&ItemKey::DiscNumber)
+                        .map(|s| parse_track_disc_tag(s));
+                    let track = tag
+                        .get_string(&ItemKey::TrackNumber)
+                        .map(|s| parse_track_disc_tag(s));
+                    Some((disc, track))
+                })
+                .unwrap_or((None, None));
 
-        let disc = tag_disc.unwrap_or_else(|| extract_disc_from_path(p));
-        let track = tag_track.unwrap_or_else(|| {
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            extract_track_from_filename(stem)
-        });
-        let filename = p.file_name()
-            .map(|n| n.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        (disc, track, filename)
-    }).collect();
+            let disc = tag_disc.unwrap_or_else(|| extract_disc_from_path(p));
+            let track = tag_track.unwrap_or_else(|| {
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                extract_track_from_filename(stem)
+            });
+            let filename = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            (disc, track, filename)
+        })
+        .collect();
 
     let mut perm: Vec<usize> = (0..paths.len()).collect();
     perm.sort_by(|&a, &b| sort_keys[a].cmp(&sort_keys[b]));
@@ -1163,15 +1201,31 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
 
 /// Priority order for standard fields (displayed first, in this order).
 pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
-    "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE",
-    "DATE", "ORIGINALDATE", "YEAR",
-    "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL",
-    "CATALOGNUMBER", "RELEASECOUNTRY",
-    "COMMENT", "COMPOSER", "CONDUCTOR", "LABEL",
-    "ISRC", "BARCODE",
-    "MUSICBRAINZ_ALBUMID", "MUSICBRAINZ_ALBUMARTISTID",
+    "TITLE",
+    "ARTIST",
+    "ALBUM",
+    "ALBUMARTIST",
+    "GENRE",
+    "DATE",
+    "ORIGINALDATE",
+    "YEAR",
+    "TRACKNUMBER",
+    "TRACKTOTAL",
+    "DISCNUMBER",
+    "DISCTOTAL",
+    "CATALOGNUMBER",
+    "RELEASECOUNTRY",
+    "COMMENT",
+    "COMPOSER",
+    "CONDUCTOR",
+    "LABEL",
+    "ISRC",
+    "BARCODE",
+    "MUSICBRAINZ_ALBUMID",
+    "MUSICBRAINZ_ALBUMARTISTID",
     "MUSICBRAINZ_RELEASEGROUPID",
-    "MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RELEASETRACKID",
+    "MUSICBRAINZ_TRACKID",
+    "MUSICBRAINZ_RELEASETRACKID",
     "MUSICBRAINZ_ARTISTID",
 ];
 
@@ -1249,7 +1303,9 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
     // is blocked everywhere — those values can be 1-2KB of multi-line
     // content and a synthetic summary is shown in the editor instead.
     for e in &mut entries {
-        if is_synthetic_preview(e) { e.is_binary = true; }
+        if is_synthetic_preview(e) {
+            e.is_binary = true;
+        }
     }
 
     sort_entries_standard_first(&mut entries);
@@ -1263,9 +1319,9 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
 /// If all files agree → shared value. If they differ → `<mixed>`.
 /// Duplicate keys within a single file are joined with "; ".
 pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry>, String> {
-    use std::collections::HashMap;
     use lofty::file::TaggedFileExt;
     use lofty::tag::{ItemValue, TagType};
+    use std::collections::HashMap;
 
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -1314,7 +1370,9 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
                 ItemValue::Locator(l) => (l.clone(), false),
                 ItemValue::Binary(b) => (format!("<binary, {} bytes>", b.len()), true),
             };
-            let entry = file_values.entry(key.clone()).or_insert_with(|| (String::new(), is_bin));
+            let entry = file_values
+                .entry(key.clone())
+                .or_insert_with(|| (String::new(), is_bin));
             if entry.0.is_empty() {
                 entry.0 = val;
             } else {
@@ -1324,11 +1382,14 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             if !key_map.contains_key(&key) {
                 let display = item_key_display(&key, tag_type);
                 key_order.push(key.clone());
-                key_map.insert(key, KeyData {
-                    display_key: display,
-                    is_binary: is_bin,
-                    values: vec![String::new(); n],
-                });
+                key_map.insert(
+                    key,
+                    KeyData {
+                        display_key: display,
+                        is_binary: is_bin,
+                        values: vec![String::new(); n],
+                    },
+                );
             }
         }
 
@@ -1336,7 +1397,9 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
         for (key, (val, is_bin)) in &file_values {
             if let Some(data) = key_map.get_mut(key) {
                 data.values[file_idx] = val.clone();
-                if *is_bin { data.is_binary = true; }
+                if *is_bin {
+                    data.is_binary = true;
+                }
             }
         }
     }
@@ -1370,7 +1433,9 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
     // Force-binary on synthetic-preview rows (CUESHEET) so inline
     // edit is blocked — see read_all_tags for rationale.
     for e in &mut entries {
-        if is_synthetic_preview(e) { e.is_binary = true; }
+        if is_synthetic_preview(e) {
+            e.is_binary = true;
+        }
     }
 
     // Sort with standard key priority.
@@ -1415,10 +1480,7 @@ pub fn apply_audio_tag_changes(
                 changes.push((key.clone(), None));
             } else if file_idx < vals.len() && file_idx < origs.len() {
                 if vals[file_idx] != origs[file_idx] {
-                    changes.push((
-                        key.clone(),
-                        Some(vals[file_idx].clone()),
-                    ));
+                    changes.push((key.clone(), Some(vals[file_idx].clone())));
                 }
             }
         }
@@ -1455,7 +1517,8 @@ pub fn write_all_tags(
             let tt = tagged.primary_tag_type();
             tagged.insert_tag(lofty::tag::Tag::new(tt));
         }
-        let tag = tagged.primary_tag_mut()
+        let tag = tagged
+            .primary_tag_mut()
             .ok_or_else(|| "failed to create primary tag".to_string())?;
 
         for (key, new_value) in changes {
@@ -1531,11 +1594,7 @@ mod tests {
         assert_eq!(r128_raw_to_db("  -1664  ").as_deref(), Some("-6.50 dB"));
     }
 
-    fn entry_with_mb_proposed(
-        original: &str,
-        proposed: &str,
-        per_file_count: usize,
-    ) -> TagEntry {
+    fn entry_with_mb_proposed(original: &str, proposed: &str, per_file_count: usize) -> TagEntry {
         TagEntry {
             display_key: "TITLE".to_string(),
             item_key: lofty::tag::ItemKey::TrackTitle,
@@ -1577,8 +1636,10 @@ mod tests {
         let e = TagEntry {
             display_key: "TITLE".into(),
             item_key: lofty::tag::ItemKey::TrackTitle,
-            value: "x".into(), original: "x".into(),
-            is_binary: false, is_mixed: false,
+            value: "x".into(),
+            original: "x".into(),
+            is_binary: false,
+            is_mixed: false,
             per_file_values: vec!["x".into()],
             per_file_originals: vec!["x".into()],
             mb_proposed_value: None,
@@ -1604,7 +1665,7 @@ mod tests {
         e.value = "Hand-Edit".into();
         e.per_file_values = vec!["Hand-Edit".into()];
         toggle_mb_revert(&mut e);
-        assert_eq!(e.value, "Hand-Edit");  // unchanged
+        assert_eq!(e.value, "Hand-Edit"); // unchanged
     }
 
     #[test]
@@ -1626,19 +1687,35 @@ mod tests {
             entries: vec![TagEntry {
                 display_key: "TITLE".into(),
                 item_key: lofty::tag::ItemKey::TrackTitle,
-                value: "x".into(), original: "x".into(),
-                is_binary: false, is_mixed: false,
+                value: "x".into(),
+                original: "x".into(),
+                is_binary: false,
+                is_mixed: false,
                 per_file_values: vec!["x".into()],
                 per_file_originals: vec!["x".into()],
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             }],
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: false, deleted: vec![0],
+            dirty: false,
+            deleted: vec![0],
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false, sacd_sidecar_path: None, sacd_area_kind: None, sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
         assert!(metadata_editor_has_changes(&state));
     }
@@ -1652,12 +1729,26 @@ mod tests {
                 entry_with_mb_proposed("File", "MB", 1),
                 entry_with_mb_proposed("File2", "MB2", 1),
             ],
-            cursor: 0, scroll: 0, last_click: None,
-            edit_input: None, add_key_input: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
             phase: MetadataEditorPhase::Editing,
-            dirty: true, deleted: Vec::new(),
+            dirty: true,
+            deleted: Vec::new(),
             file_labels: vec!["01".into()],
-            detail_field_idx: 0, detail_cursor: 0, detail_scroll: 0, detail_edit: None, mb_back: None, gnudb_back: None, read_only: false, sacd_sidecar_path: None, sacd_area_kind: None, sacd_stereo_durations: None, sacd_multi_channel_durations: None,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
         };
         // Both entries currently show the MB value → has changes.
         assert!(metadata_editor_has_changes(&state));
@@ -1683,16 +1774,18 @@ mod tests {
         use lofty::file::{AudioFile, TaggedFileExt};
         use lofty::tag::{ItemKey, ItemValue, TagItem};
 
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/silence.flac");
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/silence.flac");
         assert!(
             fixture.exists(),
             "missing test fixture: {}",
             fixture.display()
         );
         // Copy to a tmp file so we don't mutate the fixture.
-        let tmp = std::env::temp_dir()
-            .join(format!("tonepoet-cuesheet-roundtrip-{}.flac", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "tonepoet-cuesheet-roundtrip-{}.flac",
+            std::process::id()
+        ));
         std::fs::copy(&fixture, &tmp).expect("copy fixture");
 
         let cue_payload = "REM GENRE Rock\n\
@@ -1724,7 +1817,9 @@ mod tests {
                 key,
                 ItemValue::Text(cue_payload.trim().to_string()),
             ));
-            tagged.save_to_path(&tmp, WriteOptions::default()).expect("save");
+            tagged
+                .save_to_path(&tmp, WriteOptions::default())
+                .expect("save");
         }
 
         // Read CUESHEET back.
@@ -1739,12 +1834,16 @@ mod tests {
 
         let read_back = read_back.expect("CUESHEET tag should be present after save");
         assert_eq!(
-            read_back, cue_payload.trim(),
+            read_back,
+            cue_payload.trim(),
             "lofty should preserve multi-line Vorbis comment value byte-for-byte (modulo trim)"
         );
         // Sanity: the value still has internal newlines (lofty didn't
         // collapse them).
-        assert!(read_back.contains('\n'), "internal newlines must be preserved");
+        assert!(
+            read_back.contains('\n'),
+            "internal newlines must be preserved"
+        );
         assert!(
             read_back.matches('\n').count() >= 5,
             "multi-line content (≥5 newlines) must round-trip"
@@ -1756,8 +1855,10 @@ mod tests {
         let mut e = TagEntry {
             display_key: "TITLE".into(),
             item_key: lofty::tag::ItemKey::TrackTitle,
-            value: "x".into(), original: "y".into(),
-            is_binary: false, is_mixed: false,
+            value: "x".into(),
+            original: "y".into(),
+            is_binary: false,
+            is_mixed: false,
             per_file_values: vec!["x".into()],
             per_file_originals: vec!["y".into()],
             mb_proposed_value: None,
@@ -1784,8 +1885,8 @@ mod tests {
         catalog: Option<&str>,
         playtime_minutes: u8,
     ) {
-        use std::io::{Seek, SeekFrom, Write};
         use crate::tui::sacd::*;
+        use std::io::{Seek, SeekFrom, Write};
 
         let total_sectors = 700u64;
         let f = std::fs::File::create(path).unwrap();
@@ -1796,7 +1897,8 @@ mod tests {
         // Master TOC
         let mut mtoc = vec![0u8; 0xa8];
         mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
-        mtoc[0x08] = 1; mtoc[0x09] = 20;
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
         mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
         mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
         if let Some(c) = catalog {
@@ -1814,12 +1916,16 @@ mod tests {
         }
         if disc_year > 0 {
             mtoc[0x78..0x7a].copy_from_slice(&disc_year.to_be_bytes());
-            mtoc[0x7a] = 6;  mtoc[0x7b] = 15;
+            mtoc[0x7a] = 6;
+            mtoc[0x7b] = 15;
         }
         // disc_genre[0] = JAZZ for the test
-        mtoc[0x68] = 1; mtoc[0x6b] = 14;
+        mtoc[0x68] = 1;
+        mtoc[0x6b] = 14;
         mtoc[0x80] = 1;
-        mtoc[0x88] = b'e'; mtoc[0x89] = b'n'; mtoc[0x8a] = 2;
+        mtoc[0x88] = b'e';
+        mtoc[0x89] = b'n';
+        mtoc[0x8a] = 2;
         f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
         f.write_all(&mtoc).unwrap();
 
@@ -1848,7 +1954,8 @@ mod tests {
         let mut build_area = |magic: &[u8; 8], channels: u8, lou: u8| {
             let mut a = vec![0u8; SECTOR_SIZE as usize];
             a[0..8].copy_from_slice(magic);
-            a[0x08] = 1; a[0x09] = 20;
+            a[0x08] = 1;
+            a[0x09] = 20;
             a[0x0a..0x0c].copy_from_slice(&3u16.to_be_bytes()); // size
             a[0x14] = 0x04;
             a[0x15] = if dst_encoded { 0 } else { 2 };
@@ -1863,7 +1970,9 @@ mod tests {
             a[0x48..0x4c].copy_from_slice(&650u32.to_be_bytes());
             a[0x4c..0x50].copy_from_slice(&100_000u32.to_be_bytes());
             a[0x50] = 1;
-            a[0x58] = b'e'; a[0x59] = b'n'; a[0x5a] = 2;
+            a[0x58] = b'e';
+            a[0x59] = b'n';
+            a[0x5a] = 2;
             a
         };
 
@@ -1918,7 +2027,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("titled.iso");
         write_sacd_iso(
-            &path, true, false, false,
+            &path,
+            true,
+            false,
+            false,
             Some("Kind of Blue"),
             Some("Miles Davis"),
             1959,
@@ -1951,8 +2063,10 @@ mod tests {
         drop(f);
 
         // Confirm the SACD detector says no.
-        assert!(!crate::tui::sacd::is_sacd_iso(&path),
-            "synthetic ISO should not match SACD magic");
+        assert!(
+            !crate::tui::sacd::is_sacd_iso(&path),
+            "synthetic ISO should not match SACD magic"
+        );
 
         // probe_audio should error from ffmpeg (zeros aren't a valid
         // audio container) — and the error must not be the SACD
@@ -1960,8 +2074,11 @@ mod tests {
         match probe_audio(&path) {
             Ok(_) => panic!("ffmpeg should not synthesize info from zeros"),
             Err(e) => {
-                assert!(!e.contains("SACD parse failed"),
-                    "should have reached ffmpeg, not SACD branch: {}", e);
+                assert!(
+                    !e.contains("SACD parse failed"),
+                    "should have reached ffmpeg, not SACD branch: {}",
+                    e
+                );
             }
         }
     }
@@ -1974,8 +2091,8 @@ mod tests {
         // is_sacd_iso passes the cheap magic-byte check; probe_sacd
         // must therefore propagate the parser's Err rather than
         // silently fall through.
-        use std::io::{Seek, SeekFrom, Write};
         use crate::tui::sacd::*;
+        use std::io::{Seek, SeekFrom, Write};
 
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("magic_only.iso");
@@ -1984,7 +2101,8 @@ mod tests {
         f.set_len(total_sectors * SECTOR_SIZE).unwrap();
         drop(f);
         let mut f = std::fs::File::options().write(true).open(&path).unwrap();
-        f.seek(SeekFrom::Start(MASTER_TOC_LSNS[0] * SECTOR_SIZE)).unwrap();
+        f.seek(SeekFrom::Start(MASTER_TOC_LSNS[0] * SECTOR_SIZE))
+            .unwrap();
         f.write_all(MASTER_TOC_MAGIC).unwrap();
         // The remaining 160 bytes of the master_toc_t stay zero,
         // which means area_1_toc_1_start = 0 AND area_2_toc_1_start = 0,
@@ -1996,7 +2114,8 @@ mod tests {
         match res {
             Err(e) => assert!(
                 e.contains("SACD parse failed") && e.contains("no playable areas"),
-                "unexpected error message: {}", e,
+                "unexpected error message: {}",
+                e,
             ),
             Ok(_) => panic!("probe_sacd should reject malformed master TOC"),
         }
@@ -2012,10 +2131,16 @@ mod tests {
         // Stereo absent, multi-channel present, DST-encoded.
         write_sacd_iso(&path, false, true, true, None, None, 0, None, 75);
         let info = probe_audio(&path).expect("probe");
-        assert!(info.format_name.contains("DST"),
-            "format_name should mark DST: got {}", info.format_name);
-        assert!(info.format_name.contains("MCH"),
-            "format_name should mark MCH: got {}", info.format_name);
+        assert!(
+            info.format_name.contains("DST"),
+            "format_name should mark DST: got {}",
+            info.format_name
+        );
+        assert!(
+            info.format_name.contains("MCH"),
+            "format_name should mark MCH: got {}",
+            info.format_name
+        );
         assert_eq!(info.channels, 6);
         assert_eq!(info.channel_layout, "5.1");
     }
