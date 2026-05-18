@@ -159,16 +159,25 @@ fn draw_queue_item(
 
     // For processing items, draw a progress bar overlay if we have enough width
     if let ConversionStatus::Processing {
-        progress, phase, ..
+        progress,
+        message,
+        phase,
+        ..
     } = &item.status
     {
         let progress_width = area.width.saturating_sub(max_name_len as u16 + 12);
         if progress_width > 10 {
             let overall = *progress;
-            let phase_label = phase
-                .as_ref()
-                .map(|p| p.short_name())
-                .unwrap_or("Processing");
+            let label = match message.as_deref() {
+                Some(msg) => format!("{:.0}% {}", overall, msg),
+                None => {
+                    let phase_label = phase
+                        .as_ref()
+                        .map(|p| p.short_name())
+                        .unwrap_or("Processing");
+                    format!("{:.0}% {}", overall, phase_label)
+                }
+            };
 
             let gauge_area = Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
 
@@ -177,7 +186,7 @@ fn draw_queue_item(
             let gauge = Gauge::default()
                 .gauge_style(Style::default().fg(color).bg(Color::Rgb(40, 40, 40)))
                 .ratio(pct as f64)
-                .label(format!("{:.0}% {}", overall, phase_label));
+                .label(label);
             f.render_widget(gauge, gauge_area);
         }
     }
@@ -198,15 +207,24 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             Style::default(),
         ),
         ConversionStatus::Processing {
-            progress, phase, ..
+            progress,
+            message,
+            phase,
+            ..
         } => {
-            let phase_name = phase
-                .as_ref()
-                .map(|p| p.short_name())
-                .unwrap_or("Processing");
+            let text = match message.as_deref() {
+                Some(msg) => format!("{:.0}% {}", progress, msg),
+                None => {
+                    let phase_name = phase
+                        .as_ref()
+                        .map(|p| p.short_name())
+                        .unwrap_or("Processing");
+                    format!("{:.0}% {}", progress, phase_name)
+                }
+            };
             (
                 vec![Span::styled(
-                    format!("{:.0}% {}", progress, phase_name),
+                    text,
                     Style::default().fg(phase_color(phase.as_ref())),
                 )],
                 Style::default(),

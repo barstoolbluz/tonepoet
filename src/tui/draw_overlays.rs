@@ -578,14 +578,20 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
         ConversionStatus::NotConfigured => "Not Configured".to_string(),
         ConversionStatus::Queued => "Queued".to_string(),
         ConversionStatus::Processing {
-            progress, phase, ..
-        } => {
-            let phase_name = phase
-                .as_ref()
-                .map(|p| p.display_name())
-                .unwrap_or("Processing");
-            format!("{:.1}% - {}", progress, phase_name)
-        }
+            progress,
+            message,
+            phase,
+            ..
+        } => match message.as_deref() {
+            Some(msg) => format!("{:.1}% - {}", progress, msg),
+            None => {
+                let phase_name = phase
+                    .as_ref()
+                    .map(|p| p.display_name())
+                    .unwrap_or("Processing");
+                format!("{:.1}% - {}", progress, phase_name)
+            }
+        },
         ConversionStatus::Completed { output_path, .. } => {
             format!("Completed -> {}", output_path.display())
         }
