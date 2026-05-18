@@ -19,6 +19,7 @@ use crate::tui::sacd::{
     detect_sacd_iso, parse_sacd_iso, AreaInfo, AreaKind, DetectionResult, Genre, PlayTime,
     SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE, SACD_SAMPLE_RATE_HZ,
 };
+use crate::tui::sacd_sidecar::{find_sidecar_for_iso, parse_sidecar, SidecarTrack};
 
 pub struct SacdIsoMaterializer;
 
@@ -41,6 +42,12 @@ impl Materializer for SacdIsoMaterializer {
         let explicit_sacd_request = explicit_sacd_requested(req);
         let metadata = parse_sacd_iso(&req.container)
             .map_err(|err| sacd_error_to_materialize(err, explicit_sacd_request))?;
+
+        // Sidecar XML is the primary metadata source (has track titles,
+        // artist, album from MusicBrainz). TOC provides structural data
+        // (sector ranges, durations) and fallback text when no sidecar.
+        let sidecar_tracks = load_sidecar_tracks(&req.container, req.source.sacd_area);
+
         let requested_area = requested_sacd_area(req.source.sacd_area);
         let area = sacd_area_info(&metadata, requested_area).ok_or_else(|| {
             MaterializeError::InvalidTrackSelection(format!(
@@ -82,7 +89,14 @@ impl Materializer for SacdIsoMaterializer {
                     track_index: idx as u32,
                     area: requested_area,
                 },
-                metadata: track_metadata(entry, &metadata, area, requested_area, track_number),
+                metadata: track_metadata(
+                    entry,
+                    &metadata,
+                    area,
+                    requested_area,
+                    track_number,
+                    sidecar_tracks.get(idx),
+                ),
                 // The encoded artifact will usually be PCM FLAC/MP3/AAC/etc.,
                 // not DSD64. Leave this unset so merge validation probes the
                 // real encoded output instead of comparing against 2.8224 MHz
@@ -93,7 +107,13 @@ impl Materializer for SacdIsoMaterializer {
         }
 
         let tracks = apply_track_selection(tracks, &req.source.track_selection)?;
-        let album_metadata = album_metadata(&metadata, area, requested_area, tracks.len() as u32);
+        let album_metadata = album_metadata(
+            &metadata,
+            area,
+            requested_area,
+            tracks.len() as u32,
+            sidecar_tracks.first(),
+        );
         let mut tool_versions = BTreeMap::new();
         tool_versions.insert("sacd-rs".to_string(), "in-process".to_string());
 
@@ -181,6 +201,7 @@ fn album_metadata(
     area: &AreaInfo,
     requested_area: SacdArea,
     total_tracks: u32,
+    sidecar_first_track: Option<&SidecarTrack>,
 ) -> AlbumMetadata {
     let mut extra = BTreeMap::new();
     insert_nonempty(
@@ -230,14 +251,15 @@ fn album_metadata(
         insert_nonempty(&mut extra, "sacd_area_copyright", copyright.clone());
     }
 
+    let sc = |key: &str| sidecar_first_track.and_then(|t| t.meta.get(key)).cloned();
+
     AlbumMetadata {
-        album: metadata
-            .album_title()
-            .map(str::to_string)
+        album: sc("ALBUM")
+            .or_else(|| metadata.album_title().map(str::to_string))
             .or_else(|| area.header.description.clone()),
-        album_artist: metadata.album_artist().map(str::to_string),
-        genre: first_genre(metadata),
-        date: format_disc_date(metadata.master_toc.disc_date),
+        album_artist: sc("ARTIST").or_else(|| metadata.album_artist().map(str::to_string)),
+        genre: sc("GENRE").or_else(|| first_genre(metadata)),
+        date: sc("DATE").or_else(|| format_disc_date(metadata.master_toc.disc_date)),
         total_tracks,
         total_discs: if metadata.master_toc.album_set_size > 1 {
             Some(u32::from(metadata.master_toc.album_set_size))
@@ -255,6 +277,7 @@ fn track_metadata(
     area: &AreaInfo,
     requested_area: SacdArea,
     track_number: u32,
+    sidecar: Option<&SidecarTrack>,
 ) -> TrackMetadata {
     let mut extra = BTreeMap::new();
     insert_nonempty(
@@ -309,29 +332,49 @@ fn track_metadata(
         insert_nonempty(&mut extra, "sacd_composer_phonetic", value.clone());
     }
 
+    // Sidecar is primary source for text metadata; TOC is fallback.
+    let sc = |key: &str| sidecar.and_then(|t| t.meta.get(key)).cloned();
+
     TrackMetadata {
-        title: entry.text.title.clone(),
-        artist: entry
-            .text
-            .performer
-            .clone()
+        title: sc("TITLE").or_else(|| entry.text.title.clone()),
+        artist: sc("ARTIST")
+            .or_else(|| entry.text.performer.clone())
             .or_else(|| metadata.album_artist().map(str::to_string)),
-        album_artist: metadata.album_artist().map(str::to_string),
+        album_artist: sc("ARTIST").or_else(|| metadata.album_artist().map(str::to_string)),
         composer: entry.text.composer.clone(),
-        performer: entry.text.performer.clone(),
-        genre: entry
-            .genre
-            .map(genre_to_string)
+        performer: sc("ARTIST").or_else(|| entry.text.performer.clone()),
+        genre: sc("GENRE")
+            .or_else(|| entry.genre.map(genre_to_string))
             .or_else(|| first_genre(metadata)),
-        date: format_disc_date(metadata.master_toc.disc_date),
+        date: sc("DATE").or_else(|| format_disc_date(metadata.master_toc.disc_date)),
         track_number: Some(track_number),
         disc_number: disc_number(metadata),
-        isrc: entry.isrc.clone(),
+        isrc: sc("ISRC").or_else(|| entry.isrc.clone()),
         publisher: None,
         copyright: area.header.copyright.clone(),
         comment: entry.text.message.clone(),
         pre_emphasis: false,
-        extra,
+        extra: {
+            // Preserve TOC ISRC in extra when sidecar overrides it.
+            if let (Some(sidecar_isrc), Some(toc_isrc)) = (sc("ISRC"), &entry.isrc) {
+                if sidecar_isrc != *toc_isrc {
+                    insert_nonempty(&mut extra, "sacd_toc_isrc", toc_isrc.clone());
+                }
+            }
+            // Carry sidecar-only fields into extra.
+            if let Some(sidecar_track) = sidecar {
+                for (key, value) in &sidecar_track.meta {
+                    match key.as_str() {
+                        // Already mapped to top-level fields.
+                        "TITLE" | "ARTIST" | "GENRE" | "DATE" | "ISRC"
+                        | "TRACKNUMBER" | "TOTALTRACKS" => {}
+                        // Preserve everything else (MusicBrainz IDs, etc.).
+                        _ => { insert_nonempty(&mut extra, &key.to_lowercase(), value.clone()); }
+                    }
+                }
+            }
+            extra
+        },
     }
 }
 
@@ -496,4 +539,25 @@ pub(crate) mod test_support {
                 .collect()
         })
     }
+}
+
+/// Load sidecar tracks for the requested area, if a sidecar XML exists.
+/// Returns an empty vec if no sidecar is found or parsing fails.
+fn load_sidecar_tracks(iso: &Path, sacd_area: Option<SacdArea>) -> Vec<SidecarTrack> {
+    let sidecar_path = match find_sidecar_for_iso(iso) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let sidecar = match parse_sidecar(&sidecar_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("SACD sidecar at {} could not be parsed: {:?}", sidecar_path.display(), e);
+            return Vec::new();
+        }
+    };
+    let area_index = match sacd_area.unwrap_or(SacdArea::Stereo) {
+        SacdArea::Stereo => 1_u8,
+        SacdArea::MultiChannel => 2_u8,
+    };
+    sidecar.tracks_for_area(area_index).into_iter().cloned().collect()
 }
