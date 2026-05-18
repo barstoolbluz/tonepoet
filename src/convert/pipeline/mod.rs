@@ -17,12 +17,14 @@ pub mod errors;
 pub mod materializer_7z;
 pub mod materializer_cue;
 pub mod materializer_sacd;
+pub mod progress;
 pub mod reporter;
 pub mod stages;
 pub mod tool;
 pub mod types;
 
 pub use errors::*;
+pub use progress::*;
 pub use reporter::*;
 pub use stages::*;
 pub use tool::*;

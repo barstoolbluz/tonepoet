@@ -25,6 +25,7 @@ use super::errors::{
 use super::materializer_7z::SevenZipMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
+use super::progress::OperationProgressTracker;
 use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
@@ -1233,6 +1234,11 @@ async fn convert_tracks_with_reporter(
     let total_tracks = source.tracks.len();
     let total_expected_samples = total_expected_samples(source);
     let mut completed_expected_samples = 0_u64;
+    let mut progress_tracker = OperationProgressTracker::new(
+        req.item_id.clone(),
+        PipelineStage::Convert,
+        reporter,
+    );
 
     for (track_index, track) in source.tracks.iter().enumerate() {
         let track_number = track_index + 1;
@@ -1243,16 +1249,11 @@ async fn convert_tracks_with_reporter(
             track_index,
             total_tracks,
         );
-        emit_convert_progress(
-            reporter,
-            &req.item_id,
-            start_fraction,
-            convert_track_message("Converting", track_number, total_tracks, track, planned_final_path.as_deref()),
-        )
-        .await;
+        progress_tracker.estimated(start_fraction, convert_track_message("Converting", track_number, total_tracks, track, planned_final_path.as_deref())).await;
 
         if cancel.is_cancelled() {
-            records.push(failed_track_record(
+            progress_tracker.cancel_requested().await;
+records.push(failed_track_record(
                 track,
                 None,
                 None,
@@ -1260,18 +1261,12 @@ async fn convert_tracks_with_reporter(
                 "cancelled".to_string(),
             ));
             completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-            emit_convert_progress(
-                reporter,
-                &req.item_id,
-                convert_progress_fraction(
+            progress_tracker.estimated(convert_progress_fraction(
                     completed_expected_samples,
                     total_expected_samples,
                     track_number,
                     total_tracks,
-                ),
-                convert_track_message("Cancelled before", track_number, total_tracks, track, planned_final_path.as_deref()),
-            )
-            .await;
+                ), convert_track_message("Cancelled before", track_number, total_tracks, track, planned_final_path.as_deref())).await;
             continue;
         }
 
@@ -1284,18 +1279,12 @@ async fn convert_tracks_with_reporter(
                 format!("missing planned output for track {}", track.id.source_ordinal),
             ));
             completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-            emit_convert_progress(
-                reporter,
-                &req.item_id,
-                convert_progress_fraction(
+            progress_tracker.estimated(convert_progress_fraction(
                     completed_expected_samples,
                     total_expected_samples,
                     track_number,
                     total_tracks,
-                ),
-                format!("Track {} of {} failed: missing planned output", track_number, total_tracks),
-            )
-            .await;
+                ), format!("Track {} of {} failed: missing planned output", track_number, total_tracks)).await;
             continue;
         };
 
@@ -1312,18 +1301,12 @@ async fn convert_tracks_with_reporter(
                     error.clone(),
                 ));
                 completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                emit_convert_progress(
-                    reporter,
-                    &req.item_id,
-                    convert_progress_fraction(
+                progress_tracker.estimated(convert_progress_fraction(
                         completed_expected_samples,
                         total_expected_samples,
                         track_number,
                         total_tracks,
-                    ),
-                    convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
-                )
-                .await;
+                    ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
                 continue;
             }
         };
@@ -1339,18 +1322,12 @@ async fn convert_tracks_with_reporter(
                     error.clone(),
                 ));
                 completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                emit_convert_progress(
-                    reporter,
-                    &req.item_id,
-                    convert_progress_fraction(
+                progress_tracker.estimated(convert_progress_fraction(
                         completed_expected_samples,
                         total_expected_samples,
                         track_number,
                         total_tracks,
-                    ),
-                    convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
-                )
-                .await;
+                    ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
                 continue;
             }
         }
@@ -1368,18 +1345,12 @@ async fn convert_tracks_with_reporter(
                     error.clone(),
                 ));
                 completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                emit_convert_progress(
-                    reporter,
-                    &req.item_id,
-                    convert_progress_fraction(
+                progress_tracker.estimated(convert_progress_fraction(
                         completed_expected_samples,
                         total_expected_samples,
                         track_number,
                         total_tracks,
-                    ),
-                    convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
-                )
-                .await;
+                    ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
                 continue;
             }
         };
@@ -1399,18 +1370,12 @@ async fn convert_tracks_with_reporter(
                         error.clone(),
                     ));
                     completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                    emit_convert_progress(
-                        reporter,
-                        &req.item_id,
-                        convert_progress_fraction(
+                    progress_tracker.estimated(convert_progress_fraction(
                             completed_expected_samples,
                             total_expected_samples,
                             track_number,
                             total_tracks,
-                        ),
-                        convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
-                    )
-                    .await;
+                        ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
                     continue;
                 }
                 let record = TrackRecord {
@@ -1432,18 +1397,12 @@ async fn convert_tracks_with_reporter(
                 });
                 records.push(record);
                 completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                emit_convert_progress(
-                    reporter,
-                    &req.item_id,
-                    convert_progress_fraction(
+                progress_tracker.estimated(convert_progress_fraction(
                         completed_expected_samples,
                         total_expected_samples,
                         track_number,
                         total_tracks,
-                    ),
-                    convert_track_message("Finished", track_number, total_tracks, track, Some(&final_path)),
-                )
-                .await;
+                    ), convert_track_message("Finished", track_number, total_tracks, track, Some(&final_path))).await;
             }
             Err(err) => {
                 let error = err.to_string();
@@ -1456,18 +1415,12 @@ async fn convert_tracks_with_reporter(
                     error.clone(),
                 ));
                 completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
-                emit_convert_progress(
-                    reporter,
-                    &req.item_id,
-                    convert_progress_fraction(
+                progress_tracker.estimated(convert_progress_fraction(
                         completed_expected_samples,
                         total_expected_samples,
                         track_number,
                         total_tracks,
-                    ),
-                    convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
-                )
-                .await;
+                    ), convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error)).await;
             }
         }
     }
@@ -1508,24 +1461,6 @@ fn convert_progress_fraction(
         0.0
     } else {
         (completed_tracks as f32 / total_tracks as f32).clamp(0.0, 1.0)
-    }
-}
-
-async fn emit_convert_progress(
-    reporter: Option<&dyn PipelineReporter>,
-    item_id: &str,
-    phase_progress: f32,
-    message: String,
-) {
-    if let Some(reporter) = reporter {
-        reporter
-            .emit(PipelineEvent::Progress {
-                item_id: item_id.to_string(),
-                stage: PipelineStage::Convert,
-                phase_progress: phase_progress.clamp(0.0, 1.0),
-                message: Some(message),
-            })
-            .await;
     }
 }
 
