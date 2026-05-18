@@ -12,6 +12,7 @@
 
 pub mod confidence;
 pub mod elapsed;
+pub mod eta;
 pub mod heartbeat;
 pub mod operation;
 pub mod probes;
@@ -20,6 +21,7 @@ pub mod throttle;
 
 pub use confidence::{ProgressConfidence, ProgressScope};
 pub use elapsed::{append_elapsed, format_elapsed, DEFAULT_ELAPSED_THRESHOLD};
+pub use eta::{append_eta, format_eta_coarse, EtaEstimator};
 pub use heartbeat::{run_with_heartbeat, DEFAULT_HEARTBEAT_INTERVAL};
 pub use operation::OperationProgressTracker;
 pub use streaming::{

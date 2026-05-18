@@ -607,6 +607,40 @@ mod broadcast_reporter_tests {
     }
 
     #[tokio::test]
+    async fn cancelled_terminal_keeps_cancelled_at_message_as_last_processing_update() {
+        let (reporter, mut rx) = reporter_pair();
+        reporter
+            .emit(PipelineEvent::Progress {
+                item_id: "item-1".to_string(),
+                stage: PipelineStage::Convert,
+                phase_progress: 0.37,
+                message: Some("Cancelled at 37%".to_string()),
+            })
+            .await;
+        let progress = next_update(&mut rx).await;
+        let progress_value = progress.progress;
+        match progress.status {
+            crate::convert::ConversionStatus::Processing { message, .. } => {
+                assert_eq!(message.as_deref(), Some("Cancelled at 37%"));
+            }
+            other => panic!("expected processing update, got {other:?}"),
+        }
+
+        reporter
+            .emit(PipelineEvent::Terminal {
+                item_id: "item-1".to_string(),
+                status: crate::convert::ConversionStatus::Cancelled,
+            })
+            .await;
+        let terminal = next_update(&mut rx).await;
+        assert_eq!(terminal.progress, progress_value);
+        assert!(matches!(
+            terminal.status,
+            crate::convert::ConversionStatus::Cancelled
+        ));
+    }
+
+    #[tokio::test]
     async fn partial_terminal_reaches_one_hundred() {
         let (reporter, mut rx) = reporter_pair();
         reporter

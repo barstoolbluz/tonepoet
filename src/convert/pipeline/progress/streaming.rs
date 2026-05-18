@@ -160,14 +160,15 @@ where
     F: FnMut(StreamSource, &str) -> Option<ProbeUpdate>,
 {
     let start = Instant::now();
-
     let mut proc = tokio::process::Command::new(&binary_path);
     proc.args(&cmd.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
     if let Some(ref cwd) = cmd.cwd {
         proc.current_dir(cwd);
     }
+
     for env_var in &cmd.env {
         proc.env(&env_var.key, env_var.value.expose());
     }
@@ -192,6 +193,7 @@ where
 
     let timeout_sleep = time::sleep(cmd.timeout);
     tokio::pin!(timeout_sleep);
+
     let heartbeat_interval = heartbeat
         .as_ref()
         .map(|heartbeat| heartbeat.interval)
@@ -226,7 +228,7 @@ where
             }
             _ = cancel.cancelled() => {
                 if let Some(tracker) = tracker.as_deref_mut() {
-                    tracker.cancel_requested().await;
+                    tracker.cancel_requested_for_tool(cmd.binary.default_name()).await;
                 }
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -239,6 +241,9 @@ where
                     &mut parse_line,
                 )
                 .await;
+                if let Some(tracker) = tracker.as_deref_mut() {
+                    tracker.cancelled_at_last_progress().await;
+                }
                 return Err(ToolRunnerError::Cancelled {
                     command: build_record(&cmd, None, &stdout_tail, &stderr_tail, elapsed),
                 });
@@ -401,11 +406,13 @@ pub fn resolve_binary_with_tool_paths(
     if let Some(path) = tool_paths.get(name) {
         return path.clone();
     }
+
     if binary == ToolBinary::SevenZip {
         if let Some(bin) = crate::detect_7z_binary() {
             return PathBuf::from(bin);
         }
     }
+
     PathBuf::from(name)
 }
 
@@ -421,6 +428,7 @@ where
         let mut reader = BufReader::new(reader);
         let mut tail = TailBuffer::new(TOOL_OUTPUT_TAIL_BYTES);
         let mut line = Vec::new();
+
         loop {
             line.clear();
             match reader.read_until(b'\n', &mut line).await {
@@ -433,6 +441,7 @@ where
                 Err(_) => break,
             }
         }
+
         tail.into_string()
     })
 }
@@ -455,12 +464,14 @@ impl TailBuffer {
             self.bytes.clear();
             return;
         }
+
         if chunk.len() >= self.limit {
             self.bytes.clear();
             self.bytes
                 .extend_from_slice(&chunk[chunk.len().saturating_sub(self.limit)..]);
             return;
         }
+
         self.bytes.extend_from_slice(chunk);
         let overflow = self.bytes.len().saturating_sub(self.limit);
         if overflow > 0 {
@@ -496,6 +507,7 @@ fn map_exit_status(status: std::process::ExitStatus) -> ProcessExit {
     if let Some(code) = status.code() {
         return ProcessExit::Code(code);
     }
+
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -503,6 +515,7 @@ fn map_exit_status(status: std::process::ExitStatus) -> ProcessExit {
             return ProcessExit::Signal(sig);
         }
     }
+
     ProcessExit::Unknown
 }
 
@@ -532,6 +545,16 @@ mod tests {
             .collect()
     }
 
+    fn progress_messages(reporter: &RecordingReporter) -> Vec<String> {
+        progress_events(reporter)
+            .into_iter()
+            .map(|event| match event {
+                PipelineEvent::Progress { message, .. } => message.expect("message"),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn streaming_helper_feeds_probe_updates_through_tracker() {
         let reporter = RecordingReporter::new();
@@ -539,6 +562,7 @@ mod tests {
             OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
         let cmd = sh_command("echo 'time=00:00:01.00' >&2", 5);
         let cancel = CancellationToken::new();
+
         let result = run_streaming_tool_with_probe_at_path(
             PathBuf::from("/bin/sh"),
             cmd,
@@ -558,6 +582,7 @@ mod tests {
             },
         )
         .await;
+
         assert!(result.is_ok());
         assert_eq!(progress_events(&reporter).len(), 1);
     }
@@ -571,6 +596,7 @@ mod tests {
         let seen_for_parser = Arc::clone(&seen);
         let cmd = sh_command("for i in 1 2 3 4 5; do echo progress-$i >&2; done", 5);
         let cancel = CancellationToken::new();
+
         let result = run_streaming_tool_with_probe_at_path(
             PathBuf::from("/bin/sh"),
             cmd,
@@ -592,6 +618,7 @@ mod tests {
             },
         )
         .await;
+
         assert!(result.is_ok());
         assert!(seen.lock().unwrap().iter().any(|line| line == "progress-5"));
         assert_eq!(progress_events(&reporter).len(), 1);
@@ -606,6 +633,7 @@ mod tests {
         let seen_for_parser = Arc::clone(&seen);
         let cmd = sh_command("for i in $(seq 1 96); do echo progress-$i >&2; done", 5);
         let cancel = CancellationToken::new();
+
         let result = run_streaming_tool_with_probe_at_path(
             PathBuf::from("/bin/sh"),
             cmd,
@@ -627,6 +655,7 @@ mod tests {
             },
         )
         .await;
+
         assert!(result.is_ok());
         assert_eq!(*seen.lock().unwrap(), 96);
         assert_eq!(progress_events(&reporter).len(), 1);
@@ -634,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_helper_handles_timeout() {
-        let cmd = sh_command("sleep 60", 1);
+        let cmd = sh_command("exec sleep 5", 3);
         let cancel = CancellationToken::new();
         let err = run_streaming_tool_with_probe_at_path(
             PathBuf::from("/bin/sh"),
@@ -646,18 +675,20 @@ mod tests {
         )
         .await
         .expect_err("should timeout");
+
         assert!(matches!(err, ToolRunnerError::Timeout { .. }));
     }
 
     #[tokio::test]
     async fn streaming_helper_handles_cancellation() {
-        let cmd = sh_command("sleep 60", 30);
+        let cmd = sh_command("exec sleep 5", 10);
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             cancel2.cancel();
         });
+
         let err = run_streaming_tool_with_probe_at_path(
             PathBuf::from("/bin/sh"),
             cmd,
@@ -668,7 +699,79 @@ mod tests {
         )
         .await
         .expect_err("should cancel");
+
         assert!(matches!(err, ToolRunnerError::Cancelled { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancel_during_streaming_tool_emits_tool_specific_message() {
+        let reporter = RecordingReporter::new();
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
+        let cmd = sh_command("exec sleep 5", 10);
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel2.cancel();
+        });
+
+        let err = run_streaming_tool_with_probe_at_path(
+            PathBuf::from("/bin/sh"),
+            cmd,
+            &cancel,
+            Some(&mut tracker),
+            None,
+            |_source, _line| None,
+        )
+        .await
+        .expect_err("should cancel");
+
+        assert!(matches!(err, ToolRunnerError::Cancelled { .. }));
+        assert!(progress_messages(&reporter)
+            .iter()
+            .any(|message| message == "Stopping ffmpeg…"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_preserves_last_known_progress_percentage() {
+        let reporter = RecordingReporter::new();
+        let mut tracker =
+            OperationProgressTracker::new("item-1", PipelineStage::Convert, Some(&reporter));
+        let cmd = sh_command("echo progress >&2; exec sleep 5", 10);
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel2.cancel();
+        });
+
+        let err = run_streaming_tool_with_probe_at_path(
+            PathBuf::from("/bin/sh"),
+            cmd,
+            &cancel,
+            Some(&mut tracker),
+            None,
+            |source, line| {
+                if source == StreamSource::Stderr && line == "progress" {
+                    Some(ProbeUpdate::measured(
+                        0.37,
+                        "ffmpeg-progress".to_string(),
+                        "Encoding · 37%".to_string(),
+                    ))
+                } else {
+                    None
+                }
+            },
+        )
+        .await
+        .expect_err("should cancel");
+
+        assert!(matches!(err, ToolRunnerError::Cancelled { .. }));
+        let messages = progress_messages(&reporter);
+        assert!(messages
+            .iter()
+            .any(|message| message.starts_with("Cancelled at 37%")));
     }
 
     #[test]

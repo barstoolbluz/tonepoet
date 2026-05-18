@@ -1285,10 +1285,17 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     let mut completed_expected_samples = 0_u64;
     let mut progress_tracker =
         OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
+    let mut cancellation_progress_reported = false;
 
     for (track_index, track) in source.tracks.iter().enumerate() {
         let track_number = track_index + 1;
         let planned_final_path = planned.get(&track.id).cloned();
+        progress_tracker.observe_weighted_unit_start(
+            track_number,
+            total_tracks,
+            track.expected_samples,
+            total_expected_samples,
+        );
         let start_fraction = convert_progress_fraction(
             completed_expected_samples,
             total_expected_samples,
@@ -1309,7 +1316,11 @@ async fn convert_tracks_with_reporter_with_tool_paths(
             .await;
 
         if cancel.is_cancelled() {
-            progress_tracker.cancel_requested().await;
+            if !cancellation_progress_reported {
+                progress_tracker.cancel_requested().await;
+                progress_tracker.cancelled_at_last_progress().await;
+                cancellation_progress_reported = true;
+            }
             records.push(failed_track_record(
                 track,
                 None,
@@ -1317,25 +1328,9 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                 Vec::new(),
                 "cancelled".to_string(),
             ));
+            progress_tracker.suppress_eta();
             completed_expected_samples =
                 advance_expected_samples(completed_expected_samples, track);
-            progress_tracker
-                .estimated(
-                    convert_progress_fraction(
-                        completed_expected_samples,
-                        total_expected_samples,
-                        track_number,
-                        total_tracks,
-                    ),
-                    convert_track_message(
-                        "Cancelled before",
-                        track_number,
-                        total_tracks,
-                        track,
-                        planned_final_path.as_deref(),
-                    ),
-                )
-                .await;
             continue;
         }
 
@@ -1350,6 +1345,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                     track.id.source_ordinal
                 ),
             ));
+            progress_tracker.suppress_eta();
             completed_expected_samples =
                 advance_expected_samples(completed_expected_samples, track);
             progress_tracker
@@ -1391,6 +1387,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                     Vec::new(),
                     error.clone(),
                 ));
+                progress_tracker.suppress_eta();
                 completed_expected_samples =
                     advance_expected_samples(completed_expected_samples, track);
                 progress_tracker
@@ -1424,6 +1421,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                     Vec::new(),
                     error.clone(),
                 ));
+                progress_tracker.suppress_eta();
                 completed_expected_samples =
                     advance_expected_samples(completed_expected_samples, track);
                 progress_tracker
@@ -1459,6 +1457,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                     Vec::new(),
                     error.clone(),
                 ));
+                progress_tracker.suppress_eta();
                 completed_expected_samples =
                     advance_expected_samples(completed_expected_samples, track);
                 progress_tracker
@@ -1521,6 +1520,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                         vec![command],
                         error.clone(),
                     ));
+                    progress_tracker.suppress_eta();
                     completed_expected_samples =
                         advance_expected_samples(completed_expected_samples, track);
                     progress_tracker
@@ -1562,6 +1562,12 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                 records.push(record);
                 completed_expected_samples =
                     advance_expected_samples(completed_expected_samples, track);
+                progress_tracker.observe_weighted_unit_finish(
+                    track_number,
+                    total_tracks,
+                    track.expected_samples,
+                    total_expected_samples,
+                );
                 progress_tracker
                     .estimated(
                         convert_progress_fraction(
@@ -1590,6 +1596,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                     commands,
                     error.clone(),
                 ));
+                progress_tracker.suppress_eta();
                 completed_expected_samples =
                     advance_expected_samples(completed_expected_samples, track);
                 progress_tracker
