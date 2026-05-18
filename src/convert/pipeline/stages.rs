@@ -645,11 +645,33 @@ async fn realize_sacd_track(
     let iso = iso.to_path_buf();
     let staging_root = staging.root.clone();
 
-    let output = tokio::task::spawn_blocking(move || {
-        realize_sacd_track_blocking(&iso, track_index, area, &staging_root)
-    })
-    .await
-    .map_err(|err| ConvertError::Realize(format!("SACD extraction task failed: {err}")))??;
+    let output = match progress_tracker {
+        Some(tracker) => {
+            heartbeat::run_with_heartbeat(
+                async {
+                    let iso = iso.clone();
+                    let staging_root = staging_root.clone();
+                    tokio::task::spawn_blocking(move || {
+                        realize_sacd_track_blocking(&iso, track_index, area, &staging_root)
+                    })
+                    .await
+                    .map_err(|err| {
+                        ConvertError::Realize(format!("SACD extraction task failed: {err}"))
+                    })?
+                },
+                tracker,
+                "sacd-extraction",
+                "Extracting DSD audio\u{2026}",
+                Duration::from_secs(5),
+            )
+            .await?
+        }
+        None => tokio::task::spawn_blocking(move || {
+            realize_sacd_track_blocking(&iso, track_index, area, &staging_root)
+        })
+        .await
+        .map_err(|err| ConvertError::Realize(format!("SACD extraction task failed: {err}")))??,
+    };
 
     if cancel.is_cancelled() {
         return Err(ConvertError::Realize("cancelled".to_string()));
@@ -3698,6 +3720,7 @@ fn dsd_to_pcm_command(
     Ok(ToolCommand {
         binary: ToolBinary::Sox,
         args: vec![
+            "-S".into(),
             input.display().to_string(),
             "-b".into(),
             "24".into(),

@@ -15,10 +15,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{MaterializeError, ToolRunnerError};
-use super::progress::{
-    probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker, StreamSource,
-    StreamingHeartbeat,
-};
+use super::progress::{heartbeat, OperationProgressTracker};
 use super::reporter::PipelineReporter;
 use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
@@ -159,7 +156,26 @@ async fn extract_archive(
         timeout: Duration::from_secs(3600), // 1 hour max for large archives
     };
 
-    match runner.run(cmd, cancel).await {
+    let result = match reporter {
+        Some(rpt) => {
+            let mut tracker = OperationProgressTracker::new(
+                req.item_id.clone(),
+                PipelineStage::Materialize,
+                Some(rpt),
+            );
+            heartbeat::run_with_heartbeat(
+                runner.run(cmd, cancel),
+                &mut tracker,
+                "archive-extraction",
+                "Extracting archive\u{2026}",
+                Duration::from_secs(5),
+            )
+            .await
+        }
+        None => runner.run(cmd, cancel).await,
+    };
+
+    match result {
         Ok(_output) => Ok(()),
         Err(ToolRunnerError::Cancelled { .. }) => Err(MaterializeError::Cancelled),
         Err(ToolRunnerError::NonZeroExit { stderr_tail, .. }) => {
