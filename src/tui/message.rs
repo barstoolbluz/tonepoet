@@ -58,6 +58,7 @@ pub enum AppMessage {
     /// A conversion item's progress was updated
     ConversionProgress {
         item_id: String,
+        progress: f32,
         status: crate::convert::ConversionStatus,
     },
     /// All conversions completed

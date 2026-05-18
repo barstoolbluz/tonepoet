@@ -170,7 +170,7 @@ fn check_pending_browse_rename(app: &mut AppState) {
 /// Handle async messages from background tasks
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
-        AppMessage::ConversionProgress { item_id, status } => {
+        AppMessage::ConversionProgress { item_id, progress, status } => {
             // Capture terminal state info BEFORE the status is moved into the item.
             let history_data = match &status {
                 crate::convert::ConversionStatus::Completed { output_path, .. } => {
@@ -185,7 +185,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 _ => None,
             };
 
-            app.manager.update_item_status(&item_id, status, 0.0);
+            app.manager.update_item_status(&item_id, status, progress);
 
             // Save queue + record history on terminal states.
             if let Some((success, output_path, error_msg)) = history_data {

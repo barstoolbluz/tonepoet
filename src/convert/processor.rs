@@ -176,6 +176,18 @@ async fn send_phase_update(
     });
 }
 
+fn terminal_progress_for_status(status: &ConversionStatus, last_known_progress: Option<f32>) -> f32 {
+    match status {
+        ConversionStatus::Processing { progress, .. } => *progress,
+        ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
+        ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
+            last_known_progress.unwrap_or(0.0).clamp(0.0, 100.0)
+        }
+        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => 0.0,
+    }
+}
+
+
 impl ConversionProcessor {
     /// Create a new processor
     pub fn new(config: ProcessorConfig) -> Self {
@@ -265,8 +277,15 @@ impl ConversionProcessor {
             tx
         };
 
+        // Keep a local progress receiver so processor-level final status broadcasts
+        // can preserve last-known progress even when the caller did not pass a
+        // receiver. This does not write progress into the shared queue; it only
+        // records the last broadcast percentage per item.
+        progress_rx = progress_rx.or_else(|| Some(progress_tx.subscribe()));
+
         // Create worker pool
         let mut workers: JoinSet<ConversionResult<(String, ConversionStatus)>> = JoinSet::new();
+        let mut last_progress_by_item: HashMap<String, f32> = HashMap::new();
 
         // Don't spawn local progress handler - let UI handle updates
 
@@ -370,14 +389,9 @@ impl ConversionProcessor {
                 // progress updates via its own broadcast → AppMessage pipeline.
                 // Writing here caused write-lock contention that starved the UI's
                 // try_read(), making the queue list appear empty during conversion.
-                Ok(_update) = async {
-                    if let Some(ref mut rx) = progress_rx {
-                        rx.recv().await
-                    } else {
-                        std::future::pending::<Result<ProgressUpdate, broadcast::error::RecvError>>().await
-                    }
-                }, if progress_rx.is_some() => {
-                    // Intentionally not writing to queue — UI handles this
+                Ok(update) = async { if let Some(ref mut rx) = progress_rx { rx.recv().await } else { std::future::pending::<Result<ProgressUpdate, broadcast::error::RecvError>>().await } }, if progress_rx.is_some() => {
+                    last_progress_by_item.insert(update.item_id.clone(), update.progress);
+                    // Intentionally not writing to queue - UI handles this
                 }
 
                 // Wait for worker completion
@@ -392,10 +406,7 @@ impl ConversionProcessor {
                                     _ => "Other",
                                 });
                             // Broadcast final status to UI so it renders the result
-                            let progress = match &final_status {
-                                ConversionStatus::Completed { .. } => 100.0,
-                                _ => 0.0,
-                            };
+                            let progress = terminal_progress_for_status(&final_status, last_progress_by_item.get(&item_id).copied());
                             let _ = progress_tx.send(ProgressUpdate {
                                 item_id: item_id.clone(),
                                 progress,
@@ -1095,12 +1106,12 @@ async fn run_sacd_pipeline_conversion_item(
     tool_paths: HashMap<String, PathBuf>,
 ) -> ConversionResult<(String, ConversionStatus)> {
     use crate::convert::pipeline::{
-        map_album_outcome, run_pipeline_item, RealToolRunner, RecordingReporter,
+        map_album_outcome, run_pipeline_item, RealToolRunner, BroadcastReporter,
     };
 
     let pipeline_req = pipeline_request_for_sacd_item(item);
     let runner = RealToolRunner::new(tool_paths);
-    let reporter = RecordingReporter::new();
+    let reporter = BroadcastReporter::new(progress_tx.clone(), item.id.clone());
     let cancel = CancellationToken::new();
     let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
 
@@ -1110,11 +1121,7 @@ async fn run_sacd_pipeline_conversion_item(
         report.durable_log.as_deref(),
     );
 
-    let _ = progress_tx.send(ProgressUpdate {
-        item_id: item.id.clone(),
-        progress: 100.0,
-        status: status.clone(),
-    });
+    // Final pipeline status is emitted by BroadcastReporter.
 
     if let ConversionStatus::Failed { error, .. } = &status {
         return Ok((
@@ -1135,11 +1142,11 @@ async fn run_cue_pipeline_conversion_item(
     tool_paths: HashMap<String, PathBuf>,
     fallback_cue_policy: crate::convert::pipeline::CueSidecarPolicy,
 ) -> ConversionResult<(String, ConversionStatus)> {
-    use crate::convert::pipeline::{map_album_outcome, RealToolRunner, RecordingReporter, run_pipeline_item};
+    use crate::convert::pipeline::{map_album_outcome, RealToolRunner, BroadcastReporter, run_pipeline_item};
 
     let pipeline_req = pipeline_request_for_cue_item(item, fallback_cue_policy);
     let runner = RealToolRunner::new(tool_paths);
-    let reporter = RecordingReporter::new();
+    let reporter = BroadcastReporter::new(progress_tx.clone(), item.id.clone());
     let cancel = CancellationToken::new();
     let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
 
@@ -1149,11 +1156,115 @@ async fn run_cue_pipeline_conversion_item(
         report.durable_log.as_deref(),
     );
 
-    let _ = progress_tx.send(ProgressUpdate {
-        item_id: item.id.clone(),
-        progress: 100.0,
-        status: status.clone(),
-    });
+    // Final pipeline status is emitted by BroadcastReporter.
+
+    if let ConversionStatus::Failed { error, .. } = &status {
+        return Ok((
+            item.id.clone(),
+            ConversionStatus::Failed {
+                error: error.clone(),
+                log_path: report.durable_log,
+            },
+        ));
+    }
+
+    Ok((item.id.clone(), status))
+}
+
+
+
+async fn run_sevenzip_pipeline_conversion_item(
+    item: &ConversionItem,
+    progress_tx: broadcast::Sender<ProgressUpdate>,
+    tool_paths: HashMap<String, PathBuf>,
+) -> ConversionResult<(String, ConversionStatus)> {
+    use crate::convert::pipeline::{
+        map_album_outcome, run_pipeline_item, BroadcastReporter, CueSidecarPolicy,
+        DitherPolicy, EncodeBackend, EncodeOptions, FailurePolicy, LogPolicy,
+        NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest,
+        PublishPolicy, RealToolRunner, SecretString, SourceOptions, StagePolicy,
+        StageRequirement, TrackSelection,
+    };
+
+    let pipeline_req = if let Some(req) = item.pipeline_request.clone() {
+        req
+    } else {
+        let output_root = item
+            .options
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| item.input_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        PipelineRequest {
+            job_id: format!("job-{}", item.id),
+            item_id: item.id.clone(),
+            container: item.input_path.clone(),
+            source: SourceOptions {
+                archive_password: item
+                    .archive_password
+                    .as_ref()
+                    .map(|password| SecretString::new(password.clone())),
+                sacd_area: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            target_format: item.output_format,
+            encode: EncodeOptions {
+                backend: EncodeBackend::Auto,
+                bitrate: match &item.options.quality {
+                    crate::convert::formats::QualitySettings::Opus { bitrate, .. } => Some(*bitrate),
+                    crate::convert::formats::QualitySettings::Aac { bitrate, .. } => Some(*bitrate),
+                    crate::convert::formats::QualitySettings::Mp3 { bitrate_mode, .. } => match bitrate_mode {
+                        crate::convert::formats::Mp3BitrateMode::Cbr { bitrate }
+                        | crate::convert::formats::Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
+                        crate::convert::formats::Mp3BitrateMode::Vbr { quality } => Some(*quality as u32),
+                    },
+                    _ => None,
+                },
+                compression_level: match &item.options.quality {
+                    crate::convert::formats::QualitySettings::Flac { compression_level } => {
+                        Some(*compression_level)
+                    }
+                    _ => None,
+                },
+                dither: DitherPolicy::Auto,
+            },
+            merge: item.options.merge_to_single,
+            output_root: output_root.clone(),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+            },
+            log: LogPolicy {
+                root: output_root.join(".tonepoet-logs"),
+                write_for_blocked: true,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: if item.options.calculate_replaygain {
+                    StageRequirement::Enabled
+                } else {
+                    StageRequirement::Disabled
+                },
+                features: StageRequirement::Enabled,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        }
+    };
+
+    let runner = RealToolRunner::new(tool_paths);
+    let reporter = BroadcastReporter::new(progress_tx, item.id.clone());
+    let cancel = CancellationToken::new();
+    let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
+    let status = map_album_outcome(
+        &report.outcome,
+        report.published.as_ref(),
+        report.durable_log.as_deref(),
+    );
 
     if let ConversionStatus::Failed { error, .. } = &status {
         return Ok((
@@ -1196,6 +1307,50 @@ pub async fn process_item(
         },
     });
     
+
+    // Route staged pipeline jobs before legacy 10%/25% setup updates.
+    // The staged reporter owns the full 0-100 stage-window model, so sending
+    // legacy setup updates first would make the user-visible stream regress.
+    if let Ok(true) = sacd_pipeline_candidate_for_item(&item) {
+        return run_sacd_pipeline_conversion_item(
+            &item,
+            progress_tx.clone(),
+            tool_paths.clone(),
+        )
+        .await;
+    }
+
+    match cue_pipeline_policy_for_item(&item) {
+        Ok(Some(policy)) => {
+            return run_cue_pipeline_conversion_item(
+                &item,
+                progress_tx.clone(),
+                tool_paths.clone(),
+                policy,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Ok((
+                item.id.clone(),
+                ConversionStatus::Failed {
+                    error: format!("CUE source detection failed: {err}"),
+                    log_path: None,
+                },
+            ));
+        }
+    }
+
+    if matches!(item.input_format, crate::convert::FileFormat::SevenZip) {
+        return run_sevenzip_pipeline_conversion_item(
+            &item,
+            progress_tx.clone(),
+            tool_paths.clone(),
+        )
+        .await;
+    }
+
     // Determine output path - 10%
     let output_path = determine_output_path(&item)?;
     item.output_path = Some(output_path.clone());
@@ -1285,7 +1440,7 @@ pub async fn process_item(
         crate::convert::FileFormat::SevenZip => {
             // Route 7z archives through the new staged pipeline.
             use crate::convert::pipeline::{
-                RealToolRunner, RecordingReporter, PipelineRequest, SourceOptions,
+                RealToolRunner, BroadcastReporter, PipelineRequest, SourceOptions,
                 EncodeOptions, EncodeBackend, DitherPolicy, NamingPolicy,
                 NamingCollisionPolicy, PublishPolicy, OverwritePolicy, LogPolicy,
                 StagePolicy, StageRequirement, FailurePolicy, SecretString,
@@ -1361,7 +1516,7 @@ pub async fn process_item(
             }};
 
             let runner = RealToolRunner::new(tool_paths);
-            let reporter = RecordingReporter::new();
+            let reporter = BroadcastReporter::new(progress_tx.clone(), item.id.clone());
             let cancel = CancellationToken::new();
 
             let report = run_pipeline_item(pipeline_req, &runner, &reporter, &cancel).await;
@@ -1386,11 +1541,7 @@ pub async fn process_item(
             }
 
             // Send completion progress.
-            let _ = progress_tx.send(ProgressUpdate {
-                item_id: item.id.clone(),
-                progress: 100.0,
-                status: status.clone(),
-            });
+            // Final pipeline status is emitted by BroadcastReporter.
 
             return Ok((item.id.clone(), status));
         }

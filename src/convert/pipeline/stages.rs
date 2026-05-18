@@ -1180,6 +1180,7 @@ pub fn plan_outputs(
 
 /// Convert every planned track. Per-track failures are represented in
 /// `TrackRecord`s; successful artifacts only contain tracks that encoded.
+
 pub async fn convert_tracks(
     source: &PreparedSource,
     plan: &AlbumPlan,
@@ -1188,14 +1189,25 @@ pub async fn convert_tracks(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> ConvertStageResult {
+    convert_tracks_with_reporter(source, plan, req, staging, runner, cancel, None).await
+}
+
+async fn convert_tracks_with_reporter(
+    source: &PreparedSource,
+    plan: &AlbumPlan,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    reporter: Option<&dyn PipelineReporter>,
+) -> ConvertStageResult {
     let mut records = Vec::with_capacity(source.tracks.len());
     let mut artifacts = Vec::new();
-    let planned: BTreeMap<TrackId, PathBuf> = plan
+    let planned: BTreeMap<_, _> = plan
         .entries
         .iter()
         .map(|entry| (entry.track_id.clone(), entry.final_path.clone()))
         .collect();
-
     let convert_root = staging.root.join("converted");
     if let Err(err) = fs::create_dir_all(&convert_root) {
         let error = format!("could not create conversion staging directory: {err}");
@@ -1218,7 +1230,27 @@ pub async fn convert_tracks(
         };
     }
 
-    for track in &source.tracks {
+    let total_tracks = source.tracks.len();
+    let total_expected_samples = total_expected_samples(source);
+    let mut completed_expected_samples = 0_u64;
+
+    for (track_index, track) in source.tracks.iter().enumerate() {
+        let track_number = track_index + 1;
+        let planned_final_path = planned.get(&track.id).cloned();
+        let start_fraction = convert_progress_fraction(
+            completed_expected_samples,
+            total_expected_samples,
+            track_index,
+            total_tracks,
+        );
+        emit_convert_progress(
+            reporter,
+            &req.item_id,
+            start_fraction,
+            convert_track_message("Converting", track_number, total_tracks, track, planned_final_path.as_deref()),
+        )
+        .await;
+
         if cancel.is_cancelled() {
             records.push(failed_track_record(
                 track,
@@ -1227,10 +1259,23 @@ pub async fn convert_tracks(
                 Vec::new(),
                 "cancelled".to_string(),
             ));
+            completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
+            emit_convert_progress(
+                reporter,
+                &req.item_id,
+                convert_progress_fraction(
+                    completed_expected_samples,
+                    total_expected_samples,
+                    track_number,
+                    total_tracks,
+                ),
+                convert_track_message("Cancelled before", track_number, total_tracks, track, planned_final_path.as_deref()),
+            )
+            .await;
             continue;
         }
 
-        let Some(final_path) = planned.get(&track.id).cloned() else {
+        let Some(final_path) = planned_final_path else {
             records.push(failed_track_record(
                 track,
                 None,
@@ -1238,6 +1283,19 @@ pub async fn convert_tracks(
                 Vec::new(),
                 format!("missing planned output for track {}", track.id.source_ordinal),
             ));
+            completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
+            emit_convert_progress(
+                reporter,
+                &req.item_id,
+                convert_progress_fraction(
+                    completed_expected_samples,
+                    total_expected_samples,
+                    track_number,
+                    total_tracks,
+                ),
+                format!("Track {} of {} failed: missing planned output", track_number, total_tracks),
+            )
+            .await;
             continue;
         };
 
@@ -1245,26 +1303,54 @@ pub async fn convert_tracks(
         let realized_input = match realize_track(&track.source_ref, req, staging, runner, cancel).await {
             Ok(path) => path,
             Err(err) => {
+                let error = err.to_string();
                 records.push(failed_track_record(
                     track,
                     None,
                     Some(staged_path.clone()),
                     Vec::new(),
-                    err.to_string(),
+                    error.clone(),
                 ));
+                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
+                emit_convert_progress(
+                    reporter,
+                    &req.item_id,
+                    convert_progress_fraction(
+                        completed_expected_samples,
+                        total_expected_samples,
+                        track_number,
+                        total_tracks,
+                    ),
+                    convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
+                )
+                .await;
                 continue;
             }
         };
 
         if let Some(parent) = staged_path.parent() {
             if let Err(err) = fs::create_dir_all(parent) {
+                let error = format!("could not create output directory: {err}");
                 records.push(failed_track_record(
                     track,
                     Some(realized_input.clone()),
                     Some(staged_path.clone()),
                     Vec::new(),
-                    format!("could not create output directory: {err}"),
+                    error.clone(),
                 ));
+                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
+                emit_convert_progress(
+                    reporter,
+                    &req.item_id,
+                    convert_progress_fraction(
+                        completed_expected_samples,
+                        total_expected_samples,
+                        track_number,
+                        total_tracks,
+                    ),
+                    convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
+                )
+                .await;
                 continue;
             }
         }
@@ -1273,32 +1359,60 @@ pub async fn convert_tracks(
         let cmd = match encode_command(&realized_input, &staged_path, req, track.sample_rate) {
             Ok(cmd) => cmd,
             Err(err) => {
+                let error = err.to_string();
                 records.push(failed_track_record(
                     track,
                     Some(realized_input),
                     Some(staged_path),
                     Vec::new(),
-                    err.to_string(),
+                    error.clone(),
                 ));
+                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
+                emit_convert_progress(
+                    reporter,
+                    &req.item_id,
+                    convert_progress_fraction(
+                        completed_expected_samples,
+                        total_expected_samples,
+                        track_number,
+                        total_tracks,
+                    ),
+                    convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
+                )
+                .await;
                 continue;
             }
         };
+
         let output = runner.run(cmd, cancel).await;
         match output {
             Ok(tool_output) => {
                 let command = tool_output.command.clone();
                 let bytes_out = file_len(&staged_path);
                 if bytes_out.unwrap_or(0) == 0 {
+                    let error = format!("encoder did not produce output: {}", staged_path.display());
                     records.push(failed_track_record(
                         track,
                         Some(realized_input),
                         Some(staged_path.clone()),
                         vec![command],
-                        format!("encoder did not produce output: {}", staged_path.display()),
+                        error.clone(),
                     ));
+                    completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
+                    emit_convert_progress(
+                        reporter,
+                        &req.item_id,
+                        convert_progress_fraction(
+                            completed_expected_samples,
+                            total_expected_samples,
+                            track_number,
+                            total_tracks,
+                        ),
+                        convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
+                    )
+                    .await;
                     continue;
                 }
-
                 let record = TrackRecord {
                     track_id: track.id.clone(),
                     outcome: TrackOutcome::Ok,
@@ -1313,20 +1427,47 @@ pub async fn convert_tracks(
                 artifacts.push(TrackArtifact {
                     track_id: track.id.clone(),
                     staged_path,
-                    final_path,
+                    final_path: final_path.clone(),
                     samples: track.expected_samples,
                 });
                 records.push(record);
+                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
+                emit_convert_progress(
+                    reporter,
+                    &req.item_id,
+                    convert_progress_fraction(
+                        completed_expected_samples,
+                        total_expected_samples,
+                        track_number,
+                        total_tracks,
+                    ),
+                    convert_track_message("Finished", track_number, total_tracks, track, Some(&final_path)),
+                )
+                .await;
             }
             Err(err) => {
+                let error = err.to_string();
                 let commands = command_from_tool_error(&err).into_iter().collect();
                 records.push(failed_track_record(
                     track,
                     Some(realized_input),
                     Some(staged_path),
                     commands,
-                    err.to_string(),
+                    error.clone(),
                 ));
+                completed_expected_samples = advance_expected_samples(completed_expected_samples, track);
+                emit_convert_progress(
+                    reporter,
+                    &req.item_id,
+                    convert_progress_fraction(
+                        completed_expected_samples,
+                        total_expected_samples,
+                        track_number,
+                        total_tracks,
+                    ),
+                    convert_track_failure_message(track_number, total_tracks, track, Some(&final_path), &error),
+                )
+                .await;
             }
         }
     }
@@ -1340,6 +1481,101 @@ pub async fn convert_tracks(
         record: stage_record(PipelineStage::Convert, StageOutcome::Ok),
     }
 }
+
+fn total_expected_samples(source: &PreparedSource) -> Option<u64> {
+    let mut total = 0_u64;
+    for track in &source.tracks {
+        let samples = track.expected_samples?;
+        total = total.saturating_add(samples);
+    }
+    if total == 0 { None } else { Some(total) }
+}
+
+fn advance_expected_samples(completed: u64, track: &PreparedTrack) -> u64 {
+    completed.saturating_add(track.expected_samples.unwrap_or(0))
+}
+
+fn convert_progress_fraction(
+    completed_expected_samples: u64,
+    total_expected_samples: Option<u64>,
+    completed_tracks: usize,
+    total_tracks: usize,
+) -> f32 {
+    if let Some(total) = total_expected_samples.filter(|total| *total > 0) {
+        return (completed_expected_samples as f32 / total as f32).clamp(0.0, 1.0);
+    }
+    if total_tracks == 0 {
+        0.0
+    } else {
+        (completed_tracks as f32 / total_tracks as f32).clamp(0.0, 1.0)
+    }
+}
+
+async fn emit_convert_progress(
+    reporter: Option<&dyn PipelineReporter>,
+    item_id: &str,
+    phase_progress: f32,
+    message: String,
+) {
+    if let Some(reporter) = reporter {
+        reporter
+            .emit(PipelineEvent::Progress {
+                item_id: item_id.to_string(),
+                stage: PipelineStage::Convert,
+                phase_progress: phase_progress.clamp(0.0, 1.0),
+                message: Some(message),
+            })
+            .await;
+    }
+}
+
+fn convert_track_message(
+    action: &str,
+    track_number: usize,
+    total_tracks: usize,
+    track: &PreparedTrack,
+    final_path: Option<&Path>,
+) -> String {
+    format!(
+        "{} track {} of {}: {}",
+        action,
+        track_number,
+        total_tracks,
+        progress_track_label(track, final_path)
+    )
+}
+
+fn convert_track_failure_message(
+    track_number: usize,
+    total_tracks: usize,
+    track: &PreparedTrack,
+    final_path: Option<&Path>,
+    error: &str,
+) -> String {
+    format!(
+        "Track {} of {} failed: {} ({})",
+        track_number,
+        total_tracks,
+        progress_track_label(track, final_path),
+        error
+    )
+}
+
+fn progress_track_label(track: &PreparedTrack, final_path: Option<&Path>) -> String {
+    if let Some(title) = track.metadata.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return title.to_string();
+    }
+    if let Some(stem) = final_path
+        .and_then(|path| path.file_stem())
+        .and_then(|stem| stem.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return stem.to_string();
+    }
+    format!("Track {:02}", track.id.track_number)
+}
+
 
 /// Merge per-track audio artifacts into a single file using ffmpeg's
 /// concat demuxer (`-c copy`, no re-encoding). Skipped when
@@ -3526,3 +3762,22 @@ fn failed_tracks_from(outcome: &AlbumOutcome) -> Vec<TrackRecord> {
         }
     }
 }
+
+#[cfg(test)]
+mod rich_progress_stage_tests {
+    use super::*;
+
+    #[test]
+    fn item_count_progress_is_used_when_sample_metadata_is_missing() {
+        assert_eq!(convert_progress_fraction(0, None, 0, 4), 0.0);
+        assert_eq!(convert_progress_fraction(0, None, 2, 4), 0.5);
+        assert_eq!(convert_progress_fraction(0, None, 4, 4), 1.0);
+    }
+
+    #[test]
+    fn sample_weighted_progress_prefers_samples_when_available() {
+        assert_eq!(convert_progress_fraction(250, Some(1_000), 1, 2), 0.25);
+        assert_eq!(convert_progress_fraction(750, Some(1_000), 1, 2), 0.75);
+    }
+}
+

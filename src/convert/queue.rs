@@ -236,6 +236,17 @@ impl ConversionItem {
     }
 }
 
+
+
+fn status_progress(status: &ConversionStatus) -> f32 {
+    match status {
+        ConversionStatus::Processing { progress, .. } => *progress,
+        ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
+        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => 0.0,
+        ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => 0.0,
+    }
+}
+
 /// Manages the queue of files to be converted
 pub struct ConversionQueue {
     /// Items waiting to be processed
