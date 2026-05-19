@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
@@ -425,18 +425,45 @@ where
     R: AsyncRead + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
-        let mut reader = BufReader::new(reader);
+        let mut reader = reader;
         let mut tail = TailBuffer::new(TOOL_OUTPUT_TAIL_BYTES);
-        let mut line = Vec::new();
+        let mut line_buf = Vec::new();
+        let mut chunk = [0u8; 4096];
 
+        // Read in small chunks and split on both '\r' and '\n'. Sox -S uses
+        // '\r' exclusively for progress updates (no '\n' until exit), so
+        // read_until(b'\n') would buffer all progress lines until EOF.
+        // Reading raw chunks and scanning for either delimiter ensures
+        // progress probes see updates in real time.
         loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    tail.push(&line);
-                    let text = String::from_utf8_lossy(&line).trim_end().to_string();
-                    let _ = line_tx.send(StreamLine { source, line: text }).await;
+            match reader.read(&mut chunk).await {
+                Ok(0) => {
+                    // EOF — flush any remaining partial line
+                    if !line_buf.is_empty() {
+                        tail.push(&line_buf);
+                        let text = String::from_utf8_lossy(&line_buf).to_string();
+                        if !text.is_empty() {
+                            let _ = line_tx.send(StreamLine { source, line: text }).await;
+                        }
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    for &byte in &chunk[..n] {
+                        if byte == b'\r' || byte == b'\n' {
+                            if !line_buf.is_empty() {
+                                tail.push(&line_buf);
+                                let text = String::from_utf8_lossy(&line_buf).to_string();
+                                if !text.is_empty() {
+                                    let _ =
+                                        line_tx.send(StreamLine { source, line: text }).await;
+                                }
+                                line_buf.clear();
+                            }
+                        } else {
+                            line_buf.push(byte);
+                        }
+                    }
                 }
                 Err(_) => break,
             }

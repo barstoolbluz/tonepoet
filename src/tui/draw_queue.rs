@@ -48,30 +48,51 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         return;
     }
 
-    // Track visible height for scrolling
-    app.visible_height = inner.height as usize;
-
     let items = &app.items_snapshot;
     let start = app.scroll_offset;
-    let end = (start + inner.height as usize).min(items.len());
+    let mut y = inner.y;
+    let mut visible_count = 0_usize;
 
-    for (i, idx) in (start..end).enumerate() {
+    for idx in start..items.len() {
+        if y >= inner.y + inner.height {
+            break;
+        }
         let item = &items[idx];
-        let y = inner.y + i as u16;
         let item_area = Rect::new(inner.x, y, inner.width, 1);
 
         let is_hovered = app.hover_target == Some(TuiButton::QueueItem(idx));
-        draw_queue_item(
-            f,
-            item_area,
-            item,
-            idx == app.selected_index,
-            is_hovered,
-            app,
-        );
+        draw_queue_item(f, item_area, item, idx == app.selected_index, is_hovered, app);
         app.button_map
             .record_button(TuiButton::QueueItem(idx), item_area);
+        y += 1;
+        visible_count += 1;
+
+        // Render detail line for items with extra context
+        let detail_line: Option<(String, Color)> = match &item.status {
+            ConversionStatus::Processing {
+                message: Some(msg),
+                phase,
+                ..
+            } if !msg.is_empty() => Some((msg.clone(), phase_color(phase.as_ref()))),
+            ConversionStatus::Failed { error, .. } if !error.is_empty() => {
+                Some((error.clone(), Color::Red))
+            }
+            _ => None,
+        };
+        if let Some((text, color)) = detail_line {
+            if y < inner.y + inner.height {
+                let detail_area = Rect::new(inner.x, y, inner.width, 1);
+                let detail = Paragraph::new(Line::from(vec![
+                    Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(text, Style::default().fg(color)),
+                ]));
+                f.render_widget(detail, detail_area);
+                y += 1;
+            }
+        }
     }
+
+    app.visible_height = visible_count;
 }
 
 /// Draw a single queue item on one line
@@ -109,7 +130,9 @@ fn draw_queue_item(
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    let max_name_len = (area.width as usize).saturating_sub(40).max(8);
+    let name_budget = (area.width as usize).saturating_sub(40);
+    let shift = (area.width as usize) / 10; // give ~10% more to status/progress
+    let max_name_len = name_budget.saturating_sub(shift).max(8);
     let display_name: String = if name.len() > max_name_len && max_name_len > 3 {
         let truncate_at = max_name_len - 3;
         // Truncate by chars to avoid splitting multi-byte characters
@@ -159,30 +182,25 @@ fn draw_queue_item(
 
     // For processing items, draw a progress bar overlay if we have enough width
     if let ConversionStatus::Processing {
-        progress,
-        message,
         phase,
+        phase_progress,
         ..
     } = &item.status
     {
         let progress_width = area.width.saturating_sub(max_name_len as u16 + 12);
         if progress_width > 10 {
-            let overall = *progress;
-            let label = match message.as_deref() {
-                Some(msg) => format!("{:.0}% {}", overall, msg),
-                None => {
-                    let phase_label = phase
-                        .as_ref()
-                        .map(|p| p.short_name())
-                        .unwrap_or("Processing");
-                    format!("{:.0}% {}", overall, phase_label)
-                }
-            };
+            let pct_value = phase_progress.unwrap_or(0.0);
+            let phase_label = phase
+                .as_ref()
+                .map(|p| p.short_name())
+                .unwrap_or("Processing");
+            let label = format!("{:.0}% {}", pct_value, phase_label);
 
-            let gauge_area = Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
+            let gauge_area =
+                Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
 
             let color = phase_color(phase.as_ref());
-            let pct = (overall / 100.0).clamp(0.0, 1.0);
+            let pct = (pct_value / 100.0).clamp(0.0, 1.0);
             let gauge = Gauge::default()
                 .gauge_style(Style::default().fg(color).bg(Color::Rgb(40, 40, 40)))
                 .ratio(pct as f64)
@@ -207,24 +225,18 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             Style::default(),
         ),
         ConversionStatus::Processing {
-            progress,
-            message,
             phase,
+            phase_progress,
             ..
         } => {
-            let text = match message.as_deref() {
-                Some(msg) => format!("{:.0}% {}", progress, msg),
-                None => {
-                    let phase_name = phase
-                        .as_ref()
-                        .map(|p| p.short_name())
-                        .unwrap_or("Processing");
-                    format!("{:.0}% {}", progress, phase_name)
-                }
-            };
+            let pct = phase_progress.unwrap_or(0.0);
+            let phase_name = phase
+                .as_ref()
+                .map(|p| p.short_name())
+                .unwrap_or("Processing");
             (
                 vec![Span::styled(
-                    text,
+                    format!("{:.0}% {}", pct, phase_name),
                     Style::default().fg(phase_color(phase.as_ref())),
                 )],
                 Style::default(),
@@ -243,21 +255,10 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             )],
             Style::default(),
         ),
-        ConversionStatus::Failed { error, .. } => {
-            let short_err: String = if error.len() > 30 {
-                let truncated: String = error.chars().take(27).collect();
-                format!("{}...", truncated)
-            } else {
-                error.clone()
-            };
-            (
-                vec![
-                    Span::styled("Failed: ", Style::default().fg(Color::Red)),
-                    Span::styled(short_err, Style::default().fg(Color::Red)),
-                ],
-                Style::default(),
-            )
-        }
+        ConversionStatus::Failed { .. } => (
+            vec![Span::styled("Failed", Style::default().fg(Color::Red))],
+            Style::default(),
+        ),
         ConversionStatus::Paused => (
             vec![Span::styled("Paused", Style::default().fg(Color::Yellow))],
             Style::default(),
