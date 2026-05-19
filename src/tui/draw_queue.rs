@@ -61,7 +61,14 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         let item_area = Rect::new(inner.x, y, inner.width, 1);
 
         let is_hovered = app.hover_target == Some(TuiButton::QueueItem(idx));
-        draw_queue_item(f, item_area, item, idx == app.selected_index, is_hovered, app);
+        draw_queue_item(
+            f,
+            item_area,
+            item,
+            idx == app.selected_index,
+            is_hovered,
+            app,
+        );
         app.button_map
             .record_button(TuiButton::QueueItem(idx), item_area);
         y += 1;
@@ -74,6 +81,35 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 phase,
                 ..
             } if !msg.is_empty() => Some((msg.clone(), phase_color(phase.as_ref()))),
+            ConversionStatus::Completed { output_path, .. } => {
+                let path = output_path.display().to_string();
+                if !path.is_empty() {
+                    Some((path, Color::Green))
+                } else {
+                    None
+                }
+            }
+            ConversionStatus::Partial {
+                output_path,
+                successful,
+                failed,
+                ..
+            } => {
+                let path = output_path.display().to_string();
+                if !path.is_empty() {
+                    Some((
+                        format!(
+                            "{}/{} ok \u{2192} {}",
+                            successful,
+                            successful + failed,
+                            path
+                        ),
+                        Color::Yellow,
+                    ))
+                } else {
+                    None
+                }
+            }
             ConversionStatus::Failed { error, .. } if !error.is_empty() => {
                 Some((error.clone(), Color::Red))
             }
@@ -196,8 +232,7 @@ fn draw_queue_item(
                 .unwrap_or("Processing");
             let label = format!("{:.0}% {}", pct_value, phase_label);
 
-            let gauge_area =
-                Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
+            let gauge_area = Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
 
             let color = phase_color(phase.as_ref());
             let pct = (pct_value / 100.0).clamp(0.0, 1.0);

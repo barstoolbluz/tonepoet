@@ -1140,7 +1140,6 @@ fn pipeline_request_for_sacd_item(
             .unwrap_or(Path::new("."))
             .to_path_buf()
     });
-
     PipelineRequest {
         job_id: format!("job-{}", item.id),
         item_id: item.id.clone(),
