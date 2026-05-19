@@ -207,6 +207,28 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     tokio::spawn(async move {
         let mut processor = crate::convert::ConversionProcessor::new(processor_config);
 
+        // Bridge progress broadcasts to the TUI event loop.
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::broadcast::channel::<crate::convert::ProgressUpdate>(256);
+        processor.set_progress_channel(progress_tx);
+
+        let ui_tx = tx_clone.clone();
+        let progress_forwarder = tokio::spawn(async move {
+            loop {
+                match progress_rx.recv().await {
+                    Ok(update) => {
+                        let _ = ui_tx.try_send(AppMessage::ConversionProgress {
+                            item_id: update.item_id,
+                            progress: update.progress,
+                            status: update.status,
+                        });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
         if let Err(e) = processor
             .process_queue_with_progress(queue.clone(), None)
             .await
@@ -217,6 +239,11 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
                 })
                 .await;
         }
+
+        // Processor finished — drop it so its broadcast sender closes,
+        // which causes the forwarder to exit.
+        drop(processor);
+        let _ = progress_forwarder.await;
 
         if let Ok(q) = queue.try_read() {
             let completed = q
