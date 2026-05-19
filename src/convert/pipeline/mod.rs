@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod errors;
+pub mod label_resolver;
 pub mod materializer_7z;
 pub mod materializer_cue;
 pub mod materializer_sacd;
@@ -24,6 +25,7 @@ pub mod tool;
 pub mod types;
 
 pub use errors::*;
+pub use label_resolver::*;
 pub use progress::*;
 pub use reporter::*;
 pub use stages::*;
@@ -1069,7 +1071,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let source = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1132,7 +1141,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let _source = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1161,7 +1177,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap_err();
 
@@ -1191,7 +1214,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap_err();
 
@@ -1214,7 +1244,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap_err();
 
@@ -1279,7 +1316,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let source = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1340,7 +1384,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let source = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1390,7 +1441,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let source = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1432,7 +1490,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let source = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1472,7 +1537,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, MaterializeError::InvalidTrackSelection(_)));
@@ -1509,7 +1581,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, MaterializeError::InvalidTrackSelection(_)));
@@ -1539,7 +1618,14 @@ mod tests {
         let req = mat_request(PathBuf::from("/fake/archive.7z"), None);
         let mat = SevenZipMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, MaterializeError::Cancelled));
@@ -1568,7 +1654,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mat = SevenZipMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &cancel)
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &cancel,
+            )
             .await
             .unwrap_err();
 
@@ -2293,9 +2386,16 @@ FILE "{}" WAVE
         ));
 
         let mat = super::materializer_cue::CueImageMaterializer;
-        mat.materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
-            .await
-            .unwrap()
+        mat.materialize(
+            &req,
+            &staging,
+            &runner,
+            None,
+            &std::collections::HashMap::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2417,7 +2517,14 @@ FILE "{}" WAVE
         let runner = StubToolRunner::new();
         let mat = super::materializer_cue::CueImageMaterializer;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &CancellationToken::new(),
+            )
             .await
             .expect_err("malformed same-stem sidecar should fail in materialization");
         assert!(matches!(err, MaterializeError::Parse(_)));
@@ -2440,14 +2547,28 @@ FILE "{}" WAVE
 
         req.source.cue_sidecar = CueSidecarPolicy::SidecarOnly;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &CancellationToken::new(),
+            )
             .await
             .expect_err("missing sidecar should fail");
         assert!(matches!(err, MaterializeError::Parse(_)));
 
         req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
         let err = mat
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &CancellationToken::new(),
+            )
             .await
             .expect_err("IgnoreCue must not materialize");
         assert!(matches!(err, MaterializeError::Parse(_)));
@@ -2526,9 +2647,16 @@ FILE "{}" WAVE
         let staging = StagingDir::new(tmp.path().join("stage"), "job-realize".to_string());
         let runner = CaptureFfmpegCutRunner::new();
 
-        let out = realize_track(&src, &req, &staging, &runner, &CancellationToken::new(), None)
-            .await
-            .expect("realization should succeed");
+        let out = realize_track(
+            &src,
+            &req,
+            &staging,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("realization should succeed");
         assert!(out.exists());
 
         let args = runner.ffmpeg_args();
@@ -2673,9 +2801,16 @@ FILE "{}" WAVE
         let staging = StagingDir::new(tmp.path().join("stage"), "job-realize".to_string());
         let runner = FailingWavpackFallbackRunner::new();
 
-        let err = realize_track(&src, &req, &staging, &runner, &CancellationToken::new(), None)
-            .await
-            .expect_err("fallback cut should fail");
+        let err = realize_track(
+            &src,
+            &req,
+            &staging,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("fallback cut should fail");
         assert!(matches!(err, ConvertError::Tool(_)));
 
         let segment_dir = staging.root.join("realized-image-segments");
@@ -2714,9 +2849,16 @@ FILE "{}" WAVE
                 start_sample,
                 samples: 44_100,
             };
-            let out = realize_track(&src, &req, &staging, &runner, &CancellationToken::new(), None)
-                .await
-                .expect("fallback realization should succeed");
+            let out = realize_track(
+                &src,
+                &req,
+                &staging,
+                &runner,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("fallback realization should succeed");
             assert!(out.exists());
         }
 
@@ -2874,7 +3016,14 @@ FILE "{image_name}" WAVE
         let staging = StagingDir::new(tmp_root.join("stage"), "job-real-corpus".to_string());
         let runner = RealToolRunner::new(std::collections::HashMap::new());
         super::materializer_cue::CueImageMaterializer
-            .materialize(&req, &staging, &runner, None, &std::collections::HashMap::new(), &CancellationToken::new())
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &std::collections::HashMap::new(),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap()
     }
@@ -3080,9 +3229,16 @@ FILE "{image_name}" WAVE
             start_sample: 44_100,
             samples: 44_100,
         };
-        let realized = realize_track(&src, &req, &staging, &runner, &CancellationToken::new(), None)
-            .await
-            .expect("segment realization should succeed");
+        let realized = realize_track(
+            &src,
+            &req,
+            &staging,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("segment realization should succeed");
 
         let source_pcm = pr8_decode_pcm_s16le(&flac);
         let realized_pcm = pr8_decode_pcm_s16le(&realized);

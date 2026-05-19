@@ -2917,6 +2917,16 @@ pub async fn run_pipeline_item_with_tool_paths(
         return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
     }
 
+    // Enrich album metadata with label/pressing info before planning.
+    // Tag-sourced values take priority; the resolver only fills gaps.
+    if let Some(ref mut src) = source {
+        super::label_resolver::enrich_with_label_info(
+            &mut src.album_metadata,
+            &req.container,
+            &super::label_resolver::StubLabelResolver,
+        );
+    }
+
     emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
     match plan_outputs(source.as_ref().expect("materialized source present"), &req) {
         Ok(album_plan) => {
@@ -3424,16 +3434,11 @@ pub fn map_album_outcome(
             failed: failed.len() as u32,
             log_path: log_path.unwrap_or_default(),
         },
-        AlbumOutcome::Blocked {
-            reason, stages, ..
-        } => {
-            let stage_error = stages
-                .iter()
-                .rev()
-                .find_map(|r| match &r.outcome {
-                    StageOutcome::Failed(err) => Some(format!("{:?}: {}", r.stage, err)),
-                    _ => None,
-                });
+        AlbumOutcome::Blocked { reason, stages, .. } => {
+            let stage_error = stages.iter().rev().find_map(|r| match &r.outcome {
+                StageOutcome::Failed(err) => Some(format!("{:?}: {}", r.stage, err)),
+                _ => None,
+            });
             let error = match stage_error {
                 Some(detail) => detail,
                 None => format!("album blocked: {:?}", reason),
@@ -3642,11 +3647,7 @@ fn render_track_template(
     Ok(rel)
 }
 
-fn render_folder_template(
-    template: &str,
-    source: &PreparedSource,
-    format: AudioFormat,
-) -> PathBuf {
+fn render_folder_template(template: &str, source: &PreparedSource, format: AudioFormat) -> PathBuf {
     let artist = source
         .album_metadata
         .album_artist
@@ -3754,7 +3755,8 @@ fn path_from_template_components(rendered: &str) -> PathBuf {
 }
 
 fn catalog_value(extra: &BTreeMap<String, String>) -> Option<&str> {
-    extra.get("catalog")
+    extra
+        .get("catalog")
         .or_else(|| extra.get("sacd_album_catalog_number"))
         .map(String::as_str)
 }
@@ -4640,10 +4642,7 @@ mod naming_template_tests {
                     track_number: Some(1),
                     disc_number: Some(1),
                     isrc: Some("USSM17100001".to_string()),
-                    extra: BTreeMap::from([(
-                        "catalognumber".to_string(),
-                        "CAT/999".to_string(),
-                    )]),
+                    extra: BTreeMap::from([("catalognumber".to_string(), "CAT/999".to_string())]),
                     ..TrackMetadata::default()
                 },
                 expected_samples: Some(1000),
@@ -4711,7 +4710,6 @@ mod naming_template_tests {
         }
     }
 
-
     #[test]
     fn plan_outputs_without_folder_template_keeps_album_name_fallback() {
         let source = template_source();
@@ -4769,7 +4767,11 @@ mod naming_template_tests {
             .extra
             .insert("catalognumber".to_string(), "CK/1234".to_string());
         assert_eq!(
-            render_folder_template("%ARTIST%/%CATALOGNUMBER%/%ALBUM%", &source, AudioFormat::Flac),
+            render_folder_template(
+                "%ARTIST%/%CATALOGNUMBER%/%ALBUM%",
+                &source,
+                AudioFormat::Flac
+            ),
             PathBuf::from("Miles Davis/CK_1234/A Tribute to Jack Johnson")
         );
     }
@@ -4793,7 +4795,10 @@ mod naming_template_tests {
     #[test]
     fn validate_template_is_structural_only() {
         assert!(validate_template("%UNKNOWN%/%BARCODE%").is_ok());
-        assert_eq!(validate_template("%UNKNOWN").unwrap_err(), "unclosed % token");
+        assert_eq!(
+            validate_template("%UNKNOWN").unwrap_err(),
+            "unclosed % token"
+        );
         assert_eq!(validate_template("%%").unwrap_err(), "empty token %%");
     }
 
