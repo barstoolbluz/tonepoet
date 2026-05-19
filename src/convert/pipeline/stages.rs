@@ -2394,7 +2394,21 @@ pub async fn run_features(
         ));
     }
 
-    let album_dir = req.output_root.clone();
+    // Derive album_dir from the first audio artifact's final path so sidecars
+    // land in the same directory. Using output_root directly fails when
+    // per_album_subdir is true because audio files are one level deeper.
+    let album_dir = match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => tracks
+            .first()
+            .and_then(|t| t.final_path.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| req.output_root.clone()),
+        AudioArtifacts::Merged(merged) => merged
+            .final_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| req.output_root.clone()),
+    };
 
     let log_staged = staging.root.join("conversion_log.txt");
     let log_content = build_conversion_log(outcome, source, req);
@@ -3396,10 +3410,22 @@ pub fn map_album_outcome(
             failed: failed.len() as u32,
             log_path: log_path.unwrap_or_default(),
         },
-        AlbumOutcome::Blocked { reason, .. } => ConversionStatus::Failed {
-            error: format!("album blocked: {:?}", reason),
-            log_path,
-        },
+        AlbumOutcome::Blocked {
+            reason, stages, ..
+        } => {
+            let stage_error = stages
+                .iter()
+                .rev()
+                .find_map(|r| match &r.outcome {
+                    StageOutcome::Failed(err) => Some(format!("{:?}: {}", r.stage, err)),
+                    _ => None,
+                });
+            let error = match stage_error {
+                Some(detail) => detail,
+                None => format!("album blocked: {:?}", reason),
+            };
+            ConversionStatus::Failed { error, log_path }
+        }
     }
 }
 
