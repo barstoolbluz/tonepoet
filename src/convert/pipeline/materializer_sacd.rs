@@ -103,6 +103,7 @@ impl Materializer for SacdIsoMaterializer {
                 // SACD source-domain sample counts.
                 expected_samples: None,
                 sample_rate: SACD_SAMPLE_RATE_HZ,
+                bit_depth: None,
             });
         }
 
@@ -530,6 +531,7 @@ pub(crate) mod test_support {
                 metadata: TrackMetadata::default(),
                 expected_samples: None,
                 sample_rate: SACD_SAMPLE_RATE_HZ,
+                bit_depth: None,
             })
             .collect();
         apply_track_selection(tracks, &selection).map(|tracks| {

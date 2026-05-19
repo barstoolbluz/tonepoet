@@ -90,6 +90,7 @@ impl super::stages::Materializer for SevenZipMaterializer {
                 metadata,
                 expected_samples: probe.expected_samples,
                 sample_rate: probe.sample_rate,
+                bit_depth: probe.bit_depth,
             });
         }
 
@@ -236,6 +237,7 @@ fn walk_audio_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Materializ
 pub(crate) struct ProbeResult {
     pub sample_rate: u32,
     pub expected_samples: Option<u64>,
+    pub bit_depth: Option<u32>,
 }
 
 /// Probe a single audio file via ffprobe through `ToolRunner`.
@@ -252,7 +254,7 @@ async fn probe_audio_file(
             "-select_streams".into(),
             "a:0".into(),
             "-show_entries".into(),
-            "stream=sample_rate,duration".into(),
+            "stream=sample_rate,duration,bits_per_raw_sample,bits_per_sample".into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -305,11 +307,23 @@ fn parse_ffprobe_json(json_str: &str) -> Result<ProbeResult, MaterializeError> {
         });
 
     let expected_samples = duration_secs.map(|d| (d * sample_rate as f64).round() as u64);
+    let bit_depth = val
+        .pointer("/streams/0/bits_per_raw_sample")
+        .or_else(|| val.pointer("/streams/0/bits_per_sample"))
+        .and_then(json_u32);
 
     Ok(ProbeResult {
         sample_rate,
         expected_samples,
+        bit_depth,
     })
+}
+
+fn json_u32(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
 }
 
 // =========================================================================
@@ -336,6 +350,20 @@ fn read_track_metadata(path: &Path) -> TrackMetadata {
     let mut extra = BTreeMap::new();
     if let Some(album) = tag.album() {
         extra.insert("album".to_string(), album.to_string());
+    }
+
+    // Enumerate all text tag items into `extra` so naming templates can use
+    // arbitrary format-specific fields such as CATALOGNUMBER, BARCODE,
+    // MUSICBRAINZ_ALBUMID, and RELEASECOUNTRY. Keys are lowercased to match
+    // the template engine's fallthrough lookup.
+    let tag_type = tag.tag_type();
+    for item in tag.items() {
+        if let lofty::tag::ItemValue::Text(text) = item.value() {
+            let key = item_key_to_extra_key(item.key(), tag_type);
+            if !key.is_empty() {
+                extra.entry(key).or_insert_with(|| text.clone());
+            }
+        }
     }
 
     TrackMetadata {
@@ -366,6 +394,17 @@ fn read_track_metadata(path: &Path) -> TrackMetadata {
         comment: tag.comment().map(|s| s.to_string()),
         pre_emphasis: false,
         extra,
+    }
+}
+
+fn item_key_to_extra_key(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) -> String {
+    if let Some(mapped) = key.map_key(tag_type, true) {
+        return mapped.to_lowercase();
+    }
+
+    match key {
+        lofty::tag::ItemKey::Unknown(value) => value.to_lowercase(),
+        _ => format!("{key:?}").to_lowercase(),
     }
 }
 
@@ -467,6 +506,31 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
         }
     };
 
+    // Promote album-wide extra tags so folder templates can use custom
+    // variables from 7z-contained audio files. A tag is album-wide only when
+    // every prepared track that carries the key agrees on the same value.
+    // This keeps per-track-only values out of folder paths while enabling
+    // common release fields such as CATALOGNUMBER, BARCODE,
+    // MUSICBRAINZ_ALBUMID, and RELEASECOUNTRY.
+    let mut extra = BTreeMap::new();
+    for key in tracks
+        .iter()
+        .flat_map(|track| track.metadata.extra.keys())
+    {
+        if extra.contains_key(key) {
+            continue;
+        }
+        let Some(first) = tracks[0].metadata.extra.get(key) else {
+            continue;
+        };
+        if tracks
+            .iter()
+            .all(|track| track.metadata.extra.get(key) == Some(first))
+        {
+            extra.insert(key.clone(), first.clone());
+        }
+    }
+
     AlbumMetadata {
         album,
         album_artist: common(tracks, |m| &m.album_artist).or_else(|| common(tracks, |m| &m.artist)),
@@ -479,6 +543,113 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
         } else {
             None
         },
-        extra: BTreeMap::new(),
+        extra,
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ffprobe_json_extracts_bit_depth_from_raw_sample_field() {
+        let json = r#"{
+            "streams": [{
+                "sample_rate": "96000",
+                "duration": "1.5",
+                "bits_per_raw_sample": "24"
+            }]
+        }"#;
+        let probe = parse_ffprobe_json(json).unwrap();
+        assert_eq!(probe.sample_rate, 96_000);
+        assert_eq!(probe.expected_samples, Some(144_000));
+        assert_eq!(probe.bit_depth, Some(24));
+    }
+
+    #[test]
+    fn parse_ffprobe_json_falls_back_to_bits_per_sample() {
+        let json = r#"{
+            "streams": [{
+                "sample_rate": "44100",
+                "duration": "2.0",
+                "bits_per_sample": 16
+            }]
+        }"#;
+        let probe = parse_ffprobe_json(json).unwrap();
+        assert_eq!(probe.sample_rate, 44_100);
+        assert_eq!(probe.expected_samples, Some(88_200));
+        assert_eq!(probe.bit_depth, Some(16));
+    }
+    #[test]
+    fn derive_album_metadata_promotes_common_extra_tags_for_folder_templates() {
+        let make_track = |ordinal: u32, catalog: &str, barcode: &str| PreparedTrack {
+            id: TrackId {
+                source_ordinal: ordinal,
+                disc_number: Some(1),
+                track_number: ordinal,
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("/stage/{ordinal:02}.flac"))),
+            metadata: TrackMetadata {
+                title: Some(format!("Track {ordinal}")),
+                artist: Some("Miles Davis".to_string()),
+                album_artist: Some("Miles Davis".to_string()),
+                genre: Some("Jazz".to_string()),
+                date: Some("1971".to_string()),
+                track_number: Some(ordinal),
+                disc_number: Some(1),
+                extra: BTreeMap::from([
+                    ("album".to_string(), "A Tribute to Jack Johnson".to_string()),
+                    ("catalognumber".to_string(), catalog.to_string()),
+                    ("barcode".to_string(), barcode.to_string()),
+                ]),
+                ..TrackMetadata::default()
+            },
+            expected_samples: None,
+            sample_rate: 44_100,
+            bit_depth: Some(24),
+        };
+
+        let tracks = vec![
+            make_track(1, "CK-1234", "074646123426"),
+            make_track(2, "CK-1234", "074646123426"),
+        ];
+        let album = derive_album_metadata(&tracks);
+
+        assert_eq!(album.extra.get("catalognumber").map(String::as_str), Some("CK-1234"));
+        assert_eq!(album.extra.get("barcode").map(String::as_str), Some("074646123426"));
+        assert_eq!(album.album.as_deref(), Some("A Tribute to Jack Johnson"));
+    }
+
+    #[test]
+    fn derive_album_metadata_does_not_promote_track_specific_extra_tags() {
+        let make_track = |ordinal: u32, isrc: &str| PreparedTrack {
+            id: TrackId {
+                source_ordinal: ordinal,
+                disc_number: Some(1),
+                track_number: ordinal,
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("/stage/{ordinal:02}.flac"))),
+            metadata: TrackMetadata {
+                title: Some(format!("Track {ordinal}")),
+                artist: Some("Miles Davis".to_string()),
+                album_artist: Some("Miles Davis".to_string()),
+                extra: BTreeMap::from([
+                    ("album".to_string(), "A Tribute to Jack Johnson".to_string()),
+                    ("isrc".to_string(), isrc.to_string()),
+                ]),
+                ..TrackMetadata::default()
+            },
+            expected_samples: None,
+            sample_rate: 44_100,
+            bit_depth: Some(24),
+        };
+
+        let tracks = vec![make_track(1, "USSM17100001"), make_track(2, "USSM17100002")];
+        let album = derive_album_metadata(&tracks);
+
+        assert!(!album.extra.contains_key("isrc"));
+        assert_eq!(album.extra.get("album").map(String::as_str), Some("A Tribute to Jack Johnson"));
+    }
+
 }

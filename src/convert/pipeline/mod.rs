@@ -63,6 +63,7 @@ mod tests {
             output_root: PathBuf::from("/tmp/out"),
             naming: NamingPolicy {
                 template: "%NN% - %TITLE%".into(),
+                folder_template: None,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
             },
@@ -119,6 +120,7 @@ mod tests {
                 metadata: TrackMetadata::default(),
                 expected_samples: Some(1000),
                 sample_rate: 44_100,
+                bit_depth: None,
             }],
             album_metadata: AlbumMetadata {
                 total_tracks: 1,
@@ -965,6 +967,7 @@ mod tests {
             output_root: PathBuf::from("/tmp/out"),
             naming: NamingPolicy {
                 template: "%NN% - %TITLE%".into(),
+                folder_template: None,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
             },
@@ -1864,6 +1867,7 @@ mod tests {
                 },
                 expected_samples: Some(441000),
                 sample_rate: 44100,
+                bit_depth: None,
             },
             PreparedTrack {
                 id: TrackId {
@@ -1879,6 +1883,7 @@ mod tests {
                 },
                 expected_samples: Some(441000),
                 sample_rate: 44100,
+                bit_depth: None,
             },
         ];
 

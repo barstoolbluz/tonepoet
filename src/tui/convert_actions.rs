@@ -84,6 +84,8 @@ pub fn pills_to_options(
         dither_type,
         calculate_replaygain,
         replaygain_mode,
+        naming_template: Some(output_opts.filename_template.clone()),
+        folder_template: Some(output_opts.folder_template.clone()),
         output_dir: output_opts.dest_path.clone(),
         merge_to_single: matches!(merge, MergeMode::SingleImage),
         preserve_metadata: true,

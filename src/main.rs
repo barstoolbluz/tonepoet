@@ -116,6 +116,9 @@ enum Commands {
         /// Output naming template (e.g. "%NN% - %TITLE%")
         #[arg(long)]
         naming: Option<String>,
+    /// Output album/folder naming template (e.g. "%ARTIST%/%ALBUM% (%YEAR%)")
+    #[arg(long = "folder-naming")]
+    folder_naming: Option<String>,
 
         /// Disable metadata tagging stage
         #[arg(long)]
@@ -252,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
             partial,
             overwrite_output,
             naming,
-            no_metadata,
+            folder_naming, no_metadata,
             no_features,
         } => {
             run_convert(
@@ -277,10 +280,7 @@ async fn main() -> anyhow::Result<()> {
                 no_cue,
                 partial,
                 overwrite_output,
-                naming,
-                no_metadata,
-                no_features,
-                &config,
+                naming, folder_naming, no_metadata, no_features, &config,
             )
             .await?;
         }
@@ -398,6 +398,7 @@ async fn run_convert(
     partial: bool,
     overwrite_output: bool,
     naming: Option<String>,
+    folder_naming: Option<String>,
     no_metadata: bool,
     no_features: bool,
     config: &TonepoetConfig,
@@ -497,6 +498,12 @@ async fn run_convert(
         append_lineage || config.conversion.append_lineage_to_comment;
     options.write_log_file = write_log || config.conversion.write_log_file;
     options.generate_cue_files = generate_cue || config.conversion.generate_cue_files;
+    if let Some(template) = &naming {
+        options.naming_template = Some(template.clone());
+    }
+    if let Some(template) = &folder_naming {
+        options.folder_template = Some(template.clone());
+    }
 
     // Build pipeline request template from CLI flags (PR 10).
     // If any pipeline-specific flags are set, we construct a PipelineRequest
@@ -515,6 +522,7 @@ async fn run_convert(
         partial,
         overwrite_output,
         naming.as_deref(),
+        folder_naming.as_deref(),
         no_metadata,
         no_features,
     );
@@ -721,6 +729,7 @@ fn build_pipeline_request_template(
     partial: bool,
     overwrite_output: bool,
     naming: Option<&str>,
+    folder_naming: Option<&str>,
     no_metadata: bool,
     no_features: bool,
 ) -> Option<tonepoet::convert::pipeline::PipelineRequest> {
@@ -734,8 +743,7 @@ fn build_pipeline_request_template(
         || no_cue
         || partial
         || overwrite_output
-        || naming.is_some()
-        || no_metadata
+        || naming.is_some() || folder_naming.is_some() || no_metadata
         || no_features;
 
     if !has_pipeline_flags {
@@ -811,6 +819,7 @@ fn build_pipeline_request_template(
         output_root: output_root.clone(),
         naming: NamingPolicy {
             template: naming.unwrap_or("%NN% - %TITLE%").to_string(),
+            folder_template: folder_naming.map(str::to_string),
             per_album_subdir: true,
             collision_policy: NamingCollisionPolicy::Fail,
         },

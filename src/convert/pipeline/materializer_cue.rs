@@ -34,6 +34,7 @@ struct AudioProbe {
     sample_rate: u32,
     total_samples: u64,
     exact_samples: bool,
+    bit_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,7 @@ impl Materializer for CueImageMaterializer {
                 metadata,
                 expected_samples: Some(samples),
                 sample_rate: probe.sample_rate,
+                bit_depth: probe.bit_depth,
             });
         }
 
@@ -592,7 +594,7 @@ async fn probe_audio_image(
             "a:0".into(),
             "-count_frames".into(),
             "-show_entries".into(),
-            "stream=sample_rate,duration_ts,time_base,duration".into(),
+            "stream=sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample".into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -631,6 +633,10 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
             "ffprobe returned no valid sample_rate".to_string(),
         ));
     }
+    let bit_depth = stream
+        .get("bits_per_raw_sample")
+        .or_else(|| stream.get("bits_per_sample"))
+        .and_then(json_u32_from_value);
 
     if let Some(duration_ts_samples) = samples_from_duration_ts(stream, sample_rate) {
         if duration_ts_samples > 0 {
@@ -638,6 +644,7 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
                 sample_rate,
                 total_samples: duration_ts_samples,
                 exact_samples: true,
+                bit_depth,
             });
         }
     }
@@ -665,6 +672,7 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
         sample_rate,
         total_samples,
         exact_samples: false,
+        bit_depth,
     })
 }
 
@@ -691,6 +699,13 @@ fn json_u64_from_value(value: &serde_json::Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+}
+
+fn json_u32_from_value(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
 }
 
 fn compute_track_boundaries(
@@ -970,5 +985,18 @@ pub(crate) mod test_support {
     pub(crate) fn parse_probe_for_test(json: &str) -> Result<(u32, u64, bool), MaterializeError> {
         let probe = parse_audio_probe_json(json)?;
         Ok((probe.sample_rate, probe.total_samples, probe.exact_samples))
+    }
+}
+
+
+#[cfg(test)]
+mod naming_template_bit_depth_tests {
+    use super::*;
+
+    #[test]
+    fn cue_json_u32_from_value_reads_string_and_number_bit_depths() {
+        assert_eq!(json_u32_from_value(&serde_json::json!("24")), Some(24));
+        assert_eq!(json_u32_from_value(&serde_json::json!(16)), Some(16));
+        assert_eq!(json_u32_from_value(&serde_json::json!("not-a-number")), None);
     }
 }

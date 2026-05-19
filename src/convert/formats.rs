@@ -123,8 +123,11 @@ pub struct ConversionOptions {
     /// ReplayGain mode (Track, Album, or Both)
     pub replaygain_mode: Option<ReplayGainMode>,
 
-    /// Output naming template
+    /// Output filename template
     pub naming_template: Option<String>,
+
+    /// Output album/folder template
+    pub folder_template: Option<String>,
 
     /// Whether to overwrite existing files
     pub overwrite: bool,
@@ -200,6 +203,7 @@ impl Default for ConversionOptions {
             calculate_replaygain: false,
             replaygain_mode: None,
             naming_template: None,
+            folder_template: None,
             overwrite: false,
             output_dir: None,
             resample_quality: None,

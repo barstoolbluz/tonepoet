@@ -455,8 +455,7 @@ where
                                 tail.push(&line_buf);
                                 let text = String::from_utf8_lossy(&line_buf).to_string();
                                 if !text.is_empty() {
-                                    let _ =
-                                        line_tx.send(StreamLine { source, line: text }).await;
+                                    let _ = line_tx.send(StreamLine { source, line: text }).await;
                                 }
                                 line_buf.clear();
                             }

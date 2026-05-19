@@ -106,6 +106,9 @@ pub fn validate_request(req: &PipelineRequest) -> Result<(), RequestValidationEr
         ));
     }
     validate_template(&req.naming.template).map_err(RequestValidationError::InvalidTemplate)?;
+    if let Some(folder_template) = &req.naming.folder_template {
+        validate_template(folder_template).map_err(RequestValidationError::InvalidTemplate)?;
+    }
 
     match &req.source.track_selection {
         TrackSelection::All => {}
@@ -1143,18 +1146,29 @@ pub fn plan_outputs(
         return Err(PlanError::EmptyManifest);
     }
     validate_template(&req.naming.template).map_err(PlanError::InvalidTemplate)?;
+    if let Some(folder_template) = &req.naming.folder_template {
+        validate_template(folder_template).map_err(PlanError::InvalidTemplate)?;
+    }
 
     let output_root = normalize_path(&req.output_root);
-    let album_component = sanitize_component(
-        source
-            .album_metadata
-            .album
-            .as_deref()
-            .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
-            .unwrap_or("Album"),
-    );
     let album_dir = if req.naming.per_album_subdir {
-        output_root.join(album_component)
+        match &req.naming.folder_template {
+            Some(tmpl) => {
+                let rendered = render_folder_template(tmpl, source, req.target_format);
+                output_root.join(rendered)
+            }
+            None => {
+                let album_component = sanitize_component(
+                    source
+                        .album_metadata
+                        .album
+                        .as_deref()
+                        .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
+                        .unwrap_or("Album"),
+                );
+                output_root.join(album_component)
+            }
+        }
     } else {
         output_root.clone()
     };
@@ -3508,17 +3522,7 @@ async fn emit_stage_finished(reporter: &dyn PipelineReporter, item_id: &str, rec
 }
 
 fn validate_template(template: &str) -> Result<(), String> {
-    let known = [
-        "NN",
-        "N",
-        "TRACK",
-        "TITLE",
-        "ARTIST",
-        "ALBUM_ARTIST",
-        "ALBUM",
-        "DISC",
-        "FORMAT",
-    ];
+    // Only validate structure. Unknown tokens are resolved from extra maps at render time.
     let mut rest = template;
     while let Some(start) = rest.find('%') {
         rest = &rest[start + 1..];
@@ -3526,8 +3530,8 @@ fn validate_template(template: &str) -> Result<(), String> {
             return Err("unclosed % token".to_string());
         };
         let token = &rest[..end];
-        if !known.contains(&token) {
-            return Err(format!("unknown token %{token}%"));
+        if token.is_empty() {
+            return Err("empty token %%".to_string());
         }
         rest = &rest[end + 1..];
     }
@@ -3571,6 +3575,40 @@ fn render_track_template(
         .or(track.metadata.disc_number)
         .unwrap_or(1);
     let n = track.metadata.track_number.unwrap_or(track.id.track_number);
+    let year = source
+        .album_metadata
+        .date
+        .as_deref()
+        .and_then(extract_year_from_date)
+        .unwrap_or_default();
+    let genre = track
+        .metadata
+        .genre
+        .as_deref()
+        .or(source.album_metadata.genre.as_deref())
+        .map(sanitize_component)
+        .unwrap_or_default();
+    let composer = track
+        .metadata
+        .composer
+        .as_deref()
+        .map(sanitize_component)
+        .unwrap_or_default();
+    let catalog = catalog_value(&source.album_metadata.extra)
+        .map(sanitize_component)
+        .unwrap_or_default();
+    let sample_rate = sanitize_component(&format_sample_rate(track.sample_rate));
+    let bit_depth = track
+        .bit_depth
+        .map(|depth| depth.to_string())
+        .map(|value| sanitize_component(&value))
+        .unwrap_or_default();
+    let isrc = track
+        .metadata
+        .isrc
+        .as_deref()
+        .map(sanitize_component)
+        .unwrap_or_default();
 
     let mut rendered = template.to_string();
     rendered = rendered.replace("%NN%", &format!("{n:02}"));
@@ -3582,6 +3620,18 @@ fn render_track_template(
     rendered = rendered.replace("%ALBUM%", &album);
     rendered = rendered.replace("%DISC%", &disc.to_string());
     rendered = rendered.replace("%FORMAT%", format.extension());
+    rendered = rendered.replace("%YEAR%", &year);
+    rendered = rendered.replace("%GENRE%", &genre);
+    rendered = rendered.replace("%COMPOSER%", &composer);
+    rendered = rendered.replace("%CATALOG%", &catalog);
+    rendered = rendered.replace("%SAMPLERATE%", &sample_rate);
+    rendered = rendered.replace("%BITDEPTH%", &bit_depth);
+    rendered = rendered.replace("%ISRC%", &isrc);
+    rendered = resolve_extra_tokens(
+        &rendered,
+        Some(&track.metadata.extra),
+        &source.album_metadata.extra,
+    );
 
     let rel = PathBuf::from(rendered);
     if rel.as_os_str().is_empty() {
@@ -3590,6 +3640,159 @@ fn render_track_template(
         ));
     }
     Ok(rel)
+}
+
+fn render_folder_template(
+    template: &str,
+    source: &PreparedSource,
+    format: AudioFormat,
+) -> PathBuf {
+    let artist = source
+        .album_metadata
+        .album_artist
+        .as_deref()
+        .or_else(|| {
+            source
+                .tracks
+                .iter()
+                .find_map(|track| track.metadata.artist.as_deref())
+        })
+        .map(sanitize_component)
+        .unwrap_or_else(|| "Unknown Artist".to_string());
+    let album = source
+        .album_metadata
+        .album
+        .as_deref()
+        .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
+        .map(sanitize_component)
+        .unwrap_or_else(|| "Album".to_string());
+    let year = source
+        .album_metadata
+        .date
+        .as_deref()
+        .and_then(extract_year_from_date)
+        .unwrap_or_default();
+    let genre = source
+        .album_metadata
+        .genre
+        .as_deref()
+        .map(sanitize_component)
+        .unwrap_or_default();
+    let catalog = catalog_value(&source.album_metadata.extra)
+        .map(sanitize_component)
+        .unwrap_or_default();
+    let sample_rate = source
+        .tracks
+        .first()
+        .map(|track| sanitize_component(&format_sample_rate(track.sample_rate)))
+        .unwrap_or_default();
+    let bit_depth = source
+        .tracks
+        .first()
+        .and_then(|track| track.bit_depth)
+        .map(|depth| depth.to_string())
+        .map(|value| sanitize_component(&value))
+        .unwrap_or_default();
+
+    let mut rendered = template.to_string();
+    rendered = rendered.replace("%ARTIST%", &artist);
+    rendered = rendered.replace("%ALBUM_ARTIST%", &artist);
+    rendered = rendered.replace("%ALBUM%", &album);
+    rendered = rendered.replace("%YEAR%", &year);
+    rendered = rendered.replace("%GENRE%", &genre);
+    rendered = rendered.replace("%CATALOG%", &catalog);
+    rendered = rendered.replace("%FORMAT%", format.extension());
+    rendered = rendered.replace("%SAMPLERATE%", &sample_rate);
+    rendered = rendered.replace("%BITDEPTH%", &bit_depth);
+    rendered = resolve_extra_tokens(&rendered, None, &source.album_metadata.extra);
+
+    path_from_template_components(&rendered)
+}
+
+fn resolve_extra_tokens(
+    rendered: &str,
+    track_extra: Option<&BTreeMap<String, String>>,
+    album_extra: &BTreeMap<String, String>,
+) -> String {
+    let mut output = String::with_capacity(rendered.len());
+    let mut rest = rendered;
+
+    while let Some(start) = rest.find('%') {
+        output.push_str(&rest[..start]);
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('%') else {
+            output.push('%');
+            output.push_str(rest);
+            return output;
+        };
+
+        let token = &rest[..end];
+        let key = token.to_ascii_lowercase();
+        let value = track_extra
+            .and_then(|extra| extra.get(&key))
+            .or_else(|| album_extra.get(&key))
+            .map(|value| sanitize_component(value))
+            .unwrap_or_default();
+        output.push_str(&value);
+        rest = &rest[end + 1..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn path_from_template_components(rendered: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for component in rendered
+        .split('/')
+        .map(|component| component.trim().trim_matches('.').trim())
+        .filter(|component| !component.is_empty())
+    {
+        path.push(component);
+    }
+    path
+}
+
+fn catalog_value(extra: &BTreeMap<String, String>) -> Option<&str> {
+    extra.get("catalog")
+        .or_else(|| extra.get("sacd_album_catalog_number"))
+        .map(String::as_str)
+}
+
+fn extract_year_from_date(date: &str) -> Option<String> {
+    let mut run = String::new();
+    for ch in date.chars() {
+        if ch.is_ascii_digit() {
+            run.push(ch);
+            if run.len() == 4 {
+                return Some(run);
+            }
+        } else {
+            run.clear();
+        }
+    }
+    None
+}
+
+fn format_sample_rate(hz: u32) -> String {
+    const DSD64_HZ: u32 = 2_822_400;
+    if hz >= DSD64_HZ && hz % DSD64_HZ == 0 {
+        return format!("DSD{}", 64 * (hz / DSD64_HZ));
+    }
+    if hz % 1_000 == 0 {
+        return format!("{}kHz", hz / 1_000);
+    }
+    if hz % 100 == 0 {
+        return format!("{:.1}kHz", hz as f64 / 1_000.0);
+    }
+    let mut khz = format!("{:.3}", hz as f64 / 1_000.0);
+    while khz.contains('.') && khz.ends_with('0') {
+        khz.pop();
+    }
+    if khz.ends_with('.') {
+        khz.pop();
+    }
+    format!("{khz}kHz")
 }
 
 fn sanitize_component(value: &str) -> String {
@@ -4409,6 +4612,208 @@ fn failed_tracks_from(outcome: &AlbumOutcome) -> Vec<TrackRecord> {
         AlbumOutcome::Partial { failed, .. } | AlbumOutcome::Blocked { failed, .. } => {
             failed.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod naming_template_tests {
+    use super::*;
+
+    fn template_source() -> PreparedSource {
+        let mut album_extra = BTreeMap::new();
+        album_extra.insert("catalog".to_string(), "CK-1234".to_string());
+        PreparedSource {
+            container: PathBuf::from("/tmp/container.7z"),
+            kind: SourceKind::SevenZip,
+            tracks: vec![PreparedTrack {
+                id: TrackId {
+                    source_ordinal: 1,
+                    disc_number: Some(1),
+                    track_number: 1,
+                },
+                source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac")),
+                metadata: TrackMetadata {
+                    title: Some("Right Off".to_string()),
+                    artist: Some("Miles/Davis".to_string()),
+                    genre: Some("Jazz".to_string()),
+                    composer: Some("Miles Davis".to_string()),
+                    track_number: Some(1),
+                    disc_number: Some(1),
+                    isrc: Some("USSM17100001".to_string()),
+                    extra: BTreeMap::from([(
+                        "catalognumber".to_string(),
+                        "CAT/999".to_string(),
+                    )]),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(1000),
+                sample_rate: 44_100,
+                bit_depth: Some(24),
+            }],
+            album_metadata: AlbumMetadata {
+                album: Some("A Tribute to Jack Johnson".to_string()),
+                album_artist: Some("Miles Davis".to_string()),
+                genre: Some("Fusion".to_string()),
+                date: Some("March 1971".to_string()),
+                total_tracks: 1,
+                extra: album_extra,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SevenZip,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        }
+    }
+
+    fn template_request(folder_template: Option<String>) -> PipelineRequest {
+        PipelineRequest {
+            job_id: "job-test".to_string(),
+            item_id: "item-test".to_string(),
+            container: PathBuf::from("/tmp/container.7z"),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            target_format: AudioFormat::Flac,
+            encode: EncodeOptions {
+                backend: EncodeBackend::Auto,
+                bitrate: None,
+                compression_level: None,
+                dither: DitherPolicy::Auto,
+            },
+            merge: false,
+            output_root: PathBuf::from("/out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template,
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+            },
+            log: LogPolicy {
+                root: PathBuf::from("/out/.tonepoet-logs"),
+                write_for_blocked: true,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Enabled,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        }
+    }
+
+
+    #[test]
+    fn plan_outputs_without_folder_template_keeps_album_name_fallback() {
+        let source = template_source();
+        let req = template_request(None);
+        let plan = plan_outputs(&source, &req).unwrap();
+        assert_eq!(
+            plan.album_dir,
+            PathBuf::from("/out/A Tribute to Jack Johnson")
+        );
+        assert_eq!(
+            plan.entries[0].final_path,
+            PathBuf::from("/out/A Tribute to Jack Johnson/01 - Right Off.flac")
+        );
+    }
+
+    #[test]
+    fn plan_outputs_with_folder_template_sets_nested_album_dir_and_track_paths() {
+        let source = template_source();
+        let req = template_request(Some("%ARTIST%/%ALBUM% (%YEAR%)".to_string()));
+        let plan = plan_outputs(&source, &req).unwrap();
+        assert_eq!(
+            plan.album_dir,
+            PathBuf::from("/out/Miles Davis/A Tribute to Jack Johnson (1971)")
+        );
+        assert_eq!(
+            plan.entries[0].final_path,
+            PathBuf::from("/out/Miles Davis/A Tribute to Jack Johnson (1971)/01 - Right Off.flac")
+        );
+    }
+
+    #[test]
+    fn render_folder_template_preserves_template_slashes() {
+        let source = template_source();
+        assert_eq!(
+            render_folder_template("%ARTIST%/%ALBUM% (%YEAR%)", &source, AudioFormat::Flac),
+            PathBuf::from("Miles Davis/A Tribute to Jack Johnson (1971)")
+        );
+    }
+
+    #[test]
+    fn render_folder_template_keeps_empty_year_parentheses() {
+        let mut source = template_source();
+        source.album_metadata.date = None;
+        assert_eq!(
+            render_folder_template("%ARTIST%/%ALBUM% (%YEAR%)", &source, AudioFormat::Flac),
+            PathBuf::from("Miles Davis/A Tribute to Jack Johnson ()")
+        );
+    }
+
+    #[test]
+    fn render_folder_template_resolves_custom_album_extra_tokens() {
+        let mut source = template_source();
+        source
+            .album_metadata
+            .extra
+            .insert("catalognumber".to_string(), "CK/1234".to_string());
+        assert_eq!(
+            render_folder_template("%ARTIST%/%CATALOGNUMBER%/%ALBUM%", &source, AudioFormat::Flac),
+            PathBuf::from("Miles Davis/CK_1234/A Tribute to Jack Johnson")
+        );
+    }
+
+    #[test]
+    fn render_track_template_expands_new_builtins_and_custom_extras() {
+        let source = template_source();
+        let path = render_track_template(
+            "%NN% - %TITLE% - %YEAR% - %GENRE% - %CATALOG% - %SAMPLERATE% - %BITDEPTH% - %CATALOGNUMBER% - %NONEXISTENT%",
+            &source,
+            &source.tracks[0],
+            AudioFormat::Flac,
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("01 - Right Off - 1971 - Jazz - CK-1234 - 44.1kHz - 24 - CAT_999 - ")
+        );
+    }
+
+    #[test]
+    fn validate_template_is_structural_only() {
+        assert!(validate_template("%UNKNOWN%/%BARCODE%").is_ok());
+        assert_eq!(validate_template("%UNKNOWN").unwrap_err(), "unclosed % token");
+        assert_eq!(validate_template("%%").unwrap_err(), "empty token %%");
+    }
+
+    #[test]
+    fn folder_template_sanitizes_value_slashes_but_preserves_template_slashes() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = Some("Miles/Davis".to_string());
+        assert_eq!(
+            render_folder_template("%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
+            PathBuf::from("Miles_Davis/A Tribute to Jack Johnson")
+        );
+    }
+
+    #[test]
+    fn sample_rate_formatter_handles_pcm_and_dsd() {
+        assert_eq!(format_sample_rate(44_100), "44.1kHz");
+        assert_eq!(format_sample_rate(48_000), "48kHz");
+        assert_eq!(format_sample_rate(96_000), "96kHz");
+        assert_eq!(format_sample_rate(2_822_400), "DSD64");
+        assert_eq!(format_sample_rate(5_644_800), "DSD128");
     }
 }
 

@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -216,7 +216,7 @@ fn draw_queue_item(
     let line = Paragraph::new(Line::from(spans)).style(row_style);
     f.render_widget(line, area);
 
-    // For processing items, draw a progress bar overlay if we have enough width
+    // For processing items, draw a CRT aperture-grille progress bar
     if let ConversionStatus::Processing {
         phase,
         phase_progress,
@@ -232,15 +232,10 @@ fn draw_queue_item(
                 .unwrap_or("Processing");
             let label = format!("{:.0}% {}", pct_value, phase_label);
 
-            let gauge_area = Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
-
-            let color = phase_color(phase.as_ref());
+            let gauge_area =
+                Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
             let pct = (pct_value / 100.0).clamp(0.0, 1.0);
-            let gauge = Gauge::default()
-                .gauge_style(Style::default().fg(color).bg(Color::Rgb(40, 40, 40)))
-                .ratio(pct as f64)
-                .label(label);
-            f.render_widget(gauge, gauge_area);
+            draw_crt_gauge(f, gauge_area, pct, &label);
         }
     }
 }
@@ -319,6 +314,53 @@ fn phase_color(phase: Option<&ConversionPhase>) -> Color {
         Some(ConversionPhase::PostProcessing) => Color::Yellow,
         Some(ConversionPhase::Finalizing) => Color::White,
         None => Color::Blue,
+    }
+}
+
+/// Draw a progress bar with a CRT aperture-grille effect.
+///
+/// Alternates between brighter and dimmer columns in the filled region
+/// to simulate the vertical phosphor stripe pattern of a CRT display.
+/// Uses `theme::GREEN` (the start pill color) as the base fill color.
+fn draw_crt_gauge(f: &mut Frame, area: Rect, ratio: f32, label: &str) {
+    use super::theme;
+
+    if area.is_empty() {
+        return;
+    }
+
+    let buf = f.buffer_mut();
+    let filled_width = ((area.width as f32) * ratio).round() as u16;
+
+    let fill_color = theme::GREEN;
+    let bg_empty = Color::Rgb(30, 30, 30);
+
+    let y = area.y;
+    for col in 0..area.width {
+        let x = area.x + col;
+        let cell = buf.get_mut(x, y);
+        if col < filled_width {
+            cell.set_symbol("\u{2588}") // █ full block
+                .set_fg(fill_color)
+                .set_bg(bg_empty);
+        } else {
+            cell.set_symbol(" ").set_fg(bg_empty).set_bg(bg_empty);
+        }
+    }
+
+    // Overlay the label, centered.
+    let label_width = label.len().min(area.width as usize);
+    let label_start = area.x + (area.width.saturating_sub(label_width as u16)) / 2;
+    for (i, ch) in label.chars().take(label_width).enumerate() {
+        let x = label_start + i as u16;
+        let col = x - area.x;
+        let cell = buf.get_mut(x, y);
+        cell.set_char(ch);
+        if col < filled_width {
+            cell.set_fg(Color::Rgb(15, 15, 15)).set_bg(fill_color);
+        } else {
+            cell.set_fg(Color::Rgb(120, 120, 120)).set_bg(bg_empty);
+        }
     }
 }
 

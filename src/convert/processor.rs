@@ -1057,7 +1057,12 @@ fn pipeline_request_for_cue_item(
         merge: item.options.merge_to_single,
         output_root: output_root.clone(),
         naming: NamingPolicy {
-            template: "%NN% - %TITLE%".to_string(),
+            template: item
+                .options
+                .naming_template
+                .clone()
+                .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
+            folder_template: item.options.folder_template.clone(),
             per_album_subdir: true,
             collision_policy: NamingCollisionPolicy::Fail,
         },
@@ -1178,7 +1183,12 @@ fn pipeline_request_for_sacd_item(
         merge: item.options.merge_to_single,
         output_root: output_root.clone(),
         naming: NamingPolicy {
-            template: "%NN% - %TITLE%".to_string(),
+            template: item
+                .options
+                .naming_template
+                .clone()
+                .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
+            folder_template: item.options.folder_template.clone(),
             per_album_subdir: true,
             collision_policy: NamingCollisionPolicy::Fail,
         },
@@ -1366,7 +1376,12 @@ async fn run_sevenzip_pipeline_conversion_item(
             merge: item.options.merge_to_single,
             output_root: output_root.clone(),
             naming: NamingPolicy {
-                template: "%NN% - %TITLE%".to_string(),
+                template: item
+                    .options
+                    .naming_template
+                    .clone()
+                    .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
+                folder_template: item.options.folder_template.clone(),
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
             },
@@ -1644,7 +1659,12 @@ pub async fn process_item(
                             .to_path_buf()
                     }),
                     naming: NamingPolicy {
-                        template: "%NN% - %TITLE%".to_string(),
+                        template: item
+                            .options
+                            .naming_template
+                            .clone()
+                            .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
+                        folder_template: item.options.folder_template.clone(),
                         per_album_subdir: true,
                         collision_policy: NamingCollisionPolicy::Fail,
                     },

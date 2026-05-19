@@ -118,6 +118,7 @@ pub enum TrackSelection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamingPolicy {
     pub template: String,
+    pub folder_template: Option<String>,
     pub per_album_subdir: bool,
     pub collision_policy: NamingCollisionPolicy,
 }
@@ -323,6 +324,7 @@ pub struct PreparedTrack {
     pub metadata: TrackMetadata,
     pub expected_samples: Option<u64>,
     pub sample_rate: u32,
+    pub bit_depth: Option<u32>,
 }
 
 /// A source container resolved into its ordered tracks + provenance.

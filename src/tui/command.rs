@@ -3906,10 +3906,14 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                     merge: options.merge_to_single,
                     output_root: output_root.clone(),
                     naming: NamingPolicy {
-                        template: "%NN% - %TITLE%".to_string(),
-                        per_album_subdir: true,
-                        collision_policy: NamingCollisionPolicy::Fail,
-                    },
+                    template: options
+                        .naming_template
+                        .clone()
+                        .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
+                    folder_template: options.folder_template.clone(),
+                    per_album_subdir: true,
+                    collision_policy: NamingCollisionPolicy::Fail,
+                },
                     publish: PublishPolicy {
                         overwrite: OverwritePolicy::FailIfExists,
                         same_filesystem_required: false,

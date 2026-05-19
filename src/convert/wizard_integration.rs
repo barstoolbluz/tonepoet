@@ -186,6 +186,7 @@ pub fn extract_wizard_settings(
         calculate_replaygain,
         replaygain_mode,
         naming_template: None, // Use default naming
+        folder_template: None, // Use default folder naming
         overwrite: false,      // Don't overwrite by default
         output_dir,
         resample_quality: wizard.resample_quality, // Pass through resample quality (0-4)
@@ -523,6 +524,7 @@ pub fn preset_to_conversion_options(
             }
         }),
         naming_template: None,
+        folder_template: None,
         overwrite: settings.overwrite,
         output_dir: None,
         resample_quality: settings.resample_quality,
