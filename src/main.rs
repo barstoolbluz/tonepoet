@@ -859,6 +859,7 @@ fn build_pipeline_request_template(
             } else {
                 StageRequirement::Enabled
             },
+            generate_cue: false,
         },
         failure_policy: if partial {
             FailurePolicy::AllowPartialAlbum

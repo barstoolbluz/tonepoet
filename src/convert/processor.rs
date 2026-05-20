@@ -1083,6 +1083,7 @@ fn pipeline_request_for_cue_item(
                 StageRequirement::Disabled
             },
             features: StageRequirement::Enabled,
+                generate_cue: false,
         },
         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
     }
@@ -1210,6 +1211,7 @@ fn pipeline_request_for_sacd_item(
                 StageRequirement::Disabled
             },
             features: StageRequirement::Enabled,
+                generate_cue: false,
         },
         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
     }
@@ -1404,6 +1406,7 @@ async fn run_sevenzip_pipeline_conversion_item(
                     StageRequirement::Disabled
                 },
                 features: StageRequirement::Enabled,
+                generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
         }
@@ -1698,6 +1701,7 @@ pub async fn process_item(
                             StageRequirement::Disabled
                         },
                         features: StageRequirement::Enabled,
+                generate_cue: false,
                     },
                     failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
                 }

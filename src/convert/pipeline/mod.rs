@@ -82,6 +82,7 @@ mod tests {
                 metadata: StageRequirement::Enabled,
                 replaygain: StageRequirement::Enabled,
                 features: StageRequirement::Disabled,
+                generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
         }
@@ -987,6 +988,7 @@ mod tests {
                 metadata: StageRequirement::Enabled,
                 replaygain: StageRequirement::Enabled,
                 features: StageRequirement::Disabled,
+                generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
         }

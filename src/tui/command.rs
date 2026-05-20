@@ -3937,6 +3937,7 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                             StageRequirement::Disabled
                         },
                         features: StageRequirement::Enabled,
+                generate_cue: false,
                     },
                     failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
                 };

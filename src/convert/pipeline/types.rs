@@ -156,6 +156,10 @@ pub struct StagePolicy {
     pub metadata: StageRequirement,
     pub replaygain: StageRequirement,
     pub features: StageRequirement,
+    /// Generate a CUE sheet sidecar for multi-track albums.
+    /// Disabled by default; intended as an advanced/per-preset option.
+    #[serde(default)]
+    pub generate_cue: bool,
 }
 
 /// Per-stage requirement. The user either enables a stage or

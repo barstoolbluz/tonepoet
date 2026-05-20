@@ -2433,7 +2433,7 @@ pub async fn run_features(
         final_path: album_dir.join("conversion.log"),
     });
 
-    if source.tracks.len() > 1 {
+    if req.stages.generate_cue && source.tracks.len() > 1 {
         let cue_staged = staging.root.join("album.cue");
         let cue_content = build_cue_sheet(source, &artifacts);
         fs::write(&cue_staged, &cue_content)?;
@@ -5443,6 +5443,7 @@ mod conversion_log_tests {
                 metadata: StageRequirement::Enabled,
                 replaygain: StageRequirement::Disabled,
                 features: StageRequirement::Enabled,
+                generate_cue: false,
             },
             failure_policy: FailurePolicy::AllowPartialAlbum,
         }
@@ -5736,6 +5737,7 @@ mod naming_template_tests {
                 metadata: StageRequirement::Enabled,
                 replaygain: StageRequirement::Disabled,
                 features: StageRequirement::Enabled,
+                generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
         }
