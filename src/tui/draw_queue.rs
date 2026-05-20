@@ -10,7 +10,7 @@ use ratatui::{
 
 use super::app::AppState;
 use super::button_map::TuiButton;
-use crate::convert::{ConversionItem, ConversionPhase, ConversionStatus};
+use crate::convert::{ConversionItem, ConversionStatus};
 
 /// Draw the queue content area (item list + action bar)
 pub fn draw_queue_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
@@ -80,11 +80,11 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 message: Some(msg),
                 phase,
                 ..
-            } if !msg.is_empty() => Some((msg.clone(), phase_color(phase.as_ref()))),
+            } if !msg.is_empty() => Some((msg.clone(), super::theme::GREEN)),
             ConversionStatus::Completed { output_path, .. } => {
                 let path = output_path.display().to_string();
                 if !path.is_empty() {
-                    Some((path, Color::Green))
+                    Some((path, super::theme::GREEN))
                 } else {
                     None
                 }
@@ -233,7 +233,7 @@ fn draw_queue_item(
             let label = format!("{:.0}% {}", pct_value, phase_label);
 
             let gauge_area =
-                Rect::new(area.x + max_name_len as u16 + 9, area.y, progress_width, 1);
+                Rect::new(area.x + max_name_len as u16 + 10, area.y, progress_width - 1, 1);
             let pct = (pct_value / 100.0).clamp(0.0, 1.0);
             draw_crt_gauge(f, gauge_area, pct, &label);
         }
@@ -267,13 +267,16 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             (
                 vec![Span::styled(
                     format!("{:.0}% {}", pct, phase_name),
-                    Style::default().fg(phase_color(phase.as_ref())),
+                    Style::default().fg(super::theme::GREEN),
                 )],
                 Style::default(),
             )
         }
         ConversionStatus::Completed { .. } => (
-            vec![Span::styled("Completed", Style::default().fg(Color::Green))],
+            vec![Span::styled(
+                "Completed",
+                Style::default().fg(super::theme::GREEN),
+            )],
             Style::default(),
         ),
         ConversionStatus::Partial {
@@ -304,19 +307,6 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
 }
 
 /// Get color for a conversion phase
-fn phase_color(phase: Option<&ConversionPhase>) -> Color {
-    match phase {
-        Some(ConversionPhase::Extracting) => Color::Magenta,
-        Some(ConversionPhase::Analyzing) => Color::Blue,
-        Some(ConversionPhase::Renaming) => Color::Cyan,
-        Some(ConversionPhase::Tagging) => Color::Cyan,
-        Some(ConversionPhase::Converting) => Color::Green,
-        Some(ConversionPhase::PostProcessing) => Color::Yellow,
-        Some(ConversionPhase::Finalizing) => Color::White,
-        None => Color::Blue,
-    }
-}
-
 /// Draw a progress bar with a CRT aperture-grille effect.
 ///
 /// Alternates between brighter and dimmer columns in the filled region
