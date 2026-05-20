@@ -567,6 +567,12 @@ impl Drop for StagingDir {
     fn drop(&mut self) {
         if self.armed {
             let _ = std::fs::remove_dir_all(&self.root);
+            // Try to remove the staging parent (.tonepoet-staging) if now empty.
+            // remove_dir only succeeds on empty directories, so this is safe
+            // when other jobs are still using sibling staging dirs.
+            if let Some(parent) = self.root.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
         }
     }
 }

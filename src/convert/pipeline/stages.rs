@@ -3305,7 +3305,16 @@ async fn finalize_report(
             outcome: logged_outcome.clone(),
             durable_log: None,
         };
-        match write_durable_log(&report_to_write, &req.log) {
+        // Write the log alongside the album artifacts when possible,
+        // fall back to the configured log root for blocked/failed jobs.
+        let effective_log = match &published {
+            Some(album) => LogPolicy {
+                root: album.album_dir.clone(),
+                ..req.log.clone()
+            },
+            None => req.log.clone(),
+        };
+        match write_durable_log(&report_to_write, &effective_log) {
             Ok(path) => {
                 durable_log = Some(path);
                 outcome = logged_outcome;
