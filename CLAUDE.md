@@ -217,6 +217,8 @@ The flake provides:
 - `docs/canonical_artists_reference.txt` — 2,273 canonical artist names for case normalization. One name per line. Used by `ArtistCanonicalizer` for case-insensitive exact matching (match → canonical casing, no match → pass through unchanged).
 - `docs/label_resolver_implementation_brief.md` — Implementation brief for the `DictionaryLabelResolver` (replaces the `StubLabelResolver`).
 - `docs/naming_template_expansion_brief.md` — Implementation brief for the naming template system (folder + filename templates, custom variables).
+- `docs/hexload_log_writer_reference.rs` — Vendored log writer from hexload-tui predecessor project. Reference for conversion log structure and field coverage. **NOT created by a reasoning model** — use as inspiration for WHAT to include, not HOW to implement. Tonepoet's pipeline has richer data structures.
+- `docs/conversion_log_enrichment_brief.md` — Implementation brief for enriching `build_conversion_log()` with comprehensive per-track details.
 
 ## Important Notes
 
