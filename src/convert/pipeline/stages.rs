@@ -3761,6 +3761,7 @@ fn path_from_template_components(rendered: &str) -> PathBuf {
 fn catalog_value(extra: &BTreeMap<String, String>) -> Option<&str> {
     extra
         .get("catalog")
+        .or_else(|| extra.get("catalognumber"))
         .or_else(|| extra.get("sacd_album_catalog_number"))
         .map(String::as_str)
 }

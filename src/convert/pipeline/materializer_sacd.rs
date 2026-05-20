@@ -254,6 +254,21 @@ fn album_metadata(
 
     let sc = |key: &str| sidecar_first_track.and_then(|t| t.meta.get(key)).cloned();
 
+    // Promote sidecar-only fields to album-level extra so folder templates
+    // can resolve %CATALOGNUMBER%, %RELEASECOUNTRY%, MusicBrainz IDs, etc.
+    if let Some(sidecar) = sidecar_first_track {
+        for (key, value) in &sidecar.meta {
+            match key.as_str() {
+                // Already mapped to top-level AlbumMetadata fields.
+                "TITLE" | "ALBUM" | "ARTIST" | "GENRE" | "DATE" | "TRACKNUMBER"
+                | "TOTALTRACKS" => {}
+                _ => {
+                    insert_nonempty(&mut extra, &key.to_lowercase(), value.clone());
+                }
+            }
+        }
+    }
+
     AlbumMetadata {
         album: sc("ALBUM")
             .or_else(|| metadata.album_title().map(str::to_string))
@@ -367,10 +382,12 @@ fn track_metadata(
                 for (key, value) in &sidecar_track.meta {
                     match key.as_str() {
                         // Already mapped to top-level fields.
-                        "TITLE" | "ARTIST" | "GENRE" | "DATE" | "ISRC"
-                        | "TRACKNUMBER" | "TOTALTRACKS" => {}
+                        "TITLE" | "ARTIST" | "GENRE" | "DATE" | "ISRC" | "TRACKNUMBER"
+                        | "TOTALTRACKS" => {}
                         // Preserve everything else (MusicBrainz IDs, etc.).
-                        _ => { insert_nonempty(&mut extra, &key.to_lowercase(), value.clone()); }
+                        _ => {
+                            insert_nonempty(&mut extra, &key.to_lowercase(), value.clone());
+                        }
                     }
                 }
             }
@@ -553,7 +570,11 @@ fn load_sidecar_tracks(iso: &Path, sacd_area: Option<SacdArea>) -> Vec<SidecarTr
     let sidecar = match parse_sidecar(&sidecar_path) {
         Ok(s) => s,
         Err(e) => {
-            log::warn!("SACD sidecar at {} could not be parsed: {:?}", sidecar_path.display(), e);
+            log::warn!(
+                "SACD sidecar at {} could not be parsed: {:?}",
+                sidecar_path.display(),
+                e
+            );
             return Vec::new();
         }
     };
@@ -561,5 +582,9 @@ fn load_sidecar_tracks(iso: &Path, sacd_area: Option<SacdArea>) -> Vec<SidecarTr
         SacdArea::Stereo => 1_u8,
         SacdArea::MultiChannel => 2_u8,
     };
-    sidecar.tracks_for_area(area_index).into_iter().cloned().collect()
+    sidecar
+        .tracks_for_area(area_index)
+        .into_iter()
+        .cloned()
+        .collect()
 }

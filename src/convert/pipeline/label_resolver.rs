@@ -25,6 +25,7 @@ const CATALOG_COUNTRY_MAPPINGS: &[(&str, &str)] = &[
     ("POCM", "Japan"),
     ("SICP", "Japan"),
     ("SRCS", "Japan"),
+    ("SRGS", "Japan"),
     ("TECW", "Japan"),
     ("TOCJ", "Japan"),
     ("TYCJ", "Japan"),
@@ -661,7 +662,9 @@ fn nonempty_extra<'a>(extra: &'a BTreeMap<String, String>, key: &str) -> Option<
 }
 
 fn catalog_value(extra: &BTreeMap<String, String>) -> Option<&str> {
-    nonempty_extra(extra, "catalog").or_else(|| nonempty_extra(extra, "sacd_album_catalog_number"))
+    nonempty_extra(extra, "catalog")
+        .or_else(|| nonempty_extra(extra, "catalognumber"))
+        .or_else(|| nonempty_extra(extra, "sacd_album_catalog_number"))
 }
 
 fn extract_catalog_prefix(value: &str) -> Option<String> {
