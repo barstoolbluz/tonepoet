@@ -4553,7 +4553,10 @@ fn acquire_file_lock(lock_path: &Path, busy_message: &str) -> Result<FileLock, L
         .map_err(LockAcquireError::Io)?;
 
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(FileLock { file }),
+        Ok(()) => Ok(FileLock {
+            file,
+            path: lock_path.to_path_buf(),
+        }),
         Err(err) if is_lock_contention(&err) => {
             Err(LockAcquireError::Busy(busy_message.to_string()))
         }
@@ -4597,11 +4600,13 @@ enum LockAcquireError {
 
 struct FileLock {
     file: fs::File,
+    path: PathBuf,
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
+        let _ = fs::remove_file(&self.path);
     }
 }
 
