@@ -4238,9 +4238,13 @@ fn render_track_template(
         .unwrap_or_default();
 
     let mut rendered = template.to_string();
-    rendered = rendered.replace("%NN%", &format!("{n:02}"));
-    rendered = rendered.replace("%N%", &n.to_string());
-    rendered = rendered.replace("%TRACK%", &n.to_string());
+    let nn = format!("{n:02}");
+    rendered = rendered.replace("%NN%", &nn);
+    rendered = rendered.replace("%TRACKNN%", &nn);
+    let n_str = n.to_string();
+    rendered = rendered.replace("%N%", &n_str);
+    rendered = rendered.replace("%TRACKN%", &n_str);
+    rendered = rendered.replace("%TRACK%", &n_str);
     rendered = rendered.replace("%TITLE%", &title);
     rendered = rendered.replace("%ARTIST%", &artist);
     rendered = rendered.replace("%ALBUM_ARTIST%", &album_artist);
