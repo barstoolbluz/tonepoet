@@ -25,6 +25,8 @@ pub struct TuiPreset {
     pub replaygain: String, // "album", "track", "both", "off"
 
     // Output options pane
+    #[serde(default)]
+    pub dest_path: Option<String>,
     pub folder_template: String,
     pub filename_template: String,
     pub merge: String, // "multi-file", "single-image"
@@ -46,6 +48,10 @@ impl TuiPreset {
             bit_depth: format.bit_depth.selected_label().to_string(),
             dither: format.dither.selected_label().to_lowercase(),
             replaygain: format.replaygain.selected_label().to_lowercase(),
+            dest_path: output_opts
+                .dest_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             folder_template: output_opts.folder_template.clone(),
             filename_template: output_opts.filename_template.clone(),
             merge: match *output_opts.merge.selected_value() {
@@ -86,6 +92,9 @@ impl TuiPreset {
         }
 
         // Output options
+        if let Some(ref p) = self.dest_path {
+            output_opts.dest_path = Some(std::path::PathBuf::from(p));
+        }
         output_opts.folder_template = self.folder_template.clone();
         output_opts.filename_template = self.filename_template.clone();
 
@@ -163,6 +172,7 @@ impl TuiPreset {
             bit_depth: bit_depth.to_string(),
             dither: dither.to_string(),
             replaygain: replaygain.to_string(),
+            dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
             merge: merge.to_string(),

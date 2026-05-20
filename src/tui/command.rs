@@ -3822,6 +3822,12 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
         return;
     }
 
+    // Block commit when no destination path is set.
+    if app.convert.output_options.dest_path.is_none() {
+        app.set_status("no destination path set — enter a path in the output options");
+        return;
+    }
+
     // Block commit when all tracks are deselected.
     if let SourceMode::MultiTrack { selected, .. } = &app.convert.source.mode {
         if selected.iter().all(|s| !s) {
