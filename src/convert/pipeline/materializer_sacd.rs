@@ -260,7 +260,7 @@ fn album_metadata(
         for (key, value) in &sidecar.meta {
             match key.as_str() {
                 // Already mapped to top-level AlbumMetadata fields.
-                "TITLE" | "ALBUM" | "ARTIST" | "GENRE" | "DATE" | "TRACKNUMBER"
+                "TITLE" | "ALBUM" | "ARTIST" | "GENRE" | "DATE" | "ISRC" | "TRACKNUMBER"
                 | "TOTALTRACKS" => {}
                 _ => {
                     insert_nonempty(&mut extra, &key.to_lowercase(), value.clone());

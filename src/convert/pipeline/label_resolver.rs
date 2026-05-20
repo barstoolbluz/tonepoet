@@ -881,6 +881,70 @@ fn extract_year_from_date(date: &str) -> Option<String> {
     None
 }
 
+/// Format keywords that indicate a parenthetical contains metadata,
+/// not album title content. Each is independently sufficient to
+/// trigger `%TITLE_EXTRA%` extraction.
+const FORMAT_KEYWORDS: &[&str] = &[
+    "SACD", "DVDA", "DVD-A", "DVD-V", "ISO", "XRCD", "XRCD2", "XRCD24", "SHM", "Hybrid", "Blu-Ray",
+    "Blu-ray", "BluRay",
+];
+
+/// Check whether a string contains a recognized metadata identifier
+/// (catalog prefix + number, format keyword, or premium/audiophile label).
+///
+/// Used by `%TITLE_EXTRA%` to determine whether a trailing parenthetical
+/// in an album name contains metadata that should be stripped.
+pub fn contains_metadata_identifier(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+
+    // Rule 1: catalog prefix + number pattern (e.g., "SRGS-4504", "UCCQ 1234")
+    for &(prefix, _) in CATALOG_COUNTRY_MAPPINGS {
+        if upper.contains(prefix) {
+            // Check that the prefix is followed (possibly after a separator) by digits
+            if let Some(pos) = upper.find(prefix) {
+                let after = &upper[pos + prefix.len()..];
+                let after_trimmed = after.trim_start_matches(|c: char| c == '-' || c == ' ');
+                if after_trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Rule 2: format keywords (SACD, DVDA, ISO, etc.)
+    for keyword in FORMAT_KEYWORDS {
+        let kw_upper = keyword.to_ascii_uppercase();
+        if upper.contains(&kw_upper) {
+            return true;
+        }
+    }
+
+    // Rule 3: premium/audiophile label names
+    let normalized = normalize_for_match(text);
+    for &label in PREMIUM_LABELS {
+        let label_norm = normalize_for_match(label);
+        if contains_phrase(&normalized, &label_norm) {
+            return true;
+        }
+    }
+
+    // Also check all canonical label variants (Blue Note Tone Poet, Music Matters, etc.)
+    for &(canonical, variants) in CANONICAL_LABEL_VARIANTS {
+        let canon_norm = normalize_for_match(canonical);
+        if contains_phrase(&normalized, &canon_norm) {
+            return true;
+        }
+        for variant in variants {
+            let var_norm = normalize_for_match(variant);
+            if contains_phrase(&normalized, &var_norm) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1205,5 +1269,43 @@ mod tests {
             canonicalizer.canonicalize("Unknown Artist Not In List"),
             "Unknown Artist Not In List"
         );
+    }
+
+    #[test]
+    fn metadata_identifier_matches_catalog_prefix_with_digits() {
+        assert!(contains_metadata_identifier("SME JSACD SRGS-4504"));
+        assert!(contains_metadata_identifier("UCCQ 1234"));
+        assert!(contains_metadata_identifier("TOCP-12345"));
+    }
+
+    #[test]
+    fn metadata_identifier_rejects_catalog_prefix_without_digits() {
+        assert!(!contains_metadata_identifier("SRGS"));
+        assert!(!contains_metadata_identifier("UCCQ only text"));
+    }
+
+    #[test]
+    fn metadata_identifier_matches_format_keywords() {
+        assert!(contains_metadata_identifier("SACD 2.0"));
+        assert!(contains_metadata_identifier("Japan / SHM SACD ISO"));
+        assert!(contains_metadata_identifier("Hybrid SACD"));
+        assert!(contains_metadata_identifier("DVDA"));
+        assert!(contains_metadata_identifier("Blu-Ray"));
+    }
+
+    #[test]
+    fn metadata_identifier_matches_premium_labels() {
+        assert!(contains_metadata_identifier("MFSL LP / 24-96"));
+        assert!(contains_metadata_identifier("DCC Compact Classics"));
+        assert!(contains_metadata_identifier("Analogue Productions SACD"));
+    }
+
+    #[test]
+    fn metadata_identifier_rejects_non_metadata() {
+        assert!(!contains_metadata_identifier("alternate take"));
+        assert!(!contains_metadata_identifier("Mono"));
+        assert!(!contains_metadata_identifier("Live at the Apollo"));
+        assert!(!contains_metadata_identifier("US"));
+        assert!(!contains_metadata_identifier("1st show"));
     }
 }

@@ -3572,12 +3572,15 @@ fn render_track_template(
         .as_deref()
         .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| artist.clone());
-    let album = source
-        .album_metadata
-        .album
-        .as_deref()
-        .map(sanitize_component)
-        .unwrap_or_else(|| "Album".to_string());
+    let raw_album = source.album_metadata.album.as_deref().unwrap_or("Album");
+    let (album, title_extra) = if template.contains("%TITLE_EXTRA%") {
+        match extract_title_extra(raw_album) {
+            Some((clean, extra)) => (sanitize_component(&clean), sanitize_component(&extra)),
+            None => (sanitize_component(raw_album), String::new()),
+        }
+    } else {
+        (sanitize_component(raw_album), String::new())
+    };
     let disc = track
         .id
         .disc_number
@@ -3627,6 +3630,7 @@ fn render_track_template(
     rendered = rendered.replace("%ARTIST%", &artist);
     rendered = rendered.replace("%ALBUM_ARTIST%", &album_artist);
     rendered = rendered.replace("%ALBUM%", &album);
+    rendered = rendered.replace("%TITLE_EXTRA%", &title_extra);
     rendered = rendered.replace("%DISC%", &disc.to_string());
     rendered = rendered.replace("%FORMAT%", format.name());
     rendered = rendered.replace("%YEAR%", &year);
@@ -3664,13 +3668,20 @@ fn render_folder_template(template: &str, source: &PreparedSource, format: Audio
         })
         .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| "Unknown Artist".to_string());
-    let album = source
+    let raw_album = source
         .album_metadata
         .album
         .as_deref()
         .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
-        .map(sanitize_component)
-        .unwrap_or_else(|| "Album".to_string());
+        .unwrap_or("Album");
+    let (album, title_extra) = if template.contains("%TITLE_EXTRA%") {
+        match extract_title_extra(raw_album) {
+            Some((clean, extra)) => (sanitize_component(&clean), sanitize_component(&extra)),
+            None => (sanitize_component(raw_album), String::new()),
+        }
+    } else {
+        (sanitize_component(raw_album), String::new())
+    };
     let year = source
         .album_metadata
         .date
@@ -3703,6 +3714,7 @@ fn render_folder_template(template: &str, source: &PreparedSource, format: Audio
     rendered = rendered.replace("%ARTIST%", &artist);
     rendered = rendered.replace("%ALBUM_ARTIST%", &artist);
     rendered = rendered.replace("%ALBUM%", &album);
+    rendered = rendered.replace("%TITLE_EXTRA%", &title_extra);
     rendered = rendered.replace("%YEAR%", &year);
     rendered = rendered.replace("%GENRE%", &genre);
     rendered = rendered.replace("%CATALOG%", &catalog);
@@ -3756,6 +3768,85 @@ fn path_from_template_components(rendered: &str) -> PathBuf {
         path.push(component);
     }
     path
+}
+
+/// Extract metadata from a trailing parenthetical in an album name.
+///
+/// Scans for the last `(content)` optionally followed by `[bracket]` at the
+/// end of the string. If the parenthetical content contains a recognized
+/// metadata identifier (catalog prefix, format keyword, or audiophile label),
+/// returns `Some((clean_album, extra_content))`. Otherwise returns `None`.
+///
+/// Only called when `%TITLE_EXTRA%` appears in the template.
+fn extract_title_extra(album: &str) -> Option<(String, String)> {
+    // Find the last '(' that has a matching ')'
+    let mut depth = 0_i32;
+    let mut last_open = None;
+    let mut last_close = None;
+    for (i, ch) in album.char_indices().rev() {
+        match ch {
+            ')' => {
+                depth += 1;
+                if last_close.is_none() {
+                    last_close = Some(i);
+                }
+            }
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    last_open = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let open = last_open?;
+    let close = last_close?;
+    if close <= open {
+        return None;
+    }
+
+    // Don't strip parentheticals at the very start of the album name
+    // (e.g., "(Ain't That) Good News")
+    if open == 0 {
+        return None;
+    }
+
+    let content = &album[open + 1..close];
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    // Check if the content contains a recognized metadata identifier
+    if !super::label_resolver::contains_metadata_identifier(content) {
+        return None;
+    }
+
+    // Strip the parenthetical and any trailing bracket like [ISO], [FLAC]
+    let before = album[..open].trim_end();
+    let after = album[close + 1..].trim_start();
+
+    // Strip trailing [...] if present
+    let clean = if after.starts_with('[') {
+        if let Some(bracket_end) = after.find(']') {
+            let remainder = after[bracket_end + 1..].trim();
+            if remainder.is_empty() {
+                before.to_string()
+            } else {
+                format!("{} {}", before, remainder)
+            }
+        } else {
+            before.to_string()
+        }
+    } else if after.is_empty() {
+        before.to_string()
+    } else {
+        format!("{} {}", before, after)
+    };
+
+    Some((clean, content.trim().to_string()))
 }
 
 fn catalog_value(extra: &BTreeMap<String, String>) -> Option<&str> {
@@ -4967,6 +5058,171 @@ mod naming_template_tests {
         assert_eq!(format_sample_rate(96_000), "96kHz");
         assert_eq!(format_sample_rate(2_822_400), "DSD64");
         assert_eq!(format_sample_rate(5_644_800), "DSD128");
+    }
+}
+
+#[cfg(test)]
+mod title_extra_tests {
+    use super::*;
+
+    #[test]
+    fn strips_catalog_prefix_parenthetical() {
+        let (album, extra) =
+            extract_title_extra("A Tribute to Jack Johnson (SME JSACD SRGS-4504) [ISO]").unwrap();
+        assert_eq!(album, "A Tribute to Jack Johnson");
+        assert_eq!(extra, "SME JSACD SRGS-4504");
+    }
+
+    #[test]
+    fn strips_shm_sacd_parenthetical() {
+        let (album, extra) = extract_title_extra("Aja (Japan / SHM SACD ISO)").unwrap();
+        assert_eq!(album, "Aja");
+        assert_eq!(extra, "Japan / SHM SACD ISO");
+    }
+
+    #[test]
+    fn strips_sacd_version_parenthetical() {
+        let (album, extra) = extract_title_extra("All I Got (SACD 2.0)").unwrap();
+        assert_eq!(album, "All I Got");
+        assert_eq!(extra, "SACD 2.0");
+    }
+
+    #[test]
+    fn strips_label_sacd_parenthetical() {
+        let (album, extra) =
+            extract_title_extra("Amused to Death (Analogue Productions SACD) [ISO]").unwrap();
+        assert_eq!(album, "Amused to Death");
+        assert_eq!(extra, "Analogue Productions SACD");
+    }
+
+    #[test]
+    fn strips_mfsl_parenthetical() {
+        let (album, extra) =
+            extract_title_extra("Dark Side of the Moon (MFSL LP / 24-96)").unwrap();
+        assert_eq!(album, "Dark Side of the Moon");
+        assert_eq!(extra, "MFSL LP / 24-96");
+    }
+
+    #[test]
+    fn preserves_live_at_parenthetical() {
+        assert!(extract_title_extra("Live at the Apollo").is_none());
+    }
+
+    #[test]
+    fn preserves_alternate_take_parenthetical() {
+        assert!(extract_title_extra("All The Things You Are (alternate take)").is_none());
+    }
+
+    #[test]
+    fn preserves_mono_parenthetical() {
+        assert!(extract_title_extra("A Legal Matter (Mono)").is_none());
+    }
+
+    #[test]
+    fn preserves_country_only_parenthetical() {
+        assert!(extract_title_extra("Aftermath (US)").is_none());
+    }
+
+    #[test]
+    fn preserves_leading_parenthetical() {
+        assert!(extract_title_extra("(Ain't That) Good News").is_none());
+    }
+
+    #[test]
+    fn strips_last_parenthetical_only() {
+        let (album, extra) = extract_title_extra("Aftermath (US) (ABKCO Hybrid SACD ISO)").unwrap();
+        assert_eq!(album, "Aftermath (US)");
+        assert_eq!(extra, "ABKCO Hybrid SACD ISO");
+    }
+
+    #[test]
+    fn no_parenthetical_returns_none() {
+        assert!(extract_title_extra("Dark Side of the Moon").is_none());
+    }
+
+    #[test]
+    fn folder_template_without_title_extra_preserves_album() {
+        let mut source = template_source();
+        source.album_metadata.album =
+            Some("A Tribute to Jack Johnson (SME JSACD SRGS-4504) [ISO]".to_string());
+        let result = render_folder_template("%ARTIST% - %ALBUM%", &source, AudioFormat::Flac);
+        // Without %TITLE_EXTRA%, album is unchanged (just sanitized)
+        assert!(result
+            .to_string_lossy()
+            .contains("A Tribute to Jack Johnson (SME JSACD SRGS-4504)"));
+    }
+
+    #[test]
+    fn folder_template_with_title_extra_strips_album() {
+        let mut source = template_source();
+        source.album_metadata.album =
+            Some("A Tribute to Jack Johnson (SME JSACD SRGS-4504) [ISO]".to_string());
+        let result = render_folder_template(
+            "%ARTIST% - %ALBUM% {%TITLE_EXTRA%}",
+            &source,
+            AudioFormat::Flac,
+        );
+        let s = result.to_string_lossy();
+        assert!(
+            s.contains("A Tribute to Jack Johnson"),
+            "album should be clean: {s}"
+        );
+        assert!(
+            s.contains("SME JSACD SRGS-4504"),
+            "extra should contain catalog: {s}"
+        );
+        assert!(!s.contains("[ISO]"), "bracket should be stripped: {s}");
+    }
+
+    #[test]
+    fn track_template_with_title_extra_strips_album() {
+        let mut source = template_source();
+        source.album_metadata.album = Some("Dark Side of the Moon (MFSL SACD) [ISO]".to_string());
+        source.tracks[0].metadata.title = Some("Time".to_string());
+        let result = render_track_template(
+            "%NN% - %TITLE% [%ALBUM%] {%TITLE_EXTRA%}",
+            &source,
+            &source.tracks[0],
+            AudioFormat::Flac,
+        )
+        .unwrap();
+        let s = result.to_string_lossy();
+        assert!(s.contains("Dark Side of the Moon"), "album stripped: {s}");
+        assert!(s.contains("MFSL SACD"), "extra populated: {s}");
+        assert!(!s.contains("[ISO]"), "bracket stripped: {s}");
+    }
+
+    fn template_source() -> PreparedSource {
+        PreparedSource {
+            container: PathBuf::from("/tmp/test.iso"),
+            kind: SourceKind::SacdIso,
+            tracks: vec![PreparedTrack {
+                id: TrackId {
+                    source_ordinal: 1,
+                    track_number: 1,
+                    disc_number: None,
+                },
+                source_ref: TrackSourceRef::StagedFile(PathBuf::from("/tmp/track.dsf")),
+                metadata: TrackMetadata {
+                    artist: Some("Miles Davis".to_string()),
+                    ..Default::default()
+                },
+                expected_samples: None,
+                sample_rate: 2_822_400,
+                bit_depth: None,
+            }],
+            album_metadata: AlbumMetadata {
+                album: Some("A Tribute to Jack Johnson".to_string()),
+                album_artist: Some("Miles Davis".to_string()),
+                ..Default::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SacdIso,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        }
     }
 }
 
