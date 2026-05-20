@@ -211,6 +211,13 @@ The flake provides:
 - `BINDGEN_EXTRA_CLANG_ARGS` — C header include paths for sandboxed `nix build`
 - `ffmpeg_7-full` in `buildInputs` — provides libavformat/libavcodec/libavutil for ffmpeg-next linking
 
+## Reference Data (docs/)
+
+- `docs/hexload_labels_reference.rs` — 370+ label/pressing/mastering-engineer/pressing-plant mappings vendored from hexload-tui. Used as the data source for the `DictionaryLabelResolver` implementation. Includes audiophile labels, country-specific labels (UK Harvest vs Japan Harvest), mastering engineers (RL, Sterling, KG, BG, Wally, etc.), and pressing plants (RTI, QRP, Pallas, Monarch, TML, etc.).
+- `docs/canonical_artists_reference.txt` — 2,273 canonical artist names for case normalization. One name per line. Used by `ArtistCanonicalizer` for case-insensitive exact matching (match → canonical casing, no match → pass through unchanged).
+- `docs/label_resolver_implementation_brief.md` — Implementation brief for the `DictionaryLabelResolver` (replaces the `StubLabelResolver`).
+- `docs/naming_template_expansion_brief.md` — Implementation brief for the naming template system (folder + filename templates, custom variables).
+
 ## Important Notes
 
 - **processor.rs is the largest file** (~4K LOC) — it orchestrates the entire conversion pipeline including 7z extraction, multi-format conversion, ReplayGain, metadata transfer, and file renaming
