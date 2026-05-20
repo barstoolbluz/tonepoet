@@ -2752,6 +2752,14 @@ pub fn write_durable_log(report: &PipelineReport, log: &LogPolicy) -> Result<Pat
 // Orchestrator  (PR 4 body, final shape)
 // ===========================================================================
 
+fn enrich_source_with_label_info(source: &mut PreparedSource, container: &Path) {
+    super::label_resolver::enrich_with_label_info(
+        &mut source.album_metadata,
+        container,
+        super::label_resolver::dictionary_label_resolver(),
+    );
+}
+
 /// Run the staged pipeline for one queue item. `process_item` does not call
 /// this yet; PR 4 freezes this orchestration shape for later PRs.
 pub async fn run_pipeline_item(
@@ -2920,11 +2928,7 @@ pub async fn run_pipeline_item_with_tool_paths(
     // Enrich album metadata with label/pressing info before planning.
     // Tag-sourced values take priority; the resolver only fills gaps.
     if let Some(ref mut src) = source {
-        super::label_resolver::enrich_with_label_info(
-            &mut src.album_metadata,
-            &req.container,
-            &super::label_resolver::StubLabelResolver,
-        );
+        enrich_source_with_label_info(src, &req.container);
     }
 
     emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
@@ -3560,13 +3564,13 @@ fn render_track_template(
         .artist
         .as_deref()
         .or(source.album_metadata.album_artist.as_deref())
-        .map(sanitize_component)
+        .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| "Unknown Artist".to_string());
     let album_artist = source
         .album_metadata
         .album_artist
         .as_deref()
-        .map(sanitize_component)
+        .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| artist.clone());
     let album = source
         .album_metadata
@@ -3658,7 +3662,7 @@ fn render_folder_template(template: &str, source: &PreparedSource, format: Audio
                 .iter()
                 .find_map(|track| track.metadata.artist.as_deref())
         })
-        .map(sanitize_component)
+        .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| "Unknown Artist".to_string());
     let album = source
         .album_metadata
@@ -4809,6 +4813,149 @@ mod naming_template_tests {
         assert_eq!(
             render_folder_template("%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
             PathBuf::from("Miles_Davis/A Tribute to Jack Johnson")
+        );
+    }
+
+    #[test]
+    fn resolver_enrichment_feeds_folder_template_extra_tokens() {
+        let mut source = template_source();
+        source
+            .album_metadata
+            .extra
+            .insert("catalog".to_string(), "UCCQ-1234".to_string());
+        source
+            .album_metadata
+            .extra
+            .insert("media".to_string(), "CD".to_string());
+
+        super::super::label_resolver::enrich_with_label_info(
+            &mut source.album_metadata,
+            Path::new("Miles Davis - Album.7z"),
+            super::super::label_resolver::dictionary_label_resolver(),
+        );
+
+        assert_eq!(
+            render_folder_template("%COUNTRY%/%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
+            PathBuf::from("Japan/Miles Davis/A Tribute to Jack Johnson")
+        );
+    }
+
+    #[test]
+    fn resolver_enrichment_feeds_pressing_token_without_overwriting_label() {
+        let mut source = template_source();
+        source
+            .album_metadata
+            .extra
+            .insert("label".to_string(), "MoFi".to_string());
+        source
+            .album_metadata
+            .extra
+            .insert("media".to_string(), "CD".to_string());
+
+        super::super::label_resolver::enrich_with_label_info(
+            &mut source.album_metadata,
+            Path::new("Miles Davis - Album.7z"),
+            super::super::label_resolver::dictionary_label_resolver(),
+        );
+
+        assert_eq!(
+            source.album_metadata.extra.get("label").map(String::as_str),
+            Some("MoFi")
+        );
+        assert_eq!(
+            source
+                .album_metadata
+                .extra
+                .get("pressing")
+                .map(String::as_str),
+            Some("MFSL")
+        );
+        assert_eq!(
+            render_folder_template("%PRESSING%/%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
+            PathBuf::from("MFSL/Miles Davis/A Tribute to Jack Johnson")
+        );
+    }
+
+    #[test]
+    fn folder_template_canonicalizes_artist_casing() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = Some("miles davis".to_string());
+        assert_eq!(
+            render_folder_template("%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
+            PathBuf::from("Miles Davis/A Tribute to Jack Johnson")
+        );
+    }
+
+    #[test]
+    fn track_template_canonicalizes_track_artist_casing() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = None;
+        source.tracks[0].metadata.artist = Some("bill evans trio".to_string());
+        let path = render_track_template(
+            "%ARTIST% - %TITLE%",
+            &source,
+            &source.tracks[0],
+            AudioFormat::Flac,
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("Bill Evans Trio - Right Off"));
+    }
+
+    #[test]
+    fn track_template_canonicalizes_album_artist_casing() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = Some("miles davis".to_string());
+        let path = render_track_template(
+            "%ALBUM_ARTIST% - %TITLE%",
+            &source,
+            &source.tracks[0],
+            AudioFormat::Flac,
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("Miles Davis - Right Off"));
+    }
+
+    #[test]
+    fn pipeline_enrichment_before_output_planning_produces_folder_name() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = Some("miles davis".to_string());
+        source.album_metadata.extra.clear();
+        source
+            .album_metadata
+            .extra
+            .insert("media".to_string(), "LP".to_string());
+
+        let mut req = template_request(Some("%COUNTRY%/%PRESSING%/%ARTIST%/%ALBUM%".to_string()));
+        req.container = PathBuf::from("/tmp/The Beatles - Let It Be QRP.7z");
+
+        enrich_source_with_label_info(&mut source, &req.container);
+        let plan = plan_outputs(&source, &req).unwrap();
+
+        assert_eq!(
+            source
+                .album_metadata
+                .extra
+                .get("country")
+                .map(String::as_str),
+            Some("US")
+        );
+        assert_eq!(
+            source
+                .album_metadata
+                .extra
+                .get("pressing")
+                .map(String::as_str),
+            Some("US QRP Press LP")
+        );
+        assert_eq!(
+            plan.album_dir,
+            PathBuf::from("/out/US/US QRP Press LP/Miles Davis/A Tribute to Jack Johnson")
+        );
+        assert_eq!(
+            plan.entries[0].final_path,
+            PathBuf::from(
+                "/out/US/US QRP Press LP/Miles Davis/A Tribute to Jack Johnson/01 - Right Off.flac"
+            )
         );
     }
 
