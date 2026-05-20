@@ -225,7 +225,7 @@ impl ArtistCanonicalizer {
 - Build a `HashMap<String, String>` mapping `artist.to_lowercase()` → canonical form
 - `canonicalize()` looks up the lowercased input; returns canonical form if found, original input unchanged if not
 - Never rejects — always returns a value
-- The canonical list has 2,273 entries (vendored at `docs/canonical_artists_reference.txt`)
+- The canonical list has 2,437 entries (vendored at `docs/canonical_artists_reference.txt`)
 
 **Integration point:** Call the canonicalizer on the artist value in BOTH `render_folder_template` and `render_track_template`, after extracting the artist from metadata but before `sanitize_component`. This ensures `%ARTIST%` in templates always produces the canonical casing.
 
