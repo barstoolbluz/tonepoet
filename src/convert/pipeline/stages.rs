@@ -2459,33 +2459,639 @@ fn build_conversion_log(
     req: &PipelineRequest,
 ) -> String {
     let mut log = String::new();
-    log.push_str(&format!(
-        "Conversion Log — {}\n",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-    ));
-    log.push_str(&format!("Source: {}\n", source.container.display()));
-    log.push_str(&format!("Target format: {:?}\n", req.target_format));
-    log.push_str(&format!("Tracks in source: {}\n\n", source.tracks.len()));
-    match outcome {
-        AlbumOutcome::Complete { tracks, .. } => {
-            log.push_str(&format!("Result: Complete ({} tracks)\n", tracks.len()));
-        }
-        AlbumOutcome::Partial {
-            successful, failed, ..
-        } => {
-            log.push_str(&format!(
-                "Result: Partial ({} ok, {} failed)\n",
-                successful.len(),
-                failed.len()
-            ));
-        }
-        AlbumOutcome::Blocked { reason, .. } => {
-            log.push_str(&format!("Result: Blocked ({:?})\n", reason));
+    let tracks = collect_outcome_tracks(outcome);
+    let source_tracks_by_ordinal = build_source_track_index(source);
+    let successful_count = tracks
+        .iter()
+        .filter(|track| matches!(track.outcome, TrackOutcome::Ok))
+        .count();
+    let failed_count = tracks.len().saturating_sub(successful_count);
+    let total_track_count = source.tracks.len().max(tracks.len());
+    let total_bytes_in = tracks
+        .iter()
+        .filter_map(|track| track.bytes_in)
+        .fold(0_u64, u64::saturating_add);
+    let total_bytes_out = tracks
+        .iter()
+        .filter_map(|track| track.bytes_out)
+        .fold(0_u64, u64::saturating_add);
+    let missing_input_sizes = tracks
+        .iter()
+        .filter(|track| track.bytes_in.is_none())
+        .count();
+    let missing_output_sizes = tracks
+        .iter()
+        .filter(|track| track.bytes_out.is_none())
+        .count();
+    let missing_durations = tracks
+        .iter()
+        .filter(|track| track.duration.is_none())
+        .count();
+    let total_duration = total_track_duration(&tracks);
+
+    log.push_str("TONEPOET CONVERSION LOG\n");
+    log.push_str("=======================\n");
+    push_kv_line(
+        &mut log,
+        "Generated (UTC)",
+        chrono::Utc::now()
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string(),
+    );
+    push_kv_line(&mut log, "Job ID", &req.job_id);
+    push_kv_line(&mut log, "Item ID", &req.item_id);
+    log.push('\n');
+
+    log.push_str("Source Information\n");
+    log.push_str("------------------\n");
+    push_kv_line(&mut log, "Container path", path_log_value(&req.container));
+    push_kv_line(&mut log, "Source kind", source_kind_label(source.kind));
+    push_kv_line(&mut log, "Track count", source.tracks.len().to_string());
+    push_optional_kv_line(
+        &mut log,
+        "Album artist",
+        source.album_metadata.album_artist.as_deref(),
+    );
+    push_optional_kv_line(&mut log, "Album", source.album_metadata.album.as_deref());
+    push_optional_kv_line(
+        &mut log,
+        "Year",
+        conversion_log_album_year(&source.album_metadata),
+    );
+    push_optional_kv_line(&mut log, "Genre", source.album_metadata.genre.as_deref());
+    push_optional_kv_line(
+        &mut log,
+        "Catalog number",
+        conversion_log_catalog_number(&source.album_metadata.extra),
+    );
+    log.push('\n');
+
+    log.push_str("Conversion Settings\n");
+    log.push_str("-------------------\n");
+    push_kv_line(&mut log, "Target format", req.target_format.name());
+    push_kv_line(
+        &mut log,
+        "Encode backend",
+        format!("{:?}", req.encode.backend),
+    );
+    if let Some(bitrate) = req.encode.bitrate {
+        push_kv_line(&mut log, "Bitrate", format!("{bitrate} kbps"));
+    }
+    if let Some(level) = req.encode.compression_level {
+        push_kv_line(&mut log, "Compression level", level.to_string());
+    }
+    push_kv_line(
+        &mut log,
+        "Dither policy",
+        format!("{:?}", req.encode.dither),
+    );
+    push_kv_line(&mut log, "Merge mode", yes_no(req.merge));
+    push_kv_line(
+        &mut log,
+        "Metadata",
+        stage_requirement_label(req.stages.metadata),
+    );
+    push_kv_line(
+        &mut log,
+        "ReplayGain",
+        stage_requirement_label(req.stages.replaygain),
+    );
+    push_kv_line(
+        &mut log,
+        "Features",
+        stage_requirement_label(req.stages.features),
+    );
+    match &req.naming.folder_template {
+        Some(template) => push_kv_line(&mut log, "Folder template", template),
+        None => push_kv_line(&mut log, "Folder template", "album-name fallback"),
+    }
+    push_kv_line(&mut log, "Filename template", &req.naming.template);
+    log.push('\n');
+
+    log.push_str("Per-Track Results\n");
+    log.push_str("-----------------\n");
+    if tracks.is_empty() {
+        log.push_str("No track records were produced.\n");
+    } else {
+        for record in &tracks {
+            append_track_log(
+                &mut log,
+                record,
+                source_tracks_by_ordinal
+                    .get(&record.track_id.source_ordinal)
+                    .copied(),
+            );
         }
     }
+    log.push('\n');
+
+    log.push_str("Stage Summary\n");
+    log.push_str("-------------\n");
+    let stages = outcome_stage_records(outcome);
+    if stages.is_empty() {
+        log.push_str("No stage records were produced.\n");
+    } else {
+        for stage in stages {
+            push_kv_line(
+                &mut log,
+                pipeline_stage_label(stage.stage),
+                stage_outcome_label(&stage.outcome),
+            );
+        }
+    }
+    log.push('\n');
+
+    log.push_str("Overall Summary\n");
+    log.push_str("---------------\n");
+    push_kv_line(
+        &mut log,
+        "Total tracks",
+        format!(
+            "{successful_count} successful / {failed_count} failed / {total_track_count} total"
+        ),
+    );
+    append_total_size_line(
+        &mut log,
+        total_bytes_in,
+        total_bytes_out,
+        missing_input_sizes,
+        missing_output_sizes,
+    );
+    append_total_duration_line(&mut log, total_duration, missing_durations);
+    push_kv_line(
+        &mut log,
+        "Result",
+        outcome_result_label(outcome, successful_count, failed_count, total_track_count),
+    );
+    log.push('\n');
+
+    log.push_str("Log generated by tonepoet\n");
     log
 }
 
+fn build_source_track_index<'a>(source: &'a PreparedSource) -> BTreeMap<u32, &'a PreparedTrack> {
+    let mut tracks_by_ordinal = BTreeMap::new();
+    for track in &source.tracks {
+        tracks_by_ordinal
+            .entry(track.id.source_ordinal)
+            .or_insert(track);
+    }
+    tracks_by_ordinal
+}
+
+fn append_track_log(log: &mut String, record: &TrackRecord, prepared: Option<&PreparedTrack>) {
+    log.push_str(&escape_log_value(&track_display_label(record, prepared)));
+    log.push('\n');
+    match &record.outcome {
+        TrackOutcome::Ok => log.push_str("  Status: Success\n"),
+        TrackOutcome::Err(error) => {
+            log.push_str("  Status: Failure\n");
+            push_kv_line(log, "  Error", error);
+        }
+    }
+
+    if let Some(track) = prepared {
+        push_optional_kv_line(log, "  Artist", track.metadata.artist.as_deref());
+        push_optional_kv_line(log, "  Composer", track.metadata.composer.as_deref());
+        let mut source_audio = format_sample_rate(track.sample_rate);
+        if let Some(bit_depth) = track.bit_depth {
+            source_audio.push_str(&format!(", {bit_depth}-bit"));
+        }
+        if let Some(expected_samples) = track.expected_samples {
+            source_audio.push_str(&format!(", {expected_samples} expected samples"));
+        }
+        push_kv_line(log, "  Source audio", source_audio);
+    }
+
+    push_kv_line(
+        log,
+        "  Source ref",
+        track_source_ref_label(&record.source_ref),
+    );
+    if let Some(realized_input) = &record.realized_input {
+        push_kv_line(log, "  Realized input", path_log_value(realized_input));
+    }
+    if let Some(output_file) = &record.output_file {
+        push_kv_line(log, "  Output file", path_log_value(output_file));
+    }
+
+    match (record.bytes_in, record.bytes_out) {
+        (Some(bytes_in), Some(bytes_out)) => push_kv_line(
+            log,
+            "  Size",
+            format!(
+                "{} -> {} ({})",
+                format_bytes(bytes_in),
+                format_bytes(bytes_out),
+                compression_ratio(bytes_in, bytes_out)
+            ),
+        ),
+        (Some(bytes_in), None) => push_kv_line(log, "  Input size", format_bytes(bytes_in)),
+        (None, Some(bytes_out)) => push_kv_line(log, "  Output size", format_bytes(bytes_out)),
+        (None, None) => log.push_str("  Size: unknown\n"),
+    }
+
+    if let Some(duration) = record.duration {
+        push_kv_line(log, "  Encode duration", format_duration(duration));
+    }
+
+    if record.commands.is_empty() {
+        log.push_str("  Commands: none recorded\n");
+    } else {
+        log.push_str("  Commands:\n");
+        for (index, command) in record.commands.iter().enumerate() {
+            log.push_str(&format!(
+                "    {}. {} [{}; {}]\n",
+                index + 1,
+                command_line_label(command),
+                format_duration(command.elapsed),
+                process_exit_label(command.exit)
+            ));
+        }
+    }
+    log.push('\n');
+}
+
+fn collect_outcome_tracks(outcome: &AlbumOutcome) -> Vec<&TrackRecord> {
+    let mut tracks: Vec<&TrackRecord> = match outcome {
+        AlbumOutcome::Complete { tracks, .. } => tracks.iter().collect(),
+        AlbumOutcome::Partial {
+            successful, failed, ..
+        }
+        | AlbumOutcome::Blocked {
+            successful, failed, ..
+        } => successful.iter().chain(failed.iter()).collect(),
+    };
+    tracks.sort_by_key(|track| {
+        (
+            track.track_id.source_ordinal,
+            track.track_id.disc_number.unwrap_or(0),
+            track.track_id.track_number,
+        )
+    });
+    tracks
+}
+
+fn outcome_stage_records(outcome: &AlbumOutcome) -> &[StageRecord] {
+    match outcome {
+        AlbumOutcome::Complete { stages, .. }
+        | AlbumOutcome::Partial { stages, .. }
+        | AlbumOutcome::Blocked { stages, .. } => stages,
+    }
+}
+
+fn total_track_duration(tracks: &[&TrackRecord]) -> Duration {
+    let mut total = Duration::ZERO;
+    for duration in tracks.iter().filter_map(|track| track.duration) {
+        total = total
+            .checked_add(duration)
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX));
+    }
+    total
+}
+
+fn append_total_size_line(
+    log: &mut String,
+    total_bytes_in: u64,
+    total_bytes_out: u64,
+    missing_input_sizes: usize,
+    missing_output_sizes: usize,
+) {
+    if total_bytes_in == 0 && total_bytes_out == 0 {
+        log.push_str("Total size: unknown\n");
+        return;
+    }
+
+    let mut line = format!(
+        "{} -> {}",
+        format_bytes(total_bytes_in),
+        format_bytes(total_bytes_out)
+    );
+    if total_bytes_in > 0 {
+        line.push_str(&format!(
+            " ({})",
+            compression_ratio(total_bytes_in, total_bytes_out)
+        ));
+    } else {
+        line.push_str(" (ratio unavailable)");
+    }
+    if missing_input_sizes > 0 || missing_output_sizes > 0 {
+        line.push_str(&format!(
+            " [partial data: {missing_input_sizes} missing input size(s), {missing_output_sizes} missing output size(s)]"
+        ));
+    }
+    push_kv_line(log, "Total size", line);
+}
+
+fn append_total_duration_line(
+    log: &mut String,
+    total_duration: Duration,
+    missing_durations: usize,
+) {
+    let mut line = format_duration(total_duration);
+    if missing_durations > 0 {
+        line.push_str(&format!(
+            " [partial data: {missing_durations} missing duration(s)]"
+        ));
+    }
+    push_kv_line(log, "Total conversion time", line);
+}
+
+fn track_display_label(record: &TrackRecord, prepared: Option<&PreparedTrack>) -> String {
+    let track_number = prepared
+        .and_then(|track| track.metadata.track_number)
+        .unwrap_or(record.track_id.track_number);
+    let label = match record.track_id.disc_number {
+        Some(disc_number) => format!("Disc {disc_number}, Track {track_number}"),
+        None => format!("Track {track_number}"),
+    };
+    match prepared
+        .and_then(|track| track.metadata.title.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        Some(title) => format!("{label}: {title}"),
+        None => format!("{label} (untitled)"),
+    }
+}
+
+fn command_line_label(command: &CommandRecord) -> String {
+    let mut parts = Vec::with_capacity(command.sanitized_args.len() + 1);
+    parts.push(command.binary.default_name().to_string());
+    parts.extend(
+        command
+            .sanitized_args
+            .iter()
+            .map(|arg| quote_command_arg(arg)),
+    );
+    parts.join(" ")
+}
+
+fn quote_command_arg(arg: &str) -> String {
+    let arg = escape_log_value(arg);
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '/' | '.' | '_' | '-' | '=' | ':' | ',' | '+' | '@' | '%'
+            )
+    }) {
+        return arg;
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn process_exit_label(exit: Option<super::tool::ProcessExit>) -> String {
+    match exit {
+        Some(super::tool::ProcessExit::Code(0)) => "exit 0".to_string(),
+        Some(super::tool::ProcessExit::Code(code)) => format!("exit {code} (error)"),
+        Some(super::tool::ProcessExit::Signal(signal)) => format!("killed by signal {signal}"),
+        Some(super::tool::ProcessExit::Unknown) | None => "exit unknown".to_string(),
+    }
+}
+
+fn outcome_result_label(
+    outcome: &AlbumOutcome,
+    successful_count: usize,
+    failed_count: usize,
+    total_track_count: usize,
+) -> String {
+    match outcome {
+        AlbumOutcome::Complete { .. } => {
+            format!("Complete ({successful_count}/{total_track_count} ok)")
+        }
+        AlbumOutcome::Partial { .. } => {
+            format!("Partial ({successful_count}/{total_track_count} ok, {failed_count} failed)")
+        }
+        AlbumOutcome::Blocked { reason, .. } => {
+            format!("Blocked ({})", block_reason_label(reason))
+        }
+    }
+}
+
+fn block_reason_label(reason: &BlockReason) -> String {
+    match reason {
+        BlockReason::TrackFailures => "track failures".to_string(),
+        BlockReason::RequiredStageFailure(stage) => {
+            format!("required stage failed: {}", pipeline_stage_label(*stage))
+        }
+        BlockReason::MaterializeFailed => "materialize failed".to_string(),
+        BlockReason::PlanFailed => "output planning failed".to_string(),
+        BlockReason::PublishFailed => "publish failed".to_string(),
+        BlockReason::DurableLogFailed => "durable log failed".to_string(),
+        BlockReason::Cancelled => "cancelled".to_string(),
+    }
+}
+
+fn pipeline_stage_label(stage: PipelineStage) -> &'static str {
+    match stage {
+        PipelineStage::Materialize => "Materialize",
+        PipelineStage::PlanOutputs => "PlanOutputs",
+        PipelineStage::Convert => "Convert",
+        PipelineStage::Merge => "Merge",
+        PipelineStage::Metadata => "Metadata",
+        PipelineStage::ReplayGain => "ReplayGain",
+        PipelineStage::Features => "Features",
+        PipelineStage::Publish => "Publish",
+        PipelineStage::DurableLog => "DurableLog",
+    }
+}
+
+fn stage_outcome_label(outcome: &StageOutcome) -> String {
+    match outcome {
+        StageOutcome::Ok => "Ok".to_string(),
+        StageOutcome::Skipped => "Skipped".to_string(),
+        StageOutcome::Failed(error) => format!("Failed ({})", escape_log_value(error)),
+    }
+}
+
+fn stage_requirement_label(requirement: StageRequirement) -> &'static str {
+    match requirement {
+        StageRequirement::Enabled => "Enabled",
+        StageRequirement::Disabled => "Disabled",
+    }
+}
+
+fn source_kind_label(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::SevenZip => "SevenZip",
+        SourceKind::CueImage => "CueImage",
+        SourceKind::SacdIso => "SacdIso",
+    }
+}
+
+fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
+    match source_ref {
+        TrackSourceRef::StagedFile(path) => format!("staged file {}", path_log_value(path)),
+        TrackSourceRef::ImageSegment {
+            image,
+            start_sample,
+            samples,
+        } => format!(
+            "image segment {} (start sample {start_sample}, {samples} samples)",
+            path_log_value(image)
+        ),
+        TrackSourceRef::SacdTrack {
+            iso,
+            track_index,
+            area,
+        } => format!(
+            "SACD track {} from {} ({:?})",
+            track_index + 1,
+            path_log_value(iso),
+            area
+        ),
+    }
+}
+
+fn push_kv_line(log: &mut String, label: &str, value: impl AsRef<str>) {
+    log.push_str(label);
+    log.push_str(": ");
+    log.push_str(&escape_log_value(value.as_ref()));
+    log.push('\n');
+}
+
+fn push_optional_kv_line(log: &mut String, label: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        push_kv_line(log, label, value);
+    }
+}
+
+fn path_log_value(path: &Path) -> String {
+    escape_log_value(&path.display().to_string())
+}
+
+fn escape_log_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn conversion_log_album_year(metadata: &AlbumMetadata) -> Option<&str> {
+    metadata.date.as_deref().and_then(first_four_digit_run)
+}
+
+fn first_four_digit_run(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    for start in 0..=bytes.len() - 4 {
+        if bytes[start..start + 4]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            return value.get(start..start + 4);
+        }
+    }
+    None
+}
+
+fn conversion_log_catalog_number(extra: &BTreeMap<String, String>) -> Option<&str> {
+    for (key, value) in extra {
+        let normalized = normalize_extra_key(key);
+        if matches!(
+            normalized.as_str(),
+            "catno"
+                | "catnumber"
+                | "catalog"
+                | "catalogid"
+                | "catalogno"
+                | "catalognumber"
+                | "catalogue"
+                | "catalogueid"
+                | "catalogueno"
+                | "cataloguenumber"
+                | "sacdalbumcatalognumber"
+        ) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_extra_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "Yes"
+    } else {
+        "No"
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0_usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let millis = duration.subsec_millis();
+    if seconds == 0 {
+        if millis == 0 {
+            return "0s".to_string();
+        }
+        return format!("0.{millis:03}s");
+    }
+    if seconds < 60 {
+        if millis == 0 {
+            return format!("{seconds}s");
+        }
+        return format!("{seconds}.{millis:03}s");
+    }
+    let minutes = seconds / 60;
+    let remaining_seconds = seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {remaining_seconds}s");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    format!("{hours}h {remaining_minutes}m {remaining_seconds}s")
+}
+
+fn compression_ratio(bytes_in: u64, bytes_out: u64) -> String {
+    if bytes_in == 0 {
+        return "n/a".to_string();
+    }
+    let input = bytes_in as f64;
+    let output = bytes_out as f64;
+    if bytes_out < bytes_in {
+        format!("{:.1}% smaller", (1.0 - output / input) * 100.0)
+    } else if bytes_out > bytes_in {
+        format!("{:.1}% larger", (output / input - 1.0) * 100.0)
+    } else {
+        "0.0% change".to_string()
+    }
+}
 fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
     let mut cue = String::new();
     if let Some(ref album) = source.album_metadata.album {
@@ -4727,6 +5333,314 @@ fn failed_tracks_from(outcome: &AlbumOutcome) -> Vec<TrackRecord> {
     }
 }
 
+#[cfg(test)]
+mod conversion_log_tests {
+    use super::*;
+
+    fn log_test_source() -> PreparedSource {
+        let mut album_extra = BTreeMap::new();
+        album_extra.insert("catalog_number".to_string(), "CAT-123".to_string());
+        PreparedSource {
+            container: PathBuf::from("/tmp/input.7z"),
+            kind: SourceKind::SevenZip,
+            tracks: vec![
+                PreparedTrack {
+                    id: TrackId {
+                        source_ordinal: 1,
+                        disc_number: Some(1),
+                        track_number: 1,
+                    },
+                    source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav")),
+                    metadata: TrackMetadata {
+                        title: Some("One".to_string()),
+                        artist: Some("Artist One".to_string()),
+                        composer: Some("Composer One".to_string()),
+                        track_number: Some(1),
+                        disc_number: Some(1),
+                        ..TrackMetadata::default()
+                    },
+                    expected_samples: Some(44_100),
+                    sample_rate: 44_100,
+                    bit_depth: Some(24),
+                },
+                PreparedTrack {
+                    id: TrackId {
+                        source_ordinal: 2,
+                        disc_number: Some(1),
+                        track_number: 2,
+                    },
+                    source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/02.wav")),
+                    metadata: TrackMetadata {
+                        title: None,
+                        track_number: Some(2),
+                        disc_number: Some(1),
+                        ..TrackMetadata::default()
+                    },
+                    expected_samples: None,
+                    sample_rate: 96_000,
+                    bit_depth: Some(24),
+                },
+            ],
+            album_metadata: AlbumMetadata {
+                album: Some("Test Album".to_string()),
+                album_artist: Some("Test Artist".to_string()),
+                genre: Some("Jazz".to_string()),
+                date: Some("2025-12-31".to_string()),
+                total_tracks: 2,
+                extra: album_extra,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SevenZip,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        }
+    }
+
+    fn log_test_request() -> PipelineRequest {
+        PipelineRequest {
+            job_id: "job-1".to_string(),
+            item_id: "item-1".to_string(),
+            container: PathBuf::from("/tmp/input.7z"),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            target_format: AudioFormat::Flac,
+            encode: EncodeOptions {
+                backend: EncodeBackend::Ffmpeg,
+                bitrate: Some(960),
+                compression_level: Some(8),
+                dither: DitherPolicy::Off,
+            },
+            merge: false,
+            output_root: PathBuf::from("/out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: Some("%ARTIST%/%ALBUM%".to_string()),
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+            },
+            log: LogPolicy {
+                root: PathBuf::from("/out/.tonepoet-logs"),
+                write_for_blocked: true,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Enabled,
+            },
+            failure_policy: FailurePolicy::AllowPartialAlbum,
+        }
+    }
+
+    fn command_record() -> CommandRecord {
+        CommandRecord {
+            binary: ToolBinary::Ffmpeg,
+            sanitized_args: vec![
+                "-i".to_string(),
+                "/tmp/in file.wav".to_string(),
+                "/tmp/out.flac".to_string(),
+            ],
+            cwd: None,
+            env_keys: vec![],
+            exit: Some(super::super::tool::ProcessExit::Code(0)),
+            stdout_tail: "ignored stdout".to_string(),
+            stderr_tail: "ignored stderr".to_string(),
+            elapsed: Duration::from_secs(65),
+        }
+    }
+
+    fn ok_record() -> TrackRecord {
+        TrackRecord {
+            track_id: TrackId {
+                source_ordinal: 1,
+                disc_number: Some(1),
+                track_number: 1,
+            },
+            outcome: TrackOutcome::Ok,
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav")),
+            realized_input: Some(PathBuf::from("/realized/01.wav")),
+            output_file: Some(PathBuf::from("/encoded/01.flac")),
+            commands: vec![command_record()],
+            bytes_in: Some(2048),
+            bytes_out: Some(1024),
+            duration: Some(Duration::from_secs(65)),
+        }
+    }
+
+    fn failed_record() -> TrackRecord {
+        TrackRecord {
+            track_id: TrackId {
+                source_ordinal: 2,
+                disc_number: Some(1),
+                track_number: 2,
+            },
+            outcome: TrackOutcome::Err("encode failed".to_string()),
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/02.wav")),
+            realized_input: Some(PathBuf::from("/realized/02.wav")),
+            output_file: None,
+            commands: vec![],
+            bytes_in: Some(4096),
+            bytes_out: None,
+            duration: None,
+        }
+    }
+
+    fn stage_records() -> Vec<StageRecord> {
+        vec![
+            StageRecord {
+                stage: PipelineStage::Materialize,
+                outcome: StageOutcome::Ok,
+            },
+            StageRecord {
+                stage: PipelineStage::ReplayGain,
+                outcome: StageOutcome::Skipped,
+            },
+            StageRecord {
+                stage: PipelineStage::Features,
+                outcome: StageOutcome::Ok,
+            },
+        ]
+    }
+
+    #[test]
+    fn build_conversion_log_complete_contains_required_sections() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req);
+
+        assert!(log.contains("TONEPOET CONVERSION LOG"));
+        assert!(log.contains("Source Information"));
+        assert!(log.contains("Conversion Settings"));
+        assert!(log.contains("Per-Track Results"));
+        assert!(log.contains("Stage Summary"));
+        assert!(log.contains("Overall Summary"));
+        assert!(log.contains("Job ID: job-1"));
+        assert!(log.contains("Item ID: item-1"));
+        assert!(log.contains("Catalog number: CAT-123"));
+        assert!(log.contains("Target format: FLAC"));
+        assert!(log.contains("Result: Complete"));
+        assert!(log.contains("Log generated by tonepoet"));
+    }
+
+    #[test]
+    fn build_conversion_log_partial_shows_successful_and_failed_tracks() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Partial {
+            successful: vec![ok_record()],
+            failed: vec![failed_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req);
+
+        assert!(log.contains("Disc 1, Track 1: One"));
+        assert!(log.contains("Status: Success"));
+        assert!(log.contains("Disc 1, Track 2 (untitled)"));
+        assert!(log.contains("Status: Failure"));
+        assert!(log.contains("Error: encode failed"));
+        assert!(log.contains("Result: Partial (1/2 ok, 1 failed)"));
+    }
+
+    #[test]
+    fn build_conversion_log_blocked_shows_reason() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Blocked {
+            successful: vec![],
+            failed: vec![failed_record()],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Convert,
+                outcome: StageOutcome::Failed("convert failed".to_string()),
+            }],
+            reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
+        };
+        let log = build_conversion_log(&outcome, &source, &req);
+
+        assert!(log.contains("Result: Blocked (required stage failed: Convert)"));
+        assert!(log.contains("Convert: Failed (convert failed)"));
+    }
+
+    #[test]
+    fn per_track_details_include_sizes_duration_and_command_info() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req);
+
+        assert!(log.contains("Source audio: 44.1kHz, 24-bit, 44100 expected samples"));
+        assert!(log.contains("Size: 2.0 KB -> 1.0 KB (50.0% smaller)"));
+        assert!(log.contains("Encode duration: 1m 5s"));
+        assert!(log.contains("ffmpeg -i '/tmp/in file.wav' /tmp/out.flac [1m 5s; exit 0]"));
+        assert!(!log.contains("ignored stdout"));
+        assert!(!log.contains("ignored stderr"));
+    }
+
+    #[test]
+    fn stage_summary_includes_all_stage_records() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req);
+
+        assert!(log.contains("Materialize: Ok"));
+        assert!(log.contains("ReplayGain: Skipped"));
+        assert!(log.contains("Features: Ok"));
+    }
+
+    #[test]
+    fn log_values_escape_control_characters_without_dropping_text() {
+        assert_eq!(
+            escape_log_value("line1\nline2\ttail"),
+            "line1\\nline2\\ttail"
+        );
+        let mut record = ok_record();
+        record.outcome = TrackOutcome::Err("first line\nsecond line".to_string());
+        record.commands[0].sanitized_args = vec!["arg\nnext".to_string()];
+        let outcome = AlbumOutcome::Partial {
+            successful: vec![],
+            failed: vec![record],
+            stages: vec![],
+        };
+        let log = build_conversion_log(&outcome, &log_test_source(), &log_test_request());
+
+        assert!(log.contains("Error: first line\\nsecond line"));
+        assert!(log.contains("'arg\\nnext'"));
+    }
+
+    #[test]
+    fn helper_formatters_have_expected_output() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1_572_864), "1.5 MB");
+        assert_eq!(format_duration(Duration::from_millis(250)), "0.250s");
+        assert_eq!(format_duration(Duration::from_secs(5)), "5s");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 5s");
+        assert_eq!(compression_ratio(1000, 500), "50.0% smaller");
+        assert_eq!(compression_ratio(1000, 1250), "25.0% larger");
+        assert_eq!(compression_ratio(1000, 1000), "0.0% change");
+        assert_eq!(compression_ratio(0, 1000), "n/a");
+    }
+}
 #[cfg(test)]
 mod naming_template_tests {
     use super::*;
