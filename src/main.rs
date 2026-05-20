@@ -116,9 +116,9 @@ enum Commands {
         /// Output naming template (e.g. "%NN% - %TITLE%")
         #[arg(long)]
         naming: Option<String>,
-    /// Output album/folder naming template (e.g. "%ARTIST%/%ALBUM% (%YEAR%)")
-    #[arg(long = "folder-naming")]
-    folder_naming: Option<String>,
+        /// Output album/folder naming template (e.g. "%ARTIST%/%ALBUM% (%YEAR%)")
+        #[arg(long = "folder-naming")]
+        folder_naming: Option<String>,
 
         /// Disable metadata tagging stage
         #[arg(long)]
@@ -255,7 +255,8 @@ async fn main() -> anyhow::Result<()> {
             partial,
             overwrite_output,
             naming,
-            folder_naming, no_metadata,
+            folder_naming,
+            no_metadata,
             no_features,
         } => {
             run_convert(
@@ -280,7 +281,11 @@ async fn main() -> anyhow::Result<()> {
                 no_cue,
                 partial,
                 overwrite_output,
-                naming, folder_naming, no_metadata, no_features, &config,
+                naming,
+                folder_naming,
+                no_metadata,
+                no_features,
+                &config,
             )
             .await?;
         }
@@ -743,7 +748,9 @@ fn build_pipeline_request_template(
         || no_cue
         || partial
         || overwrite_output
-        || naming.is_some() || folder_naming.is_some() || no_metadata
+        || naming.is_some()
+        || folder_naming.is_some()
+        || no_metadata
         || no_features;
 
     if !has_pipeline_flags {
@@ -834,6 +841,7 @@ fn build_pipeline_request_template(
         log: LogPolicy {
             root: output_root.join(".tonepoet-logs"),
             write_for_blocked: true,
+                write_json_log: false,
         },
         stages: StagePolicy {
             metadata: if no_metadata {

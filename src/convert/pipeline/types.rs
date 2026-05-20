@@ -145,6 +145,10 @@ pub enum OverwritePolicy {
 pub struct LogPolicy {
     pub root: PathBuf,
     pub write_for_blocked: bool,
+    /// Write the machine-readable JSON durable log. Disabled by default;
+    /// intended as a debug/advanced option.
+    #[serde(default)]
+    pub write_json_log: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

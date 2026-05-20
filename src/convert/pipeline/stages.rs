@@ -3892,10 +3892,11 @@ async fn finalize_report(
     let item_id = req.item_id.clone();
     let mut durable_log = None;
     let mut terminal_error_override: Option<String> = None;
-    let should_write = match &outcome {
-        AlbumOutcome::Complete { .. } | AlbumOutcome::Partial { .. } => true,
-        AlbumOutcome::Blocked { .. } => req.log.write_for_blocked,
-    };
+    let should_write = req.log.write_json_log
+        && match &outcome {
+            AlbumOutcome::Complete { .. } | AlbumOutcome::Partial { .. } => true,
+            AlbumOutcome::Blocked { .. } => req.log.write_for_blocked,
+        };
 
     if should_write {
         emit_stage_started(reporter, &item_id, PipelineStage::DurableLog).await;
@@ -5436,6 +5437,7 @@ mod conversion_log_tests {
             log: LogPolicy {
                 root: PathBuf::from("/out/.tonepoet-logs"),
                 write_for_blocked: true,
+                write_json_log: false,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,
@@ -5728,6 +5730,7 @@ mod naming_template_tests {
             log: LogPolicy {
                 root: PathBuf::from("/out/.tonepoet-logs"),
                 write_for_blocked: true,
+                write_json_log: false,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,

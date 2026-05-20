@@ -1073,6 +1073,7 @@ fn pipeline_request_for_cue_item(
         log: LogPolicy {
             root: output_root.join(".tonepoet-logs"),
             write_for_blocked: true,
+                write_json_log: false,
         },
         stages: StagePolicy {
             metadata: StageRequirement::Enabled,
@@ -1199,6 +1200,7 @@ fn pipeline_request_for_sacd_item(
         log: LogPolicy {
             root: output_root.join(".tonepoet-logs"),
             write_for_blocked: true,
+                write_json_log: false,
         },
         stages: StagePolicy {
             metadata: StageRequirement::Enabled,
@@ -1392,6 +1394,7 @@ async fn run_sevenzip_pipeline_conversion_item(
             log: LogPolicy {
                 root: output_root.join(".tonepoet-logs"),
                 write_for_blocked: true,
+                write_json_log: false,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,
@@ -1685,6 +1688,7 @@ pub async fn process_item(
                             })
                             .join(".tonepoet-logs"),
                         write_for_blocked: true,
+                write_json_log: false,
                     },
                     stages: StagePolicy {
                         metadata: StageRequirement::Enabled,
