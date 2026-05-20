@@ -2424,13 +2424,13 @@ pub async fn run_features(
             .unwrap_or_else(|| req.output_root.clone()),
     };
 
-    let log_staged = staging.root.join("conversion_log.txt");
+    let log_staged = staging.root.join("conversion.log");
     let log_content = build_conversion_log(outcome, source, req);
     fs::write(&log_staged, &log_content)?;
     artifacts.sidecars.push(SidecarArtifact {
         kind: SidecarKind::ConversionLog,
         staged_path: log_staged,
-        final_path: album_dir.join("conversion_log.txt"),
+        final_path: album_dir.join("conversion.log"),
     });
 
     if source.tracks.len() > 1 {
