@@ -3628,7 +3628,7 @@ fn render_track_template(
     rendered = rendered.replace("%ALBUM_ARTIST%", &album_artist);
     rendered = rendered.replace("%ALBUM%", &album);
     rendered = rendered.replace("%DISC%", &disc.to_string());
-    rendered = rendered.replace("%FORMAT%", format.extension());
+    rendered = rendered.replace("%FORMAT%", format.name());
     rendered = rendered.replace("%YEAR%", &year);
     rendered = rendered.replace("%GENRE%", &genre);
     rendered = rendered.replace("%COMPOSER%", &composer);
@@ -3706,7 +3706,7 @@ fn render_folder_template(template: &str, source: &PreparedSource, format: Audio
     rendered = rendered.replace("%YEAR%", &year);
     rendered = rendered.replace("%GENRE%", &genre);
     rendered = rendered.replace("%CATALOG%", &catalog);
-    rendered = rendered.replace("%FORMAT%", format.extension());
+    rendered = rendered.replace("%FORMAT%", format.name());
     rendered = rendered.replace("%SAMPLERATE%", &sample_rate);
     rendered = rendered.replace("%BITDEPTH%", &bit_depth);
     rendered = resolve_extra_tokens(&rendered, None, &source.album_metadata.extra);
