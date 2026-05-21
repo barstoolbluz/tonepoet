@@ -98,13 +98,13 @@ pub fn draw_output_options_pane(
             .add_modifier(Modifier::BOLD),
     );
     let build_pill = Span::styled(
-        " build ",
+        " custom ",
         Style::default()
             .fg(theme::PILL_ACTIVE_FG)
             .bg(theme::BLUE)
             .add_modifier(Modifier::BOLD),
     );
-    let pill_width = 6 + 1 + 7; // " load " + gap + " build "
+    let pill_width = 6 + 1 + 8; // " load " + gap + " custom "
     let folder_tmpl_max = w.saturating_sub(15 + pill_width + 4); // label + pills + borders + gap
     let folder_display = truncate_to(&opts.folder_template, folder_tmpl_max);
     let folder_row = template_row_with_pills(

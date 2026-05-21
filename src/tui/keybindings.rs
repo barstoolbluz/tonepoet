@@ -6070,7 +6070,7 @@ fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
             let category_rows: u16 = categories.iter().map(|_| 2).sum();
             let content_height =
                 1 + 2 + 1 + 1 + saved_visible as u16 + 1 + category_rows + 2 + 1 + 1;
-            let th = content_height.min(area.1.saturating_sub(2));
+            let th = (content_height + 2).min(area.1.saturating_sub(2));
             let px = (area.0.saturating_sub(tw)) / 2;
             let py = (area.1.saturating_sub(th)) / 2;
             if tw < 60 || th < 12 {

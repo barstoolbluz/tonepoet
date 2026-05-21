@@ -210,7 +210,7 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
             Rect::new(inner_x, output_options_area.y + 1, inner_w, 1),
         );
         // Template text fields (clickable area excludes the pills on the right)
-        let pill_zone = 6 + 1 + 7 + 1; // " load " + gap + " build " + border
+        let pill_zone = 6 + 1 + 8 + 1; // " load " + gap + " custom " + border
         let text_w = inner_w.saturating_sub(pill_zone);
         buttons.record_button(
             TuiButton::FolderTemplateField,
@@ -228,7 +228,7 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         );
         buttons.record_button(
             TuiButton::TemplateBuildFolderButton,
-            Rect::new(load_x + 7, output_options_area.y + 2, 7, 1),
+            Rect::new(load_x + 7, output_options_area.y + 2, 8, 1),
         );
         buttons.record_button(
             TuiButton::TemplateLoadFilenameButton,
@@ -236,7 +236,7 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         );
         buttons.record_button(
             TuiButton::TemplateBuildFilenameButton,
-            Rect::new(load_x + 7, output_options_area.y + 3, 7, 1),
+            Rect::new(load_x + 7, output_options_area.y + 3, 8, 1),
         );
     }
 

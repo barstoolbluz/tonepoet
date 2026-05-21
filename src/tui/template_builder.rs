@@ -285,7 +285,7 @@ pub fn draw_template_builder(
     let saved_visible = state.saved_templates.len().min(4).max(1);
     let category_rows: u16 = categories.iter().map(|_| 2).sum::<u16>(); // label + tokens per category
     let content_height = 1 + 2 + 1 + 1 + saved_visible as u16 + 1 + category_rows + 2 + 1 + 1;
-    let h = content_height.min(area.height.saturating_sub(2));
+    let h = (content_height + 2).min(area.height.saturating_sub(2)); // +2 for top/bottom borders
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
