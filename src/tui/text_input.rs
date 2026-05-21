@@ -35,6 +35,12 @@ impl TextInputState {
         self.cursor += c.len_utf8();
     }
 
+    /// Insert a string at the cursor and advance the cursor past it.
+    pub fn insert_string(&mut self, s: &str) {
+        self.text.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
     /// Delete the character before the cursor (Backspace behavior).
     pub fn backspace(&mut self) {
         if let Some(prev) = self.prev_char_boundary() {

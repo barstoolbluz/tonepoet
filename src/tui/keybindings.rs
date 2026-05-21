@@ -2279,6 +2279,125 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
+        ActiveOverlay::TemplateBuilder(mut state) => {
+            match state.focus {
+                TemplateBuilderFocus::TemplateInput => match key.code {
+                    KeyCode::Esc => {
+                        app.active_overlay = ActiveOverlay::None;
+                    }
+                    KeyCode::Tab => {
+                        state.focus = TemplateBuilderFocus::SavedList;
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::Enter => {
+                        // Apply: write template to the target field
+                        let text = state.template_input.text.clone();
+                        match state.target {
+                            TemplateTarget::Folder => {
+                                app.convert.output_options.folder_template = text;
+                            }
+                            TemplateTarget::Filename => {
+                                app.convert.output_options.filename_template = text;
+                            }
+                        }
+                        app.preset.mark_modified();
+                        app.active_overlay = ActiveOverlay::None;
+                        app.set_status("Template applied");
+                    }
+                    _ => {
+                        super::text_input::handle_text_input_key(&mut state.template_input, &key);
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                },
+                TemplateBuilderFocus::SavedList => match key.code {
+                    KeyCode::Esc => {
+                        app.active_overlay = ActiveOverlay::None;
+                    }
+                    KeyCode::Tab => {
+                        state.focus = TemplateBuilderFocus::TokenGrid;
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::BackTab => {
+                        state.focus = TemplateBuilderFocus::TemplateInput;
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if state.saved_selected > 0 {
+                            state.saved_selected -= 1;
+                        }
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if state.saved_selected + 1 < state.saved_templates.len() {
+                            state.saved_selected += 1;
+                        }
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::Enter => {
+                        // Load selected template into the input line
+                        if let Some(tmpl) = state.saved_templates.get(state.saved_selected).cloned()
+                        {
+                            state.template_input = super::text_input::TextInputState::new(tmpl);
+                            state.template_input.cursor = state.template_input.text.len();
+                            state.focus = TemplateBuilderFocus::TemplateInput;
+                        }
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::Char('x') | KeyCode::Delete => {
+                        // Delete selected saved template
+                        if let Some(tmpl) = state.saved_templates.get(state.saved_selected).cloned()
+                        {
+                            let _ = super::template_builder::delete_template(state.target, &tmpl);
+                            state.saved_templates =
+                                super::template_builder::list_templates(state.target);
+                            if state.saved_selected >= state.saved_templates.len()
+                                && state.saved_selected > 0
+                            {
+                                state.saved_selected -= 1;
+                            }
+                            app.set_status("Template deleted");
+                        }
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    _ => {
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                },
+                TemplateBuilderFocus::TokenGrid => match key.code {
+                    KeyCode::Esc => {
+                        app.active_overlay = ActiveOverlay::None;
+                    }
+                    KeyCode::Tab => {
+                        state.focus = TemplateBuilderFocus::TemplateInput;
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::BackTab => {
+                        state.focus = TemplateBuilderFocus::SavedList;
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::Left => {
+                        if state.grid_cursor > 0 {
+                            state.grid_cursor -= 1;
+                        }
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::Right => {
+                        let max = state.total_grid_items().saturating_sub(1);
+                        if state.grid_cursor < max {
+                            state.grid_cursor += 1;
+                        }
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    KeyCode::Enter => {
+                        state.insert_current_grid_item();
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                    _ => {
+                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+                    }
+                },
+            }
+        }
         ActiveOverlay::None => {}
     }
 }
@@ -5870,6 +5989,104 @@ fn build_metadata_detail_context_menu(
     entries
 }
 
+/// Mouse handler for the template builder overlay.
+fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mx = mouse.column;
+    let my = mouse.row;
+
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+
+    let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+        ActiveOverlay::TemplateBuilder(s) => s,
+        other => {
+            app.active_overlay = other;
+            return;
+        }
+    };
+
+    match app.button_map.find_button_at(mx, my) {
+        Some(TuiButton::TemplateBuilderToken(idx)) => {
+            state.grid_cursor = idx;
+            state.insert_current_grid_item();
+            state.focus = TemplateBuilderFocus::TemplateInput;
+        }
+        Some(TuiButton::TemplateBuilderSavedItem(idx)) => {
+            if let Some(tmpl) = state.saved_templates.get(idx).cloned() {
+                state.template_input = super::text_input::TextInputState::new(tmpl);
+                state.template_input.cursor = state.template_input.text.len();
+                state.saved_selected = idx;
+                state.focus = TemplateBuilderFocus::TemplateInput;
+            }
+        }
+        Some(TuiButton::TemplateBuilderApply) => {
+            let text = state.template_input.text.clone();
+            match state.target {
+                TemplateTarget::Folder => {
+                    app.convert.output_options.folder_template = text;
+                }
+                TemplateTarget::Filename => {
+                    app.convert.output_options.filename_template = text;
+                }
+            }
+            app.preset.mark_modified();
+            app.set_status("Template applied");
+            return; // overlay already set to None
+        }
+        Some(TuiButton::TemplateBuilderSave) => {
+            let text = state.template_input.text.clone();
+            match super::template_builder::save_template(state.target, &text) {
+                Ok(()) => {
+                    state.saved_templates = super::template_builder::list_templates(state.target);
+                    app.set_status("Template saved");
+                }
+                Err(e) => {
+                    app.set_status(format!("Save failed: {}", e));
+                }
+            }
+        }
+        Some(TuiButton::TemplateBuilderClear) => {
+            state.template_input = super::text_input::TextInputState::empty();
+        }
+        Some(TuiButton::TemplateBuilderDelete) => {
+            if let Some(tmpl) = state.saved_templates.get(state.saved_selected).cloned() {
+                let _ = super::template_builder::delete_template(state.target, &tmpl);
+                state.saved_templates = super::template_builder::list_templates(state.target);
+                if state.saved_selected >= state.saved_templates.len() && state.saved_selected > 0 {
+                    state.saved_selected -= 1;
+                }
+                app.set_status("Template deleted");
+            }
+        }
+        _ => {
+            // Click outside popup or on non-button area — close.
+            // Compute bounds matching draw_template_builder's layout.
+            let area = crossterm::terminal::size().unwrap_or((80, 24));
+            let tw = (area.0 * 80 / 100).max(60).min(area.0.saturating_sub(2));
+            let categories = state.token_categories();
+            let saved_visible = state.saved_templates.len().min(4).max(1);
+            let category_rows: u16 = categories.iter().map(|_| 2).sum();
+            let content_height =
+                1 + 2 + 1 + 1 + saved_visible as u16 + 1 + category_rows + 2 + 1 + 1;
+            let th = content_height.min(area.1.saturating_sub(2));
+            let px = (area.0.saturating_sub(tw)) / 2;
+            let py = (area.1.saturating_sub(th)) / 2;
+            if tw < 60 || th < 12 {
+                return; // terminal too small for popup
+            }
+            if mx < px || mx >= px + tw || my < py || my >= py + th {
+                return; // click outside — overlay already set to None
+            }
+            // Click inside but not on a button — switch focus to template input
+            state.focus = TemplateBuilderFocus::TemplateInput;
+        }
+    }
+
+    app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+}
+
 /// Mouse handler for the CuePreview overlay.
 fn handle_cue_preview_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
     let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
@@ -8911,6 +9128,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
+    // Template builder: dedicated handler for token/saved clicks.
+    if matches!(app.active_overlay, ActiveOverlay::TemplateBuilder(_)) {
+        handle_template_builder_mouse(app, mouse);
+        return;
+    }
+
     // Generic overlay mouse: click-outside-to-close + footer pill clicks
     // for all overlays (except MetadataEditor which has its own handler,
     // and ContextMenu which has its own hover/click system).
@@ -9662,6 +9885,54 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataDetailRevert
             | TuiButton::MetadataDetailRestore
             | TuiButton::MetadataEntryView(_) => {}
+
+            // ── Template builder: open pills ──
+            TuiButton::TemplateBuildFolderButton => {
+                let initial = app.convert.output_options.folder_template.clone();
+                app.active_overlay =
+                    ActiveOverlay::TemplateBuilder(Box::new(TemplateBuilderState::new(
+                        TemplateTarget::Folder,
+                        &initial,
+                        TemplateBuilderFocus::TemplateInput,
+                    )));
+            }
+            TuiButton::TemplateBuildFilenameButton => {
+                let initial = app.convert.output_options.filename_template.clone();
+                app.active_overlay =
+                    ActiveOverlay::TemplateBuilder(Box::new(TemplateBuilderState::new(
+                        TemplateTarget::Filename,
+                        &initial,
+                        TemplateBuilderFocus::TemplateInput,
+                    )));
+            }
+            TuiButton::TemplateLoadFolderButton => {
+                let initial = app.convert.output_options.folder_template.clone();
+                app.active_overlay =
+                    ActiveOverlay::TemplateBuilder(Box::new(TemplateBuilderState::new(
+                        TemplateTarget::Folder,
+                        &initial,
+                        TemplateBuilderFocus::SavedList,
+                    )));
+            }
+            TuiButton::TemplateLoadFilenameButton => {
+                let initial = app.convert.output_options.filename_template.clone();
+                app.active_overlay =
+                    ActiveOverlay::TemplateBuilder(Box::new(TemplateBuilderState::new(
+                        TemplateTarget::Filename,
+                        &initial,
+                        TemplateBuilderFocus::SavedList,
+                    )));
+            }
+
+            // ── Template builder overlay buttons (handled by dedicated mouse handler) ──
+            TuiButton::TemplateBuilderToken(_)
+            | TuiButton::TemplateBuilderSavedItem(_)
+            | TuiButton::TemplateBuilderApply
+            | TuiButton::TemplateBuilderSave
+            | TuiButton::TemplateBuilderClear
+            | TuiButton::TemplateBuilderDelete => {
+                // Handled in handle_template_builder_mouse; no-op here.
+            }
         }
     }
 }

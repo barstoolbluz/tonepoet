@@ -2,6 +2,7 @@
 
 use ratatui::{
     layout::Rect,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -89,13 +90,31 @@ pub fn draw_output_options_pane(
     } else {
         theme::muted()
     };
-    let folder_row = bordered_line(
+    let load_pill = Span::styled(
+        " load ",
+        Style::default()
+            .fg(theme::PILL_ACTIVE_FG)
+            .bg(theme::AMBER)
+            .add_modifier(Modifier::BOLD),
+    );
+    let build_pill = Span::styled(
+        " build ",
+        Style::default()
+            .fg(theme::PILL_ACTIVE_FG)
+            .bg(theme::BLUE)
+            .add_modifier(Modifier::BOLD),
+    );
+    let pill_width = 6 + 1 + 7; // " load " + gap + " build "
+    let folder_tmpl_max = w.saturating_sub(15 + pill_width + 4); // label + pills + borders + gap
+    let folder_display = truncate_to(&opts.folder_template, folder_tmpl_max);
+    let folder_row = template_row_with_pills(
         border_color,
         w,
-        vec![
-            Span::styled("   folder      ", folder_label_style),
-            Span::styled(opts.folder_template.clone(), theme::text()),
-        ],
+        "   folder      ",
+        &folder_display,
+        folder_label_style,
+        load_pill.clone(),
+        build_pill.clone(),
     );
 
     // Filename template
@@ -104,13 +123,15 @@ pub fn draw_output_options_pane(
     } else {
         theme::muted()
     };
-    let file_row = bordered_line(
+    let file_display = truncate_to(&opts.filename_template, folder_tmpl_max);
+    let file_row = template_row_with_pills(
         border_color,
         w,
-        vec![
-            Span::styled("   filename    ", file_label_style),
-            Span::styled(opts.filename_template.clone(), theme::text()),
-        ],
+        "   filename    ",
+        &file_display,
+        file_label_style,
+        load_pill,
+        build_pill,
     );
 
     // Merge mode pills
@@ -193,4 +214,46 @@ fn bordered_line<'a>(
     spans.push(Span::raw(" ".repeat(padding)));
     spans.push(Span::styled("│", theme::border(border_color)));
     Line::from(spans)
+}
+
+/// Build a template row with trailing [load] [build] pills.
+fn template_row_with_pills<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    label: &'a str,
+    template_display: &str,
+    label_style: Style,
+    load_pill: Span<'a>,
+    build_pill: Span<'a>,
+) -> Line<'a> {
+    let load_w = load_pill.width();
+    let build_w = build_pill.width();
+
+    let mut spans = vec![
+        Span::styled("│", theme::border(border_color)),
+        Span::styled(label, label_style),
+        Span::styled(template_display.to_string(), theme::text()),
+    ];
+
+    let content_width: usize = spans.iter().map(|s| s.width()).sum();
+    let pills_total = load_w + 1 + build_w; // pills + gap
+    let padding = width.saturating_sub(content_width + pills_total + 2); // +2 for gap + border
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(load_pill);
+    spans.push(Span::raw(" "));
+    spans.push(build_pill);
+    spans.push(Span::styled("│", theme::border(border_color)));
+    Line::from(spans)
+}
+
+/// Truncate a string to at most `max_chars` characters, adding "..." if truncated.
+fn truncate_to(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else if max_chars > 3 {
+        let truncated: String = s.chars().take(max_chars - 3).collect();
+        format!("{}...", truncated)
+    } else {
+        s.chars().take(max_chars).collect()
+    }
 }

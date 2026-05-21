@@ -209,13 +209,34 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
             TuiButton::DestPathField,
             Rect::new(inner_x, output_options_area.y + 1, inner_w, 1),
         );
+        // Template text fields (clickable area excludes the pills on the right)
+        let pill_zone = 6 + 1 + 7 + 1; // " load " + gap + " build " + border
+        let text_w = inner_w.saturating_sub(pill_zone);
         buttons.record_button(
             TuiButton::FolderTemplateField,
-            Rect::new(inner_x, output_options_area.y + 2, inner_w, 1),
+            Rect::new(inner_x, output_options_area.y + 2, text_w, 1),
         );
         buttons.record_button(
             TuiButton::FilenameTemplateField,
-            Rect::new(inner_x, output_options_area.y + 3, inner_w, 1),
+            Rect::new(inner_x, output_options_area.y + 3, text_w, 1),
+        );
+        // [load] and [build] pills at the right edge of folder/filename rows
+        let load_x = output_options_area.x + output_options_area.width - pill_zone;
+        buttons.record_button(
+            TuiButton::TemplateLoadFolderButton,
+            Rect::new(load_x, output_options_area.y + 2, 6, 1),
+        );
+        buttons.record_button(
+            TuiButton::TemplateBuildFolderButton,
+            Rect::new(load_x + 7, output_options_area.y + 2, 7, 1),
+        );
+        buttons.record_button(
+            TuiButton::TemplateLoadFilenameButton,
+            Rect::new(load_x, output_options_area.y + 3, 6, 1),
+        );
+        buttons.record_button(
+            TuiButton::TemplateBuildFilenameButton,
+            Rect::new(load_x + 7, output_options_area.y + 3, 7, 1),
         );
     }
 

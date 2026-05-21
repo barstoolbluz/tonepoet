@@ -154,6 +154,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::ArBatchReport { ref result, scroll } => {
             draw_ar_batch_report(f, result, scroll);
         }
+        ActiveOverlay::TemplateBuilder(ref state) => {
+            super::template_builder::draw_template_builder(f, state, &mut app.button_map);
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)

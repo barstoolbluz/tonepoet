@@ -133,6 +133,19 @@ pub enum TuiButton {
     BrowseSearchMode,
     BrowseSearchSort,
     BrowseSearchAudioOnly,
+
+    // Template builder: open pills on output options pane.
+    TemplateBuildFolderButton,
+    TemplateBuildFilenameButton,
+    TemplateLoadFolderButton,
+    TemplateLoadFilenameButton,
+    // Template builder overlay: clickable elements.
+    TemplateBuilderToken(usize),
+    TemplateBuilderSavedItem(usize),
+    TemplateBuilderApply,
+    TemplateBuilderSave,
+    TemplateBuilderClear,
+    TemplateBuilderDelete,
 }
 
 impl TuiButton {
@@ -157,7 +170,13 @@ impl TuiButton {
             | Self::CuePreviewTop
             | Self::CuePreviewBottom
             | Self::CuePreviewEditCommit
-            | Self::CuePreviewEditCancel => None,
+            | Self::CuePreviewEditCancel
+            | Self::TemplateBuilderToken(_)
+            | Self::TemplateBuilderSavedItem(_)
+            | Self::TemplateBuilderApply
+            | Self::TemplateBuilderSave
+            | Self::TemplateBuilderClear
+            | Self::TemplateBuilderDelete => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)
@@ -176,7 +195,11 @@ impl TuiButton {
             | Self::SourceExpandButton
             | Self::SourceAnalyzeButton
             | Self::SourceEnqueueButton
-            | Self::SourceEnqueueStartButton => Some(AppScreen::Convert),
+            | Self::SourceEnqueueStartButton
+            | Self::TemplateBuildFolderButton
+            | Self::TemplateBuildFilenameButton
+            | Self::TemplateLoadFolderButton
+            | Self::TemplateLoadFilenameButton => Some(AppScreen::Convert),
             Self::AddFiles
             | Self::AddFolder
             | Self::Configure

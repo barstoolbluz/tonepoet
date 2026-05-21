@@ -987,6 +987,42 @@ pub enum ActiveOverlay {
         result: Box<crate::tui::accuraterip::ArBatchResult>,
         scroll: usize,
     },
+    /// Template builder overlay for composing folder/filename templates.
+    TemplateBuilder(Box<TemplateBuilderState>),
+}
+
+/// Which field the template builder is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateTarget {
+    Folder,
+    Filename,
+}
+
+/// Which section of the template builder has keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateBuilderFocus {
+    TemplateInput,
+    SavedList,
+    TokenGrid,
+}
+
+/// State for the template builder overlay.
+#[derive(Debug, Clone)]
+pub struct TemplateBuilderState {
+    /// The editable template line.
+    pub template_input: crate::tui::text_input::TextInputState,
+    /// Whether this builds a folder or filename template.
+    pub target: TemplateTarget,
+    /// Which section has keyboard focus.
+    pub focus: TemplateBuilderFocus,
+    /// Cursor position in the token/separator grid.
+    pub grid_cursor: usize,
+    /// Saved template strings loaded from disk.
+    pub saved_templates: Vec<String>,
+    /// Selected index in the saved templates list.
+    pub saved_selected: usize,
+    /// Scroll offset for the saved templates list.
+    pub saved_scroll: usize,
 }
 
 /// State for the AccurateRip verification overlay.

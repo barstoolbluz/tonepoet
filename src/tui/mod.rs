@@ -49,6 +49,7 @@ pub mod rename_presets;
 pub mod rename_template;
 pub mod sacd;
 pub mod sacd_sidecar;
+pub mod template_builder;
 pub mod text_input;
 pub mod theme;
 pub mod verify;
