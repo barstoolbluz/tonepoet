@@ -2,6 +2,9 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::Color,
+    text::{Line, Span},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -15,6 +18,7 @@ use super::draw_output_options::draw_output_options_pane;
 use super::draw_preset_bar::draw_preset_bar;
 use super::draw_source::draw_source_pane;
 use super::pill::PillState;
+use super::theme;
 
 /// Draw the full convert screen
 pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
@@ -30,6 +34,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
             Constraint::Length(10), // format pane
             Constraint::Length(7),  // output options pane
             Constraint::Min(0),     // absorb extra vertical space
+            Constraint::Length(1),  // convert action bar
             Constraint::Length(2),  // footer (tabs + context)
         ])
         .split(area);
@@ -65,10 +70,11 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         &app.convert.output_options,
         app.convert.focus == ConvertFocus::OutputOptions,
     );
+    draw_convert_action_bar(f, chunks[9], &mut app.button_map);
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
         f,
-        chunks[9],
+        chunks[10],
         app.current_screen,
         &mut app.button_map,
         status_msg,
@@ -343,4 +349,43 @@ fn register_pill_row<T: Clone>(
         buttons.record_button(make_button(i), Rect::new(x, y, pill_width, 1));
         x += pill_width;
     }
+}
+
+/// Draw the convert screen action bar with enqueue + enqueue+start pills, centered.
+fn draw_convert_action_bar(f: &mut Frame, area: Rect, buttons: &mut ButtonRenderMap) {
+    use super::draw_overlays::{footer_pill_pub, pill_gap_pub};
+
+    let pills: &[(&str, TuiButton, Color)] = &[
+        ("enqueue", TuiButton::SourceEnqueueButton, theme::GREEN),
+        (
+            "enqueue + start",
+            TuiButton::SourceEnqueueStartButton,
+            theme::BLUE,
+        ),
+    ];
+
+    let total_width: u16 = pills
+        .iter()
+        .map(|(label, _, _)| label.len() as u16 + 2)
+        .sum::<u16>()
+        + (pills.len().saturating_sub(1) as u16); // gaps
+
+    let left_pad = area.width.saturating_sub(total_width) / 2;
+    let mut x = area.x + left_pad;
+    let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(left_pad as usize))];
+
+    for (i, (label, btn, color)) in pills.iter().enumerate() {
+        if i > 0 {
+            spans.push(pill_gap_pub());
+            x += 1;
+        }
+        let pill = footer_pill_pub(label, *color);
+        let pill_width = label.len() as u16 + 2;
+        buttons.record_button(*btn, Rect::new(x, area.y, pill_width, 1));
+        x += pill_width;
+        spans.push(pill);
+    }
+
+    let bar = Paragraph::new(Line::from(spans));
+    f.render_widget(bar, area);
 }
