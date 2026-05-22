@@ -273,9 +273,14 @@ fn estimate_output_size(info: Option<&SourceInfo>, format: &FormatState) -> Opti
             let channels = info.channels as f64;
             let target_raw = info.duration_secs * target_rate * target_bits * channels / 8.0;
 
+            let target_is_compressed = matches!(
+                target_format,
+                AudioFormat::Flac | AudioFormat::Alac | AudioFormat::WavPack
+            );
             let is_container = info.format_name.starts_with("SACD");
             let is_uncompressed = info.codec.starts_with("pcm_");
-            let can_scale = !is_container
+            let can_scale = target_is_compressed
+                && !is_container
                 && !is_uncompressed
                 && info.bit_depth.is_some()
                 && info.sample_rate > 0
