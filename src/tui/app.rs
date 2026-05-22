@@ -989,6 +989,17 @@ pub enum ActiveOverlay {
     },
     /// Template builder overlay for composing folder/filename templates.
     TemplateBuilder(Box<TemplateBuilderState>),
+    /// Template picker overlay for loading saved templates.
+    TemplatePicker {
+        target: TemplateTarget,
+        templates: Vec<String>,
+        selected: usize,
+        scroll: usize,
+        /// Precomputed preview of the selected template.
+        preview: String,
+        /// Current field value (for "active" badge).
+        active_template: Option<String>,
+    },
 }
 
 /// Which field the template builder is editing.

@@ -555,3 +555,165 @@ pub fn draw_template_builder(
         );
     }
 }
+
+// =========================================================================
+// Template picker overlay
+// =========================================================================
+
+/// Render a preview of a template by substituting metadata from the convert screen.
+pub fn render_template_preview(
+    template: &str,
+    metadata: &super::app::MetadataState,
+    format_name: Option<&str>,
+) -> String {
+    let mut s = template.to_string();
+    let artist = metadata.artist.as_deref().unwrap_or("Artist");
+    let album = metadata.album.as_deref().unwrap_or("Album");
+    let title = metadata.title.as_deref().unwrap_or("Title");
+    let year = metadata.year.as_deref().unwrap_or("Year");
+    let genre = metadata.genre.as_deref().unwrap_or("Genre");
+    let fmt = format_name.unwrap_or("FLAC");
+
+    s = s.replace("%ARTIST%", artist);
+    s = s.replace("%ALBUM_ARTIST%", artist);
+    s = s.replace("%ALBUM%", album);
+    s = s.replace("%TITLE%", title);
+    s = s.replace("%TITLE_EXTRA%", "");
+    s = s.replace("%YEAR%", year);
+    s = s.replace("%GENRE%", genre);
+    s = s.replace("%FORMAT%", fmt);
+    s = s.replace("%TRACKNN%", "01");
+    s = s.replace("%TRACKN%", "1");
+    s = s.replace("%TRACK%", "1");
+    s = s.replace("%NN%", "01");
+    s = s.replace("%N%", "1");
+    s = s.replace("%DISC%", "1");
+    s = s.replace("%COMPOSER%", "Composer");
+    s = s.replace("%CATALOG%", "");
+    s = s.replace("%SAMPLERATE%", "44.1kHz");
+    s = s.replace("%BITDEPTH%", "16");
+    s = s.replace("%ISRC%", "");
+    s = s.replace("%LABEL%", "");
+    s = s.replace("%COUNTRY%", "");
+    s = s.replace("%PRESSING%", "");
+    s
+}
+
+/// Draw the template picker overlay — a list of saved templates with preview.
+pub fn draw_template_picker(
+    f: &mut Frame,
+    target: TemplateTarget,
+    templates: &[String],
+    selected: usize,
+    scroll: usize,
+    preview: &str,
+    active_template: Option<&str>,
+    button_map: &mut ButtonRenderMap,
+) {
+    use super::theme;
+
+    let area = f.size();
+    let w = (area.width * 75 / 100).max(50).min(area.width.saturating_sub(2));
+    let list_rows = templates.len().max(1) as u16;
+    // header(1) + blank(1) + list + blank(1) + preview label(1) + preview(1) + blank(1) + hint(1)
+    let content_h = 2 + 1 + list_rows + 1 + 1 + 1 + 1 + 1;
+    let h = content_h.min(area.height * 60 / 100).max(8);
+    let px = (area.width.saturating_sub(w)) / 2;
+    let py = (area.height.saturating_sub(h)) / 2;
+    let outer = Rect::new(px, py, w, h);
+
+    f.render_widget(Clear, outer);
+
+    let title_label = match target {
+        TemplateTarget::Folder => "Load Folder Template",
+        TemplateTarget::Filename => "Load Filename Template",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::CYAN))
+        .title(format!(" {} ", title_label))
+        .title_alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(block, outer);
+
+    let inner = Rect::new(outer.x + 1, outer.y + 1, outer.width.saturating_sub(2), outer.height.saturating_sub(2));
+    let mut cy = inner.y;
+
+    // Template list
+    let visible_rows = (inner.height.saturating_sub(5)) as usize; // reserve for preview + hints
+    if templates.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "No saved templates",
+            theme::muted(),
+        )));
+        f.render_widget(empty, Rect::new(inner.x + 1, cy, inner.width.saturating_sub(2), 1));
+        cy += 1;
+    } else {
+        let end = (scroll + visible_rows).min(templates.len());
+        for (i, tmpl) in templates[scroll..end].iter().enumerate() {
+            let idx = scroll + i;
+            let is_selected = idx == selected;
+            let is_active = active_template.map_or(false, |a| a == tmpl);
+
+            let mut spans = Vec::new();
+
+            // Selection indicator
+            if is_selected {
+                spans.push(Span::styled("▸ ", Style::default().fg(theme::CYAN)));
+            } else {
+                spans.push(Span::raw("  "));
+            }
+
+            // Template text
+            let style = if is_selected {
+                Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+            spans.push(Span::styled(tmpl.clone(), style));
+
+            // Active badge
+            if is_active {
+                spans.push(Span::styled(" (active)", Style::default().fg(theme::GREEN)));
+            }
+
+            let row_rect = Rect::new(inner.x, cy, inner.width, 1);
+            f.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+            button_map.record_button(TuiButton::TemplatePickerRow(idx), row_rect);
+            cy += 1;
+        }
+    }
+
+    // Preview section at the bottom
+    let preview_y = inner.y + inner.height.saturating_sub(3);
+    if preview_y > cy {
+        cy = preview_y;
+    }
+
+    // Preview label
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled("Preview:", theme::muted()))),
+        Rect::new(inner.x + 1, cy, inner.width.saturating_sub(2), 1),
+    );
+    cy += 1;
+
+    // Preview value
+    let preview_style = Style::default().fg(theme::TEXT_BRIGHT);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(preview, preview_style))),
+        Rect::new(inner.x + 2, cy, inner.width.saturating_sub(4), 1),
+    );
+    cy += 1;
+
+    // Hint line
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(theme::CYAN)),
+            Span::styled(" apply  ", theme::muted()),
+            Span::styled("x", Style::default().fg(theme::RED)),
+            Span::styled(" delete  ", theme::muted()),
+            Span::styled("Esc", Style::default().fg(theme::CYAN)),
+            Span::styled(" close", theme::muted()),
+        ])),
+        Rect::new(inner.x + 1, cy, inner.width.saturating_sub(2), 1),
+    );
+}

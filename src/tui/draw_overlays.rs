@@ -157,6 +157,25 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::TemplateBuilder(ref state) => {
             super::template_builder::draw_template_builder(f, state, &mut app.button_map);
         }
+        ActiveOverlay::TemplatePicker {
+            target,
+            ref templates,
+            selected,
+            scroll,
+            ref preview,
+            ref active_template,
+        } => {
+            super::template_builder::draw_template_picker(
+                f,
+                target,
+                templates,
+                selected,
+                scroll,
+                preview,
+                active_template.as_deref(),
+                &mut app.button_map,
+            );
+        }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)

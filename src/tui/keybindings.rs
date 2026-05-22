@@ -2398,6 +2398,130 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 },
             }
         }
+        ActiveOverlay::TemplatePicker {
+            target,
+            templates,
+            mut selected,
+            mut scroll,
+            active_template,
+            ..
+        } => {
+            let count = templates.len();
+            match key.code {
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if selected > 0 {
+                        selected -= 1;
+                        if selected < scroll {
+                            scroll = selected;
+                        }
+                    }
+                    let preview = if let Some(tmpl) = templates.get(selected) {
+                        super::template_builder::render_template_preview(
+                            tmpl,
+                            &app.convert.metadata,
+                            None,
+                        )
+                    } else {
+                        String::new()
+                    };
+                    app.active_overlay = ActiveOverlay::TemplatePicker {
+                        target,
+                        templates,
+                        selected,
+                        scroll,
+                        preview,
+                        active_template,
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if count > 0 && selected + 1 < count {
+                        selected += 1;
+                        // Scroll follows selection: assume ~10 visible rows
+                        let visible = 10_usize;
+                        if selected >= scroll + visible {
+                            scroll = selected.saturating_sub(visible - 1);
+                        }
+                    }
+                    let preview = if let Some(tmpl) = templates.get(selected) {
+                        super::template_builder::render_template_preview(
+                            tmpl,
+                            &app.convert.metadata,
+                            None,
+                        )
+                    } else {
+                        String::new()
+                    };
+                    app.active_overlay = ActiveOverlay::TemplatePicker {
+                        target,
+                        templates,
+                        selected,
+                        scroll,
+                        preview,
+                        active_template,
+                    };
+                }
+                KeyCode::Enter => {
+                    if let Some(tmpl) = templates.get(selected).cloned() {
+                        match target {
+                            TemplateTarget::Folder => {
+                                app.convert.output_options.folder_template = tmpl;
+                            }
+                            TemplateTarget::Filename => {
+                                app.convert.output_options.filename_template = tmpl;
+                            }
+                        }
+                        app.preset.mark_modified();
+                        app.active_overlay = ActiveOverlay::None;
+                        app.set_status("Template applied");
+                    }
+                }
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    if let Some(tmpl) = templates.get(selected).cloned() {
+                        let _ =
+                            super::template_builder::delete_template(target, &tmpl);
+                        let mut new_templates =
+                            super::template_builder::list_templates(target);
+                        if selected >= new_templates.len() && selected > 0 {
+                            selected -= 1;
+                        }
+                        if scroll > 0 && scroll >= new_templates.len() {
+                            scroll = new_templates.len().saturating_sub(1);
+                        }
+                        let preview = if let Some(tmpl) = new_templates.get(selected) {
+                            super::template_builder::render_template_preview(
+                                tmpl,
+                                &app.convert.metadata,
+                                None,
+                            )
+                        } else {
+                            String::new()
+                        };
+                        app.set_status("Template deleted");
+                        app.active_overlay = ActiveOverlay::TemplatePicker {
+                            target,
+                            templates: new_templates,
+                            selected,
+                            scroll,
+                            preview,
+                            active_template,
+                        };
+                    }
+                }
+                _ => {
+                    app.active_overlay = ActiveOverlay::TemplatePicker {
+                        target,
+                        templates,
+                        selected,
+                        scroll,
+                        preview: String::new(),
+                        active_template,
+                    };
+                }
+            }
+        }
         ActiveOverlay::None => {}
     }
 }
@@ -5989,6 +6113,84 @@ fn build_metadata_detail_context_menu(
     entries
 }
 
+fn open_template_picker(app: &mut AppState, target: TemplateTarget) {
+    let templates = super::template_builder::list_templates(target);
+    let active = match target {
+        TemplateTarget::Folder => Some(app.convert.output_options.folder_template.clone()),
+        TemplateTarget::Filename => Some(app.convert.output_options.filename_template.clone()),
+    };
+    let preview = if let Some(tmpl) = templates.first() {
+        super::template_builder::render_template_preview(tmpl, &app.convert.metadata, None)
+    } else {
+        String::new()
+    };
+    app.active_overlay = ActiveOverlay::TemplatePicker {
+        target,
+        templates,
+        selected: 0,
+        scroll: 0,
+        preview,
+        active_template: active,
+    };
+}
+
+/// Mouse handler for the template picker overlay.
+fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mx = mouse.column;
+    let my = mouse.row;
+
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+
+    match app.button_map.find_button_at(mx, my) {
+        Some(TuiButton::TemplatePickerRow(idx)) => {
+            // Extract target from the overlay
+            if let ActiveOverlay::TemplatePicker {
+                target,
+                ref templates,
+                ..
+            } = app.active_overlay
+            {
+                if let Some(tmpl) = templates.get(idx).cloned() {
+                    match target {
+                        TemplateTarget::Folder => {
+                            app.convert.output_options.folder_template = tmpl;
+                        }
+                        TemplateTarget::Filename => {
+                            app.convert.output_options.filename_template = tmpl;
+                        }
+                    }
+                    app.preset.mark_modified();
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("Template applied");
+                }
+            }
+        }
+        _ => {
+            // Click outside or on non-button area — compute bounds and close if outside
+            let area = crossterm::terminal::size().unwrap_or((80, 24));
+            let w = (area.0 * 75 / 100).max(50).min(area.0.saturating_sub(2));
+            let template_count = if let ActiveOverlay::TemplatePicker { ref templates, .. } =
+                app.active_overlay
+            {
+                templates.len()
+            } else {
+                0
+            };
+            let list_rows = template_count.max(1) as u16;
+            let content_h = 2 + 1 + list_rows + 1 + 1 + 1 + 1 + 1;
+            let h = content_h.min(area.1 * 60 / 100).max(8);
+            let px = (area.0.saturating_sub(w)) / 2;
+            let py = (area.1.saturating_sub(h)) / 2;
+            if mx < px || mx >= px + w || my < py || my >= py + h {
+                app.active_overlay = ActiveOverlay::None;
+            }
+        }
+    }
+}
+
 /// Mouse handler for the template builder overlay.
 fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -9128,6 +9330,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
+    // Template picker: dedicated handler for row clicks.
+    if matches!(app.active_overlay, ActiveOverlay::TemplatePicker { .. }) {
+        handle_template_picker_mouse(app, mouse);
+        return;
+    }
+
     // Template builder: dedicated handler for token/saved clicks.
     if matches!(app.active_overlay, ActiveOverlay::TemplateBuilder(_)) {
         handle_template_builder_mouse(app, mouse);
@@ -9906,22 +10114,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     )));
             }
             TuiButton::TemplateLoadFolderButton => {
-                let initial = app.convert.output_options.folder_template.clone();
-                app.active_overlay =
-                    ActiveOverlay::TemplateBuilder(Box::new(TemplateBuilderState::new(
-                        TemplateTarget::Folder,
-                        &initial,
-                        TemplateBuilderFocus::SavedList,
-                    )));
+                open_template_picker(app, TemplateTarget::Folder);
             }
             TuiButton::TemplateLoadFilenameButton => {
-                let initial = app.convert.output_options.filename_template.clone();
-                app.active_overlay =
-                    ActiveOverlay::TemplateBuilder(Box::new(TemplateBuilderState::new(
-                        TemplateTarget::Filename,
-                        &initial,
-                        TemplateBuilderFocus::SavedList,
-                    )));
+                open_template_picker(app, TemplateTarget::Filename);
             }
 
             // ── Template builder overlay buttons (handled by dedicated mouse handler) ──
@@ -9930,8 +10126,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::TemplateBuilderApply
             | TuiButton::TemplateBuilderSave
             | TuiButton::TemplateBuilderClear
-            | TuiButton::TemplateBuilderDelete => {
-                // Handled in handle_template_builder_mouse; no-op here.
+            | TuiButton::TemplateBuilderDelete
+            | TuiButton::TemplatePickerRow(_) => {
+                // Handled in dedicated mouse handlers; no-op here.
             }
         }
     }
