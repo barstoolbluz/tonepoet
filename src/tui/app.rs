@@ -239,6 +239,8 @@ impl SourceMode {
                 Self::from_single(path, None, SourceMetadata::default())
             }
             _ => {
+                let mut paths = paths;
+                paths.sort();
                 let total_size: u64 = paths
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok())
