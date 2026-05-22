@@ -2419,11 +2419,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         }
                     }
                     let preview = if let Some(tmpl) = templates.get(selected) {
-                        super::template_builder::render_template_preview(
-                            tmpl,
-                            &app.convert.metadata,
-                            None,
-                        )
+                        super::template_builder::render_template_preview(tmpl)
                     } else {
                         String::new()
                     };
@@ -2446,11 +2442,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         }
                     }
                     let preview = if let Some(tmpl) = templates.get(selected) {
-                        super::template_builder::render_template_preview(
-                            tmpl,
-                            &app.convert.metadata,
-                            None,
-                        )
+                        super::template_builder::render_template_preview(tmpl)
                     } else {
                         String::new()
                     };
@@ -2491,11 +2483,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             scroll = new_templates.len().saturating_sub(1);
                         }
                         let preview = if let Some(tmpl) = new_templates.get(selected) {
-                            super::template_builder::render_template_preview(
-                                tmpl,
-                                &app.convert.metadata,
-                                None,
-                            )
+                            super::template_builder::render_template_preview(tmpl)
                         } else {
                             String::new()
                         };
@@ -6120,7 +6108,7 @@ fn open_template_picker(app: &mut AppState, target: TemplateTarget) {
         TemplateTarget::Filename => Some(app.convert.output_options.filename_template.clone()),
     };
     let preview = if let Some(tmpl) = templates.first() {
-        super::template_builder::render_template_preview(tmpl, &app.convert.metadata, None)
+        super::template_builder::render_template_preview(tmpl)
     } else {
         String::new()
     };

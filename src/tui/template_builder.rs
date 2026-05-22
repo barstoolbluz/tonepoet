@@ -560,42 +560,42 @@ pub fn draw_template_builder(
 // Template picker overlay
 // =========================================================================
 
-/// Render a preview of a template by substituting metadata from the convert screen.
-pub fn render_template_preview(
-    template: &str,
-    metadata: &super::app::MetadataState,
-    format_name: Option<&str>,
-) -> String {
-    let mut s = template.to_string();
-    let artist = metadata.artist.as_deref().unwrap_or("Artist");
-    let album = metadata.album.as_deref().unwrap_or("Album");
-    let title = metadata.title.as_deref().unwrap_or("Title");
-    let year = metadata.year.as_deref().unwrap_or("Year");
-    let genre = metadata.genre.as_deref().unwrap_or("Genre");
-    let fmt = format_name.unwrap_or("FLAC");
+/// Render a preview of a template using a canonical example album.
+///
+/// Uses the Japan CBS/Sony pressing of Pink Floyd's "Wish You Were Here"
+/// (35DP-4, 1975) as a canonical example that populates every token,
+/// including %TITLE_EXTRA%.
+pub fn render_template_preview(template: &str) -> String {
+    const ALBUM_FULL: &str = "Wish You Were Here (Japan CBS-Sony 35DP-4)";
+    const ALBUM_CLEAN: &str = "Wish You Were Here";
+    const TITLE_EXTRA: &str = " (Japan CBS-Sony 35DP-4)";
 
-    s = s.replace("%ARTIST%", artist);
-    s = s.replace("%ALBUM_ARTIST%", artist);
+    let has_title_extra = template.contains("%TITLE_EXTRA%");
+    let album = if has_title_extra { ALBUM_CLEAN } else { ALBUM_FULL };
+
+    let mut s = template.to_string();
+    s = s.replace("%ARTIST%", "Pink Floyd");
+    s = s.replace("%ALBUM_ARTIST%", "Pink Floyd");
     s = s.replace("%ALBUM%", album);
-    s = s.replace("%TITLE%", title);
-    s = s.replace("%TITLE_EXTRA%", "");
-    s = s.replace("%YEAR%", year);
-    s = s.replace("%GENRE%", genre);
-    s = s.replace("%FORMAT%", fmt);
+    s = s.replace("%TITLE%", "Shine On You Crazy Diamond (Parts I-V)");
+    s = s.replace("%TITLE_EXTRA%", if has_title_extra { TITLE_EXTRA } else { "" });
+    s = s.replace("%YEAR%", "1975");
+    s = s.replace("%GENRE%", "Rock");
+    s = s.replace("%FORMAT%", "FLAC");
     s = s.replace("%TRACKNN%", "01");
     s = s.replace("%TRACKN%", "1");
     s = s.replace("%TRACK%", "1");
     s = s.replace("%NN%", "01");
     s = s.replace("%N%", "1");
     s = s.replace("%DISC%", "1");
-    s = s.replace("%COMPOSER%", "Composer");
-    s = s.replace("%CATALOG%", "");
+    s = s.replace("%COMPOSER%", "Roger Waters");
+    s = s.replace("%CATALOG%", "35DP-4");
     s = s.replace("%SAMPLERATE%", "44.1kHz");
     s = s.replace("%BITDEPTH%", "16");
-    s = s.replace("%ISRC%", "");
-    s = s.replace("%LABEL%", "");
-    s = s.replace("%COUNTRY%", "");
-    s = s.replace("%PRESSING%", "");
+    s = s.replace("%ISRC%", "GBN9Y7500101");
+    s = s.replace("%LABEL%", "CBS/Sony");
+    s = s.replace("%COUNTRY%", "JP");
+    s = s.replace("%PRESSING%", "CBS/Sony");
     s
 }
 
