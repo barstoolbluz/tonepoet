@@ -139,6 +139,10 @@ pub fn extract_wizard_settings(
         }
 
         AudioFormat::Alac => QualitySettings::Alac,
+
+        AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
+            compression_level: 0,
+        },
     };
 
     // Extract destination path from wizard
@@ -507,6 +511,9 @@ pub fn preset_to_conversion_options(
             }
         }
         AudioFormat::Alac => QualitySettings::Alac,
+        AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
+            compression_level: 0,
+        },
     };
 
     ConversionOptions {

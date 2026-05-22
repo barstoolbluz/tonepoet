@@ -273,6 +273,12 @@ fn estimate_output_size(
 
     let target_format = format.format.selected_value();
     let bytes = match target_format {
+        // DSD: 1-bit per sample at the DSD rate, scaled to batch
+        AudioFormat::Dsf | AudioFormat::Dff => {
+            let dsd_rate = *format.sample_rate.selected_value() as f64;
+            let channels = info.channels as f64;
+            (info.duration_secs * dsd_rate * channels / 8.0 * batch_scale) as u64
+        }
         // Lossy: bitrate × duration / 8, scaled to batch
         AudioFormat::Mp3 => (320_000.0 * info.duration_secs / 8.0 * batch_scale) as u64,
         AudioFormat::Aac => (256_000.0 * info.duration_secs / 8.0 * batch_scale) as u64,

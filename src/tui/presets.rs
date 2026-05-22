@@ -426,6 +426,8 @@ fn parse_format(s: &str) -> Option<AudioFormat> {
         "aac" => Some(AudioFormat::Aac),
         "opus" => Some(AudioFormat::Opus),
         "alac" => Some(AudioFormat::Alac),
+        "dsf" => Some(AudioFormat::Dsf),
+        "dff" => Some(AudioFormat::Dff),
         _ => None,
     }
 }

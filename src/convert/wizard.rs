@@ -281,6 +281,8 @@ fn format_description(format: AudioFormat) -> String {
         AudioFormat::Aac => "Modern lossy format - Better than MP3 at same bitrate",
         AudioFormat::Opus => "Best lossy codec - Excellent quality at low bitrates",
         AudioFormat::Alac => "Apple Lossless Audio Codec - Lossless compression, Apple ecosystem",
+        AudioFormat::Dsf => "DSD Stream File - 1-bit DSD audio container",
+        AudioFormat::Dff => "DSDIFF - Philips DSD Interchange File Format",
     }
     .to_string()
 }

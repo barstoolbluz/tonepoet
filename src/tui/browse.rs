@@ -140,7 +140,9 @@ impl FormatFilter {
             Self::Only(AudioFormat::Alac) => Self::Only(AudioFormat::Wav),
             Self::Only(AudioFormat::Wav) => Self::Only(AudioFormat::WavPack),
             Self::Only(AudioFormat::WavPack) => Self::Only(AudioFormat::Aiff),
-            Self::Only(AudioFormat::Aiff) => Self::Off,
+            Self::Only(AudioFormat::Aiff) => Self::Only(AudioFormat::Dsf),
+            Self::Only(AudioFormat::Dsf) => Self::Only(AudioFormat::Dff),
+            Self::Only(AudioFormat::Dff) => Self::Off,
         }
     }
 
@@ -2046,7 +2048,9 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
         EntryKind::AudioFile(AudioFormat::Mp3) => 15,
         EntryKind::AudioFile(AudioFormat::Aac) => 16,
         EntryKind::AudioFile(AudioFormat::Opus) => 17,
-        EntryKind::SacdIso => 19,
+        EntryKind::AudioFile(AudioFormat::Dsf) => 18,
+        EntryKind::AudioFile(AudioFormat::Dff) => 19,
+        EntryKind::SacdIso => 20,
         EntryKind::Archive => 20,
         EntryKind::OtherFile => 30,
     }

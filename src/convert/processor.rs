@@ -2006,6 +2006,10 @@ fn create_backend_conversion_item(
         crate::convert::AudioFormat::Aac => tonepoet_backend::integration::MainAudioFormat::Aac,
         crate::convert::AudioFormat::Opus => tonepoet_backend::integration::MainAudioFormat::Opus,
         crate::convert::AudioFormat::Alac => tonepoet_backend::integration::MainAudioFormat::Alac,
+        // DSD formats don't map to backend yet — placeholder.
+        crate::convert::AudioFormat::Dsf | crate::convert::AudioFormat::Dff => {
+            tonepoet_backend::integration::MainAudioFormat::Flac
+        }
     };
 
     // Map quality settings

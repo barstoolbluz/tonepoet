@@ -604,6 +604,7 @@ impl FormatState {
         );
 
         let sample_rate = PillState::new(vec![
+            // PCM rates (kHz)
             (44_100, "44.1"),
             (48_000, "48"),
             (88_200, "88.2"),
@@ -614,6 +615,11 @@ impl FormatState {
             (384_000, "384"),
             (705_600, "705.6"),
             (768_000, "768"),
+            // DSD rates
+            (2_822_400, "DSD64"),
+            (5_644_800, "DSD128"),
+            (11_289_600, "DSD256"),
+            (22_579_200, "DSD512"),
         ]);
 
         let bit_depth = PillState::new(vec![
@@ -658,7 +664,26 @@ impl FormatState {
         self.bit_depth.set_all_enabled(true);
         self.dither.set_all_enabled(true);
 
+        // DSD rate threshold: rates at or above this are DSD, below are PCM.
+        const DSD_RATE_MIN: u32 = 2_822_400;
+
+        let is_dsd_format = matches!(fmt, AudioFormat::Dsf | AudioFormat::Dff);
+
+        // First pass: enable/disable sample rates based on PCM vs DSD.
+        for opt in &mut self.sample_rate.options {
+            if is_dsd_format {
+                opt.enabled = opt.value >= DSD_RATE_MIN;
+            } else {
+                opt.enabled = opt.value < DSD_RATE_MIN;
+            }
+        }
+
         match fmt {
+            AudioFormat::Dsf | AudioFormat::Dff => {
+                // DSD: no bit depth (always 1-bit), no dither
+                self.bit_depth.set_all_enabled(false);
+                self.dither.set_all_enabled(false);
+            }
             AudioFormat::Opus => {
                 self.sample_rate.select_value(&48_000);
                 for opt in &mut self.sample_rate.options {
@@ -686,17 +711,14 @@ impl FormatState {
                 }
             }
             AudioFormat::Flac => {
-                // FLAC: up to 32-bit integer, no float
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
             }
             AudioFormat::Aiff => {
-                // AIFF: up to 32-bit integer, no float (standard AIFF)
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
             }
             AudioFormat::Alac => {
-                // ALAC: up to 32-bit integer, no float
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
             }

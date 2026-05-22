@@ -59,6 +59,9 @@ pub fn pills_to_options(
             complexity: 10,
         },
         AudioFormat::Alac => QualitySettings::Alac,
+        AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
+            compression_level: 0, // DSD passthrough placeholder
+        },
     };
 
     // Map ReplayGain choice

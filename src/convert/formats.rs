@@ -32,6 +32,10 @@ pub enum AudioFormat {
     Opus,
     /// Apple Lossless Audio Codec
     Alac,
+    /// DSD Stream File
+    Dsf,
+    /// DSDIFF (Philips DSD Interchange File Format)
+    Dff,
 }
 
 impl AudioFormat {
@@ -46,6 +50,8 @@ impl AudioFormat {
             Self::Aac => "m4a",
             Self::Opus => "opus",
             Self::Alac => "m4a",
+            Self::Dsf => "dsf",
+            Self::Dff => "dff",
         }
     }
 
@@ -60,6 +66,8 @@ impl AudioFormat {
             Self::Aac => "AAC",
             Self::Opus => "Opus",
             Self::Alac => "ALAC",
+            Self::Dsf => "DSF",
+            Self::Dff => "DFF",
         }
     }
 
@@ -67,7 +75,7 @@ impl AudioFormat {
     pub fn is_lossless(&self) -> bool {
         matches!(
             self,
-            Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac
+            Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac | Self::Dsf | Self::Dff
         )
     }
 
@@ -82,6 +90,8 @@ impl AudioFormat {
             Self::Aac,
             Self::Opus,
             Self::Alac,
+            Self::Dsf,
+            Self::Dff,
         ]
     }
 
@@ -95,6 +105,8 @@ impl AudioFormat {
             Self::Alac,
             Self::Wav,
             Self::WavPack,
+            Self::Dsf,
+            Self::Dff,
         ]
     }
 }
@@ -438,6 +450,9 @@ impl AudioFormat {
                 complexity: 10,
             },
             AudioFormat::Alac => QualitySettings::Alac,
+            AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
+                compression_level: 0, // DSD passthrough — no compression parameter
+            },
         }
     }
 }

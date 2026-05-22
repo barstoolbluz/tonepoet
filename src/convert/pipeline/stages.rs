@@ -4709,6 +4709,8 @@ fn backend_audio_format(format: AudioFormat) -> tonepoet_backend::AudioFormat {
         AudioFormat::Aac => tonepoet_backend::AudioFormat::Aac,
         AudioFormat::Opus => tonepoet_backend::AudioFormat::Opus,
         AudioFormat::Alac => tonepoet_backend::AudioFormat::Alac,
+        // DSD formats don't map to a backend format yet — passthrough only.
+        AudioFormat::Dsf | AudioFormat::Dff => tonepoet_backend::AudioFormat::Flac, // placeholder
     }
 }
 
