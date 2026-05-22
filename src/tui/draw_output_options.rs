@@ -265,28 +265,37 @@ fn estimate_output_size(info: Option<&SourceInfo>, format: &FormatState) -> Opti
         AudioFormat::Mp3 => (320_000.0 * info.duration_secs / 8.0) as u64,
         AudioFormat::Aac => (256_000.0 * info.duration_secs / 8.0) as u64,
         AudioFormat::Opus => (128_000.0 * info.duration_secs / 8.0) as u64,
-        // Lossless: duration × rate × bits × channels / 8, with compression factor
+        // Lossless: scale proportionally from source file size when possible,
+        // otherwise fall back to raw PCM formula with compression estimate.
         _ => {
-            let rate = *format.sample_rate.selected_value() as f64;
-            let bits = format.bit_depth.selected_value().bits() as f64;
+            let target_rate = *format.sample_rate.selected_value() as f64;
+            let target_bits = format.bit_depth.selected_value().bits() as f64;
             let channels = info.channels as f64;
-            let raw_pcm = info.duration_secs * rate * bits * channels / 8.0;
-            let factor = match target_format {
-                AudioFormat::Flac | AudioFormat::Alac | AudioFormat::WavPack => {
-                    // Derive actual compression ratio from source when possible,
-                    // rather than using a generic 0.6 estimate.
-                    let source_bits = info.bit_depth.unwrap_or(16) as f64;
-                    let source_raw =
-                        info.duration_secs * info.sample_rate as f64 * source_bits * channels / 8.0;
-                    if source_raw > 0.0 && info.file_size > 0 {
-                        (info.file_size as f64 / source_raw).clamp(0.3, 0.9)
-                    } else {
-                        0.6
-                    }
-                }
-                _ => 1.0, // WAV, AIFF, etc.
-            };
-            (raw_pcm * factor) as u64
+            let target_raw = info.duration_secs * target_rate * target_bits * channels / 8.0;
+
+            let is_container = info.format_name.starts_with("SACD");
+            let is_uncompressed = info.codec.starts_with("pcm_");
+            let can_scale = !is_container
+                && !is_uncompressed
+                && info.bit_depth.is_some()
+                && info.sample_rate > 0
+                && info.file_size > 0;
+
+            if can_scale {
+                // Proportional scaling: preserves source's actual compression
+                // ratio. Same settings → estimate = source file size.
+                let source_rate = info.sample_rate as f64;
+                let source_bits = info.bit_depth.unwrap() as f64;
+                let scale = (target_rate * target_bits) / (source_rate * source_bits);
+                (info.file_size as f64 * scale) as u64
+            } else {
+                // No source bit_depth or container format: use generic factor.
+                let factor = match target_format {
+                    AudioFormat::Flac | AudioFormat::Alac | AudioFormat::WavPack => 0.6,
+                    _ => 1.0,
+                };
+                (target_raw * factor) as u64
+            }
         }
     };
 
