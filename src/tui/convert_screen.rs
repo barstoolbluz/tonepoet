@@ -68,6 +68,8 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         f,
         chunks[7],
         &app.convert.output_options,
+        app.convert.source.mode.current_info(),
+        &app.convert.format,
         app.convert.focus == ConvertFocus::OutputOptions,
     );
     draw_convert_action_bar(f, chunks[9], &mut app.button_map);

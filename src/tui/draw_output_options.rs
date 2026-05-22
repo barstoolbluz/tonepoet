@@ -8,15 +8,19 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{OutputOptionsField, OutputOptionsState};
+use super::app::{FormatState, OutputOptionsField, OutputOptionsState};
 use super::pill::render_pill_spans;
+use super::probe::SourceInfo;
 use super::theme;
+use crate::convert::formats::AudioFormat;
 
 /// Draw the output options pane with cyan border
 pub fn draw_output_options_pane(
     f: &mut Frame,
     area: Rect,
     opts: &OutputOptionsState,
+    source_info: Option<&SourceInfo>,
+    format: &FormatState,
     focused: bool,
 ) {
     if area.height < 5 || area.width < 30 {
@@ -145,12 +149,14 @@ pub fn draw_output_options_pane(
     );
 
     // Estimated size
+    let est_display = estimate_output_size(source_info, format)
+        .unwrap_or_else(|| "—".to_string());
     let est_row = bordered_line(
         border_color,
         w,
         vec![
             Span::styled("   est. size   ", theme::muted()),
-            Span::styled("—", theme::accent()),
+            Span::styled(est_display, theme::accent()),
         ],
     );
 
@@ -244,6 +250,51 @@ fn template_row_with_pills<'a>(
     spans.push(build_pill);
     spans.push(Span::styled("│", theme::border(border_color)));
     Line::from(spans)
+}
+
+/// Estimate the output file size based on source audio properties and target format.
+fn estimate_output_size(info: Option<&SourceInfo>, format: &FormatState) -> Option<String> {
+    let info = info?;
+    if info.duration_secs <= 0.0 {
+        return None;
+    }
+
+    let target_format = format.format.selected_value();
+    let bytes = match target_format {
+        // Lossy: bitrate × duration / 8
+        AudioFormat::Mp3 => (320_000.0 * info.duration_secs / 8.0) as u64,
+        AudioFormat::Aac => (256_000.0 * info.duration_secs / 8.0) as u64,
+        AudioFormat::Opus => (128_000.0 * info.duration_secs / 8.0) as u64,
+        // Lossless: duration × rate × bits × channels / 8, with compression factor
+        _ => {
+            let rate = *format.sample_rate.selected_value() as f64;
+            let bits = format.bit_depth.selected_value().bits() as f64;
+            let channels = info.channels as f64;
+            let raw_pcm = info.duration_secs * rate * bits * channels / 8.0;
+            let factor = match target_format {
+                AudioFormat::Flac | AudioFormat::Alac | AudioFormat::WavPack => 0.6,
+                _ => 1.0, // WAV, AIFF, etc.
+            };
+            (raw_pcm * factor) as u64
+        }
+    };
+
+    Some(format_size_estimate(bytes))
+}
+
+fn format_size_estimate(bytes: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    const KB: u64 = 1_024;
+    if bytes >= GB {
+        format!("~{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("~{:.0} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("~{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("~{} B", bytes)
+    }
 }
 
 /// Truncate a string to at most `max_chars` characters, adding "..." if truncated.
