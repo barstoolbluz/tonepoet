@@ -2470,7 +2470,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         app.set_status("Template applied");
                     }
                 }
-                KeyCode::Char('x') | KeyCode::Delete => {
+                KeyCode::Delete => {
                     if let Some(tmpl) = templates.get(selected).cloned() {
                         let _ =
                             super::template_builder::delete_template(target, &tmpl);
@@ -6133,14 +6133,19 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
     }
 
     match app.button_map.find_button_at(mx, my) {
-        Some(TuiButton::TemplatePickerRow(idx)) => {
-            // Extract target from the overlay
+        Some(TuiButton::TemplatePickerRow(_)) | Some(TuiButton::TemplatePickerApply) => {
+            let click_idx = match app.button_map.find_button_at(mx, my) {
+                Some(TuiButton::TemplatePickerRow(i)) => Some(i),
+                _ => None, // Apply pill → use selected
+            };
             if let ActiveOverlay::TemplatePicker {
                 target,
                 ref templates,
+                selected,
                 ..
             } = app.active_overlay
             {
+                let idx = click_idx.unwrap_or(selected);
                 if let Some(tmpl) = templates.get(idx).cloned() {
                     match target {
                         TemplateTarget::Folder => {
@@ -6155,6 +6160,46 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
                     app.set_status("Template applied");
                 }
             }
+        }
+        Some(TuiButton::TemplatePickerDelete) => {
+            if let ActiveOverlay::TemplatePicker {
+                target,
+                ref templates,
+                mut selected,
+                mut scroll,
+                ref active_template,
+                ..
+            } = app.active_overlay
+            {
+                if let Some(tmpl) = templates.get(selected).cloned() {
+                    let _ = super::template_builder::delete_template(target, &tmpl);
+                    let new_templates = super::template_builder::list_templates(target);
+                    if selected >= new_templates.len() && selected > 0 {
+                        selected -= 1;
+                    }
+                    if scroll > 0 && scroll >= new_templates.len() {
+                        scroll = new_templates.len().saturating_sub(1);
+                    }
+                    let preview = if let Some(tmpl) = new_templates.get(selected) {
+                        super::template_builder::render_template_preview(tmpl)
+                    } else {
+                        String::new()
+                    };
+                    let active_template = active_template.clone();
+                    app.set_status("Template deleted");
+                    app.active_overlay = ActiveOverlay::TemplatePicker {
+                        target,
+                        templates: new_templates,
+                        selected,
+                        scroll,
+                        preview,
+                        active_template,
+                    };
+                }
+            }
+        }
+        Some(TuiButton::TemplatePickerClose) => {
+            app.active_overlay = ActiveOverlay::None;
         }
         _ => {
             // Click outside or on non-button area — compute bounds and close if outside
@@ -10115,7 +10160,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::TemplateBuilderSave
             | TuiButton::TemplateBuilderClear
             | TuiButton::TemplateBuilderDelete
-            | TuiButton::TemplatePickerRow(_) => {
+            | TuiButton::TemplatePickerRow(_)
+            | TuiButton::TemplatePickerApply
+            | TuiButton::TemplatePickerDelete
+            | TuiButton::TemplatePickerClose => {
                 // Handled in dedicated mouse handlers; no-op here.
             }
         }

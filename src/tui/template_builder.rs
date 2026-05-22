@@ -568,7 +568,7 @@ pub fn draw_template_builder(
 pub fn render_template_preview(template: &str) -> String {
     const ALBUM_FULL: &str = "Wish You Were Here (Japan  CBS-Sony 35DP-4)";
     const ALBUM_CLEAN: &str = "Wish You Were Here";
-    const TITLE_EXTRA: &str = " (Japan  CBS-Sony 35DP-4)";
+    const TITLE_EXTRA: &str = "Japan  CBS-Sony 35DP-4";
 
     let has_title_extra = template.contains("%TITLE_EXTRA%");
     let album = if has_title_extra { ALBUM_CLEAN } else { ALBUM_FULL };
@@ -704,16 +704,39 @@ pub fn draw_template_picker(
     );
     cy += 1;
 
-    // Hint line
+    // Footer pills
+    let pills: &[(&str, TuiButton, Color)] = &[
+        ("apply", TuiButton::TemplatePickerApply, theme::GREEN),
+        ("delete", TuiButton::TemplatePickerDelete, theme::RED),
+        ("close", TuiButton::TemplatePickerClose, theme::PURPLE),
+    ];
+    let total_w: u16 = pills
+        .iter()
+        .map(|(l, _, _)| l.len() as u16 + 2)
+        .sum::<u16>()
+        + (pills.len().saturating_sub(1) as u16);
+    let left_pad = inner.width.saturating_sub(total_w) / 2;
+    let mut px = inner.x + left_pad;
+    let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(left_pad as usize))];
+    for (i, (label, btn, color)) in pills.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+            px += 1;
+        }
+        let pill_w = label.len() as u16 + 2;
+        let pill = Span::styled(
+            format!(" {} ", label),
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(*color)
+                .add_modifier(Modifier::BOLD),
+        );
+        button_map.record_button(*btn, Rect::new(px, cy, pill_w, 1));
+        spans.push(pill);
+        px += pill_w;
+    }
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Enter", Style::default().fg(theme::CYAN)),
-            Span::styled(" apply  ", theme::muted()),
-            Span::styled("x", Style::default().fg(theme::RED)),
-            Span::styled(" delete  ", theme::muted()),
-            Span::styled("Esc", Style::default().fg(theme::CYAN)),
-            Span::styled(" close", theme::muted()),
-        ])),
-        Rect::new(inner.x + 1, cy, inner.width.saturating_sub(2), 1),
+        Paragraph::new(Line::from(spans)),
+        Rect::new(inner.x, cy, inner.width, 1),
     );
 }

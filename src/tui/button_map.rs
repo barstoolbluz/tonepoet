@@ -147,8 +147,11 @@ pub enum TuiButton {
     TemplateBuilderClear,
     TemplateBuilderDelete,
 
-    // Template picker overlay: clickable template row.
+    // Template picker overlay: clickable elements.
     TemplatePickerRow(usize),
+    TemplatePickerApply,
+    TemplatePickerDelete,
+    TemplatePickerClose,
 }
 
 impl TuiButton {
@@ -180,7 +183,10 @@ impl TuiButton {
             | Self::TemplateBuilderSave
             | Self::TemplateBuilderClear
             | Self::TemplateBuilderDelete
-            | Self::TemplatePickerRow(_) => None,
+            | Self::TemplatePickerRow(_)
+            | Self::TemplatePickerApply
+            | Self::TemplatePickerDelete
+            | Self::TemplatePickerClose => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)
