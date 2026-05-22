@@ -33,8 +33,24 @@ pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
     const BASE: u16 = 6;
     const MAX: u16 = 12;
 
+    let per_row: usize = if terminal_width >= 100 { 2 } else { 1 };
+
     match mode {
-        SourceMode::Empty | SourceMode::Single { .. } | SourceMode::Batch { .. } => BASE,
+        SourceMode::Empty | SourceMode::Single { .. } => BASE,
+        SourceMode::Batch { paths, .. } => {
+            let n = paths.len();
+            if n <= 1 {
+                return BASE;
+            }
+            // Header: summary(1) + formats(1). Pill: expand(1).
+            let header: u16 = 2;
+            let visible = n.min(10);
+            let track_rows = ((visible + per_row - 1) / per_row) as u16;
+            let overflow: u16 = if n > 10 { 1 } else { 0 };
+            let pill: u16 = 1;
+            let total = header + track_rows + overflow + pill + 2;
+            total.min(MAX)
+        }
         SourceMode::MultiTrack {
             tracks,
             album_title,
@@ -46,13 +62,11 @@ pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
             }
             // Header: filename(1) + album info(1 if present) + track count(1)
             let header: u16 = if album_title.is_some() { 3 } else { 2 };
-            // 2 tracks per row on wide terminals, 1 on narrow
-            let per_row: usize = if terminal_width >= 100 { 2 } else { 1 };
             let visible = n.min(10);
             let track_rows = ((visible + per_row - 1) / per_row) as u16;
             let overflow: u16 = if n > 10 { 1 } else { 0 };
             let pill: u16 = 1;
-            let total = header + track_rows + overflow + pill + 2; // +2 borders
+            let total = header + track_rows + overflow + pill + 2;
             total.min(MAX)
         }
     }
@@ -145,6 +159,7 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
             *total_size,
             *album_count,
             format_histogram,
+            area.height,
         ),
     };
 
@@ -247,20 +262,22 @@ fn render_single<'a>(
     ]
 }
 
-/// Render the multi-file batch content: summary line + format histogram
-/// + inline file list + [expand] pill.
+/// Render the multi-file batch content: summary + inline file list + pill.
+/// `pane_height` is the total allocated pane height including borders.
 #[allow(clippy::too_many_arguments)]
 fn render_batch<'a>(
     border_color: ratatui::style::Color,
     w: usize,
     paths: &[std::path::PathBuf],
     cursor: usize,
-    cursor_info: Option<&SourceInfo>,
+    _cursor_info: Option<&SourceInfo>,
     total_size: u64,
     album_count: usize,
     format_histogram: &[(AudioFormat, usize)],
+    pane_height: u16,
 ) -> Vec<Line<'a>> {
     let n = paths.len();
+    let mut lines = Vec::new();
 
     // Line 1: "batch: 5 files · 2 albums · 892 MB"
     let summary_line = format!(
@@ -270,6 +287,14 @@ fn render_batch<'a>(
         if album_count == 1 { "" } else { "s" },
         format_size(total_size),
     );
+    lines.push(bordered_line(
+        border_color,
+        w,
+        vec![
+            Span::styled("   batch     ", theme::muted()),
+            Span::styled(summary_line, theme::bold(theme::BLUE)),
+        ],
+    ));
 
     // Line 2: format histogram, e.g. "FLAC (3) · WAV (2)"
     let hist_str = if format_histogram.is_empty() {
@@ -281,69 +306,75 @@ fn render_batch<'a>(
             .collect::<Vec<_>>()
             .join(" · ")
     };
+    lines.push(bordered_line(
+        border_color,
+        w,
+        vec![
+            Span::styled("   formats   ", theme::muted()),
+            Span::styled(hist_str, theme::text()),
+        ],
+    ));
 
-    // Line 3: inline file list with [1/N] cursor highlight — first file
-    // gets the cursor by default. Shows the cursor file info if probed.
-    let cursor_info_str = cursor_info
-        .map(|i| {
-            let mut parts = Vec::new();
-            if !i.codec.is_empty() {
-                parts.push(i.codec_display());
+    // Inline file list (same horizontal layout as multi-track).
+    let header_rows: u16 = 2; // summary + formats
+    let tracks_per_row: usize = if w >= 100 { 2 } else { 1 };
+    let mut track_area = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
+    let tentative_max = track_area * tracks_per_row;
+    if n > tentative_max {
+        track_area = track_area.saturating_sub(1); // reserve for overflow row
+    }
+    let max_visible = track_area * tracks_per_row;
+    let end = n.min(max_visible);
+    let col_width = if tracks_per_row == 2 {
+        w.saturating_sub(4) / 2
+    } else {
+        w.saturating_sub(4)
+    };
+
+    let mut idx = 0usize;
+    while idx < end {
+        let mut row_spans = Vec::new();
+        for _col in 0..tracks_per_row {
+            let abs = idx;
+            if abs >= end {
+                break;
             }
-            if i.sample_rate > 0 {
-                parts.push(i.sample_rate_display());
-            }
-            parts.join(" · ")
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "probing…".to_string());
+            let filename = paths
+                .get(abs)
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_default();
+            let fg = if abs == cursor {
+                Color::Cyan
+            } else {
+                Color::White
+            };
+            let truncated = truncate_to(&filename, col_width.saturating_sub(4));
+            let padded = format!("   {:<width$}", truncated, width = col_width.saturating_sub(3));
+            row_spans.push(Span::styled(padded, Style::default().fg(fg)));
+            idx += 1;
+        }
+        lines.push(bordered_line(border_color, w, row_spans));
+    }
 
-    let cursor_file = paths
-        .get(cursor)
-        .map(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .unwrap_or_default();
-
-    let cursor_line = format!(
-        "[{}/{}] {} — {}",
-        cursor + 1,
-        n,
-        cursor_file,
-        cursor_info_str
-    );
-    let cursor_line_trunc = truncate_display(&cursor_line, w.saturating_sub(16));
-
-    vec![
-        bordered_line(
+    if end < n {
+        lines.push(bordered_line(
             border_color,
             w,
-            vec![
-                Span::styled("   batch     ", theme::muted()),
-                Span::styled(summary_line, theme::bold(theme::BLUE)),
-            ],
-        ),
-        bordered_line(
-            border_color,
-            w,
-            vec![
-                Span::styled("   formats   ", theme::muted()),
-                Span::styled(hist_str, theme::text()),
-            ],
-        ),
-        bordered_line(
-            border_color,
-            w,
-            vec![
-                Span::styled("   preview   ", theme::muted()),
-                Span::styled(cursor_line_trunc, theme::bright()),
-            ],
-        ),
-        two_pill_row(border_color, w, EXPAND_PILL_LABEL),
-    ]
+            vec![Span::styled(
+                format!("   ... and {} more", n - end),
+                Style::default().fg(Color::DarkGray),
+            )],
+        ));
+    }
+
+    lines.push(two_pill_row(border_color, w, EXPAND_PILL_LABEL));
+
+    lines
 }
 
 /// Format a byte count as human-readable (e.g., "892.3 MB").
@@ -385,15 +416,6 @@ fn shorten_path(path: &std::path::Path, max_chars: usize) -> String {
     } else {
         s
     }
-}
-
-/// Left-truncate a display string with "…" if longer than `max_chars`.
-fn truncate_display(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars || max_chars < 2 {
-        return s.to_string();
-    }
-    let trunc: String = s.chars().take(max_chars - 1).collect();
-    format!("{}…", trunc)
 }
 
 /// Render the "browse files" pill row, right-aligned inside the source pane.
