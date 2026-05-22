@@ -272,7 +272,18 @@ fn estimate_output_size(info: Option<&SourceInfo>, format: &FormatState) -> Opti
             let channels = info.channels as f64;
             let raw_pcm = info.duration_secs * rate * bits * channels / 8.0;
             let factor = match target_format {
-                AudioFormat::Flac | AudioFormat::Alac | AudioFormat::WavPack => 0.6,
+                AudioFormat::Flac | AudioFormat::Alac | AudioFormat::WavPack => {
+                    // Derive actual compression ratio from source when possible,
+                    // rather than using a generic 0.6 estimate.
+                    let source_bits = info.bit_depth.unwrap_or(16) as f64;
+                    let source_raw =
+                        info.duration_secs * info.sample_rate as f64 * source_bits * channels / 8.0;
+                    if source_raw > 0.0 && info.file_size > 0 {
+                        (info.file_size as f64 / source_raw).clamp(0.3, 0.9)
+                    } else {
+                        0.6
+                    }
+                }
                 _ => 1.0, // WAV, AIFF, etc.
             };
             (raw_pcm * factor) as u64
