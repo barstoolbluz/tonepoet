@@ -300,6 +300,18 @@ impl SourceMode {
         }
     }
 
+    /// Total source size across all files in the current mode.
+    /// Single/MultiTrack: the one file's size. Batch: sum of all file sizes.
+    pub fn total_source_size(&self) -> u64 {
+        match self {
+            Self::Empty => 0,
+            Self::Single { info, .. } | Self::MultiTrack { info, .. } => {
+                info.as_ref().map_or(0, |i| i.file_size)
+            }
+            Self::Batch { total_size, .. } => *total_size,
+        }
+    }
+
     /// The currently previewed `SourceMetadata`. Returns an owned default
     /// for the Empty variant so the caller can always have something to
     /// display without extra matching.

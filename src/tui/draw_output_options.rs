@@ -20,6 +20,7 @@ pub fn draw_output_options_pane(
     area: Rect,
     opts: &OutputOptionsState,
     source_info: Option<&SourceInfo>,
+    total_source_size: u64,
     format: &FormatState,
     focused: bool,
 ) {
@@ -149,7 +150,7 @@ pub fn draw_output_options_pane(
     );
 
     // Estimated size
-    let est_display = estimate_output_size(source_info, format)
+    let est_display = estimate_output_size(source_info, total_source_size, format)
         .unwrap_or_else(|| "—".to_string());
     let est_row = bordered_line(
         border_color,
@@ -253,9 +254,13 @@ fn template_row_with_pills<'a>(
 }
 
 /// Estimate the output file size based on source audio properties and target format.
-fn estimate_output_size(info: Option<&SourceInfo>, format: &FormatState) -> Option<String> {
+fn estimate_output_size(
+    info: Option<&SourceInfo>,
+    total_source_size: u64,
+    format: &FormatState,
+) -> Option<String> {
     let info = info?;
-    if info.duration_secs <= 0.0 {
+    if info.duration_secs <= 0.0 || total_source_size == 0 {
         return None;
     }
 
@@ -283,23 +288,29 @@ fn estimate_output_size(info: Option<&SourceInfo>, format: &FormatState) -> Opti
                 && !is_container
                 && !is_uncompressed
                 && info.bit_depth.is_some()
-                && info.sample_rate > 0
-                && info.file_size > 0;
+                && info.sample_rate > 0;
 
             if can_scale {
-                // Proportional scaling: preserves source's actual compression
-                // ratio. Same settings → estimate = source file size.
+                // Proportional scaling from total source size: preserves
+                // actual compression ratio. Same settings → total output
+                // size equals total source size.
                 let source_rate = info.sample_rate as f64;
                 let source_bits = info.bit_depth.unwrap() as f64;
                 let scale = (target_rate * target_bits) / (source_rate * source_bits);
-                (info.file_size as f64 * scale) as u64
+                (total_source_size as f64 * scale) as u64
             } else {
                 // No source bit_depth or container format: use generic factor.
+                // Scale from cursor file to total batch via size ratio.
+                let batch_scale = if info.file_size > 0 {
+                    total_source_size as f64 / info.file_size as f64
+                } else {
+                    1.0
+                };
                 let factor = match target_format {
                     AudioFormat::Flac | AudioFormat::Alac | AudioFormat::WavPack => 0.6,
                     _ => 1.0,
                 };
-                (target_raw * factor) as u64
+                (target_raw * factor * batch_scale) as u64
             }
         }
     };
