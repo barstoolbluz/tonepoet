@@ -566,9 +566,9 @@ pub fn draw_template_builder(
 /// (35DP-4, 1975) as a canonical example that populates every token,
 /// including %TITLE_EXTRA%.
 pub fn render_template_preview(template: &str) -> String {
-    const ALBUM_FULL: &str = "Wish You Were Here (Japan CBS-Sony 35DP-4)";
+    const ALBUM_FULL: &str = "Wish You Were Here (Japan  CBS-Sony 35DP-4)";
     const ALBUM_CLEAN: &str = "Wish You Were Here";
-    const TITLE_EXTRA: &str = " (Japan CBS-Sony 35DP-4)";
+    const TITLE_EXTRA: &str = " (Japan  CBS-Sony 35DP-4)";
 
     let has_title_extra = template.contains("%TITLE_EXTRA%");
     let album = if has_title_extra { ALBUM_CLEAN } else { ALBUM_FULL };
