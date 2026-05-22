@@ -421,7 +421,10 @@ mod tests {
         assert_eq!(&buf[11..20], b"PERFORMER", "description MUST be uppercase");
         assert_eq!(buf[20], 0x00, "description null terminator");
         assert_eq!(&buf[21..32], b"ARTIST NAME");
-        assert_eq!(buf[32], 0x00, "value null terminator (libid3 non-spec quirk)");
+        assert_eq!(
+            buf[32], 0x00,
+            "value null terminator (libid3 non-spec quirk)"
+        );
         assert_eq!(buf.len(), 33); // 10 header + 23 data
     }
 

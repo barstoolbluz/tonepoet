@@ -594,7 +594,8 @@ async fn probe_audio_image(
             "a:0".into(),
             "-count_frames".into(),
             "-show_entries".into(),
-            "stream=sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample".into(),
+            "stream=sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
+                .into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -988,7 +989,6 @@ pub(crate) mod test_support {
     }
 }
 
-
 #[cfg(test)]
 mod naming_template_bit_depth_tests {
     use super::*;
@@ -997,6 +997,9 @@ mod naming_template_bit_depth_tests {
     fn cue_json_u32_from_value_reads_string_and_number_bit_depths() {
         assert_eq!(json_u32_from_value(&serde_json::json!("24")), Some(24));
         assert_eq!(json_u32_from_value(&serde_json::json!(16)), Some(16));
-        assert_eq!(json_u32_from_value(&serde_json::json!("not-a-number")), None);
+        assert_eq!(
+            json_u32_from_value(&serde_json::json!("not-a-number")),
+            None
+        );
     }
 }

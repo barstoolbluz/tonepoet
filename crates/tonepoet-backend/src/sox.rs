@@ -1,10 +1,10 @@
 //! Sox command builder
 
-use crate::{ConversionCommand, ConversionSettings, Result};
-use crate::types::*;
 use crate::mapping;
-use std::path::Path;
+use crate::types::*;
+use crate::{ConversionCommand, ConversionSettings, Result};
 use std::collections::HashMap;
+use std::path::Path;
 
 pub struct SoxBuilder;
 
@@ -12,33 +12,37 @@ impl SoxBuilder {
     pub fn new() -> Self {
         Self
     }
-    
+
     pub fn build(
         &self,
         input: &Path,
         output: &Path,
-        settings: &ConversionSettings
+        settings: &ConversionSettings,
     ) -> Result<ConversionCommand> {
         let mut args = Vec::new();
-        
+
         // Input file
         args.push(input.to_string_lossy().to_string());
-        
+
         // Output format options (before output file)
         self.add_output_format(&mut args, settings)?;
-        
+
         // Output file
         args.push(output.to_string_lossy().to_string());
-        
+
         // Effects chain (after output file)
         self.add_effects(&mut args, settings)?;
-        
+
         // Build description
         let description = format!(
             "Convert to {} with sox{}{}",
             settings.format.extension(),
             if let Some(rate) = settings.sample_rate {
-                if rate > 0 { format!(" @ {}Hz", rate) } else { String::new() }
+                if rate > 0 {
+                    format!(" @ {}Hz", rate)
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             },
@@ -54,7 +58,7 @@ impl SoxBuilder {
                 String::new()
             }
         );
-        
+
         Ok(ConversionCommand {
             program: "sox".to_string(),
             arguments: args,
@@ -63,8 +67,12 @@ impl SoxBuilder {
             description,
         })
     }
-    
-    fn add_output_format(&self, args: &mut Vec<String>, settings: &ConversionSettings) -> Result<()> {
+
+    fn add_output_format(
+        &self,
+        args: &mut Vec<String>,
+        settings: &ConversionSettings,
+    ) -> Result<()> {
         // Bit depth and encoding
         if let Some(depth) = settings.bit_depth {
             if depth > 0 {
@@ -79,10 +87,10 @@ impl SoxBuilder {
                 }
             }
         }
-        
+
         // Sample rate (if specified before resampling)
         // Sox handles this differently - rate conversion goes in effects
-        
+
         // Format-specific encoding options
         match settings.format {
             AudioFormat::Mp3 => {
@@ -125,35 +133,35 @@ impl SoxBuilder {
             }
             _ => {}
         }
-        
+
         Ok(())
     }
-    
+
     fn add_effects(&self, args: &mut Vec<String>, settings: &ConversionSettings) -> Result<()> {
         let mut _has_effects = false;
-        
+
         // Resampling
         if let Some(sample_rate) = settings.sample_rate {
             if sample_rate > 0 {
                 args.push("rate".to_string());
-                
+
                 // Add quality flag
                 let quality_flag = mapping::get_sox_resample_flag(settings.resample_quality);
                 args.push(quality_flag.to_string());
-                
+
                 // Add sample rate
                 args.push(sample_rate.to_string());
-                
+
                 // Add rolloff if specified
                 if let Some(transition) = settings.nyquist_transition {
                     let rolloff = mapping::get_sox_rolloff(Some(transition));
                     args.push(rolloff.to_string());
                 }
-                
+
                 _has_effects = true;
             }
         }
-        
+
         // Dithering (must come after rate conversion)
         if let Some(dither) = settings.dither_type {
             if dither != DitherType::None {
@@ -164,7 +172,7 @@ impl SoxBuilder {
                 _has_effects = true;
             }
         }
-        
+
         Ok(())
     }
 }

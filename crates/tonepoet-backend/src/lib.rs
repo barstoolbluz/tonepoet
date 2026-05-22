@@ -1,25 +1,34 @@
 //! Audio Conversion Backend
-//! 
+//!
 //! A robust module for constructing audio conversion commands from wizard settings.
 
-pub mod types;
 pub mod ffmpeg;
-pub mod sox;
-pub mod validation;
-pub mod mapping;
-pub mod preset;
-pub mod pipeline;
-pub mod metadata;
 pub mod integration;
 pub mod integration_api;
+pub mod mapping;
+pub mod metadata;
+pub mod pipeline;
+pub mod preset;
+pub mod sox;
+pub mod types;
+pub mod validation;
 
-pub use types::*;
 pub use ffmpeg::FFmpegBuilder;
+pub use integration::{
+    calculate_phase_progress, map_conversion_item_to_settings, ConversionPhase, ConversionStatus,
+    ProgressUpdate,
+};
+pub use integration_api::{
+    convert_with_backend, ConversionBackend, FormatCapabilities, ToolAvailability,
+};
+pub use metadata::{
+    AacMetadataApplier, AacMetadataExtractor, FlacMetadata, FlacMetadataApplier,
+    FlacMetadataExtractor, MetadataPreservingPipeline, OpusMetadataApplier, OpusMetadataExtractor,
+    WavPackMetadataApplier, WavPackMetadataExtractor,
+};
+pub use pipeline::{ConversionPipeline, MetadataStrategy, PipelineBuilder};
 pub use sox::SoxBuilder;
-pub use pipeline::{PipelineBuilder, ConversionPipeline, MetadataStrategy};
-pub use metadata::{FlacMetadata, FlacMetadataExtractor, FlacMetadataApplier, WavPackMetadataExtractor, WavPackMetadataApplier, OpusMetadataExtractor, OpusMetadataApplier, AacMetadataExtractor, AacMetadataApplier, MetadataPreservingPipeline};
-pub use integration::{map_conversion_item_to_settings, calculate_phase_progress, ConversionPhase, ProgressUpdate, ConversionStatus};
-pub use integration_api::{ConversionBackend, convert_with_backend, ToolAvailability, FormatCapabilities};
+pub use types::*;
 
 use std::path::Path;
 use thiserror::Error;
@@ -28,13 +37,13 @@ use thiserror::Error;
 pub enum ConversionError {
     #[error("Invalid settings: {0}")]
     InvalidSettings(String),
-    
+
     #[error("Unsupported format combination: {0}")]
     UnsupportedFormat(String),
-    
+
     #[error("Backend not available: {0}")]
     BackendUnavailable(String),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -57,17 +66,17 @@ impl CommandBuilder {
     pub fn new(backend: Backend) -> Self {
         Self { backend }
     }
-    
+
     /// Build a conversion command from settings
     pub fn build(
-        &self, 
-        input: &Path, 
-        output: &Path, 
-        settings: &ConversionSettings
+        &self,
+        input: &Path,
+        output: &Path,
+        settings: &ConversionSettings,
     ) -> Result<ConversionCommand> {
         // Validate settings first
         validation::validate_settings(settings)?;
-        
+
         match self.backend {
             Backend::FFmpeg => {
                 let builder = FFmpegBuilder::new();
@@ -77,9 +86,10 @@ impl CommandBuilder {
                 // Check if SoX can write this format (based on testing)
                 match settings.format {
                     AudioFormat::Opus | AudioFormat::Aac => {
-                        return Err(ConversionError::UnsupportedFormat(
-                            format!("SoX cannot write {} format (read-only)", settings.format.extension())
-                        ));
+                        return Err(ConversionError::UnsupportedFormat(format!(
+                            "SoX cannot write {} format (read-only)",
+                            settings.format.extension()
+                        )));
                     }
                     _ => {}
                 }
@@ -88,7 +98,7 @@ impl CommandBuilder {
             }
         }
     }
-    
+
     /// Check if a backend is available on the system
     pub fn is_available(&self) -> bool {
         match self.backend {

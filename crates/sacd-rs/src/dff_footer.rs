@@ -53,7 +53,11 @@ use crate::id3::{render_id3v24, Id3Metadata};
 /// `CEIL_ODD_NUMBER` macro (despite the misleading name, it rounds
 /// UP to even).
 fn ceil_odd(n: u64) -> u64 {
-    if n % 2 == 1 { n + 1 } else { n }
+    if n % 2 == 1 {
+        n + 1
+    } else {
+        n
+    }
 }
 
 /// All metadata required to render the DFF footer for non-edit-master
@@ -365,7 +369,7 @@ mod tests {
         let mut buf = Vec::new();
         emit_text_chunk(&mut buf, b"DIAR", "AB"); // 2 chars (even)
         assert_eq!(buf.len(), 16 + 2); // no pad
-        // chunk_data_size = 4 (count) + 2 (text) = 6 (even)
+                                       // chunk_data_size = 4 (count) + 2 (text) = 6 (even)
         let size = u64::from_be_bytes(buf[4..12].try_into().unwrap());
         assert_eq!(size, 6);
     }
@@ -375,7 +379,7 @@ mod tests {
         let mut buf = Vec::new();
         emit_text_chunk(&mut buf, b"DIAR", "X"); // 1 char (odd)
         assert_eq!(buf.len(), 16 + 1 + 1); // text + pad
-        // chunk_data_size = 4 + 1 = 5 → rounded to 6 (even)
+                                           // chunk_data_size = 4 + 1 = 5 → rounded to 6 (even)
         let size = u64::from_be_bytes(buf[4..12].try_into().unwrap());
         assert_eq!(size, 6);
         assert_eq!(buf[17], 0x00); // pad byte
@@ -554,5 +558,4 @@ mod tests {
             trck: Some((1, 13)),
         }
     }
-
 }

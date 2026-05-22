@@ -50,9 +50,20 @@ async fn test_corpus_training() {
             println!("  frames: {}", model.n_frames);
             println!("  PCA components: {}", model.pca_components.len());
             println!("  mean[0..5]: {:?}", &model.mean[..5]);
-            assert!(model.n_tracks >= 30, "need at least 30 tracks, got {}", model.n_tracks);
-            assert!(model.n_frames >= 100, "need at least 100 frames, got {}", model.n_frames);
-            assert!(!model.pca_components.is_empty(), "should have PCA components");
+            assert!(
+                model.n_tracks >= 30,
+                "need at least 30 tracks, got {}",
+                model.n_tracks
+            );
+            assert!(
+                model.n_frames >= 100,
+                "need at least 100 frames, got {}",
+                model.n_frames
+            );
+            assert!(
+                !model.pca_components.is_empty(),
+                "should have PCA components"
+            );
         }
         Err(e) => {
             panic!("Corpus training failed: {}", e);
@@ -84,7 +95,10 @@ async fn test_detect_pe_file() {
         "PE file should be detected via metadata: {:?}",
         result.detail
     );
-    assert!(result.cue_confirmed, "PE file should have metadata confirmation");
+    assert!(
+        result.cue_confirmed,
+        "PE file should have metadata confirmation"
+    );
 }
 
 #[tokio::test]
@@ -112,7 +126,10 @@ async fn test_detect_non_pe_file() {
         }
     };
 
-    println!("=== Detecting PE on non-PE file: {} ===", non_pe_file.display());
+    println!(
+        "=== Detecting PE on non-PE file: {} ===",
+        non_pe_file.display()
+    );
     let result = tonepoet::tui::preemphasis::detect_preemphasis(non_pe_file.clone()).await;
 
     println!("  confidence: {:?}", result.confidence);
@@ -128,8 +145,10 @@ async fn test_detect_non_pe_file() {
     // Non-PE file should NOT be flagged as Detected or StrongCandidate.
     assert!(
         result.confidence != tonepoet::tui::preemphasis::PreemphasisConfidence::Detected
-        && result.confidence != tonepoet::tui::preemphasis::PreemphasisConfidence::StrongCandidate,
+            && result.confidence
+                != tonepoet::tui::preemphasis::PreemphasisConfidence::StrongCandidate,
         "Non-PE file should not be flagged as PE: {:?} — {}",
-        result.confidence, result.detail
+        result.confidence,
+        result.detail
     );
 }

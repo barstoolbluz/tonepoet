@@ -13,7 +13,11 @@ pub(crate) struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub(crate) fn new(input: &'a [u8]) -> Self {
-        Self { input, bit_pos: 0, zero_pad_after_eof: false }
+        Self {
+            input,
+            bit_pos: 0,
+            zero_pad_after_eof: false,
+        }
     }
 
     pub(crate) fn set_zero_pad_after_eof(&mut self, yes: bool) {
@@ -27,7 +31,9 @@ impl<'a> BitReader<'a> {
                 self.bit_pos = self.bit_pos.saturating_add(1);
                 return Ok(0);
             }
-            return Err(DstError::UnexpectedEof { consumed: self.input.len() });
+            return Err(DstError::UnexpectedEof {
+                consumed: self.input.len(),
+            });
         }
 
         let byte = self.input[self.bit_pos / 8];
@@ -50,7 +56,9 @@ impl<'a> BitReader<'a> {
 
     pub(crate) fn read_signed(&mut self, n: usize) -> Result<i32, DstError> {
         if n == 0 || n >= 32 {
-            return Err(DstError::InternalDecodeError("signed bit read width too large"));
+            return Err(DstError::InternalDecodeError(
+                "signed bit read width too large",
+            ));
         }
 
         let raw = self.read_bits(n)? as i32;

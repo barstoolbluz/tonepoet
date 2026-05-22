@@ -1,7 +1,7 @@
 //! Preset loading and parsing functionality
 
 use crate::types::*;
-use crate::{Result, ConversionError};
+use crate::{ConversionError, Result};
 use std::fs;
 use std::path::Path;
 
@@ -9,7 +9,7 @@ use std::path::Path;
 pub fn load_preset<P: AsRef<Path>>(path: P) -> Result<ConversionSettings> {
     let content = fs::read_to_string(path)
         .map_err(|e| ConversionError::InvalidSettings(format!("Failed to read preset: {}", e)))?;
-    
+
     parse_preset_toml(&content)
 }
 
@@ -39,10 +39,10 @@ pub fn parse_preset_toml(content: &str) -> Result<ConversionSettings> {
         merge_to_single: Option<bool>,
         reencode_flac: Option<bool>,
     }
-    
+
     let preset: PresetToml = toml::from_str(content)
         .map_err(|e| ConversionError::InvalidSettings(format!("Invalid TOML: {}", e)))?;
-    
+
     // Convert string format to enum (case-insensitive)
     let format = match preset.selected_format.to_lowercase().as_str() {
         "flac" => AudioFormat::Flac,
@@ -53,65 +53,80 @@ pub fn parse_preset_toml(content: &str) -> Result<ConversionSettings> {
         "aac" => AudioFormat::Aac,
         "opus" => AudioFormat::Opus,
         "alac" => AudioFormat::Alac,
-        other => return Err(ConversionError::InvalidSettings(
-            format!("Unknown audio format: {}", other)
-        )),
+        other => {
+            return Err(ConversionError::InvalidSettings(format!(
+                "Unknown audio format: {}",
+                other
+            )))
+        }
     };
-    
+
     // Convert string dither type to enum (case-insensitive)
-    let dither_type = preset.dither_type.and_then(|s| match s.to_lowercase().as_str() {
-        "none" => Some(DitherType::None),
-        "tpdf" => Some(DitherType::Tpdf),
-        "shibata" => Some(DitherType::Shibata),
-        "lowshibata" => Some(DitherType::LowShibata),
-        "highshibata" => Some(DitherType::HighShibata),
-        "fshaped" => Some(DitherType::FShaped),
-        "modifiede" => Some(DitherType::ModifiedE),
-        "improvede" => Some(DitherType::ImprovedE),
-        "gesemann" => Some(DitherType::Gesemann),
-        _ => None,
-    });
-    
+    let dither_type = preset
+        .dither_type
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "none" => Some(DitherType::None),
+            "tpdf" => Some(DitherType::Tpdf),
+            "shibata" => Some(DitherType::Shibata),
+            "lowshibata" => Some(DitherType::LowShibata),
+            "highshibata" => Some(DitherType::HighShibata),
+            "fshaped" => Some(DitherType::FShaped),
+            "modifiede" => Some(DitherType::ModifiedE),
+            "improvede" => Some(DitherType::ImprovedE),
+            "gesemann" => Some(DitherType::Gesemann),
+            _ => None,
+        });
+
     // Convert string nyquist transition to enum (case-insensitive)
-    let nyquist_transition = preset.nyquist_transition.and_then(|s| match s.to_lowercase().as_str() {
-        "sharp" => Some(NyquistTransition::Sharp),
-        "medium" => Some(NyquistTransition::Medium),
-        "gentle" => Some(NyquistTransition::Gentle),
-        "steep" => Some(NyquistTransition::Steep),
-        "brickwall" => Some(NyquistTransition::BrickWall),
-        _ => None,
-    });
-    
+    let nyquist_transition =
+        preset
+            .nyquist_transition
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "sharp" => Some(NyquistTransition::Sharp),
+                "medium" => Some(NyquistTransition::Medium),
+                "gentle" => Some(NyquistTransition::Gentle),
+                "steep" => Some(NyquistTransition::Steep),
+                "brickwall" => Some(NyquistTransition::BrickWall),
+                _ => None,
+            });
+
     // Convert other string enums (case-insensitive)
-    let opus_content_type = preset.opus_content_type.and_then(|s| match s.to_lowercase().as_str() {
-        "music" => Some(OpusContentType::Music),
-        "speech" => Some(OpusContentType::Speech),
-        "auto" => Some(OpusContentType::Auto),
-        _ => None,
-    });
-    
-    let aac_profile = preset.aac_profile.and_then(|s| match s.to_lowercase().as_str() {
-        "lcaac" => Some(AacProfile::LcAac),
-        "heaac" => Some(AacProfile::HeAac),
-        "heaacv2" => Some(AacProfile::HeAacV2),
-        "ldaac" => Some(AacProfile::LdAac),
-        _ => None,
-    });
-    
-    let replaygain_mode = preset.replaygain_mode.and_then(|s| match s.to_lowercase().as_str() {
-        "track" => Some(ReplayGainMode::Track),
-        "album" => Some(ReplayGainMode::Album),
-        "both" => Some(ReplayGainMode::Both),
-        _ => None,
-    });
-    
+    let opus_content_type =
+        preset
+            .opus_content_type
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "music" => Some(OpusContentType::Music),
+                "speech" => Some(OpusContentType::Speech),
+                "auto" => Some(OpusContentType::Auto),
+                _ => None,
+            });
+
+    let aac_profile = preset
+        .aac_profile
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "lcaac" => Some(AacProfile::LcAac),
+            "heaac" => Some(AacProfile::HeAac),
+            "heaacv2" => Some(AacProfile::HeAacV2),
+            "ldaac" => Some(AacProfile::LdAac),
+            _ => None,
+        });
+
+    let replaygain_mode = preset
+        .replaygain_mode
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "track" => Some(ReplayGainMode::Track),
+            "album" => Some(ReplayGainMode::Album),
+            "both" => Some(ReplayGainMode::Both),
+            _ => None,
+        });
+
     // Parse selected_quality string for format-specific parameters
     let (mp3_bitrate, mp3_quality, mp3_mode) = if format == AudioFormat::Mp3 {
         parse_mp3_quality(&preset.selected_quality)
     } else {
         (None, None, None)
     };
-    
+
     Ok(ConversionSettings {
         name: preset.name,
         version: preset.version,
@@ -119,7 +134,7 @@ pub fn parse_preset_toml(content: &str) -> Result<ConversionSettings> {
         selected_quality: preset.selected_quality,
         bit_depth: preset.bit_depth,
         sample_rate: preset.sample_rate,
-        source_bit_depth: None,  // Presets don't have source info (will be populated at runtime)
+        source_bit_depth: None, // Presets don't have source info (will be populated at runtime)
         source_sample_rate: None,
         resample_quality: preset.resample_quality,
         compression_level: preset.compression_level,
@@ -128,7 +143,7 @@ pub fn parse_preset_toml(content: &str) -> Result<ConversionSettings> {
         opus_content_type,
         aac_profile,
         mp3_bitrate,
-        mp3_quality, 
+        mp3_quality,
         mp3_mode,
         verify_encoding: preset.verify_encoding,
         store_md5: preset.store_md5,
@@ -141,7 +156,7 @@ pub fn parse_preset_toml(content: &str) -> Result<ConversionSettings> {
         reencode_flac: preset.reencode_flac,
         ssrc_insane_mode: None, // Presets don't include insane mode (user checkbox only)
         lineage_file_path: None, // Not part of presets (runtime-determined)
-        overwrite: false, // Default
+        overwrite: false,       // Default
     })
 }
 
@@ -151,10 +166,10 @@ fn parse_mp3_quality(quality_str: &Option<String>) -> (Option<u32>, Option<u8>, 
         Some(s) => s,
         None => return (None, None, None),
     };
-    
+
     // Parse common MP3 quality patterns (case-insensitive)
     let quality_lower = quality.to_lowercase();
-    
+
     if quality_lower.contains("320 kbps") || quality_lower.contains("320kbps") {
         (Some(320), None, Some(Mp3Mode::Cbr))
     } else if quality_lower.contains("256 kbps") || quality_lower.contains("256kbps") {
@@ -184,7 +199,7 @@ fn parse_mp3_quality(quality_str: &Option<String>) -> (Option<u32>, Option<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_basic_preset() {
         let toml_content = r#"
@@ -202,9 +217,9 @@ replaygain_mode = "Both"
 copy_files_enabled = true
 merge_to_single = false
         "#;
-        
+
         let settings = parse_preset_toml(toml_content).expect("Failed to parse preset");
-        
+
         assert_eq!(settings.format, AudioFormat::Flac);
         assert_eq!(settings.bit_depth, Some(24));
         assert_eq!(settings.sample_rate, Some(44100));
@@ -214,7 +229,7 @@ merge_to_single = false
         assert_eq!(settings.store_md5, Some(false));
         assert_eq!(settings.replaygain_mode, Some(ReplayGainMode::Both));
     }
-    
+
     #[test]
     fn test_parse_brick_wall_preset() {
         let toml_content = r#"
@@ -226,13 +241,16 @@ sample_rate = 44100
 dither_type = "Gesemann"
 nyquist_transition = "BrickWall"
         "#;
-        
+
         let settings = parse_preset_toml(toml_content).expect("Failed to parse preset");
-        
+
         assert_eq!(settings.dither_type, Some(DitherType::Gesemann));
-        assert_eq!(settings.nyquist_transition, Some(NyquistTransition::BrickWall));
+        assert_eq!(
+            settings.nyquist_transition,
+            Some(NyquistTransition::BrickWall)
+        );
     }
-    
+
     #[test]
     fn test_parse_mp3_preset() {
         let toml_content = r#"
@@ -242,15 +260,15 @@ selected_format = "Mp3"
 selected_quality = "320 kbps"
 bit_depth = 0
         "#;
-        
+
         let settings = parse_preset_toml(toml_content).expect("Failed to parse preset");
-        
+
         assert_eq!(settings.format, AudioFormat::Mp3);
         assert_eq!(settings.mp3_bitrate, Some(320));
         assert_eq!(settings.mp3_mode, Some(Mp3Mode::Cbr));
         assert_eq!(settings.mp3_quality, None);
     }
-    
+
     #[test]
     fn test_parse_mp3_vbr_preset() {
         let toml_content = r#"
@@ -259,9 +277,9 @@ version = 1
 selected_format = "Mp3"
 selected_quality = "V0 (VBR ~245 kbps)"
         "#;
-        
+
         let settings = parse_preset_toml(toml_content).expect("Failed to parse preset");
-        
+
         assert_eq!(settings.format, AudioFormat::Mp3);
         assert_eq!(settings.mp3_quality, Some(0));
         assert_eq!(settings.mp3_mode, Some(Mp3Mode::Vbr));

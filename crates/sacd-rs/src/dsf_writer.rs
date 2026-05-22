@@ -214,8 +214,7 @@ impl<W: Write + Seek> DsfWriter<W> {
             self.writer.write_all(buf)?;
             buf.clear();
         }
-        self.audio_data_size +=
-            (BLOCK_SIZE_PER_CHANNEL as u64) * (self.channel_count as u64);
+        self.audio_data_size += (BLOCK_SIZE_PER_CHANNEL as u64) * (self.channel_count as u64);
         Ok(())
     }
 
@@ -245,8 +244,7 @@ impl<W: Write + Seek> DsfWriter<W> {
         // padding): `handle->sample_count / channel_count * 8`,
         // with integer truncation. Mirror that exactly so the fmt
         // chunk is byte-identical for the same input.
-        let real_bytes_per_channel =
-            self.real_bytes_total / (self.channel_count as u64);
+        let real_bytes_per_channel = self.real_bytes_total / (self.channel_count as u64);
         let sample_count_per_channel = real_bytes_per_channel * 8;
         let total_file_size = HEADER_TOTAL_SIZE + self.audio_data_size + footer_size;
         // metadata_offset: per sacd_extract's dsf_create_header,
@@ -416,10 +414,7 @@ mod tests {
             2_822_400,
         );
         // block_size_per_channel = 4096
-        assert_eq!(
-            u32::from_le_bytes(header[72..76].try_into().unwrap()),
-            4096,
-        );
+        assert_eq!(u32::from_le_bytes(header[72..76].try_into().unwrap()), 4096,);
         // reserved = 0
         assert_eq!(u32::from_le_bytes(header[76..80].try_into().unwrap()), 0);
 
@@ -451,8 +446,8 @@ mod tests {
         let buf: Vec<u8> = Vec::new();
         let mut cursor = Cursor::new(buf);
         {
-            let mut w = DsfWriter::new(&mut cursor, channel_count, SACD_SAMPLING_FREQUENCY)
-                .unwrap();
+            let mut w =
+                DsfWriter::new(&mut cursor, channel_count, SACD_SAMPLING_FREQUENCY).unwrap();
             w.write_interleaved(payload).unwrap();
             w.finish().unwrap();
         }
@@ -466,10 +461,7 @@ mod tests {
         // Expected size: 92 header + 2 channels × 4096 bytes = 8284.
         assert_eq!(out.len(), 92 + 2 * 4096);
         // Header sample_count should equal 4096 bytes × 8 = 32768.
-        assert_eq!(
-            u64::from_le_bytes(out[64..72].try_into().unwrap()),
-            32_768,
-        );
+        assert_eq!(u64::from_le_bytes(out[64..72].try_into().unwrap()), 32_768,);
         // Channel 0's block is bytes 92..92+4096; verify first byte
         // is bit-reverse of synth payload's first byte (c=0, i=0 → 0).
         assert_eq!(out[92], BIT_REVERSE[0]);
@@ -492,10 +484,7 @@ mod tests {
         // padded block size — matching the C reference, which only
         // bumps `handle->sample_count` by the real partial length in
         // dsf_close. 100 real bytes × 8 bits = 800 samples/channel.
-        assert_eq!(
-            u64::from_le_bytes(out[64..72].try_into().unwrap()),
-            800,
-        );
+        assert_eq!(u64::from_le_bytes(out[64..72].try_into().unwrap()), 800,);
         // ch0 byte 99 was the last real byte: bit-reverse of 99.
         assert_eq!(out[92 + 99], BIT_REVERSE[99]);
         // ch0 byte 100 and onward should be zero.
@@ -556,10 +545,7 @@ mod tests {
             let block_start = 92 + ch * 4096;
             // First byte of channel ch should be bit-reverse(ch * 100).
             let expected = BIT_REVERSE[((ch * 100) & 0xFF) as usize];
-            assert_eq!(
-                out[block_start], expected,
-                "ch{} first byte mismatch", ch,
-            );
+            assert_eq!(out[block_start], expected, "ch{} first byte mismatch", ch,);
         }
     }
 
@@ -579,10 +565,7 @@ mod tests {
         for ch in 0..5 {
             let block_start = 92 + ch * 4096;
             let expected = BIT_REVERSE[((ch * 100) & 0xFF) as usize];
-            assert_eq!(
-                out[block_start], expected,
-                "ch{} first byte mismatch", ch,
-            );
+            assert_eq!(out[block_start], expected, "ch{} first byte mismatch", ch,);
         }
     }
 }

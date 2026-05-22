@@ -91,7 +91,8 @@ mod tests {
         reader.read_sectors(0, 3, &mut buf).unwrap();
         assert!(buf[..SECTOR_SIZE as usize].iter().all(|&b| b == 0x11));
         assert!(buf[SECTOR_SIZE as usize..2 * SECTOR_SIZE as usize]
-            .iter().all(|&b| b == 0x22));
+            .iter()
+            .all(|&b| b == 0x22));
         assert!(buf[2 * SECTOR_SIZE as usize..].iter().all(|&b| b == 0x33));
     }
 

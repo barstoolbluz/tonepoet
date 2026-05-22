@@ -6,9 +6,9 @@
 
 use super::bitreader::BitReader;
 use super::tables::{
-    log2_floor_u32, log2_floor_usize, prob_dst_x_bit, FilterTable, Table,
-    FSETS_CODE_PRED_COEFF, FRAME_BITS_PER_CHANNEL, FRAME_BYTES_PER_CHANNEL, MAX_CHANNELS,
-    MAX_ELEMENTS, MAX_TABLE_LEN, PROBS_CODE_PRED_COEFF,
+    log2_floor_u32, log2_floor_usize, prob_dst_x_bit, FilterTable, Table, FRAME_BITS_PER_CHANNEL,
+    FRAME_BYTES_PER_CHANNEL, FSETS_CODE_PRED_COEFF, MAX_CHANNELS, MAX_ELEMENTS, MAX_TABLE_LEN,
+    PROBS_CODE_PRED_COEFF,
 };
 use super::DstError;
 
@@ -34,7 +34,10 @@ pub fn decode_frame(input: &[u8], channel_count: u8) -> Result<Vec<u8>, DstError
     Ok(out)
 }
 
-fn decode_uncompressed_dst_payload(reader: &mut BitReader<'_>, out: &mut [u8]) -> Result<(), DstError> {
+fn decode_uncompressed_dst_payload(
+    reader: &mut BitReader<'_>,
+    out: &mut [u8],
+) -> Result<(), DstError> {
     let _marker = reader.read_bit()?;
     let reserved = reader.read_bits(6)?;
     if reserved != 0 {
@@ -59,13 +62,19 @@ fn decode_compressed_dst_payload(
     // end of the frame. More complex segment layouts are valid in the DST syntax,
     // but are not present in the staged SACD fixtures or the Al Jarreau stereo area.
     if reader.read_bit()? == 0 {
-        return Err(DstError::MalformedFrame("unsupported DST probability segmentation"));
+        return Err(DstError::MalformedFrame(
+            "unsupported DST probability segmentation",
+        ));
     }
     if reader.read_bit()? == 0 {
-        return Err(DstError::MalformedFrame("unsupported per-channel DST segmentation"));
+        return Err(DstError::MalformedFrame(
+            "unsupported per-channel DST segmentation",
+        ));
     }
     if reader.read_bit()? == 0 {
-        return Err(DstError::MalformedFrame("unsupported multi-segment DST frame"));
+        return Err(DstError::MalformedFrame(
+            "unsupported multi-segment DST frame",
+        ));
     }
 
     let same_probability_map = reader.read_bit()? != 0;
@@ -90,7 +99,9 @@ fn decode_compressed_dst_payload(
     read_table(reader, &mut probs, &PROBS_CODE_PRED_COEFF, 6, 7, false, 1)?;
 
     if reader.read_bit()? != 0 {
-        return Err(DstError::MalformedFrame("invalid arithmetic-code start bit"));
+        return Err(DstError::MalformedFrame(
+            "invalid arithmetic-code start bit",
+        ));
     }
 
     let mut arithmetic = ArithmeticCoder::new(reader)?;
@@ -117,7 +128,8 @@ fn decode_compressed_dst_payload(
                 predict += i32::from(filters[filter_element][tap][usize::from(status[ch][tap])]);
             }
 
-            let probability = if !half_probability[ch] || bit_index >= fsets.length[filter_element] {
+            let probability = if !half_probability[ch] || bit_index >= fsets.length[filter_element]
+            {
                 let probability_element = probability_map[ch];
                 if probability_element >= probs.elements {
                     return Err(DstError::MalformedFrame("invalid probability table map"));
@@ -126,7 +138,11 @@ fn decode_compressed_dst_payload(
                 if length == 0 {
                     return Err(DstError::MalformedFrame("empty probability table"));
                 }
-                let abs_predict = if predict < 0 { (-predict) as usize } else { predict as usize };
+                let abs_predict = if predict < 0 {
+                    (-predict) as usize
+                } else {
+                    predict as usize
+                };
                 let mut idx = abs_predict >> 3;
                 if idx >= length {
                     idx = length - 1;
@@ -206,7 +222,9 @@ fn read_table(
 
             let warmup = method + 1;
             if warmup > length {
-                return Err(DstError::MalformedFrame("coefficient predictor exceeds table length"));
+                return Err(DstError::MalformedFrame(
+                    "coefficient predictor exceeds table length",
+                ));
             }
 
             for idx in 0..warmup {
@@ -253,7 +271,12 @@ fn read_uncoded_coeff(
     }
 }
 
-fn validate_coeff(coeff: i32, coeff_bits: usize, signed: bool, offset: i32) -> Result<(), DstError> {
+fn validate_coeff(
+    coeff: i32,
+    coeff_bits: usize,
+    signed: bool,
+    offset: i32,
+) -> Result<(), DstError> {
     if signed {
         let min = -(1i32 << (coeff_bits - 1));
         let max = (1i32 << (coeff_bits - 1)) - 1;
@@ -264,7 +287,9 @@ fn validate_coeff(coeff: i32, coeff_bits: usize, signed: bool, offset: i32) -> R
         let min = offset;
         let max = offset + (1i32 << coeff_bits) - 1;
         if coeff < min || coeff > max {
-            return Err(DstError::MalformedFrame("probability coefficient out of range"));
+            return Err(DstError::MalformedFrame(
+                "probability coefficient out of range",
+            ));
         }
     }
 
@@ -363,7 +388,9 @@ impl ArithmeticCoder {
         };
 
         if self.a == 0 {
-            return Err(DstError::MalformedFrame("arithmetic coder interval collapsed"));
+            return Err(DstError::MalformedFrame(
+                "arithmetic coder interval collapsed",
+            ));
         }
 
         if self.a < 2048 {

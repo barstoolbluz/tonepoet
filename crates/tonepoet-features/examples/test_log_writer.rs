@@ -1,11 +1,10 @@
 //! Standalone test for log file writing functionality
 
+use chrono::Utc;
 use conversion_features::{
-    write_conversion_log,
-    ConversionResult, ConversionStatus, ConversionConfig
+    write_conversion_log, ConversionConfig, ConversionResult, ConversionStatus,
 };
 use std::path::PathBuf;
-use chrono::Utc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -152,7 +151,9 @@ fn create_comprehensive_test_results() -> Vec<ConversionResult> {
             output_size: 0,
             start_time: now + chrono::Duration::seconds(26),
             end_time: now + chrono::Duration::seconds(27),
-            error_message: Some("FFmpeg error: Invalid data found when processing input".to_string()),
+            error_message: Some(
+                "FFmpeg error: Invalid data found when processing input".to_string(),
+            ),
             replaygain_values: None,
             source_info: None,
             conversion_pipeline: None,
@@ -227,15 +228,25 @@ fn create_large_album_results(count: usize) -> Vec<ConversionResult> {
     for i in 0..count {
         let track_num = i + 1;
         results.push(ConversionResult {
-            source_file: PathBuf::from(format!("/source/{:02} - Track {}.flac", track_num, track_num)),
-            output_file: PathBuf::from(format!("./test_log_output/{:02} - Track {}.opus", track_num, track_num)),
+            source_file: PathBuf::from(format!(
+                "/source/{:02} - Track {}.flac",
+                track_num, track_num
+            )),
+            output_file: PathBuf::from(format!(
+                "./test_log_output/{:02} - Track {}.opus",
+                track_num, track_num
+            )),
             status: if i % 10 == 9 {
                 ConversionStatus::Failed
             } else {
                 ConversionStatus::Success
             },
             source_size: 20_000_000 + (i as u64 * 1_000_000),
-            output_size: if i % 10 == 9 { 0 } else { 16_000_000 + (i as u64 * 800_000) },
+            output_size: if i % 10 == 9 {
+                0
+            } else {
+                16_000_000 + (i as u64 * 800_000)
+            },
             start_time: now + chrono::Duration::seconds(i as i64 * 10),
             end_time: now + chrono::Duration::seconds((i + 1) as i64 * 10),
             error_message: if i % 10 == 9 {

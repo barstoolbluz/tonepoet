@@ -1,18 +1,18 @@
 //! Conversion Features Implementation
-//! 
+//!
 //! Implements log file writing and cue file generation functionality
 //! for the options configured in the Options Wizard.
 
-pub mod log_writer;
 pub mod cue_generator;
+pub mod log_writer;
 
-pub use log_writer::{write_conversion_log, ConversionLogData, ConversionLogSettings};
 pub use cue_generator::{generate_cue_file, AlbumMetadata, CueFileError};
+pub use log_writer::{write_conversion_log, ConversionLogData, ConversionLogSettings};
 
 // Re-export common types
-use std::path::PathBuf;
-use std::collections::HashSet;
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
+use std::path::PathBuf;
 use tonepoet_backend::ConversionPipeline;
 
 /// Result type for conversion feature operations
@@ -23,13 +23,13 @@ pub type FeatureResult<T> = Result<T, FeatureError>;
 pub enum FeatureError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Metadata extraction error: {0}")]
     Metadata(String),
-    
+
     #[error("File format error: {0}")]
     Format(String),
-    
+
     #[error("Permission denied: {0}")]
     Permission(String),
 }
@@ -61,38 +61,56 @@ pub async fn post_conversion_features(
 ) -> FeatureResult<()> {
     // Generate log file if enabled
     if should_write_log(config) {
-        if let Err(e) = write_conversion_log(output_dir, conversion_results, config, conversion_options).await {
+        if let Err(e) =
+            write_conversion_log(output_dir, conversion_results, config, conversion_options).await
+        {
             log::warn!("Failed to write conversion log: {}", e);
             // Don't propagate error - log writing shouldn't break conversions
         }
     }
 
     // Generate CUE file if enabled
-    log::debug!("CUE check: generate_cue_files={}, mode={}", config.generate_cue_files, config.cue_generation_mode);
+    log::debug!(
+        "CUE check: generate_cue_files={}, mode={}",
+        config.generate_cue_files,
+        config.cue_generation_mode
+    );
     if config.generate_cue_files {
         // Detect merge: multiple sources -> single output
-        let unique_outputs: HashSet<_> = conversion_results
-            .iter()
-            .map(|r| &r.output_file)
-            .collect();
+        let unique_outputs: HashSet<_> =
+            conversion_results.iter().map(|r| &r.output_file).collect();
         let is_merge = conversion_results.len() > 1 && unique_outputs.len() == 1;
-        log::debug!("CUE merge detection: results={}, unique_outputs={}, is_merge={}",
-            conversion_results.len(), unique_outputs.len(), is_merge);
+        log::debug!(
+            "CUE merge detection: results={}, unique_outputs={}, is_merge={}",
+            conversion_results.len(),
+            unique_outputs.len(),
+            is_merge
+        );
 
         // For non-merge operations, generate CUE based on mode setting
         // For merge operations, skip here (already handled at merge sites in processor.rs)
         if !is_merge {
             let should_generate = match config.cue_generation_mode.as_str() {
                 "Always" => true,
-                "If merging multiple tracks" => false,  // Don't generate for non-merge when mode is IfMerging
-                "IfMerging" => false,  // Legacy value support
+                "If merging multiple tracks" => false, // Don't generate for non-merge when mode is IfMerging
+                "IfMerging" => false,                  // Legacy value support
                 _ => false,
             };
-            log::debug!("CUE should_generate={} for mode={}", should_generate, config.cue_generation_mode);
+            log::debug!(
+                "CUE should_generate={} for mode={}",
+                should_generate,
+                config.cue_generation_mode
+            );
 
             if should_generate {
-                log::info!("Generating CUE file for {} audio files in {:?}", audio_files.len(), output_dir);
-                if let Err(e) = generate_cue_file(output_dir, audio_files, config, conversion_results).await {
+                log::info!(
+                    "Generating CUE file for {} audio files in {:?}",
+                    audio_files.len(),
+                    output_dir
+                );
+                if let Err(e) =
+                    generate_cue_file(output_dir, audio_files, config, conversion_results).await
+                {
                     log::warn!("Failed to generate cue file: {}", e);
                     // Don't propagate error - cue generation shouldn't break conversions
                 } else {
@@ -155,7 +173,7 @@ impl ConversionResult {
             0.0
         }
     }
-    
+
     pub fn duration(&self) -> chrono::Duration {
         self.end_time - self.start_time
     }

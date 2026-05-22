@@ -1,8 +1,8 @@
 //! Comprehensive test suite for conversion features
 
+use chrono::Utc;
 use conversion_features::*;
 use std::path::PathBuf;
-use chrono::Utc;
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -38,16 +38,34 @@ async fn test_log_file_creation() {
         .expect("Failed to read log file");
 
     // Check for required sections
-    assert!(content.contains("HEXLOAD-TUI CONVERSION LOG"), "Missing header");
-    assert!(content.contains("CONVERSION SETTINGS:"), "Missing settings section");
-    assert!(content.contains("INPUT FILES:"), "Missing input files section");
-    assert!(content.contains("CONVERSION RESULTS:"), "Missing results section");
-    assert!(content.contains("CONVERSION SUMMARY:"), "Missing summary section");
+    assert!(
+        content.contains("HEXLOAD-TUI CONVERSION LOG"),
+        "Missing header"
+    );
+    assert!(
+        content.contains("CONVERSION SETTINGS:"),
+        "Missing settings section"
+    );
+    assert!(
+        content.contains("INPUT FILES:"),
+        "Missing input files section"
+    );
+    assert!(
+        content.contains("CONVERSION RESULTS:"),
+        "Missing results section"
+    );
+    assert!(
+        content.contains("CONVERSION SUMMARY:"),
+        "Missing summary section"
+    );
     assert!(content.contains("END OF CONVERSION LOG"), "Missing footer");
 
     // Check specific content
     assert!(content.contains("Backend: FFmpeg"), "Backend not recorded");
-    assert!(content.contains("Workers: 4 parallel"), "Worker count not recorded");
+    assert!(
+        content.contains("Workers: 4 parallel"),
+        "Worker count not recorded"
+    );
     assert!(content.contains("✅"), "Success markers missing");
     assert!(content.contains("❌"), "Failure markers missing");
 }
@@ -71,13 +89,8 @@ async fn test_log_file_not_created_when_disabled() {
 
     // Try to write log (should be skipped internally based on config)
     // Since write_conversion_log doesn't check config, we test the wrapper
-    let result = post_conversion_features(
-        &output_dir.to_path_buf(),
-        &results,
-        &[],
-        &config,
-        None,
-    ).await;
+    let result =
+        post_conversion_features(&output_dir.to_path_buf(), &results, &[], &config, None).await;
 
     assert!(result.is_ok(), "Should not fail even when disabled");
 
@@ -85,10 +98,18 @@ async fn test_log_file_not_created_when_disabled() {
     let entries = std::fs::read_dir(output_dir).expect("Failed to read dir");
     let log_files: Vec<_> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("conversion-log-"))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("conversion-log-")
+        })
         .collect();
 
-    assert_eq!(log_files.len(), 0, "No log files should be created when disabled");
+    assert_eq!(
+        log_files.len(),
+        0,
+        "No log files should be created when disabled"
+    );
 }
 
 #[tokio::test]
@@ -135,13 +156,25 @@ async fn test_cue_file_creation() {
     // Check for required elements
     assert!(content.contains("PERFORMER"), "Missing performer");
     assert!(content.contains("TITLE"), "Missing title");
-    assert!(content.contains("FILE \"01 - Track One.opus\" OPUS"), "Missing first track");
-    assert!(content.contains("FILE \"02 - Track Two.opus\" OPUS"), "Missing second track");
-    assert!(content.contains("FILE \"03 - Track Three.opus\" OPUS"), "Missing third track");
+    assert!(
+        content.contains("FILE \"01 - Track One.opus\" OPUS"),
+        "Missing first track"
+    );
+    assert!(
+        content.contains("FILE \"02 - Track Two.opus\" OPUS"),
+        "Missing second track"
+    );
+    assert!(
+        content.contains("FILE \"03 - Track Three.opus\" OPUS"),
+        "Missing third track"
+    );
     assert!(content.contains("TRACK 01 AUDIO"), "Missing track 1 entry");
     assert!(content.contains("TRACK 02 AUDIO"), "Missing track 2 entry");
     assert!(content.contains("TRACK 03 AUDIO"), "Missing track 3 entry");
-    assert!(content.contains("INDEX 01 00:00:00"), "Missing index entries");
+    assert!(
+        content.contains("INDEX 01 00:00:00"),
+        "Missing index entries"
+    );
 }
 
 #[tokio::test]
@@ -180,7 +213,8 @@ async fn test_both_features_together() {
         &audio_files,
         &config,
         None,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_ok(), "Both features should work together");
 
@@ -216,13 +250,7 @@ async fn test_error_handling_graceful() {
     let results = create_test_results();
 
     // This should not panic, just return an error or handle gracefully
-    let result = post_conversion_features(
-        &output_dir,
-        &results,
-        &[],
-        &config,
-        None,
-    ).await;
+    let result = post_conversion_features(&output_dir, &results, &[], &config, None).await;
 
     // The wrapper function should return Ok even if features fail
     assert!(result.is_ok(), "Should handle errors gracefully");
@@ -257,7 +285,8 @@ async fn test_special_characters_in_filenames() {
 
     // Note: Some filesystems may not support all special characters
     for file in &audio_files {
-        let safe_name = file.file_name()
+        let safe_name = file
+            .file_name()
             .unwrap()
             .to_string_lossy()
             .replace('"', "_")

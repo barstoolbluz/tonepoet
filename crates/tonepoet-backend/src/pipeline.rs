@@ -4,7 +4,7 @@
 //! requiring intelligent switching between FFmpeg, SoX, SSRC, and format-specific tools.
 
 use crate::types::*;
-use crate::{Result, ConversionError, Backend};
+use crate::{Backend, ConversionError, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -13,16 +13,16 @@ use std::path::Path;
 pub struct ConversionPipeline {
     /// Ordered list of commands to execute
     pub commands: Vec<ConversionCommand>,
-    
+
     /// Intermediate temporary files that need cleanup
     pub temp_files: Vec<String>,
-    
+
     /// Metadata preservation strategy
     pub metadata_strategy: MetadataStrategy,
-    
+
     /// Expected total duration for progress reporting
     pub expected_duration: Option<std::time::Duration>,
-    
+
     /// Description of the pipeline for logging
     pub description: String,
 }
@@ -36,14 +36,14 @@ pub enum MetadataStrategy {
         import_command: ConversionCommand,
         temp_file: String,
     },
-    
+
     /// Use FFmpeg JSON extraction/reapplication
     FFmpegJson {
         extract_command: ConversionCommand,
-        apply_command: ConversionCommand, 
+        apply_command: ConversionCommand,
         temp_file: String,
     },
-    
+
     /// No metadata preservation needed (same format, lossless)
     None,
 }
@@ -58,7 +58,7 @@ impl PipelineBuilder {
     pub fn new(preferred_backend: Backend) -> Self {
         Self { preferred_backend }
     }
-    
+
     /// Build complete pipeline from settings
     pub fn build_pipeline(
         &self,
@@ -68,41 +68,44 @@ impl PipelineBuilder {
     ) -> Result<ConversionPipeline> {
         // Analyze what operations are needed
         let operations = self.analyze_required_operations(settings)?;
-        
+
         // Check if preferred backend can handle everything
         if self.can_single_backend_handle(&operations, settings) {
             return self.build_single_backend_pipeline(input, output, settings, &operations);
         }
-        
+
         // Build multi-tool pipeline
         self.build_multi_tool_pipeline(input, output, settings, &operations)
     }
-    
+
     /// Determine what operations are required
-    fn analyze_required_operations(&self, settings: &ConversionSettings) -> Result<RequiredOperations> {
+    fn analyze_required_operations(
+        &self,
+        settings: &ConversionSettings,
+    ) -> Result<RequiredOperations> {
         let mut ops = RequiredOperations::default();
-        
+
         // Check if format conversion needed
         ops.needs_format_conversion = true; // Always assume we're converting format
-        
+
         // Check if resampling needed
         ops.needs_resampling = crate::validation::needs_resampling(settings);
         if ops.needs_resampling {
             ops.resample_type = self.determine_resample_type(settings);
         }
-        
+
         // Check if dithering needed
         ops.needs_dithering = crate::validation::needs_dithering(settings);
         if ops.needs_dithering {
             ops.dither_complexity = self.determine_dither_complexity(settings.dither_type);
         }
-        
+
         // Check if post-processing needed
         ops.needs_replaygain = settings.replaygain_mode.is_some();
-        
+
         Ok(ops)
     }
-    
+
     /// Determine type of resampling required
     fn determine_resample_type(&self, settings: &ConversionSettings) -> ResampleType {
         match settings.nyquist_transition {
@@ -110,12 +113,14 @@ impl PipelineBuilder {
             _ => ResampleType::Standard,
         }
     }
-    
+
     /// Determine complexity of dithering
     fn determine_dither_complexity(&self, dither_type: Option<DitherType>) -> DitherComplexity {
         match dither_type {
             Some(DitherType::Gesemann) => DitherComplexity::GesemmannOnly, // Only SoX supports
-            Some(DitherType::Shibata) | Some(DitherType::LowShibata) | Some(DitherType::HighShibata) => {
+            Some(DitherType::Shibata)
+            | Some(DitherType::LowShibata)
+            | Some(DitherType::HighShibata) => {
                 DitherComplexity::Advanced // SoX or SSRC
             }
             Some(DitherType::Tpdf) => DitherComplexity::Basic, // Most tools support
@@ -124,39 +129,49 @@ impl PipelineBuilder {
     }
 
     /// Check if we need a processing step (resample/bit-depth/dither) before final encode
-    fn needs_processing_step(&self, settings: &ConversionSettings, operations: &RequiredOperations) -> bool {
+    fn needs_processing_step(
+        &self,
+        settings: &ConversionSettings,
+        operations: &RequiredOperations,
+    ) -> bool {
         // Skip if brick wall (SSRC handles everything)
         if operations.resample_type == ResampleType::BrickWall {
             return false;
         }
 
-        let is_lossy = matches!(settings.format,
-            AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac);
+        let is_lossy = matches!(
+            settings.format,
+            AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac
+        );
 
         // For lossy formats, only process for resampling (skip bit reduction/dithering)
         // Lossy codec handles quantization internally
         if is_lossy {
-            return operations.needs_resampling &&
-                   operations.resample_type == ResampleType::Standard;
+            return operations.needs_resampling
+                && operations.resample_type == ResampleType::Standard;
         }
 
         // For lossless formats:
         // If Gesemann, only need processing for resampling (Gesemann step handles dithering)
         if operations.dither_complexity == DitherComplexity::GesemmannOnly {
-            return operations.needs_resampling &&
-                   operations.resample_type == ResampleType::Standard;
+            return operations.needs_resampling
+                && operations.resample_type == ResampleType::Standard;
         }
 
         // For other cases, need processing if bit reduction OR resample OR dither
         let needs_bit_reduction = crate::validation::needs_bit_depth_reduction(settings);
-        let needs_standard_resample = operations.needs_resampling &&
-                                       operations.resample_type == ResampleType::Standard;
+        let needs_standard_resample =
+            operations.needs_resampling && operations.resample_type == ResampleType::Standard;
 
         needs_bit_reduction || needs_standard_resample || operations.needs_dithering
     }
 
     /// Check if single backend can handle all operations
-    fn can_single_backend_handle(&self, ops: &RequiredOperations, settings: &ConversionSettings) -> bool {
+    fn can_single_backend_handle(
+        &self,
+        ops: &RequiredOperations,
+        settings: &ConversionSettings,
+    ) -> bool {
         // WavPack always requires multi-tool pipeline (needs WAV input, must decode first)
         if settings.format == AudioFormat::WavPack {
             return false;
@@ -164,7 +179,10 @@ impl PipelineBuilder {
 
         // FLAC with any processing requires multi-tool (native encoder can't process)
         if settings.format == AudioFormat::Flac {
-            if ops.needs_resampling || ops.needs_dithering || crate::validation::needs_bit_depth_reduction(settings) {
+            if ops.needs_resampling
+                || ops.needs_dithering
+                || crate::validation::needs_bit_depth_reduction(settings)
+            {
                 return false; // Force multi-tool for processing
             }
             // Simple FLAC transcode: single backend can handle (FLAC encoder accepts FLAC input)
@@ -173,8 +191,13 @@ impl PipelineBuilder {
 
         // Lossy formats with dithering or bit reduction should use multi-tool
         // (single-backend would incorrectly apply dithering/reduction before lossy encoding)
-        let is_lossy = matches!(settings.format, AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac);
-        if is_lossy && (ops.needs_dithering || crate::validation::needs_bit_depth_reduction(settings)) {
+        let is_lossy = matches!(
+            settings.format,
+            AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac
+        );
+        if is_lossy
+            && (ops.needs_dithering || crate::validation::needs_bit_depth_reduction(settings))
+        {
             return false; // Force multi-tool to properly skip dithering/reduction
         }
 
@@ -206,7 +229,7 @@ impl PipelineBuilder {
             }
         }
     }
-    
+
     /// Build pipeline using single backend
     fn build_single_backend_pipeline(
         &self,
@@ -235,25 +258,25 @@ impl PipelineBuilder {
                 }
             }
         };
-        
+
         // No need for duration estimation with stage-weighted progress
         let mut commands = vec![command];
-        
+
         // Add file copying if enabled (same as multi-tool pipeline)
         if settings.copy_files_enabled == Some(true) {
             commands.push(self.build_file_copy_command(input, output, settings)?);
         }
-        
+
         // Add subdirectory copying if enabled
         if settings.copy_subdirectories_enabled == Some(true) {
             commands.push(self.build_subdirectory_copy_command(input, output, settings)?);
         }
-        
+
         // Add merge functionality if enabled
         if settings.merge_to_single == Some(true) {
             commands.push(self.build_merge_command(input, output, settings)?);
         }
-        
+
         // Add ReplayGain if enabled (missing from single-backend mode)
         if settings.replaygain_mode.is_some() {
             commands.push(self.build_replaygain_command(output, settings)?);
@@ -266,23 +289,27 @@ impl PipelineBuilder {
 
         // Update description if additional commands were added
         let description = if commands.len() > 1 {
-            format!("Multi-tool pipeline: {} + copying/merging", 
-                   format!("{:?}", self.preferred_backend).to_lowercase())
+            format!(
+                "Multi-tool pipeline: {} + copying/merging",
+                format!("{:?}", self.preferred_backend).to_lowercase()
+            )
         } else {
-            format!("Single {} command: {}", 
-                   format!("{:?}", self.preferred_backend).to_lowercase(),
-                   commands[0].description)
+            format!(
+                "Single {} command: {}",
+                format!("{:?}", self.preferred_backend).to_lowercase(),
+                commands[0].description
+            )
         };
-        
+
         Ok(ConversionPipeline {
             commands,
             temp_files: vec![],
             metadata_strategy: MetadataStrategy::None, // Single command preserves metadata
-            expected_duration: None, // Using stage-weighted progress
+            expected_duration: None,                   // Using stage-weighted progress
             description,
         })
     }
-    
+
     /// Build complex multi-tool pipeline
     fn build_multi_tool_pipeline(
         &self,
@@ -306,7 +333,7 @@ impl PipelineBuilder {
             temp_files.push(temp_output.clone());
             current_input = temp_output.into();
         }
-        
+
         // Step 2: Handle brick wall resampling (requires SSRC)
         if operations.resample_type == ResampleType::BrickWall {
             let temp_output = format!("temp_ssrc_{}.wav", uuid::Uuid::new_v4());
@@ -317,7 +344,10 @@ impl PipelineBuilder {
             // SSRC handled resampling and bit depth, clear from encode_settings
             encode_settings.sample_rate = None;
             // Also clear dither for lossy formats (pointless after SSRC)
-            if matches!(settings.format, AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac) {
+            if matches!(
+                settings.format,
+                AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac
+            ) {
                 encode_settings.dither_type = None;
             }
         }
@@ -325,7 +355,10 @@ impl PipelineBuilder {
         // Step 3: Processing step (NEW) - resample/bit-depth/dither when not SSRC
         if self.needs_processing_step(settings, operations) {
             let temp_output = format!("temp_process_{}.wav", uuid::Uuid::new_v4());
-            log::info!("  📊 Processing: resample/bit-depth/dither → {}", temp_output);
+            log::info!(
+                "  📊 Processing: resample/bit-depth/dither → {}",
+                temp_output
+            );
 
             commands.push(self.build_processing_command(&current_input, &temp_output, settings)?);
             temp_files.push(temp_output.clone());
@@ -337,14 +370,17 @@ impl PipelineBuilder {
             }
 
             // Clear dithering based on what was processed
-            let is_lossy = matches!(settings.format,
-                AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac);
+            let is_lossy = matches!(
+                settings.format,
+                AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac
+            );
 
             if is_lossy {
                 // Always clear dithering for lossy (codec handles quantization)
                 encode_settings.dither_type = None;
-            } else if settings.dither_type.is_some() &&
-                      settings.dither_type != Some(DitherType::Gesemann) {
+            } else if settings.dither_type.is_some()
+                && settings.dither_type != Some(DitherType::Gesemann)
+            {
                 // For lossless, clear non-Gesemann dithering (was applied by processing)
                 encode_settings.dither_type = None;
             }
@@ -372,7 +408,11 @@ impl PipelineBuilder {
         let metadata_strategy = self.build_metadata_strategy(input, output, settings)?;
 
         match &metadata_strategy {
-            MetadataStrategy::FormatSpecific { export_command, import_command, temp_file } => {
+            MetadataStrategy::FormatSpecific {
+                export_command,
+                import_command,
+                temp_file,
+            } => {
                 // Insert export command at the beginning (before any conversion)
                 commands.insert(0, export_command.clone());
 
@@ -386,12 +426,17 @@ impl PipelineBuilder {
                     || settings.format == AudioFormat::WavPack
                     || settings.format == AudioFormat::Opus
                     || settings.format == AudioFormat::Aac
-                    || settings.format == AudioFormat::Mp3 {
+                    || settings.format == AudioFormat::Mp3
+                {
                     let unfiltered = temp_file.replace("temp_filtered_", "temp_metadata_");
                     temp_files.push(unfiltered);
                 }
             }
-            MetadataStrategy::FFmpegJson { extract_command, apply_command, temp_file } => {
+            MetadataStrategy::FFmpegJson {
+                extract_command,
+                apply_command,
+                temp_file,
+            } => {
                 // Insert extract command at the beginning
                 commands.insert(0, extract_command.clone());
 
@@ -441,34 +486,49 @@ impl PipelineBuilder {
             description: self.build_pipeline_description(operations),
         })
     }
-    
+
     /// Check if we need a decode step before processing
-    fn needs_decode_step(&self, input: &Path, operations: &RequiredOperations, settings: &ConversionSettings) -> bool {
+    fn needs_decode_step(
+        &self,
+        input: &Path,
+        operations: &RequiredOperations,
+        settings: &ConversionSettings,
+    ) -> bool {
         // Need decode if:
         // 1. Input is compressed format (FLAC, MP3, etc.) AND
         // 2. We need SSRC (which only accepts WAV) OR WavPack (which only accepts WAV) OR other tools that need uncompressed input
 
-        let input_ext = input.extension()
+        let input_ext = input
+            .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_lowercase())
             .unwrap_or_default();
 
-        let is_compressed = matches!(input_ext.as_str(), "flac" | "mp3" | "ogg" | "opus" | "m4a" | "aac" | "wv");
+        let is_compressed = matches!(
+            input_ext.as_str(),
+            "flac" | "mp3" | "ogg" | "opus" | "m4a" | "aac" | "wv"
+        );
         let needs_ssrc = operations.resample_type == ResampleType::BrickWall;
         let needs_wavpack = settings.format == AudioFormat::WavPack;
 
         is_compressed && (needs_ssrc || needs_wavpack)
     }
-    
+
     /// Build decode command to convert compressed input to WAV
-    fn build_decode_command(&self, input: &Path, output: &str, settings: &ConversionSettings) -> Result<ConversionCommand> {
+    fn build_decode_command(
+        &self,
+        input: &Path,
+        output: &str,
+        settings: &ConversionSettings,
+    ) -> Result<ConversionCommand> {
         let mut args = Vec::new();
-        
-        let input_ext = input.extension()
+
+        let input_ext = input
+            .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_lowercase())
             .unwrap_or_default();
-        
+
         match input_ext.as_str() {
             "flac" => {
                 // Use sox to create standard PCM WAV format that SSRC accepts
@@ -481,14 +541,18 @@ impl PipelineBuilder {
                 // If we know source bit depth, use it explicitly to preserve quality
                 if let Some(source_depth) = settings.source_bit_depth {
                     // Convert 320 (float marker) to 32 for sox
-                    let bit_depth = if source_depth == 320 { 32 } else { source_depth };
+                    let bit_depth = if source_depth == 320 {
+                        32
+                    } else {
+                        source_depth
+                    };
                     args.push("-b".to_string());
                     args.push(bit_depth.to_string());
                 }
                 // Otherwise let sox auto-detect from FLAC metadata (preserves source bit depth)
 
                 args.push("-t".to_string());
-                args.push("wavpcm".to_string());  // Force standard PCM format for SSRC compatibility
+                args.push("wavpcm".to_string()); // Force standard PCM format for SSRC compatibility
                 args.push(output.to_string());
 
                 Ok(ConversionCommand {
@@ -497,8 +561,10 @@ impl PipelineBuilder {
                     environment: HashMap::new(),
                     expected_duration: None,
                     description: if let Some(depth) = settings.source_bit_depth {
-                        format!("Decode FLAC to {}-bit PCM WAV (SSRC-compatible)",
-                               if depth == 320 { 32 } else { depth })
+                        format!(
+                            "Decode FLAC to {}-bit PCM WAV (SSRC-compatible)",
+                            if depth == 320 { 32 } else { depth }
+                        )
                     } else {
                         format!("Decode FLAC to PCM WAV (SSRC-compatible, auto bit-depth)")
                     },
@@ -513,7 +579,7 @@ impl PipelineBuilder {
                 args.push("wav".to_string());
                 args.push("-y".to_string());
                 args.push(output.to_string());
-                
+
                 Ok(ConversionCommand {
                     program: "ffmpeg".to_string(),
                     arguments: args,
@@ -533,20 +599,22 @@ impl PipelineBuilder {
         settings: &ConversionSettings,
     ) -> Result<ConversionCommand> {
         let mut args = vec![];
-        
+
         // Sample rate
         if let Some(rate) = settings.sample_rate {
             args.push("--rate".to_string());
             args.push(rate.to_string());
         }
-        
+
         // Bit depth strategy depends on target format:
         // - Lossy formats (Opus, MP3, AAC): preserve source bit depth (no reduction/dithering)
         // - Lossless formats (FLAC, WAV, AIFF): use target bit depth with dithering
         args.push("--bits".to_string());
 
-        let is_lossy_target = matches!(settings.format,
-            AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac);
+        let is_lossy_target = matches!(
+            settings.format,
+            AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac
+        );
 
         let ssrc_bits = if is_lossy_target {
             // For lossy: preserve source bit depth through resampling
@@ -566,21 +634,23 @@ impl PipelineBuilder {
         // Quality profile based on resample quality
         let profile = crate::mapping::get_ssrc_profile(
             settings.resample_quality,
-            settings.ssrc_insane_mode.unwrap_or(false)
+            settings.ssrc_insane_mode.unwrap_or(false),
         );
         args.push("--profile".to_string());
         args.push(profile.to_string());
-        
+
         // Quality-based options: for LQ (0), optimize for speed
         let quality = settings.resample_quality.unwrap_or(2);
-        
+
         // Two-pass processing for higher quality levels (slower but better)
-        if quality >= 2 { // HQ and above get two-pass
+        if quality >= 2 {
+            // HQ and above get two-pass
             args.push("--twopass".to_string());
         }
-        
+
         // Normalization for highest quality levels
-        if quality >= 3 { // VHQ and above get normalization
+        if quality >= 3 {
+            // VHQ and above get normalization
             args.push("--normalize".to_string());
         }
 
@@ -590,9 +660,9 @@ impl PipelineBuilder {
             false // Never reducing for lossy (we preserve source depth)
         } else {
             // For lossless: check if target < source
-            settings.bit_depth.is_some() &&
-            settings.source_bit_depth.is_some() &&
-            settings.bit_depth.unwrap() < settings.source_bit_depth.unwrap() as u32
+            settings.bit_depth.is_some()
+                && settings.source_bit_depth.is_some()
+                && settings.bit_depth.unwrap() < settings.source_bit_depth.unwrap() as u32
         };
 
         let dither_id = if is_reducing_bit_depth {
@@ -610,21 +680,25 @@ impl PipelineBuilder {
             args.push("0".to_string()); // 0 = no dither
             0
         };
-        
+
         // Input and output files (SSRC doesn't support piping)
         args.push(input.to_string_lossy().to_string());
         args.push(output.to_string());
-        
+
         Ok(ConversionCommand {
             program: "ssrc".to_string(),
             arguments: args,
             environment: HashMap::new(),
             expected_duration: None,
-            description: format!("SSRC brick wall resample to {} Hz (profile: {}, dither: {})", 
-                               settings.sample_rate.unwrap_or(0), profile, dither_id),
+            description: format!(
+                "SSRC brick wall resample to {} Hz (profile: {}, dither: {})",
+                settings.sample_rate.unwrap_or(0),
+                profile,
+                dither_id
+            ),
         })
     }
-    
+
     /// Build SoX command for advanced dithering
     fn build_sox_dither_command(
         &self,
@@ -633,7 +707,7 @@ impl PipelineBuilder {
         settings: &ConversionSettings,
     ) -> Result<ConversionCommand> {
         let mut args = vec![input.to_string_lossy().to_string()];
-        
+
         // Output format (preserve intermediate quality)
         if let Some(depth) = settings.bit_depth {
             args.push("-b".to_string());
@@ -645,21 +719,24 @@ impl PipelineBuilder {
                 args.push(depth.to_string());
             }
         }
-        
+
         args.push(output.to_string());
-        
+
         // Add dithering effect
         if let Some(dither) = settings.dither_type {
             let dither_args = crate::mapping::get_sox_dither_args(dither);
             args.extend(dither_args);
         }
-        
+
         Ok(ConversionCommand {
             program: "sox".to_string(),
             arguments: args,
             environment: HashMap::new(),
             expected_duration: None,
-            description: format!("SoX dithering with {:?}", settings.dither_type.unwrap_or(DitherType::None)),
+            description: format!(
+                "SoX dithering with {:?}",
+                settings.dither_type.unwrap_or(DitherType::None)
+            ),
         })
     }
 
@@ -673,8 +750,10 @@ impl PipelineBuilder {
         let mut process_settings = settings.clone();
         process_settings.format = AudioFormat::Wav; // Force WAV output for intermediate
 
-        let is_lossy = matches!(settings.format,
-            AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac);
+        let is_lossy = matches!(
+            settings.format,
+            AudioFormat::Opus | AudioFormat::Mp3 | AudioFormat::Aac
+        );
 
         if is_lossy {
             // For lossy targets, only resample - don't reduce bit depth or dither
@@ -691,14 +770,15 @@ impl PipelineBuilder {
         // - FFmpeg backend selected
         // - Dithering requested (after Gesemann/lossy clearing above)
         // - No resampling
-        let needs_dithering = process_settings.dither_type.is_some() &&
-                              process_settings.dither_type != Some(DitherType::None);
-        let is_resampling = process_settings.sample_rate.is_some() &&
-                            process_settings.sample_rate != Some(0);
+        let needs_dithering = process_settings.dither_type.is_some()
+            && process_settings.dither_type != Some(DitherType::None);
+        let is_resampling =
+            process_settings.sample_rate.is_some() && process_settings.sample_rate != Some(0);
 
-        let backend_to_use = if self.preferred_backend == Backend::FFmpeg &&
-                                needs_dithering &&
-                                !is_resampling {
+        let backend_to_use = if self.preferred_backend == Backend::FFmpeg
+            && needs_dithering
+            && !is_resampling
+        {
             log::debug!("🔄 Override: Using Sox for processing step (FFmpeg can't dither without resampling)");
             Backend::Sox
         } else {
@@ -745,7 +825,7 @@ impl PipelineBuilder {
             }
         }
     }
-    
+
     /// Build format-specific encoding command
     fn build_format_specific_encode(
         &self,
@@ -756,74 +836,77 @@ impl PipelineBuilder {
         match settings.format {
             AudioFormat::Flac => {
                 let mut args = vec![];
-                
+
                 // Force overwrite if requested
                 if settings.overwrite {
                     args.push("-f".to_string());
                 }
-                
+
                 // Compression level
                 if let Some(level) = settings.compression_level {
                     args.push(format!("-{}", level));
                 }
-                
+
                 // Verification
                 if settings.verify_encoding == Some(true) {
                     args.push("--verify".to_string());
                 }
-                
+
                 // MD5 handling - CORRECTED: --no-md5sum option doesn't exist in FLAC
                 // Based on testing, FLAC doesn't have --no-md5sum option
                 // MD5 checksum is controlled automatically by FLAC encoder
-                
+
                 args.push(input.to_string_lossy().to_string());
                 args.push("-o".to_string());
                 args.push(output.to_string_lossy().to_string());
-                
+
                 Ok(ConversionCommand {
                     program: "flac".to_string(),
                     arguments: args,
                     environment: HashMap::new(),
                     expected_duration: None,
-                    description: format!("FLAC encode with compression level {}", 
-                                       settings.compression_level.unwrap_or(8)),
+                    description: format!(
+                        "FLAC encode with compression level {}",
+                        settings.compression_level.unwrap_or(8)
+                    ),
                 })
             }
             AudioFormat::WavPack => {
                 // WavPack tool requires WAV input - need to decode first if input is FLAC
-                let input_ext = input.extension()
+                let input_ext = input
+                    .extension()
                     .and_then(|ext| ext.to_str())
                     .map(|ext| ext.to_lowercase())
                     .unwrap_or_default();
-                
+
                 // Multi-tool pipeline should have decoded to WAV by this point
                 // If we get FLAC input here, it means pipeline setup is wrong
                 if input_ext == "flac" {
                     // This shouldn't happen in multi-tool mode - decode stage should have run first
                     eprintln!("WARNING: WavPack encode getting FLAC input - decode stage missing?");
                 }
-                
+
                 // For WAV input, use dedicated wavpack tool
                 let mut args = vec![];
-                
+
                 // Always overwrite without prompting
                 args.push("-y".to_string());
-                
+
                 // Compression level mapping for wavpack
                 if let Some(level) = settings.compression_level {
                     match level {
-                        0..=2 => args.push("-f".to_string()), // Fast
-                        3..=5 => args.push("-h".to_string()), // High  
+                        0..=2 => args.push("-f".to_string()),  // Fast
+                        3..=5 => args.push("-h".to_string()),  // High
                         6..=8 => args.push("-hh".to_string()), // Very high
-                        _ => args.push("-h".to_string()), // Default high
+                        _ => args.push("-h".to_string()),      // Default high
                     }
                 }
-                
+
                 // Verification (wavpack uses -v)
                 if settings.verify_encoding == Some(true) {
                     args.push("-v".to_string());
                 }
-                
+
                 // Bit depth handling
                 if let Some(bit_depth) = settings.bit_depth {
                     if bit_depth == 33 {
@@ -831,19 +914,21 @@ impl PipelineBuilder {
                         args.push("-a".to_string());
                     }
                 }
-                
+
                 // Input and output
                 args.push(input.to_string_lossy().to_string());
                 args.push("-o".to_string());
                 args.push(output.to_string_lossy().to_string());
-                
+
                 Ok(ConversionCommand {
                     program: "wavpack".to_string(),
                     arguments: args,
                     environment: HashMap::new(),
                     expected_duration: None,
-                    description: format!("WavPack encode with compression level {}", 
-                                       settings.compression_level.unwrap_or(5)),
+                    description: format!(
+                        "WavPack encode with compression level {}",
+                        settings.compression_level.unwrap_or(5)
+                    ),
                 })
             }
             _ => {
@@ -853,15 +938,18 @@ impl PipelineBuilder {
             }
         }
     }
-    
+
     /// Build ReplayGain command
     fn build_replaygain_command(
         &self,
         output: &Path,
         settings: &ConversionSettings,
     ) -> Result<ConversionCommand> {
-        log::info!("🎯 Building ReplayGain command for format {:?} with mode {:?}",
-            settings.format, settings.replaygain_mode);
+        log::info!(
+            "🎯 Building ReplayGain command for format {:?} with mode {:?}",
+            settings.format,
+            settings.replaygain_mode
+        );
 
         let (program, args, description) = match settings.format {
             _ => {
@@ -878,19 +966,23 @@ impl PipelineBuilder {
                         args.push("-r".to_string());
                     }
                     Some(ReplayGainMode::Track) => args.push("-r".to_string()),
-                    _ => return Err(ConversionError::InvalidSettings("ReplayGain mode not specified".to_string())),
+                    _ => {
+                        return Err(ConversionError::InvalidSettings(
+                            "ReplayGain mode not specified".to_string(),
+                        ))
+                    }
                 }
-                
+
                 // loudgain flags
                 args.push("-k".to_string()); // Keep existing tags (noclip)
                 args.push("-s".to_string()); // Tag mode
                 args.push("i".to_string()); // Write ReplayGain 2.0 tags
                 args.push(output.to_string_lossy().to_string());
-                
+
                 ("loudgain".to_string(), args, "ReplayGain with loudgain")
             }
         };
-        
+
         Ok(ConversionCommand {
             program,
             arguments: args,
@@ -910,13 +1002,16 @@ impl PipelineBuilder {
             Some(path) if path.exists() => path,
             Some(path) => {
                 log::warn!("Lineage file does not exist: {}", path.display());
-                return Err(ConversionError::InvalidSettings(
-                    format!("Lineage file not found: {}", path.display())
-                ));
+                return Err(ConversionError::InvalidSettings(format!(
+                    "Lineage file not found: {}",
+                    path.display()
+                )));
             }
-            None => return Err(ConversionError::InvalidSettings(
-                "No lineage file path provided".to_string()
-            )),
+            None => {
+                return Err(ConversionError::InvalidSettings(
+                    "No lineage file path provided".to_string(),
+                ))
+            }
         };
 
         // Skip lineage embedding for WAV/AIFF to preserve ReplayGain tags
@@ -936,8 +1031,8 @@ impl PipelineBuilder {
             AudioFormat::Aac => {
                 // Use AtomicParsley to set comment tag from lineage
                 // Read lineage content
-                let content = std::fs::read_to_string(lineage_path)
-                    .map_err(|e| ConversionError::Io(e))?;
+                let content =
+                    std::fs::read_to_string(lineage_path).map_err(|e| ConversionError::Io(e))?;
 
                 // Store lineage as reverse DNS atom to preserve multi-line content
                 // Standard ©cmt atom only stores first line, so use custom field instead
@@ -971,8 +1066,8 @@ impl PipelineBuilder {
             }
             AudioFormat::Opus => {
                 // Read lineage content
-                let content = std::fs::read_to_string(lineage_path)
-                    .map_err(|e| ConversionError::Io(e))?;
+                let content =
+                    std::fs::read_to_string(lineage_path).map_err(|e| ConversionError::Io(e))?;
 
                 // Escape single quotes for shell (replace ' with '\\'')
                 let output_escaped = output.display().to_string().replace("'", "'\\''");
@@ -984,8 +1079,7 @@ impl PipelineBuilder {
                         "-c".to_string(),
                         format!(
                             "opustags --delete COMMENT -a 'COMMENT={}' --in-place '{}'",
-                            content_escaped,
-                            output_escaped
+                            content_escaped, output_escaped
                         ),
                     ],
                     environment: HashMap::new(),
@@ -995,22 +1089,28 @@ impl PipelineBuilder {
             }
             AudioFormat::Mp3 => {
                 // MP3: Use FFmpeg with -id3v2_version 3 for compatibility
-                let content = std::fs::read_to_string(lineage_path)
-                    .map_err(|e| ConversionError::Io(e))?;
+                let content =
+                    std::fs::read_to_string(lineage_path).map_err(|e| ConversionError::Io(e))?;
 
                 // Preserve original extension by appending to filename, not replacing extension
                 let temp_output = {
-                    let stem = output.file_stem()
-                        .ok_or_else(|| ConversionError::InvalidSettings(
-                            "Output file has no stem".to_string()))?
+                    let stem = output
+                        .file_stem()
+                        .ok_or_else(|| {
+                            ConversionError::InvalidSettings("Output file has no stem".to_string())
+                        })?
                         .to_string_lossy();
-                    let ext = output.extension()
-                        .ok_or_else(|| ConversionError::InvalidSettings(
-                            "Output file has no extension".to_string()))?
+                    let ext = output
+                        .extension()
+                        .ok_or_else(|| {
+                            ConversionError::InvalidSettings(
+                                "Output file has no extension".to_string(),
+                            )
+                        })?
                         .to_string_lossy();
-                    let parent = output.parent()
-                        .ok_or_else(|| ConversionError::InvalidSettings(
-                            "Output file has no parent".to_string()))?;
+                    let parent = output.parent().ok_or_else(|| {
+                        ConversionError::InvalidSettings("Output file has no parent".to_string())
+                    })?;
 
                     parent.join(format!("{}.lineage_temp.{}", stem, ext))
                 };
@@ -1028,28 +1128,35 @@ impl PipelineBuilder {
                     arguments: vec!["-c".to_string(), script],
                     environment: HashMap::new(),
                     expected_duration: None,
-                    description: "Set comment metadata from Lineage.txt (FFmpeg with ID3v2.3)".to_string(),
+                    description: "Set comment metadata from Lineage.txt (FFmpeg with ID3v2.3)"
+                        .to_string(),
                 })
             }
             _ => {
                 // For non-FLAC, read content and use FFmpeg
                 // Use bash to handle temp file + move atomically
-                let content = std::fs::read_to_string(lineage_path)
-                    .map_err(|e| ConversionError::Io(e))?;
+                let content =
+                    std::fs::read_to_string(lineage_path).map_err(|e| ConversionError::Io(e))?;
 
                 // Preserve original extension by appending to filename, not replacing extension
                 let temp_output = {
-                    let stem = output.file_stem()
-                        .ok_or_else(|| ConversionError::InvalidSettings(
-                            "Output file has no stem".to_string()))?
+                    let stem = output
+                        .file_stem()
+                        .ok_or_else(|| {
+                            ConversionError::InvalidSettings("Output file has no stem".to_string())
+                        })?
                         .to_string_lossy();
-                    let ext = output.extension()
-                        .ok_or_else(|| ConversionError::InvalidSettings(
-                            "Output file has no extension".to_string()))?
+                    let ext = output
+                        .extension()
+                        .ok_or_else(|| {
+                            ConversionError::InvalidSettings(
+                                "Output file has no extension".to_string(),
+                            )
+                        })?
                         .to_string_lossy();
-                    let parent = output.parent()
-                        .ok_or_else(|| ConversionError::InvalidSettings(
-                            "Output file has no parent".to_string()))?;
+                    let parent = output.parent().ok_or_else(|| {
+                        ConversionError::InvalidSettings("Output file has no parent".to_string())
+                    })?;
 
                     parent.join(format!("{}.lineage_temp.{}", stem, ext))
                 };
@@ -1081,7 +1188,8 @@ impl PipelineBuilder {
         settings: &ConversionSettings,
     ) -> Result<MetadataStrategy> {
         // Detect input format from extension
-        let input_ext = input.extension()
+        let input_ext = input
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
@@ -1501,7 +1609,7 @@ BEGIN {{ skip=0 }}
             _ => Ok(MetadataStrategy::None),
         }
     }
-    
+
     /// Calculate total expected duration for a pipeline
     #[allow(dead_code)]
     fn calculate_pipeline_duration(
@@ -1512,12 +1620,12 @@ BEGIN {{ skip=0 }}
         if commands.is_empty() {
             return Ok(None);
         }
-        
+
         // Sum the duration estimates from individual commands
         // (Commands should already have their durations estimated when built)
         let mut total_duration = std::time::Duration::from_secs(0);
         let mut any_estimate_found = false;
-        
+
         for command in commands {
             match command.expected_duration {
                 Some(duration) => {
@@ -1532,17 +1640,20 @@ BEGIN {{ skip=0 }}
                 }
             }
         }
-        
+
         if any_estimate_found {
             Ok(Some(total_duration))
         } else {
             Ok(None)
         }
     }
-    
+
     /// Get fallback duration for a command when estimation fails
     #[allow(dead_code)]
-    fn get_fallback_duration_for_command(&self, command: &ConversionCommand) -> std::time::Duration {
+    fn get_fallback_duration_for_command(
+        &self,
+        command: &ConversionCommand,
+    ) -> std::time::Duration {
         match command.program.as_str() {
             "ssrc" => std::time::Duration::from_secs(60), // SSRC is slow
             "sox" => std::time::Duration::from_secs(30),  // Sox is medium
@@ -1550,33 +1661,33 @@ BEGIN {{ skip=0 }}
             "metaflac" => std::time::Duration::from_secs(5), // Metadata operations are very fast
             "loudgain" => std::time::Duration::from_secs(15), // ReplayGain analysis takes time
             "ffmpeg" => std::time::Duration::from_secs(30), // FFmpeg varies
-            _ => std::time::Duration::from_secs(30), // Generic fallback
+            _ => std::time::Duration::from_secs(30),      // Generic fallback
         }
     }
 
     /// Build human-readable pipeline description
     fn build_pipeline_description(&self, operations: &RequiredOperations) -> String {
         let mut parts = vec![];
-        
+
         if operations.resample_type == ResampleType::BrickWall {
             parts.push("SSRC brick wall");
         }
-        
+
         if operations.dither_complexity == DitherComplexity::GesemmannOnly {
             parts.push("SoX Gesemann dither");
         }
-        
+
         if operations.needs_replaygain {
             parts.push("ReplayGain");
         }
-        
+
         if parts.is_empty() {
             "Multi-tool pipeline".to_string()
         } else {
             format!("Multi-tool pipeline: {}", parts.join(" → "))
         }
     }
-    
+
     /// Build file copying command
     fn build_file_copy_command(
         &self,
@@ -1590,47 +1701,52 @@ BEGIN {{ skip=0 }}
         let output_dir = if let Some(parent) = output.parent() {
             if parent.as_os_str().is_empty() {
                 // Parent exists but is empty string - use current directory
-                std::env::current_dir()
-                    .map_err(|e| ConversionError::InvalidSettings(format!("Cannot get current directory: {}", e)))?
+                std::env::current_dir().map_err(|e| {
+                    ConversionError::InvalidSettings(format!("Cannot get current directory: {}", e))
+                })?
             } else {
                 parent.to_path_buf()
             }
         } else {
-            // Output file has no parent, use current working directory  
-            std::env::current_dir()
-                .map_err(|e| ConversionError::InvalidSettings(format!("Cannot get current directory: {}", e)))?
+            // Output file has no parent, use current working directory
+            std::env::current_dir().map_err(|e| {
+                ConversionError::InvalidSettings(format!("Cannot get current directory: {}", e))
+            })?
         };
-        
+
         // Skip copying if source and destination are the same directory
         // This happens in archive processing where files are already in the right location
         if input_dir == output_dir {
             // Return a no-op command instead of an error
             return Ok(ConversionCommand {
-                program: "true".to_string(),  // No-op command that always succeeds
+                program: "true".to_string(), // No-op command that always succeeds
                 arguments: vec![],
                 environment: HashMap::new(),
                 expected_duration: None,
-                description: "Skip file copy - auxiliary files already in target directory".to_string(),
+                description: "Skip file copy - auxiliary files already in target directory"
+                    .to_string(),
             });
         }
-        
+
         // Get the base filename (without extension) to find related files
-        let _input_stem = input.file_stem().ok_or_else(|| {
-            ConversionError::InvalidSettings("Input file has no stem".to_string())
-        })?.to_string_lossy();
-        
+        let _input_stem = input
+            .file_stem()
+            .ok_or_else(|| ConversionError::InvalidSettings("Input file has no stem".to_string()))?
+            .to_string_lossy();
+
         // Parse extensions to copy
         let default_extensions = "txt,cue,log".to_string();
-        let extensions = settings.copy_files_extensions
+        let extensions = settings
+            .copy_files_extensions
             .as_ref()
             .unwrap_or(&default_extensions)
             .split(',')
             .map(|s| s.trim())
             .collect::<Vec<_>>();
-        
+
         // Build simpler approach: just use cp to copy specific files
         let mut args = Vec::new();
-        
+
         // Find auxiliary files manually - look for any files with specified extensions
         for entry in std::fs::read_dir(input_dir)? {
             let entry = entry?;
@@ -1655,21 +1771,20 @@ BEGIN {{ skip=0 }}
         // This is normal for archives that don't include .cue, .log, or .txt files
         if args.is_empty() {
             return Ok(ConversionCommand {
-                program: "true".to_string(),  // No-op command that always succeeds
+                program: "true".to_string(), // No-op command that always succeeds
                 arguments: vec![],
                 environment: HashMap::new(),
                 expected_duration: None,
                 description: "Skip file copy - no auxiliary files found".to_string(),
             });
         }
-        
-        // Add destination directory  
+
+        // Add destination directory
         let dest_dir = output_dir.to_string_lossy().to_string();
         args.push(dest_dir.clone());
-        
-        let file_count = args.len() - 1;  // Count before moving args
-        
-        
+
+        let file_count = args.len() - 1; // Count before moving args
+
         Ok(ConversionCommand {
             program: "cp".to_string(),
             arguments: args,
@@ -1678,7 +1793,7 @@ BEGIN {{ skip=0 }}
             description: format!("Copy {} auxiliary files to {}", file_count, dest_dir),
         })
     }
-    
+
     /// Build subdirectory copying command
     fn build_subdirectory_copy_command(
         &self,
@@ -1692,32 +1807,35 @@ BEGIN {{ skip=0 }}
         let output_dir = output.parent().ok_or_else(|| {
             ConversionError::InvalidSettings("Output file has no parent directory".to_string())
         })?;
-        
+
         // Skip copying if source and destination are the same directory
         // This happens in archive processing where subdirectories are already in the right location
         if input_dir == output_dir {
             // Return a no-op command instead of an error
             return Ok(ConversionCommand {
-                program: "true".to_string(),  // No-op command that always succeeds
+                program: "true".to_string(), // No-op command that always succeeds
                 arguments: vec![],
                 environment: HashMap::new(),
                 expected_duration: None,
                 description: "Skip subdirectory copy - already in target directory".to_string(),
             });
         }
-        
+
         // Use find + cp for more reliable subdirectory copying
         let default_pattern = "*".to_string();
-        let patterns = settings.copy_subdirectories
+        let patterns = settings
+            .copy_subdirectories
             .as_ref()
             .unwrap_or(&default_pattern);
-        
+
         let mut args = vec![
             input_dir.to_string_lossy().to_string(),
-            "-type".to_string(), "d".to_string(), // Find directories only
-            "-mindepth".to_string(), "1".to_string(), // Skip the input directory itself
+            "-type".to_string(),
+            "d".to_string(), // Find directories only
+            "-mindepth".to_string(),
+            "1".to_string(), // Skip the input directory itself
         ];
-        
+
         // Add pattern matching if not "*"
         if patterns != "*" {
             args.push("-name".to_string());
@@ -1736,7 +1854,7 @@ BEGIN {{ skip=0 }}
                 args.push(patterns.to_string());
             }
         }
-        
+
         // Use find + exec to copy each directory
         args.extend(vec![
             "-exec".to_string(),
@@ -1746,7 +1864,7 @@ BEGIN {{ skip=0 }}
             output_dir.to_string_lossy().to_string(),
             ";".to_string(),
         ]);
-        
+
         Ok(ConversionCommand {
             program: "find".to_string(),
             arguments: args,
@@ -1755,7 +1873,7 @@ BEGIN {{ skip=0 }}
             description: format!("Copy subdirectories ({})", patterns),
         })
     }
-    
+
     /// Build merge command for combining multiple files
     fn build_merge_command(
         &self,
@@ -1768,18 +1886,22 @@ BEGIN {{ skip=0 }}
         let input_dir = input.parent().ok_or_else(|| {
             ConversionError::InvalidSettings("Input file has no parent directory".to_string())
         })?;
-        
+
         match settings.format {
             AudioFormat::Mp3 => {
                 // Use ffmpeg for MP3 concatenation
                 let args = vec![
-                    "-f".to_string(), "concat".to_string(),
-                    "-safe".to_string(), "0".to_string(),
-                    "-i".to_string(), format!("{}/filelist.txt", input_dir.display()),
-                    "-c".to_string(), "copy".to_string(),
+                    "-f".to_string(),
+                    "concat".to_string(),
+                    "-safe".to_string(),
+                    "0".to_string(),
+                    "-i".to_string(),
+                    format!("{}/filelist.txt", input_dir.display()),
+                    "-c".to_string(),
+                    "copy".to_string(),
                     output.to_string_lossy().to_string(),
                 ];
-                
+
                 Ok(ConversionCommand {
                     program: "ffmpeg".to_string(),
                     arguments: args,
@@ -1791,7 +1913,7 @@ BEGIN {{ skip=0 }}
             _ => {
                 // Use sox for other formats - manually expand glob pattern
                 let mut args = Vec::new();
-                
+
                 // Find all audio files in the directory to merge
                 let _pattern = format!("*.{}", settings.format.extension());
                 for entry in std::fs::read_dir(input_dir)? {
@@ -1805,16 +1927,18 @@ BEGIN {{ skip=0 }}
                         }
                     }
                 }
-                
+
                 // Add output file
                 args.push(output.to_string_lossy().to_string());
-                
+
                 if args.len() < 2 {
-                    return Err(ConversionError::InvalidSettings("No files found to merge".to_string()));
+                    return Err(ConversionError::InvalidSettings(
+                        "No files found to merge".to_string(),
+                    ));
                 }
-                
+
                 let file_count = args.len() - 1; // Count before moving args
-                
+
                 Ok(ConversionCommand {
                     program: "sox".to_string(),
                     arguments: args,
@@ -1841,8 +1965,8 @@ struct RequiredOperations {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ResampleType {
     None,
-    Standard,    // Regular SoXR or SoX resampling
-    BrickWall,   // Requires SSRC
+    Standard,  // Regular SoXR or SoX resampling
+    BrickWall, // Requires SSRC
 }
 
 impl Default for ResampleType {
@@ -1854,9 +1978,9 @@ impl Default for ResampleType {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DitherComplexity {
     None,
-    Basic,           // TPDF - most tools support
-    Advanced,        // Shibata variants - SoX or SSRC
-    GesemmannOnly,   // Only SoX supports
+    Basic,         // TPDF - most tools support
+    Advanced,      // Shibata variants - SoX or SSRC
+    GesemmannOnly, // Only SoX supports
 }
 
 impl Default for DitherComplexity {
@@ -1870,28 +1994,28 @@ impl ConversionPipeline {
     pub fn execute_with_progress(
         &self,
         _input_path: &Path,
-        progress_callback: Option<ProgressCallback>
+        progress_callback: Option<ProgressCallback>,
     ) -> std::io::Result<Vec<std::process::Output>> {
         let mut outputs = Vec::new();
-        
+
         // Define stage weights based on typical operation complexity
         let stage_weights = self.calculate_stage_weights();
         let mut cumulative_progress = 0.0f32;
-        
+
         for (index, command) in self.commands.iter().enumerate() {
             let stage_weight = stage_weights.get(index).copied().unwrap_or(10.0);
-            
+
             // Execute command (no individual progress for simplicity)
             let output = command.execute()?;
-            
+
             // Check if command failed (non-zero exit code)
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                
+
                 // Clean up temp files before returning error
                 self.cleanup_temp_files();
-                
+
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("Stage {} ({}) failed with exit code {:?}.\nStderr: {}\nStdout: {}\nCommand: {} {}",
@@ -1905,31 +2029,35 @@ impl ConversionPipeline {
                     )
                 ));
             }
-            
+
             outputs.push(output);
-            
+
             // Update progress based on stage completion
             cumulative_progress += stage_weight;
-            
+
             if let Some(ref callback) = progress_callback {
                 callback(cumulative_progress);
             }
-            
-            println!("✅ Stage {} ({}) completed - Progress: {:.1}%", 
-                     index + 1, command.program, cumulative_progress);
+
+            println!(
+                "✅ Stage {} ({}) completed - Progress: {:.1}%",
+                index + 1,
+                command.program,
+                cumulative_progress
+            );
         }
-        
+
         // Ensure we reach 100% at the end
         if let Some(ref callback) = progress_callback {
             callback(100.0);
         }
-        
+
         // Clean up temporary files
         self.cleanup_temp_files();
-        
+
         Ok(outputs)
     }
-    
+
     /// Execute pipeline with progress mapped to specific phase for main project integration
     pub async fn execute_with_phase_progress(
         &self,
@@ -1938,41 +2066,51 @@ impl ConversionPipeline {
         target_phase: crate::integration::ConversionPhase,
     ) -> crate::Result<Vec<std::process::Output>> {
         let mut outputs = Vec::new();
-        
+
         // Calculate stage weights (already implemented)
         let stage_weights = self.calculate_stage_weights();
         let mut cumulative_progress = 0.0f32;
-        
+
         for (index, command) in self.commands.iter().enumerate() {
             let stage_weight = stage_weights.get(index).copied().unwrap_or(10.0);
-            
+
             // Send progress update before starting stage
             let stage_progress = cumulative_progress;
             let overall_progress = target_phase.calculate_overall_progress(stage_progress);
-            
-            let _ = progress_tx.send(crate::integration::ProgressUpdate {
-                item_id: item_id.to_string(),
-                progress: overall_progress,
-                status: crate::integration::ConversionStatus::Processing {
+
+            let _ = progress_tx
+                .send(crate::integration::ProgressUpdate {
+                    item_id: item_id.to_string(),
                     progress: overall_progress,
-                    message: Some(format!("Stage {}/{}: {}", index + 1, self.commands.len(), command.description)),
-                    file_progress: None,
-                    phase: Some(target_phase),
-                    phase_progress: Some(stage_progress),
-                },
-            }).await;
+                    status: crate::integration::ConversionStatus::Processing {
+                        progress: overall_progress,
+                        message: Some(format!(
+                            "Stage {}/{}: {}",
+                            index + 1,
+                            self.commands.len(),
+                            command.description
+                        )),
+                        file_progress: None,
+                        phase: Some(target_phase),
+                        phase_progress: Some(stage_progress),
+                    },
+                })
+                .await;
 
             // Execute command with timeout (use robust execution)
             // CRITICAL: execute_with_timeout() is blocking, so run it in a dedicated thread pool
             // to avoid blocking the async runtime
             let command_clone = command.clone();
-            let output = tokio::task::spawn_blocking(move || {
-                command_clone.execute_with_timeout(None)
-            }).await
-                .map_err(|e| crate::ConversionError::Io(
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("Task join error: {}", e))
-                ))??;
-            
+            let output =
+                tokio::task::spawn_blocking(move || command_clone.execute_with_timeout(None))
+                    .await
+                    .map_err(|e| {
+                        crate::ConversionError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Task join error: {}", e),
+                        ))
+                    })??;
+
             // Check if command failed (critical for robustness)
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1984,76 +2122,82 @@ impl ConversionPipeline {
                     command.to_string(),
                     stderr.trim()
                 );
-                
+
                 // Send failure update
-                let _ = progress_tx.send(crate::integration::ProgressUpdate {
-                    item_id: item_id.to_string(), 
-                    progress: overall_progress,
-                    status: crate::integration::ConversionStatus::Failed { error: error_msg.clone() },
-                }).await;
-                
+                let _ = progress_tx
+                    .send(crate::integration::ProgressUpdate {
+                        item_id: item_id.to_string(),
+                        progress: overall_progress,
+                        status: crate::integration::ConversionStatus::Failed {
+                            error: error_msg.clone(),
+                        },
+                    })
+                    .await;
+
                 // Clean up temp files before returning error
                 self.cleanup_temp_files();
-                
+
                 return Err(crate::ConversionError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    error_msg
+                    error_msg,
                 )));
             }
-            
+
             outputs.push(output);
-            
+
             // Update cumulative progress
             cumulative_progress += stage_weight;
         }
-        
+
         // Send final completion within Converting phase
         let final_progress = target_phase.calculate_overall_progress(100.0);
-        let _ = progress_tx.send(crate::integration::ProgressUpdate {
-            item_id: item_id.to_string(),
-            progress: final_progress,
-            status: crate::integration::ConversionStatus::Processing {
+        let _ = progress_tx
+            .send(crate::integration::ProgressUpdate {
+                item_id: item_id.to_string(),
                 progress: final_progress,
-                message: Some("Conversion pipeline complete".to_string()),
-                file_progress: None,
-                phase: Some(target_phase),
-                phase_progress: Some(100.0),
-            },
-        }).await;
-        
+                status: crate::integration::ConversionStatus::Processing {
+                    progress: final_progress,
+                    message: Some("Conversion pipeline complete".to_string()),
+                    file_progress: None,
+                    phase: Some(target_phase),
+                    phase_progress: Some(100.0),
+                },
+            })
+            .await;
+
         // Clean up temporary files
         self.cleanup_temp_files();
-        
+
         Ok(outputs)
     }
-    
+
     /// Calculate stage weights based on operation types
     pub fn calculate_stage_weights(&self) -> Vec<f32> {
         let mut weights = Vec::new();
-        
+
         for command in &self.commands {
             let weight = match command.program.as_str() {
                 // Heavy operations
-                "7z" => 50.0,      // Archive extraction is heaviest
-                "ssrc" => 25.0,    // Brick wall resampling is heavy
-                
-                // Medium operations  
-                "ffmpeg" => 15.0,  // Audio conversion
-                "sox" => 10.0,     // Dithering/effects
-                "flac" => 10.0,    // FLAC encoding
-                "lame" => 10.0,    // MP3 encoding
-                
+                "7z" => 50.0,   // Archive extraction is heaviest
+                "ssrc" => 25.0, // Brick wall resampling is heavy
+
+                // Medium operations
+                "ffmpeg" => 15.0, // Audio conversion
+                "sox" => 10.0,    // Dithering/effects
+                "flac" => 10.0,   // FLAC encoding
+                "lame" => 10.0,   // MP3 encoding
+
                 // Light operations
                 "metaflac" => 3.0, // Metadata operations
                 "loudgain" => 5.0, // ReplayGain analysis
                 "opustags" => 2.0, // Tag operations
-                
+
                 // Unknown operations
                 _ => 10.0,
             };
             weights.push(weight);
         }
-        
+
         // Normalize weights to sum to 100%
         let total_weight: f32 = weights.iter().sum();
         if total_weight > 0.0 {
@@ -2061,25 +2205,25 @@ impl ConversionPipeline {
                 *weight = (*weight / total_weight) * 100.0;
             }
         }
-        
+
         weights
     }
-    
+
     /// Execute pipeline without progress reporting (original method)
     pub fn execute(&self) -> std::io::Result<Vec<std::process::Output>> {
         let mut outputs = Vec::new();
-        
+
         for (i, command) in self.commands.iter().enumerate() {
             let output = command.execute()?;
-            
+
             // Check if command failed (non-zero exit code)
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                
+
                 // Clean up temp files before returning error
                 self.cleanup_temp_files();
-                
+
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("Stage {} ({}) failed with exit code {:?}.\nStderr: {}\nStdout: {}\nCommand: {} {}",
@@ -2093,16 +2237,16 @@ impl ConversionPipeline {
                     )
                 ));
             }
-            
+
             outputs.push(output);
         }
-        
+
         // Clean up temporary files
         self.cleanup_temp_files();
-        
+
         Ok(outputs)
     }
-    
+
     /// Clean up temporary files
     fn cleanup_temp_files(&self) {
         for temp_file in &self.temp_files {
@@ -2111,13 +2255,13 @@ impl ConversionPipeline {
             }
         }
     }
-    
+
     /// Estimate total duration for the pipeline
     pub fn estimate_total_duration(&mut self, input_path: &Path) -> Result<DurationEstimate> {
         let mut total_duration = std::time::Duration::from_secs(0);
         let mut min_confidence = 1.0f32;
         let mut estimation_methods = Vec::new();
-        
+
         for command in &mut self.commands {
             match command.estimate_duration(input_path) {
                 Ok(estimate) => {
@@ -2133,14 +2277,14 @@ impl ConversionPipeline {
                 }
             }
         }
-        
+
         // Update pipeline's expected duration
         self.expected_duration = Some(total_duration);
-        
+
         Ok(DurationEstimate {
             total_duration,
             confidence: min_confidence,
-            method: EstimationMethod::AudioMetadata { 
+            method: EstimationMethod::AudioMetadata {
                 source_duration: total_duration,
                 complexity_factor: 1.0, // Already calculated per command
             },

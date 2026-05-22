@@ -513,10 +513,7 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
     // common release fields such as CATALOGNUMBER, BARCODE,
     // MUSICBRAINZ_ALBUMID, and RELEASECOUNTRY.
     let mut extra = BTreeMap::new();
-    for key in tracks
-        .iter()
-        .flat_map(|track| track.metadata.extra.keys())
-    {
+    for key in tracks.iter().flat_map(|track| track.metadata.extra.keys()) {
         if extra.contains_key(key) {
             continue;
         }
@@ -546,7 +543,6 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
         extra,
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -589,7 +585,9 @@ mod tests {
                 disc_number: Some(1),
                 track_number: ordinal,
             },
-            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("/stage/{ordinal:02}.flac"))),
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "/stage/{ordinal:02}.flac"
+            ))),
             metadata: TrackMetadata {
                 title: Some(format!("Track {ordinal}")),
                 artist: Some("Miles Davis".to_string()),
@@ -616,8 +614,14 @@ mod tests {
         ];
         let album = derive_album_metadata(&tracks);
 
-        assert_eq!(album.extra.get("catalognumber").map(String::as_str), Some("CK-1234"));
-        assert_eq!(album.extra.get("barcode").map(String::as_str), Some("074646123426"));
+        assert_eq!(
+            album.extra.get("catalognumber").map(String::as_str),
+            Some("CK-1234")
+        );
+        assert_eq!(
+            album.extra.get("barcode").map(String::as_str),
+            Some("074646123426")
+        );
         assert_eq!(album.album.as_deref(), Some("A Tribute to Jack Johnson"));
     }
 
@@ -629,7 +633,9 @@ mod tests {
                 disc_number: Some(1),
                 track_number: ordinal,
             },
-            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("/stage/{ordinal:02}.flac"))),
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "/stage/{ordinal:02}.flac"
+            ))),
             metadata: TrackMetadata {
                 title: Some(format!("Track {ordinal}")),
                 artist: Some("Miles Davis".to_string()),
@@ -649,7 +655,9 @@ mod tests {
         let album = derive_album_metadata(&tracks);
 
         assert!(!album.extra.contains_key("isrc"));
-        assert_eq!(album.extra.get("album").map(String::as_str), Some("A Tribute to Jack Johnson"));
+        assert_eq!(
+            album.extra.get("album").map(String::as_str),
+            Some("A Tribute to Jack Johnson")
+        );
     }
-
 }

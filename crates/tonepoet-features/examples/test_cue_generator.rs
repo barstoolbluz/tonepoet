@@ -1,9 +1,6 @@
 //! Standalone test for cue file generation functionality
 
-use conversion_features::{
-    generate_cue_file,
-    ConversionConfig
-};
+use conversion_features::{generate_cue_file, ConversionConfig};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -144,9 +141,7 @@ async fn test_single_track() -> Result<(), Box<dyn std::error::Error>> {
     let album_dir = PathBuf::from("./test_cue_output/Single");
     tokio::fs::create_dir_all(&album_dir).await?;
 
-    let audio_files = vec![
-        album_dir.join("Amazing Song.opus"),
-    ];
+    let audio_files = vec![album_dir.join("Amazing Song.opus")];
 
     for file in &audio_files {
         tokio::fs::write(file, b"dummy").await?;

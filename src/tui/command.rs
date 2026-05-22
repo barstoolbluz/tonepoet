@@ -3927,7 +3927,7 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                     log: LogPolicy {
                         root: output_root.join(".tonepoet-logs"),
                         write_for_blocked: true,
-                write_json_log: false,
+                        write_json_log: false,
                     },
                     stages: StagePolicy {
                         metadata: StageRequirement::Enabled,
@@ -3937,7 +3937,7 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                             StageRequirement::Disabled
                         },
                         features: StageRequirement::Enabled,
-                generate_cue: false,
+                        generate_cue: false,
                     },
                     failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
                 };

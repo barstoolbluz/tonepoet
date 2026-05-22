@@ -841,7 +841,7 @@ fn build_pipeline_request_template(
         log: LogPolicy {
             root: output_root.join(".tonepoet-logs"),
             write_for_blocked: true,
-                write_json_log: false,
+            write_json_log: false,
         },
         stages: StagePolicy {
             metadata: if no_metadata {

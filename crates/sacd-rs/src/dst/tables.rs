@@ -9,17 +9,9 @@ pub(crate) const MAX_TABLE_LEN: usize = 128;
 pub(crate) const FRAME_BYTES_PER_CHANNEL: usize = 4704;
 pub(crate) const FRAME_BITS_PER_CHANNEL: usize = FRAME_BYTES_PER_CHANNEL * 8;
 
-pub(crate) const FSETS_CODE_PRED_COEFF: [[i32; 3]; 3] = [
-    [-8, 0, 0],
-    [-16, 8, 0],
-    [-9, -5, 6],
-];
+pub(crate) const FSETS_CODE_PRED_COEFF: [[i32; 3]; 3] = [[-8, 0, 0], [-16, 8, 0], [-9, -5, 6]];
 
-pub(crate) const PROBS_CODE_PRED_COEFF: [[i32; 3]; 3] = [
-    [-8, 0, 0],
-    [-16, 8, 0],
-    [-24, 24, -8],
-];
+pub(crate) const PROBS_CODE_PRED_COEFF: [[i32; 3]; 3] = [[-8, 0, 0], [-16, 8, 0], [-24, 24, -8]];
 
 #[derive(Clone, Debug)]
 pub(crate) struct Table {

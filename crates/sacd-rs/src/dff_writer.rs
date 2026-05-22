@@ -185,11 +185,7 @@ impl<W: Write + Seek> DffWriter<W> {
 /// `audio_data_size` must already reflect any pad byte (i.e. even).
 /// The output length equals `header_size(channel_count)`.
 /// Convenience wrapper for the no-footer case.
-pub fn serialize_header(
-    channel_count: u8,
-    sample_rate: u32,
-    audio_data_size: u64,
-) -> Vec<u8> {
+pub fn serialize_header(channel_count: u8, sample_rate: u32, audio_data_size: u64) -> Vec<u8> {
     serialize_header_with_footer(channel_count, sample_rate, audio_data_size, 0)
 }
 
@@ -208,8 +204,7 @@ pub fn serialize_header_with_footer(
 
     // FRM8 (16 bytes): chunk_id, chunk_data_size, form_type.
     // chunk_data_size = header_size + audio_data_size + footer_size - 12.
-    let frm8_size =
-        total_header + audio_data_size + footer_size - CHUNK_HEADER_SIZE;
+    let frm8_size = total_header + audio_data_size + footer_size - CHUNK_HEADER_SIZE;
     buf.extend_from_slice(FRM8);
     buf.extend_from_slice(&frm8_size.to_be_bytes());
     buf.extend_from_slice(DSD);
@@ -295,7 +290,12 @@ fn write_channel_ids(buf: &mut Vec<u8>, channel_count: u8) {
             // ... — no NUL terminator. The C reference's sprintf
             // overflows by 1 byte; we deliberately diverge.
             for i in 0..n {
-                let id = [b'C', b'0' + (i / 100), b'0' + ((i / 10) % 10), b'0' + (i % 10)];
+                let id = [
+                    b'C',
+                    b'0' + (i / 100),
+                    b'0' + ((i / 10) % 10),
+                    b'0' + (i % 10),
+                ];
                 buf.extend_from_slice(&id);
             }
         }
@@ -319,8 +319,8 @@ mod tests {
     fn run(channel_count: u8, payload: &[u8]) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::<u8>::new());
         {
-            let mut w = DffWriter::new(&mut cursor, channel_count, SACD_SAMPLING_FREQUENCY)
-                .unwrap();
+            let mut w =
+                DffWriter::new(&mut cursor, channel_count, SACD_SAMPLING_FREQUENCY).unwrap();
             if !payload.is_empty() {
                 w.write_frame(payload).unwrap();
             }
@@ -490,7 +490,7 @@ mod tests {
         let out = run(2, &payload);
         let header = 144usize;
         assert_eq!(out.len(), header + 7 + 1); // padded
-        // Real audio bytes preserved.
+                                               // Real audio bytes preserved.
         assert_eq!(&out[header..header + 7], &payload[..]);
         // Pad byte is 0x00.
         assert_eq!(out[header + 7], 0);
@@ -509,10 +509,7 @@ mod tests {
         assert_eq!(read_u64_be(&out, cmpr_start + 4), 20);
         assert_eq!(&out[cmpr_start + 12..cmpr_start + 16], DSD); // compression_type
         assert_eq!(out[cmpr_start + 16], 14); // count
-        assert_eq!(
-            &out[cmpr_start + 17..cmpr_start + 31],
-            b"not compressed",
-        );
+        assert_eq!(&out[cmpr_start + 17..cmpr_start + 31], b"not compressed",);
         // Pad byte at cmpr_start + 31.
         assert_eq!(out[cmpr_start + 31], 0);
     }
@@ -560,8 +557,7 @@ mod tests {
     fn consecutive_write_frames_accumulate() {
         let mut cursor = Cursor::new(Vec::<u8>::new());
         {
-            let mut w =
-                DffWriter::new(&mut cursor, 2, SACD_SAMPLING_FREQUENCY).unwrap();
+            let mut w = DffWriter::new(&mut cursor, 2, SACD_SAMPLING_FREQUENCY).unwrap();
             w.write_frame(&[0x01, 0x02, 0x03, 0x04]).unwrap();
             w.write_frame(&[0x05, 0x06]).unwrap();
             w.write_frame(&[0x07, 0x08, 0x09, 0x0A]).unwrap();
@@ -569,7 +565,10 @@ mod tests {
         }
         let out = cursor.into_inner();
         assert_eq!(out.len(), 144 + 10);
-        assert_eq!(&out[144..154], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A]);
+        assert_eq!(
+            &out[144..154],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A]
+        );
         assert_eq!(read_u64_be(&out, 136), 10);
     }
 }

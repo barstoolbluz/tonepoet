@@ -232,8 +232,12 @@ fn draw_queue_item(
                 .unwrap_or("Processing");
             let label = format!("{:.0}% {}", pct_value, phase_label);
 
-            let gauge_area =
-                Rect::new(area.x + max_name_len as u16 + 10, area.y, progress_width - 1, 1);
+            let gauge_area = Rect::new(
+                area.x + max_name_len as u16 + 10,
+                area.y,
+                progress_width - 1,
+                1,
+            );
             let pct = (pct_value / 100.0).clamp(0.0, 1.0);
             draw_crt_gauge(f, gauge_area, pct, &label);
         }

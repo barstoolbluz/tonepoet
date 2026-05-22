@@ -1073,7 +1073,7 @@ fn pipeline_request_for_cue_item(
         log: LogPolicy {
             root: output_root.join(".tonepoet-logs"),
             write_for_blocked: true,
-                write_json_log: false,
+            write_json_log: false,
         },
         stages: StagePolicy {
             metadata: StageRequirement::Enabled,
@@ -1083,7 +1083,7 @@ fn pipeline_request_for_cue_item(
                 StageRequirement::Disabled
             },
             features: StageRequirement::Enabled,
-                generate_cue: false,
+            generate_cue: false,
         },
         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
     }
@@ -1201,7 +1201,7 @@ fn pipeline_request_for_sacd_item(
         log: LogPolicy {
             root: output_root.join(".tonepoet-logs"),
             write_for_blocked: true,
-                write_json_log: false,
+            write_json_log: false,
         },
         stages: StagePolicy {
             metadata: StageRequirement::Enabled,
@@ -1211,7 +1211,7 @@ fn pipeline_request_for_sacd_item(
                 StageRequirement::Disabled
             },
             features: StageRequirement::Enabled,
-                generate_cue: false,
+            generate_cue: false,
         },
         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
     }
@@ -1691,7 +1691,7 @@ pub async fn process_item(
                             })
                             .join(".tonepoet-logs"),
                         write_for_blocked: true,
-                write_json_log: false,
+                        write_json_log: false,
                     },
                     stages: StagePolicy {
                         metadata: StageRequirement::Enabled,
@@ -1701,7 +1701,7 @@ pub async fn process_item(
                             StageRequirement::Disabled
                         },
                         features: StageRequirement::Enabled,
-                generate_cue: false,
+                        generate_cue: false,
                     },
                     failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
                 }

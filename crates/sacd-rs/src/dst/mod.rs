@@ -129,12 +129,21 @@ mod fixture_tests {
     #[test]
     fn fixture_sha256_pins() {
         let cases = [
-            (1, "a788eb38dd9cf5bf5313ed521dabca62107332e2ffa02bc0943384fe5b1e87e4",
-                "4ba636974ba4217e348137a0ff9dda2df3f5ec1d80df03ad71c369a7a4f45ef7"),
-            (2, "fd77fa6f66e793eb309963fcda75fecbd5927dd816538d158d3440359c40efc9",
-                "d138a1d886e52c6fcd741d3eaf7ffe482b1bcb460e7a10062fa78bdf6e48d913"),
-            (3, "9a788271fa0893b190ea180d47bf14019612b6f97c9680f71e80df41982ee921",
-                "506f08c2eb6c82cd5ead58328f6b9a77c2676a391c49b90782ac3cda3fa4ff21"),
+            (
+                1,
+                "a788eb38dd9cf5bf5313ed521dabca62107332e2ffa02bc0943384fe5b1e87e4",
+                "4ba636974ba4217e348137a0ff9dda2df3f5ec1d80df03ad71c369a7a4f45ef7",
+            ),
+            (
+                2,
+                "fd77fa6f66e793eb309963fcda75fecbd5927dd816538d158d3440359c40efc9",
+                "d138a1d886e52c6fcd741d3eaf7ffe482b1bcb460e7a10062fa78bdf6e48d913",
+            ),
+            (
+                3,
+                "9a788271fa0893b190ea180d47bf14019612b6f97c9680f71e80df41982ee921",
+                "506f08c2eb6c82cd5ead58328f6b9a77c2676a391c49b90782ac3cda3fa4ff21",
+            ),
         ];
         for (n, dst_h, dsd_h) in cases {
             let (dst, dsd) = pair(n);
@@ -148,17 +157,36 @@ mod fixture_tests {
     #[test]
     fn fixture_sha256_pins_6ch() {
         let cases = [
-            (1, "59e54dd6a45fd543e96ad10d106ce254931b93a391424d82af5549f1528799bc",
-                "f5a8b3f86aad452c166ab3f86a71d8355222f92735458f959328271f9f33765c"),
-            (2, "4931e8ebd786ec0a62d1290877e51796ba17ada62009fbc2c3fc5012f234bbd0",
-                "43882f0757dddd92de08252057ed6d3c1ee2d75f25823bcae28490dee7994eea"),
-            (3, "7bcd510c01d54f8cd26677619cddc2c04cf83ff8077b534377536e5df54e95ba",
-                "36fbd17cca9ff410070673f4870673d708fda5398ccebb0d8888c4ebebdbba06"),
+            (
+                1,
+                "59e54dd6a45fd543e96ad10d106ce254931b93a391424d82af5549f1528799bc",
+                "f5a8b3f86aad452c166ab3f86a71d8355222f92735458f959328271f9f33765c",
+            ),
+            (
+                2,
+                "4931e8ebd786ec0a62d1290877e51796ba17ada62009fbc2c3fc5012f234bbd0",
+                "43882f0757dddd92de08252057ed6d3c1ee2d75f25823bcae28490dee7994eea",
+            ),
+            (
+                3,
+                "7bcd510c01d54f8cd26677619cddc2c04cf83ff8077b534377536e5df54e95ba",
+                "36fbd17cca9ff410070673f4870673d708fda5398ccebb0d8888c4ebebdbba06",
+            ),
         ];
         for (n, dst_h, dsd_h) in cases {
             let (dst, dsd) = pair_6ch(n);
-            assert_eq!(sha256_hex(dst), dst_h, "6ch frame {} DST input hash drift", n);
-            assert_eq!(sha256_hex(dsd), dsd_h, "6ch frame {} DSD output hash drift", n);
+            assert_eq!(
+                sha256_hex(dst),
+                dst_h,
+                "6ch frame {} DST input hash drift",
+                n
+            );
+            assert_eq!(
+                sha256_hex(dsd),
+                dsd_h,
+                "6ch frame {} DSD output hash drift",
+                n
+            );
         }
     }
 
@@ -187,6 +215,9 @@ mod fixture_tests {
     fn invalid_channel_count_is_malformed() {
         let (inp, _) = pair(1);
         let err = decode_frame(inp, 5).expect_err("invalid channel count");
-        assert!(matches!(err, super::DstError::MalformedFrame("invalid channel_count")));
+        assert!(matches!(
+            err,
+            super::DstError::MalformedFrame("invalid channel_count")
+        ));
     }
 }

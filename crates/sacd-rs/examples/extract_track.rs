@@ -82,7 +82,9 @@ fn print_usage() {
 
 /// Parse \"N/M\" → (N, M) as u16 pair.
 fn parse_pair_u16(s: &str) -> Result<(u16, u16), String> {
-    let (a, b) = s.split_once('/').ok_or_else(|| format!("expected N/M, got {:?}", s))?;
+    let (a, b) = s
+        .split_once('/')
+        .ok_or_else(|| format!("expected N/M, got {:?}", s))?;
     let n: u16 = a.parse().map_err(|_| format!("bad first u16: {}", a))?;
     let m: u16 = b.parse().map_err(|_| format!("bad second u16: {}", b))?;
     Ok((n, m))
@@ -94,8 +96,12 @@ fn parse_mmdd(s: &str) -> Result<(u8, u8), String> {
     if s.len() != 4 {
         return Err(format!("expected MMDD (4 chars), got {:?}", s));
     }
-    let m: u8 = s[..2].parse().map_err(|_| format!("bad month: {}", &s[..2]))?;
-    let d: u8 = s[2..].parse().map_err(|_| format!("bad day: {}", &s[2..]))?;
+    let m: u8 = s[..2]
+        .parse()
+        .map_err(|_| format!("bad month: {}", &s[..2]))?;
+    let d: u8 = s[2..]
+        .parse()
+        .map_err(|_| format!("bad day: {}", &s[2..]))?;
     Ok((m, d))
 }
 
@@ -107,9 +113,15 @@ fn parse_mmss_ff(s: &str) -> Result<u32, String> {
     if parts.len() != 3 {
         return Err(format!("expected MM:SS:FF, got {:?}", s));
     }
-    let m: u32 = parts[0].parse().map_err(|_| format!("bad minutes: {}", parts[0]))?;
-    let sec: u32 = parts[1].parse().map_err(|_| format!("bad seconds: {}", parts[1]))?;
-    let f: u32 = parts[2].parse().map_err(|_| format!("bad frames: {}", parts[2]))?;
+    let m: u32 = parts[0]
+        .parse()
+        .map_err(|_| format!("bad minutes: {}", parts[0]))?;
+    let sec: u32 = parts[1]
+        .parse()
+        .map_err(|_| format!("bad seconds: {}", parts[1]))?;
+    let f: u32 = parts[2]
+        .parse()
+        .map_err(|_| format!("bad frames: {}", parts[2]))?;
     if sec >= 60 {
         return Err(format!("seconds out of range: {}", sec));
     }
@@ -136,7 +148,10 @@ fn parse_args() -> Result<Args, String> {
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
-        let mut val = || args.next().ok_or_else(|| format!("missing value for {}", flag));
+        let mut val = || {
+            args.next()
+                .ok_or_else(|| format!("missing value for {}", flag))
+        };
         match flag.as_str() {
             "--iso" => iso = Some(PathBuf::from(val()?)),
             "--output" | "-o" => output = Some(PathBuf::from(val()?)),
@@ -173,37 +188,102 @@ fn parse_args() -> Result<Args, String> {
             "--id3-copyright" => id3.tcop = Some(val()?),
             "--id3-disc" => id3.tpos = Some(parse_pair_u16(&val()?)?),
             "--id3-genre" => id3.tcon = Some(val()?),
-            "--id3-year" => id3.tyer = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
+            "--id3-year" => {
+                id3.tyer = Some(
+                    val()?
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                )
+            }
             "--id3-date" => id3.tdat = Some(parse_mmdd(&val()?)?),
             "--id3-track" => id3.trck = Some(parse_pair_u16(&val()?)?),
             // --- DFF footer args ---
             "--dff-diar" => dff_opts.diar = Some(val()?),
             "--dff-diti" => dff_opts.diti = Some(val()?),
-            "--dff-duration-minutes" => dff_opts.duration_minutes_total = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
-            "--dff-duration-seconds" => dff_opts.duration_seconds = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
-            "--dff-duration-frames" => dff_opts.duration_frames = Some(val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?),
+            "--dff-duration-minutes" => {
+                dff_opts.duration_minutes_total = Some(
+                    val()?
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                )
+            }
+            "--dff-duration-seconds" => {
+                dff_opts.duration_seconds = Some(
+                    val()?
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                )
+            }
+            "--dff-duration-frames" => {
+                dff_opts.duration_frames = Some(
+                    val()?
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                )
+            }
             "--dff-disc-date" => {
                 // Format YYYY-MM-DD (month 1-indexed)
                 let s = val()?;
                 let parts: Vec<&str> = s.split('-').collect();
-                if parts.len() != 3 { return Err(format!("--dff-disc-date expects YYYY-MM-DD, got {}", s)); }
-                dff_opts.disc_date_year = Some(parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
-                dff_opts.disc_date_month_1_indexed = Some(parts[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
-                dff_opts.disc_date_day = Some(parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                if parts.len() != 3 {
+                    return Err(format!("--dff-disc-date expects YYYY-MM-DD, got {}", s));
+                }
+                dff_opts.disc_date_year = Some(
+                    parts[0]
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                );
+                dff_opts.disc_date_month_1_indexed = Some(
+                    parts[1]
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                );
+                dff_opts.disc_date_day = Some(
+                    parts[2]
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                );
             }
             "--dff-title" => dff_opts.disc_or_album_title = Some(val()?),
             "--dff-creation-time" => {
                 // Format YYYY-MM-DD-HH:MM (month 0-indexed for tm_mon)
                 let s = val()?;
                 let dash_parts: Vec<&str> = s.split('-').collect();
-                if dash_parts.len() != 4 { return Err(format!("--dff-creation-time expects YYYY-MM-DD-HH:MM, got {}", s)); }
-                dff_opts.creation_year = Some(dash_parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
-                dff_opts.creation_month_0_indexed = Some(dash_parts[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
-                dff_opts.creation_day = Some(dash_parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                if dash_parts.len() != 4 {
+                    return Err(format!(
+                        "--dff-creation-time expects YYYY-MM-DD-HH:MM, got {}",
+                        s
+                    ));
+                }
+                dff_opts.creation_year = Some(
+                    dash_parts[0]
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                );
+                dff_opts.creation_month_0_indexed = Some(
+                    dash_parts[1]
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                );
+                dff_opts.creation_day = Some(
+                    dash_parts[2]
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                );
                 let hm: Vec<&str> = dash_parts[3].split(':').collect();
-                if hm.len() != 2 { return Err(format!("--dff-creation-time HH:MM section bad, got {}", s)); }
-                dff_opts.creation_hour = Some(hm[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
-                dff_opts.creation_minute = Some(hm[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+                if hm.len() != 2 {
+                    return Err(format!("--dff-creation-time HH:MM section bad, got {}", s));
+                }
+                dff_opts.creation_hour = Some(
+                    hm[0]
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                );
+                dff_opts.creation_minute = Some(
+                    hm[1]
+                        .parse()
+                        .map_err(|e: std::num::ParseIntError| e.to_string())?,
+                );
             }
             "--dff-creating-machine" => dff_opts.creating_machine = Some(val()?),
             "-h" | "--help" => {
@@ -237,10 +317,15 @@ fn parse_args() -> Result<Args, String> {
 
 /// True if any --dff-* flag was specified.
 fn dff_opts_populated(d: &DffFooterOptions) -> bool {
-    d.diar.is_some() || d.diti.is_some() || d.duration_minutes_total.is_some()
-        || d.duration_seconds.is_some() || d.duration_frames.is_some()
-        || d.disc_date_year.is_some() || d.disc_or_album_title.is_some()
-        || d.creation_year.is_some() || d.creating_machine.is_some()
+    d.diar.is_some()
+        || d.diti.is_some()
+        || d.duration_minutes_total.is_some()
+        || d.duration_seconds.is_some()
+        || d.duration_frames.is_some()
+        || d.disc_date_year.is_some()
+        || d.disc_or_album_title.is_some()
+        || d.creation_year.is_some()
+        || d.creating_machine.is_some()
 }
 
 /// Build a DffMetadata from the collected CLI options + ID3 metadata.
@@ -249,29 +334,49 @@ fn build_dff_metadata(opts: DffFooterOptions, id3: Id3Metadata) -> Result<DffMet
     Ok(DffMetadata {
         diar: opts.diar,
         diti: opts.diti,
-        duration_minutes_total: opts.duration_minutes_total.ok_or("--dff-duration-minutes required for DFF footer")?,
-        duration_seconds: opts.duration_seconds.ok_or("--dff-duration-seconds required")?,
-        duration_frames: opts.duration_frames.ok_or("--dff-duration-frames required")?,
+        duration_minutes_total: opts
+            .duration_minutes_total
+            .ok_or("--dff-duration-minutes required for DFF footer")?,
+        duration_seconds: opts
+            .duration_seconds
+            .ok_or("--dff-duration-seconds required")?,
+        duration_frames: opts
+            .duration_frames
+            .ok_or("--dff-duration-frames required")?,
         disc_date_year: opts.disc_date_year.ok_or("--dff-disc-date required")?,
         disc_date_month_1_indexed: opts.disc_date_month_1_indexed.unwrap(),
         disc_date_day: opts.disc_date_day.unwrap(),
-        disc_or_album_title: opts.disc_or_album_title.ok_or("--dff-title required for COMT comment 1")?,
+        disc_or_album_title: opts
+            .disc_or_album_title
+            .ok_or("--dff-title required for COMT comment 1")?,
         creation_year: opts.creation_year.ok_or("--dff-creation-time required")?,
         creation_month_0_indexed: opts.creation_month_0_indexed.unwrap(),
         creation_day: opts.creation_day.unwrap(),
         creation_hour: opts.creation_hour.unwrap(),
         creation_minute: opts.creation_minute.unwrap(),
-        creating_machine: opts.creating_machine.ok_or("--dff-creating-machine required")?,
+        creating_machine: opts
+            .creating_machine
+            .ok_or("--dff-creating-machine required")?,
         id3,
     })
 }
 
 /// True if any field on `Id3Metadata` is populated.
 fn id3_is_populated(m: &Id3Metadata) -> bool {
-    m.tit2.is_some() || m.talb.is_some() || m.tpe1.is_some() || m.tpe2.is_some()
-        || m.txxx_performer.is_some() || m.tcom.is_some() || m.tsrc.is_some()
-        || m.tpub.is_some() || m.tcop.is_some() || m.tpos.is_some() || m.tcon.is_some()
-        || m.tyer.is_some() || m.tdat.is_some() || m.trck.is_some()
+    m.tit2.is_some()
+        || m.talb.is_some()
+        || m.tpe1.is_some()
+        || m.tpe2.is_some()
+        || m.txxx_performer.is_some()
+        || m.tcom.is_some()
+        || m.tsrc.is_some()
+        || m.tpub.is_some()
+        || m.tcop.is_some()
+        || m.tpos.is_some()
+        || m.tcon.is_some()
+        || m.tyer.is_some()
+        || m.tdat.is_some()
+        || m.trck.is_some()
 }
 
 fn main() -> ExitCode {
@@ -300,12 +405,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut opts = ExtractOptions::new(
-        args.start_lsn,
-        args.end_lsn,
-        args.channels,
-        args.format,
-    );
+    let mut opts = ExtractOptions::new(args.start_lsn, args.end_lsn, args.channels, args.format);
     if let Some(tf) = args.time_filter {
         opts = opts.with_time_filter(tf);
     }
@@ -340,7 +440,10 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("extraction failed: {}", e);
-            eprintln!("(output file at {} is incomplete; discard it)", args.output.display());
+            eprintln!(
+                "(output file at {} is incomplete; discard it)",
+                args.output.display()
+            );
             ExitCode::FAILURE
         }
     }

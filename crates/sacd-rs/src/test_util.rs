@@ -16,11 +16,7 @@ pub(crate) const DATA_TYPE_AUDIO: u8 = 2;
 /// with `tc`; `frame_start=false` produces a continuation packet (no
 /// frame_info, no timecode). Pads the rest of the 2048-byte sector
 /// with zeros.
-pub(crate) fn synth_audio_sector(
-    frame_start: bool,
-    payload: &[u8],
-    tc: Timecode,
-) -> Vec<u8> {
+pub(crate) fn synth_audio_sector(frame_start: bool, payload: &[u8], tc: Timecode) -> Vec<u8> {
     let mut s = vec![0u8; SECTOR_SIZE as usize];
     let frame_info_count: u8 = if frame_start { 1 } else { 0 };
     // dst=0, reserved=0, frame_info_count, packet_info_count=1.
@@ -107,7 +103,11 @@ pub(crate) fn tc_at(frame_count: u32) -> Timecode {
     let rem = frame_count % (60 * 75);
     let s = (rem / 75) as u8;
     let f = (rem % 75) as u8;
-    Timecode { minutes: m, seconds: s, frames: f }
+    Timecode {
+        minutes: m,
+        seconds: s,
+        frames: f,
+    }
 }
 
 /// Hash `bytes` with SHA-256 and return the result as a lowercase
@@ -119,7 +119,11 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// Write `sectors` to a temp file and return the TempDir (kept alive

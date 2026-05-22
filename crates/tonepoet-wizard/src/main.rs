@@ -1,19 +1,15 @@
-use std::io;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io;
 
-mod types;
-mod ui;
 mod events;
 mod presets;
-
+mod types;
+mod ui;
 
 use types::*;
 
@@ -27,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create wizard
     let mut wizard = SimpleWizard::new();
-    
+
     // Main loop
     loop {
         let mut mouse_areas = ui::MouseAreas::new();
@@ -40,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Let wizard handle the key first (including Escape for help)
                 if wizard.handle_key(key) {
                     if wizard.should_exit {
-                        break;  // Exit when Cancel is pressed
+                        break; // Exit when Cancel is pressed
                     }
                     if wizard.should_start_conversion {
                         // In standalone mode, just print the settings and exit
@@ -51,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             DisableMouseCapture
                         )?;
                         terminal.show_cursor()?;
-                        
+
                         println!("\nConversion settings:");
                         println!("{:#?}", wizard.extract_settings());
                         break;
@@ -63,17 +59,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                         let button_id = mouse_areas.get_button_at(mouse.column, mouse.row);
                         wizard.handle_mouse(mouse, button_id);
-                        
+
                         if wizard.should_exit {
                             // Debug logging
                             use std::fs::OpenOptions;
                             use std::io::Write;
-                            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("wizard_areas.log") {
-                                let _ = writeln!(file, "Main loop: Exiting wizard due to should_exit flag");
+                            if let Ok(mut file) = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("wizard_areas.log")
+                            {
+                                let _ = writeln!(
+                                    file,
+                                    "Main loop: Exiting wizard due to should_exit flag"
+                                );
                             }
                             break; // Exit the wizard when Cancel is clicked
                         }
-                        
+
                         if wizard.should_start_conversion {
                             // In standalone mode, just print the settings and exit
                             disable_raw_mode()?;
@@ -83,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 DisableMouseCapture
                             )?;
                             terminal.show_cursor()?;
-                            
+
                             println!("\nConversion settings:");
                             println!("{:#?}", wizard.extract_settings());
                             break;

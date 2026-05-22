@@ -1,6 +1,6 @@
 // Test to verify unbounded channel doesn't deadlock with many rapid sends
-use tokio::sync::mpsc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn test_unbounded_channel_no_deadlock() {
@@ -55,10 +55,14 @@ async fn test_bounded_channel_would_deadlock() {
         for i in 0..500 {
             tx.send(i).await.unwrap();
         }
-    }).await;
+    })
+    .await;
 
     // With bounded channel and slow receiver, this WILL timeout
-    assert!(send_result.is_err(), "Bounded channel should timeout with slow receiver");
+    assert!(
+        send_result.is_err(),
+        "Bounded channel should timeout with slow receiver"
+    );
 
     drop(tx);
     let _ = forwarder.await;

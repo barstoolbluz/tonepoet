@@ -138,7 +138,9 @@ async fn run() -> Result<(), String> {
     }
 
     if printed == 0 {
-        println!("no exact-zero or Chien-valid offsets printed; rerun with --all for the full table");
+        println!(
+            "no exact-zero or Chien-valid offsets printed; rerun with --all for the full table"
+        );
     }
     println!(
         "summary exact_hits={} chien_hits={} best_errors_offset={:?}",
@@ -160,7 +162,10 @@ fn infer_ctdb_toc(paths: &[PathBuf]) -> Result<String, String> {
     }
 
     let (sample_counts, sample_rate) = accuraterip_collect_sample_counts(paths)?;
-    Ok(ctdb::build_ctdb_toc_from_samples(&sample_counts, sample_rate))
+    Ok(ctdb::build_ctdb_toc_from_samples(
+        &sample_counts,
+        sample_rate,
+    ))
 }
 
 fn select_entry<'a>(
@@ -176,7 +181,9 @@ fn select_entry<'a>(
     }
 
     if let Some(confidence) = confidence {
-        let mut matches = entries.iter().filter(|entry| entry.confidence == confidence);
+        let mut matches = entries
+            .iter()
+            .filter(|entry| entry.confidence == confidence);
         let first = matches
             .next()
             .ok_or_else(|| format!("no CTDB entry has confidence {confidence}"))?;

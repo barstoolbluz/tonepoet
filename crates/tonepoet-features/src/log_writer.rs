@@ -1,8 +1,8 @@
 //! Conversion log file writing implementation
 
-use super::{ConversionResult, ConversionConfig, FeatureResult, FeatureError};
-use std::path::{Path, PathBuf};
+use super::{ConversionConfig, ConversionResult, FeatureError, FeatureResult};
 use chrono::{DateTime, Utc};
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 /// Comprehensive conversion log data
@@ -54,21 +54,22 @@ pub async fn write_conversion_log(
 ) -> FeatureResult<PathBuf> {
     // Generate log data
     let log_data = collect_log_data(output_dir, results, config, conversion_options).await?;
-    
+
     // Generate timestamped filename
     let timestamp = log_data.timestamp.format("%Y%m%d-%H%M%S");
     let log_filename = format!("conversion-log-{}.txt", timestamp);
     let log_path = output_dir.join(&log_filename);
-    
+
     // Generate log content
     let log_content = generate_log_content(&log_data);
-    
+
     // Write log file
-    fs::write(&log_path, log_content).await
+    fs::write(&log_path, log_content)
+        .await
         .map_err(|e| FeatureError::Permission(format!("Cannot write log file: {}", e)))?;
-    
+
     log::info!("Conversion log written to: {}", log_path.display());
-    
+
     Ok(log_path)
 }
 
@@ -80,8 +81,12 @@ fn derive_actual_backend(results: &[ConversionResult], preferred: &str) -> Strin
             for cmd in &pipeline.commands {
                 // Skip no-op commands, shell wrappers, and utility commands
                 match cmd.program.as_str() {
-                    "true" | "sh" | "bash" | "cp" | "find" | "metaflac" | "AtomicParsley" => continue,
-                    _ => { tools.insert(cmd.program.clone()); }
+                    "true" | "sh" | "bash" | "cp" | "find" | "metaflac" | "AtomicParsley" => {
+                        continue
+                    }
+                    _ => {
+                        tools.insert(cmd.program.clone());
+                    }
                 }
             }
         }
@@ -91,12 +96,24 @@ fn derive_actual_backend(results: &[ConversionResult], preferred: &str) -> Strin
     }
 
     let mut parts = Vec::new();
-    if tools.contains("ffmpeg") { parts.push("FFmpeg"); }
-    if tools.contains("sox") { parts.push("SoX"); }
-    if tools.contains("ssrc") { parts.push("SSRC"); }
-    if tools.contains("flac") { parts.push("FLAC encoder"); }
-    if tools.contains("wavpack") { parts.push("WavPack"); }
-    if tools.contains("loudgain") { parts.push("loudgain"); }
+    if tools.contains("ffmpeg") {
+        parts.push("FFmpeg");
+    }
+    if tools.contains("sox") {
+        parts.push("SoX");
+    }
+    if tools.contains("ssrc") {
+        parts.push("SSRC");
+    }
+    if tools.contains("flac") {
+        parts.push("FLAC encoder");
+    }
+    if tools.contains("wavpack") {
+        parts.push("WavPack");
+    }
+    if tools.contains("loudgain") {
+        parts.push("loudgain");
+    }
 
     if parts.is_empty() {
         // Unknown tools — fall back to preferred
@@ -114,9 +131,11 @@ async fn collect_log_data(
     conversion_options: Option<&str>,
 ) -> FeatureResult<ConversionLogData> {
     let timestamp = Utc::now();
-    let session_id = format!("conv_{}_{:x}",
+    let session_id = format!(
+        "conv_{}_{:x}",
         timestamp.format("%Y%m%d_%H%M%S"),
-        timestamp.timestamp() as u32);
+        timestamp.timestamp() as u32
+    );
 
     // Analyze input files for summary
     let input_summary = analyze_input_files(results).await?;
@@ -132,7 +151,8 @@ async fn collect_log_data(
     // Extract merge_to_single from conversion options
     let merge_to_single = conversion_options
         .and_then(|json_str| {
-            serde_json::from_str::<serde_json::Value>(json_str).ok()
+            serde_json::from_str::<serde_json::Value>(json_str)
+                .ok()
                 .and_then(|v| v.get("merge_to_single").and_then(|m| m.as_bool()))
         })
         .unwrap_or(false);
@@ -152,11 +172,15 @@ async fn collect_log_data(
         output_format: detect_output_format(results),
         quality_settings,
         copy_options: format_copy_options(config, conversion_options),
-        source_type: if results.len() > 3 { "Archive".to_string() } else { "Individual files".to_string() },
+        source_type: if results.len() > 3 {
+            "Archive".to_string()
+        } else {
+            "Individual files".to_string()
+        },
         merge_to_single,
         merged_track_count,
     };
-    
+
     Ok(ConversionLogData {
         timestamp,
         session_id,
@@ -171,42 +195,66 @@ async fn collect_log_data(
 /// Generate formatted log content
 fn generate_log_content(data: &ConversionLogData) -> String {
     let mut log = String::new();
-    
+
     // Header
     log.push_str("HEXLOAD-TUI CONVERSION LOG\n");
-    log.push_str(&format!("Generated: {}\n", data.timestamp.format("%Y-%m-%d %H:%M:%S UTC")));
+    log.push_str(&format!(
+        "Generated: {}\n",
+        data.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
     log.push_str(&format!("Session ID: {}\n", data.session_id));
     log.push_str("\n============================================\n\n");
-    
+
     // Settings section
     log.push_str("CONVERSION SETTINGS:\n");
     log.push_str(&format!("- Backend: {}\n", data.settings.backend));
-    log.push_str(&format!("- Workers: {} concurrent\n", data.settings.worker_count));
-    log.push_str(&format!("- Process Priority: {}\n", data.settings.process_priority));
-    log.push_str(&format!("- Output Format: {}\n", data.settings.output_format));
+    log.push_str(&format!(
+        "- Workers: {} concurrent\n",
+        data.settings.worker_count
+    ));
+    log.push_str(&format!(
+        "- Process Priority: {}\n",
+        data.settings.process_priority
+    ));
+    log.push_str(&format!(
+        "- Output Format: {}\n",
+        data.settings.output_format
+    ));
     log.push_str(&format!("- Quality: {}\n", data.settings.quality_settings));
     log.push_str(&format!("- Copy Options: {}\n", data.settings.copy_options));
     log.push_str(&format!("- Source: {}\n", data.settings.source_type));
     if data.settings.merge_to_single {
         if let Some(count) = data.settings.merged_track_count {
-            log.push_str(&format!("- Merge Tracks: Yes ({} tracks merged to single file)\n", count));
+            log.push_str(&format!(
+                "- Merge Tracks: Yes ({} tracks merged to single file)\n",
+                count
+            ));
         } else {
             log.push_str("- Merge Tracks: Yes\n");
         }
     }
     log.push_str("\n");
-    
+
     // Input files section
     log.push_str("INPUT FILES:\n");
-    log.push_str(&format!("- Total: {} files processed\n", data.input_summary.total_files));
-    log.push_str(&format!("- Source Directory: {}\n", data.input_summary.source_directory));
-    log.push_str(&format!("- Total Input Size: {}\n", format_file_size(data.input_summary.total_input_size)));
+    log.push_str(&format!(
+        "- Total: {} files processed\n",
+        data.input_summary.total_files
+    ));
+    log.push_str(&format!(
+        "- Source Directory: {}\n",
+        data.input_summary.source_directory
+    ));
+    log.push_str(&format!(
+        "- Total Input Size: {}\n",
+        format_file_size(data.input_summary.total_input_size)
+    ));
     log.push_str("\nInput Formats:\n");
     for (format, count) in &data.input_summary.input_formats {
         log.push_str(&format!("- {}: {} files\n", format, count));
     }
     log.push_str("\n");
-    
+
     // Conversion results section
     log.push_str("CONVERSION RESULTS:\n");
 
@@ -215,11 +263,13 @@ fn generate_log_content(data: &ConversionLogData) -> String {
         // Display merged output
         let first_result = &data.results[merged_indices[0]];
         let timestamp = first_result.start_time.format("%H:%M:%S");
-        let merged_filename = merged_file.file_name()
+        let merged_filename = merged_file
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
 
-        let total_input: u64 = merged_indices.iter()
+        let total_input: u64 = merged_indices
+            .iter()
             .map(|&i| data.results[i].source_size)
             .sum();
         let output_size = first_result.output_size;
@@ -244,7 +294,9 @@ fn generate_log_content(data: &ConversionLogData) -> String {
         // List individual tracks
         for &idx in &merged_indices {
             let r = &data.results[idx];
-            let track_name = r.source_file.file_name()
+            let track_name = r
+                .source_file
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
             log.push_str(&format!(
@@ -299,28 +351,32 @@ fn generate_log_content(data: &ConversionLogData) -> String {
     } else {
         // Normal per-file display (no merge)
         for (_i, result) in data.results.iter().enumerate() {
-        let timestamp = result.start_time.format("%H:%M:%S");
-        let status_symbol = match result.status {
-            super::ConversionStatus::Success => "✅",
-            super::ConversionStatus::Failed => "❌",
-        };
-        
-        let source_name = result.source_file.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        let output_name = result.output_file.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-            
-        match result.status {
-            super::ConversionStatus::Success => {
-                let compression_reduction = 100.0 - result.compression_ratio();
-                let size_change_label = if compression_reduction >= 0.0 {
-                    format!("Size Reduction: {:.1}%", compression_reduction)
-                } else {
-                    format!("Size Increase: {:.1}%", -compression_reduction)
-                };
-                log.push_str(&format!(
+            let timestamp = result.start_time.format("%H:%M:%S");
+            let status_symbol = match result.status {
+                super::ConversionStatus::Success => "✅",
+                super::ConversionStatus::Failed => "❌",
+            };
+
+            let source_name = result
+                .source_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            let output_name = result
+                .output_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+
+            match result.status {
+                super::ConversionStatus::Success => {
+                    let compression_reduction = 100.0 - result.compression_ratio();
+                    let size_change_label = if compression_reduction >= 0.0 {
+                        format!("Size Reduction: {:.1}%", compression_reduction)
+                    } else {
+                        format!("Size Increase: {:.1}%", -compression_reduction)
+                    };
+                    log.push_str(&format!(
                     "[{}] {} {} → {}\n           Input: {} | Output: {} | {} | Duration: {:.1}s\n",
                     timestamp,
                     status_symbol,
@@ -332,78 +388,96 @@ fn generate_log_content(data: &ConversionLogData) -> String {
                     result.duration().num_seconds()
                 ));
 
-                // Display source info if available
-                log::debug!("Log writer checking source_info for {:?}: {:?}", result.source_file, result.source_info);
-                if let Some(ref src) = result.source_info {
-                    let mut parts = vec![src.format.clone()];
+                    // Display source info if available
+                    log::debug!(
+                        "Log writer checking source_info for {:?}: {:?}",
+                        result.source_file,
+                        result.source_info
+                    );
+                    if let Some(ref src) = result.source_info {
+                        let mut parts = vec![src.format.clone()];
 
-                    if let Some(depth) = src.bit_depth {
-                        if depth == 320 {
-                            parts.push("32-bit float".to_string());
-                        } else {
-                            parts.push(format!("{}bit", depth));
-                        }
-                    }
-
-                    if let Some(rate) = src.sample_rate {
-                        parts.push(format!("{}kHz", rate / 1000));
-                    }
-
-                    if let Some(ch) = src.channels {
-                        if ch != 2 {  // Only show if not stereo
-                            parts.push(format!("{}ch", ch));
-                        }
-                    }
-
-                    log.push_str(&format!("           Source: {}\n", parts.join(" ")));
-                }
-
-                // Display conversion commands if available
-                if let Some(ref pipeline) = result.conversion_pipeline {
-                    if pipeline.commands.len() == 1 {
-                        // Single command - display inline
-                        let cmd = &pipeline.commands[0];
-                        if cmd.program == "true" && cmd.arguments.is_empty() {
-                            log.push_str(&format!("           [Skipped] {}\n", cmd.description));
-                        } else {
-                            log.push_str(&format!("           Command: {} {}\n",
-                                cmd.program, cmd.arguments.join(" ")));
-                        }
-                    } else if pipeline.commands.len() > 1 {
-                        // Multiple commands - display numbered list
-                        log.push_str("           Commands:\n");
-                        for (idx, cmd) in pipeline.commands.iter().enumerate() {
-                            // For "true" (no-op) commands, show the description instead
-                            if cmd.program == "true" && cmd.arguments.is_empty() {
-                                log.push_str(&format!("             {}. [Skipped] {}\n",
-                                    idx + 1, cmd.description));
+                        if let Some(depth) = src.bit_depth {
+                            if depth == 320 {
+                                parts.push("32-bit float".to_string());
                             } else {
-                                log.push_str(&format!("             {}. {} {}\n",
-                                    idx + 1, cmd.program, cmd.arguments.join(" ")));
+                                parts.push(format!("{}bit", depth));
+                            }
+                        }
+
+                        if let Some(rate) = src.sample_rate {
+                            parts.push(format!("{}kHz", rate / 1000));
+                        }
+
+                        if let Some(ch) = src.channels {
+                            if ch != 2 {
+                                // Only show if not stereo
+                                parts.push(format!("{}ch", ch));
+                            }
+                        }
+
+                        log.push_str(&format!("           Source: {}\n", parts.join(" ")));
+                    }
+
+                    // Display conversion commands if available
+                    if let Some(ref pipeline) = result.conversion_pipeline {
+                        if pipeline.commands.len() == 1 {
+                            // Single command - display inline
+                            let cmd = &pipeline.commands[0];
+                            if cmd.program == "true" && cmd.arguments.is_empty() {
+                                log.push_str(&format!(
+                                    "           [Skipped] {}\n",
+                                    cmd.description
+                                ));
+                            } else {
+                                log.push_str(&format!(
+                                    "           Command: {} {}\n",
+                                    cmd.program,
+                                    cmd.arguments.join(" ")
+                                ));
+                            }
+                        } else if pipeline.commands.len() > 1 {
+                            // Multiple commands - display numbered list
+                            log.push_str("           Commands:\n");
+                            for (idx, cmd) in pipeline.commands.iter().enumerate() {
+                                // For "true" (no-op) commands, show the description instead
+                                if cmd.program == "true" && cmd.arguments.is_empty() {
+                                    log.push_str(&format!(
+                                        "             {}. [Skipped] {}\n",
+                                        idx + 1,
+                                        cmd.description
+                                    ));
+                                } else {
+                                    log.push_str(&format!(
+                                        "             {}. {} {}\n",
+                                        idx + 1,
+                                        cmd.program,
+                                        cmd.arguments.join(" ")
+                                    ));
+                                }
                             }
                         }
                     }
-                }
 
-                // Display ReplayGain values if available
-                if let Some(ref rg) = result.replaygain_values {
-                    if rg.track_gain.is_some() || rg.album_gain.is_some() {
-                        log.push_str("           ReplayGain:");
+                    // Display ReplayGain values if available
+                    if let Some(ref rg) = result.replaygain_values {
+                        if rg.track_gain.is_some() || rg.album_gain.is_some() {
+                            log.push_str("           ReplayGain:");
 
-                        if let Some(ref gain) = rg.track_gain {
-                            log.push_str(&format!(" Track: {}", gain));
+                            if let Some(ref gain) = rg.track_gain {
+                                log.push_str(&format!(" Track: {}", gain));
+                            }
+
+                            if let Some(ref gain) = rg.album_gain {
+                                log.push_str(&format!(" | Album: {}", gain));
+                            }
+
+                            log.push_str("\n");
                         }
-
-                        if let Some(ref gain) = rg.album_gain {
-                            log.push_str(&format!(" | Album: {}", gain));
-                        }
-
-                        log.push_str("\n");
                     }
                 }
-            }
-            super::ConversionStatus::Failed => {
-                log.push_str(&format!(
+                super::ConversionStatus::Failed => {
+                    log.push_str(&format!(
                     "[{}] {} {} → CONVERSION FAILED\n           Error: {}\n           Duration: {:.1}s\n",
                     timestamp,
                     status_symbol,
@@ -411,30 +485,41 @@ fn generate_log_content(data: &ConversionLogData) -> String {
                     result.error_message.as_deref().unwrap_or("Unknown error"),
                     result.duration().num_seconds()
                 ));
+                }
             }
-        }
         }
     }
     log.push_str("\n");
-    
+
     // Summary statistics
-    let successful = data.results.iter().filter(|r| matches!(r.status, super::ConversionStatus::Success)).count();
+    let successful = data
+        .results
+        .iter()
+        .filter(|r| matches!(r.status, super::ConversionStatus::Success))
+        .count();
     let failed = data.results.len() - successful;
     let total_input_size: u64 = data.results.iter().map(|r| r.source_size).sum();
 
     // Calculate total output size, accounting for merged files
-    let total_output_size: u64 = if let Some((_, merged_indices)) = detect_merged_output(&data.results) {
+    let total_output_size: u64 = if let Some((_, merged_indices)) =
+        detect_merged_output(&data.results)
+    {
         // For merged files: count merged output once + any non-merged outputs
         let merged_output_size = data.results[merged_indices[0]].output_size;
-        let non_merged_size: u64 = data.results.iter()
+        let non_merged_size: u64 = data
+            .results
+            .iter()
             .enumerate()
-            .filter(|(i, r)| !merged_indices.contains(i) && matches!(r.status, super::ConversionStatus::Success))
+            .filter(|(i, r)| {
+                !merged_indices.contains(i) && matches!(r.status, super::ConversionStatus::Success)
+            })
             .map(|(_, r)| r.output_size)
             .sum();
         merged_output_size + non_merged_size
     } else {
         // No merges: sum all output sizes normally
-        data.results.iter()
+        data.results
+            .iter()
             .filter(|r| matches!(r.status, super::ConversionStatus::Success))
             .map(|r| r.output_size)
             .sum()
@@ -446,10 +531,13 @@ fn generate_log_content(data: &ConversionLogData) -> String {
     };
 
     // Calculate total duration, accounting for merged files
-    let total_duration: i64 = if let Some((_, merged_indices)) = detect_merged_output(&data.results) {
+    let total_duration: i64 = if let Some((_, merged_indices)) = detect_merged_output(&data.results)
+    {
         // For merged files: count merged duration once + any non-merged durations
         let merged_duration = data.results[merged_indices[0]].duration().num_seconds();
-        let non_merged_duration: i64 = data.results.iter()
+        let non_merged_duration: i64 = data
+            .results
+            .iter()
             .enumerate()
             .filter(|(i, _)| !merged_indices.contains(i))
             .map(|(_, r)| r.duration().num_seconds())
@@ -457,31 +545,61 @@ fn generate_log_content(data: &ConversionLogData) -> String {
         merged_duration + non_merged_duration
     } else {
         // No merges: sum all durations normally
-        data.results.iter()
+        data.results
+            .iter()
             .map(|r| r.duration().num_seconds())
             .sum()
     };
-        
+
     log.push_str("CONVERSION SUMMARY:\n");
-    log.push_str(&format!("- Successful: {}/{} files ({:.1}%)\n", successful, data.results.len(), (successful as f32 / data.results.len() as f32) * 100.0));
+    log.push_str(&format!(
+        "- Successful: {}/{} files ({:.1}%)\n",
+        successful,
+        data.results.len(),
+        (successful as f32 / data.results.len() as f32) * 100.0
+    ));
     if failed > 0 {
-        log.push_str(&format!("- Failed: {}/{} files ({:.1}%)\n", failed, data.results.len(), (failed as f32 / data.results.len() as f32) * 100.0));
+        log.push_str(&format!(
+            "- Failed: {}/{} files ({:.1}%)\n",
+            failed,
+            data.results.len(),
+            (failed as f32 / data.results.len() as f32) * 100.0
+        ));
     }
-    log.push_str(&format!("- Total Input Size: {}\n", format_file_size(total_input_size)));
-    log.push_str(&format!("- Total Output Size: {}\n", format_file_size(total_output_size)));
+    log.push_str(&format!(
+        "- Total Input Size: {}\n",
+        format_file_size(total_input_size)
+    ));
+    log.push_str(&format!(
+        "- Total Output Size: {}\n",
+        format_file_size(total_output_size)
+    ));
     let avg_reduction = 100.0 - avg_compression;
     if avg_reduction >= 0.0 {
-        log.push_str(&format!("- Average Size Reduction: {:.1}%\n", avg_reduction));
+        log.push_str(&format!(
+            "- Average Size Reduction: {:.1}%\n",
+            avg_reduction
+        ));
     } else {
-        log.push_str(&format!("- Average Size Increase: {:.1}%\n", -avg_reduction));
+        log.push_str(&format!(
+            "- Average Size Increase: {:.1}%\n",
+            -avg_reduction
+        ));
     }
-    log.push_str(&format!("- Total Duration: {} minutes {} seconds\n", total_duration / 60, total_duration % 60));
+    log.push_str(&format!(
+        "- Total Duration: {} minutes {} seconds\n",
+        total_duration / 60,
+        total_duration % 60
+    ));
     if total_duration > 0 {
-        log.push_str(&format!("- Average Speed: {:.1} files/minute\n", (data.results.len() as f32 / total_duration as f32) * 60.0));
+        log.push_str(&format!(
+            "- Average Speed: {:.1} files/minute\n",
+            (data.results.len() as f32 / total_duration as f32) * 60.0
+        ));
     }
     log.push_str(&format!("- Backend: {} engine\n", data.settings.backend));
     log.push_str("\n");
-    
+
     // Errors section (if any)
     if !data.errors.is_empty() {
         log.push_str("CONVERSION ERRORS:\n");
@@ -490,21 +608,26 @@ fn generate_log_content(data: &ConversionLogData) -> String {
         }
         log.push_str("\n");
     }
-    
+
     // Auxiliary files section
     if !data.auxiliary_files.is_empty() {
         log.push_str("AUXILIARY FILES PROCESSED:\n");
         for aux in &data.auxiliary_files {
-            log.push_str(&format!("- {} ({}) - {}\n", aux.name, format_file_size(aux.size), aux.action));
+            log.push_str(&format!(
+                "- {} ({}) - {}\n",
+                aux.name,
+                format_file_size(aux.size),
+                aux.action
+            ));
         }
         log.push_str("\n");
     }
-    
+
     // Footer
     log.push_str("============================================\n");
     log.push_str("Log generated by tonepoet v0.1.0\n");
     log.push_str("\nEND OF CONVERSION LOG\n");
-    
+
     log
 }
 
@@ -518,7 +641,9 @@ async fn analyze_input_files(results: &[ConversionResult]) -> FeatureResult<Inpu
 
     for result in results {
         // Extract format from source file extension
-        let format = result.source_file.extension()
+        let format = result
+            .source_file
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("unknown")
             .to_uppercase();
@@ -526,7 +651,9 @@ async fn analyze_input_files(results: &[ConversionResult]) -> FeatureResult<Inpu
 
         // Extract source directory from first file
         if source_dir.is_empty() {
-            source_dir = result.source_file.parent()
+            source_dir = result
+                .source_file
+                .parent()
                 .and_then(|p| p.to_str())
                 .unwrap_or("Unknown")
                 .to_string();
@@ -538,7 +665,11 @@ async fn analyze_input_files(results: &[ConversionResult]) -> FeatureResult<Inpu
 
     Ok(InputSummary {
         total_files: results.len(),
-        source_directory: if source_dir.is_empty() { "Current directory".to_string() } else { source_dir },
+        source_directory: if source_dir.is_empty() {
+            "Current directory".to_string()
+        } else {
+            source_dir
+        },
         input_formats,
         total_input_size: results.iter().map(|r| r.source_size).sum(),
     })
@@ -548,28 +679,34 @@ async fn detect_auxiliary_files(_output_dir: &Path) -> FeatureResult<Vec<Auxilia
     // Detect non-audio files in output directory
     let mut auxiliary_files = Vec::new();
 
-    let mut entries = tokio::fs::read_dir(_output_dir).await
+    let mut entries = tokio::fs::read_dir(_output_dir)
+        .await
         .map_err(|e| FeatureError::Io(e))?;
 
-    while let Some(entry) = entries.next_entry().await
-        .map_err(|e| FeatureError::Io(e))? {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| FeatureError::Io(e))?
+    {
         let path = entry.path();
         if path.is_file() {
-            let filename = path.file_name()
+            let filename = path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
 
             // Check if it's an auxiliary file (not audio)
             let is_auxiliary = match path.extension().and_then(|e| e.to_str()) {
-                Some("txt") | Some("ini") | Some("jpg") | Some("jpeg") |
-                Some("png") | Some("pdf") | Some("log") => true,
-                Some("opus") | Some("mp3") | Some("flac") | Some("aac") |
-                Some("wav") | Some("aiff") | Some("cue") => false,
+                Some("txt") | Some("ini") | Some("jpg") | Some("jpeg") | Some("png")
+                | Some("pdf") | Some("log") => true,
+                Some("opus") | Some("mp3") | Some("flac") | Some("aac") | Some("wav")
+                | Some("aiff") | Some("cue") => false,
                 _ => false,
             };
 
             if is_auxiliary {
-                let metadata = tokio::fs::metadata(&path).await
+                let metadata = tokio::fs::metadata(&path)
+                    .await
                     .map_err(|e| FeatureError::Io(e))?;
                 auxiliary_files.push(AuxiliaryFile {
                     name: filename.to_string(),
@@ -616,19 +753,31 @@ fn format_copy_options(_config: &ConversionConfig, conversion_options: Option<&s
     if let Some(json_str) = conversion_options {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
             // Extract boolean fields (default to true per ConversionOptions defaults)
-            let copy_aux = value.get("copy_auxiliary_files").and_then(|v| v.as_bool()).unwrap_or(true);
-            let copy_subdirs = value.get("copy_subdirectories").and_then(|v| v.as_bool()).unwrap_or(true);
+            let copy_aux = value
+                .get("copy_auxiliary_files")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let copy_subdirs = value
+                .get("copy_subdirectories")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
 
             if is_copy_mode(&value) {
                 // Copy mode: show FLAC + settings
                 let aux_str = if copy_aux { "yes" } else { "no" };
                 let subdir_str = if copy_subdirs { "yes" } else { "no" };
-                return format!("FLAC copied without transcoding (Auxiliary files: {}, Subdirectories: {})", aux_str, subdir_str);
+                return format!(
+                    "FLAC copied without transcoding (Auxiliary files: {}, Subdirectories: {})",
+                    aux_str, subdir_str
+                );
             } else {
                 // Normal conversion: show settings
                 let aux_str = if copy_aux { "enabled" } else { "disabled" };
                 let subdir_str = if copy_subdirs { "enabled" } else { "disabled" };
-                return format!("Auxiliary files: {}, Subdirectories: {}", aux_str, subdir_str);
+                return format!(
+                    "Auxiliary files: {}, Subdirectories: {}",
+                    aux_str, subdir_str
+                );
             }
         }
     }
@@ -638,7 +787,8 @@ fn format_copy_options(_config: &ConversionConfig, conversion_options: Option<&s
 }
 
 fn collect_errors(results: &[ConversionResult]) -> Vec<String> {
-    results.iter()
+    results
+        .iter()
         .filter_map(|r| r.error_message.clone())
         .collect()
 }
@@ -650,13 +800,15 @@ fn detect_merged_output(results: &[ConversionResult]) -> Option<(PathBuf, Vec<us
     let mut output_map: HashMap<PathBuf, Vec<usize>> = HashMap::new();
 
     for (i, result) in results.iter().enumerate() {
-        output_map.entry(result.output_file.clone())
+        output_map
+            .entry(result.output_file.clone())
             .or_insert_with(Vec::new)
             .push(i);
     }
 
     // Find output with multiple sources (indicates merge)
-    output_map.into_iter()
+    output_map
+        .into_iter()
         .find(|(_, indices)| indices.len() > 1)
 }
 
@@ -709,25 +861,37 @@ fn format_from_conversion_settings(value: &serde_json::Value) -> Option<String> 
                 _ => 128,
             };
             format!("Opus {} kbps", bitrate)
-        },
+        }
         "Flac" => {
-            let level = value.get("compression_level").and_then(|v| v.as_u64()).unwrap_or(8);
+            let level = value
+                .get("compression_level")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8);
             format!("FLAC compression level {}", level)
-        },
+        }
         "Mp3" => {
             if let Some(bitrate) = value.get("mp3_bitrate").and_then(|v| v.as_u64()) {
                 format!("MP3 {} kbps", bitrate)
             } else {
                 "MP3".to_string()
             }
-        },
+        }
         "Aac" => {
-            let profile = value.get("aac_profile").and_then(|v| v.as_str()).unwrap_or("LcAac");
+            let profile = value
+                .get("aac_profile")
+                .and_then(|v| v.as_str())
+                .unwrap_or("LcAac");
             format!("AAC {}", profile)
-        },
+        }
         "Wav" | "Aiff" => {
-            let bit_depth = value.get("bit_depth").and_then(|v| v.as_u64()).unwrap_or(16);
-            let sample_rate = value.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(44100);
+            let bit_depth = value
+                .get("bit_depth")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(16);
+            let sample_rate = value
+                .get("sample_rate")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(44100);
             let depth_str = if bit_depth == 0 {
                 "Same As Source".to_string()
             } else if bit_depth == 320 || bit_depth == 33 {
@@ -736,7 +900,7 @@ fn format_from_conversion_settings(value: &serde_json::Value) -> Option<String> 
                 format!("{}bit", bit_depth)
             };
             format!("{} {}kHz/{}", format, sample_rate / 1000, depth_str)
-        },
+        }
         _ => format.to_string(),
     };
     parts.push(format_str);
@@ -803,10 +967,17 @@ fn format_from_conversion_settings(value: &serde_json::Value) -> Option<String> 
 fn is_copy_mode(value: &serde_json::Value) -> bool {
     // Check ConversionSettings format (has "format" field)
     if let Some(format) = value.get("format").and_then(|v| v.as_str()) {
-        if format != "Flac" { return false; }
+        if format != "Flac" {
+            return false;
+        }
 
-        let reencode = value.get("reencode_flac").and_then(|v| v.as_bool()).unwrap_or(false);
-        if reencode { return false; }
+        let reencode = value
+            .get("reencode_flac")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if reencode {
+            return false;
+        }
 
         let bit_depth = value.get("bit_depth").and_then(|v| v.as_u64());
         let sample_rate = value.get("sample_rate").and_then(|v| v.as_u64());
@@ -818,10 +989,17 @@ fn is_copy_mode(value: &serde_json::Value) -> bool {
 
     // Check ConversionOptions format (has "output_format" field)
     if let Some(format) = value.get("output_format").and_then(|v| v.as_str()) {
-        if format != "Flac" { return false; }
+        if format != "Flac" {
+            return false;
+        }
 
-        let reencode = value.get("reencode_flac").and_then(|v| v.as_bool()).unwrap_or(false);
-        if reencode { return false; }
+        let reencode = value
+            .get("reencode_flac")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if reencode {
+            return false;
+        }
 
         let target_sr = value.get("target_sample_rate").and_then(|v| v.as_u64());
         let target_bd = value.get("target_bit_depth").and_then(|v| v.as_u64());
@@ -830,8 +1008,9 @@ fn is_copy_mode(value: &serde_json::Value) -> bool {
         // Match copy mode conditions from processor.rs:1540-1546
         return (target_sr.is_none() || target_sr == Some(0))
             && (target_bd.is_none() || target_bd == Some(0))
-            && !(dither.is_some() && target_bd.is_some()
-                 && (target_bd == Some(16) || target_bd == Some(24)));
+            && !(dither.is_some()
+                && target_bd.is_some()
+                && (target_bd == Some(16) || target_bd == Some(24)));
     }
 
     false
@@ -873,7 +1052,7 @@ fn format_quality_settings_from_json(json_str: &str) -> Option<String> {
         "Flac" => {
             let level = quality.get("Flac")?.get("compression_level")?.as_u64()?;
             format!("FLAC compression level {}", level)
-        },
+        }
         "Wav" => {
             let wav = quality.get("Wav")?;
             let bit_depth = wav.get("bit_depth")?.as_u64()?;
@@ -886,7 +1065,7 @@ fn format_quality_settings_from_json(json_str: &str) -> Option<String> {
                 format!("{}bit", bit_depth)
             };
             format!("WAV {}kHz/{}", sample_rate / 1000, depth_str)
-        },
+        }
         "Aiff" => {
             let aiff = quality.get("Aiff")?;
             let bit_depth = aiff.get("bit_depth")?.as_u64()?;
@@ -899,7 +1078,7 @@ fn format_quality_settings_from_json(json_str: &str) -> Option<String> {
                 format!("{}bit", bit_depth)
             };
             format!("AIFF {}kHz/{}", sample_rate / 1000, depth_str)
-        },
+        }
         "Mp3" => {
             let mp3 = quality.get("Mp3")?;
             let bitrate_mode = mp3.get("bitrate_mode")?;
@@ -915,24 +1094,24 @@ fn format_quality_settings_from_json(json_str: &str) -> Option<String> {
             } else {
                 "MP3".to_string()
             }
-        },
+        }
         "Aac" => {
             let aac = quality.get("Aac")?;
             let bitrate = aac.get("bitrate")?.as_u64()?;
             let profile = aac.get("profile")?.as_str()?;
             format!("AAC {} {} kbps", profile, bitrate)
-        },
+        }
         "Opus" => {
             let opus = quality.get("Opus")?;
             let bitrate = opus.get("bitrate")?.as_u64()?;
             let complexity = opus.get("complexity")?.as_u64()?;
             format!("Opus {} kbps (complexity {})", bitrate, complexity)
-        },
+        }
         "WavPack" => {
             let wv = quality.get("WavPack")?;
             let mode = wv.get("compression_mode")?.as_str()?;
             format!("WavPack {}", mode)
-        },
+        }
         _ => "Unknown format".to_string(),
     };
 
@@ -975,14 +1154,14 @@ fn format_quality_settings_from_json(json_str: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_file_size_formatting() {
         assert_eq!(format_file_size(500), "500 B");
         assert_eq!(format_file_size(1536), "1.5 KB");
         assert_eq!(format_file_size(2097152), "2.0 MB");
     }
-    
+
     #[test]
     fn test_compression_ratio() {
         let result = ConversionResult {

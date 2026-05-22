@@ -28,8 +28,8 @@
 
 use crate::dff_footer::{render_dff_footer, DffMetadata};
 use crate::dff_writer::DffWriter;
-use crate::dst::{decode_frame, DstError};
 use crate::dsf_writer::{DsfWriter, SACD_SAMPLING_FREQUENCY};
+use crate::dst::{decode_frame, DstError};
 use crate::frame::{FrameError, FrameReader};
 use crate::id3::{render_id3v24, Id3Metadata};
 use crate::iso_reader::IsoReader;
@@ -72,7 +72,10 @@ impl TimeFilter {
     /// `m * 60 * 75 + s * 75 + f` to derive each value from a
     /// (minutes, seconds, frames) timecode triple.
     pub fn new(start_frame: u32, duration_frames: u32) -> Self {
-        Self { start_frame, duration_frames }
+        Self {
+            start_frame,
+            duration_frames,
+        }
     }
 
     /// True iff `tc ∈ [start_frame, start_frame + duration_frames)`,
@@ -115,12 +118,7 @@ pub struct ExtractOptions {
 impl ExtractOptions {
     /// Construct options for the no-filter case (matches
     /// sacd_extract's `-b pauses` flag behavior).
-    pub fn new(
-        start_lsn: u64,
-        end_lsn: u64,
-        channel_count: u8,
-        format: OutputFormat,
-    ) -> Self {
+    pub fn new(start_lsn: u64, end_lsn: u64, channel_count: u8, format: OutputFormat) -> Self {
         Self {
             start_lsn,
             end_lsn,
@@ -252,8 +250,7 @@ pub fn extract_track<W: Write + Seek>(
 
     match opts.format {
         OutputFormat::Dsf => {
-            let mut writer =
-                DsfWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
+            let mut writer = DsfWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
             if let Some(ref meta) = opts.id3_metadata {
                 writer.set_id3_footer(render_id3v24(meta));
             }
@@ -264,8 +261,7 @@ pub fn extract_track<W: Write + Seek>(
             Ok(stats)
         }
         OutputFormat::Dff => {
-            let mut writer =
-                DffWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
+            let mut writer = DffWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
             if let Some(ref meta) = opts.dff_metadata {
                 writer.set_footer_bytes(render_dff_footer(meta));
             }
@@ -324,8 +320,8 @@ mod tests {
     use crate::dsf_writer::BLOCK_SIZE_PER_CHANNEL;
     use crate::frame::{Timecode, FRAME_SIZE_UNCOMPRESSED};
     use crate::test_util::{
-        sha256_hex, synth_audio_sector, synth_continuation_sector, synth_dst_sector,
-        tc_at, write_iso,
+        sha256_hex, synth_audio_sector, synth_continuation_sector, synth_dst_sector, tc_at,
+        write_iso,
     };
 
     const PART_SIZE: usize = 2000;
@@ -375,9 +371,11 @@ mod tests {
         r
     }
 
-    fn run_extract(sectors: Vec<Vec<u8>>, channel_count: u8, format: OutputFormat)
-        -> (Vec<u8>, ExtractStats)
-    {
+    fn run_extract(
+        sectors: Vec<Vec<u8>>,
+        channel_count: u8,
+        format: OutputFormat,
+    ) -> (Vec<u8>, ExtractStats) {
         run_extract_with(sectors, channel_count, format, None)
     }
 
@@ -397,8 +395,7 @@ mod tests {
         if let Some(tf) = time_filter {
             opts = opts.with_time_filter(tf);
         }
-        let stats = extract_track(&mut iso, &mut output, opts)
-            .expect("extract should succeed");
+        let stats = extract_track(&mut iso, &mut output, opts).expect("extract should succeed");
         (output.into_inner(), stats)
     }
 
@@ -408,7 +405,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, stats) = run_extract(sectors, 2, OutputFormat::Dff);
 
@@ -434,7 +435,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, stats) = run_extract(sectors, 2, OutputFormat::Dsf);
 
@@ -448,22 +453,34 @@ mod tests {
         // bit-reverse of frame[i * 2] (channel 0 = even-indexed
         // bytes of the interleaved input).
         for i in 0..BLOCK_SIZE_PER_CHANNEL {
-            assert_eq!(out[92 + i], bit_reverse(frame[i * 2]),
-                "ch0 block0 byte {} mismatch", i);
+            assert_eq!(
+                out[92 + i],
+                bit_reverse(frame[i * 2]),
+                "ch0 block0 byte {} mismatch",
+                i
+            );
         }
         // ch1 block 0 at offset (92+4096)..(92+2*4096). Channel 1 =
         // odd-indexed bytes.
         let ch1_b0 = 92 + BLOCK_SIZE_PER_CHANNEL;
         for i in 0..BLOCK_SIZE_PER_CHANNEL {
-            assert_eq!(out[ch1_b0 + i], bit_reverse(frame[i * 2 + 1]),
-                "ch1 block0 byte {} mismatch", i);
+            assert_eq!(
+                out[ch1_b0 + i],
+                bit_reverse(frame[i * 2 + 1]),
+                "ch1 block0 byte {} mismatch",
+                i
+            );
         }
         // ch0 block 1: first 608 bytes are real (continuing the
         // even-indexed stream), rest are zero pad.
         let ch0_b1 = 92 + 2 * BLOCK_SIZE_PER_CHANNEL;
         for i in 0..608 {
-            assert_eq!(out[ch0_b1 + i], bit_reverse(frame[(BLOCK_SIZE_PER_CHANNEL + i) * 2]),
-                "ch0 block1 real byte {} mismatch", i);
+            assert_eq!(
+                out[ch0_b1 + i],
+                bit_reverse(frame[(BLOCK_SIZE_PER_CHANNEL + i) * 2]),
+                "ch0 block1 real byte {} mismatch",
+                i
+            );
         }
         for i in 608..BLOCK_SIZE_PER_CHANNEL {
             assert_eq!(out[ch0_b1 + i], 0, "ch0 block1 pad byte {} not zero", i);
@@ -487,7 +504,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 6);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, _stats) = run_extract(sectors, 6, OutputFormat::Dff);
 
@@ -512,7 +533,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 6);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, stats) = run_extract(sectors, 6, OutputFormat::Dsf);
 
@@ -539,7 +564,8 @@ mod tests {
             assert_eq!(
                 out[block_start],
                 bit_reverse(frame[c]),
-                "ch{} block0 byte 0 mismatch", c,
+                "ch{} block0 byte 0 mismatch",
+                c,
             );
         }
 
@@ -550,8 +576,10 @@ mod tests {
             let block_start = 92 + (6 + c) * BLOCK_SIZE_PER_CHANNEL;
             assert!(
                 out[block_start + 608..block_start + BLOCK_SIZE_PER_CHANNEL]
-                    .iter().all(|&b| b == 0),
-                "ch{} block1 pad zone non-zero", c,
+                    .iter()
+                    .all(|&b| b == 0),
+                "ch{} block1 pad zone non-zero",
+                c,
             );
         }
 
@@ -571,7 +599,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 5);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, _stats) = run_extract(sectors, 5, OutputFormat::Dff);
 
@@ -595,7 +627,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 5);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, stats) = run_extract(sectors, 5, OutputFormat::Dsf);
 
@@ -617,7 +653,8 @@ mod tests {
             assert_eq!(
                 out[block_start],
                 bit_reverse(frame[c]),
-                "ch{} block0 byte 0 mismatch", c,
+                "ch{} block0 byte 0 mismatch",
+                c,
             );
         }
 
@@ -627,8 +664,10 @@ mod tests {
             let block_start = 92 + (5 + c) * BLOCK_SIZE_PER_CHANNEL;
             assert!(
                 out[block_start + 608..block_start + BLOCK_SIZE_PER_CHANNEL]
-                    .iter().all(|&b| b == 0),
-                "ch{} block1 pad zone non-zero", c,
+                    .iter()
+                    .all(|&b| b == 0),
+                "ch{} block1 pad zone non-zero",
+                c,
             );
         }
 
@@ -714,7 +753,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, _) = run_extract(sectors, 2, OutputFormat::Dsf);
 
@@ -722,9 +765,11 @@ mod tests {
         let ch1_b1 = 92 + 3 * BLOCK_SIZE_PER_CHANNEL;
         // Zero-pad zones in both block 1's.
         assert!(out[ch0_b1 + 608..ch0_b1 + BLOCK_SIZE_PER_CHANNEL]
-            .iter().all(|&b| b == 0));
+            .iter()
+            .all(|&b| b == 0));
         assert!(out[ch1_b1 + 608..ch1_b1 + BLOCK_SIZE_PER_CHANNEL]
-            .iter().all(|&b| b == 0));
+            .iter()
+            .all(|&b| b == 0));
     }
 
     #[test]
@@ -734,7 +779,11 @@ mod tests {
             &payload,
             2,
             1, // sector_count: decrements to 0 after the audio packet → complete
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         )];
         let td = write_iso(&sectors);
         let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
@@ -812,8 +861,14 @@ mod tests {
         assert!(!tf.includes(149), "tc 149 (one before start) should be out");
         assert!(tf.includes(150), "tc 150 (start, inclusive) should be in");
         assert!(tf.includes(5000), "tc 5000 (mid-track) should be in");
-        assert!(tf.includes(11280), "tc 11280 (end-1, inclusive) should be in");
-        assert!(!tf.includes(11281), "tc 11281 (end, exclusive) should be out");
+        assert!(
+            tf.includes(11280),
+            "tc 11280 (end-1, inclusive) should be in"
+        );
+        assert!(
+            !tf.includes(11281),
+            "tc 11281 (end, exclusive) should be out"
+        );
         assert!(!tf.includes(50000), "tc 50000 (post-track) should be out");
     }
 
@@ -821,7 +876,11 @@ mod tests {
     fn time_filter_with_zero_duration_rejects_everything() {
         let tf = TimeFilter::new(100, 0);
         for tc in [0, 99, 100, 101, 1000, u32::MAX] {
-            assert!(!tf.includes(tc), "tc {} should be rejected (duration=0)", tc);
+            assert!(
+                !tf.includes(tc),
+                "tc {} should be rejected (duration=0)",
+                tc
+            );
         }
     }
 
@@ -912,9 +971,13 @@ mod tests {
             .collect();
         let mut sectors = synth_uncompressed_frame_sectors(&frame_at_start, tc_at(150));
         sectors.extend(synth_uncompressed_frame_sectors(
-            &frame_at_end_minus_one, tc_at(11280),
+            &frame_at_end_minus_one,
+            tc_at(11280),
         ));
-        sectors.extend(synth_uncompressed_frame_sectors(&frame_at_end, tc_at(11281)));
+        sectors.extend(synth_uncompressed_frame_sectors(
+            &frame_at_end,
+            tc_at(11281),
+        ));
 
         let (out, stats) = run_extract_with(
             sectors,
@@ -926,7 +989,10 @@ mod tests {
         assert_eq!(stats.frames_read, 2, "start and end-1 kept; end excluded");
         assert_eq!(stats.audio_bytes, 9408 * 2);
         assert_eq!(&out[144..144 + 9408], &frame_at_start[..]);
-        assert_eq!(&out[144 + 9408..144 + 9408 * 2], &frame_at_end_minus_one[..]);
+        assert_eq!(
+            &out[144 + 9408..144 + 9408 * 2],
+            &frame_at_end_minus_one[..]
+        );
     }
 
     #[test]
@@ -977,7 +1043,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let meta = Id3Metadata {
             tit2: Some("TEST TITLE".into()),
@@ -1033,7 +1103,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let meta = DffMetadata {
             diar: Some("ARTIST".into()),
@@ -1089,7 +1163,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, _) = run_extract(sectors, 2, OutputFormat::Dff);
         // No footer → file size = header (144) + audio (9408) = 9552.
@@ -1104,7 +1182,11 @@ mod tests {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
         let sectors = synth_uncompressed_frame_sectors(
             &frame,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         let (out, _) = run_extract(sectors, 2, OutputFormat::Dsf);
         assert_eq!(read_u64_le(&out, 20), 0, "no footer → metadata_offset = 0");
@@ -1169,8 +1251,7 @@ mod tests {
         let mut output = std::io::Cursor::new(Vec::<u8>::new());
         let opts = ExtractOptions::new(0, 1, 2, OutputFormat::Dff)
             .with_time_filter(TimeFilter::new(150, 100));
-        let err = extract_track(&mut iso, &mut output, opts)
-            .expect_err("in-range DST must error");
+        let err = extract_track(&mut iso, &mut output, opts).expect_err("in-range DST must error");
         assert!(matches!(err, ExtractError::Dst(_)), "got {:?}", err);
     }
 
@@ -1186,11 +1267,19 @@ mod tests {
             .collect();
         let mut sectors = synth_uncompressed_frame_sectors(
             &frame_a,
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         sectors.extend(synth_uncompressed_frame_sectors(
             &frame_b,
-            Timecode { minutes: 0, seconds: 0, frames: 2 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 2,
+            },
         ));
         let (out, stats) = run_extract(sectors, 2, OutputFormat::Dff);
 
@@ -1201,4 +1290,3 @@ mod tests {
         assert_eq!(&out[144 + 9408..144 + 9408 * 2], &frame_b[..]);
     }
 }
-

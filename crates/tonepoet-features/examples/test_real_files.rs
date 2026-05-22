@@ -1,11 +1,11 @@
 //! Test with real audio files
 
+use chrono::Utc;
 use conversion_features::{
-    write_conversion_log, generate_cue_file, post_conversion_features,
-    ConversionResult, ConversionStatus, ConversionConfig
+    generate_cue_file, post_conversion_features, write_conversion_log, ConversionConfig,
+    ConversionResult, ConversionStatus,
 };
 use std::path::{Path, PathBuf};
-use chrono::Utc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,7 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("📊 Found {} audio files:", audio_files.len());
     for (i, file) in audio_files.iter().enumerate().take(10) {
-        println!("  {}. {}", i + 1, file.file_name().unwrap().to_string_lossy());
+        println!(
+            "  {}. {}",
+            i + 1,
+            file.file_name().unwrap().to_string_lossy()
+        );
     }
     if audio_files.len() > 10 {
         println!("  ... and {} more", audio_files.len() - 10);
@@ -103,12 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 3: Use integration function
     println!("\n🔄 Testing integrated post_conversion_features...");
-    let result = post_conversion_features(
-        &output_dir,
-        &conversion_results,
-        &output_files,
-        &config,
-    ).await;
+    let result =
+        post_conversion_features(&output_dir, &conversion_results, &output_files, &config).await;
 
     match result {
         Ok(_) => println!("✅ Integration function successful"),
@@ -130,7 +130,10 @@ async fn find_audio_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 let ext_lower = ext.to_lowercase();
-                if matches!(ext_lower.as_str(), "flac" | "mp3" | "opus" | "m4a" | "aac" | "wav" | "aiff" | "ogg" | "wv") {
+                if matches!(
+                    ext_lower.as_str(),
+                    "flac" | "mp3" | "opus" | "m4a" | "aac" | "wav" | "aiff" | "ogg" | "wv"
+                ) {
                     audio_files.push(path);
                 }
             }
@@ -141,7 +144,9 @@ async fn find_audio_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     Ok(audio_files)
 }
 
-async fn create_results_from_files(files: &[PathBuf]) -> Result<Vec<ConversionResult>, std::io::Error> {
+async fn create_results_from_files(
+    files: &[PathBuf],
+) -> Result<Vec<ConversionResult>, std::io::Error> {
     let mut results = Vec::new();
     let now = Utc::now();
 
@@ -162,9 +167,17 @@ async fn create_results_from_files(files: &[PathBuf]) -> Result<Vec<ConversionRe
         results.push(ConversionResult {
             source_file: file.clone(),
             output_file: output_file.clone(),
-            status: if is_success { ConversionStatus::Success } else { ConversionStatus::Failed },
+            status: if is_success {
+                ConversionStatus::Success
+            } else {
+                ConversionStatus::Failed
+            },
             source_size: file_size,
-            output_size: if is_success { (file_size as f64 * 0.8) as u64 } else { 0 },
+            output_size: if is_success {
+                (file_size as f64 * 0.8) as u64
+            } else {
+                0
+            },
             start_time: now + chrono::Duration::seconds(i as i64 * 10),
             end_time: now + chrono::Duration::seconds((i + 1) as i64 * 10),
             error_message: if !is_success {
@@ -178,7 +191,10 @@ async fn create_results_from_files(files: &[PathBuf]) -> Result<Vec<ConversionRe
     Ok(results)
 }
 
-async fn simulate_output_files(input_files: &[PathBuf], output_dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+async fn simulate_output_files(
+    input_files: &[PathBuf],
+    output_dir: &Path,
+) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut output_files = Vec::new();
 
     for file in input_files {

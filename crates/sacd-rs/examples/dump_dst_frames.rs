@@ -38,11 +38,21 @@ fn parse_mmss_ff(s: &str) -> Result<u32, String> {
     if parts.len() != 3 {
         return Err(format!("expected MM:SS:FF, got {:?}", s));
     }
-    let m: u32 = parts[0].parse().map_err(|_| format!("bad minutes: {}", parts[0]))?;
-    let sec: u32 = parts[1].parse().map_err(|_| format!("bad seconds: {}", parts[1]))?;
-    let f: u32 = parts[2].parse().map_err(|_| format!("bad frames: {}", parts[2]))?;
-    if sec >= 60 { return Err(format!("seconds out of range: {}", sec)); }
-    if f >= 75 { return Err(format!("frames out of range: {}", f)); }
+    let m: u32 = parts[0]
+        .parse()
+        .map_err(|_| format!("bad minutes: {}", parts[0]))?;
+    let sec: u32 = parts[1]
+        .parse()
+        .map_err(|_| format!("bad seconds: {}", parts[1]))?;
+    let f: u32 = parts[2]
+        .parse()
+        .map_err(|_| format!("bad frames: {}", parts[2]))?;
+    if sec >= 60 {
+        return Err(format!("seconds out of range: {}", sec));
+    }
+    if f >= 75 {
+        return Err(format!("frames out of range: {}", f));
+    }
     m.checked_mul(60 * 75)
         .and_then(|x| x.checked_add(sec * 75))
         .and_then(|x| x.checked_add(f))
@@ -60,7 +70,10 @@ fn parse_args() -> Result<Args, String> {
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
-        let mut val = || args.next().ok_or_else(|| format!("missing value for {}", flag));
+        let mut val = || {
+            args.next()
+                .ok_or_else(|| format!("missing value for {}", flag))
+        };
         match flag.as_str() {
             "--iso" => iso = Some(PathBuf::from(val()?)),
             "--start-lsn" => start_lsn = Some(val()?.parse::<u64>().map_err(|e| e.to_string())?),
@@ -68,7 +81,11 @@ fn parse_args() -> Result<Args, String> {
             "--time-filter-start" => tf_start = Some(parse_mmss_ff(&val()?)?),
             "--time-filter-duration" => tf_dur = Some(parse_mmss_ff(&val()?)?),
             "--out-dir" => out_dir = Some(PathBuf::from(val()?)),
-            "--count" => count = val()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
+            "--count" => {
+                count = val()?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?
+            }
             "-h" | "--help" => {
                 eprintln!("usage: dump_dst_frames --iso PATH --start-lsn N --end-lsn N \\");
                 eprintln!("       --time-filter-start MM:SS:FF --time-filter-duration MM:SS:FF \\");

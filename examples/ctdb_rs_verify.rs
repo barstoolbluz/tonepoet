@@ -39,7 +39,8 @@ fn main() {
     // parity-cache path the same way the TUI would.
     let db = Database::open().expect("open tonepoet db");
     let cache_key = ctdb::compute_ctdb_parity_cache_key(&paths);
-    let cached_parity = cache_key.as_deref()
+    let cached_parity = cache_key
+        .as_deref()
         .and_then(|k| db.get_cached_ctdb_parity(k, 16));
     let cache_hit = cached_parity.is_some();
     if cache_hit {
@@ -56,8 +57,13 @@ fn main() {
 
     let mut result = runtime.block_on(async {
         ctdb::verify_ctdb(
-            &paths, &sample_counts, sample_rate, cache_key, cached_parity,
-        ).await
+            &paths,
+            &sample_counts,
+            sample_rate,
+            cache_key,
+            cached_parity,
+        )
+        .await
     });
 
     // Persist freshly computed parity to the cache (matches event_loop's
@@ -66,22 +72,29 @@ fn main() {
         if let Err(e) = db.store_ctdb_parity(&key, 16, &parity) {
             eprintln!("CTDB parity cache store failed: {}", e);
         } else {
-            println!("Parity cache: stored {} bytes for key {}",
-                parity.len() * parity[0].len() * 2, &key[..16]);
+            println!(
+                "Parity cache: stored {} bytes for key {}",
+                parity.len() * parity[0].len() * 2,
+                &key[..16]
+            );
         }
     }
 
     println!("TOC: {}", result.toc);
     if let Some(npar) = result.npar {
-        println!("Matched entry: npar={}, stride={:?}, parity_url={:?}",
-            npar, result.stride, result.parity_url);
+        println!(
+            "Matched entry: npar={}, stride={:?}, parity_url={:?}",
+            npar, result.stride, result.parity_url
+        );
     }
     println!();
     println!("Per-track results:");
     for t in &result.tracks {
         let status = match &t.status {
             ctdb::CtdbTrackStatus::Verified => "Verified".to_string(),
-            ctdb::CtdbTrackStatus::VerifiedRs => "VerifiedRs (RS-verified, CRC differs)".to_string(),
+            ctdb::CtdbTrackStatus::VerifiedRs => {
+                "VerifiedRs (RS-verified, CRC differs)".to_string()
+            }
             ctdb::CtdbTrackStatus::Mismatch => "Mismatch".to_string(),
             ctdb::CtdbTrackStatus::NoDiscInDatabase => "NoDiscInDatabase".to_string(),
             ctdb::CtdbTrackStatus::Error(e) => format!("Error: {}", e),
@@ -91,8 +104,12 @@ fn main() {
             t.track_number,
             status,
             t.computed_crc32,
-            t.expected_crc32.map(|c| format!("{:08x}", c)).unwrap_or_else(|| "—".into()),
-            t.confidence.map(|c| c.to_string()).unwrap_or_else(|| "—".into()),
+            t.expected_crc32
+                .map(|c| format!("{:08x}", c))
+                .unwrap_or_else(|| "—".into()),
+            t.confidence
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "—".into()),
         );
     }
     println!();

@@ -17,20 +17,32 @@ async fn full_calibration_pipeline() {
     if tonepoet::tui::preemphasis::corpus::load_corpus().is_err() {
         println!("  Training corpus from non-PE files...");
         tonepoet::tui::preemphasis::corpus::train_corpus_from_dir(&non_pe_dir)
-            .await.expect("corpus training failed");
+            .await
+            .expect("corpus training failed");
     }
     let corpus = tonepoet::tui::preemphasis::corpus::load_corpus().unwrap();
-    println!("  Corpus: {} tracks, {} frames", corpus.n_tracks, corpus.n_frames);
+    println!(
+        "  Corpus: {} tracks, {} frames",
+        corpus.n_tracks, corpus.n_frames
+    );
 
     // Step 2: Ensure empirical template exists.
     println!("\n=== Step 2: Empirical template ===");
     if corpus.empirical_pe_template.is_none() && deemph_dir.is_dir() {
         println!("  Computing empirical template from paired files...");
         tonepoet::tui::preemphasis::corpus::train_empirical_template(&pe_dir, &deemph_dir)
-            .await.expect("template training failed");
+            .await
+            .expect("template training failed");
     }
     let corpus = tonepoet::tui::preemphasis::corpus::load_corpus().unwrap();
-    println!("  Empirical template: {}", if corpus.empirical_pe_template.is_some() { "yes" } else { "no (using theoretical)" });
+    println!(
+        "  Empirical template: {}",
+        if corpus.empirical_pe_template.is_some() {
+            "yes"
+        } else {
+            "no (using theoretical)"
+        }
+    );
 
     // Step 3: Calibrate.
     println!("\n=== Step 3: Calibrate LDA classifier ===");
@@ -51,15 +63,19 @@ async fn full_calibration_pipeline() {
 
     // Find one PE file and one non-PE file.
     let pe_file: std::path::PathBuf = walkdir::WalkDir::new(&pe_dir)
-        .into_iter().flatten()
+        .into_iter()
+        .flatten()
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("flac"))
         .map(|e| e.path().to_path_buf())
-        .next().unwrap();
+        .next()
+        .unwrap();
     let non_pe_file: std::path::PathBuf = walkdir::WalkDir::new(&non_pe_dir)
-        .into_iter().flatten()
+        .into_iter()
+        .flatten()
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("flac"))
         .map(|e| e.path().to_path_buf())
-        .next().unwrap();
+        .next()
+        .unwrap();
 
     println!("  PE file: {:?}", pe_file.file_name().unwrap());
     let pe_result = tonepoet::tui::preemphasis::detect_preemphasis(pe_file).await;

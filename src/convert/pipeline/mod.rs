@@ -2235,7 +2235,7 @@ mod tests {
         let policy = LogPolicy {
             root: tmp.path().to_path_buf(),
             write_for_blocked: true,
-                write_json_log: false,
+            write_json_log: false,
         };
 
         let path = write_durable_log(&report, &policy).expect("should write");
@@ -2273,7 +2273,7 @@ mod tests {
         let policy = LogPolicy {
             root: tmp.path().to_path_buf(),
             write_for_blocked: true,
-                write_json_log: false,
+            write_json_log: false,
         };
 
         let path = write_durable_log(&report, &policy).expect("should write");
@@ -2305,7 +2305,7 @@ mod tests {
         let policy = LogPolicy {
             root: PathBuf::from("/nonexistent/deeply/nested/path"),
             write_for_blocked: true,
-                write_json_log: false,
+            write_json_log: false,
         };
 
         let err = write_durable_log(&report, &policy).expect_err("should fail");

@@ -84,9 +84,7 @@ pub struct Timecode {
 impl Timecode {
     /// Total frame count at 75 fps.
     pub fn as_frame_count(self) -> u32 {
-        (self.minutes as u32) * 60 * 75
-            + (self.seconds as u32) * 75
-            + (self.frames as u32)
+        (self.minutes as u32) * 60 * 75 + (self.seconds as u32) * 75 + (self.frames as u32)
     }
 }
 
@@ -94,9 +92,14 @@ impl Timecode {
 pub enum FrameError {
     Io(io::Error),
     /// Sector header was malformed (e.g., too many packets declared).
-    MalformedSector { lsn: u64, reason: String },
+    MalformedSector {
+        lsn: u64,
+        reason: String,
+    },
     /// Frame buffer would overflow the 64 KiB limit.
-    BufferOverflow { lsn: u64 },
+    BufferOverflow {
+        lsn: u64,
+    },
 }
 
 impl std::fmt::Display for FrameError {
@@ -305,7 +308,11 @@ impl<'a> FrameReader<'a> {
                 // multi-sector layout (sector_count is irrelevant).
                 (0u8, 0u8)
             };
-            frame_infos[i] = FrameInfo { timecode: tc, channel_count, sector_count };
+            frame_infos[i] = FrameInfo {
+                timecode: tc,
+                channel_count,
+                sector_count,
+            };
             off += frame_info_entry_size;
         }
 
@@ -421,7 +428,11 @@ mod tests {
         let sector1 = synth_audio_sector(
             true,
             &frame_bytes[..part_size],
-            Timecode { minutes: 0, seconds: 0, frames: 1 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
         );
         // Sector 2..N: continuation packets (frame_start=false), no
         // frame_info entry.
@@ -429,7 +440,9 @@ mod tests {
         let mut written = part_size;
         while written < frame_bytes.len() {
             let chunk = (frame_bytes.len() - written).min(part_size);
-            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
+            sectors.push(synth_continuation_sector(
+                &frame_bytes[written..written + chunk],
+            ));
             written += chunk;
         }
         // Trailing sector with a frame_start so the previous frame
@@ -437,7 +450,11 @@ mod tests {
         sectors.push(synth_audio_sector(
             true,
             &[],
-            Timecode { minutes: 0, seconds: 0, frames: 2 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 2,
+            },
         ));
 
         let td = write_iso(&sectors);
@@ -445,7 +462,14 @@ mod tests {
         let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
 
         let frame = reader.next_frame().unwrap().expect("frame 1");
-        assert_eq!(frame.timecode, Timecode { minutes: 0, seconds: 0, frames: 1 });
+        assert_eq!(
+            frame.timecode,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1
+            }
+        );
         assert!(!frame.dst_encoded);
         assert_eq!(frame.data, frame_bytes);
     }
@@ -463,12 +487,18 @@ mod tests {
         let mut sectors = vec![synth_audio_sector(
             true,
             &frame_bytes[..part_size],
-            Timecode { minutes: 0, seconds: 0, frames: 5 },
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 5,
+            },
         )];
         let mut written = part_size;
         while written < frame_bytes.len() {
             let chunk = (frame_bytes.len() - written).min(part_size);
-            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
+            sectors.push(synth_continuation_sector(
+                &frame_bytes[written..written + chunk],
+            ));
             written += chunk;
         }
         // NO trailing frame_start sector — range ends with the last
@@ -479,7 +509,14 @@ mod tests {
         let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
 
         let frame = reader.next_frame().unwrap().expect("frame flushed at EOR");
-        assert_eq!(frame.timecode, Timecode { minutes: 0, seconds: 0, frames: 5 });
+        assert_eq!(
+            frame.timecode,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 5
+            }
+        );
         assert_eq!(frame.data, frame_bytes);
         // Next call should now return None — pending cleared.
         assert!(reader.next_frame().unwrap().is_none());
@@ -502,15 +539,30 @@ mod tests {
     #[test]
     fn timecode_frame_count_is_75fps() {
         assert_eq!(
-            Timecode { minutes: 1, seconds: 0, frames: 0 }.as_frame_count(),
+            Timecode {
+                minutes: 1,
+                seconds: 0,
+                frames: 0
+            }
+            .as_frame_count(),
             60 * 75,
         );
         assert_eq!(
-            Timecode { minutes: 0, seconds: 1, frames: 0 }.as_frame_count(),
+            Timecode {
+                minutes: 0,
+                seconds: 1,
+                frames: 0
+            }
+            .as_frame_count(),
             75,
         );
         assert_eq!(
-            Timecode { minutes: 0, seconds: 0, frames: 74 }.as_frame_count(),
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 74
+            }
+            .as_frame_count(),
             74,
         );
     }

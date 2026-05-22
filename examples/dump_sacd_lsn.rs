@@ -36,8 +36,7 @@ fn main() {
         );
         println!(
             "area_toc.track_start_lsn={}  area_toc.track_end_lsn={}",
-            area.header.track_start_lsn,
-            area.header.track_end_lsn,
+            area.header.track_start_lsn, area.header.track_end_lsn,
         );
         for (i, t) in area.tracks.iter().enumerate() {
             let end_lsn = t.start_lsn as u64 + t.length_lsn as u64;
