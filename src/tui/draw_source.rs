@@ -20,7 +20,7 @@ pub const BROWSE_PILL_LABEL: &str = " browse files ";
 
 /// Label shown on the clickable "expand" pill in Batch mode (opens the
 /// BatchList overlay to view / manage the full file list).
-pub const EXPAND_PILL_LABEL: &str = " expand ";
+pub const EXPAND_PILL_LABEL: &str = " edit batch ";
 
 /// Label shown on the clickable "analyze" pill on the source pane.
 pub const ANALYZE_PILL_LABEL: &str = " analyze ";
@@ -331,11 +331,12 @@ fn render_batch<'a>(
         w.saturating_sub(4)
     };
 
-    let mut idx = 0usize;
-    while idx < end {
+    // Column-first layout: items 1..N in left column, N+1..2N in right.
+    let num_rows = (end + tracks_per_row - 1) / tracks_per_row;
+    for row in 0..num_rows {
         let mut row_spans = Vec::new();
-        for _col in 0..tracks_per_row {
-            let abs = idx;
+        for col in 0..tracks_per_row {
+            let abs = row + col * num_rows;
             if abs >= end {
                 break;
             }
@@ -356,7 +357,6 @@ fn render_batch<'a>(
             let truncated = truncate_to(&filename, col_width.saturating_sub(4));
             let padded = format!("   {:<width$}", truncated, width = col_width.saturating_sub(3));
             row_spans.push(Span::styled(padded, Style::default().fg(fg)));
-            idx += 1;
         }
         lines.push(bordered_line(border_color, w, row_spans));
     }
@@ -581,11 +581,13 @@ fn render_multi_track<'a>(
         w.saturating_sub(4)
     };
 
-    let mut idx = scroll;
-    while idx < end {
+    // Column-first layout: tracks 1..N in left column, N+1..2N in right.
+    let visible_count = end - scroll;
+    let num_rows = (visible_count + tracks_per_row - 1) / tracks_per_row;
+    for row in 0..num_rows {
         let mut row_spans = Vec::new();
         for col in 0..tracks_per_row {
-            let abs = idx + col;
+            let abs = scroll + row + col * num_rows;
             if abs >= end {
                 break;
             }
@@ -611,7 +613,6 @@ fn render_multi_track<'a>(
             row_spans.push(Span::styled(padded, Style::default().fg(fg)));
         }
         lines.push(bordered_line(border_color, w, row_spans));
-        idx += tracks_per_row;
     }
 
     if end < tracks.len() {
