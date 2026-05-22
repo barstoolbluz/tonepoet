@@ -615,8 +615,8 @@ pub fn draw_template_picker(
     let area = f.size();
     let w = (area.width * 75 / 100).max(50).min(area.width.saturating_sub(2));
     let list_rows = templates.len().max(1) as u16;
-    // header(1) + blank(1) + list + blank(1) + preview label(1) + preview(1) + blank(1) + hint(1)
-    let content_h = 2 + 1 + list_rows + 1 + 1 + 1 + 1 + 1;
+    // header(1) + blank(1) + list + blank(1) + preview label(1) + preview(1) + blank(1) + pills(1) + border(1)
+    let content_h = 2 + 1 + list_rows + 1 + 1 + 1 + 1 + 1 + 1;
     let h = content_h.min(area.height * 60 / 100).max(8);
     let px = (area.width.saturating_sub(w)) / 2;
     let py = (area.height.saturating_sub(h)) / 2;
@@ -684,7 +684,7 @@ pub fn draw_template_picker(
     }
 
     // Preview section at the bottom
-    let preview_y = inner.y + inner.height.saturating_sub(3);
+    let preview_y = inner.y + inner.height.saturating_sub(4);
     if preview_y > cy {
         cy = preview_y;
     }
@@ -702,7 +702,7 @@ pub fn draw_template_picker(
         Paragraph::new(Line::from(Span::styled(preview, preview_style))),
         Rect::new(inner.x + 2, cy, inner.width.saturating_sub(4), 1),
     );
-    cy += 1;
+    cy += 2; // blank row before pills
 
     // Footer pills
     let pills: &[(&str, TuiButton, Color)] = &[

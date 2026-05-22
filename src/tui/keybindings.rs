@@ -6213,7 +6213,7 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
                 0
             };
             let list_rows = template_count.max(1) as u16;
-            let content_h = 2 + 1 + list_rows + 1 + 1 + 1 + 1 + 1;
+            let content_h = 2 + 1 + list_rows + 1 + 1 + 1 + 1 + 1 + 1;
             let h = content_h.min(area.1 * 60 / 100).max(8);
             let px = (area.0.saturating_sub(w)) / 2;
             let py = (area.1.saturating_sub(h)) / 2;
