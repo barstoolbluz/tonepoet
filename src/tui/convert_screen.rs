@@ -29,7 +29,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
             Constraint::Length(1),  // blank
             Constraint::Length(1),  // preset bar
             Constraint::Length(1),  // blank
-            Constraint::Length(5),  // source pane (path + format + duration + browse pill)
+            Constraint::Length(6),  // source pane (top + path + format + duration + browse pill + bottom)
             Constraint::Length(5),  // metadata pane
             Constraint::Length(10), // format pane
             Constraint::Length(7),  // output options pane
