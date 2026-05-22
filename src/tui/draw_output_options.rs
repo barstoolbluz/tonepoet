@@ -264,12 +264,19 @@ fn estimate_output_size(
         return None;
     }
 
+    // For batch mode, scale cursor-file estimates to the full batch.
+    let batch_scale = if info.file_size > 0 {
+        total_source_size as f64 / info.file_size as f64
+    } else {
+        1.0
+    };
+
     let target_format = format.format.selected_value();
     let bytes = match target_format {
-        // Lossy: bitrate × duration / 8
-        AudioFormat::Mp3 => (320_000.0 * info.duration_secs / 8.0) as u64,
-        AudioFormat::Aac => (256_000.0 * info.duration_secs / 8.0) as u64,
-        AudioFormat::Opus => (128_000.0 * info.duration_secs / 8.0) as u64,
+        // Lossy: bitrate × duration / 8, scaled to batch
+        AudioFormat::Mp3 => (320_000.0 * info.duration_secs / 8.0 * batch_scale) as u64,
+        AudioFormat::Aac => (256_000.0 * info.duration_secs / 8.0 * batch_scale) as u64,
+        AudioFormat::Opus => (128_000.0 * info.duration_secs / 8.0 * batch_scale) as u64,
         // Lossless: scale proportionally from source file size when possible,
         // otherwise fall back to raw PCM formula with compression estimate.
         _ => {
@@ -299,13 +306,8 @@ fn estimate_output_size(
                 let scale = (target_rate * target_bits) / (source_rate * source_bits);
                 (total_source_size as f64 * scale) as u64
             } else {
-                // No source bit_depth or container format: use generic factor.
-                // Scale from cursor file to total batch via size ratio.
-                let batch_scale = if info.file_size > 0 {
-                    total_source_size as f64 / info.file_size as f64
-                } else {
-                    1.0
-                };
+                // No source bit_depth or container format: use generic factor,
+                // scaled to total batch.
                 let factor = match target_format {
                     AudioFormat::Flac | AudioFormat::Alac | AudioFormat::WavPack => 0.6,
                     _ => 1.0,
