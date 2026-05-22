@@ -27,8 +27,8 @@ pub const ANALYZE_PILL_LABEL: &str = " analyze ";
 
 /// Compute the source pane height (border-inclusive) for the current mode.
 ///
-/// Empty / Single / Batch: always 6 (top + 4 content + bottom).
-/// MultiTrack: grows based on track count and terminal width, capped at 12.
+/// Empty / Single: always 6 (top + 4 content + bottom).
+/// Batch / MultiTrack: grows based on item count and terminal width, capped at 12.
 pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
     const BASE: u16 = 6;
     const MAX: u16 = 12;
