@@ -1115,16 +1115,6 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
         ));
     }
 
-    // Restore batch state from a previous session (if any).
-    if let Some((paths, ..)) = app.db.load_batch_state() {
-        let mode = tonepoet::tui::app::SourceMode::from_paths(paths);
-        if !matches!(mode, tonepoet::tui::app::SourceMode::Empty) {
-            app.convert.source.mode = mode;
-            app.current_screen = tonepoet::tui::app::AppScreen::Convert;
-            app.set_status("Restored batch from previous session");
-        }
-    }
-
     // Phase 6f: if the user launched with file args (`tonepoet tui foo.flac
     // bar.flac`), seed the Convert screen with those files and land on
     // Convert instead of the configured default screen. Invalid paths
