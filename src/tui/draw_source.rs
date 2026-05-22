@@ -541,8 +541,13 @@ fn render_multi_track<'a>(
     // Derive max visible tracks from pane height.
     // pane_height = borders(2) + header_rows + track_rows + pill(1) [+ overflow(1)]
     let header_rows: u16 = if album_title.is_some() { 3 } else { 2 };
-    let track_area = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
     let tracks_per_row: usize = if w >= 100 { 2 } else { 1 };
+    let mut track_area = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
+    // If there will be an overflow indicator, reserve a row for it.
+    let tentative_max = track_area * tracks_per_row;
+    if tracks.len() > scroll + tentative_max {
+        track_area = track_area.saturating_sub(1);
+    }
     let max_visible = track_area * tracks_per_row;
 
     // Track listing (scrollable) with selection checkboxes.
