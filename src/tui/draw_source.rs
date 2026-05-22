@@ -25,12 +25,6 @@ pub const EXPAND_PILL_LABEL: &str = " expand ";
 /// Label shown on the clickable "analyze" pill on the source pane.
 pub const ANALYZE_PILL_LABEL: &str = " analyze ";
 
-/// Label for the enqueue pill on the source pane.
-pub const ENQUEUE_PILL_LABEL: &str = " enqueue ";
-
-/// Label for the enqueue+start pill on the source pane.
-pub const ENQUEUE_START_PILL_LABEL: &str = " enqueue + start ";
-
 /// Draw the source pane with amber border. Dispatches to the right
 /// renderer based on `source.mode`:
 /// - `Empty` → placeholder "press :browse..."
@@ -216,7 +210,6 @@ fn render_single<'a>(
             ],
         ),
         two_pill_row(border_color, w, BROWSE_PILL_LABEL),
-        enqueue_pill_row(border_color, w),
     ]
 }
 
@@ -316,7 +309,6 @@ fn render_batch<'a>(
             ],
         ),
         two_pill_row(border_color, w, EXPAND_PILL_LABEL),
-        enqueue_pill_row(border_color, w),
     ]
 }
 
@@ -430,37 +422,6 @@ fn pill_row(
         Span::styled("│", theme::border(border_color)),
         Span::raw(" ".repeat(left_pad)),
         Span::styled(label, pill_style),
-        Span::raw(" ".repeat(right_margin)),
-        Span::styled("│", theme::border(border_color)),
-    ])
-}
-
-/// Row with enqueue + enqueue+start pills, right-aligned. Uses green
-/// background to distinguish from the browse/analyze pills above.
-fn enqueue_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'static> {
-    let enq_style = Style::default()
-        .fg(theme::PILL_ACTIVE_FG)
-        .bg(theme::GREEN)
-        .add_modifier(ratatui::style::Modifier::BOLD);
-    let start_style = Style::default()
-        .fg(theme::PILL_ACTIVE_FG)
-        .bg(theme::BLUE)
-        .add_modifier(ratatui::style::Modifier::BOLD);
-
-    let enq_w = ENQUEUE_PILL_LABEL.chars().count();
-    let start_w = ENQUEUE_START_PILL_LABEL.chars().count();
-    let gap = 2;
-    let right_margin = 3;
-    let total_pills = enq_w + gap + start_w;
-    let inner_w = width.saturating_sub(2);
-    let left_pad = inner_w.saturating_sub(total_pills + right_margin);
-
-    Line::from(vec![
-        Span::styled("│", theme::border(border_color)),
-        Span::raw(" ".repeat(left_pad)),
-        Span::styled(ENQUEUE_PILL_LABEL, enq_style),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(ENQUEUE_START_PILL_LABEL, start_style),
         Span::raw(" ".repeat(right_margin)),
         Span::styled("│", theme::border(border_color)),
     ])

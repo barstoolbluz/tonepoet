@@ -29,12 +29,13 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
             Constraint::Length(1),  // blank
             Constraint::Length(1),  // preset bar
             Constraint::Length(1),  // blank
-            Constraint::Length(6),  // source pane (path + format + duration + browse pill)
+            Constraint::Length(5),  // source pane (path + format + duration + browse pill)
             Constraint::Length(5),  // metadata pane
             Constraint::Length(10), // format pane
             Constraint::Length(7),  // output options pane
-            Constraint::Min(0),     // absorb extra vertical space
+            Constraint::Length(1),  // blank
             Constraint::Length(1),  // convert action bar
+            Constraint::Min(0),     // absorb extra vertical space
             Constraint::Length(2),  // footer (tabs + context)
         ])
         .split(area);
@@ -77,7 +78,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
         f,
-        chunks[10],
+        chunks[11],
         app.current_screen,
         &mut app.button_map,
         status_msg,
@@ -282,26 +283,8 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
                     );
                 }
 
-                // Enqueue pill row (row 5 of the pane).
-                let enq_start_w =
-                    super::draw_source::ENQUEUE_START_PILL_LABEL.chars().count() as u16;
-                let enq_w = super::draw_source::ENQUEUE_PILL_LABEL.chars().count() as u16;
-                let enq_start_x =
-                    source_area.x + 1 + (inner_w as u16).saturating_sub(enq_start_w + right_margin);
-                let enq_x = enq_start_x.saturating_sub(enq_w + gap);
-                let enq_row = source_area.y + 5;
-                if enq_row < source_area.y + source_area.height {
-                    buttons.record_button(
-                        TuiButton::SourceEnqueueStartButton,
-                        Rect::new(enq_start_x, enq_row, enq_start_w, 1),
-                    );
-                    if enq_x > source_area.x + 1 {
-                        buttons.record_button(
-                            TuiButton::SourceEnqueueButton,
-                            Rect::new(enq_x, enq_row, enq_w, 1),
-                        );
-                    }
-                }
+                // Enqueue pills live in the action bar below output options,
+                // not in the source pane — no button registration here.
             }
         }
     }
