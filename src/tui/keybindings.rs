@@ -2474,7 +2474,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     if let Some(tmpl) = templates.get(selected).cloned() {
                         let _ =
                             super::template_builder::delete_template(target, &tmpl);
-                        let mut new_templates =
+                        let new_templates =
                             super::template_builder::list_templates(target);
                         if selected >= new_templates.len() && selected > 0 {
                             selected -= 1;

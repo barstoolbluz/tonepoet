@@ -115,7 +115,7 @@ impl Default for ConversionConfig {
     }
 }
 
-fn status_progress_for_update(status: &ConversionStatus, progress_hint: f32) -> f32 {
+fn _status_progress_for_update(status: &ConversionStatus, progress_hint: f32) -> f32 {
     match status {
         ConversionStatus::Processing { progress, .. } => *progress,
         ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
@@ -297,7 +297,7 @@ impl ConversionManager {
     }
 
     /// Update item status by ID
-    pub fn update_item_status(&self, id: &str, status: ConversionStatus, progress: f32) -> bool {
+    pub fn update_item_status(&self, id: &str, status: ConversionStatus, _progress: f32) -> bool {
         if let Ok(mut queue) = self.queue.try_write() {
             if let Some(item) = queue.find_item_mut(id) {
                 // Just use the status as-is - it already has all the correct fields including phase

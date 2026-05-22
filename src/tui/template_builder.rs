@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
@@ -691,7 +691,7 @@ pub fn draw_template_picker(
 
     // Preview label
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled("Preview:", theme::muted()))),
+        Paragraph::new(Line::from(Span::styled("Example:", theme::muted()))),
         Rect::new(inner.x + 1, cy, inner.width.saturating_sub(2), 1),
     );
     cy += 1;

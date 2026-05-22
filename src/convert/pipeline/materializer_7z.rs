@@ -128,7 +128,7 @@ async fn extract_archive(
     staging: &StagingDir,
     runner: &dyn ToolRunner,
     reporter: Option<&dyn PipelineReporter>,
-    tool_paths: &HashMap<String, PathBuf>,
+    _tool_paths: &HashMap<String, PathBuf>,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
     let mut args = vec![
