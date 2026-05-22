@@ -273,6 +273,11 @@ impl SourceMode {
         matches!(self, Self::Batch { .. })
     }
 
+    /// True if this is a multi-track source (SACD ISO, CUE+image).
+    pub fn is_multi_track(&self) -> bool {
+        matches!(self, Self::MultiTrack { .. })
+    }
+
     /// All paths in this source (0 for Empty, 1 for Single/MultiTrack, N for Batch).
     pub fn all_paths(&self) -> Vec<PathBuf> {
         match self {

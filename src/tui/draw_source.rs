@@ -25,6 +25,39 @@ pub const EXPAND_PILL_LABEL: &str = " expand ";
 /// Label shown on the clickable "analyze" pill on the source pane.
 pub const ANALYZE_PILL_LABEL: &str = " analyze ";
 
+/// Compute the source pane height (border-inclusive) for the current mode.
+///
+/// Empty / Single / Batch: always 6 (top + 4 content + bottom).
+/// MultiTrack: grows based on track count and terminal width, capped at 12.
+pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
+    const BASE: u16 = 6;
+    const MAX: u16 = 12;
+
+    match mode {
+        SourceMode::Empty | SourceMode::Single { .. } | SourceMode::Batch { .. } => BASE,
+        SourceMode::MultiTrack {
+            tracks,
+            album_title,
+            ..
+        } => {
+            let n = tracks.len();
+            if n == 0 {
+                return BASE;
+            }
+            // Header: filename(1) + album info(1 if present) + track count(1)
+            let header: u16 = if album_title.is_some() { 3 } else { 2 };
+            // 2 tracks per row on wide terminals, 1 on narrow
+            let per_row: usize = if terminal_width >= 100 { 2 } else { 1 };
+            let visible = n.min(10);
+            let track_rows = ((visible + per_row - 1) / per_row) as u16;
+            let overflow: u16 = if n > 10 { 1 } else { 0 };
+            let pill: u16 = 1;
+            let total = header + track_rows + overflow + pill + 2; // +2 borders
+            total.min(MAX)
+        }
+    }
+}
+
 /// Draw the source pane with amber border. Dispatches to the right
 /// renderer based on `source.mode`:
 /// - `Empty` → placeholder "press :browse..."
@@ -93,6 +126,7 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
             *scroll,
             *cursor,
             selected,
+            area.height,
         ),
         SourceMode::Batch {
             paths,
@@ -444,6 +478,7 @@ fn bordered_line<'a>(
 }
 
 /// Render multi-track source (SACD ISO or CUE+image).
+/// `pane_height` is the total allocated pane height including borders.
 #[allow(clippy::too_many_arguments)]
 fn render_multi_track<'a>(
     border_color: ratatui::style::Color,
@@ -456,6 +491,7 @@ fn render_multi_track<'a>(
     scroll: usize,
     cursor: usize,
     selected: &[bool],
+    pane_height: u16,
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -502,36 +538,55 @@ fn render_multi_track<'a>(
         )],
     ));
 
-    // Track listing (scrollable) with selection checkboxes
-    let max_visible = 6_usize;
+    // Derive max visible tracks from pane height.
+    // pane_height = borders(2) + header_rows + track_rows + pill(1) [+ overflow(1)]
+    let header_rows: u16 = if album_title.is_some() { 3 } else { 2 };
+    let track_area = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
+    let tracks_per_row: usize = if w >= 100 { 2 } else { 1 };
+    let max_visible = track_area * tracks_per_row;
+
+    // Track listing (scrollable) with selection checkboxes.
+    // Two tracks per row on wide terminals, one on narrow.
     let end = tracks.len().min(scroll + max_visible);
-    for idx in scroll..end {
-        let t = &tracks[idx];
-        let checked = selected.get(idx).copied().unwrap_or(true);
-        let check = if checked { "[x]" } else { "[ ]" };
-        let title_str = t.title.as_deref().unwrap_or("—");
-        let dur_str = t.duration_display.as_deref().unwrap_or("");
-        let line_text = if dur_str.is_empty() {
-            format!("   {} {:2}. {}", check, t.number, title_str)
-        } else {
-            format!("   {} {:2}. {} [{}]", check, t.number, title_str, dur_str)
-        };
-        let fg = if idx == cursor {
-            Color::Cyan
-        } else if checked {
-            Color::White
-        } else {
-            Color::DarkGray
-        };
-        lines.push(bordered_line(
-            border_color,
-            w,
-            vec![Span::styled(
-                truncate_to(&line_text, w.saturating_sub(4)),
-                Style::default().fg(fg),
-            )],
-        ));
+    let col_width = if tracks_per_row == 2 {
+        w.saturating_sub(4) / 2
+    } else {
+        w.saturating_sub(4)
+    };
+
+    let mut idx = scroll;
+    while idx < end {
+        let mut row_spans = Vec::new();
+        for col in 0..tracks_per_row {
+            let abs = idx + col;
+            if abs >= end {
+                break;
+            }
+            let t = &tracks[abs];
+            let checked = selected.get(abs).copied().unwrap_or(true);
+            let check = if checked { "[x]" } else { "[ ]" };
+            let title_str = t.title.as_deref().unwrap_or("—");
+            let dur_str = t.duration_display.as_deref().unwrap_or("");
+            let entry = if dur_str.is_empty() {
+                format!("{} {:2}. {}", check, t.number, title_str)
+            } else {
+                format!("{} {:2}. {} [{}]", check, t.number, title_str, dur_str)
+            };
+            let fg = if abs == cursor {
+                Color::Cyan
+            } else if checked {
+                Color::White
+            } else {
+                Color::DarkGray
+            };
+            let truncated = truncate_to(&entry, col_width.saturating_sub(1));
+            let padded = format!("   {:<width$}", truncated, width = col_width.saturating_sub(3));
+            row_spans.push(Span::styled(padded, Style::default().fg(fg)));
+        }
+        lines.push(bordered_line(border_color, w, row_spans));
+        idx += tracks_per_row;
     }
+
     if end < tracks.len() {
         lines.push(bordered_line(
             border_color,
@@ -542,6 +597,9 @@ fn render_multi_track<'a>(
             )],
         ));
     }
+
+    // Expand + analyze pill row
+    lines.push(two_pill_row(border_color, w, EXPAND_PILL_LABEL));
 
     lines
 }

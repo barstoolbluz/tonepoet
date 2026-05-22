@@ -22,15 +22,19 @@ use super::theme;
 
 /// Draw the full convert screen
 pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
+    let source_h = super::draw_source::source_pane_height(
+        &app.convert.source.mode,
+        area.width,
+    );
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),  // header (ASCII art box)
-            Constraint::Length(1),  // blank
-            Constraint::Length(1),  // preset bar
-            Constraint::Length(1),  // blank
-            Constraint::Length(6),  // source pane (top + path + format + duration + browse pill + bottom)
-            Constraint::Length(5),  // metadata pane
+            Constraint::Length(7),       // header (ASCII art box)
+            Constraint::Length(1),       // blank
+            Constraint::Length(1),       // preset bar
+            Constraint::Length(1),       // blank
+            Constraint::Length(source_h), // source pane (dynamic for multi-track)
+            Constraint::Length(5),       // metadata pane
             Constraint::Length(10), // format pane
             Constraint::Length(7),  // output options pane
             Constraint::Length(1),  // blank
@@ -244,14 +248,15 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         );
     }
 
-    // Source pane pills (row 4 of the pane, right-aligned with 3-space
-    // margin). Primary pill: browse/expand. Secondary: analyze (when loaded).
+    // Source pane pills (last content row, right-aligned with 3-space
+    // margin). Primary pill: browse or expand. Secondary: analyze (when loaded).
     {
         let buttons = &mut app.button_map;
         let inner_w = source_area.width.saturating_sub(2);
         let in_batch = app.convert.source.mode.is_batch();
+        let in_multi = app.convert.source.mode.is_multi_track();
         let has_source = !app.convert.source.mode.is_empty();
-        let (button, label) = if in_batch {
+        let (button, label) = if in_batch || in_multi {
             (
                 TuiButton::SourceExpandButton,
                 super::draw_source::EXPAND_PILL_LABEL,
@@ -264,11 +269,13 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         };
         let pill_label_w = label.chars().count() as u16;
         let right_margin = 3u16;
+        // Pill row = second-to-last row (last content row before bottom border)
+        let pill_y = source_area.y + source_area.height.saturating_sub(2);
         if inner_w as u16 >= pill_label_w + right_margin {
             let pill_x = source_area.x + 1 + (inner_w as u16 - pill_label_w - right_margin);
             buttons.record_button(
                 button,
-                Rect::new(pill_x, source_area.y + 4, pill_label_w, 1),
+                Rect::new(pill_x, pill_y, pill_label_w, 1),
             );
 
             // Register analyze pill to the left of the primary pill.
@@ -279,12 +286,9 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
                 if analyze_x > source_area.x + 1 {
                     buttons.record_button(
                         TuiButton::SourceAnalyzeButton,
-                        Rect::new(analyze_x, source_area.y + 4, analyze_w, 1),
+                        Rect::new(analyze_x, pill_y, analyze_w, 1),
                     );
                 }
-
-                // Enqueue pills live in the action bar below output options,
-                // not in the source pane — no button registration here.
             }
         }
     }
