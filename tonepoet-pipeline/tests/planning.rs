@@ -1,0 +1,664 @@
+#![allow(missing_docs, clippy::field_reassign_with_default, clippy::cmp_owned)]
+
+use std::path::PathBuf;
+use tonepoet_pipeline::*;
+
+fn flac_source() -> SourceInfo {
+    SourceInfo {
+        format: AudioFormat::Flac,
+        codec: AudioCodec::Flac,
+        sample_rate_hz: Some(96_000),
+        bit_depth: Some(PcmBitDepth::Int24),
+        sample_kind: Some(SampleKind::SignedInteger),
+        channels: Some(2),
+        duration: None,
+        audio_md5: None,
+    }
+}
+
+fn request(settings: PipelineSettings) -> PlanRequest {
+    PlanRequest {
+        input_path: PathBuf::from("in.flac"),
+        output_path: PathBuf::from("out.flac"),
+        source: flac_source(),
+        settings,
+        intermediate_dir: Some(PathBuf::from("work")),
+    }
+}
+
+#[test]
+fn passthrough_is_explicit_when_metadata_policy_is_copy_safe() {
+    let req = request(PipelineSettings::default());
+    let plan = plan_conversion(&req).unwrap();
+    match plan.action {
+        PlanAction::PassthroughCopy { input, output, .. } => {
+            assert_eq!(input, PathBuf::from("in.flac"));
+            assert_eq!(output, PathBuf::from("out.flac"));
+        }
+        PlanAction::Execute { .. } => panic!("expected passthrough"),
+    }
+}
+
+#[test]
+fn metadata_strip_blocks_passthrough_and_rewrites_without_reencoding() {
+    let mut settings = PipelineSettings::default();
+    settings.metadata.transfer_tags = false;
+    settings.metadata.preserve_artwork = false;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    let commands = plan.commands();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].tool, ToolIdentifier::Ffmpeg);
+    assert!(commands[0].args.iter().any(|arg| arg == "-map_metadata"));
+    assert!(commands[0].args.iter().any(|arg| arg == "-1"));
+    assert!(commands[0].args.iter().any(|arg| arg == "-c:a"));
+    assert!(commands[0].args.iter().any(|arg| arg == "copy"));
+}
+
+#[test]
+fn sox_flac_resample_dither_plan_is_deterministic_and_preserves_metadata_by_post_step() {
+    let mut settings = PipelineSettings::default();
+    settings.target_sample_rate = RateTarget::PcmHz(44_100);
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+    settings.dither_type = DitherType::Shibata;
+
+    let req = request(settings);
+    let first = plan_conversion(&req).unwrap();
+    let second = plan_conversion(&req).unwrap();
+    assert_eq!(first, second);
+
+    let commands = first.commands();
+    assert_eq!(commands[0].tool, ToolIdentifier::Sox);
+    assert_eq!(commands[1].tool, ToolIdentifier::Ffmpeg);
+    assert!(commands[0].args.iter().any(|arg| arg == "rate"));
+    assert!(commands[0].args.iter().any(|arg| arg == "44100"));
+    assert!(commands[0].args.iter().any(|arg| arg == "dither"));
+    assert!(commands[0].args.iter().any(|arg| arg == "-s"));
+    assert!(commands[1].args.iter().any(|arg| arg == "-map_metadata"));
+}
+
+#[test]
+fn brickwall_uses_ffmpeg_ssrc_final_encode_without_redundant_metadata_step() {
+    let mut settings = PipelineSettings::default();
+    settings.target_sample_rate = RateTarget::PcmHz(44_100);
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+    settings.nyquist_transition = NyquistTransition::BrickWall;
+    settings.dither_type = DitherType::LowShibata;
+
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    let tools: Vec<_> = plan.commands().iter().map(|cmd| cmd.tool.clone()).collect();
+    assert_eq!(
+        tools,
+        vec![
+            ToolIdentifier::Ffmpeg,
+            ToolIdentifier::Ssrc,
+            ToolIdentifier::Ffmpeg
+        ]
+    );
+}
+
+#[test]
+fn ssrc_force_routes_rate_change_through_ssrc_without_brickwall_transition() {
+    let mut settings = PipelineSettings::default();
+    settings.target_sample_rate = RateTarget::PcmHz(44_100);
+    settings.ssrc.force = true;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    assert!(plan
+        .commands()
+        .iter()
+        .any(|command| command.tool == ToolIdentifier::Ssrc));
+}
+
+#[test]
+fn preferred_ffmpeg_is_honored_when_supported() {
+    let mut settings = PipelineSettings::default();
+    settings.force_encode = true;
+    settings.preferred_tool = PreferredTool::Ffmpeg;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    assert_eq!(plan.commands()[0].tool, ToolIdentifier::Ffmpeg);
+}
+
+#[test]
+fn invalid_pcm_target_rejects_dsd_rate() {
+    let mut settings = PipelineSettings::default();
+    settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd64);
+    let req = request(settings);
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSettings {
+            field: "target_sample_rate",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn high_rate_pcm_is_not_misclassified_as_dsd() {
+    let source = SourceInfo {
+        format: AudioFormat::Wav,
+        codec: AudioCodec::PcmSigned,
+        sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+        bit_depth: Some(PcmBitDepth::Int24),
+        sample_kind: Some(SampleKind::SignedInteger),
+        channels: Some(2),
+        duration: None,
+        audio_md5: None,
+    };
+    assert!(!source.is_dsd());
+}
+
+#[test]
+fn flac_verify_uses_real_decode_test_not_metaflac_streaminfo_listing() {
+    let mut settings = PipelineSettings::default();
+    settings.force_encode = true;
+    settings.flac.verify = true;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    let verify = plan.commands().last().unwrap();
+    assert_eq!(verify.tool, ToolIdentifier::Flac);
+    assert!(verify.args.iter().any(|arg| arg == "-t"));
+}
+
+#[test]
+fn dsd_to_pcm_uses_sox() {
+    let mut settings = PipelineSettings::default();
+    settings.target_sample_rate = RateTarget::PcmHz(88_200);
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+    let req = PlanRequest {
+        input_path: PathBuf::from("in.dsf"),
+        output_path: PathBuf::from("out.flac"),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+            bit_depth: None,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(PathBuf::from("work")),
+    };
+    let plan = plan_conversion(&req).unwrap();
+    assert_eq!(plan.commands()[0].tool, ToolIdentifier::Sox);
+    assert!(plan.commands()[0].args.iter().any(|arg| arg == "88200"));
+}
+
+#[test]
+fn changed_flac_compression_blocks_passthrough() {
+    let mut settings = PipelineSettings::default();
+    settings.flac.compression_level = 8;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    assert!(matches!(plan.action, PlanAction::Execute { .. }));
+}
+
+#[test]
+fn lossy_same_format_never_passes_through_without_proven_encoder_settings() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Mp3;
+    settings.mp3.mode = Mp3Mode::Cbr;
+    settings.mp3.bitrate_kbps = 192;
+    let req = PlanRequest {
+        input_path: PathBuf::from("in.mp3"),
+        output_path: PathBuf::from("out.mp3"),
+        source: SourceInfo {
+            format: AudioFormat::Mp3,
+            codec: AudioCodec::Mp3,
+            sample_rate_hz: Some(44_100),
+            bit_depth: None,
+            sample_kind: None,
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(PathBuf::from("work")),
+    };
+    let plan = plan_conversion(&req).unwrap();
+    assert!(matches!(plan.action, PlanAction::Execute { .. }));
+    assert_eq!(plan.commands()[0].tool, ToolIdentifier::Ffmpeg);
+}
+
+#[test]
+fn replaygain_only_uses_stream_copy_then_post_processing_not_reencode() {
+    let mut settings = PipelineSettings::default();
+    settings.replay_gain.mode = Some(ReplayGainMode::Album);
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    let commands = plan.commands();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].tool, ToolIdentifier::Ffmpeg);
+    assert!(commands[0].args.iter().any(|arg| arg == "copy"));
+    assert_eq!(commands[1].tool, ToolIdentifier::Loudgain);
+}
+
+#[test]
+fn flac_md5_only_uses_stream_copy_then_metaflac_tagging() {
+    let mut settings = PipelineSettings::default();
+    settings.metadata.store_source_audio_md5 = true;
+    let mut req = request(settings);
+    req.source.audio_md5 = Some("0123456789abcdef0123456789abcdef".into());
+    let plan = plan_conversion(&req).unwrap();
+    let commands = plan.commands();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].tool, ToolIdentifier::Ffmpeg);
+    assert_eq!(commands[1].tool, ToolIdentifier::Metaflac);
+    assert!(commands[1]
+        .args
+        .iter()
+        .any(|arg| arg.starts_with("--set-tag=SOURCE_AUDIO_MD5=")));
+}
+
+#[test]
+fn flac_verify_is_rejected_for_non_flac_targets() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Mp3;
+    settings.flac.verify = true;
+    let req = request(settings);
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSettings {
+            field: "flac.verify",
+            ..
+        })
+    ));
+}
+
+#[derive(Debug)]
+struct CustomEncodePlugin;
+
+impl ToolPlugin for CustomEncodePlugin {
+    fn id(&self) -> ToolIdentifier {
+        ToolIdentifier::Custom("customenc".into())
+    }
+
+    fn supports(&self, _context: &PlanContext<'_>, step: &PlanStep) -> ToolSupport {
+        match &step.operation {
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Custom { .. },
+                ..
+            } => ToolSupport::CANONICAL,
+            PlanOperation::ReplayGain {
+                target_format: AudioFormat::Custom { .. },
+                ..
+            } => ToolSupport::CANONICAL,
+            _ => ToolSupport::UNSUPPORTED,
+        }
+    }
+
+    fn metadata_disposition(
+        &self,
+        _context: &PlanContext<'_>,
+        step: &PlanStep,
+    ) -> MetadataDisposition {
+        match &step.operation {
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Custom { .. },
+                ..
+            } => MetadataDisposition::WritesRequestedPolicy,
+            _ => MetadataDisposition::DoesNotWrite,
+        }
+    }
+
+    fn build_command(&self, context: &PlanContext<'_>, step: &PlanStep) -> Result<PlannedCommand> {
+        match &step.operation {
+            PlanOperation::EncodePcm { .. } => {
+                let input = step.input.as_path().unwrap().to_string_lossy().into_owned();
+                let output = step
+                    .output
+                    .as_path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                Ok(PlannedCommand::new(
+                    self.id(),
+                    vec!["--input".into(), input, "--output".into(), output],
+                    step.input.clone(),
+                    step.output.clone(),
+                    context.request.source.duration,
+                    step.description.clone(),
+                ))
+            }
+            PlanOperation::ReplayGain { .. } => {
+                let input = step.input.as_path().unwrap().to_string_lossy().into_owned();
+                Ok(PlannedCommand::new(
+                    self.id(),
+                    vec!["--replaygain".into(), input],
+                    step.input.clone(),
+                    step.output.clone(),
+                    context.request.source.duration,
+                    step.description.clone(),
+                ))
+            }
+            _ => panic!("unexpected custom operation"),
+        }
+    }
+}
+
+#[test]
+fn custom_target_is_routed_through_registry_not_rejected_by_topology() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Custom {
+        extension: "cust".into(),
+        display_name: "Custom".into(),
+    };
+    let req = request(settings);
+    let mut registry = ToolRegistry::empty();
+    registry.register(Box::new(CustomEncodePlugin)).unwrap();
+    let plan = plan_conversion_with_registry(&req, &registry).unwrap();
+    assert_eq!(
+        plan.commands()[0].tool,
+        ToolIdentifier::Custom("customenc".into())
+    );
+}
+
+#[test]
+fn custom_target_can_supply_custom_replaygain_plugin() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Custom {
+        extension: "cust".into(),
+        display_name: "Custom".into(),
+    };
+    settings.replay_gain.mode = Some(ReplayGainMode::Track);
+    let req = request(settings);
+    let mut registry = ToolRegistry::empty();
+    registry.register(Box::new(CustomEncodePlugin)).unwrap();
+    let plan = plan_conversion_with_registry(&req, &registry).unwrap();
+    let tools: Vec<_> = plan
+        .commands()
+        .iter()
+        .map(|command| command.tool.clone())
+        .collect();
+    assert_eq!(
+        tools,
+        vec![
+            ToolIdentifier::Custom("customenc".into()),
+            ToolIdentifier::Custom("customenc".into())
+        ]
+    );
+}
+
+#[test]
+fn dsf_metadata_requires_a_registered_metadata_plugin() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Dsf;
+    settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd64);
+    let req = request(settings);
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::NoPluginForOperation { .. })
+    ));
+}
+
+#[test]
+fn flac_verify_only_uses_stream_copy_then_native_verify() {
+    let mut settings = PipelineSettings::default();
+    settings.flac.verify = true;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    let commands = plan.commands();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].tool, ToolIdentifier::Ffmpeg);
+    assert!(commands[0].args.iter().any(|arg| arg == "copy"));
+    assert_eq!(commands[1].tool, ToolIdentifier::Flac);
+}
+
+#[test]
+fn dsd_sinc_transition_width_shapes_sox_command() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Dsf;
+    settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd128);
+    settings.metadata.transfer_tags = false;
+    settings.metadata.preserve_artwork = false;
+    settings.dsd.pcm_to_dsd_filter = DsdFilterPreset::Sinc;
+    settings.dsd.sinc.transition_hz = 750.0;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    let args = &plan.commands()[0].args;
+    let pos = args
+        .iter()
+        .position(|arg| arg == "-t")
+        .expect("sinc transition flag");
+    assert_eq!(args[pos + 1], "750");
+}
+
+#[test]
+fn dsd_auto_and_sox_ultra_lowpass_produce_distinct_rate_flags() {
+    let mut auto = PipelineSettings::default();
+    auto.target_sample_rate = RateTarget::PcmHz(88_200);
+    auto.resample_quality = ResampleQuality::Low;
+    auto.dsd.dsd_to_pcm_lowpass = DsdLowpassMethod::Auto;
+
+    let source = SourceInfo {
+        format: AudioFormat::Dsf,
+        codec: AudioCodec::Dsd,
+        sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+        bit_depth: None,
+        sample_kind: Some(SampleKind::Dsd),
+        channels: Some(2),
+        duration: None,
+        audio_md5: None,
+    };
+
+    let req_auto = PlanRequest {
+        input_path: PathBuf::from("in.dsf"),
+        output_path: PathBuf::from("out.flac"),
+        source: source.clone(),
+        settings: auto,
+        intermediate_dir: Some(PathBuf::from("work")),
+    };
+
+    let mut ultra = req_auto.clone();
+    ultra.settings.dsd.dsd_to_pcm_lowpass = DsdLowpassMethod::SoxUltra;
+
+    let auto_plan = plan_conversion(&req_auto).unwrap();
+    let ultra_plan = plan_conversion(&ultra).unwrap();
+    let auto_args = &auto_plan.commands()[0].args;
+    let ultra_args = &ultra_plan.commands()[0].args;
+    assert!(auto_args.iter().any(|arg| arg == "-q"));
+    assert!(ultra_args.iter().any(|arg| arg == "-u"));
+}
+
+#[test]
+fn dsd_source_rejects_pcm_bit_depth_fact() {
+    let source = SourceInfo {
+        format: AudioFormat::Dsf,
+        codec: AudioCodec::Dsd,
+        sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+        bit_depth: Some(PcmBitDepth::Int24),
+        sample_kind: Some(SampleKind::Dsd),
+        channels: Some(2),
+        duration: None,
+        audio_md5: None,
+    };
+    assert!(matches!(
+        source.validate(),
+        Err(PlanningError::InvalidSource {
+            field: "bit_depth",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn execute_plan_lists_deterministic_cleanup_paths() {
+    let mut settings = PipelineSettings::default();
+    settings.target_sample_rate = RateTarget::PcmHz(44_100);
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    assert!(!plan.cleanup_paths().is_empty());
+    assert!(plan
+        .cleanup_paths()
+        .iter()
+        .all(|path| path != &PathBuf::from("out.flac")));
+}
+
+#[test]
+fn identical_input_output_paths_are_rejected() {
+    let mut req = request(PipelineSettings::default());
+    req.output_path = req.input_path.clone();
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSettings {
+            field: "output_path",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn invalid_custom_extension_is_rejected() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Custom {
+        extension: ".bad".into(),
+        display_name: "Bad".into(),
+    };
+    let req = request(settings);
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSettings {
+            field: "target_format.extension",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn passthrough_plan_includes_atomic_work_path_and_cleanup() {
+    let req = request(PipelineSettings::default());
+    let plan = plan_conversion(&req).unwrap();
+    match plan.action {
+        PlanAction::PassthroughCopy {
+            work_path,
+            cleanup_paths,
+            finalization,
+            ..
+        } => {
+            assert_eq!(cleanup_paths, vec![work_path.clone()]);
+            assert!(
+                matches!(finalization, Finalization::AtomicRename { from, to } if from == work_path && to == PathBuf::from("out.flac"))
+            );
+        }
+        PlanAction::Execute { .. } => panic!("expected passthrough"),
+    }
+}
+
+#[test]
+fn non_finite_dsd_gain_is_rejected() {
+    let mut settings = PipelineSettings::default();
+    settings.dsd.dsd_to_pcm_gain_db = Some(f32::NAN);
+    let req = request(settings);
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSettings {
+            field: "dsd.dsd_to_pcm_gain_db",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn sox_selected_encode_gets_metadata_transfer_step() {
+    let mut settings = PipelineSettings::default();
+    settings.force_encode = true;
+    settings.preferred_tool = PreferredTool::Sox;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    let tools: Vec<_> = plan.commands().iter().map(|cmd| cmd.tool.clone()).collect();
+    assert_eq!(tools, vec![ToolIdentifier::Sox, ToolIdentifier::Ffmpeg]);
+    assert!(plan.commands()[1]
+        .args
+        .iter()
+        .any(|arg| arg == "-map_metadata"));
+}
+
+#[test]
+fn wav_artwork_preservation_needs_a_metadata_plugin() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Wav;
+    let req = request(settings);
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::NoPluginForOperation { .. })
+    ));
+}
+
+#[test]
+fn wav_replaygain_needs_a_replaygain_plugin() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Wav;
+    settings.metadata.preserve_artwork = false;
+    settings.replay_gain.mode = Some(ReplayGainMode::Track);
+    let req = request(settings);
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::NoPluginForOperation { .. })
+    ));
+}
+
+#[test]
+fn generated_final_work_path_cannot_equal_input_path() {
+    let mut req = request(PipelineSettings::default());
+    req.input_path = PathBuf::from("work/.out.tonepoet-final.flac");
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSettings {
+            field: "intermediate_dir/output_path",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn metadata_pruning_updates_later_verify_input() {
+    let mut settings = PipelineSettings::default();
+    settings.force_encode = true;
+    settings.flac.verify = true;
+    let req = request(settings);
+    let plan = plan_conversion(&req).unwrap();
+    let commands = plan.commands();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].tool, ToolIdentifier::Ffmpeg);
+    assert_eq!(commands[1].tool, ToolIdentifier::Flac);
+    assert_eq!(commands[1].input.as_path(), commands[0].output.as_path());
+}
+
+#[test]
+fn dsd_source_rejects_bit_depth_even_without_sample_kind() {
+    let source = SourceInfo {
+        format: AudioFormat::Dsf,
+        codec: AudioCodec::Dsd,
+        sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+        bit_depth: Some(PcmBitDepth::Int24),
+        sample_kind: None,
+        channels: Some(2),
+        duration: None,
+        audio_md5: None,
+    };
+    assert!(matches!(
+        source.validate(),
+        Err(PlanningError::InvalidSource {
+            field: "bit_depth",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn ssrc_force_without_rate_change_is_rejected() {
+    let mut settings = PipelineSettings::default();
+    settings.ssrc.force = true;
+    let req = request(settings);
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSettings {
+            field: "ssrc.force",
+            ..
+        })
+    ));
+}
