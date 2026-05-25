@@ -26,8 +26,12 @@ pub enum ToolBinary {
     Ffmpeg,
     Ffprobe,
     Sox,
+    /// SSRC brick-wall resampler.
+    Ssrc,
     Loudgain,
     Metaflac,
+    /// Native FLAC command-line verifier/encoder.
+    Flac,
     Opustags,
     Wvunpack,
     Wvtag,
@@ -37,19 +41,26 @@ pub enum ToolBinary {
 impl ToolBinary {
     /// The canonical system binary name used for PATH lookup and as
     /// the key into `ProcessorConfig.tool_paths`.
-    pub fn default_name(&self) -> &'static str {
+    pub fn canonical_name(&self) -> &'static str {
         match self {
             Self::SevenZip => "7z",
             Self::Ffmpeg => "ffmpeg",
             Self::Ffprobe => "ffprobe",
             Self::Sox => "sox",
+            Self::Ssrc => "ssrc",
             Self::Loudgain => "loudgain",
             Self::Metaflac => "metaflac",
+            Self::Flac => "flac",
             Self::Opustags => "opustags",
             Self::Wvunpack => "wvunpack",
             Self::Wvtag => "wvtag",
             Self::AtomicParsley => "AtomicParsley",
         }
+    }
+
+    /// Backward-compatible alias for older call sites.
+    pub fn default_name(&self) -> &'static str {
+        self.canonical_name()
     }
 }
 
@@ -322,15 +333,21 @@ impl RealToolRunner {
 /// Read an async reader to completion and return at most the last
 /// `TOOL_OUTPUT_TAIL_BYTES` as a UTF-8 string (lossy).
 async fn read_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> String {
-    let mut buf = Vec::new();
-    // Read everything. Pipeline tools don't flood stderr/stdout — they
-    // write to files. If a pathological tool does, we truncate below.
-    let _ = reader.read_to_end(&mut buf).await;
-    if buf.len() > TOOL_OUTPUT_TAIL_BYTES {
-        let start = buf.len() - TOOL_OUTPUT_TAIL_BYTES;
-        return String::from_utf8_lossy(&buf[start..]).into_owned();
+    let mut tail = Vec::with_capacity(TOOL_OUTPUT_TAIL_BYTES);
+    let mut buf = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        tail.extend_from_slice(&buf[..read]);
+        if tail.len() > TOOL_OUTPUT_TAIL_BYTES {
+            let excess = tail.len() - TOOL_OUTPUT_TAIL_BYTES;
+            tail.drain(..excess);
+        }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 /// Map a `std::process::ExitStatus` to a `ProcessExit`.
@@ -396,41 +413,38 @@ impl ToolRunner for RealToolRunner {
             }
         });
 
-        // Race: child completion vs timeout vs cancellation.
-        let wait_result = tokio::select! {
-            status = child.wait() => {
-                match status {
-                    Ok(s) => Ok(s),
-                    Err(e) => Err(e),
-                }
-            }
+        enum WaitOutcome {
+            Finished(Result<std::process::ExitStatus, std::io::Error>),
+            TimedOut,
+            Cancelled,
+        }
+
+        // Race child completion, timeout, and cancellation. Always reap the
+        // child and join pipe readers before returning so cancelled or timed-out
+        // runs do not leave detached stdout/stderr tasks behind.
+        let wait_outcome = tokio::select! {
+            status = child.wait() => WaitOutcome::Finished(status),
             _ = tokio::time::sleep(cmd.timeout) => {
                 let _ = child.start_kill();
-                let _ = child.wait().await; // reap
-                let elapsed = start.elapsed();
-                return Err(ToolRunnerError::Timeout {
-                    elapsed,
-                    command: Self::build_record(&cmd, None, "", "", elapsed),
-                });
+                let _ = child.wait().await;
+                WaitOutcome::TimedOut
             }
             _ = cancel.cancelled() => {
                 let _ = child.start_kill();
-                let _ = child.wait().await; // reap
-                let elapsed = start.elapsed();
-                return Err(ToolRunnerError::Cancelled {
-                    command: Self::build_record(&cmd, None, "", "", elapsed),
-                });
+                let _ = child.wait().await;
+                WaitOutcome::Cancelled
             }
         };
 
         let elapsed = start.elapsed();
 
-        // Collect stdout/stderr (the tasks complete once the pipe closes).
+        // Collect bounded stdout/stderr tails after the process exits or is
+        // killed. The readers retain at most TOOL_OUTPUT_TAIL_BYTES each.
         let stdout_tail = stdout_task.await.unwrap_or_default();
         let stderr_tail = stderr_task.await.unwrap_or_default();
 
-        match wait_result {
-            Ok(status) => {
+        match wait_outcome {
+            WaitOutcome::Finished(Ok(status)) => {
                 let exit = map_exit_status(status);
                 let record =
                     Self::build_record(&cmd, Some(exit), &stdout_tail, &stderr_tail, elapsed);
@@ -451,7 +465,14 @@ impl ToolRunner for RealToolRunner {
                     })
                 }
             }
-            Err(io_err) => Err(ToolRunnerError::Io(io_err)),
+            WaitOutcome::Finished(Err(io_err)) => Err(ToolRunnerError::Io(io_err)),
+            WaitOutcome::TimedOut => Err(ToolRunnerError::Timeout {
+                elapsed,
+                command: Self::build_record(&cmd, None, &stdout_tail, &stderr_tail, elapsed),
+            }),
+            WaitOutcome::Cancelled => Err(ToolRunnerError::Cancelled {
+                command: Self::build_record(&cmd, None, &stdout_tail, &stderr_tail, elapsed),
+            }),
         }
     }
 }

@@ -186,6 +186,15 @@ pub struct ConversionOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_settings: Option<Box<tonepoet_backend::types::ConversionSettings>>,
 
+    /// Exact Chunk 1 planner settings selected by the UI/CLI.
+    ///
+    /// This is the lossless handoff path for the unified orchestrator. The
+    /// legacy fields above remain for display, migration, and compatibility,
+    /// but production queue processing requires this field or a prebuilt
+    /// `PipelineRequest` on the `ConversionItem`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_settings: Option<tonepoet_pipeline::PipelineSettings>,
+
     /// Enable SSRC Insane mode (requires BrickWall nyquist transition)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssrc_insane_mode: Option<bool>,
@@ -229,6 +238,7 @@ impl Default for ConversionOptions {
             merge_to_single: false,
             preferred_backend: None,
             original_settings: None,
+            pipeline_settings: None,
             ssrc_insane_mode: None,
             append_lineage_to_comment: false, // Default to off
             write_log_file: false,

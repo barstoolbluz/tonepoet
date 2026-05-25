@@ -155,6 +155,12 @@ pub struct ConversionItem {
     pub selected: bool,
     /// Archive password (for 7z files)
     pub archive_password: Option<String>,
+    /// Exact Chunk 1 planner settings selected by the UI/CLI.
+    ///
+    /// Kept on the queue item so persisted queued work can recover without
+    /// projecting through the legacy option surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_settings: Option<tonepoet_pipeline::PipelineSettings>,
     /// New pipeline request (populated during migration; legacy fields
     /// remain until PR 10 finishes CLI/TUI surface).
     #[serde(default)]
@@ -177,6 +183,7 @@ impl Default for ConversionItem {
             file_size: 0,
             selected: false,
             archive_password: None,
+            pipeline_settings: None,
             pipeline_request: None,
         }
     }
@@ -189,6 +196,7 @@ impl ConversionItem {
         let file_size = std::fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
 
         let archive_password = None;
+        let pipeline_settings = options.pipeline_settings.clone();
 
         Self {
             id,
@@ -204,8 +212,29 @@ impl ConversionItem {
             file_size,
             selected: false,
             archive_password,
+            pipeline_settings,
             pipeline_request: None,
         }
+    }
+
+    /// Create a new conversion item with exact Chunk 1 planner settings attached.
+    pub fn new_with_pipeline_settings(
+        input_path: PathBuf,
+        input_format: FileFormat,
+        mut options: ConversionOptions,
+        settings: tonepoet_pipeline::PipelineSettings,
+    ) -> Self {
+        options.pipeline_settings = Some(settings.clone());
+        let mut item = Self::new(input_path, input_format, options);
+        item.pipeline_settings = Some(settings);
+        item
+    }
+
+    /// Attach exact Chunk 1 planner settings to an existing queue item.
+    pub fn set_pipeline_settings(&mut self, settings: tonepoet_pipeline::PipelineSettings) {
+        self.options.pipeline_settings = Some(settings.clone());
+        self.pipeline_settings = Some(settings);
+        self.pipeline_request = None;
     }
 
     /// Check if the item is in a terminal state
@@ -266,15 +295,82 @@ impl ConversionQueue {
         &mut self.items
     }
 
-    /// Add an item to the queue
+    /// Add an item to the queue only when options already carry exact Chunk 1 planner settings.
+    ///
+    /// Older UI code used this method with legacy `ConversionOptions` only. That is now
+    /// intentionally rejected at the queue boundary instead of failing later in
+    /// `process_queue()`: a queued production item must be lossless before it can enter
+    /// the shared scheduler. Compatibility/import code that cannot yet construct
+    /// `PipelineSettings` should leave the item `NotConfigured` and call
+    /// `set_pipeline_settings()` before marking it `Queued`.
     pub fn add_item(&mut self, path: PathBuf, format: FileFormat, options: ConversionOptions) {
         let item = ConversionItem::new(path, format, options);
+        debug_assert!(
+            item.pipeline_settings.is_some() || item.pipeline_request.is_some(),
+            "ConversionQueue::add_item requires full PipelineSettings for production queued work; use add_item_with_pipeline_settings"
+        );
         self.items.push_back(item);
     }
 
-    /// Add a pre-configured item directly to the queue
-    pub fn add_item_direct(&mut self, item: ConversionItem) {
+    /// Add an item to the queue with exact Chunk 1 planner settings.
+    ///
+    /// UI/CLI callers should use this when they have collected the full
+    /// `PipelineSettings` value from user selections. This keeps normal queue
+    /// processing lossless without prebuilding a full orchestrator request.
+    pub fn add_item_with_pipeline_settings(
+        &mut self,
+        path: PathBuf,
+        format: FileFormat,
+        options: ConversionOptions,
+        settings: tonepoet_pipeline::PipelineSettings,
+    ) {
+        let item = ConversionItem::new_with_pipeline_settings(path, format, options, settings);
         self.items.push_back(item);
+    }
+
+    /// Add a pre-configured item directly to the queue.
+    ///
+    /// The item may be `NotConfigured`, but any item whose status is `Queued` must
+    /// already contain full planner settings or a prebuilt `PipelineRequest`.
+    pub fn add_item_direct(&mut self, item: ConversionItem) {
+        debug_assert!(
+            item.status != ConversionStatus::Queued
+                || item.pipeline_settings.is_some()
+                || item.pipeline_request.is_some()
+                || item.options.pipeline_settings.is_some(),
+            "queued ConversionItem must contain full PipelineSettings or a prebuilt PipelineRequest"
+        );
+        self.items.push_back(item);
+    }
+
+    /// Return every queued item missing a lossless Chunk 1 settings handoff.
+    pub fn queued_items_missing_pipeline_settings(&self) -> Vec<&ConversionItem> {
+        self.items
+            .iter()
+            .filter(|item| item.status == ConversionStatus::Queued)
+            .filter(|item| {
+                item.pipeline_request.is_none()
+                    && item.pipeline_settings.is_none()
+                    && item.options.pipeline_settings.is_none()
+            })
+            .collect()
+    }
+
+    /// Validate that all runnable queue entries have exact planner settings.
+    pub fn validate_full_settings_handoff(&self) -> Result<(), String> {
+        let missing: Vec<String> = self
+            .queued_items_missing_pipeline_settings()
+            .into_iter()
+            .map(|item| item.id.clone())
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "queued conversion items missing full PipelineSettings: {}",
+                missing.join(",")
+            ))
+        }
     }
 
     /// Get the next item to process

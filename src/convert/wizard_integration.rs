@@ -184,6 +184,7 @@ pub fn extract_wizard_settings(
     // So for this wizard, backend stays None (defaults to FFmpeg in conversion_backend)
 
     let options = ConversionOptions {
+        pipeline_settings: None,
         output_format: format,
         quality,
         preserve_metadata: true, // Always preserve metadata
@@ -517,6 +518,7 @@ pub fn preset_to_conversion_options(
     };
 
     ConversionOptions {
+        pipeline_settings: None,
         output_format: format,
         quality,
         preserve_metadata: true,

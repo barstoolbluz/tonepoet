@@ -3892,7 +3892,16 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                 });
                 let rg_enabled = options.calculate_replaygain;
 
+                let pipeline_settings = options
+                    .pipeline_settings
+                    .clone()
+                    .unwrap_or_else(|| {
+                        let mut s = tonepoet_pipeline::PipelineSettings::default();
+                        s.target_format = tonepoet_pipeline::AudioFormat::Flac;
+                        s
+                    });
                 let req = PipelineRequest {
+                    worker_count: None,
                     job_id: String::new(),
                     item_id: String::new(),
                     container: path.clone(),
@@ -3902,13 +3911,7 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                         cue_sidecar: CueSidecarPolicy::PreferSidecar,
                         track_selection: TrackSelection::Set(selected_numbers),
                     },
-                    target_format: options.output_format,
-                    encode: EncodeOptions {
-                        backend: EncodeBackend::Auto,
-                        bitrate: None,
-                        compression_level: None,
-                        dither: DitherPolicy::Auto,
-                    },
+                    settings: pipeline_settings,
                     merge: options.merge_to_single,
                     output_root: output_root.clone(),
                     naming: NamingPolicy {

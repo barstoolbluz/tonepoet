@@ -23,7 +23,10 @@ pub mod simple_wizard;
 pub mod wizard;
 pub mod wizard_integration;
 
-pub use formats::{AudioFormat, ConversionOptions, FileFormat, FormatDetector};
+pub use formats::{
+    AacProfile, AudioFormat, ConversionOptions, FileFormat, FormatDetector, Mp3BitrateMode,
+    QualitySettings, WavPackMode,
+};
 pub use labels::{detect_pressing_info, LabelInfo};
 pub use metadata::{extract_metadata_from_flac, extract_year_from_flac_files, FlacMetadata};
 pub use processor::{process_item, ConversionProcessor, ProcessorConfig, ProgressUpdate};

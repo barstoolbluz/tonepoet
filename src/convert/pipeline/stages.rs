@@ -25,24 +25,24 @@ use super::errors::{
 use super::materializer_7z::SevenZipMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
+use super::materializer_single::SingleFileMaterializer;
+use super::track_executor::execute_planned_track_conversion;
+use super::plan_bridge::orchestrator_metadata_stage_required;
 use super::progress::{
     heartbeat, probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker,
     StreamSource, StreamingHeartbeat,
 };
 use super::reporter::{PipelineEvent, PipelineReporter};
-use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
+use super::tool::{CommandRecord, RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
-use crate::convert::{AudioFormat, ConversionStatus};
+use crate::convert::ConversionStatus;
+use tonepoet_pipeline::{AudioFormat as PlannerAudioFormat, MetadataDisposition};
 use crate::tui::sacd::{
     parse_sacd_iso, AreaInfo, PlayTime, SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE,
     SACD_SAMPLE_RATE_HZ,
 };
 use sacd_rs::extract::{extract_track, ExtractOptions, ExtractStats, OutputFormat};
 use sacd_rs::iso_reader::IsoReader;
-use tonepoet_backend::{
-    Backend as BackendCrateKind, CommandBuilder, ConversionCommand,
-    ConversionSettings as BackendConversionSettings,
-};
 
 const DEFAULT_CONVERT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const STAGING_PARENT_NAME: &str = ".tonepoet-staging";
@@ -147,25 +147,47 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-
-    match ext.as_str() {
-        "7z" => return Ok(SourceKind::SevenZip),
-        _ => {}
-    }
+    let name = req
+        .container
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
     if is_sacd_iso_candidate(req)? {
         return Ok(SourceKind::SacdIso);
     }
-    if is_cue_image_candidate(req)? {
+    if !matches!(req.source.cue_sidecar, CueSidecarPolicy::IgnoreCue) && is_cue_image_candidate(req)? {
         return Ok(SourceKind::CueImage);
     }
-
+    if matches!(ext.as_str(), "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "dmg" | "tgz" | "tbz2" | "txz")
+        || name.ends_with(".tar.gz")
+        || name.ends_with(".tar.bz2")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".tar.zst")
+        || name.ends_with(".tar.lz")
+        || name.ends_with(".tar.lzma")
+    {
+        return Ok(SourceKind::SevenZip);
+    }
+    if is_single_audio_extension(&ext) {
+        return Ok(SourceKind::SingleFile);
+    }
     Err(SourceDetectError::UnknownSource)
+}
+
+fn is_single_audio_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "flac" | "wav" | "wave" | "aiff" | "aif" | "aifc" | "wv" | "mp3" | "m4a" | "mp4"
+            | "aac" | "opus" | "ogg" | "ape" | "w64" | "rf64" | "dsf" | "dff"
+    )
 }
 
 /// Dispatch a supported source kind to its materializer.
 pub fn materializer_for(kind: SourceKind) -> Result<Box<dyn Materializer>, SourceDispatchError> {
     match kind {
+        SourceKind::SingleFile => Ok(Box::new(SingleFileMaterializer)),
         SourceKind::SevenZip => Ok(Box::new(SevenZipMaterializer)),
         SourceKind::CueImage => Ok(Box::new(CueImageMaterializer)),
         SourceKind::SacdIso => Ok(Box::new(SacdIsoMaterializer)),
@@ -1154,7 +1176,7 @@ pub fn plan_outputs(
     let album_dir = if req.naming.per_album_subdir {
         match &req.naming.folder_template {
             Some(tmpl) => {
-                let rendered = render_folder_template(tmpl, source, req.target_format);
+                let rendered = render_folder_template(tmpl, source, &req.settings.target_format);
                 output_root.join(rendered)
             }
             None => {
@@ -1185,11 +1207,11 @@ pub fn plan_outputs(
                 track.id.source_ordinal
             )));
         }
-        let rel = render_track_template(&req.naming.template, source, track, req.target_format)?;
+        let rel = render_track_template(&req.naming.template, source, track, &req.settings.target_format)?;
         reject_escaping_path(&rel).map_err(PlanError::InvalidTemplate)?;
 
         let mut final_path = normalize_path(&album_dir.join(rel));
-        append_default_extension(&mut final_path, req.target_format);
+        append_default_extension(&mut final_path, &req.settings.target_format);
         if !path_is_under_root(&final_path, &output_root) {
             return Err(PlanError::PathOutsideOutputRoot(
                 final_path.display().to_string(),
@@ -1243,6 +1265,64 @@ pub fn plan_outputs(
 /// Convert every planned track. Per-track failures are represented in
 /// `TrackRecord`s; successful artifacts only contain tracks that encoded.
 
+/// Worker result for one encoded track. Records are sorted back into source
+/// order after concurrent execution so durable logs remain deterministic.
+#[derive(Debug)]
+pub struct ScheduledTrackOutput {
+    pub index: usize,
+    pub record: TrackRecord,
+    pub artifact: Option<TrackArtifact>,
+    pub ok: bool,
+    pub metadata_written_by_plan: bool,
+}
+
+/// Result of an extraction/split work unit. The scheduler submits this to the
+/// same shared queue as encode work, so SACD/CUE realization and encoding are
+/// separate dependency steps instead of hidden serial work inside encoding.
+#[derive(Debug)]
+pub struct ScheduledRealizedTrack {
+    pub index: usize,
+    pub track: PreparedTrack,
+    pub final_path: PathBuf,
+    pub realized_path: PathBuf,
+    pub req: PipelineRequest,
+    pub staging_root: PathBuf,
+    pub staging_job: String,
+    pub convert_root: PathBuf,
+    pub cancel: CancellationToken,
+}
+
+/// Build a deterministic failed track output for scheduler boundary failures.
+///
+/// Worker-pool execution errors are still track-level conversion failures, not
+/// process-wide scheduler failures. Converting them here keeps album failure
+/// policy, durable logs, and post-processing gates in one code path.
+pub fn scheduled_worker_failure_output(
+    index: usize,
+    track: &PreparedTrack,
+    realized_input: Option<PathBuf>,
+    output_file: Option<PathBuf>,
+    error: String,
+) -> ScheduledTrackOutput {
+    ScheduledTrackOutput {
+        index,
+        record: TrackRecord {
+            track_id: track.id.clone(),
+            outcome: TrackOutcome::Err(error),
+            source_ref: track.source_ref.clone(),
+            realized_input,
+            output_file,
+            commands: Vec::new(),
+            bytes_in: None,
+            bytes_out: None,
+            duration: None,
+        },
+        artifact: None,
+        ok: false,
+        metadata_written_by_plan: false,
+    }
+}
+
 pub async fn convert_tracks(
     source: &PreparedSource,
     plan: &AlbumPlan,
@@ -1287,8 +1367,6 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     reporter: Option<&dyn PipelineReporter>,
     tool_paths: &HashMap<String, PathBuf>,
 ) -> ConvertStageResult {
-    let mut records = Vec::with_capacity(source.tracks.len());
-    let mut artifacts = Vec::new();
     let planned: BTreeMap<_, _> = plan
         .entries
         .iter()
@@ -1297,41 +1375,43 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     let convert_root = staging.root.join("converted");
     if let Err(err) = fs::create_dir_all(&convert_root) {
         let error = format!("could not create conversion staging directory: {err}");
-        for track in &source.tracks {
-            records.push(failed_track_record(
-                track,
-                None,
-                None,
-                Vec::new(),
-                error.clone(),
-            ));
-        }
+        let records = source
+            .tracks
+            .iter()
+            .map(|track| failed_track_record(track, None, None, Vec::new(), error.clone()))
+            .collect();
         return ConvertStageResult {
             tracks: records,
             artifacts: ArtifactSet {
-                audio: AudioArtifacts::Tracks(artifacts),
+                audio: AudioArtifacts::Tracks(Vec::new()),
                 sidecars: Vec::new(),
             },
             record: stage_record(PipelineStage::Convert, StageOutcome::Failed(error)),
         };
     }
 
+    // Fallback entry used by direct unit tests and legacy callers. The normal
+    // queue path uses the processor-level shared pool and calls
+    // `encode_track_for_scheduler` for each ready track. Keeping this fallback
+    // serial avoids nested worker pools and worker overcommit.
     let total_tracks = source.tracks.len();
     let total_expected_samples = total_expected_samples(source);
+    let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
+    let mut records = Vec::with_capacity(total_tracks);
+    let mut artifacts = Vec::new();
     let mut completed_expected_samples = 0_u64;
-    let mut progress_tracker =
-        OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
-    let mut cancellation_progress_reported = false;
 
-    for (track_index, track) in source.tracks.iter().enumerate() {
-        let track_number = track_index + 1;
-        let planned_final_path = planned.get(&track.id).cloned();
-        progress_tracker.observe_weighted_unit_start(
-            track_number,
-            total_tracks,
-            track.expected_samples,
-            total_expected_samples,
-        );
+    for (track_index, track) in source.tracks.iter().cloned().enumerate() {
+        let Some(final_path) = planned.get(&track.id).cloned() else {
+            records.push(failed_track_record(
+                &track,
+                None,
+                None,
+                Vec::new(),
+                format!("missing planned output for track {}", track.id.source_ordinal),
+            ));
+            continue;
+        };
         let start_fraction = convert_progress_fraction(
             completed_expected_samples,
             total_expected_samples,
@@ -1341,396 +1421,177 @@ async fn convert_tracks_with_reporter_with_tool_paths(
         progress_tracker
             .estimated(
                 start_fraction,
-                convert_track_message(
-                    "Converting",
-                    track_number,
-                    total_tracks,
-                    track,
-                    planned_final_path.as_deref(),
-                ),
+                convert_track_message("Starting", track_index + 1, total_tracks, &track, Some(final_path.as_path())),
             )
             .await;
-
-        if cancel.is_cancelled() {
-            if !cancellation_progress_reported {
-                progress_tracker.cancel_requested().await;
-                progress_tracker.cancelled_at_last_progress().await;
-                cancellation_progress_reported = true;
-            }
-            records.push(failed_track_record(
-                track,
-                None,
-                None,
-                Vec::new(),
-                "cancelled".to_string(),
-            ));
-            progress_tracker.suppress_eta();
-            completed_expected_samples =
-                advance_expected_samples(completed_expected_samples, track);
-            continue;
-        }
-
-        let Some(final_path) = planned_final_path else {
-            records.push(failed_track_record(
-                track,
-                None,
-                None,
-                Vec::new(),
-                format!(
-                    "missing planned output for track {}",
-                    track.id.source_ordinal
-                ),
-            ));
-            progress_tracker.suppress_eta();
-            completed_expected_samples =
-                advance_expected_samples(completed_expected_samples, track);
-            progress_tracker
-                .estimated(
-                    convert_progress_fraction(
-                        completed_expected_samples,
-                        total_expected_samples,
-                        track_number,
-                        total_tracks,
-                    ),
-                    format!(
-                        "Track {} of {} failed: missing planned output",
-                        track_number, total_tracks
-                    ),
-                )
-                .await;
-            continue;
-        };
-
-        let staged_path =
-            staged_audio_path(&convert_root, &final_path, &track.id, req.target_format);
-        let realized_input = match realize_track(
-            &track.source_ref,
-            req,
-            staging,
-            runner,
-            cancel,
-            Some(&mut progress_tracker),
+        let output = convert_one_track_work(
+            track_index,
+            track.clone(),
+            final_path,
+            req.clone(),
+            staging.root.clone(),
+            staging.job_id.clone(),
+            convert_root.clone(),
+            tool_paths.clone(),
+            cancel.clone(),
+            reporter,
         )
         .await
-        {
-            Ok(path) => path,
-            Err(err) => {
-                let error = err.to_string();
-                records.push(failed_track_record(
-                    track,
-                    None,
-                    Some(staged_path.clone()),
-                    Vec::new(),
-                    error.clone(),
-                ));
-                progress_tracker.suppress_eta();
-                completed_expected_samples =
-                    advance_expected_samples(completed_expected_samples, track);
-                progress_tracker
-                    .estimated(
-                        convert_progress_fraction(
-                            completed_expected_samples,
-                            total_expected_samples,
-                            track_number,
-                            total_tracks,
-                        ),
-                        convert_track_failure_message(
-                            track_number,
-                            total_tracks,
-                            track,
-                            Some(&final_path),
-                            &error,
-                        ),
-                    )
-                    .await;
-                continue;
-            }
-        };
-
-        if let Some(parent) = staged_path.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
-                let error = format!("could not create output directory: {err}");
-                records.push(failed_track_record(
-                    track,
-                    Some(realized_input.clone()),
-                    Some(staged_path.clone()),
-                    Vec::new(),
-                    error.clone(),
-                ));
-                progress_tracker.suppress_eta();
-                completed_expected_samples =
-                    advance_expected_samples(completed_expected_samples, track);
-                progress_tracker
-                    .estimated(
-                        convert_progress_fraction(
-                            completed_expected_samples,
-                            total_expected_samples,
-                            track_number,
-                            total_tracks,
-                        ),
-                        convert_track_failure_message(
-                            track_number,
-                            total_tracks,
-                            track,
-                            Some(&final_path),
-                            &error,
-                        ),
-                    )
-                    .await;
-                continue;
-            }
-        }
-
-        let bytes_in = file_len(&realized_input);
-        let cmd = match encode_command(&realized_input, &staged_path, req, track.sample_rate) {
-            Ok(cmd) => cmd,
-            Err(err) => {
-                let error = err.to_string();
-                records.push(failed_track_record(
-                    track,
-                    Some(realized_input),
-                    Some(staged_path),
-                    Vec::new(),
-                    error.clone(),
-                ));
-                progress_tracker.suppress_eta();
-                completed_expected_samples =
-                    advance_expected_samples(completed_expected_samples, track);
-                progress_tracker
-                    .estimated(
-                        convert_progress_fraction(
-                            completed_expected_samples,
-                            total_expected_samples,
-                            track_number,
-                            total_tracks,
-                        ),
-                        convert_track_failure_message(
-                            track_number,
-                            total_tracks,
-                            track,
-                            Some(&final_path),
-                            &error,
-                        ),
-                    )
-                    .await;
-                continue;
-            }
-        };
-
-        let end_fraction = convert_progress_fraction(
-            advance_expected_samples(completed_expected_samples, track),
+        .unwrap_or_else(|err| ScheduledTrackOutput {
+            index: track_index,
+            record: failed_track_record(&track, None, None, Vec::new(), err),
+            artifact: None,
+            ok: false,
+            metadata_written_by_plan: false,
+        });
+        completed_expected_samples = advance_expected_samples(completed_expected_samples, &track);
+        let progress = convert_progress_fraction(
+            completed_expected_samples,
             total_expected_samples,
-            track_number,
+            track_index + 1,
             total_tracks,
         );
-        let output = run_encode_command_with_progress(
-            cmd,
-            runner,
-            cancel,
-            reporter,
-            tool_paths,
-            &mut progress_tracker,
-            track,
-            start_fraction,
-            end_fraction,
-            convert_track_message(
-                "Converting",
-                track_number,
-                total_tracks,
-                track,
-                Some(&final_path),
-            ),
-        )
-        .await;
-        match output {
-            Ok(tool_output) => {
-                let command = tool_output.command.clone();
-                let bytes_out = file_len(&staged_path);
-                if bytes_out.unwrap_or(0) == 0 {
-                    let error =
-                        format!("encoder did not produce output: {}", staged_path.display());
-                    records.push(failed_track_record(
-                        track,
-                        Some(realized_input),
-                        Some(staged_path.clone()),
-                        vec![command],
-                        error.clone(),
-                    ));
-                    progress_tracker.suppress_eta();
-                    completed_expected_samples =
-                        advance_expected_samples(completed_expected_samples, track);
-                    progress_tracker
-                        .estimated(
-                            convert_progress_fraction(
-                                completed_expected_samples,
-                                total_expected_samples,
-                                track_number,
-                                total_tracks,
-                            ),
-                            convert_track_failure_message(
-                                track_number,
-                                total_tracks,
-                                track,
-                                Some(&final_path),
-                                &error,
-                            ),
-                        )
-                        .await;
-                    continue;
-                }
-                let record = TrackRecord {
-                    track_id: track.id.clone(),
-                    outcome: TrackOutcome::Ok,
-                    source_ref: track.source_ref.clone(),
-                    realized_input: Some(realized_input),
-                    output_file: Some(staged_path.clone()),
-                    commands: vec![command],
-                    bytes_in,
-                    bytes_out,
-                    duration: Some(tool_output.elapsed),
-                };
-                artifacts.push(TrackArtifact {
-                    track_id: track.id.clone(),
-                    staged_path,
-                    final_path: final_path.clone(),
-                    samples: track.expected_samples,
-                });
-                records.push(record);
-                completed_expected_samples =
-                    advance_expected_samples(completed_expected_samples, track);
-                progress_tracker.observe_weighted_unit_finish(
-                    track_number,
-                    total_tracks,
-                    track.expected_samples,
-                    total_expected_samples,
-                );
-                progress_tracker
-                    .estimated(
-                        convert_progress_fraction(
-                            completed_expected_samples,
-                            total_expected_samples,
-                            track_number,
-                            total_tracks,
-                        ),
-                        convert_track_message(
-                            "Finished",
-                            track_number,
-                            total_tracks,
-                            track,
-                            Some(&final_path),
-                        ),
-                    )
-                    .await;
-            }
-            Err(err) => {
-                let error = err.to_string();
-                let commands = command_from_tool_error(&err).into_iter().collect();
-                records.push(failed_track_record(
-                    track,
-                    Some(realized_input),
-                    Some(staged_path),
-                    commands,
-                    error.clone(),
-                ));
-                progress_tracker.suppress_eta();
-                completed_expected_samples =
-                    advance_expected_samples(completed_expected_samples, track);
-                progress_tracker
-                    .estimated(
-                        convert_progress_fraction(
-                            completed_expected_samples,
-                            total_expected_samples,
-                            track_number,
-                            total_tracks,
-                        ),
-                        convert_track_failure_message(
-                            track_number,
-                            total_tracks,
-                            track,
-                            Some(&final_path),
-                            &error,
-                        ),
-                    )
-                    .await;
-            }
+        progress_tracker
+            .estimated(
+                progress,
+                convert_track_message("Finished", track_index + 1, total_tracks, &track, output.artifact.as_ref().map(|artifact| artifact.final_path.as_path())),
+            )
+            .await;
+        if let Some(artifact) = output.artifact.clone() {
+            artifacts.push(artifact);
+        }
+        records.push(output.record);
+        if cancel.is_cancelled() {
+            break;
         }
     }
 
+    let failed = records.iter().any(|record| matches!(record.outcome, TrackOutcome::Err(_)));
     ConvertStageResult {
         tracks: records,
         artifacts: ArtifactSet {
             audio: AudioArtifacts::Tracks(artifacts),
             sidecars: Vec::new(),
         },
-        record: stage_record(PipelineStage::Convert, StageOutcome::Ok),
+        record: stage_record(
+            PipelineStage::Convert,
+            if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
+                StageOutcome::Failed("one or more tracks failed".to_string())
+            } else {
+                StageOutcome::Ok
+            },
+        ),
     }
 }
 
-async fn run_encode_command_with_progress(
-    cmd: ToolCommand,
-    runner: &dyn ToolRunner,
-    cancel: &CancellationToken,
+async fn convert_one_track_work(
+    track_index: usize,
+    track: PreparedTrack,
+    final_path: PathBuf,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    cancel: CancellationToken,
     reporter: Option<&dyn PipelineReporter>,
-    tool_paths: &HashMap<String, PathBuf>,
-    progress_tracker: &mut OperationProgressTracker<'_>,
-    track: &PreparedTrack,
-    start_fraction: f32,
-    end_fraction: f32,
-    label: String,
-) -> Result<ToolOutput, ToolRunnerError> {
-    if reporter.is_none() {
-        return runner.run(cmd, cancel).await;
+) -> Result<ScheduledTrackOutput, String> {
+    let staging = StagingDir::borrowed(staging_root, staging_job);
+    let runner = RealToolRunner::new(tool_paths.clone());
+    let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
+    let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
+    let realized_input = match realize_track(
+        &track.source_ref,
+        &req,
+        &staging,
+        &runner,
+        &cancel,
+        Some(&mut progress_tracker),
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(err) => {
+            let record = failed_track_record(&track, None, Some(staged_path), Vec::new(), err.to_string());
+            return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_written_by_plan: false });
+        }
+    };
+
+    if let Some(parent) = staged_path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            let record = failed_track_record(
+                &track,
+                Some(realized_input),
+                Some(staged_path),
+                Vec::new(),
+                format!("could not create output directory: {err}"),
+            );
+            return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_written_by_plan: false });
+        }
     }
 
-    match cmd.binary {
-        ToolBinary::Ffmpeg => {
-            if let Some(duration) = track_expected_duration(track) {
-                return run_streaming_tool_with_probe_with_tool_paths(
-                    cmd,
-                    cancel,
-                    Some(progress_tracker),
-                    None,
-                    tool_paths,
-                    |source, line| {
-                        if source == StreamSource::Stderr {
-                            probes::ffmpeg::parse_line(
-                                line,
-                                duration,
-                                start_fraction,
-                                end_fraction,
-                                &label,
-                            )
-                        } else {
-                            None
-                        }
-                    },
-                )
-                .await;
+    let bytes_in = file_len(&realized_input);
+    let executed = execute_planned_track_conversion(
+        &req,
+        &track,
+        &realized_input,
+        &staged_path,
+        &convert_root,
+        &runner,
+        &cancel,
+        &tool_paths,
+        &mut progress_tracker,
+        0.0,
+        1.0,
+    )
+    .await;
+
+    match executed {
+        Ok(executed) => {
+            let bytes_out = file_len(&staged_path);
+            if bytes_out.unwrap_or(0) == 0 {
+                let error = format!("planner did not produce output: {}", staged_path.display());
+                let record = failed_track_record(
+                    &track,
+                    Some(realized_input),
+                    Some(staged_path),
+                    executed.commands,
+                    error,
+                );
+                Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_written_by_plan: false })
+            } else {
+                let record = TrackRecord {
+                    track_id: track.id.clone(),
+                    outcome: TrackOutcome::Ok,
+                    source_ref: track.source_ref.clone(),
+                    realized_input: Some(realized_input),
+                    output_file: Some(staged_path.clone()),
+                    commands: executed.commands,
+                    bytes_in,
+                    bytes_out,
+                    duration: Some(executed.elapsed),
+                };
+                let artifact = TrackArtifact {
+                    track_id: track.id.clone(),
+                    staged_path,
+                    final_path,
+                    samples: track.expected_samples,
+                    metadata_written_by_plan: executed.metadata_written_by_plan,
+                };
+                Ok(ScheduledTrackOutput { index: track_index, record, artifact: Some(artifact), ok: true, metadata_written_by_plan: executed.metadata_written_by_plan })
             }
-            runner.run(cmd, cancel).await
         }
-        ToolBinary::Sox => {
-            let heartbeat = StreamingHeartbeat::new(
-                "sox-progress-unavailable",
-                probes::sox::unknown_fallback_message(&label),
+        Err(err) => {
+            let commands = command_from_convert_error(&err);
+            let record = failed_track_record(
+                &track,
+                Some(realized_input),
+                Some(staged_path),
+                commands,
+                err.to_string(),
             );
-            run_streaming_tool_with_probe_with_tool_paths(
-                cmd,
-                cancel,
-                Some(progress_tracker),
-                Some(heartbeat),
-                tool_paths,
-                |source, line| {
-                    if source == StreamSource::Stderr {
-                        probes::sox::parse_line(line, start_fraction, end_fraction, &label)
-                    } else {
-                        None
-                    }
-                },
-            )
-            .await
+            Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_written_by_plan: false })
         }
-        _ => runner.run(cmd, cancel).await,
     }
 }
 
@@ -2041,6 +1902,37 @@ fn parse_merge_probe(json_str: &str) -> Result<(u32, f64), MergeError> {
         .unwrap_or(0.0);
 
     Ok((sample_rate, duration))
+}
+
+
+fn planner_metadata_already_satisfied(artifacts: &ArtifactSet, req: &PipelineRequest) -> bool {
+    if req.merge {
+        return false;
+    }
+    let requested = req.settings.metadata.transfer_tags
+        || req.settings.metadata.preserve_artwork
+        || req.settings.metadata.store_source_audio_md5;
+    if !requested {
+        return false;
+    }
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => {
+            if tracks.is_empty() {
+                return false;
+            }
+            let disposition = if tracks.iter().all(|track| track.metadata_written_by_plan) {
+                MetadataDisposition::WritesRequestedPolicy
+            } else {
+                MetadataDisposition::DoesNotWrite
+            };
+            !orchestrator_metadata_stage_required(
+                disposition,
+                req.stages.metadata,
+                requested,
+            )
+        }
+        AudioArtifacts::Merged(_) => false,
+    }
 }
 
 /// Apply metadata tags to staged audio artifacts.
@@ -2528,23 +2420,21 @@ fn build_conversion_log(
 
     log.push_str("Conversion Settings\n");
     log.push_str("-------------------\n");
-    push_kv_line(&mut log, "Target format", req.target_format.name());
-    push_kv_line(
-        &mut log,
-        "Encode backend",
-        format!("{:?}", req.encode.backend),
-    );
-    if let Some(bitrate) = req.encode.bitrate {
-        push_kv_line(&mut log, "Bitrate", format!("{bitrate} kbps"));
-    }
-    if let Some(level) = req.encode.compression_level {
-        push_kv_line(&mut log, "Compression level", level.to_string());
-    }
-    push_kv_line(
-        &mut log,
-        "Dither policy",
-        format!("{:?}", req.encode.dither),
-    );
+    push_kv_line(&mut log, "Target format", req.settings.target_format.display_name());
+    push_kv_line(&mut log, "Preferred tool", format!("{:?}", req.settings.preferred_tool));
+    push_kv_line(&mut log, "Target sample rate", format!("{:?}", req.settings.target_sample_rate));
+    push_kv_line(&mut log, "Target bit depth", format!("{:?}", req.settings.target_bit_depth));
+    push_kv_line(&mut log, "Resample quality", format!("{:?}", req.settings.resample_quality));
+    push_kv_line(&mut log, "Nyquist transition", format!("{:?}", req.settings.nyquist_transition));
+    push_kv_line(&mut log, "Dither type", format!("{:?}", req.settings.dither_type));
+    push_kv_line(&mut log, "Force encode", yes_no(req.settings.force_encode));
+    push_kv_line(&mut log, "FLAC compression", req.settings.flac.compression_level.to_string());
+    push_kv_line(&mut log, "MP3 mode", format!("{:?}", req.settings.mp3.mode));
+    push_kv_line(&mut log, "MP3 bitrate", format!("{} kbps", req.settings.mp3.bitrate_kbps));
+    push_kv_line(&mut log, "AAC profile", format!("{:?}", req.settings.aac.profile));
+    push_kv_line(&mut log, "AAC bitrate", format!("{} kbps", req.settings.aac.bitrate_kbps));
+    push_kv_line(&mut log, "Opus bitrate", format!("{} kbps", req.settings.opus.bitrate_kbps));
+    push_kv_line(&mut log, "WavPack mode", format!("{:?}", req.settings.wavpack.mode));
     push_kv_line(&mut log, "Merge mode", yes_no(req.merge));
     push_kv_line(
         &mut log,
@@ -2917,6 +2807,7 @@ fn stage_requirement_label(requirement: StageRequirement) -> &'static str {
 
 fn source_kind_label(kind: SourceKind) -> &'static str {
     match kind {
+        SourceKind::SingleFile => "SingleFile",
         SourceKind::SevenZip => "SevenZip",
         SourceKind::CueImage => "CueImage",
         SourceKind::SacdIso => "SacdIso",
@@ -3366,6 +3257,671 @@ fn enrich_source_with_label_info(source: &mut PreparedSource, container: &Path) 
     );
 }
 
+
+// ===========================================================================
+// Scheduler split points
+// ===========================================================================
+
+/// Materialization result used by the processor-level shared scheduler.
+pub enum ScheduledMaterialization {
+    Ready(ScheduledAlbum),
+    Finished(PipelineReport),
+}
+
+/// Album state held by the global scheduler between materialization, track
+/// encoding, and album-level post-processing. The run lock stays alive for the
+/// whole album so two workers cannot mutate the same staging root.
+pub struct ScheduledAlbum {
+    pub req: PipelineRequest,
+    pub item_id: String,
+    pub staging: StagingDir,
+    pub source: PreparedSource,
+    pub plan: AlbumPlan,
+    pub stages: Vec<StageRecord>,
+    _run_lock: FileLock,
+}
+
+impl ScheduledAlbum {
+    pub fn track_count(&self) -> usize {
+        self.source.tracks.len()
+    }
+
+    pub fn allow_partial(&self) -> bool {
+        self.req.failure_policy == FailurePolicy::AllowPartialAlbum
+    }
+
+    pub fn convert_root(&self) -> PathBuf {
+        self.staging.root.join("converted")
+    }
+
+    pub fn planned_final_path(&self, track_id: &TrackId) -> Option<PathBuf> {
+        self.plan
+            .entries
+            .iter()
+            .find(|entry| &entry.track_id == track_id)
+            .map(|entry| entry.final_path.clone())
+    }
+}
+
+/// Run validation, staging setup, source materialization, and output planning.
+/// Track conversion is intentionally not performed here; the caller submits
+/// each ready track as an independent shared-pool work unit.
+pub async fn prepare_pipeline_item_for_scheduler(
+    req: PipelineRequest,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> ScheduledMaterialization {
+    let item_id = req.item_id.clone();
+    let mut stages = Vec::new();
+    let mut source: Option<PreparedSource> = None;
+    let mut plan: Option<AlbumPlan> = None;
+
+    if cancel.is_cancelled() {
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::Cancelled,
+        };
+        return ScheduledMaterialization::Finished(
+            finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+        );
+    }
+
+    if let Err(err) = validate_request(&req) {
+        let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(err.to_string()));
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::MaterializeFailed,
+        };
+        return ScheduledMaterialization::Finished(
+            finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+        );
+    }
+
+    let staging_parent = staging_parent_for(&req);
+    if let Err(err) = fs::create_dir_all(&staging_parent) {
+        let record = stage_record(
+            PipelineStage::Materialize,
+            StageOutcome::Failed(format!("could not create staging parent directory: {err}")),
+        );
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::MaterializeFailed,
+        };
+        return ScheduledMaterialization::Finished(
+            finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+        );
+    }
+
+    let run_lock = match acquire_run_lock(&staging_parent, &req.job_id, &req.item_id) {
+        Ok(lock) => lock,
+        Err(err) => {
+            let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(err.to_string()));
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed: Vec::new(),
+                stages,
+                reason: BlockReason::MaterializeFailed,
+            };
+            return ScheduledMaterialization::Finished(
+                finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+            );
+        }
+    };
+
+    let staging_root = staging_parent.join(format!(
+        "{}-{}",
+        sanitize_component(&req.job_id),
+        sanitize_component(&req.item_id)
+    ));
+    let _ = delete_stale_staging_dir(&staging_root);
+    let staging = StagingDir::new(staging_root, req.job_id.clone());
+
+    if let Err(err) = fs::create_dir_all(&staging.root) {
+        let record = stage_record(
+            PipelineStage::Materialize,
+            StageOutcome::Failed(format!("could not create staging directory: {err}")),
+        );
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::MaterializeFailed,
+        };
+        return ScheduledMaterialization::Finished(
+            finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+        );
+    }
+
+    emit_stage_started(reporter, &item_id, PipelineStage::Materialize).await;
+    let materialized = match detect_source_kind(&req) {
+        Ok(kind) => match materializer_for(kind) {
+            Ok(materializer) => {
+                materializer
+                    .materialize(&req, &staging, runner, Some(reporter), tool_paths, cancel)
+                    .await
+            }
+            Err(err) => Err(MaterializeError::Parse(err.to_string())),
+        },
+        Err(err) => Err(MaterializeError::Parse(err.to_string())),
+    };
+
+    let mut prepared = match materialized {
+        Ok(prepared) => {
+            let record = stage_record(PipelineStage::Materialize, StageOutcome::Ok);
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            prepared
+        }
+        Err(err) => {
+            let reason = if matches!(err, MaterializeError::Cancelled) {
+                BlockReason::Cancelled
+            } else {
+                BlockReason::MaterializeFailed
+            };
+            let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(err.to_string()));
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed: Vec::new(),
+                stages,
+                reason,
+            };
+            return ScheduledMaterialization::Finished(
+                finalize_report(&req, reporter, None, None, None, None, outcome).await,
+            );
+        }
+    };
+
+    if cancel.is_cancelled() {
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::Cancelled,
+        };
+        return ScheduledMaterialization::Finished(
+            finalize_report(&req, reporter, Some(prepared), None, None, None, outcome).await,
+        );
+    }
+
+    enrich_source_with_label_info(&mut prepared, &req.container);
+
+    emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
+    let album_plan = match plan_outputs(&prepared, &req) {
+        Ok(album_plan) => {
+            let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Ok);
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            album_plan
+        }
+        Err(err) => {
+            let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(err.to_string()));
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed: Vec::new(),
+                stages,
+                reason: BlockReason::PlanFailed,
+            };
+            return ScheduledMaterialization::Finished(
+                finalize_report(&req, reporter, Some(prepared), None, None, None, outcome).await,
+            );
+        }
+    };
+
+    ScheduledMaterialization::Ready(ScheduledAlbum {
+        item_id,
+        req,
+        staging,
+        source: prepared,
+        plan: album_plan,
+        stages,
+        _run_lock: run_lock,
+    })
+}
+
+/// Encode one planned track. The caller controls scheduling; this function only
+/// realizes the selected track, runs the planner-selected command chain, and
+/// returns a deterministic record/artifact pair.
+pub async fn encode_track_for_scheduler(
+    track_index: usize,
+    track: PreparedTrack,
+    final_path: PathBuf,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    reporter: &dyn PipelineReporter,
+    cancel: CancellationToken,
+) -> Result<ScheduledTrackOutput, String> {
+    convert_one_track_work(
+        track_index,
+        track,
+        final_path,
+        req,
+        staging_root,
+        staging_job,
+        convert_root,
+        tool_paths,
+        cancel,
+        Some(reporter),
+    )
+    .await
+}
+
+/// Realize one image-segment or SACD track as its own scheduler work unit.
+/// Failures become normal failed track outputs so album policy, logging, and
+/// durable reports stay deterministic.
+pub async fn realize_track_for_scheduler(
+    track_index: usize,
+    track: PreparedTrack,
+    final_path: PathBuf,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    reporter: &dyn PipelineReporter,
+    cancel: CancellationToken,
+) -> Result<ScheduledRealizedTrack, ScheduledTrackOutput> {
+    let staging = StagingDir::borrowed(staging_root.clone(), staging_job.clone());
+    let runner = RealToolRunner::new(tool_paths);
+    let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
+    let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, Some(reporter));
+    match realize_track(
+        &track.source_ref,
+        &req,
+        &staging,
+        &runner,
+        &cancel,
+        Some(&mut progress_tracker),
+    )
+    .await
+    {
+        Ok(realized_path) => Ok(ScheduledRealizedTrack {
+            index: track_index,
+            track,
+            final_path,
+            realized_path,
+            req,
+            staging_root,
+            staging_job,
+            convert_root,
+            cancel,
+        }),
+        Err(err) => {
+            let record = failed_track_record(&track, None, Some(staged_path), Vec::new(), err.to_string());
+            Err(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_written_by_plan: false })
+        }
+    }
+}
+
+/// Encode a track that a prior scheduler work unit already realized. This is
+/// used for CUE segment splits and SACD track extraction so realization and
+/// encoding can occupy independent shared-pool slots.
+pub async fn encode_realized_track_for_scheduler(
+    realized: ScheduledRealizedTrack,
+    tool_paths: HashMap<String, PathBuf>,
+    reporter: &dyn PipelineReporter,
+) -> Result<ScheduledTrackOutput, String> {
+    let runner = RealToolRunner::new(tool_paths.clone());
+    let staged_path = staged_audio_path(
+        &realized.convert_root,
+        &realized.final_path,
+        &realized.track.id,
+        &realized.req.settings.target_format,
+    );
+    let mut progress_tracker = OperationProgressTracker::new(realized.req.item_id.clone(), PipelineStage::Convert, Some(reporter));
+
+    if let Some(parent) = staged_path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            let record = failed_track_record(
+                &realized.track,
+                Some(realized.realized_path),
+                Some(staged_path),
+                Vec::new(),
+                format!("could not create output directory: {err}"),
+            );
+            return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_written_by_plan: false });
+        }
+    }
+
+    let bytes_in = file_len(&realized.realized_path);
+    let executed = execute_planned_track_conversion(
+        &realized.req,
+        &realized.track,
+        &realized.realized_path,
+        &staged_path,
+        &realized.convert_root,
+        &runner,
+        &realized.cancel,
+        &tool_paths,
+        &mut progress_tracker,
+        0.0,
+        1.0,
+    )
+    .await;
+
+    match executed {
+        Ok(executed) => {
+            let bytes_out = file_len(&staged_path);
+            if bytes_out.unwrap_or(0) == 0 {
+                let error = format!("planner did not produce output: {}", staged_path.display());
+                let record = failed_track_record(
+                    &realized.track,
+                    Some(realized.realized_path),
+                    Some(staged_path),
+                    executed.commands,
+                    error,
+                );
+                Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_written_by_plan: false })
+            } else {
+                let record = TrackRecord {
+                    track_id: realized.track.id.clone(),
+                    outcome: TrackOutcome::Ok,
+                    source_ref: realized.track.source_ref.clone(),
+                    realized_input: Some(realized.realized_path),
+                    output_file: Some(staged_path.clone()),
+                    commands: executed.commands,
+                    bytes_in,
+                    bytes_out,
+                    duration: Some(executed.elapsed),
+                };
+                let artifact = TrackArtifact {
+                    track_id: realized.track.id.clone(),
+                    staged_path,
+                    final_path: realized.final_path,
+                    samples: realized.track.expected_samples,
+                    metadata_written_by_plan: executed.metadata_written_by_plan,
+                };
+                Ok(ScheduledTrackOutput { index: realized.index, record, artifact: Some(artifact), ok: true, metadata_written_by_plan: executed.metadata_written_by_plan })
+            }
+        }
+        Err(err) => {
+            let commands = command_from_convert_error(&err);
+            let record = failed_track_record(
+                &realized.track,
+                Some(realized.realized_path),
+                Some(staged_path),
+                commands,
+                err.to_string(),
+            );
+            Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_written_by_plan: false })
+        }
+    }
+}
+
+fn push_stage_and_reaggregate(mut outcome: AlbumOutcome, record: StageRecord, _policy: FailurePolicy) -> AlbumOutcome {
+    push_stage(&mut outcome, record);
+    outcome
+}
+
+fn convert_result_from_scheduled_outputs(
+    source: &PreparedSource,
+    outputs: Vec<ScheduledTrackOutput>,
+    req: &PipelineRequest,
+) -> ConvertStageResult {
+    let mut records_by_index: Vec<Option<TrackRecord>> = vec![None; source.tracks.len()];
+    let mut artifacts_by_index: Vec<Option<TrackArtifact>> = vec![None; source.tracks.len()];
+    for output in outputs {
+        if output.index < records_by_index.len() {
+            records_by_index[output.index] = Some(output.record);
+            artifacts_by_index[output.index] = output.artifact;
+        }
+    }
+
+    let mut records = Vec::with_capacity(source.tracks.len());
+    let mut artifacts = Vec::new();
+    for (index, track) in source.tracks.iter().enumerate() {
+        if let Some(record) = records_by_index.get_mut(index).and_then(Option::take) {
+            records.push(record);
+        } else {
+            records.push(failed_track_record(
+                track,
+                None,
+                None,
+                Vec::new(),
+                "track worker did not produce a result".to_string(),
+            ));
+        }
+        if let Some(artifact) = artifacts_by_index.get_mut(index).and_then(Option::take) {
+            artifacts.push(artifact);
+        }
+    }
+
+    let failed = records.iter().any(|record| matches!(record.outcome, TrackOutcome::Err(_)));
+    ConvertStageResult {
+        tracks: records,
+        artifacts: ArtifactSet {
+            audio: AudioArtifacts::Tracks(artifacts),
+            sidecars: Vec::new(),
+        },
+        record: stage_record(
+            PipelineStage::Convert,
+            if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
+                StageOutcome::Failed("one or more tracks failed".to_string())
+            } else {
+                StageOutcome::Ok
+            },
+        ),
+    }
+}
+
+/// Run album-level stages after every scheduled track has completed. This is
+/// the post-processing gate for merge, metadata, ReplayGain, feature analysis,
+/// publish, and durable log. Album-mode ReplayGain can only enter here because
+/// the scheduler calls this function after all track work has reported back.
+pub async fn finish_pipeline_album_for_scheduler(
+    album: ScheduledAlbum,
+    track_outputs: Vec<ScheduledTrackOutput>,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+) -> PipelineReport {
+    let req = album.req;
+    let item_id = req.item_id.clone();
+    let staging = album.staging;
+    let source_value = album.source;
+    let plan_value = album.plan;
+    let mut stages = album.stages;
+    let source = Some(source_value.clone());
+    let plan = Some(plan_value.clone());
+    let mut published = None;
+
+    emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
+    let converted = convert_result_from_scheduled_outputs(&source_value, track_outputs, &req);
+    emit_stage_finished(reporter, &item_id, converted.record.clone()).await;
+    stages.push(converted.record.clone());
+    let tracks = converted.tracks.clone();
+    let mut artifacts = Some(converted.artifacts);
+
+    let mut current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+    if cancel.is_cancelled() {
+        current_outcome = cancelled_outcome_from(current_outcome);
+        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+    }
+    if matches!(current_outcome, AlbumOutcome::Partial { .. })
+        && artifacts.as_ref().map(audio_artifact_count).unwrap_or(0) == 0
+    {
+        current_outcome = AlbumOutcome::Blocked {
+            successful: successful_tracks_from(&current_outcome),
+            failed: failed_tracks_from(&current_outcome),
+            stages: stages_from(&current_outcome),
+            reason: BlockReason::TrackFailures,
+        };
+    }
+    if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+    }
+
+    if req.merge {
+        emit_stage_started(reporter, &item_id, PipelineStage::Merge).await;
+        match merge_tracks(artifacts.take().expect("artifacts present"), &req, &staging, runner, cancel).await {
+            Ok((merged_artifacts, record)) => {
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+                artifacts = Some(merged_artifacts);
+            }
+            Err(err) => {
+                let record = stage_record(PipelineStage::Merge, StageOutcome::Failed(err.to_string()));
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+                current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+            }
+        }
+    } else {
+        let record = stage_record(PipelineStage::Merge, StageOutcome::Skipped);
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+    }
+
+    if req.stages.metadata == StageRequirement::Enabled {
+        emit_stage_started(reporter, &item_id, PipelineStage::Metadata).await;
+        if planner_metadata_already_satisfied(artifacts.as_ref().expect("artifacts present"), &req) {
+            let record = stage_record(
+                PipelineStage::Metadata,
+                StageOutcome::Skipped,
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+        } else {
+            match apply_metadata(artifacts.as_ref().expect("artifacts present"), source.as_ref().expect("source present"), &req, runner, cancel).await {
+                Ok(record) => {
+                    emit_stage_finished(reporter, &item_id, record.clone()).await;
+                    stages.push(record);
+                }
+                Err(err) => {
+                    let record = stage_record(PipelineStage::Metadata, StageOutcome::Failed(err.to_string()));
+                    emit_stage_finished(reporter, &item_id, record.clone()).await;
+                    stages.push(record);
+                    current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                    return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                }
+            }
+        }
+    } else {
+        let record = stage_record(PipelineStage::Metadata, StageOutcome::Skipped);
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+    }
+
+    if req.stages.replaygain == StageRequirement::Enabled {
+        emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
+        match apply_replaygain(artifacts.as_ref().expect("artifacts present"), &req, runner, cancel).await {
+            Ok(record) => {
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+            }
+            Err(err) => {
+                let record = stage_record(PipelineStage::ReplayGain, StageOutcome::Failed(err.to_string()));
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+                current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+            }
+        }
+    } else {
+        let record = stage_record(PipelineStage::ReplayGain, StageOutcome::Skipped);
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+    }
+
+    current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+    if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+    }
+
+    if req.stages.features == StageRequirement::Enabled {
+        emit_stage_started(reporter, &item_id, PipelineStage::Features).await;
+        match run_features(
+            artifacts.take().expect("artifacts present"),
+            &current_outcome,
+            source.as_ref().expect("source present"),
+            &req,
+            &staging,
+            runner,
+            cancel,
+        )
+        .await
+        {
+            Ok((feature_artifacts, record)) => {
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+                artifacts = Some(feature_artifacts);
+            }
+            Err(err) => {
+                let record = stage_record(PipelineStage::Features, StageOutcome::Failed(err.to_string()));
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+                current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+            }
+        }
+    } else {
+        let record = stage_record(PipelineStage::Features, StageOutcome::Skipped);
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+    }
+
+    current_outcome = aggregate_album_outcome(tracks, stages, req.failure_policy);
+    if cancel.is_cancelled() {
+        current_outcome = cancelled_outcome_from(current_outcome);
+        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+    }
+    if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+    }
+
+    emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
+    match artifacts
+        .as_ref()
+        .ok_or(PublishError::StagingMissing)
+        .and_then(|artifact_set| build_publish_plan(artifact_set, &req))
+        .and_then(|publish_plan| publish_album_output(staging, &publish_plan, req.publish.clone()))
+    {
+        Ok(album) => {
+            let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            current_outcome = push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
+            published = Some(album);
+        }
+        Err(err) => {
+            let record = stage_record(PipelineStage::Publish, StageOutcome::Failed(err.to_string()));
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            current_outcome = push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
+            current_outcome = AlbumOutcome::Blocked {
+                successful: successful_tracks_from(&current_outcome),
+                failed: failed_tracks_from(&current_outcome),
+                stages: stages_from(&current_outcome),
+                reason: BlockReason::PublishFailed,
+            };
+            return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        }
+    }
+
+    finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await
+}
+
 /// Run the staged pipeline for one queue item. `process_item` does not call
 /// this yet; PR 4 freezes this orchestration shape for later PRs.
 pub async fn run_pipeline_item(
@@ -3661,38 +4217,44 @@ pub async fn run_pipeline_item_with_tool_paths(
 
     if req.stages.metadata == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::Metadata).await;
-        match apply_metadata(
-            artifacts.as_ref().expect("artifacts present"),
-            source.as_ref().expect("source present"),
-            &req,
-            runner,
-            cancel,
-        )
-        .await
-        {
-            Ok(record) => {
-                emit_stage_finished(reporter, &item_id, record.clone()).await;
-                stages.push(record);
-            }
-            Err(err) => {
-                let record = stage_record(
-                    PipelineStage::Metadata,
-                    StageOutcome::Failed(err.to_string()),
-                );
-                emit_stage_finished(reporter, &item_id, record.clone()).await;
-                stages.push(record);
-                current_outcome =
-                    aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                return finalize_report(
-                    &req,
-                    reporter,
-                    source,
-                    plan,
-                    artifacts,
-                    published,
-                    current_outcome,
-                )
-                .await;
+        if planner_metadata_already_satisfied(artifacts.as_ref().expect("artifacts present"), &req) {
+            let record = stage_record(PipelineStage::Metadata, StageOutcome::Skipped);
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+        } else {
+            match apply_metadata(
+                artifacts.as_ref().expect("artifacts present"),
+                source.as_ref().expect("source present"),
+                &req,
+                runner,
+                cancel,
+            )
+            .await
+            {
+                Ok(record) => {
+                    emit_stage_finished(reporter, &item_id, record.clone()).await;
+                    stages.push(record);
+                }
+                Err(err) => {
+                    let record = stage_record(
+                        PipelineStage::Metadata,
+                        StageOutcome::Failed(err.to_string()),
+                    );
+                    emit_stage_finished(reporter, &item_id, record.clone()).await;
+                    stages.push(record);
+                    current_outcome =
+                        aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                    return finalize_report(
+                        &req,
+                        reporter,
+                        source,
+                        plan,
+                        artifacts,
+                        published,
+                        current_outcome,
+                    )
+                    .await;
+                }
             }
         }
     } else {
@@ -4167,7 +4729,7 @@ fn render_track_template(
     template: &str,
     source: &PreparedSource,
     track: &PreparedTrack,
-    format: AudioFormat,
+    format: &PlannerAudioFormat,
 ) -> Result<PathBuf, PlanError> {
     let title = track
         .metadata
@@ -4252,7 +4814,7 @@ fn render_track_template(
     rendered = rendered.replace("%ALBUM%", &album);
     rendered = rendered.replace("%TITLE_EXTRA%", &title_extra);
     rendered = rendered.replace("%DISC%", &disc.to_string());
-    rendered = rendered.replace("%FORMAT%", format.name());
+    rendered = rendered.replace("%FORMAT%", format.display_name());
     rendered = rendered.replace("%YEAR%", &year);
     rendered = rendered.replace("%GENRE%", &genre);
     rendered = rendered.replace("%COMPOSER%", &composer);
@@ -4275,7 +4837,7 @@ fn render_track_template(
     Ok(rel)
 }
 
-fn render_folder_template(template: &str, source: &PreparedSource, format: AudioFormat) -> PathBuf {
+fn render_folder_template(template: &str, source: &PreparedSource, format: &PlannerAudioFormat) -> PathBuf {
     let artist = source
         .album_metadata
         .album_artist
@@ -4338,7 +4900,7 @@ fn render_folder_template(template: &str, source: &PreparedSource, format: Audio
     rendered = rendered.replace("%YEAR%", &year);
     rendered = rendered.replace("%GENRE%", &genre);
     rendered = rendered.replace("%CATALOG%", &catalog);
-    rendered = rendered.replace("%FORMAT%", format.name());
+    rendered = rendered.replace("%FORMAT%", format.display_name());
     rendered = rendered.replace("%SAMPLERATE%", &sample_rate);
     rendered = rendered.replace("%BITDEPTH%", &bit_depth);
     rendered = resolve_extra_tokens(&rendered, None, &source.album_metadata.extra);
@@ -4576,7 +5138,7 @@ fn normalized_collision_key(path: &Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
 }
 
-fn append_default_extension(path: &mut PathBuf, format: AudioFormat) {
+fn append_default_extension(path: &mut PathBuf, format: &PlannerAudioFormat) {
     if path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -4604,7 +5166,7 @@ fn staged_audio_path(
     convert_root: &Path,
     final_path: &Path,
     id: &TrackId,
-    format: AudioFormat,
+    format: &PlannerAudioFormat,
 ) -> PathBuf {
     let file_stem = final_path
         .file_stem()
@@ -4619,128 +5181,11 @@ fn staged_audio_path(
     ))
 }
 
-fn encode_command(
-    input: &Path,
-    output: &Path,
-    req: &PipelineRequest,
-    source_sample_rate: u32,
-) -> Result<ToolCommand, ConvertError> {
-    // DSD sources (DSF/DFF) require sox for decimation to PCM.
-    let is_dsd = input
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| matches!(e.to_lowercase().as_str(), "dsf" | "dff"))
-        .unwrap_or(false);
-
-    if is_dsd {
-        return dsd_to_pcm_command(input, output, source_sample_rate);
+fn command_from_convert_error(err: &ConvertError) -> Vec<CommandRecord> {
+    match err {
+        ConvertError::Tool(tool_err) => command_from_tool_error(tool_err).into_iter().collect(),
+        _ => Vec::new(),
     }
-
-    let backend = match req.encode.backend {
-        EncodeBackend::Sox => BackendCrateKind::Sox,
-        EncodeBackend::Auto | EncodeBackend::Ffmpeg | EncodeBackend::BackendCrate => {
-            BackendCrateKind::FFmpeg
-        }
-    };
-    let settings = backend_settings(req);
-    let command = CommandBuilder::new(backend)
-        .build(input, output, &settings)
-        .map_err(|err| ConvertError::Backend(err.to_string()))?;
-    tool_command_from_backend(command)
-}
-
-/// Build a sox command for DSD→PCM conversion. Maps the source DSD rate
-/// to an appropriate PCM target rate and uses sox's very-high quality
-/// resampler (`rate -v`).
-fn dsd_to_pcm_command(
-    input: &Path,
-    output: &Path,
-    source_sample_rate: u32,
-) -> Result<ToolCommand, ConvertError> {
-    let target_rate = match source_sample_rate {
-        r if r <= 2_822_400 => 88_200,   // DSD64 → 88.2 kHz
-        r if r <= 5_644_800 => 176_400,  // DSD128 → 176.4 kHz
-        r if r <= 11_289_600 => 352_800, // DSD256 → 352.8 kHz
-        _ => 705_600,                    // DSD512/1024 → 705.6 kHz
-    };
-
-    Ok(ToolCommand {
-        binary: ToolBinary::Sox,
-        args: vec![
-            "-S".into(),
-            input.display().to_string(),
-            "-b".into(),
-            "24".into(),
-            output.display().to_string(),
-            "rate".into(),
-            "-v".into(),
-            target_rate.to_string(),
-        ],
-        secret_args: vec![],
-        cwd: None,
-        env: vec![],
-        timeout: Duration::from_secs(3600),
-    })
-}
-
-fn backend_settings(req: &PipelineRequest) -> BackendConversionSettings {
-    let mut settings = BackendConversionSettings::default();
-    settings.format = backend_audio_format(req.target_format);
-    settings.compression_level = req.encode.compression_level;
-    settings.mp3_bitrate = req.encode.bitrate;
-    if req.encode.bitrate.is_some() {
-        settings.mp3_mode = Some(tonepoet_backend::Mp3Mode::Cbr);
-    }
-    settings.dither_type = match req.encode.dither {
-        DitherPolicy::Off => Some(tonepoet_backend::DitherType::None),
-        DitherPolicy::On | DitherPolicy::Auto => None,
-    };
-    settings.overwrite = true;
-    settings
-}
-
-fn backend_audio_format(format: AudioFormat) -> tonepoet_backend::AudioFormat {
-    match format {
-        AudioFormat::Flac => tonepoet_backend::AudioFormat::Flac,
-        AudioFormat::Wav => tonepoet_backend::AudioFormat::Wav,
-        AudioFormat::Aiff => tonepoet_backend::AudioFormat::Aiff,
-        AudioFormat::WavPack => tonepoet_backend::AudioFormat::WavPack,
-        AudioFormat::Mp3 => tonepoet_backend::AudioFormat::Mp3,
-        AudioFormat::Aac => tonepoet_backend::AudioFormat::Aac,
-        AudioFormat::Opus => tonepoet_backend::AudioFormat::Opus,
-        AudioFormat::Alac => tonepoet_backend::AudioFormat::Alac,
-        // DSD formats don't map to a backend format yet — passthrough only.
-        AudioFormat::Dsf | AudioFormat::Dff => tonepoet_backend::AudioFormat::Flac, // placeholder
-    }
-}
-
-fn tool_command_from_backend(command: ConversionCommand) -> Result<ToolCommand, ConvertError> {
-    let binary = match command.program.as_str() {
-        "ffmpeg" => ToolBinary::Ffmpeg,
-        "sox" => ToolBinary::Sox,
-        other => {
-            return Err(ConvertError::Backend(format!(
-                "unsupported backend program: {other}"
-            )));
-        }
-    };
-    let env = command
-        .environment
-        .into_iter()
-        .map(|(key, value)| EnvVar {
-            key,
-            value: SecretString::new(value),
-            secret: false,
-        })
-        .collect();
-    Ok(ToolCommand {
-        binary,
-        args: command.arguments,
-        secret_args: Vec::new(),
-        cwd: None,
-        env,
-        timeout: command.expected_duration.unwrap_or(DEFAULT_CONVERT_TIMEOUT),
-    })
 }
 
 fn file_len(path: &Path) -> Option<u64> {
@@ -5417,13 +5862,8 @@ mod conversion_log_tests {
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
-            target_format: AudioFormat::Flac,
-            encode: EncodeOptions {
-                backend: EncodeBackend::Ffmpeg,
-                bitrate: Some(960),
-                compression_level: Some(8),
-                dither: DitherPolicy::Off,
-            },
+            settings: tonepoet_pipeline::PipelineSettings::default(),
+            worker_count: None,
             merge: false,
             output_root: PathBuf::from("/out"),
             naming: NamingPolicy {
@@ -5711,13 +6151,8 @@ mod naming_template_tests {
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
-            target_format: AudioFormat::Flac,
-            encode: EncodeOptions {
-                backend: EncodeBackend::Auto,
-                bitrate: None,
-                compression_level: None,
-                dither: DitherPolicy::Auto,
-            },
+            settings: tonepoet_pipeline::PipelineSettings::default(),
+            worker_count: None,
             merge: false,
             output_root: PathBuf::from("/out"),
             naming: NamingPolicy {
@@ -5779,7 +6214,7 @@ mod naming_template_tests {
     fn render_folder_template_preserves_template_slashes() {
         let source = template_source();
         assert_eq!(
-            render_folder_template("%ARTIST%/%ALBUM% (%YEAR%)", &source, AudioFormat::Flac),
+            render_folder_template("%ARTIST%/%ALBUM% (%YEAR%)", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("Miles Davis/A Tribute to Jack Johnson (1971)")
         );
     }
@@ -5789,7 +6224,7 @@ mod naming_template_tests {
         let mut source = template_source();
         source.album_metadata.date = None;
         assert_eq!(
-            render_folder_template("%ARTIST%/%ALBUM% (%YEAR%)", &source, AudioFormat::Flac),
+            render_folder_template("%ARTIST%/%ALBUM% (%YEAR%)", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("Miles Davis/A Tribute to Jack Johnson ()")
         );
     }
@@ -5805,7 +6240,7 @@ mod naming_template_tests {
             render_folder_template(
                 "%ARTIST%/%CATALOGNUMBER%/%ALBUM%",
                 &source,
-                AudioFormat::Flac
+                &tonepoet_pipeline::AudioFormat::Flac
             ),
             PathBuf::from("Miles Davis/CK_1234/A Tribute to Jack Johnson")
         );
@@ -5818,7 +6253,7 @@ mod naming_template_tests {
             "%NN% - %TITLE% - %YEAR% - %GENRE% - %CATALOG% - %SAMPLERATE% - %BITDEPTH% - %CATALOGNUMBER% - %NONEXISTENT%",
             &source,
             &source.tracks[0],
-            AudioFormat::Flac,
+            &tonepoet_pipeline::AudioFormat::Flac,
         )
         .unwrap();
         assert_eq!(
@@ -5842,7 +6277,7 @@ mod naming_template_tests {
         let mut source = template_source();
         source.album_metadata.album_artist = Some("Miles/Davis".to_string());
         assert_eq!(
-            render_folder_template("%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
+            render_folder_template("%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("Miles_Davis/A Tribute to Jack Johnson")
         );
     }
@@ -5866,7 +6301,7 @@ mod naming_template_tests {
         );
 
         assert_eq!(
-            render_folder_template("%COUNTRY%/%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
+            render_folder_template("%COUNTRY%/%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("Japan/Miles Davis/A Tribute to Jack Johnson")
         );
     }
@@ -5902,7 +6337,7 @@ mod naming_template_tests {
             Some("MFSL")
         );
         assert_eq!(
-            render_folder_template("%PRESSING%/%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
+            render_folder_template("%PRESSING%/%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("MFSL/Miles Davis/A Tribute to Jack Johnson")
         );
     }
@@ -5912,7 +6347,7 @@ mod naming_template_tests {
         let mut source = template_source();
         source.album_metadata.album_artist = Some("miles davis".to_string());
         assert_eq!(
-            render_folder_template("%ARTIST%/%ALBUM%", &source, AudioFormat::Flac),
+            render_folder_template("%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("Miles Davis/A Tribute to Jack Johnson")
         );
     }
@@ -5926,7 +6361,7 @@ mod naming_template_tests {
             "%ARTIST% - %TITLE%",
             &source,
             &source.tracks[0],
-            AudioFormat::Flac,
+            &tonepoet_pipeline::AudioFormat::Flac,
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("Bill Evans Trio - Right Off"));
@@ -5940,7 +6375,7 @@ mod naming_template_tests {
             "%ALBUM_ARTIST% - %TITLE%",
             &source,
             &source.tracks[0],
-            AudioFormat::Flac,
+            &tonepoet_pipeline::AudioFormat::Flac,
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("Miles Davis - Right Off"));
@@ -6084,7 +6519,7 @@ mod title_extra_tests {
         let mut source = template_source();
         source.album_metadata.album =
             Some("A Tribute to Jack Johnson (SME JSACD SRGS-4504) [ISO]".to_string());
-        let result = render_folder_template("%ARTIST% - %ALBUM%", &source, AudioFormat::Flac);
+        let result = render_folder_template("%ARTIST% - %ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac);
         // Without %TITLE_EXTRA%, album is unchanged (just sanitized)
         assert!(result
             .to_string_lossy()
@@ -6099,7 +6534,7 @@ mod title_extra_tests {
         let result = render_folder_template(
             "%ARTIST% - %ALBUM% {%TITLE_EXTRA%}",
             &source,
-            AudioFormat::Flac,
+            &tonepoet_pipeline::AudioFormat::Flac,
         );
         let s = result.to_string_lossy();
         assert!(
@@ -6122,7 +6557,7 @@ mod title_extra_tests {
             "%NN% - %TITLE% [%ALBUM%] {%TITLE_EXTRA%}",
             &source,
             &source.tracks[0],
-            AudioFormat::Flac,
+            &tonepoet_pipeline::AudioFormat::Flac,
         )
         .unwrap();
         let s = result.to_string_lossy();

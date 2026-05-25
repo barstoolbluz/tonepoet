@@ -792,6 +792,7 @@ fn build_pipeline_request_template(
     };
 
     Some(PipelineRequest {
+        worker_count: None,
         job_id: String::new(),     // filled per-item
         item_id: String::new(),    // filled per-item
         container: PathBuf::new(), // filled per-item
@@ -803,25 +804,14 @@ fn build_pipeline_request_template(
             cue_sidecar: cue_policy,
             track_selection,
         },
-        target_format: output_format,
-        encode: EncodeOptions {
-            backend: EncodeBackend::Auto,
-            bitrate: match &options.quality {
-                QualitySettings::Opus { bitrate, .. } => Some(*bitrate),
-                QualitySettings::Aac { bitrate, .. } => Some(*bitrate),
-                QualitySettings::Mp3 { bitrate_mode, .. } => match bitrate_mode {
-                    Mp3BitrateMode::Cbr { bitrate } => Some(*bitrate),
-                    Mp3BitrateMode::Vbr { quality } => Some(*quality as u32),
-                    Mp3BitrateMode::Abr { bitrate } => Some(*bitrate),
-                },
-                _ => None,
-            },
-            compression_level: match &options.quality {
-                QualitySettings::Flac { compression_level } => Some(*compression_level),
-                _ => None,
-            },
-            dither: DitherPolicy::Auto,
-        },
+        settings: options
+            .pipeline_settings
+            .clone()
+            .unwrap_or_else(|| {
+                let mut s = tonepoet_pipeline::PipelineSettings::default();
+                s.target_format = tonepoet_pipeline::AudioFormat::Flac;
+                s
+            }),
         merge,
         output_root: output_root.clone(),
         naming: NamingPolicy {
