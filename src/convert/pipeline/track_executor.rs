@@ -757,7 +757,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                 finalization,
                 ..
             } => {
-                let records = execute_commands(
+                match execute_commands(
                     commands,
                     runner,
                     cancel,
@@ -767,11 +767,16 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                     1.0,
                     "synthetic track".to_string(),
                 )
-                .await?;
-                if let Some(finalization) = finalization {
-                    apply_finalization(finalization)?;
+                .await
+                {
+                    Ok(records) => {
+                        if let Some(finalization) = finalization {
+                            apply_finalization(finalization)?;
+                        }
+                        Ok(records)
+                    }
+                    Err(err) => Err(err),
                 }
-                Ok(records)
             }
             PlanAction::PassthroughCopy { .. } => unreachable!("synthetic chain is executable"),
         };
@@ -929,9 +934,9 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                 failed_step + 1
             )));
             assert_failed_scheduled_shape(&scheduled, failed_step, failed_step + 1);
-            assert!(chain.all_cleanup_paths_absent(), "planner-declared files are gone");
+            assert!(chain.all_cleanup_paths_absent(), "planner-declared files are gone (failed_step={failed_step})");
             assert!(!chain.final_output.exists(), "failed chain did not publish final output");
-            assert!(!chain.work_dir.exists(), "track work dir was deleted");
+            assert!(!chain.work_dir.exists(), "track work dir was deleted (failed_step={failed_step})");
             assert_transcript_prefix(&runner, failed_step + 1);
         }
     }

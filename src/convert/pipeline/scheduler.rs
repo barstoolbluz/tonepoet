@@ -711,7 +711,7 @@ mod chunk_2_1_3_worker_recovery_tests {
                     successes.insert(index);
                 }
                 Err(err) => {
-                    assert!(err.contains("track failed"));
+                    assert!(err.contains("tool exited non-zero"), "got: {err}");
                     failures += 1;
                 }
             }
