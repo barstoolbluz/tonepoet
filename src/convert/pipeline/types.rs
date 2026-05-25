@@ -108,6 +108,9 @@ pub struct PublishPolicy {
 pub enum OverwritePolicy {
     FailIfExists,
     ReplaceWithBackup,
+    SkipIfManifestMatch,
+    VerifyIfManifestMatch,
+    AlwaysRedo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

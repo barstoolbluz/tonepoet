@@ -11,6 +11,7 @@ description = "Standalone CLI + TUI audio conversion toolkit"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+tonepoet-pipeline = { path = "tonepoet-pipeline", features = ["serde"] }
 fs2 = "0.4"
 tonepoet-backend = { path = "crates/tonepoet-backend" }
 tonepoet-features = { path = "crates/tonepoet-features" }
@@ -53,9 +54,13 @@ rustfft = "6"
 base64 = "0.22"
 rayon = "1"
 sha2 = "0.10"
+hex = "0.4"
+libc = "0.2"
 md-5 = "0.10"
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
 # Tokio's virtual-clock helpers (`time::pause`, `time::advance`) live
 # behind the `test-util` feature and aren't in `features = ["full"]`.
 # Used by the MB rate limiter sequencing test.

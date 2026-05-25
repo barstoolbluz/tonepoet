@@ -2392,16 +2392,19 @@ dependencies = [
  "ffmpeg-next",
  "fs2",
  "fuzzy-matcher",
+ "hex",
  "html-escape",
  "humansize",
  "indicatif",
  "lazy_static",
+ "libc",
  "lofty",
  "log",
  "md-5",
  "metaflac",
  "num_cpus",
  "once_cell",
+ "proc-macro2",
  "ratatui",
  "rayon",
  "regex",
@@ -2412,6 +2415,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "syn",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2419,6 +2423,7 @@ dependencies = [
  "toml",
  "tonepoet-backend",
  "tonepoet-features",
+ "tonepoet-pipeline",
  "tonepoet-wizard",
  "trash",
  "uuid",
@@ -2463,6 +2468,8 @@ name = "tonepoet-pipeline"
 version = "0.10.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

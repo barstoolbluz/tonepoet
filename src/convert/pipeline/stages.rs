@@ -3177,7 +3177,28 @@ pub fn publish_album_output(
                     plan.album_dir.display().to_string(),
                 ));
             }
-            OverwritePolicy::ReplaceWithBackup => {
+            OverwritePolicy::ReplaceWithBackup | OverwritePolicy::AlwaysRedo => {
+                if let Err(err) = write_publish_marker(&marker_path, &backup_dir) {
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    return Err(err);
+                }
+                fs::rename(&plan.album_dir, &backup_dir).map_err(|err| {
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    let _ = fs::remove_file(&marker_path);
+                    PublishError::BackupFailed(format!(
+                        "{} -> {}: {err}",
+                        plan.album_dir.display(),
+                        backup_dir.display()
+                    ))
+                })?;
+                backup_made = true;
+            }
+            // Manifest-based policies are handled by the orchestrator rerun gate
+            // before reaching publish. If we get here, proceed with publish.
+            OverwritePolicy::SkipIfManifestMatch
+            | OverwritePolicy::VerifyIfManifestMatch => {
+                // The rerun gate already decided to proceed (not skip).
+                // Treat as replace-with-backup for the publish step.
                 if let Err(err) = write_publish_marker(&marker_path, &backup_dir) {
                     let _ = fs::remove_dir_all(&temp_dir);
                     return Err(err);
