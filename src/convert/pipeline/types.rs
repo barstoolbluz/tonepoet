@@ -509,3 +509,52 @@ impl Drop for StagingDir {
         }
     }
 }
+
+#[cfg(test)]
+mod chunk_2_1_3_staging_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn armed_staging_dir_drop_deletes_partial_materialization_tree() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging_parent = temp.path().join(".tonepoet-staging");
+        let staging_root = staging_parent.join("job-item");
+        let partial = staging_root.join("materialized").join("partial.flac");
+        std::fs::create_dir_all(partial.parent().unwrap()).expect("partial parent");
+        std::fs::write(&partial, b"partial").expect("partial file");
+
+        {
+            let _staging = StagingDir::new(staging_root.clone(), "job".to_string());
+        }
+
+        assert!(!staging_root.exists());
+        assert!(!staging_parent.exists());
+    }
+
+    #[test]
+    fn borrowed_staging_handle_does_not_delete_owner_tree() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging_root = temp.path().join("staging");
+        let file = staging_root.join("converted").join("01.flac");
+        std::fs::create_dir_all(file.parent().unwrap()).expect("converted parent");
+        std::fs::write(&file, b"audio").expect("audio file");
+
+        {
+            let _borrowed = StagingDir::borrowed(staging_root.clone(), "job".to_string());
+        }
+
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn disarmed_staging_survives_successful_publish_boundary() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging_root = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        let mut staging = StagingDir::new(staging_root.clone(), "job".to_string());
+        staging.disarm();
+        drop(staging);
+
+        assert!(staging_root.exists());
+    }
+}

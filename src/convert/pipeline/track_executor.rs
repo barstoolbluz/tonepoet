@@ -653,3 +653,365 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
+    use super::*;
+    use crate::convert::pipeline::stages::ScheduledTrackOutput;
+    use crate::convert::pipeline::tool::blocking_test_runner::{
+        tool_gate, BlockingToolRunner, ToolBehavior,
+    };
+    use crate::convert::pipeline::types::{
+        PipelineStage, TrackId, TrackMetadata, TrackOutcome, TrackRecord, TrackSourceRef,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+    use tonepoet_pipeline::plan::ConversionPlan;
+    use tonepoet_pipeline::{Finalization, InputSource, OutputSink, PlanAction, ToolIdentifier};
+
+    struct SyntheticChain {
+        _temp: TempDir,
+        work_dir: PathBuf,
+        stage1: PathBuf,
+        stage2: PathBuf,
+        final_work: PathBuf,
+        final_output: PathBuf,
+        plan: ConversionPlan,
+    }
+
+    impl SyntheticChain {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let work_dir = temp.path().join(".track-0001.work");
+            let stage1 = work_dir.join("stage-1.wav");
+            let stage2 = work_dir.join("stage-2.wav");
+            let final_work = work_dir.join("final-work.flac");
+            let final_output = temp.path().join("01 - output.flac");
+            let plan = ConversionPlan::execute_with_cleanup(
+                vec![
+                    PlannedCommand::new(
+                        ToolIdentifier::Ssrc,
+                        vec!["step-1".to_string()],
+                        InputSource::Path(temp.path().join("source.flac")),
+                        OutputSink::Path(stage1.clone()),
+                        Some(Duration::from_secs(1)),
+                        "decode to pcm",
+                    ),
+                    PlannedCommand::new(
+                        ToolIdentifier::Ssrc,
+                        vec!["step-2".to_string()],
+                        InputSource::Path(stage1.clone()),
+                        OutputSink::Path(stage2.clone()),
+                        Some(Duration::from_secs(1)),
+                        "resample pcm",
+                    ),
+                    PlannedCommand::new(
+                        ToolIdentifier::Ssrc,
+                        vec!["step-3".to_string()],
+                        InputSource::Path(stage2.clone()),
+                        OutputSink::Path(final_work.clone()),
+                        Some(Duration::from_secs(1)),
+                        "encode final",
+                    ),
+                ],
+                vec![stage1.clone(), stage2.clone(), final_work.clone()],
+                Some(Finalization::AtomicRename {
+                    from: final_work.clone(),
+                    to: final_output.clone(),
+                }),
+            );
+            Self {
+                _temp: temp,
+                work_dir,
+                stage1,
+                stage2,
+                final_work,
+                final_output,
+                plan,
+            }
+        }
+
+        fn all_cleanup_paths_absent(&self) -> bool {
+            self.plan.cleanup_paths().iter().all(|path| !path.exists())
+        }
+    }
+
+    async fn execute_synthetic_plan(
+        chain: &SyntheticChain,
+        runner: &dyn ToolRunner,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<CommandRecord>, ConvertError> {
+        reset_track_work_dir(&chain.work_dir)?;
+        cleanup_paths(chain.plan.cleanup_paths());
+        let mut progress = OperationProgressTracker::new(
+            "chunk-2-1-3".to_string(),
+            PipelineStage::Convert,
+            None,
+        );
+
+        let result = match &chain.plan.action {
+            PlanAction::Execute {
+                commands,
+                finalization,
+                ..
+            } => {
+                let records = execute_commands(
+                    commands,
+                    runner,
+                    cancel,
+                    &HashMap::new(),
+                    &mut progress,
+                    0.0,
+                    1.0,
+                    "synthetic track".to_string(),
+                )
+                .await?;
+                if let Some(finalization) = finalization {
+                    apply_finalization(finalization)?;
+                }
+                Ok(records)
+            }
+            PlanAction::PassthroughCopy { .. } => unreachable!("synthetic chain is executable"),
+        };
+
+        match result {
+            Ok(records) => {
+                cleanup_paths(chain.plan.cleanup_paths());
+                cleanup_track_work_dir(&chain.work_dir);
+                Ok(records)
+            }
+            Err(err) => {
+                cleanup_paths(chain.plan.cleanup_paths());
+                cleanup_track_work_dir(&chain.work_dir);
+                Err(err)
+            }
+        }
+    }
+
+    fn success_behavior_for(path: &Path) -> ToolBehavior {
+        ToolBehavior::SucceedAndWrite {
+            path: path.to_path_buf(),
+            bytes: b"audio".to_vec(),
+        }
+    }
+
+    fn assert_transcript_prefix(runner: &BlockingToolRunner, invoked: usize) {
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), invoked);
+        for (index, record) in transcript.iter().enumerate() {
+            assert_eq!(record.binary, ToolBinary::Ssrc);
+            assert!(
+                record
+                    .sanitized_args
+                    .iter()
+                    .any(|arg| arg == &format!("step-{}", index + 1)),
+                "transcript entry {} should contain step argument; got {:?}",
+                index + 1,
+                record.sanitized_args
+            );
+        }
+    }
+
+    fn synthetic_track(chain: &SyntheticChain) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref: TrackSourceRef::StagedFile(chain._temp.path().join("source.flac")),
+            metadata: TrackMetadata {
+                title: Some("Synthetic Track".to_string()),
+                track_number: Some(1),
+                ..TrackMetadata::default()
+            },
+            expected_samples: Some(44_100),
+            sample_rate: 44_100,
+            bit_depth: Some(16),
+        }
+    }
+
+    fn scheduled_failure_output_for_chain(
+        chain: &SyntheticChain,
+        track: &PreparedTrack,
+        error: &ConvertError,
+        commands: Vec<CommandRecord>,
+    ) -> ScheduledTrackOutput {
+        ScheduledTrackOutput {
+            index: 0,
+            record: TrackRecord {
+                track_id: track.id.clone(),
+                outcome: TrackOutcome::Err(error.to_string()),
+                source_ref: track.source_ref.clone(),
+                realized_input: Some(chain._temp.path().join("source.flac")),
+                output_file: Some(chain.final_output.clone()),
+                commands,
+                bytes_in: None,
+                bytes_out: None,
+                duration: None,
+            },
+            artifact: None,
+            ok: false,
+            metadata_written_by_plan: false,
+        }
+    }
+
+    fn assert_failed_scheduled_shape(
+        output: &ScheduledTrackOutput,
+        failed_step: usize,
+        expected_commands: usize,
+    ) {
+        assert_eq!(output.index, 0);
+        assert!(!output.ok);
+        assert!(output.artifact.is_none());
+        assert!(matches!(output.record.outcome, TrackOutcome::Err(_)));
+        assert_eq!(output.record.commands.len(), expected_commands);
+        assert!(
+            output
+                .record
+                .commands
+                .iter()
+                .enumerate()
+                .all(|(index, record)| record
+                    .sanitized_args
+                    .iter()
+                    .any(|arg| arg == &format!("step-{}", index + 1))),
+            "scheduled failure output preserved command order up to failed step"
+        );
+        assert!(
+            matches!(&output.record.outcome, TrackOutcome::Err(message) if message.contains(&format!("planned command {} failed", failed_step + 1)))
+        );
+    }
+
+    #[tokio::test]
+    async fn three_step_chain_cleans_intermediates_at_each_failure_position() {
+        for failed_step in 0..3 {
+            let chain = SyntheticChain::new();
+            let mut behaviors = Vec::new();
+            for step in 0..3 {
+                if step == failed_step {
+                    let failed_path = match step {
+                        0 => &chain.stage1,
+                        1 => &chain.stage2,
+                        _ => &chain.final_work,
+                    };
+                    behaviors.push(ToolBehavior::FailAfterWriting {
+                        path: failed_path.clone(),
+                        bytes: b"partial".to_vec(),
+                        stderr: format!("step {} failed", step + 1),
+                    });
+                    break;
+                }
+                let path = match step {
+                    0 => &chain.stage1,
+                    1 => &chain.stage2,
+                    _ => &chain.final_work,
+                };
+                behaviors.push(success_behavior_for(path));
+            }
+            let runner = BlockingToolRunner::with_behaviors(behaviors);
+            let cancel = CancellationToken::new();
+
+            let err = execute_synthetic_plan(&chain, &runner, &cancel)
+                .await
+                .expect_err("failed step should abort chain");
+            let scheduled = scheduled_failure_output_for_chain(
+                &chain,
+                &synthetic_track(&chain),
+                &err,
+                runner.transcript(),
+            );
+
+            assert!(err.to_string().contains(&format!(
+                "planned command {} failed",
+                failed_step + 1
+            )));
+            assert_failed_scheduled_shape(&scheduled, failed_step, failed_step + 1);
+            assert!(chain.all_cleanup_paths_absent(), "planner-declared files are gone");
+            assert!(!chain.final_output.exists(), "failed chain did not publish final output");
+            assert!(!chain.work_dir.exists(), "track work dir was deleted");
+            assert_transcript_prefix(&runner, failed_step + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn three_step_chain_success_keeps_final_and_deletes_work_files() {
+        let chain = SyntheticChain::new();
+        let runner = BlockingToolRunner::with_behaviors([
+            success_behavior_for(&chain.stage1),
+            success_behavior_for(&chain.stage2),
+            success_behavior_for(&chain.final_work),
+        ]);
+        let cancel = CancellationToken::new();
+
+        let records = execute_synthetic_plan(&chain, &runner, &cancel)
+            .await
+            .expect("all steps succeed");
+
+        assert_eq!(records.len(), 3);
+        assert_transcript_prefix(&runner, 3);
+        assert_eq!(std::fs::read(&chain.final_output).unwrap(), b"audio");
+        assert!(chain.all_cleanup_paths_absent());
+        assert!(!chain.work_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_first_command_cleans_partial_outputs() {
+        let chain = Arc::new(SyntheticChain::new());
+        let (gate, blocker) = tool_gate();
+        let runner = Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceedAndWrite {
+                gate: blocker,
+                path: chain.stage1.clone(),
+                bytes: b"partial".to_vec(),
+            },
+        ]));
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run_chain = chain.clone();
+        let run_runner = runner.clone();
+        let handle = tokio::spawn(async move {
+            execute_synthetic_plan(run_chain.as_ref(), run_runner.as_ref(), &run_cancel).await
+        });
+
+        let release = gate.wait_started().await;
+        cancel.cancel();
+        let err = handle
+            .await
+            .expect("conversion task joins")
+            .expect_err("cancellation aborts command");
+
+        assert!(err.to_string().contains("cancelled"));
+        assert!(chain.all_cleanup_paths_absent());
+        assert!(!chain.final_output.exists());
+        assert!(!chain.work_dir.exists());
+        assert_transcript_prefix(&runner, 1);
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_command_one_and_two_skips_second_command() {
+        let chain = SyntheticChain::new();
+        let runner = BlockingToolRunner::with_behaviors([
+            ToolBehavior::SucceedAndWriteThenCancel {
+                path: chain.stage1.clone(),
+                bytes: b"stage1".to_vec(),
+            },
+            success_behavior_for(&chain.stage2),
+            success_behavior_for(&chain.final_work),
+        ]);
+        let cancel = CancellationToken::new();
+
+        let err = execute_synthetic_plan(&chain, &runner, &cancel)
+            .await
+            .expect_err("cancelled token aborts before command 2");
+
+        assert!(err.to_string().contains("cancelled"));
+        assert_transcript_prefix(&runner, 1);
+        assert!(chain.all_cleanup_paths_absent());
+        assert!(!chain.final_output.exists());
+        assert!(!chain.work_dir.exists());
+    }
+}

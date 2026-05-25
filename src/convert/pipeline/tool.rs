@@ -476,3 +476,429 @@ impl ToolRunner for RealToolRunner {
         }
     }
 }
+
+// ===========================================================================
+// Chunk 2.1.3 test runner: gated failure/cancellation coordination
+// ===========================================================================
+
+#[cfg(test)]
+pub(crate) mod blocking_test_runner {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::path::PathBuf;
+    use tokio::sync::oneshot;
+
+    /// Test-side handle for one blocked tool invocation.
+    pub(crate) struct ToolGate {
+        started: oneshot::Receiver<()>,
+        release: Option<oneshot::Sender<()>>,
+    }
+
+    impl ToolGate {
+        pub(crate) async fn wait_started(self) -> ToolGateRelease {
+            let ToolGate { started, release } = self;
+            let _ = started.await;
+            ToolGateRelease { release }
+        }
+    }
+
+    pub(crate) struct ToolGateRelease {
+        release: Option<oneshot::Sender<()>>,
+    }
+
+    impl ToolGateRelease {
+        pub(crate) fn release(mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    /// Runner-side blocker for one command. The test owns the paired [`ToolGate`].
+    pub(crate) struct ToolBlocker {
+        started: Option<oneshot::Sender<()>>,
+        release: oneshot::Receiver<()>,
+    }
+
+    pub(crate) fn tool_gate() -> (ToolGate, ToolBlocker) {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        (
+            ToolGate {
+                started: started_rx,
+                release: Some(release_tx),
+            },
+            ToolBlocker {
+                started: Some(started_tx),
+                release: release_rx,
+            },
+        )
+    }
+
+    pub(crate) enum ToolBehavior {
+        Succeed,
+        SucceedAndWrite { path: PathBuf, bytes: Vec<u8> },
+        SucceedAndWriteThenCancel { path: PathBuf, bytes: Vec<u8> },
+        FailWithStderr(String),
+        FailAfterWriting {
+            path: PathBuf,
+            bytes: Vec<u8>,
+            stderr: String,
+        },
+        BlockThenSucceed(ToolBlocker),
+        BlockThenFail {
+            gate: ToolBlocker,
+            stderr: String,
+        },
+        BlockThenSucceedAndWrite {
+            gate: ToolBlocker,
+            path: PathBuf,
+            bytes: Vec<u8>,
+        },
+    }
+
+    pub(crate) struct BlockingToolRunner {
+        behaviors: Mutex<VecDeque<ToolBehavior>>,
+        transcript: Mutex<Vec<CommandRecord>>,
+    }
+
+    impl BlockingToolRunner {
+        pub(crate) fn new() -> Self {
+            Self {
+                behaviors: Mutex::new(VecDeque::new()),
+                transcript: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn with_behaviors<I>(behaviors: I) -> Self
+        where
+            I: IntoIterator<Item = ToolBehavior>,
+        {
+            Self {
+                behaviors: Mutex::new(behaviors.into_iter().collect()),
+                transcript: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn push(&self, behavior: ToolBehavior) {
+            self.behaviors.lock().unwrap().push_back(behavior);
+        }
+
+        pub(crate) fn transcript(&self) -> Vec<CommandRecord> {
+            self.transcript.lock().unwrap().clone()
+        }
+
+        fn next_behavior(&self) -> ToolBehavior {
+            self.behaviors.lock().unwrap().pop_front().unwrap_or_else(|| {
+                panic!(
+                    "BlockingToolRunner behavior queue exhausted; enqueue one behavior per expected invocation"
+                )
+            })
+        }
+
+        fn record(cmd: &ToolCommand, exit: Option<ProcessExit>, stderr: &str) -> CommandRecord {
+            CommandRecord {
+                binary: cmd.binary,
+                sanitized_args: cmd.sanitized_args(),
+                cwd: cmd.cwd.clone(),
+                env_keys: cmd.env_keys(),
+                exit,
+                stdout_tail: String::new(),
+                stderr_tail: stderr.to_string(),
+                elapsed: Duration::ZERO,
+            }
+        }
+
+        fn start_record(&self, cmd: &ToolCommand) -> usize {
+            let mut transcript = self.transcript.lock().unwrap();
+            let index = transcript.len();
+            transcript.push(Self::record(cmd, None, ""));
+            index
+        }
+
+        fn set_record(&self, index: usize, record: CommandRecord) {
+            let mut transcript = self.transcript.lock().unwrap();
+            transcript[index] = record;
+        }
+
+        fn success_output(&self, index: usize, cmd: &ToolCommand) -> ToolOutput {
+            let record = Self::record(cmd, Some(ProcessExit::Code(0)), "");
+            self.set_record(index, record.clone());
+            ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: record,
+            }
+        }
+
+        fn failure_record(&self, index: usize, cmd: &ToolCommand, stderr: &str) -> CommandRecord {
+            let record = Self::record(cmd, Some(ProcessExit::Code(1)), stderr);
+            self.set_record(index, record.clone());
+            record
+        }
+
+        fn cancelled_record(&self, index: usize, cmd: &ToolCommand) -> CommandRecord {
+            let record = Self::record(cmd, None, "cancelled");
+            self.set_record(index, record.clone());
+            record
+        }
+
+        fn write_file(path: PathBuf, bytes: Vec<u8>) -> Result<(), ToolRunnerError> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(ToolRunnerError::Io)?;
+            }
+            fs::write(path, bytes).map_err(ToolRunnerError::Io)
+        }
+
+        async fn wait_on_gate(
+            mut gate: ToolBlocker,
+            cancel: &CancellationToken,
+        ) -> Result<(), ()> {
+            if let Some(started) = gate.started.take() {
+                let _ = started.send(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => Err(()),
+                released = &mut gate.release => match released {
+                    Ok(()) => Ok(()),
+                    Err(_) if cancel.is_cancelled() => Err(()),
+                    Err(_) => panic!(
+                        "BlockingToolRunner gate sender dropped without release or cancellation; call ToolGateRelease::release() for success paths"
+                    ),
+                },
+            }
+        }
+    }
+
+    impl Default for BlockingToolRunner {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[async_trait]
+    impl ToolRunner for BlockingToolRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            let behavior = self.next_behavior();
+            let slot = self.start_record(&cmd);
+
+            if cancel.is_cancelled() {
+                return Err(ToolRunnerError::Cancelled {
+                    command: self.cancelled_record(slot, &cmd),
+                });
+            }
+
+            match behavior {
+                ToolBehavior::Succeed => Ok(self.success_output(slot, &cmd)),
+                ToolBehavior::SucceedAndWrite { path, bytes } => {
+                    Self::write_file(path, bytes)?;
+                    Ok(self.success_output(slot, &cmd))
+                }
+                ToolBehavior::SucceedAndWriteThenCancel { path, bytes } => {
+                    Self::write_file(path, bytes)?;
+                    cancel.cancel();
+                    Ok(self.success_output(slot, &cmd))
+                }
+                ToolBehavior::FailWithStderr(stderr_tail) => {
+                    let command = self.failure_record(slot, &cmd, &stderr_tail);
+                    Err(ToolRunnerError::NonZeroExit {
+                        exit: ProcessExit::Code(1),
+                        stderr_tail,
+                        command,
+                    })
+                }
+                ToolBehavior::FailAfterWriting { path, bytes, stderr } => {
+                    Self::write_file(path, bytes)?;
+                    let command = self.failure_record(slot, &cmd, &stderr);
+                    Err(ToolRunnerError::NonZeroExit {
+                        exit: ProcessExit::Code(1),
+                        stderr_tail: stderr,
+                        command,
+                    })
+                }
+                ToolBehavior::BlockThenSucceed(gate) => {
+                    Self::wait_on_gate(gate, cancel)
+                        .await
+                        .map_err(|()| ToolRunnerError::Cancelled {
+                            command: self.cancelled_record(slot, &cmd),
+                        })?;
+                    Ok(self.success_output(slot, &cmd))
+                }
+                ToolBehavior::BlockThenFail { gate, stderr } => {
+                    Self::wait_on_gate(gate, cancel)
+                        .await
+                        .map_err(|()| ToolRunnerError::Cancelled {
+                            command: self.cancelled_record(slot, &cmd),
+                        })?;
+                    let command = self.failure_record(slot, &cmd, &stderr);
+                    Err(ToolRunnerError::NonZeroExit {
+                        exit: ProcessExit::Code(1),
+                        stderr_tail: stderr,
+                        command,
+                    })
+                }
+                ToolBehavior::BlockThenSucceedAndWrite { gate, path, bytes } => {
+                    Self::wait_on_gate(gate, cancel)
+                        .await
+                        .map_err(|()| ToolRunnerError::Cancelled {
+                            command: self.cancelled_record(slot, &cmd),
+                        })?;
+                    Self::write_file(path, bytes)?;
+                    Ok(self.success_output(slot, &cmd))
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+
+        fn cmd(binary: ToolBinary, arg: &str) -> ToolCommand {
+            ToolCommand {
+                binary,
+                args: vec![arg.to_string()],
+                secret_args: Vec::new(),
+                cwd: None,
+                env: Vec::new(),
+                timeout: Duration::from_secs(60),
+            }
+        }
+
+        #[tokio::test]
+        async fn succeeds_fails_and_records_in_order() {
+            let runner = BlockingToolRunner::with_behaviors([
+                ToolBehavior::Succeed,
+                ToolBehavior::FailWithStderr("boom".to_string()),
+            ]);
+            let cancel = CancellationToken::new();
+
+            runner
+                .run(cmd(ToolBinary::Ssrc, "first"), &cancel)
+                .await
+                .expect("first command succeeds");
+            let err = runner
+                .run(cmd(ToolBinary::Flac, "second"), &cancel)
+                .await
+                .expect_err("second command fails");
+
+            assert!(matches!(err, ToolRunnerError::NonZeroExit { .. }));
+            let transcript = runner.transcript();
+            assert_eq!(transcript.len(), 2);
+            assert_eq!(transcript[0].binary, ToolBinary::Ssrc);
+            assert_eq!(transcript[0].sanitized_args, vec!["first".to_string()]);
+            assert_eq!(transcript[1].binary, ToolBinary::Flac);
+            assert_eq!(transcript[1].sanitized_args, vec!["second".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn blocked_command_returns_cancelled_without_release() {
+            let (gate, blocker) = tool_gate();
+            let runner = Arc::new(BlockingToolRunner::with_behaviors([
+                ToolBehavior::BlockThenSucceed(blocker),
+            ]));
+            let cancel = CancellationToken::new();
+            let run_cancel = cancel.clone();
+            let run_runner = runner.clone();
+            let handle = tokio::spawn(async move {
+                run_runner.run(cmd(ToolBinary::Ssrc, "blocked"), &run_cancel).await
+            });
+
+            let release = gate.wait_started().await;
+            cancel.cancel();
+            let err = handle
+                .await
+                .expect("tool task joins")
+                .expect_err("blocked command observes cancellation");
+
+            assert!(matches!(err, ToolRunnerError::Cancelled { .. }));
+            let transcript = runner.transcript();
+            assert_eq!(transcript.len(), 1);
+            assert_eq!(transcript[0].exit, None);
+            assert_eq!(transcript[0].stderr_tail, "cancelled");
+            drop(release);
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "behavior queue exhausted")]
+        async fn behavior_exhaustion_fails_loudly() {
+            let runner = BlockingToolRunner::new();
+            let cancel = CancellationToken::new();
+            let _ = runner.run(cmd(ToolBinary::Ssrc, "unexpected"), &cancel).await;
+        }
+
+
+        #[tokio::test]
+        async fn dropped_release_sender_without_cancel_is_test_harness_error() {
+            let (gate, blocker) = tool_gate();
+            let runner = Arc::new(BlockingToolRunner::with_behaviors([
+                ToolBehavior::BlockThenSucceed(blocker),
+            ]));
+            let cancel = CancellationToken::new();
+            let run_cancel = cancel.clone();
+            let run_runner = runner.clone();
+            let handle = tokio::spawn(async move {
+                run_runner.run(cmd(ToolBinary::Ssrc, "blocked"), &run_cancel).await
+            });
+
+            let release = gate.wait_started().await;
+            drop(release);
+            let join_err = handle.await.expect_err("dropped release sender panics");
+            assert!(join_err.is_panic());
+        }
+
+        #[tokio::test]
+        async fn concurrent_records_update_their_own_slots() {
+            let (first_gate, first_blocker) = tool_gate();
+            let (second_gate, second_blocker) = tool_gate();
+            let runner = Arc::new(BlockingToolRunner::with_behaviors([
+                ToolBehavior::BlockThenSucceed(first_blocker),
+                ToolBehavior::BlockThenFail {
+                    gate: second_blocker,
+                    stderr: "second failed".to_string(),
+                },
+            ]));
+            let cancel = CancellationToken::new();
+
+            let first_runner = runner.clone();
+            let first_cancel = cancel.clone();
+            let first = tokio::spawn(async move {
+                first_runner.run(cmd(ToolBinary::Ffmpeg, "first"), &first_cancel).await
+            });
+            let first_release = first_gate.wait_started().await;
+
+            let second_runner = runner.clone();
+            let second_cancel = cancel.clone();
+            let second = tokio::spawn(async move {
+                second_runner.run(cmd(ToolBinary::Sox, "second"), &second_cancel).await
+            });
+            let second_release = second_gate.wait_started().await;
+
+            first_release.release();
+            second_release.release();
+            first.await.expect("first joins").expect("first succeeds");
+            assert!(matches!(
+                second.await.expect("second joins"),
+                Err(ToolRunnerError::NonZeroExit { .. })
+            ));
+
+            let transcript = runner.transcript();
+            assert_eq!(transcript.len(), 2);
+            assert_eq!(transcript[0].binary, ToolBinary::Ffmpeg);
+            assert_eq!(transcript[0].sanitized_args, vec!["first".to_string()]);
+            assert_eq!(transcript[0].exit, Some(ProcessExit::Code(0)));
+            assert_eq!(transcript[1].binary, ToolBinary::Sox);
+            assert_eq!(transcript[1].sanitized_args, vec!["second".to_string()]);
+            assert_eq!(transcript[1].exit, Some(ProcessExit::Code(1)));
+            assert_eq!(transcript[1].stderr_tail, "second failed");
+        }
+    }
+}

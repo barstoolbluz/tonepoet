@@ -377,3 +377,203 @@ fn sanitize_component(component: &str) -> String {
         sanitized
     }
 }
+
+#[cfg(test)]
+mod chunk_2_1_3_manifest_failure_interaction_tests {
+    use super::*;
+    use crate::convert::pipeline::manifest::{
+        manifest_path, write_manifest, ConversionManifestTrack, TrackIdentity, ValidationStatus,
+    };
+    use chrono::Utc;
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent dir");
+        }
+        std::fs::write(path, bytes).expect("write file");
+    }
+
+    fn manifest_for_one_track(
+        album_dir: &Path,
+        settings: &PipelineSettings,
+        source_path: &Path,
+        output_rel: &Path,
+        output_size: u64,
+    ) -> ConversionManifest {
+        let source_metadata = std::fs::metadata(source_path).expect("source metadata");
+        ConversionManifest::new(
+            album_dir.to_path_buf(),
+            settings.clone(),
+            vec![ConversionManifestTrack {
+                source_path: source_path.to_path_buf(),
+                source_size: source_metadata.len(),
+                source_mtime_secs: metadata_mtime_secs(&source_metadata).expect("source mtime"),
+                source_audio_md5: None,
+                track_identity: TrackIdentity {
+                    source_ordinal: 1,
+                    disc_number: None,
+                    track_number: Some(1),
+                },
+                settings_fingerprint: settings_fingerprint(settings),
+                planner_version: "test".to_string(),
+                planned_command_hash: "plan-hash".to_string(),
+                output_path: output_rel.to_path_buf(),
+                output_size,
+                output_hash: None,
+                validation_status: ValidationStatus::Passed,
+                publish_timestamp: Utc::now(),
+            }],
+        )
+    }
+
+    #[test]
+    fn successful_manifest_match_skips_when_policy_requests_skip() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("source.flac");
+        let output_rel = PathBuf::from("01.flac");
+        let output = album_dir.join(&output_rel);
+        let settings = PipelineSettings::default();
+        write_file(&source, b"source audio");
+        write_file(&output, b"encoded audio");
+        let manifest = manifest_for_one_track(
+            &album_dir,
+            &settings,
+            &source,
+            &output_rel,
+            13,
+        );
+        write_manifest(&album_dir, &manifest).expect("write manifest");
+
+        let decision = decide_rerun_with_options(
+            &album_dir,
+            &settings,
+            OverwritePolicy::SkipIfManifestMatch,
+            RerunOptions {
+                source_staleness: SourceStalenessPolicy::CheckSizeAndMtime,
+            },
+        );
+
+        assert!(matches!(decision, RerunDecision::Skip { .. }));
+    }
+
+    #[test]
+    fn missing_manifest_after_failed_conversion_redoes_for_manifest_match_policy() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let settings = PipelineSettings::default();
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        write_file(&album_dir.join("01.flac"), b"possibly stale audio");
+
+        let decision = decide_rerun(
+            &album_dir,
+            &settings,
+            OverwritePolicy::SkipIfManifestMatch,
+        );
+
+        assert!(matches!(
+            decision,
+            RerunDecision::Redo {
+                reason: RerunReason::ManifestMissing,
+                publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn partial_manifest_with_track_count_mismatch_redoes_as_corrupt_manifest() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("source.flac");
+        let output_rel = PathBuf::from("01.flac");
+        let output = album_dir.join(&output_rel);
+        let settings = PipelineSettings::default();
+        write_file(&source, b"source audio");
+        write_file(&output, b"encoded audio");
+        let mut manifest = manifest_for_one_track(
+            &album_dir,
+            &settings,
+            &source,
+            &output_rel,
+            13,
+        );
+        manifest.total_tracks = 5;
+        write_file(
+            &manifest_path(&album_dir),
+            &serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+        );
+
+        let decision = decide_rerun(
+            &album_dir,
+            &settings,
+            OverwritePolicy::SkipIfManifestMatch,
+        );
+
+        assert!(matches!(
+            decision,
+            RerunDecision::Redo {
+                reason: RerunReason::ManifestCorrupt(_),
+                publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn output_missing_after_partial_publish_redoes_normally() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("source.flac");
+        let output_rel = PathBuf::from("01.flac");
+        let settings = PipelineSettings::default();
+        write_file(&source, b"source audio");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let manifest = manifest_for_one_track(
+            &album_dir,
+            &settings,
+            &source,
+            &output_rel,
+            13,
+        );
+        write_manifest(&album_dir, &manifest).expect("write manifest");
+
+        let decision = decide_rerun(
+            &album_dir,
+            &settings,
+            OverwritePolicy::SkipIfManifestMatch,
+        );
+
+        assert!(matches!(
+            decision,
+            RerunDecision::Redo {
+                reason: RerunReason::OutputMissing(_),
+                publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cancelled_conversion_publish_temp_is_deleted_before_rerun() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let stale_temp = temp.path().join(".Album.tmp-abandoned");
+        write_file(&stale_temp.join("01.flac"), b"partial");
+
+        let preflight = prepare_rerun_state(&album_dir).expect("prepare rerun state");
+
+        assert_eq!(preflight.deleted_publish_temp_dirs, vec![stale_temp.clone()]);
+        assert!(!stale_temp.exists());
+        assert!(matches!(
+            decide_rerun(
+                &album_dir,
+                &PipelineSettings::default(),
+                OverwritePolicy::SkipIfManifestMatch,
+            ),
+            RerunDecision::Proceed {
+                reason: RerunReason::AlbumMissing,
+            }
+        ));
+    }
+}

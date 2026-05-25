@@ -6638,3 +6638,1079 @@ mod rich_progress_stage_tests {
         assert_eq!(convert_progress_fraction(750, Some(1_000), 1, 2), 0.75);
     }
 }
+
+// CHUNK_2_1_3_FAILURE_CANCELLATION_TESTS_BEGIN
+#[cfg(test)]
+mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
+    use super::*;
+    use crate::convert::pipeline::manifest::{manifest_path, read_manifest, ValidationStatus};
+    use crate::convert::pipeline::reporter::{PipelineEvent, PipelineReporter, RecordingReporter};
+    use crate::convert::pipeline::tool::blocking_test_runner::{
+        tool_gate, BlockingToolRunner, ToolBehavior,
+    };
+    use crate::convert::pipeline::tool::ToolBinary;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+    use async_trait::async_trait;
+    use tonepoet_pipeline::PipelineSettings;
+
+    struct AlbumFixture {
+        _temp: TempDir,
+        album: ScheduledAlbum,
+        track_ids: Vec<TrackId>,
+        staged_paths: Vec<PathBuf>,
+        final_paths: Vec<PathBuf>,
+        album_dir: PathBuf,
+        log_root: PathBuf,
+    }
+
+    fn track_id(source_ordinal: u32) -> TrackId {
+        TrackId {
+            source_ordinal,
+            disc_number: None,
+            track_number: source_ordinal + 1,
+        }
+    }
+
+    fn request(
+        root: &Path,
+        policy: FailurePolicy,
+        stages: StagePolicy,
+        overwrite: OverwritePolicy,
+    ) -> PipelineRequest {
+        PipelineRequest {
+            job_id: "job-2-1-3".to_string(),
+            item_id: format!("item-{:?}", policy),
+            container: root.join("input.flac"),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            settings: PipelineSettings::default(),
+            worker_count: Some(2),
+            merge: false,
+            output_root: root.join("out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite,
+                same_filesystem_required: false,
+            },
+            log: LogPolicy {
+                root: root.join("logs"),
+                write_for_blocked: true,
+                write_json_log: true,
+            },
+            stages,
+            failure_policy: policy,
+        }
+    }
+
+    fn stage_policy(metadata: bool, replaygain: bool, features: bool) -> StagePolicy {
+        StagePolicy {
+            metadata: if metadata { StageRequirement::Enabled } else { StageRequirement::Disabled },
+            replaygain: if replaygain { StageRequirement::Enabled } else { StageRequirement::Disabled },
+            features: if features { StageRequirement::Enabled } else { StageRequirement::Disabled },
+            generate_cue: features,
+        }
+    }
+
+    fn prepared_source(root: &Path, track_ids: &[TrackId]) -> PreparedSource {
+        let tracks = track_ids
+            .iter()
+            .map(|id| PreparedTrack {
+                id: id.clone(),
+                source_ref: TrackSourceRef::StagedFile(root.join(format!("source-{}.flac", id.source_ordinal))),
+                metadata: TrackMetadata {
+                    title: Some(format!("Track {}", id.track_number)),
+                    track_number: Some(id.track_number),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(44_100),
+                sample_rate: 44_100,
+                bit_depth: Some(16),
+            })
+            .collect::<Vec<_>>();
+
+        PreparedSource {
+            container: root.join("input.flac"),
+            kind: SourceKind::SingleFile,
+            tracks,
+            album_metadata: AlbumMetadata {
+                album: Some("Gate Test".to_string()),
+                total_tracks: track_ids.len() as u32,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SingleFile,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        }
+    }
+
+    fn track_record(id: TrackId, ok: bool, output_file: Option<PathBuf>) -> TrackRecord {
+        TrackRecord {
+            track_id: id.clone(),
+            outcome: if ok {
+                TrackOutcome::Ok
+            } else {
+                TrackOutcome::Err("encoder failed".to_string())
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("source-{}.flac", id.source_ordinal))),
+            realized_input: None,
+            output_file,
+            commands: Vec::new(),
+            bytes_in: None,
+            bytes_out: None,
+            duration: None,
+        }
+    }
+
+    fn fixture(
+        policy: FailurePolicy,
+        track_count: usize,
+        stages: StagePolicy,
+        overwrite: OverwritePolicy,
+    ) -> AlbumFixture {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("out")).expect("output root");
+        std::fs::create_dir_all(root.join("logs")).expect("log root");
+        std::fs::write(root.join("input.flac"), b"container").expect("container");
+
+        let req = request(root, policy, stages, overwrite);
+        let staging_parent = root.join(".tonepoet-staging");
+        let run_lock = acquire_run_lock(&staging_parent, &req.job_id, &req.item_id).expect("run lock");
+        let staging = StagingDir::new(staging_parent.join("job-2-1-3"), req.job_id.clone());
+        let track_ids = (0..track_count).map(|index| track_id(index as u32)).collect::<Vec<_>>();
+        let source = prepared_source(root, &track_ids);
+        let album_dir = root.join("out").join("Gate Test");
+        let mut staged_paths = Vec::new();
+        let mut final_paths = Vec::new();
+        let mut entries = Vec::new();
+        for (index, id) in track_ids.iter().enumerate() {
+            let final_path = album_dir.join(format!("{:02}.flac", index + 1));
+            let staged_path = staging.root.join("converted").join(format!("{:02}.flac", index + 1));
+            std::fs::create_dir_all(staged_path.parent().expect("stage parent")).expect("stage parent");
+            std::fs::write(&staged_path, format!("encoded-{index}")).expect("staged success");
+            entries.push(PlannedTrackOutput {
+                track_id: id.clone(),
+                final_path: final_path.clone(),
+            });
+            staged_paths.push(staged_path);
+            final_paths.push(final_path);
+        }
+        let log_root = req.log.root.clone();
+        let plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            entries,
+        };
+
+        AlbumFixture {
+            _temp: temp,
+            album: ScheduledAlbum {
+                req,
+                item_id: "item".to_string(),
+                staging,
+                source,
+                plan,
+                stages: Vec::new(),
+                _run_lock: run_lock,
+            },
+            track_ids,
+            staged_paths,
+            final_paths,
+            album_dir,
+            log_root,
+        }
+    }
+
+    fn successful_output(fixture: &AlbumFixture, index: usize) -> ScheduledTrackOutput {
+        let id = fixture.track_ids[index].clone();
+        ScheduledTrackOutput {
+            index,
+            record: track_record(id.clone(), true, Some(fixture.staged_paths[index].clone())),
+            artifact: Some(TrackArtifact {
+                track_id: id,
+                staged_path: fixture.staged_paths[index].clone(),
+                final_path: fixture.final_paths[index].clone(),
+                samples: Some(44_100),
+                metadata_written_by_plan: false,
+            }),
+            ok: true,
+            metadata_written_by_plan: false,
+        }
+    }
+
+    fn failed_output(fixture: &AlbumFixture, index: usize) -> ScheduledTrackOutput {
+        ScheduledTrackOutput {
+            index,
+            record: track_record(fixture.track_ids[index].clone(), false, None),
+            artifact: None,
+            ok: false,
+            metadata_written_by_plan: false,
+        }
+    }
+
+    fn stage_outcome(report: &PipelineReport, stage: PipelineStage) -> Option<&StageOutcome> {
+        match &report.outcome {
+            AlbumOutcome::Complete { stages, .. }
+            | AlbumOutcome::Partial { stages, .. }
+            | AlbumOutcome::Blocked { stages, .. } => {
+                stages.iter().find(|record| record.stage == stage).map(|record| &record.outcome)
+            }
+        }
+    }
+
+
+    fn phase_request(root: &Path, container_name: &str) -> PipelineRequest {
+        let container = root.join(container_name);
+        std::fs::write(&container, b"container").expect("container");
+        std::fs::create_dir_all(root.join("out")).expect("output root");
+        std::fs::create_dir_all(root.join("logs")).expect("log root");
+        let mut req = request(
+            root,
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.container = container;
+        req.item_id = format!("phase-{}", container_name.replace('.', "-"));
+        req
+    }
+
+    fn tree_has_entries(path: &Path) -> bool {
+        let Ok(mut entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        entries.next().is_some()
+    }
+
+    fn staging_root_for_request(req: &PipelineRequest) -> PathBuf {
+        staging_parent_for(req).join(format!(
+            "{}-{}",
+            sanitize_component(&req.job_id),
+            sanitize_component(&req.item_id)
+        ))
+    }
+
+    struct CancellingReporter {
+        cancel: CancellationToken,
+        cancel_after_stage: PipelineStage,
+        events: Mutex<Vec<PipelineEvent>>,
+    }
+
+    impl CancellingReporter {
+        fn new(cancel: CancellationToken, cancel_after_stage: PipelineStage) -> Self {
+            Self {
+                cancel,
+                cancel_after_stage,
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<PipelineEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl PipelineReporter for CancellingReporter {
+        async fn emit(&self, event: PipelineEvent) {
+            if matches!(
+                &event,
+                PipelineEvent::StageFinished { record, .. }
+                    if record.stage == self.cancel_after_stage && matches!(record.outcome, StageOutcome::Ok)
+            ) {
+                self.cancel.cancel();
+            }
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+
+    #[tokio::test]
+    async fn cancellation_before_materialization_enters_no_phase_and_leaves_no_staging() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let req = phase_request(temp.path(), "input.flac");
+        let staging_parent = staging_parent_for(&req);
+        let staging_root = staging_root_for_request(&req);
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let materialized = prepare_pipeline_item_for_scheduler(
+            req,
+            &runner,
+            &reporter,
+            &cancel,
+            &HashMap::new(),
+        )
+        .await;
+
+        let report = match materialized {
+            ScheduledMaterialization::Finished(report) => report,
+            ScheduledMaterialization::Ready(_) => panic!("pre-cancelled item must not become schedulable"),
+        };
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked { reason: BlockReason::Cancelled, .. }
+        ));
+        assert!(report.source.is_none());
+        assert!(report.plan.is_none());
+        assert!(report.artifacts.is_none());
+        assert!(report.published.is_none());
+        assert!(runner.transcript().is_empty());
+        assert!(!staging_root.exists());
+        assert!(!tree_has_entries(&staging_parent), "no staging files are created before materialization starts");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_archive_materialization_cancels_runner_and_drops_staging() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let req = phase_request(temp.path(), "input.7z");
+        let staging_root = staging_root_for_request(&req);
+        let (gate, blocker) = tool_gate();
+        let runner = std::sync::Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker),
+        ]));
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run_runner = runner.clone();
+        let handle = tokio::spawn(async move {
+            let reporter = RecordingReporter::new();
+            prepare_pipeline_item_for_scheduler(
+                req,
+                run_runner.as_ref(),
+                &reporter,
+                &run_cancel,
+                &HashMap::new(),
+            )
+            .await
+        });
+
+        let release = gate.wait_started().await;
+        cancel.cancel();
+        let materialized = handle.await.expect("materialization task joins");
+        drop(release);
+
+        let report = match materialized {
+            ScheduledMaterialization::Finished(report) => report,
+            ScheduledMaterialization::Ready(_) => panic!("cancelled materialization must not become schedulable"),
+        };
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked { reason: BlockReason::Cancelled, .. }
+        ));
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 1, "archive materializer started one child command");
+        assert_eq!(transcript[0].exit, None, "blocked child was cancelled rather than completed");
+        assert!(report.source.is_none());
+        assert!(report.plan.is_none());
+        assert!(report.published.is_none());
+        assert!(!staging_root.exists(), "staging root is dropped after materialization cancellation");
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_materialization_before_planning_uses_real_prepare_boundary() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let req = phase_request(temp.path(), "input.flac");
+        let staging_root = staging_root_for_request(&req);
+        let runner = BlockingToolRunner::new();
+        let cancel = CancellationToken::new();
+        let reporter = CancellingReporter::new(cancel.clone(), PipelineStage::Materialize);
+
+        let materialized = prepare_pipeline_item_for_scheduler(
+            req,
+            &runner,
+            &reporter,
+            &cancel,
+            &HashMap::new(),
+        )
+        .await;
+
+        let report = match materialized {
+            ScheduledMaterialization::Finished(report) => report,
+            ScheduledMaterialization::Ready(_) => panic!("post-materialization cancellation must not reach planning readiness"),
+        };
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked { reason: BlockReason::Cancelled, .. }
+        ));
+        assert!(report.source.is_some(), "materialized source is retained in the report");
+        assert!(report.plan.is_none(), "planning did not run after materialization-triggered cancellation");
+        assert!(report.artifacts.is_none());
+        assert!(report.published.is_none());
+        assert!(runner.transcript().is_empty(), "single-file materialization did not invoke tools");
+        assert!(reporter.events().iter().any(|event| matches!(
+            event,
+            PipelineEvent::StageFinished { record, .. }
+                if record.stage == PipelineStage::Materialize && matches!(record.outcome, StageOutcome::Ok)
+        )));
+        assert!(!reporter.events().iter().any(|event| matches!(
+            event,
+            PipelineEvent::StageStarted { stage: PipelineStage::PlanOutputs, .. }
+        )));
+        assert!(!staging_root.exists(), "owned staging dir is dropped when prepare exits cancelled");
+    }
+
+    #[tokio::test]
+    async fn all_tracks_ok_runs_metadata_replaygain_features_and_publish() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, true, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = BlockingToolRunner::with_behaviors([
+            ToolBehavior::Succeed,
+            ToolBehavior::Succeed,
+        ]);
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = vec![successful_output(&fixture, 0)];
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
+        assert!(matches!(stage_outcome(&report, PipelineStage::Metadata), Some(StageOutcome::Ok)));
+        assert!(matches!(stage_outcome(&report, PipelineStage::ReplayGain), Some(StageOutcome::Ok)));
+        assert!(matches!(stage_outcome(&report, PipelineStage::Features), Some(StageOutcome::Ok)));
+        assert!(matches!(stage_outcome(&report, PipelineStage::Publish), Some(StageOutcome::Ok)));
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].binary, ToolBinary::Metaflac);
+        assert_eq!(transcript[1].binary, ToolBinary::Loudgain);
+        assert!(report.published.is_some());
+    }
+
+    #[tokio::test]
+    async fn five_track_fail_fast_blocks_after_convert_and_runs_no_postprocessing_tools() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            5,
+            stage_policy(true, true, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = (0..5)
+            .map(|index| if index == 1 { failed_output(&fixture, index) } else { successful_output(&fixture, index) })
+            .collect::<Vec<_>>();
+        let final_paths = fixture.final_paths.clone();
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked {
+                reason: BlockReason::TrackFailures,
+                ..
+            }
+        ));
+        assert!(runner.transcript().is_empty(), "post-processing tools did not run");
+        assert!(report.published.is_none());
+        assert!(final_paths.iter().all(|path| !path.exists()));
+        assert!(!manifest_path(&fixture.album_dir).exists(), "blocked fail-fast album writes no manifest");
+    }
+
+    #[tokio::test]
+    async fn five_track_allow_partial_publishes_only_four_survivors() {
+        let fixture = fixture(
+            FailurePolicy::AllowPartialAlbum,
+            5,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = (0..5)
+            .map(|index| if index == 1 { failed_output(&fixture, index) } else { successful_output(&fixture, index) })
+            .collect::<Vec<_>>();
+        let final_paths = fixture.final_paths.clone();
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(report.outcome, AlbumOutcome::Partial { .. }));
+        assert_eq!(
+            report.published.as_ref().map(|published| published.entries.len()),
+            Some(4)
+        );
+        assert!(final_paths[0].exists());
+        assert!(!final_paths[1].exists());
+        assert!(final_paths[2].exists());
+        assert!(final_paths[3].exists());
+        assert!(final_paths[4].exists());
+
+        let manifest = read_manifest(&fixture.album_dir)
+            .expect("partial manifest read succeeds")
+            .expect("allow-partial publish writes a manifest");
+        assert_eq!(manifest.total_tracks, 5);
+        assert_eq!(manifest.tracks.len(), 5);
+        assert_eq!(
+            manifest
+                .tracks
+                .iter()
+                .filter(|track| track.validation_status == ValidationStatus::Passed)
+                .count(),
+            4,
+            "partial manifest records four successful tracks"
+        );
+        assert_eq!(
+            manifest
+                .tracks
+                .iter()
+                .filter(|track| matches!(track.validation_status, ValidationStatus::Failed { .. }))
+                .count(),
+            1,
+            "partial manifest records one failed track"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_tracks_cancelled_blocks_with_cancelled_and_runs_no_postprocessing() {
+        let fixture = fixture(
+            FailurePolicy::AllowPartialAlbum,
+            3,
+            stage_policy(true, true, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outputs = (0..3).map(|index| failed_output(&fixture, index)).collect::<Vec<_>>();
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked {
+                reason: BlockReason::Cancelled,
+                ..
+            }
+        ));
+        assert!(runner.transcript().is_empty());
+        assert!(report.published.is_none());
+        assert!(!manifest_path(&fixture.album_dir).exists(), "cancelled album writes no manifest");
+    }
+
+    #[tokio::test]
+    async fn metadata_failure_blocks_replaygain_features_and_publish() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, true, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = BlockingToolRunner::with_behaviors([
+            ToolBehavior::FailWithStderr("metadata failed".to_string()),
+        ]);
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = vec![successful_output(&fixture, 0)];
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(stage_outcome(&report, PipelineStage::Metadata), Some(StageOutcome::Failed(_))));
+        assert!(stage_outcome(&report, PipelineStage::ReplayGain).is_none());
+        assert!(stage_outcome(&report, PipelineStage::Features).is_none());
+        assert!(stage_outcome(&report, PipelineStage::Publish).is_none());
+        assert!(matches!(report.outcome, AlbumOutcome::Blocked { .. }));
+        assert_eq!(runner.transcript().len(), 1);
+        assert!(report.published.is_none());
+    }
+
+    #[tokio::test]
+    async fn replaygain_failure_blocks_features_and_publish() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, true, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = BlockingToolRunner::with_behaviors([
+            ToolBehavior::FailWithStderr("replaygain failed".to_string()),
+        ]);
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = vec![successful_output(&fixture, 0)];
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(stage_outcome(&report, PipelineStage::ReplayGain), Some(StageOutcome::Failed(_))));
+        assert!(stage_outcome(&report, PipelineStage::Features).is_none());
+        assert!(stage_outcome(&report, PipelineStage::Publish).is_none());
+        assert!(matches!(report.outcome, AlbumOutcome::Blocked { .. }));
+        assert_eq!(runner.transcript().len(), 1);
+        assert_eq!(runner.transcript()[0].binary, ToolBinary::Loudgain);
+        assert!(report.published.is_none());
+    }
+
+    #[tokio::test]
+    async fn publish_failure_blocks_and_still_writes_durable_log() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        std::fs::create_dir_all(&fixture.album_dir).expect("existing album dir");
+        std::fs::write(fixture.album_dir.join("old.flac"), b"old").expect("old output");
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = vec![successful_output(&fixture, 0)];
+        let log_root = fixture.log_root.clone();
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked {
+                reason: BlockReason::PublishFailed,
+                ..
+            }
+        ));
+        assert!(matches!(stage_outcome(&report, PipelineStage::Publish), Some(StageOutcome::Failed(_))));
+        let durable_log = report.durable_log.as_ref().expect("durable log path");
+        assert!(durable_log.starts_with(log_root));
+        assert!(durable_log.exists());
+        assert!(fixture.album_dir.join("old.flac").exists());
+        assert!(report.published.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_metadata_runs_no_later_postprocessing() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, true, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let (gate, blocker) = tool_gate();
+        let runner = std::sync::Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker),
+        ]));
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = vec![successful_output(&fixture, 0)];
+        let run_cancel = cancel.clone();
+        let run_runner = runner.clone();
+        let handle = tokio::spawn(async move {
+            finish_pipeline_album_for_scheduler(
+                fixture.album,
+                outputs,
+                run_runner.as_ref(),
+                &reporter,
+                &run_cancel,
+            )
+            .await
+        });
+
+        let release = gate.wait_started().await;
+        cancel.cancel();
+        let report = handle.await.expect("finish task joins");
+        drop(release);
+
+        assert!(matches!(stage_outcome(&report, PipelineStage::Metadata), Some(StageOutcome::Failed(_))));
+        assert!(stage_outcome(&report, PipelineStage::ReplayGain).is_none());
+        assert!(stage_outcome(&report, PipelineStage::Publish).is_none());
+        assert!(report.published.is_none());
+        assert_eq!(runner.transcript().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_replaygain_runs_no_features_or_publish() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, true, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let (gate, blocker) = tool_gate();
+        let runner = std::sync::Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker),
+        ]));
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = vec![successful_output(&fixture, 0)];
+        let run_cancel = cancel.clone();
+        let run_runner = runner.clone();
+        let handle = tokio::spawn(async move {
+            finish_pipeline_album_for_scheduler(
+                fixture.album,
+                outputs,
+                run_runner.as_ref(),
+                &reporter,
+                &run_cancel,
+            )
+            .await
+        });
+
+        let release = gate.wait_started().await;
+        cancel.cancel();
+        let report = handle.await.expect("finish task joins");
+        drop(release);
+
+        assert!(matches!(stage_outcome(&report, PipelineStage::ReplayGain), Some(StageOutcome::Failed(_))));
+        assert!(stage_outcome(&report, PipelineStage::Features).is_none());
+        assert!(stage_outcome(&report, PipelineStage::Publish).is_none());
+        assert!(report.published.is_none());
+        assert_eq!(runner.transcript().len(), 1);
+    }
+
+
+    #[tokio::test]
+    async fn cancellation_after_features_before_publish_writes_no_final_output_or_manifest() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = BlockingToolRunner::new();
+        let cancel = CancellationToken::new();
+        let reporter = CancellingReporter::new(cancel.clone(), PipelineStage::Features);
+        let outputs = vec![successful_output(&fixture, 0)];
+        let final_paths = fixture.final_paths.clone();
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(stage_outcome(&report, PipelineStage::Features), Some(StageOutcome::Ok)));
+        assert!(stage_outcome(&report, PipelineStage::Publish).is_none());
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked { reason: BlockReason::Cancelled, .. }
+        ));
+        assert!(report.published.is_none());
+        assert!(final_paths.iter().all(|path| !path.exists()));
+        assert!(!manifest_path(&fixture.album_dir).exists(), "publish-boundary cancellation writes no manifest");
+    }
+
+    fn publish_album_output_with_test_cancel_after_backup(
+        staging: StagingDir,
+        plan: &PublishPlan,
+        policy: PublishPolicy,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<PublishedAlbum, PublishError> {
+        if plan.entries.is_empty() {
+            return Err(PublishError::StagingMissing);
+        }
+        if !staging.root.exists() {
+            return Err(PublishError::StagingMissing);
+        }
+
+        let final_parent = parent_dir_or_current(&plan.album_dir);
+        let _publish_lock = acquire_publish_lock(&plan.album_dir)?;
+        let album_name = plan
+            .album_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(sanitize_component)
+            .unwrap_or_else(|| "album".to_string());
+        let marker_path = final_parent.join(format!(".{album_name}.publish-in-progress"));
+        repair_interrupted_publish(&plan.album_dir, &marker_path)?;
+        cleanup_orphan_publish_temps(final_parent, &album_name)?;
+
+        let temp_dir = unique_path(final_parent, &format!(".{album_name}.tmp"));
+        let backup_dir = unique_path(final_parent, &format!(".{album_name}.backup"));
+        if let Err(err) = std::fs::create_dir_all(&temp_dir) {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(PublishError::Io(err));
+        }
+
+        let mut published_entries = Vec::with_capacity(plan.entries.len());
+        for entry in &plan.entries {
+            if !entry.staged_path.exists() {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                return Err(PublishError::StagingMissing);
+            }
+            let rel = match entry.final_path.strip_prefix(&plan.album_dir) {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => {
+                    return cleanup_publish_temp(
+                        &temp_dir,
+                        PublishError::PathOutsideOutputRoot(entry.final_path.display().to_string()),
+                    );
+                }
+            };
+            if let Err(err) = reject_escaping_path(&rel) {
+                return cleanup_publish_temp(&temp_dir, PublishError::PathOutsideOutputRoot(err));
+            }
+            let staged_final = temp_dir.join(rel);
+            if let Some(parent) = staged_final.parent() {
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    return cleanup_publish_temp(&temp_dir, PublishError::Io(err));
+                }
+            }
+            if let Err(err) = copy_or_rename_into_publish_temp(
+                &entry.staged_path,
+                &staged_final,
+                policy.same_filesystem_required,
+            ) {
+                return cleanup_publish_temp(&temp_dir, err);
+            }
+            let bytes = match std::fs::metadata(&staged_final) {
+                Ok(metadata) => metadata.len(),
+                Err(err) => return cleanup_publish_temp(&temp_dir, PublishError::Io(err)),
+            };
+            published_entries.push(PublishedEntry {
+                final_path: entry.final_path.clone(),
+                role: entry.role.clone(),
+                bytes,
+            });
+        }
+
+        if plan.album_dir.exists() {
+            match policy.overwrite {
+                OverwritePolicy::FailIfExists => {
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    return Err(PublishError::DestinationExists(
+                        plan.album_dir.display().to_string(),
+                    ));
+                }
+                OverwritePolicy::ReplaceWithBackup
+                | OverwritePolicy::AlwaysRedo
+                | OverwritePolicy::SkipIfManifestMatch
+                | OverwritePolicy::VerifyIfManifestMatch => {
+                    if let Err(err) = write_publish_marker(&marker_path, &backup_dir) {
+                        let _ = std::fs::remove_dir_all(&temp_dir);
+                        return Err(err);
+                    }
+                    std::fs::rename(&plan.album_dir, &backup_dir).map_err(|err| {
+                        let _ = std::fs::remove_dir_all(&temp_dir);
+                        let _ = std::fs::remove_file(&marker_path);
+                        PublishError::BackupFailed(format!(
+                            "{} -> {}: {err}",
+                            plan.album_dir.display(),
+                            backup_dir.display()
+                        ))
+                    })?;
+                    cancel.cancel();
+                    return Err(PublishError::AtomicRename(format!(
+                        "cancelled after backup before final publish rename: marker {} backup {} temp {}",
+                        marker_path.display(),
+                        backup_dir.display(),
+                        temp_dir.display()
+                    )));
+                }
+            }
+        }
+
+        if cancel.is_cancelled() {
+            return Err(PublishError::AtomicRename(
+                "cancelled before final publish rename".to_string(),
+            ));
+        }
+        std::fs::rename(&temp_dir, &plan.album_dir).map_err(|err| {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            PublishError::AtomicRename(format!(
+                "{} -> {}: {err}",
+                temp_dir.display(),
+                plan.album_dir.display()
+            ))
+        })?;
+        sync_parent_dir_best_effort(&plan.album_dir);
+        drop(staging);
+        Ok(PublishedAlbum {
+            album_dir: plan.album_dir.clone(),
+            entries: published_entries,
+        })
+    }
+
+    #[test]
+    fn cancellation_during_publish_after_backup_leaves_recoverable_state_and_no_corrupt_final_output() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, false),
+            OverwritePolicy::ReplaceWithBackup,
+        );
+        let parent = fixture.album_dir.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&fixture.album_dir).expect("existing album dir");
+        std::fs::write(fixture.album_dir.join("old.flac"), b"old output").expect("old output");
+
+        let marker_path = parent.join(".Gate_Test.publish-in-progress");
+        let plan = PublishPlan {
+            album_dir: fixture.album_dir.clone(),
+            entries: vec![PublishEntry {
+                staged_path: fixture.staged_paths[0].clone(),
+                final_path: fixture.final_paths[0].clone(),
+                role: PublishRole::Audio,
+            }],
+        };
+        let publish = fixture.album.req.publish.clone();
+        let staging = fixture.album.staging;
+        let cancel = CancellationToken::new();
+
+        let err = publish_album_output_with_test_cancel_after_backup(staging, &plan, publish.clone(), &cancel)
+            .expect_err("test seam cancels after backup and before final rename");
+
+        assert!(matches!(err, PublishError::AtomicRename(_)));
+        assert!(cancel.is_cancelled());
+        assert!(marker_path.exists(), "mid-publish cancellation left recovery marker");
+        let marker_text = std::fs::read_to_string(&marker_path).expect("marker text");
+        let backup_dir = backup_dir_from_marker(&fixture.album_dir, &marker_path, &marker_text)
+            .expect("marker names a valid backup");
+        assert!(backup_dir.exists(), "backup exists for rollback");
+        assert!(backup_dir.join("old.flac").exists(), "old album contents are backed up");
+        assert!(!fixture.album_dir.exists(), "half-published final album dir is absent until repair");
+        assert!(!fixture.final_paths[0].exists(), "new final output is not exposed before repair");
+
+        let retry_staging_root = parent.join("retry-staging");
+        let retry_staging = StagingDir::new(retry_staging_root.clone(), "retry-job".to_string());
+        let retry_staged = retry_staging.root.join("converted").join("01.flac");
+        std::fs::create_dir_all(retry_staged.parent().unwrap()).expect("retry staging parent");
+        std::fs::write(&retry_staged, b"new output").expect("retry staged output");
+        let retry_plan = PublishPlan {
+            album_dir: fixture.album_dir.clone(),
+            entries: vec![PublishEntry {
+                staged_path: retry_staged,
+                final_path: fixture.final_paths[0].clone(),
+                role: PublishRole::Audio,
+            }],
+        };
+
+        let published = publish_album_output(retry_staging, &retry_plan, publish)
+            .expect("normal publish repairs marker then publishes retry output");
+
+        assert!(!marker_path.exists());
+        assert_eq!(published.entries.len(), 1);
+        assert_eq!(std::fs::read(&fixture.final_paths[0]).unwrap(), b"new output");
+        assert!(std::fs::read_dir(&parent)
+            .expect("parent entries")
+            .filter_map(|entry| entry.ok())
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".Gate_Test.tmp-")));
+    }
+
+    #[test]
+    fn interrupted_publish_recovery_restores_backup_before_new_publish() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, false),
+            OverwritePolicy::ReplaceWithBackup,
+        );
+        let parent = fixture.album_dir.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&parent).expect("album parent");
+        let backup_dir = parent.join(".Gate_Test.backup-test");
+        std::fs::create_dir_all(&backup_dir).expect("backup dir");
+        std::fs::write(backup_dir.join("restored.flac"), b"restored").expect("backup file");
+        let marker_path = parent.join(".Gate_Test.publish-in-progress");
+        let marker = serde_json::json!({
+            "version": 1,
+            "album_dir_name": "Gate_Test",
+            "backup_dir_name": ".Gate_Test.backup-test"
+        });
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).expect("marker");
+
+        let plan = PublishPlan {
+            album_dir: fixture.album_dir.clone(),
+            entries: vec![PublishEntry {
+                staged_path: fixture.staged_paths[0].clone(),
+                final_path: fixture.final_paths[0].clone(),
+                role: PublishRole::Audio,
+            }],
+        };
+        let publish = fixture.album.req.publish.clone();
+        let staging = fixture.album.staging;
+        let published = publish_album_output(staging, &plan, publish)
+            .expect("publish repairs marker then publishes");
+
+        assert!(!marker_path.exists());
+        assert!(published.album_dir.join("01.flac").exists());
+        assert!(!backup_dir.exists(), "repair consumed the old backup before publish");
+    }
+
+    #[test]
+    fn scheduled_worker_failure_output_has_failed_shape_required_by_mid_chain_contract() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        let output = scheduled_worker_failure_output(
+            0,
+            &fixture.album.source.tracks[0],
+            Some(fixture.staged_paths[0].clone()),
+            Some(fixture.final_paths[0].clone()),
+            "planned command 2 failed".to_string(),
+        );
+
+        assert!(!output.ok);
+        assert!(output.artifact.is_none());
+        assert!(matches!(output.record.outcome, TrackOutcome::Err(_)));
+        assert_eq!(output.index, 0);
+    }
+}
+// CHUNK_2_1_3_FAILURE_CANCELLATION_TESTS_END

@@ -503,7 +503,6 @@ mod tests {
                 kind,
                 task: boxed_work(move |_cancel| async move {
                     started_tx.send((job, unit)).await.map_err(|err| err.to_string())?;
-                    tokio::time::sleep(Duration::from_millis(5)).await;
                     Ok((job, unit))
                 }),
             }).await;
@@ -643,6 +642,426 @@ mod tests {
         run.shutdown().await;
         completed.sort();
         assert_eq!(completed, (0usize..100).collect::<Vec<_>>());
+    }
+
+}
+
+#[cfg(test)]
+mod chunk_2_1_3_worker_recovery_tests {
+    use super::*;
+    use crate::convert::pipeline::tool::blocking_test_runner::{
+        tool_gate, BlockingToolRunner, ToolBehavior,
+    };
+    use crate::convert::pipeline::tool::{ToolBinary, ToolCommand, ToolRunner};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn track_id(index: usize) -> TrackId {
+        TrackId {
+            source_ordinal: index as u32,
+            disc_number: None,
+            track_number: index as u32 + 1,
+        }
+    }
+
+    fn cmd(index: usize) -> ToolCommand {
+        ToolCommand {
+            binary: ToolBinary::Ssrc,
+            args: vec![format!("track-{index}")],
+            secret_args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            timeout: Duration::from_secs(60),
+        }
+    }
+
+    #[tokio::test]
+    async fn fifteen_worker_pool_recovers_after_one_tool_failure() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new(Some(15), cancel.clone());
+        let mut run = pool.start();
+        let mut behaviors = Vec::new();
+        behaviors.push(ToolBehavior::FailWithStderr("track failed".to_string()));
+        for _ in 1..15 {
+            behaviors.push(ToolBehavior::Succeed);
+        }
+        let runner = Arc::new(BlockingToolRunner::with_behaviors(behaviors));
+
+        for index in 0..15usize {
+            let runner = runner.clone();
+            pool.submit(WorkUnit {
+                job_id: "album-a".to_string(),
+                unit_id: format!("initial-{index}"),
+                kind: WorkKind::EncodeTrack { track_id: track_id(index) },
+                task: boxed_work(move |cancel| async move {
+                    runner.run(cmd(index), &cancel).await.map_err(|err| err.to_string())?;
+                    Ok(index)
+                }),
+            })
+            .await;
+        }
+
+        let mut successes = BTreeSet::new();
+        let mut failures = 0usize;
+        while successes.len() + failures < 15 {
+            let result = run.results.recv().await.expect("initial result");
+            match result.outcome {
+                Ok(index) => {
+                    successes.insert(index);
+                }
+                Err(err) => {
+                    assert!(err.contains("track failed"));
+                    failures += 1;
+                }
+            }
+        }
+        assert_eq!(failures, 1);
+        assert_eq!(successes.len(), 14);
+        assert_eq!(runner.transcript().len(), 15);
+
+        for index in 100..115usize {
+            pool.submit(WorkUnit {
+                job_id: "album-b".to_string(),
+                unit_id: format!("followup-{index}"),
+                kind: WorkKind::SingleFile,
+                task: boxed_work(move |_cancel| async move { Ok(index) }),
+            })
+            .await;
+        }
+
+        let mut followup = BTreeSet::new();
+        while followup.len() < 15 {
+            let result = run.results.recv().await.expect("followup result");
+            followup.insert(result.outcome.expect("followup succeeds"));
+        }
+
+        run.shutdown().await;
+        assert_eq!(followup, (100usize..115).collect::<BTreeSet<_>>());
+    }
+
+    #[tokio::test]
+    async fn fail_fast_album_attempts_remaining_tracks_but_schedules_no_postprocess() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new(Some(3), cancel.clone());
+        let mut run = pool.start();
+        let mut tracker = AlbumCompletionTracker::default();
+        tracker.register_album("album".to_string(), 5, false);
+
+        for index in 0..5usize {
+            pool.submit(WorkUnit {
+                job_id: "album".to_string(),
+                unit_id: format!("track-{index}"),
+                kind: WorkKind::EncodeTrack { track_id: track_id(index) },
+                task: boxed_work(move |_cancel| async move {
+                    if index == 1 {
+                        Err("track 2 failed".to_string())
+                    } else {
+                        Ok(index)
+                    }
+                }),
+            })
+            .await;
+        }
+
+        let mut attempted = BTreeSet::new();
+        let mut postprocess_submitted = false;
+        while attempted.len() < 5 {
+            let result = run.results.recv().await.expect("track result");
+            assert_eq!(result.job_id, "album");
+            let index = result
+                .unit_id
+                .strip_prefix("track-")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            attempted.insert(index);
+            let ok = result.outcome.is_ok();
+            let readiness = tracker.mark_track_finished("album", ok);
+            if readiness == AlbumReadiness::ReadyForPostProcess {
+                postprocess_submitted = true;
+            }
+        }
+
+        run.shutdown().await;
+        assert_eq!(attempted, (0usize..5).collect::<BTreeSet<_>>());
+        assert!(!postprocess_submitted, "fail-fast album must not enter postprocess");
+    }
+
+    #[tokio::test]
+    async fn allow_partial_five_track_album_schedules_postprocess_after_all_terminals() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<&'static str>::new(Some(3), cancel.clone());
+        let mut run = pool.start();
+        let mut tracker = AlbumCompletionTracker::default();
+        tracker.register_album("album".to_string(), 5, true);
+
+        for index in 0..5usize {
+            pool.submit(WorkUnit {
+                job_id: "album".to_string(),
+                unit_id: format!("track-{index}"),
+                kind: WorkKind::EncodeTrack { track_id: track_id(index) },
+                task: boxed_work(move |_cancel| async move {
+                    if index == 1 {
+                        Err("track 2 failed".to_string())
+                    } else {
+                        Ok("track-ok")
+                    }
+                }),
+            })
+            .await;
+        }
+
+        let mut terminal = 0usize;
+        let mut postprocess_submitted = false;
+        while terminal < 5 {
+            let result = run.results.recv().await.expect("track result");
+            let ok = result.outcome.is_ok();
+            terminal += 1;
+            if tracker.mark_track_finished("album", ok) == AlbumReadiness::ReadyForPostProcess {
+                postprocess_submitted = true;
+                pool.submit(WorkUnit {
+                    job_id: "album".to_string(),
+                    unit_id: "album-postprocess".to_string(),
+                    kind: WorkKind::AlbumPostProcess,
+                    task: boxed_work(move |_cancel| async move { Ok("postprocessed") }),
+                })
+                .await;
+            }
+        }
+
+        assert!(postprocess_submitted);
+        let result = run.results.recv().await.expect("postprocess result");
+        assert_eq!(result.unit_id, "album-postprocess");
+        assert_eq!(result.outcome.expect("postprocess succeeds"), "postprocessed");
+        run.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mixed_queue_album_cancellation_does_not_stop_survivor_album_already_in_queue() {
+        let pool_cancel = CancellationToken::new();
+        let cancelled_album = CancellationToken::new();
+        let pool = SharedWorkerPool::<(&'static str, usize)>::new(Some(4), pool_cancel.clone());
+        let mut run = pool.start();
+        let (first_gate, first_blocker) = tool_gate();
+        let (second_gate, second_blocker) = tool_gate();
+        let runner = Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(first_blocker),
+            ToolBehavior::BlockThenSucceed(second_blocker),
+        ]));
+
+        for index in 0..2usize {
+            let task_cancel = cancelled_album.clone();
+            let runner = runner.clone();
+            pool.submit(WorkUnit {
+                job_id: "cancelled-album".to_string(),
+                unit_id: format!("a-{index}"),
+                kind: WorkKind::EncodeTrack { track_id: track_id(index) },
+                task: boxed_work(move |_pool_cancel| async move {
+                    runner.run(cmd(index), &task_cancel).await.map_err(|err| err.to_string())?;
+                    Ok(("cancelled-album", index))
+                }),
+            })
+            .await;
+        }
+
+        for index in 0..4usize {
+            pool.submit(WorkUnit {
+                job_id: "survivor-album".to_string(),
+                unit_id: format!("b-{index}"),
+                kind: WorkKind::EncodeTrack { track_id: track_id(index + 10) },
+                task: boxed_work(move |_cancel| async move { Ok(("survivor-album", index)) }),
+            })
+            .await;
+        }
+
+        let first_release = first_gate.wait_started().await;
+        let second_release = second_gate.wait_started().await;
+        cancelled_album.cancel();
+        drop(first_release);
+        drop(second_release);
+
+        let mut survivor = BTreeSet::new();
+        let mut cancelled = 0usize;
+        while survivor.len() < 4 || cancelled < 2 {
+            let result = run.results.recv().await.expect("mixed queue result");
+            match result.job_id.as_str() {
+                "survivor-album" => {
+                    survivor.insert(result.outcome.expect("survivor succeeds").1);
+                }
+                "cancelled-album" => {
+                    assert!(result.outcome.expect_err("cancelled task fails").contains("cancelled"));
+                    cancelled += 1;
+                }
+                other => panic!("unexpected job {other}"),
+            }
+        }
+
+        run.shutdown().await;
+        assert_eq!(survivor, (0usize..4).collect::<BTreeSet<_>>());
+        assert_eq!(cancelled, 2);
+    }
+
+    #[test]
+    fn album_completion_tracker_counts_failure_policy_boundaries() {
+        let mut fail_fast = AlbumCompletionTracker::default();
+        fail_fast.register_album("album".to_string(), 5, false);
+        assert!(matches!(
+            fail_fast.mark_track_finished("album", true),
+            AlbumReadiness::Waiting { finished: 1, expected: 5 }
+        ));
+        assert!(matches!(
+            fail_fast.mark_track_finished("album", false),
+            AlbumReadiness::Failed { finished: 2, expected: 5, failed: 1 }
+        ));
+        assert!(matches!(
+            fail_fast.mark_track_finished("album", true),
+            AlbumReadiness::Failed { finished: 3, expected: 5, failed: 1 }
+        ));
+
+        let mut partial = AlbumCompletionTracker::default();
+        partial.register_album("album".to_string(), 5, true);
+        for ok in [true, false, true, true] {
+            assert!(matches!(
+                partial.mark_track_finished("album", ok),
+                AlbumReadiness::Waiting { .. }
+            ));
+        }
+        assert_eq!(
+            partial.mark_track_finished("album", true),
+            AlbumReadiness::ReadyForPostProcess
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_album_queue_records_each_album_without_partition_deadlock() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<(&'static str, usize)>::new(Some(4), cancel.clone());
+        let mut run = pool.start();
+        for (job, count) in [("a", 5usize), ("b", 5usize), ("c", 5usize)] {
+            for index in 0..count {
+                pool.submit(WorkUnit {
+                    job_id: job.to_string(),
+                    unit_id: format!("{job}-{index}"),
+                    kind: WorkKind::EncodeTrack { track_id: track_id(index) },
+                    task: boxed_work(move |_cancel| async move { Ok((job, index)) }),
+                })
+                .await;
+            }
+        }
+
+        let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        while seen.values().map(Vec::len).sum::<usize>() < 15 {
+            let result = run.results.recv().await.expect("result");
+            let (job, index) = result.outcome.expect("task succeeds");
+            seen.entry(job.to_string()).or_default().push(index);
+        }
+        run.shutdown().await;
+        for job in ["a", "b", "c"] {
+            let mut values = seen.remove(job).expect("job results");
+            values.sort();
+            assert_eq!(values, vec![0, 1, 2, 3, 4]);
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_panic_does_not_deadlock_remaining_workers() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new(Some(3), cancel.clone());
+        let mut run = pool.start();
+
+        pool.submit(WorkUnit {
+            job_id: "panic-album".to_string(),
+            unit_id: "panic".to_string(),
+            kind: WorkKind::EncodeTrack { track_id: track_id(999) },
+            task: boxed_work(move |_cancel| async move {
+                panic!("intentional worker panic for recovery test");
+                #[allow(unreachable_code)]
+                Ok::<usize, String>(0)
+            }),
+        })
+        .await;
+
+        for index in 0..6usize {
+            pool.submit(WorkUnit {
+                job_id: "survivor".to_string(),
+                unit_id: format!("survivor-{index}"),
+                kind: WorkKind::EncodeTrack { track_id: track_id(index) },
+                task: boxed_work(move |_cancel| async move { Ok(index) }),
+            })
+            .await;
+        }
+
+        let mut completed = Vec::new();
+        while completed.len() < 6 {
+            let result = run.results.recv().await.expect("survivor result");
+            if result.job_id == "survivor" {
+                completed.push(result.outcome.expect("survivor succeeds"));
+            }
+        }
+        run.shutdown().await;
+        completed.sort();
+        assert_eq!(completed, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn fail_fast_album_drains_terminal_track_results_without_postprocess_submission() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum Output {
+            Track { index: usize, ok: bool },
+            PostProcess,
+        }
+
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<Output>::new(Some(3), cancel.clone());
+        let mut run = pool.start();
+        let mut tracker = AlbumCompletionTracker::default();
+        tracker.register_album("album".to_string(), 5, false);
+
+        for index in 0..5usize {
+            pool.submit(WorkUnit {
+                job_id: "album".to_string(),
+                unit_id: format!("track-{index}"),
+                kind: WorkKind::EncodeTrack { track_id: track_id(index) },
+                task: boxed_work(move |_cancel| async move {
+                    Ok(Output::Track { index, ok: index != 1 })
+                }),
+            })
+            .await;
+        }
+
+        let mut finished_tracks = Vec::new();
+        let mut failed_seen = false;
+        let mut postprocess_submitted = false;
+        while finished_tracks.len() < 5 {
+            let result = run.results.recv().await.expect("track result");
+            match result.outcome.expect("work completes") {
+                Output::Track { index, ok } => {
+                    finished_tracks.push(index);
+                    match tracker.mark_track_finished(&result.job_id, ok) {
+                        AlbumReadiness::Failed { .. } => failed_seen = true,
+                        AlbumReadiness::ReadyForPostProcess => {
+                            postprocess_submitted = true;
+                            pool.submit(WorkUnit {
+                                job_id: "album".to_string(),
+                                unit_id: "postprocess".to_string(),
+                                kind: WorkKind::AlbumPostProcess,
+                                task: boxed_work(move |_cancel| async move { Ok(Output::PostProcess) }),
+                            })
+                            .await;
+                        }
+                        AlbumReadiness::Waiting { .. } => {}
+                    }
+                }
+                Output::PostProcess => postprocess_submitted = true,
+            }
+        }
+
+        run.shutdown().await;
+        finished_tracks.sort();
+        assert_eq!(finished_tracks, vec![0, 1, 2, 3, 4]);
+        assert!(failed_seen, "fail-fast readiness was observed");
+        assert!(!postprocess_submitted, "fail-fast album never reaches postprocess readiness");
     }
 
 }
