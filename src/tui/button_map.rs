@@ -35,8 +35,12 @@ pub enum TuiButton {
     FormatPill(usize),
     RatePill(usize),
     DepthPill(usize),
+    ResamplerPill(usize),
     DitherPill(usize),
     ReplayGainPill(usize),
+    NoiseShaperPill(usize),
+    ModulatorOrderPill(usize),
+    ConversionPresetPill(usize),
     MergePill(usize),
 
     // Convert screen controls
@@ -191,8 +195,12 @@ impl TuiButton {
             | Self::FormatPill(_)
             | Self::RatePill(_)
             | Self::DepthPill(_)
+            | Self::ResamplerPill(_)
             | Self::DitherPill(_)
             | Self::ReplayGainPill(_)
+            | Self::NoiseShaperPill(_)
+            | Self::ModulatorOrderPill(_)
+            | Self::ConversionPresetPill(_)
             | Self::MergePill(_)
             | Self::PresetsButton
             | Self::SaveButton

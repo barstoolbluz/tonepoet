@@ -7,22 +7,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::convert::formats::AudioFormat;
 use crate::convert::simple_wizard::DitherType;
+use tonepoet_pipeline::enums::{DsdFilterPreset, DsdNoiseShaper, ModulatorOrder};
 
 use super::app::*;
+
+fn default_resampler() -> String {
+    "sox".to_string()
+}
 
 /// A TUI-native preset that stores pill values directly
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiPreset {
     pub name: String,
     pub description: Option<String>,
-    pub version: u32, // 2 = TUI preset
+    pub version: u32, // 2 = legacy TUI preset, 3 = dynamic format-pane preset
 
     // Format pane
     pub format: String, // "flac", "opus", etc.
     pub sample_rate: u32,
     pub bit_depth: String,  // "16", "24", "32", "32f", "64f"
-    pub dither: String,     // "tpdf", "none", "shaped"
+    pub dither: String,     // "tpdf", "none", "shibata", ...
     pub replaygain: String, // "album", "track", "both", "off"
+    #[serde(default = "default_resampler")]
+    pub resampler: String, // "sox", "ssrc", "soxr"
+    #[serde(default)]
+    pub noise_shaper: Option<String>, // "clans", "sdm", "crfb"
+    #[serde(default)]
+    pub modulator_order: Option<u8>, // 4-8
+    #[serde(default)]
+    pub dsd_filter_preset: Option<String>, // "auto", "sinc"
 
     // Output options pane
     #[serde(default)]
@@ -42,12 +55,16 @@ impl TuiPreset {
         Self {
             name: name.to_string(),
             description: None,
-            version: 2,
+            version: 3,
             format: format.format.selected_label().to_lowercase(),
             sample_rate: *format.sample_rate.selected_value(),
             bit_depth: format.bit_depth.selected_label().to_string(),
             dither: format.dither.selected_label().to_lowercase(),
             replaygain: format.replaygain.selected_label().to_lowercase(),
+            resampler: format.resampler.selected_label().to_lowercase(),
+            noise_shaper: Some(format.noise_shaper.selected_label().to_lowercase()),
+            modulator_order: Some(format.modulator_order.selected_value().value()),
+            dsd_filter_preset: Some(format.conversion_preset.selected_label().to_lowercase()),
             dest_path: output_opts
                 .dest_path
                 .as_ref()
@@ -89,6 +106,23 @@ impl TuiPreset {
         // ReplayGain
         if let Some(rg) = parse_replaygain(&self.replaygain) {
             format_state.replaygain.select_value(&rg);
+        }
+
+        if let Some(resampler) = parse_resampler(&self.resampler) {
+            format_state.resampler.select_value(&resampler);
+        }
+        if let Some(ref shaper) = self.noise_shaper {
+            if let Some(value) = parse_noise_shaper(shaper) {
+                format_state.noise_shaper.select_value(&value);
+            }
+        }
+        if let Some(order) = self.modulator_order.and_then(parse_modulator_order) {
+            format_state.modulator_order.select_value(&order);
+        }
+        if let Some(ref preset) = self.dsd_filter_preset {
+            if let Some(value) = parse_dsd_filter_preset(preset) {
+                format_state.conversion_preset.select_value(&value);
+            }
         }
 
         // Output options
@@ -172,6 +206,10 @@ impl TuiPreset {
             bit_depth: bit_depth.to_string(),
             dither: dither.to_string(),
             replaygain: replaygain.to_string(),
+            resampler: default_resampler(),
+            noise_shaper: Some("clans".to_string()),
+            modulator_order: Some(8),
+            dsd_filter_preset: Some("auto".to_string()),
             dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
@@ -448,6 +486,47 @@ fn parse_dither(s: &str) -> Option<DitherType> {
         "tpdf" => Some(DitherType::TPDF),
         "none" => Some(DitherType::None),
         "shaped" | "shibata" => Some(DitherType::Shibata),
+        "low-shibata" | "low_shibata" => Some(DitherType::LowShibata),
+        "high-shibata" | "high_shibata" => Some(DitherType::HighShibata),
+        "gesemann" => Some(DitherType::Gesemann),
+        "lipshitz" => Some(DitherType::Lipshitz),
+        _ => None,
+    }
+}
+
+fn parse_resampler(s: &str) -> Option<ResamplerChoice> {
+    match s {
+        "sox" => Some(ResamplerChoice::Sox),
+        "ssrc" => Some(ResamplerChoice::Ssrc),
+        "soxr" => Some(ResamplerChoice::Soxr),
+        _ => None,
+    }
+}
+
+fn parse_noise_shaper(s: &str) -> Option<DsdNoiseShaper> {
+    match s {
+        "clans" => Some(DsdNoiseShaper::Clans),
+        "sdm" => Some(DsdNoiseShaper::Sdm),
+        "crfb" => Some(DsdNoiseShaper::Crfb),
+        _ => None,
+    }
+}
+
+fn parse_modulator_order(value: u8) -> Option<ModulatorOrder> {
+    match value {
+        4 => Some(ModulatorOrder::Order4),
+        5 => Some(ModulatorOrder::Order5),
+        6 => Some(ModulatorOrder::Order6),
+        7 => Some(ModulatorOrder::Order7),
+        8 => Some(ModulatorOrder::Order8),
+        _ => None,
+    }
+}
+
+fn parse_dsd_filter_preset(s: &str) -> Option<DsdFilterPreset> {
+    match s {
+        "auto" => Some(DsdFilterPreset::Auto),
+        "sinc" => Some(DsdFilterPreset::Sinc),
         _ => None,
     }
 }

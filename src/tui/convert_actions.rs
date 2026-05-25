@@ -7,28 +7,82 @@ use crate::convert::formats::{
     AacProfile, AudioFormat, ConversionOptions, Mp3BitrateMode, QualitySettings, WavPackMode,
 };
 use crate::convert::simple_wizard::ReplayGainMode;
+use tonepoet_pipeline::enums as pipeline_enums;
+use tonepoet_pipeline::PipelineSettings;
 use crate::convert::ConversionStatus;
 
 use super::app::*;
 use super::message::AppMessage;
 
-/// Build ConversionOptions from current pill and pane state
+/// Build ConversionOptions from current pill and pane state.
+///
+/// Compatibility entry point for older call sites. It never panics. New
+/// user-facing code should call `try_pills_to_options` so validation failures
+/// can be rendered as status messages instead of silently falling back.
 pub fn pills_to_options(
     format: &FormatState,
     output_opts: &OutputOptionsState,
     config: &TonepoetConfig,
 ) -> ConversionOptions {
+    match try_pills_to_options(format, output_opts, config) {
+        Ok(options) => options,
+        Err(err) => {
+            log::error!("TUI format state produced invalid pipeline settings: {err}");
+            let mut clamped = format.clone();
+            clamped.apply_format_constraints();
+            match try_pills_to_options(&clamped, output_opts, config) {
+                Ok(options) => options,
+                Err(clamped_err) => {
+                    log::error!("clamped TUI format state still invalid: {clamped_err}");
+                    fallback_options(output_opts, config)
+                }
+            }
+        }
+    }
+}
+
+
+fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -> ConversionOptions {
+    let format = FormatState::new();
+    let mut options = ConversionOptions::default();
+    options.output_format = *format.format.selected_value();
+    options.target_sample_rate = Some(*format.sample_rate.selected_value());
+    options.target_bit_depth = Some(format.bit_depth.selected_value().to_backend_depth());
+    options.dither_type = Some(*format.dither.selected_value());
+    options.naming_template = Some(output_opts.filename_template.clone());
+    options.folder_template = Some(output_opts.folder_template.clone());
+    options.output_dir = output_opts.dest_path.clone();
+    options.merge_to_single = matches!(*output_opts.merge.selected_value(), MergeMode::SingleImage);
+    options.preserve_metadata = true;
+    options.append_lineage_to_comment = config.conversion.append_lineage_to_comment;
+    options.write_log_file = config.conversion.write_log_file;
+    options.generate_cue_files = config.conversion.generate_cue_files;
+    options.cue_generation_mode = config.conversion.cue_generation_mode.clone();
+    options.pipeline_settings = format_state_to_pipeline_settings(&format).ok();
+    options
+}
+
+/// Build ConversionOptions and validate unified pipeline settings on the release path.
+pub fn try_pills_to_options(
+    format: &FormatState,
+    output_opts: &OutputOptionsState,
+    config: &TonepoetConfig,
+) -> Result<ConversionOptions, String> {
     let output_format = *format.format.selected_value();
     let target_sample_rate = *format.sample_rate.selected_value();
     let bit_depth = *format.bit_depth.selected_value();
     let dither = *format.dither.selected_value();
     let rg = *format.replaygain.selected_value();
     let merge = *output_opts.merge.selected_value();
+    let is_dsd = format.is_dsd_selected();
+    let legacy_bit_depth_applies = matches!(
+        output_format,
+        AudioFormat::Flac | AudioFormat::Wav | AudioFormat::Aiff | AudioFormat::WavPack | AudioFormat::Alac
+    );
 
-    // Use backend bit depth for quality settings too (320 for float32)
+    // Use backend bit depth for quality settings when the legacy path still needs it.
     let backend_depth = bit_depth.to_backend_depth();
 
-    // Build format-specific quality settings
     let quality = match output_format {
         AudioFormat::Flac => QualitySettings::Flac {
             compression_level: 5,
@@ -60,30 +114,41 @@ pub fn pills_to_options(
         },
         AudioFormat::Alac => QualitySettings::Alac,
         AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
-            compression_level: 0, // DSD passthrough placeholder
+            compression_level: 0,
         },
     };
 
-    // Map ReplayGain choice
-    let (calculate_replaygain, replaygain_mode) = match rg {
-        ReplayGainChoice::Album => (true, Some(ReplayGainMode::Album)),
-        ReplayGainChoice::Track => (true, Some(ReplayGainMode::Track)),
-        ReplayGainChoice::Both => (true, Some(ReplayGainMode::Both)),
-        ReplayGainChoice::Off => (false, None),
+    let (calculate_replaygain, replaygain_mode) = if is_dsd {
+        (false, None)
+    } else {
+        match rg {
+            ReplayGainChoice::Album => (true, Some(ReplayGainMode::Album)),
+            ReplayGainChoice::Track => (true, Some(ReplayGainMode::Track)),
+            ReplayGainChoice::Both => (true, Some(ReplayGainMode::Both)),
+            ReplayGainChoice::Off => (false, None),
+        }
     };
 
-    // Dither: only for lossless formats. Lossy codecs handle their own quantization.
-    let dither_type = if output_format.is_lossless() {
+    // Keep legacy fields consistent with the unified settings. Hidden DSD and
+    // lossy-codec rows do not leak stale bit-depth, dither, or ReplayGain values.
+    let dither_type = if legacy_bit_depth_applies && !is_dsd {
         Some(dither)
     } else {
         None
     };
+    let target_bit_depth = if legacy_bit_depth_applies && !is_dsd {
+        Some(backend_depth)
+    } else {
+        None
+    };
 
-    ConversionOptions {
+    let pipeline_settings = format_state_to_pipeline_settings(format)?;
+
+    Ok(ConversionOptions {
         output_format,
         quality,
         target_sample_rate: Some(target_sample_rate),
-        target_bit_depth: Some(backend_depth),
+        target_bit_depth,
         dither_type,
         calculate_replaygain,
         replaygain_mode,
@@ -96,7 +161,136 @@ pub fn pills_to_options(
         write_log_file: config.conversion.write_log_file,
         generate_cue_files: config.conversion.generate_cue_files,
         cue_generation_mode: config.conversion.cue_generation_mode.clone(),
+        pipeline_settings: Some(pipeline_settings),
         ..ConversionOptions::default()
+    })
+}
+
+/// Build the unified pipeline settings from TUI format state.
+///
+/// This is the lossless handoff from dynamic TUI rows into command planning.
+/// It validates on every build, including release builds.
+pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<PipelineSettings, String> {
+    let target_format = map_audio_format(*format.format.selected_value());
+    let selected_rate = *format.sample_rate.selected_value();
+    let is_dsd = format.is_dsd_selected();
+
+    let (target_sample_rate, target_bit_depth, dither_type, preferred_tool, nyquist_transition) =
+        if is_dsd {
+            let dsd_rate = pipeline_enums::DsdRate::from_hz(selected_rate)
+                .ok_or_else(|| format!("{} is not a supported DSD target rate", selected_rate))?;
+            (
+                pipeline_enums::RateTarget::Dsd(dsd_rate),
+                pipeline_enums::BitDepthTarget::Source,
+                pipeline_enums::DitherType::None,
+                pipeline_enums::PreferredTool::Sox,
+                pipeline_enums::NyquistTransition::Gentle,
+            )
+        } else {
+            let target_depth = match *format.bit_depth.selected_value() {
+                BitDepthChoice::Int16 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Int16),
+                BitDepthChoice::Int24 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Int24),
+                BitDepthChoice::Int32 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Int32),
+                BitDepthChoice::Float32 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Float32),
+                BitDepthChoice::Float64 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Float64),
+            };
+            let (tool, transition) = match *format.resampler.selected_value() {
+                ResamplerChoice::Sox => (
+                    pipeline_enums::PreferredTool::Sox,
+                    pipeline_enums::NyquistTransition::Gentle,
+                ),
+                ResamplerChoice::Ssrc => (
+                    pipeline_enums::PreferredTool::Ssrc,
+                    pipeline_enums::NyquistTransition::BrickWall,
+                ),
+                ResamplerChoice::Soxr => (
+                    pipeline_enums::PreferredTool::Ffmpeg,
+                    pipeline_enums::NyquistTransition::Gentle,
+                ),
+            };
+            (
+                pipeline_enums::RateTarget::PcmHz(selected_rate),
+                target_depth,
+                map_dither(*format.dither.selected_value()),
+                tool,
+                transition,
+            )
+        };
+
+    let replay_gain_mode = if is_dsd {
+        None
+    } else {
+        match *format.replaygain.selected_value() {
+            ReplayGainChoice::Album => Some(pipeline_enums::ReplayGainMode::Album),
+            ReplayGainChoice::Track => Some(pipeline_enums::ReplayGainMode::Track),
+            ReplayGainChoice::Both => Some(pipeline_enums::ReplayGainMode::Both),
+            ReplayGainChoice::Off => None,
+        }
+    };
+
+    let mut dsd: tonepoet_pipeline::DsdSettings = Default::default();
+    if is_dsd {
+        dsd.noise_shaper = *format.noise_shaper.selected_value();
+        dsd.modulator_order = *format.modulator_order.selected_value();
+        dsd.pcm_to_dsd_filter = *format.conversion_preset.selected_value();
+    }
+
+    let settings = PipelineSettings {
+        target_format,
+        target_sample_rate,
+        target_bit_depth,
+        resample_quality: pipeline_enums::ResampleQuality::High,
+        nyquist_transition,
+        dither_type,
+        preferred_tool,
+        force_encode: false,
+        flac: Default::default(),
+        mp3: Default::default(),
+        aac: Default::default(),
+        opus: Default::default(),
+        wavpack: Default::default(),
+        ssrc: Default::default(),
+        dsd,
+        metadata: Default::default(),
+        verification: Default::default(),
+        replay_gain: {
+            let mut replay_gain: tonepoet_pipeline::ReplayGainSettings = Default::default();
+            replay_gain.mode = replay_gain_mode;
+            replay_gain
+        },
+    };
+
+    settings
+        .validate()
+        .map_err(|err| format!("invalid PipelineSettings from TUI state: {err}"))?;
+    Ok(settings)
+}
+
+fn map_audio_format(format: AudioFormat) -> pipeline_enums::AudioFormat {
+    match format {
+        AudioFormat::Flac => pipeline_enums::AudioFormat::Flac,
+        AudioFormat::Wav => pipeline_enums::AudioFormat::Wav,
+        AudioFormat::Aiff => pipeline_enums::AudioFormat::Aiff,
+        AudioFormat::WavPack => pipeline_enums::AudioFormat::WavPack,
+        AudioFormat::Mp3 => pipeline_enums::AudioFormat::Mp3,
+        AudioFormat::Aac => pipeline_enums::AudioFormat::Aac,
+        AudioFormat::Opus => pipeline_enums::AudioFormat::Opus,
+        AudioFormat::Alac => pipeline_enums::AudioFormat::Alac,
+        AudioFormat::Dsf => pipeline_enums::AudioFormat::Dsf,
+        AudioFormat::Dff => pipeline_enums::AudioFormat::Dff,
+    }
+}
+
+fn map_dither(dither: crate::convert::simple_wizard::DitherType) -> pipeline_enums::DitherType {
+    match dither {
+        crate::convert::simple_wizard::DitherType::None => pipeline_enums::DitherType::None,
+        crate::convert::simple_wizard::DitherType::TPDF => pipeline_enums::DitherType::Tpdf,
+        crate::convert::simple_wizard::DitherType::Shibata => pipeline_enums::DitherType::Shibata,
+        crate::convert::simple_wizard::DitherType::Lipshitz => pipeline_enums::DitherType::Lipshitz,
+        crate::convert::simple_wizard::DitherType::Gesemann => pipeline_enums::DitherType::Gesemann,
+        crate::convert::simple_wizard::DitherType::LowShibata => pipeline_enums::DitherType::LowShibata,
+        crate::convert::simple_wizard::DitherType::HighShibata => pipeline_enums::DitherType::HighShibata,
+        _ => pipeline_enums::DitherType::None,
     }
 }
 

@@ -290,12 +290,12 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format =>
         {
-            app.convert.format.field_focus = app.convert.format.field_focus.prev();
+            app.convert.format.focus_prev();
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format =>
         {
-            app.convert.format.field_focus = app.convert.format.field_focus.next();
+            app.convert.format.focus_next();
         }
 
         // Within Format pane: Left/Right changes pill selection
@@ -10163,8 +10163,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::TemplatePickerRow(_)
             | TuiButton::TemplatePickerApply
             | TuiButton::TemplatePickerDelete
-            | TuiButton::TemplatePickerClose => {
-                // Handled in dedicated mouse handlers; no-op here.
+            | TuiButton::TemplatePickerClose
+            | TuiButton::ResamplerPill(_)
+            | TuiButton::NoiseShaperPill(_)
+            | TuiButton::ModulatorOrderPill(_)
+            | TuiButton::ConversionPresetPill(_) => {
+                // Handled in dedicated mouse handlers or format interactions; no-op here.
             }
         }
     }

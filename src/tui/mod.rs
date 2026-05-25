@@ -13,6 +13,7 @@ pub mod command;
 pub mod context_menu;
 pub mod convert_actions;
 pub mod convert_screen;
+pub mod format_interactions;
 pub mod ctdb;
 pub mod cue_generate;
 pub mod cue_parser;
