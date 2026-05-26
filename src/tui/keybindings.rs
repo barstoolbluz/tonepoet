@@ -302,21 +302,13 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format =>
         {
-            let was_format = app.convert.format.field_focus == FormatField::Format;
-            app.convert.format.focused_pill_mut().select_prev();
-            if was_format {
-                app.convert.format.apply_format_constraints();
-            }
+            super::format_interactions::handle_convert_format_row_step(&mut app.convert, false);
             app.preset.mark_modified();
         }
         (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format =>
         {
-            let was_format = app.convert.format.field_focus == FormatField::Format;
-            app.convert.format.focused_pill_mut().select_next();
-            if was_format {
-                app.convert.format.apply_format_constraints();
-            }
+            super::format_interactions::handle_convert_format_row_step(&mut app.convert, true);
             app.preset.mark_modified();
         }
 
@@ -9773,54 +9765,17 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
 
             // ── Convert screen: format pane pills ──
-            TuiButton::FormatPill(i) => {
+            TuiButton::FormatPill(_)
+            | TuiButton::RatePill(_)
+            | TuiButton::DepthPill(_)
+            | TuiButton::ResamplerPill(_)
+            | TuiButton::DitherPill(_)
+            | TuiButton::ReplayGainPill(_)
+            | TuiButton::NoiseShaperPill(_)
+            | TuiButton::ModulatorOrderPill(_)
+            | TuiButton::ConversionPresetPill(_) => {
                 app.convert.focus = ConvertFocus::Format;
-                app.convert.format.field_focus = FormatField::Format;
-                if i < app.convert.format.format.options.len()
-                    && app.convert.format.format.options[i].enabled
-                {
-                    app.convert.format.format.selected = i;
-                    app.convert.format.apply_format_constraints();
-                    app.preset.mark_modified();
-                }
-            }
-            TuiButton::RatePill(i) => {
-                app.convert.focus = ConvertFocus::Format;
-                app.convert.format.field_focus = FormatField::SampleRate;
-                if i < app.convert.format.sample_rate.options.len()
-                    && app.convert.format.sample_rate.options[i].enabled
-                {
-                    app.convert.format.sample_rate.selected = i;
-                    app.preset.mark_modified();
-                }
-            }
-            TuiButton::DepthPill(i) => {
-                app.convert.focus = ConvertFocus::Format;
-                app.convert.format.field_focus = FormatField::BitDepth;
-                if i < app.convert.format.bit_depth.options.len()
-                    && app.convert.format.bit_depth.options[i].enabled
-                {
-                    app.convert.format.bit_depth.selected = i;
-                    app.preset.mark_modified();
-                }
-            }
-            TuiButton::DitherPill(i) => {
-                app.convert.focus = ConvertFocus::Format;
-                app.convert.format.field_focus = FormatField::Dither;
-                if i < app.convert.format.dither.options.len()
-                    && app.convert.format.dither.options[i].enabled
-                {
-                    app.convert.format.dither.selected = i;
-                    app.preset.mark_modified();
-                }
-            }
-            TuiButton::ReplayGainPill(i) => {
-                app.convert.focus = ConvertFocus::Format;
-                app.convert.format.field_focus = FormatField::ReplayGain;
-                if i < app.convert.format.replaygain.options.len()
-                    && app.convert.format.replaygain.options[i].enabled
-                {
-                    app.convert.format.replaygain.selected = i;
+                if super::format_interactions::handle_convert_format_button(&mut app.convert, button) {
                     app.preset.mark_modified();
                 }
             }
@@ -10163,12 +10118,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::TemplatePickerRow(_)
             | TuiButton::TemplatePickerApply
             | TuiButton::TemplatePickerDelete
-            | TuiButton::TemplatePickerClose
-            | TuiButton::ResamplerPill(_)
-            | TuiButton::NoiseShaperPill(_)
-            | TuiButton::ModulatorOrderPill(_)
-            | TuiButton::ConversionPresetPill(_) => {
-                // Handled in dedicated mouse handlers or format interactions; no-op here.
+            | TuiButton::TemplatePickerClose => {
+                // Handled in dedicated mouse handlers; no-op here.
             }
         }
     }

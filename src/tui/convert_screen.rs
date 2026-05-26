@@ -129,6 +129,7 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
         let buttons = &mut app.button_map;
         let label_col = format_area.x + 17; // "│" + "   " + 11-char label + "  " = 17
 
+        // Row 0: top border, row 1: blank, row 2: format pills
         register_pill_row(
             buttons,
             &state.format,
@@ -137,38 +138,24 @@ fn register_buttons(app: &mut AppState, chunks: &[Rect]) {
             format_area.width,
             |i| TuiButton::FormatPill(i),
         );
-        register_pill_row(
-            buttons,
-            &state.sample_rate,
-            format_area.y + 4,
-            label_col,
-            format_area.width,
-            |i| TuiButton::RatePill(i),
-        );
-        register_pill_row(
-            buttons,
-            &state.bit_depth,
-            format_area.y + 5,
-            label_col,
-            format_area.width,
-            |i| TuiButton::DepthPill(i),
-        );
-        register_pill_row(
-            buttons,
-            &state.dither,
-            format_area.y + 6,
-            label_col,
-            format_area.width,
-            |i| TuiButton::DitherPill(i),
-        );
-        register_pill_row(
-            buttons,
-            &state.replaygain,
-            format_area.y + 7,
-            label_col,
-            format_area.width,
-            |i| TuiButton::ReplayGainPill(i),
-        );
+
+        // Rows 3+: dynamic based on PCM vs DSD
+        let is_dsd = state.is_dsd_selected();
+        if is_dsd {
+            // DSD: rate(3), 1-bit(4, no pills), noise shaper(5), mod order(6), preset(7)
+            register_pill_row(buttons, &state.sample_rate, format_area.y + 3, label_col, format_area.width, |i| TuiButton::RatePill(i));
+            // row 4 is static "1-bit" label — no pill registration
+            register_pill_row(buttons, &state.noise_shaper, format_area.y + 5, label_col, format_area.width, |i| TuiButton::NoiseShaperPill(i));
+            register_pill_row(buttons, &state.modulator_order, format_area.y + 6, label_col, format_area.width, |i| TuiButton::ModulatorOrderPill(i));
+            register_pill_row(buttons, &state.conversion_preset, format_area.y + 7, label_col, format_area.width, |i| TuiButton::ConversionPresetPill(i));
+        } else {
+            // PCM: rate(3), depth(4), resampler(5), dither(6), replaygain(7)
+            register_pill_row(buttons, &state.sample_rate, format_area.y + 3, label_col, format_area.width, |i| TuiButton::RatePill(i));
+            register_pill_row(buttons, &state.bit_depth, format_area.y + 4, label_col, format_area.width, |i| TuiButton::DepthPill(i));
+            register_pill_row(buttons, &state.resampler, format_area.y + 5, label_col, format_area.width, |i| TuiButton::ResamplerPill(i));
+            register_pill_row(buttons, &state.dither, format_area.y + 6, label_col, format_area.width, |i| TuiButton::DitherPill(i));
+            register_pill_row(buttons, &state.replaygain, format_area.y + 7, label_col, format_area.width, |i| TuiButton::ReplayGainPill(i));
+        }
     }
 
     // Output options pane pill buttons
