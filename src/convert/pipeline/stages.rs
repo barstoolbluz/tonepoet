@@ -7118,7 +7118,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires cancellation check between materialize and plan stages in prepare_pipeline_item_for_scheduler"]
+    #[ignore = "StubToolRunner returns empty ffprobe output causing MaterializeFailed before cancel check; needs faked ffprobe responses"]
     async fn cancellation_after_materialization_before_planning_uses_real_prepare_boundary() {
         let temp = tempfile::tempdir().expect("temp dir");
         let req = phase_request(temp.path(), "input.flac");

@@ -167,6 +167,62 @@ pub fn build_pipeline_request_from_legacy_options(
     build_pipeline_request_from_settings(item, settings)
 }
 
+/// Build PipelineSettings from legacy ConversionOptions fields.
+/// Used as a fallback when pipeline_settings is None (CLI path).
+pub fn pipeline_settings_from_legacy_options(options: &crate::convert::formats::ConversionOptions) -> PipelineSettings {
+    use tonepoet_pipeline::enums as pe;
+    let mut settings = PipelineSettings::default();
+    settings.target_format = main_audio_format_to_planner(options.output_format);
+    settings.force_encode = options.reencode_flac;
+    settings.metadata.transfer_tags = options.preserve_metadata;
+    settings.metadata.preserve_artwork = options.preserve_metadata;
+    if let Some(rate) = options.target_sample_rate {
+        if rate >= 2_822_400 {
+            if let Some(dsd) = pe::DsdRate::from_hz(rate) {
+                settings.target_sample_rate = pe::RateTarget::Dsd(dsd);
+            }
+        } else {
+            settings.target_sample_rate = pe::RateTarget::PcmHz(rate);
+        }
+    }
+    if let Some(depth) = options.target_bit_depth {
+        let pcm = match depth {
+            16 => pe::PcmBitDepth::Int16,
+            24 => pe::PcmBitDepth::Int24,
+            32 => pe::PcmBitDepth::Int32,
+            320 => pe::PcmBitDepth::Float32,
+            640 => pe::PcmBitDepth::Float64,
+            _ => pe::PcmBitDepth::Int24,
+        };
+        settings.target_bit_depth = pe::BitDepthTarget::Pcm(pcm);
+    }
+    if let Some(dither) = options.dither_type {
+        settings.dither_type = match dither {
+            crate::convert::simple_wizard::DitherType::None => pe::DitherType::None,
+            crate::convert::simple_wizard::DitherType::TPDF => pe::DitherType::Tpdf,
+            crate::convert::simple_wizard::DitherType::Shibata => pe::DitherType::Shibata,
+            crate::convert::simple_wizard::DitherType::LowShibata => pe::DitherType::LowShibata,
+            crate::convert::simple_wizard::DitherType::HighShibata => pe::DitherType::HighShibata,
+            crate::convert::simple_wizard::DitherType::Gesemann => pe::DitherType::Gesemann,
+            crate::convert::simple_wizard::DitherType::Lipshitz => pe::DitherType::Lipshitz,
+            crate::convert::simple_wizard::DitherType::FWeighted => pe::DitherType::FWeighted,
+            crate::convert::simple_wizard::DitherType::ModifiedEWeighted => pe::DitherType::ModifiedEWeighted,
+            crate::convert::simple_wizard::DitherType::ImprovedEWeighted => pe::DitherType::ImprovedEWeighted,
+            crate::convert::simple_wizard::DitherType::SloppedTPDF => pe::DitherType::SlopedTpdf,
+        };
+    }
+    if options.calculate_replaygain {
+        settings.replay_gain.mode = options.replaygain_mode.as_ref().map(|mode| {
+            match mode {
+                crate::convert::simple_wizard::ReplayGainMode::Album => pe::ReplayGainMode::Album,
+                crate::convert::simple_wizard::ReplayGainMode::Track => pe::ReplayGainMode::Track,
+                crate::convert::simple_wizard::ReplayGainMode::Both => pe::ReplayGainMode::Both,
+            }
+        });
+    }
+    settings
+}
+
 fn legacy_pipeline_settings_for_item(item: &ConversionItem) -> ConversionResult<PipelineSettings> {
     let mut settings = PipelineSettings::default();
     settings.target_format = main_audio_format_to_planner(item.output_format);

@@ -3896,9 +3896,7 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                     .pipeline_settings
                     .clone()
                     .unwrap_or_else(|| {
-                        let mut s = tonepoet_pipeline::PipelineSettings::default();
-                        s.target_format = tonepoet_pipeline::AudioFormat::Flac;
-                        s
+                        crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
                     });
                 let req = PipelineRequest {
                     worker_count: None,

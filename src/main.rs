@@ -808,9 +808,7 @@ fn build_pipeline_request_template(
             .pipeline_settings
             .clone()
             .unwrap_or_else(|| {
-                let mut s = tonepoet_pipeline::PipelineSettings::default();
-                s.target_format = tonepoet_pipeline::AudioFormat::Flac;
-                s
+                tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options)
             }),
         merge,
         output_root: output_root.clone(),
