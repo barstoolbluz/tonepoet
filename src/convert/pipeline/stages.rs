@@ -6888,6 +6888,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         let staging = StagingDir::new(staging_parent.join("job-2-1-3"), req.job_id.clone());
         let track_ids = (0..track_count).map(|index| track_id(index as u32)).collect::<Vec<_>>();
         let source = prepared_source(root, &track_ids);
+        // Create source files so manifest builder can stat them.
+        for id in &track_ids {
+            std::fs::write(root.join(format!("source-{}.flac", id.source_ordinal)), b"source").expect("source file");
+        }
         let album_dir = root.join("out").join("Gate Test");
         let mut staged_paths = Vec::new();
         let mut final_paths = Vec::new();
@@ -7287,32 +7291,19 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(final_paths[3].exists());
         assert!(final_paths[4].exists());
 
-        // TODO: manifest assertions deferred until manifest writing is wired into
-        // publish_album_output / finish_pipeline_album_for_scheduler.
-        // The manifest module and read_manifest exist but aren't called during publish yet.
-        //
-        // let manifest = read_manifest(&fixture.album_dir)
-        //     .expect("partial manifest read succeeds")
-        //     .expect("allow-partial publish writes a manifest");
-        // assert_eq!(manifest.total_tracks, 5);
-        // assert_eq!(manifest.tracks.len(), 5);
-        // assert_eq!(
-        //     manifest.tracks.iter()
-        //         .filter(|track| track.validation_status == ValidationStatus::Passed)
-        //         .count(),
-        //     4,
-        // );
-        #[allow(unused_variables)]
-        let manifest_deferred = true;
-        // Remaining manifest assertions also deferred:
-        // assert_eq!(
-        //     manifest.tracks
-        //         .iter()
-        //         .filter(|track| matches!(track.validation_status, ValidationStatus::Failed { .. }))
-        //         .count(),
-        //     1,
-        //     "partial manifest records one failed track"
-        // );
+        // Manifest records only published tracks (failed tracks have no artifact/output).
+        let manifest = read_manifest(&fixture.album_dir)
+            .expect("partial manifest read succeeds")
+            .expect("allow-partial publish writes a manifest");
+        assert_eq!(manifest.total_tracks, 4, "manifest records 4 published tracks");
+        assert_eq!(manifest.tracks.len(), 4);
+        assert_eq!(
+            manifest.tracks.iter()
+                .filter(|track| track.validation_status == ValidationStatus::Passed)
+                .count(),
+            4,
+            "all manifest entries are successful (failed tracks not in manifest)"
+        );
     }
 
     #[tokio::test]
