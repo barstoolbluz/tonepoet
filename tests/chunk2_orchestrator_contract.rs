@@ -9,18 +9,16 @@
 fn single_files_enter_the_shared_pool_as_immediate_work_units() {
     let processor = include_str!("../src/convert/processor.rs");
     assert!(processor.contains("WorkKind::SingleFile"));
-    assert!(processor.contains("submit_single_file_work(&pool"));
+    assert!(processor.contains("build_single_file_work(request"));
     assert!(processor.contains("run_pipeline_item_with_tool_paths"));
     assert!(processor.contains("run_single_item_with_shared_scheduler"));
-    assert!(processor.contains("run_queue_with_shared_orchestrator(
-        vec![item]"));
+    assert!(processor.contains("run_queue_with_shared_orchestrator("));
 
     let single_branch = processor
         .find("Some(SourceKind::SingleFile)")
         .expect("processor must branch on SourceKind::SingleFile");
     let branch_tail = &processor[single_branch..processor.len().min(single_branch + 500)];
-    assert!(branch_tail.contains("submit_single_file_work"));
-    assert!(branch_tail.contains("continue;"));
+    assert!(branch_tail.contains("build_single_file_work"));
     assert!(!branch_tail.contains("prepare_pipeline_item_for_scheduler"));
 }
 

@@ -7,10 +7,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -49,26 +50,425 @@ pub struct WorkResult<R> {
     pub elapsed: Duration,
 }
 
+/// Limits for ready work waiting in the shared scheduler queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolLimits {
+    /// Maximum ready work units waiting in the queue. None keeps the legacy unbounded queue.
+    pub ready_capacity: Option<usize>,
+}
+
+impl PoolLimits {
+    fn normalized(self) -> Self {
+        Self {
+            ready_capacity: self.ready_capacity.map(|capacity| capacity.max(1)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchedulerMetricsSnapshot {
+    pub jobs_queued: u64,
+    pub jobs_completed: u64,
+    pub jobs_failed: u64,
+    pub tracks_materialized: u64,
+    /// Successfully encoded tracks only. Failed/cancelled track outputs are counted in
+    /// `tracks_encode_failed` and every track encode output is counted in
+    /// `tracks_encode_attempted`.
+    pub tracks_encoded: u64,
+    pub tracks_encode_attempted: u64,
+    pub tracks_encode_failed: u64,
+    pub commands_started: u64,
+    pub commands_failed: u64,
+    pub workers_busy: u64,
+    pub worker_idle_ns: u64,
+    /// Total ready scheduler pressure: worker-pool ready queue plus processor-side
+    /// submission backlog.
+    pub ready_queue_depth: u64,
+    pub peak_queue_depth: u64,
+    /// Worker-pool queue depth only.
+    pub pool_ready_queue_depth: u64,
+    /// Processor-side deferred/logical submission depth only.
+    pub submission_backlog_depth: u64,
+    pub peak_submission_backlog_depth: u64,
+    pub tool_runtime_ns_total: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub cleanup_paths_deleted: u64,
+    pub cleanup_paths_failed: u64,
+}
+
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerTestEvent {
+    WorkerIdleWaitStarted,
+    WorkerResultSendStarted,
+    WorkerResultSendFinished,
+    SubmitManyWaitingForCapacity,
+}
+
+/// Lock-free scheduler counters for TUI, logging, and tests.
+#[derive(Debug, Default)]
+pub struct SchedulerMetrics {
+    pub jobs_queued: AtomicU64,
+    pub jobs_completed: AtomicU64,
+    pub jobs_failed: AtomicU64,
+    pub tracks_materialized: AtomicU64,
+    /// Successfully encoded tracks only.
+    pub tracks_encoded: AtomicU64,
+    pub tracks_encode_attempted: AtomicU64,
+    pub tracks_encode_failed: AtomicU64,
+    pub commands_started: AtomicU64,
+    pub commands_failed: AtomicU64,
+    pub workers_busy: AtomicU64,
+    pub worker_idle_ns: AtomicU64,
+    /// Total ready scheduler pressure: worker-pool queue + processor-side backlog.
+    pub ready_queue_depth: AtomicU64,
+    pub peak_queue_depth: AtomicU64,
+    /// Worker-pool queue depth only.
+    pub pool_ready_queue_depth: AtomicU64,
+    /// Processor-side deferred/logical submission depth only.
+    pub submission_backlog_depth: AtomicU64,
+    pub peak_submission_backlog_depth: AtomicU64,
+    pub tool_runtime_ns_total: AtomicU64,
+    pub bytes_read: AtomicU64,
+    pub bytes_written: AtomicU64,
+    pub cleanup_paths_deleted: AtomicU64,
+    pub cleanup_paths_failed: AtomicU64,
+    #[cfg(test)]
+    test_events: std::sync::Mutex<Option<mpsc::UnboundedSender<SchedulerTestEvent>>>,
+}
+
+impl SchedulerMetrics {
+    #[cfg(test)]
+    pub fn set_test_event_sender(&self, sender: mpsc::UnboundedSender<SchedulerTestEvent>) {
+        if let Ok(mut guard) = self.test_events.lock() {
+            *guard = Some(sender);
+        }
+    }
+
+    #[cfg(test)]
+    fn emit_test_event(&self, event: SchedulerTestEvent) {
+        if let Ok(guard) = self.test_events.lock() {
+            if let Some(sender) = guard.as_ref() {
+                let _ = sender.send(event);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> SchedulerMetricsSnapshot {
+        SchedulerMetricsSnapshot {
+            jobs_queued: self.jobs_queued.load(Ordering::Relaxed),
+            jobs_completed: self.jobs_completed.load(Ordering::Relaxed),
+            jobs_failed: self.jobs_failed.load(Ordering::Relaxed),
+            tracks_materialized: self.tracks_materialized.load(Ordering::Relaxed),
+            tracks_encoded: self.tracks_encoded.load(Ordering::Relaxed),
+            tracks_encode_attempted: self.tracks_encode_attempted.load(Ordering::Relaxed),
+            tracks_encode_failed: self.tracks_encode_failed.load(Ordering::Relaxed),
+            commands_started: self.commands_started.load(Ordering::Relaxed),
+            commands_failed: self.commands_failed.load(Ordering::Relaxed),
+            workers_busy: self.workers_busy.load(Ordering::Acquire),
+            worker_idle_ns: self.worker_idle_ns.load(Ordering::Relaxed),
+            ready_queue_depth: self.ready_queue_depth.load(Ordering::Acquire),
+            peak_queue_depth: self.peak_queue_depth.load(Ordering::Acquire),
+            pool_ready_queue_depth: self.pool_ready_queue_depth.load(Ordering::Acquire),
+            submission_backlog_depth: self.submission_backlog_depth.load(Ordering::Acquire),
+            peak_submission_backlog_depth: self.peak_submission_backlog_depth.load(Ordering::Acquire),
+            tool_runtime_ns_total: self.tool_runtime_ns_total.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            cleanup_paths_deleted: self.cleanup_paths_deleted.load(Ordering::Relaxed),
+            cleanup_paths_failed: self.cleanup_paths_failed.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.jobs_queued.store(0, Ordering::Relaxed);
+        self.jobs_completed.store(0, Ordering::Relaxed);
+        self.jobs_failed.store(0, Ordering::Relaxed);
+        self.tracks_materialized.store(0, Ordering::Relaxed);
+        self.tracks_encoded.store(0, Ordering::Relaxed);
+        self.tracks_encode_attempted.store(0, Ordering::Relaxed);
+        self.tracks_encode_failed.store(0, Ordering::Relaxed);
+        self.commands_started.store(0, Ordering::Relaxed);
+        self.commands_failed.store(0, Ordering::Relaxed);
+        self.workers_busy.store(0, Ordering::Release);
+        self.worker_idle_ns.store(0, Ordering::Relaxed);
+        self.ready_queue_depth.store(0, Ordering::Release);
+        self.peak_queue_depth.store(0, Ordering::Release);
+        self.pool_ready_queue_depth.store(0, Ordering::Release);
+        self.submission_backlog_depth.store(0, Ordering::Release);
+        self.peak_submission_backlog_depth.store(0, Ordering::Release);
+        self.tool_runtime_ns_total.store(0, Ordering::Relaxed);
+        self.bytes_read.store(0, Ordering::Relaxed);
+        self.bytes_written.store(0, Ordering::Relaxed);
+        self.cleanup_paths_deleted.store(0, Ordering::Relaxed);
+        self.cleanup_paths_failed.store(0, Ordering::Relaxed);
+    }
+
+    pub fn record_jobs_queued(&self, count: u64) {
+        if count > 0 {
+            saturating_add(&self.jobs_queued, count);
+        }
+    }
+
+    pub fn record_job_completed(&self) {
+        saturating_add(&self.jobs_completed, 1);
+    }
+
+    pub fn record_job_failed(&self) {
+        saturating_add(&self.jobs_failed, 1);
+    }
+
+    pub fn record_tracks_materialized(&self, count: u64) {
+        if count > 0 {
+            saturating_add(&self.tracks_materialized, count);
+        }
+    }
+
+    pub fn record_track_encoded(&self) {
+        saturating_add(&self.tracks_encoded, 1);
+    }
+
+    pub fn record_track_encode_output(&self, ok: bool) {
+        saturating_add(&self.tracks_encode_attempted, 1);
+        if ok {
+            saturating_add(&self.tracks_encoded, 1);
+        } else {
+            saturating_add(&self.tracks_encode_failed, 1);
+        }
+    }
+
+    pub fn record_command_started(&self) {
+        saturating_add(&self.commands_started, 1);
+    }
+
+    pub fn record_command_failed(&self) {
+        saturating_add(&self.commands_failed, 1);
+    }
+
+    pub fn record_worker_busy_started(&self) {
+        saturating_add(&self.workers_busy, 1);
+    }
+
+    pub fn record_worker_busy_finished(&self) {
+        saturating_sub(&self.workers_busy, 1);
+    }
+
+    pub fn record_worker_idle_duration(&self, duration: Duration) {
+        record_duration(&self.worker_idle_ns, duration);
+    }
+
+    pub fn record_tool_runtime(&self, duration: Duration) {
+        record_duration(&self.tool_runtime_ns_total, duration);
+    }
+
+    pub fn record_pool_queue_depth(&self, depth: usize) {
+        self.pool_ready_queue_depth.store(depth as u64, Ordering::Release);
+        self.refresh_total_ready_depth();
+    }
+
+    pub fn record_submission_backlog_depth(&self, depth: usize) {
+        let depth = depth as u64;
+        self.submission_backlog_depth.store(depth, Ordering::Release);
+        record_peak(&self.peak_submission_backlog_depth, depth);
+        self.refresh_total_ready_depth();
+    }
+
+    pub fn record_queue_depth(&self, depth: usize) {
+        self.record_pool_queue_depth(depth);
+    }
+
+    fn refresh_total_ready_depth(&self) {
+        let depth = self
+            .pool_ready_queue_depth
+            .load(Ordering::Acquire)
+            .saturating_add(self.submission_backlog_depth.load(Ordering::Acquire));
+        self.ready_queue_depth.store(depth, Ordering::Release);
+        record_peak(&self.peak_queue_depth, depth);
+    }
+}
+
+pub enum TrySubmitError<R: Send + 'static> {
+    QueueFull {
+        unit: WorkUnit<R>,
+        capacity: usize,
+        depth: usize,
+    },
+    /// Retained for source compatibility with the earlier non-blocking API shape.
+    /// The current semaphore-backed implementation does not use transient queue-lock
+    /// contention as a submit rejection reason.
+    QueueBusy(WorkUnit<R>),
+}
+
+impl<R: Send + 'static> std::fmt::Debug for TrySubmitError<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrySubmitError::QueueFull { capacity, depth, .. } => f
+                .debug_struct("QueueFull")
+                .field("capacity", capacity)
+                .field("depth", depth)
+                .finish(),
+            TrySubmitError::QueueBusy(_) => f.write_str("QueueBusy"),
+        }
+    }
+}
+
+impl<R: Send + 'static> TrySubmitError<R> {
+    pub fn into_unit(self) -> WorkUnit<R> {
+        match self {
+            TrySubmitError::QueueFull { unit, .. } | TrySubmitError::QueueBusy(unit) => unit,
+        }
+    }
+}
+
+pub enum TrySubmitManyError<R: Send + 'static> {
+    BatchTooLarge {
+        units: Vec<WorkUnit<R>>,
+        capacity: usize,
+    },
+    QueueFull {
+        units: Vec<WorkUnit<R>>,
+        capacity: usize,
+        depth: usize,
+    },
+    /// Retained for source compatibility. Bounded capacity is decided by semaphore
+    /// permits, so queue-lock contention is not reported as a batch rejection reason.
+    QueueBusy(Vec<WorkUnit<R>>),
+}
+
+impl<R: Send + 'static> std::fmt::Debug for TrySubmitManyError<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrySubmitManyError::BatchTooLarge { units, capacity } => f
+                .debug_struct("BatchTooLarge")
+                .field("units", &units.len())
+                .field("capacity", capacity)
+                .finish(),
+            TrySubmitManyError::QueueFull { units, capacity, depth } => f
+                .debug_struct("QueueFull")
+                .field("units", &units.len())
+                .field("capacity", capacity)
+                .field("depth", depth)
+                .finish(),
+            TrySubmitManyError::QueueBusy(units) => f
+                .debug_struct("QueueBusy")
+                .field("units", &units.len())
+                .finish(),
+        }
+    }
+}
+
+impl<R: Send + 'static> TrySubmitManyError<R> {
+    pub fn into_units(self) -> Vec<WorkUnit<R>> {
+        match self {
+            TrySubmitManyError::BatchTooLarge { units, .. }
+            | TrySubmitManyError::QueueFull { units, .. }
+            | TrySubmitManyError::QueueBusy(units) => units,
+        }
+    }
+}
+
+pub enum SubmitManyError<R: Send + 'static> {
+    BatchTooLarge {
+        units: Vec<WorkUnit<R>>,
+        capacity: usize,
+    },
+    Cancelled(Vec<WorkUnit<R>>),
+}
+
+impl<R: Send + 'static> std::fmt::Debug for SubmitManyError<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitManyError::BatchTooLarge { units, capacity } => f
+                .debug_struct("BatchTooLarge")
+                .field("units", &units.len())
+                .field("capacity", capacity)
+                .finish(),
+            SubmitManyError::Cancelled(units) => f
+                .debug_struct("Cancelled")
+                .field("units", &units.len())
+                .finish(),
+        }
+    }
+}
+
+impl<R: Send + 'static> SubmitManyError<R> {
+    pub fn into_units(self) -> Vec<WorkUnit<R>> {
+        match self {
+            SubmitManyError::BatchTooLarge { units, .. } | SubmitManyError::Cancelled(units) => units,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SharedWorkerPool<R: Send + 'static> {
     queue: Arc<Mutex<VecDeque<WorkUnit<R>>>>,
     notify: Arc<Notify>,
+    space: Option<Arc<Semaphore>>,
     cancel: CancellationToken,
     worker_count: usize,
+    limits: PoolLimits,
+    metrics: Arc<SchedulerMetrics>,
 }
 
 impl<R: Send + 'static> SharedWorkerPool<R> {
     pub fn new(worker_count: Option<usize>, cancel: CancellationToken) -> Self {
+        Self::with_limits(worker_count, cancel, PoolLimits::default())
+    }
+
+    pub fn new_with_limits(
+        worker_count: Option<usize>,
+        cancel: CancellationToken,
+        limits: PoolLimits,
+    ) -> Self {
+        Self::with_limits(worker_count, cancel, limits)
+    }
+
+    pub fn new_with_limits_and_metrics(
+        worker_count: Option<usize>,
+        cancel: CancellationToken,
+        limits: PoolLimits,
+        metrics: Arc<SchedulerMetrics>,
+    ) -> Self {
+        Self::with_limits_and_metrics(worker_count, cancel, limits, metrics)
+    }
+
+    pub fn with_limits(
+        worker_count: Option<usize>,
+        cancel: CancellationToken,
+        limits: PoolLimits,
+    ) -> Self {
+        Self::with_limits_and_metrics(
+            worker_count,
+            cancel,
+            limits,
+            Arc::new(SchedulerMetrics::default()),
+        )
+    }
+
+    pub fn with_limits_and_metrics(
+        worker_count: Option<usize>,
+        cancel: CancellationToken,
+        limits: PoolLimits,
+        metrics: Arc<SchedulerMetrics>,
+    ) -> Self {
         let detected = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             .saturating_sub(1)
             .max(1);
+        let limits = limits.normalized();
         Self {
             queue: Arc::new(Mutex::new(VecDeque::new())),
             notify: Arc::new(Notify::new()),
+            space: limits
+                .ready_capacity
+                .map(|capacity| Arc::new(Semaphore::new(capacity))),
             cancel,
             worker_count: worker_count.unwrap_or(detected).max(1),
+            limits,
+            metrics,
         }
     }
 
@@ -76,25 +476,170 @@ impl<R: Send + 'static> SharedWorkerPool<R> {
         self.worker_count
     }
 
+    pub fn limits(&self) -> PoolLimits {
+        self.limits
+    }
+
+    pub fn metrics(&self) -> &SchedulerMetrics {
+        self.metrics.as_ref()
+    }
+
+    pub fn metrics_handle(&self) -> Arc<SchedulerMetrics> {
+        self.metrics.clone()
+    }
+
     pub async fn submit(&self, unit: WorkUnit<R>) {
-        self.queue.lock().await.push_back(unit);
+        if let Some(space) = self.space.as_ref() {
+            let acquired = tokio::select! {
+                permit = space.clone().acquire_owned() => permit,
+                _ = self.cancel.cancelled() => return,
+            };
+            let Ok(permit) = acquired else {
+                return;
+            };
+            std::mem::forget(permit);
+        }
+
+        {
+            let mut queue = self.queue.lock().expect("worker queue mutex poisoned");
+            queue.push_back(unit);
+            let new_depth = queue.len();
+            self.metrics.record_jobs_queued(1);
+            self.metrics.record_queue_depth(new_depth);
+        }
         self.notify.notify_one();
     }
 
-    pub async fn submit_many<I>(&self, units: I)
+    pub fn try_submit(&self, unit: WorkUnit<R>) -> Result<(), TrySubmitError<R>> {
+        self.try_submit_inner(unit, true)
+    }
+
+    pub(crate) fn try_submit_counted(&self, unit: WorkUnit<R>) -> Result<(), TrySubmitError<R>> {
+        self.try_submit_inner(unit, false)
+    }
+
+    fn try_submit_inner(
+        &self,
+        unit: WorkUnit<R>,
+        record_queued: bool,
+    ) -> Result<(), TrySubmitError<R>> {
+        if let Some(space) = self.space.as_ref() {
+            match space.clone().try_acquire_owned() {
+                Ok(permit) => std::mem::forget(permit),
+                Err(_) => {
+                    let capacity = self.limits.ready_capacity.unwrap_or(0);
+                    let depth = capacity.saturating_sub(space.available_permits());
+                    return Err(TrySubmitError::QueueFull { unit, capacity, depth });
+                }
+            }
+        }
+
+        {
+            let mut queue = self.queue.lock().expect("worker queue mutex poisoned");
+            queue.push_back(unit);
+            let new_depth = queue.len();
+            if record_queued {
+                self.metrics.record_jobs_queued(1);
+            }
+            self.metrics.record_queue_depth(new_depth);
+        }
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// Enqueue a batch as one admission operation.
+    ///
+    /// With no ready-capacity limit this preserves the legacy behavior: all units are
+    /// appended under one queue lock. With a limit, the method waits until the full
+    /// batch fits and then appends all units under one lock. It never admits a
+    /// prefix of a batch.
+    ///
+    /// A batch larger than `ready_capacity` cannot ever fit without violating the
+    /// configured limit, so the method returns the full batch in `BatchTooLarge`
+    /// instead of waiting forever.
+    pub async fn submit_many<I>(&self, units: I) -> Result<(), SubmitManyError<R>>
     where
         I: IntoIterator<Item = WorkUnit<R>>,
     {
-        let mut added = 0usize;
-        let mut queue = self.queue.lock().await;
-        for unit in units {
-            queue.push_back(unit);
-            added += 1;
+        let mut units: Vec<_> = units.into_iter().collect();
+        if units.is_empty() {
+            return Ok(());
         }
-        drop(queue);
+
+        let added = units.len();
+        if let Some(space) = self.space.as_ref() {
+            let capacity = self.limits.ready_capacity.unwrap_or(0);
+            if added > capacity {
+                return Err(SubmitManyError::BatchTooLarge { units, capacity });
+            }
+            #[cfg(test)]
+            if space.available_permits() < added {
+                self.metrics.emit_test_event(SchedulerTestEvent::SubmitManyWaitingForCapacity);
+            }
+            let permit_count = match u32::try_from(added) {
+                Ok(count) => count,
+                Err(_) => return Err(SubmitManyError::BatchTooLarge { units, capacity }),
+            };
+            let acquired = tokio::select! {
+                permit = space.clone().acquire_many_owned(permit_count) => permit,
+                _ = self.cancel.cancelled() => return Err(SubmitManyError::Cancelled(units)),
+            };
+            let Ok(permits) = acquired else {
+                return Err(SubmitManyError::Cancelled(units));
+            };
+            std::mem::forget(permits);
+        }
+
+        {
+            let mut queue = self.queue.lock().expect("worker queue mutex poisoned");
+            queue.extend(units.drain(..));
+            self.metrics.record_jobs_queued(added as u64);
+            self.metrics.record_queue_depth(queue.len());
+        }
         for _ in 0..added {
             self.notify.notify_one();
         }
+        Ok(())
+    }
+
+    pub fn try_submit_many<I>(&self, units: I) -> Result<(), TrySubmitManyError<R>>
+    where
+        I: IntoIterator<Item = WorkUnit<R>>,
+    {
+        let units: Vec<_> = units.into_iter().collect();
+        if units.is_empty() {
+            return Ok(());
+        }
+
+        let added = units.len();
+        if let Some(space) = self.space.as_ref() {
+            let capacity = self.limits.ready_capacity.unwrap_or(0);
+            if added > capacity {
+                return Err(TrySubmitManyError::BatchTooLarge { units, capacity });
+            }
+            let permit_count = match u32::try_from(added) {
+                Ok(count) => count,
+                Err(_) => return Err(TrySubmitManyError::BatchTooLarge { units, capacity }),
+            };
+            match space.clone().try_acquire_many_owned(permit_count) {
+                Ok(permits) => std::mem::forget(permits),
+                Err(_) => {
+                    let depth = capacity.saturating_sub(space.available_permits());
+                    return Err(TrySubmitManyError::QueueFull { units, capacity, depth });
+                }
+            }
+        }
+
+        {
+            let mut queue = self.queue.lock().expect("worker queue mutex poisoned");
+            queue.extend(units);
+            self.metrics.record_jobs_queued(added as u64);
+            self.metrics.record_queue_depth(queue.len());
+        }
+        for _ in 0..added {
+            self.notify.notify_one();
+        }
+        Ok(())
     }
 
     pub fn start(&self) -> WorkerPoolRun<R> {
@@ -103,10 +648,21 @@ impl<R: Send + 'static> SharedWorkerPool<R> {
         for worker_index in 0..self.worker_count {
             let queue = self.queue.clone();
             let notify = self.notify.clone();
+            let space = self.space.clone();
             let cancel = self.cancel.clone();
             let result_tx = result_tx.clone();
+            let metrics = self.metrics.clone();
             workers.spawn(async move {
-                worker_loop(worker_index, queue, notify, cancel, result_tx).await;
+                worker_loop(
+                    worker_index,
+                    queue,
+                    notify,
+                    space,
+                    cancel,
+                    result_tx,
+                    metrics,
+                )
+                .await;
             });
         }
         WorkerPoolRun {
@@ -134,36 +690,146 @@ async fn worker_loop<R: Send + 'static>(
     _worker_index: usize,
     queue: Arc<Mutex<VecDeque<WorkUnit<R>>>>,
     notify: Arc<Notify>,
+    space: Option<Arc<Semaphore>>,
     cancel: CancellationToken,
     result_tx: mpsc::Sender<WorkResult<R>>,
+    metrics: Arc<SchedulerMetrics>,
 ) {
     loop {
         if cancel.is_cancelled() {
             break;
         }
 
-        let unit = queue.lock().await.pop_front();
+        let unit = {
+            let mut queue = queue.lock().expect("worker queue mutex poisoned");
+            let unit = queue.pop_front();
+            if unit.is_some() {
+                metrics.record_queue_depth(queue.len());
+            }
+            unit
+        };
+        if unit.is_some() {
+            if let Some(space) = space.as_ref() {
+                space.add_permits(1);
+            }
+        }
+
         let Some(unit) = unit else {
+            let idle_started = Instant::now();
+            #[cfg(test)]
+            metrics.emit_test_event(SchedulerTestEvent::WorkerIdleWaitStarted);
             tokio::select! {
-                _ = notify.notified() => continue,
-                _ = cancel.cancelled() => break,
+                _ = notify.notified() => {
+                    metrics.record_worker_idle_duration(idle_started.elapsed());
+                    continue;
+                }
+                _ = cancel.cancelled() => {
+                    metrics.record_worker_idle_duration(idle_started.elapsed());
+                    break;
+                }
             }
         };
+
+        metrics.record_command_started();
+        metrics.record_worker_busy_started();
+        let busy_guard = BusyWorkerGuard::new(metrics.as_ref());
 
         let job_id = unit.job_id.clone();
         let unit_id = unit.unit_id.clone();
         let kind = unit.kind.clone();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let outcome = (unit.task)(cancel.clone()).await;
+        let elapsed = started.elapsed();
+        metrics.record_tool_runtime(elapsed);
+        if outcome.is_err() {
+            metrics.record_command_failed();
+        }
         let result = WorkResult {
             job_id,
             unit_id,
             kind,
             outcome,
-            elapsed: started.elapsed(),
+            elapsed,
         };
-        if result_tx.send(result).await.is_err() {
+        #[cfg(test)]
+        metrics.emit_test_event(SchedulerTestEvent::WorkerResultSendStarted);
+        let send_failed = result_tx.send(result).await.is_err();
+        #[cfg(test)]
+        metrics.emit_test_event(SchedulerTestEvent::WorkerResultSendFinished);
+        drop(busy_guard);
+        if send_failed {
             break;
+        }
+    }
+}
+
+struct BusyWorkerGuard<'a> {
+    metrics: &'a SchedulerMetrics,
+}
+
+impl<'a> BusyWorkerGuard<'a> {
+    fn new(metrics: &'a SchedulerMetrics) -> Self {
+        Self { metrics }
+    }
+}
+
+impl<'a> Drop for BusyWorkerGuard<'a> {
+    fn drop(&mut self) {
+        self.metrics.record_worker_busy_finished();
+    }
+}
+
+fn duration_ns_u64(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn record_duration(counter: &AtomicU64, duration: Duration) {
+    saturating_add(counter, duration_ns_u64(duration).max(1));
+}
+
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(value);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn saturating_sub(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_sub(value);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn record_peak(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Acquire);
+    while value > current {
+        match counter.compare_exchange_weak(
+            current,
+            value,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
         }
     }
 }
@@ -239,6 +905,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     #[test]
     fn album_tracker_blocks_failed_album_when_partial_not_allowed() {
@@ -307,11 +974,843 @@ mod tests {
         ]);
     }
 
+    fn usize_test_unit(unit_id: String, value: usize) -> WorkUnit<usize> {
+        WorkUnit {
+            job_id: "job".to_string(),
+            unit_id,
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move { Ok(value) }),
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum TestSchedulerOutput {
         Materialized { job_id: String, tracks: usize },
         Encoded { job_id: String, track_index: usize },
         PostProcessed { job_id: String },
+    }
+
+    fn test_track_id(index: usize) -> TrackId {
+        TrackId {
+            source_ordinal: index as u32,
+            disc_number: None,
+            track_number: index as u32 + 1,
+        }
+    }
+
+    fn scheduler_test_unit(
+        job_id: &str,
+        unit_id: String,
+        kind: WorkKind,
+        output: TestSchedulerOutput,
+    ) -> WorkUnit<TestSchedulerOutput> {
+        WorkUnit {
+            job_id: job_id.to_string(),
+            unit_id,
+            kind,
+            task: boxed_work(move |_cancel| async move { Ok(output) }),
+        }
+    }
+
+    async fn expect_scheduler_event(
+        events: &mut mpsc::UnboundedReceiver<SchedulerTestEvent>,
+        expected: SchedulerTestEvent,
+    ) {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for scheduler event {expected:?}"))
+                .expect("scheduler event channel open");
+            if event == expected {
+                return;
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct LazyOrchestratorBacklog {
+        deferred_unit: Option<WorkUnit<TestSchedulerOutput>>,
+        album_fanout: VecDeque<(String, usize, usize)>,
+        postprocess: VecDeque<String>,
+        track_gate: Option<Arc<tokio::sync::Semaphore>>,
+        peak_deferred_units: usize,
+    }
+
+    impl LazyOrchestratorBacklog {
+        fn with_track_gate(gate: Arc<tokio::sync::Semaphore>) -> Self {
+            Self {
+                track_gate: Some(gate),
+                ..Self::default()
+            }
+        }
+
+        fn enqueue_album_fanout(&mut self, job_id: String, tracks: usize) {
+            self.album_fanout.push_back((job_id, 0, tracks));
+        }
+
+        fn enqueue_postprocess(&mut self, job_id: String) {
+            self.postprocess.push_back(job_id);
+        }
+
+        fn store_deferred(&mut self, unit: WorkUnit<TestSchedulerOutput>) {
+            assert!(self.deferred_unit.is_none(), "lazy backlog stores at most one materialized WorkUnit");
+            self.deferred_unit = Some(unit);
+            self.peak_deferred_units = self.peak_deferred_units.max(1);
+        }
+
+        fn try_submit_unit(
+            &mut self,
+            pool: &SharedWorkerPool<TestSchedulerOutput>,
+            unit: WorkUnit<TestSchedulerOutput>,
+        ) -> bool {
+            match pool.try_submit(unit) {
+                Ok(()) => true,
+                Err(err) => {
+                    self.store_deferred(err.into_unit());
+                    false
+                }
+            }
+        }
+
+        fn flush(&mut self, pool: &SharedWorkerPool<TestSchedulerOutput>) {
+            loop {
+                if let Some(unit) = self.deferred_unit.take() {
+                    if !self.try_submit_unit(pool, unit) {
+                        return;
+                    }
+                    continue;
+                }
+
+                if let Some(job_id) = self.postprocess.pop_front() {
+                    let unit = scheduler_test_unit(
+                        &job_id,
+                        format!("{job_id}-postprocess"),
+                        WorkKind::AlbumPostProcess,
+                        TestSchedulerOutput::PostProcessed { job_id: job_id.clone() },
+                    );
+                    if !self.try_submit_unit(pool, unit) {
+                        return;
+                    }
+                    continue;
+                }
+
+                if let Some((job_id, next_track, tracks)) = self.album_fanout.pop_front() {
+                    if next_track >= tracks {
+                        continue;
+                    }
+                    let output = TestSchedulerOutput::Encoded { job_id: job_id.clone(), track_index: next_track };
+                    let unit = if let Some(gate) = self.track_gate.clone() {
+                        WorkUnit {
+                            job_id: job_id.clone(),
+                            unit_id: format!("{job_id}-encode-{next_track}"),
+                            kind: WorkKind::EncodeTrack { track_id: test_track_id(next_track) },
+                            task: boxed_work(move |_cancel| async move {
+                                let permit = gate.acquire_owned().await.map_err(|_| "track gate closed".to_string())?;
+                                drop(permit);
+                                Ok(output)
+                            }),
+                        }
+                    } else {
+                        scheduler_test_unit(
+                            &job_id,
+                            format!("{job_id}-encode-{next_track}"),
+                            WorkKind::EncodeTrack { track_id: test_track_id(next_track) },
+                            output,
+                        )
+                    };
+                    if next_track + 1 < tracks {
+                        self.album_fanout.push_back((job_id, next_track + 1, tracks));
+                    }
+                    if !self.try_submit_unit(pool, unit) {
+                        return;
+                    }
+                    continue;
+                }
+
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_rejects_when_full_and_accepts_after_worker_pop() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new_with_limits(
+            Some(1),
+            cancel.clone(),
+            PoolLimits { ready_capacity: Some(1) },
+        );
+        let mut run = pool.start();
+        let (a_started_tx, a_started_rx) = tokio::sync::oneshot::channel();
+        let (release_a_tx, release_a_rx) = tokio::sync::oneshot::channel::<()>();
+        let (b_started_tx, b_started_rx) = tokio::sync::oneshot::channel();
+        let (release_b_tx, release_b_rx) = tokio::sync::oneshot::channel::<()>();
+
+        pool.submit(WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: "a".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move {
+                let _ = a_started_tx.send(());
+                let _ = release_a_rx.await;
+                Ok(1)
+            }),
+        })
+        .await;
+        a_started_rx.await.expect("first task starts");
+
+        pool.try_submit(WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: "b".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move {
+                let _ = b_started_tx.send(());
+                let _ = release_b_rx.await;
+                Ok(2)
+            }),
+        })
+        .expect("one queued unit fits");
+
+        let rejected = pool.try_submit(WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: "c".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move { Ok(3) }),
+        });
+        let c = match rejected {
+            Err(TrySubmitError::QueueFull { unit, capacity, depth }) => {
+                assert_eq!(capacity, 1);
+                assert_eq!(depth, 1);
+                unit
+            }
+            Err(TrySubmitError::QueueBusy(unit)) => unit,
+            Ok(()) => panic!("third unit must not fit while capacity is full"),
+        };
+
+        release_a_tx.send(()).expect("release first task");
+        let first = run.results.recv().await.expect("first result");
+        assert_eq!(first.outcome.expect("first succeeds"), 1);
+        b_started_rx.await.expect("second task starts after pop");
+        pool.try_submit(c).expect("space opened after worker pop");
+
+        release_b_tx.send(()).expect("release second task");
+        let mut values = vec![run.results.recv().await.expect("second result").outcome.unwrap()];
+        values.push(run.results.recv().await.expect("third result").outcome.unwrap());
+        values.sort();
+        run.shutdown().await;
+
+        assert_eq!(values, vec![2, 3]);
+        let snapshot = pool.metrics().snapshot();
+        assert_eq!(snapshot.jobs_queued, 3);
+        assert_eq!(snapshot.commands_started, 3);
+        assert_eq!(snapshot.peak_queue_depth, 1);
+        assert_eq!(snapshot.workers_busy, 0);
+    }
+
+    #[tokio::test]
+    async fn default_unbounded_queue_accepts_more_than_bounded_capacity_would_allow() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new(Some(1), cancel);
+        for index in 0..64usize {
+            pool.try_submit(WorkUnit {
+                job_id: "job".to_string(),
+                unit_id: format!("unit-{index}"),
+                kind: WorkKind::SingleFile,
+                task: boxed_work(move |_cancel| async move { Ok(index) }),
+            })
+            .expect("legacy unbounded queue accepts all ready work");
+        }
+
+        let snapshot = pool.metrics().snapshot();
+        assert_eq!(snapshot.jobs_queued, 64);
+        assert_eq!(snapshot.ready_queue_depth, 64);
+        assert_eq!(snapshot.peak_queue_depth, 64);
+        assert_eq!(pool.limits().ready_capacity, None);
+    }
+
+    #[tokio::test]
+    async fn try_submit_many_respects_ready_capacity_as_one_batch() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new_with_limits(
+            Some(1),
+            cancel,
+            PoolLimits { ready_capacity: Some(2) },
+        );
+
+        pool.try_submit_many((0..2usize).map(|index| WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: format!("fit-{index}"),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move { Ok(index) }),
+        }))
+        .expect("batch fits at capacity");
+
+        let overflow = pool.try_submit_many((2..4usize).map(|index| WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: format!("overflow-{index}"),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move { Ok(index) }),
+        }));
+        match overflow {
+            Err(TrySubmitManyError::QueueFull { units, capacity, depth }) => {
+                assert_eq!(units.len(), 2);
+                assert_eq!(capacity, 2);
+                assert_eq!(depth, 2);
+            }
+            Err(TrySubmitManyError::BatchTooLarge { units, capacity }) => {
+                panic!("batch of {} should fit empty capacity {capacity}", units.len());
+            }
+            Err(TrySubmitManyError::QueueBusy(units)) => panic!("unexpected queue contention for {} units", units.len()),
+            Ok(()) => panic!("batch must not fit once ready queue is full"),
+        }
+
+        let snapshot = pool.metrics().snapshot();
+        assert_eq!(snapshot.jobs_queued, 2);
+        assert_eq!(snapshot.ready_queue_depth, 2);
+        assert_eq!(snapshot.peak_queue_depth, 2);
+    }
+
+    #[tokio::test]
+    async fn submit_many_waits_for_full_batch_capacity_and_enqueues_batch_together() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new_with_limits(
+            Some(1),
+            cancel.clone(),
+            PoolLimits { ready_capacity: Some(2) },
+        );
+        let mut run = pool.start();
+
+        let (head_started_tx, head_started_rx) = tokio::sync::oneshot::channel();
+        let (release_head_tx, release_head_rx) = tokio::sync::oneshot::channel::<()>();
+        pool.submit(WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: "head".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move {
+                let _ = head_started_tx.send(());
+                let _ = release_head_rx.await;
+                Ok(10)
+            }),
+        })
+        .await;
+        head_started_rx.await.expect("head unit starts");
+
+        let (resident_started_tx, resident_started_rx) = tokio::sync::oneshot::channel();
+        let (release_resident_tx, release_resident_rx) = tokio::sync::oneshot::channel::<()>();
+        pool.submit(WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: "resident".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move {
+                let _ = resident_started_tx.send(());
+                let _ = release_resident_rx.await;
+                Ok(20)
+            }),
+        })
+        .await;
+
+        let before_batch = pool.metrics().snapshot();
+        assert_eq!(before_batch.jobs_queued, 2);
+        assert_eq!(before_batch.ready_queue_depth, 1);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        pool.metrics().set_test_event_sender(events_tx);
+        let submit_pool = pool.clone();
+        let submit_task = tokio::spawn(async move {
+            submit_pool
+                .submit_many(vec![usize_test_unit("batch-a".to_string(), 30), usize_test_unit("batch-b".to_string(), 40)])
+                .await
+        });
+
+        expect_scheduler_event(&mut events_rx, SchedulerTestEvent::SubmitManyWaitingForCapacity).await;
+        let while_waiting = pool.metrics().snapshot();
+        assert_eq!(while_waiting.jobs_queued, 2, "submit_many must not admit a partial batch");
+        assert_eq!(while_waiting.ready_queue_depth, 1);
+
+        release_head_tx.send(()).expect("release head unit");
+        let head = run.results.recv().await.expect("head result");
+        assert_eq!(head.outcome.expect("head succeeds"), 10);
+        resident_started_rx.await.expect("resident unit starts");
+
+        submit_task.await.expect("submit task joins").expect("batch fits after queue drains");
+        let after_batch = pool.metrics().snapshot();
+        assert_eq!(after_batch.jobs_queued, 4);
+        assert_eq!(after_batch.ready_queue_depth, 2);
+        assert_eq!(after_batch.peak_queue_depth, 2);
+
+        release_resident_tx.send(()).expect("release resident unit");
+        let mut values = vec![run.results.recv().await.expect("resident result").outcome.unwrap()];
+        values.push(run.results.recv().await.expect("batch a result").outcome.unwrap());
+        values.push(run.results.recv().await.expect("batch b result").outcome.unwrap());
+        values.sort();
+        run.shutdown().await;
+
+        assert_eq!(values, vec![20, 30, 40]);
+        assert_eq!(pool.metrics().snapshot().workers_busy, 0);
+    }
+
+
+    #[tokio::test]
+    async fn bounded_submit_waiters_admit_one_unit_per_freed_slot() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new_with_limits(
+            Some(1),
+            cancel.clone(),
+            PoolLimits { ready_capacity: Some(1) },
+        );
+        let mut run = pool.start();
+
+        let (head_started_tx, head_started_rx) = tokio::sync::oneshot::channel();
+        let (release_head_tx, release_head_rx) = tokio::sync::oneshot::channel::<()>();
+        pool.submit(WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: "head".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move {
+                let _ = head_started_tx.send(());
+                let _ = release_head_rx.await;
+                Ok(1)
+            }),
+        })
+        .await;
+        head_started_rx.await.expect("head starts and holds the only worker");
+
+        let (resident_started_tx, resident_started_rx) = tokio::sync::oneshot::channel();
+        let (release_resident_tx, release_resident_rx) = tokio::sync::oneshot::channel::<()>();
+        pool.submit(WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: "resident".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move {
+                let _ = resident_started_tx.send(());
+                let _ = release_resident_rx.await;
+                Ok(2)
+            }),
+        })
+        .await;
+        assert_eq!(pool.metrics().snapshot().ready_queue_depth, 1);
+
+        let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel::<usize>();
+        for value in [3usize, 4usize] {
+            let submit_pool = pool.clone();
+            let admitted_tx = admitted_tx.clone();
+            tokio::spawn(async move {
+                submit_pool.submit(usize_test_unit(format!("waiter-{value}"), value)).await;
+                admitted_tx.send(value).expect("admission notification is received");
+            });
+        }
+        drop(admitted_tx);
+
+        release_head_tx.send(()).expect("release head unit");
+        let head = run.results.recv().await.expect("head result");
+        assert_eq!(head.outcome.expect("head succeeds"), 1);
+        resident_started_rx.await.expect("resident starts before another slot is freed");
+
+        let first_admitted = admitted_rx.recv().await.expect("one waiter receives the freed slot");
+        assert!([3, 4].contains(&first_admitted));
+        assert!(
+            admitted_rx.try_recv().is_err(),
+            "only one waiting submitter may complete for one popped ready unit"
+        );
+        assert_eq!(pool.metrics().snapshot().ready_queue_depth, 1);
+
+        release_resident_tx.send(()).expect("release resident unit");
+        let resident = run.results.recv().await.expect("resident result");
+        assert_eq!(resident.outcome.expect("resident succeeds"), 2);
+        let second_admitted = admitted_rx.recv().await.expect("second waiter receives the next freed slot");
+        assert_ne!(first_admitted, second_admitted);
+
+        let mut waiter_results = vec![
+            run.results.recv().await.expect("first waiter result").outcome.unwrap(),
+            run.results.recv().await.expect("second waiter result").outcome.unwrap(),
+        ];
+        waiter_results.sort();
+        assert_eq!(waiter_results, vec![3, 4]);
+        run.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn submit_many_returns_oversized_batch_without_enqueueing() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new_with_limits(
+            Some(1),
+            cancel,
+            PoolLimits { ready_capacity: Some(2) },
+        );
+
+        let err = pool
+            .submit_many((0..3usize).map(|index| usize_test_unit(format!("oversized-{index}"), index)))
+            .await
+            .expect_err("oversized batch cannot fit bounded ready capacity");
+
+        match err {
+            SubmitManyError::BatchTooLarge { units, capacity } => {
+                assert_eq!(units.len(), 3);
+                assert_eq!(capacity, 2);
+            }
+            SubmitManyError::Cancelled(units) => panic!("unexpected cancellation for {} units", units.len()),
+        }
+
+        let snapshot = pool.metrics().snapshot();
+        assert_eq!(snapshot.jobs_queued, 0);
+        assert_eq!(snapshot.ready_queue_depth, 0);
+        assert_eq!(snapshot.peak_queue_depth, 0);
+    }
+
+    #[tokio::test]
+    async fn try_submit_many_returns_oversized_batch_without_enqueueing() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new_with_limits(
+            Some(1),
+            cancel,
+            PoolLimits { ready_capacity: Some(2) },
+        );
+
+        let err = pool
+            .try_submit_many((0..3usize).map(|index| usize_test_unit(format!("oversized-{index}"), index)))
+            .expect_err("oversized try_submit_many must return the whole batch");
+
+        match err {
+            TrySubmitManyError::BatchTooLarge { units, capacity } => {
+                assert_eq!(units.len(), 3);
+                assert_eq!(capacity, 2);
+            }
+            TrySubmitManyError::QueueFull { units, capacity, depth } => {
+                panic!("oversized empty-queue batch was reported as full: {} units, capacity {capacity}, depth {depth}", units.len());
+            }
+            TrySubmitManyError::QueueBusy(units) => panic!("unexpected queue contention for {} units", units.len()),
+        }
+
+        let snapshot = pool.metrics().snapshot();
+        assert_eq!(snapshot.jobs_queued, 0);
+        assert_eq!(snapshot.ready_queue_depth, 0);
+        assert_eq!(snapshot.peak_queue_depth, 0);
+    }
+
+    #[tokio::test]
+    async fn lazy_orchestrator_flush_returns_with_full_ready_queue_and_saturated_results() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<TestSchedulerOutput>::new_with_limits(
+            Some(1),
+            cancel.clone(),
+            PoolLimits { ready_capacity: Some(5) },
+        );
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        pool.metrics().set_test_event_sender(events_tx);
+        let mut run = pool.start();
+
+        for index in 0..5usize {
+            pool.submit(scheduler_test_unit(
+                "sat",
+                format!("preload-{index}"),
+                WorkKind::SingleFile,
+                TestSchedulerOutput::Encoded { job_id: "sat".to_string(), track_index: index },
+            ))
+            .await;
+        }
+        for _ in 0..5 {
+            expect_scheduler_event(&mut events_rx, SchedulerTestEvent::WorkerResultSendStarted).await;
+        }
+
+        for index in 0..5usize {
+            pool.try_submit(scheduler_test_unit(
+                "resident",
+                format!("resident-{index}"),
+                WorkKind::SingleFile,
+                TestSchedulerOutput::Encoded { job_id: "resident".to_string(), track_index: index },
+            ))
+            .expect("worker is blocked on saturated result channel, so ready queue accepts residents until full");
+        }
+        assert_eq!(pool.metrics().snapshot().pool_ready_queue_depth, 5);
+
+        let mut backlog = LazyOrchestratorBacklog::default();
+        backlog.enqueue_album_fanout("overflow".to_string(), 64);
+        tokio::time::timeout(Duration::from_secs(5), async { backlog.flush(&pool) })
+            .await
+            .expect("nonblocking flush must return even when ready queue and result channel are both full");
+        assert_eq!(backlog.peak_deferred_units, 1);
+        assert!(backlog.deferred_unit.is_some());
+
+        let drained = tokio::time::timeout(Duration::from_secs(5), run.results.recv())
+            .await
+            .expect("orchestrator can still drain a saturated result channel")
+            .expect("preloaded worker result");
+        assert!(matches!(drained.outcome, Ok(TestSchedulerOutput::Encoded { .. })));
+
+        for _ in 0..9 {
+            let _ = tokio::time::timeout(Duration::from_secs(5), run.results.recv())
+                .await
+                .expect("remaining results drain without blocking after channel saturation is relieved")
+                .expect("remaining worker result");
+        }
+        run.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lazy_orchestrator_model_completes_when_ready_queue_is_full() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<TestSchedulerOutput>::new_with_limits(
+            Some(1),
+            cancel.clone(),
+            PoolLimits { ready_capacity: Some(1) },
+        );
+        let mut run = pool.start();
+        let track_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut backlog = LazyOrchestratorBacklog::with_track_gate(track_gate.clone());
+        let mut tracker = AlbumCompletionTracker::default();
+        tracker.register_album("album".to_string(), 4, false);
+
+        pool.submit(scheduler_test_unit(
+            "album",
+            "materialize".to_string(),
+            WorkKind::ArchiveExtract,
+            TestSchedulerOutput::Materialized { job_id: "album".to_string(), tracks: 4 },
+        ))
+        .await;
+
+        let result = run.results.recv().await.expect("materialization result");
+        match result.outcome.expect("materialization output") {
+            TestSchedulerOutput::Materialized { job_id, tracks } => backlog.enqueue_album_fanout(job_id, tracks),
+            other => panic!("unexpected first output: {other:?}"),
+        }
+
+        backlog.flush(&pool);
+        assert_eq!(backlog.peak_deferred_units, 1, "fanout must pause after one deferred unit");
+        assert!(backlog.deferred_unit.is_some());
+        track_gate.add_permits(4);
+
+        let mut postprocessed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while postprocessed.len() < 1 {
+                backlog.flush(&pool);
+                let result = run.results.recv().await.expect("orchestrator result");
+                match result.outcome.expect("work output") {
+                    TestSchedulerOutput::Materialized { .. } => panic!("materialization should run only once"),
+                    TestSchedulerOutput::Encoded { job_id, .. } => {
+                        if tracker.mark_track_finished(&job_id, true) == AlbumReadiness::ReadyForPostProcess {
+                            backlog.enqueue_postprocess(job_id);
+                        }
+                    }
+                    TestSchedulerOutput::PostProcessed { job_id } => postprocessed.push(job_id),
+                }
+            }
+        })
+        .await
+        .expect("lazy orchestrator must make bounded-queue progress without hanging");
+
+        run.shutdown().await;
+        assert_eq!(postprocessed, vec!["album".to_string()]);
+        assert!(backlog.deferred_unit.is_none());
+        assert_eq!(backlog.peak_deferred_units, 1);
+        let snapshot = pool.metrics().snapshot();
+        assert_eq!(snapshot.jobs_queued, 6);
+        assert_eq!(snapshot.commands_started, 6);
+        assert_eq!(snapshot.peak_queue_depth, 1);
+        assert_eq!(snapshot.workers_busy, 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_multiple_albums_complete_without_starvation() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<TestSchedulerOutput>::new_with_limits(
+            Some(2),
+            cancel.clone(),
+            PoolLimits { ready_capacity: Some(2) },
+        );
+        let mut run = pool.start();
+        let mut backlog = LazyOrchestratorBacklog::default();
+        let mut tracker = AlbumCompletionTracker::default();
+        for job in ["album-a", "album-b"] {
+            tracker.register_album(job.to_string(), 3, false);
+            pool.try_submit(scheduler_test_unit(
+                job,
+                format!("materialize-{job}"),
+                WorkKind::ArchiveExtract,
+                TestSchedulerOutput::Materialized { job_id: job.to_string(), tracks: 3 },
+            ))
+            .expect("initial materialization units fit bounded ready queue");
+        }
+
+        let mut postprocessed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while postprocessed.len() < 2 {
+                backlog.flush(&pool);
+                let result = run.results.recv().await.expect("orchestrator result");
+                match result.outcome.expect("work output") {
+                    TestSchedulerOutput::Materialized { job_id, tracks } => {
+                        backlog.enqueue_album_fanout(job_id, tracks);
+                    }
+                    TestSchedulerOutput::Encoded { job_id, .. } => {
+                        if tracker.mark_track_finished(&job_id, true) == AlbumReadiness::ReadyForPostProcess {
+                            backlog.enqueue_postprocess(job_id);
+                        }
+                    }
+                    TestSchedulerOutput::PostProcessed { job_id } => postprocessed.push(job_id),
+                }
+            }
+        })
+        .await
+        .expect("multiple bounded albums must make progress without hanging");
+
+        run.shutdown().await;
+        postprocessed.sort();
+        assert_eq!(postprocessed, vec!["album-a".to_string(), "album-b".to_string()]);
+        assert!(backlog.deferred_unit.is_none());
+        assert!(backlog.peak_deferred_units <= 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_metrics_track_worker_and_orchestrator_counters() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<TestSchedulerOutput>::new_with_limits(
+            Some(2),
+            cancel.clone(),
+            PoolLimits { ready_capacity: Some(8) },
+        );
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        pool.metrics().set_test_event_sender(events_tx);
+        let mut run = pool.start();
+        expect_scheduler_event(&mut events_rx, SchedulerTestEvent::WorkerIdleWaitStarted).await;
+
+        for index in 0..3usize {
+            pool.submit(scheduler_test_unit(
+                "album",
+                format!("postprocess-{index}"),
+                WorkKind::AlbumPostProcess,
+                TestSchedulerOutput::PostProcessed { job_id: format!("album-{index}") },
+            ))
+            .await;
+        }
+        pool.submit(WorkUnit {
+            job_id: "failed".to_string(),
+            unit_id: "failed-unit".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move { Err("boom".to_string()) }),
+        })
+        .await;
+
+        let mut seen = 0usize;
+        while seen < 4 {
+            let result = run.results.recv().await.expect("worker result");
+            match result.outcome {
+                Ok(TestSchedulerOutput::PostProcessed { .. }) => {
+                    pool.metrics().record_job_completed();
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    pool.metrics().record_job_failed();
+                }
+            }
+            seen += 1;
+        }
+
+        run.shutdown().await;
+        let snapshot = pool.metrics().snapshot();
+        assert_eq!(snapshot.commands_started, 4);
+        assert_eq!(snapshot.commands_failed, 1);
+        assert_eq!(snapshot.jobs_completed, 3);
+        assert_eq!(snapshot.jobs_failed, 1);
+        assert_eq!(snapshot.workers_busy, 0);
+        assert!(snapshot.peak_queue_depth >= 1);
+        assert!(snapshot.tool_runtime_ns_total > 0);
+        assert!(snapshot.worker_idle_ns > 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_metrics_show_busy_worker_while_task_is_running() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<usize>::new(Some(1), cancel);
+        let mut run = pool.start();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        pool.submit(WorkUnit {
+            job_id: "job".to_string(),
+            unit_id: "blocked".to_string(),
+            kind: WorkKind::SingleFile,
+            task: boxed_work(move |_cancel| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok(7)
+            }),
+        })
+        .await;
+
+        started_rx.await.expect("worker starts blocked task");
+        let running = pool.metrics().snapshot();
+        assert_eq!(running.jobs_queued, 1);
+        assert_eq!(running.commands_started, 1);
+        assert_eq!(running.workers_busy, 1);
+        assert_eq!(running.ready_queue_depth, 0);
+
+        release_tx.send(()).expect("release blocked task");
+        let result = run.results.recv().await.expect("worker result");
+        assert_eq!(result.outcome.expect("task succeeds"), 7);
+        run.shutdown().await;
+
+        let finished = pool.metrics().snapshot();
+        assert_eq!(finished.commands_started, 1);
+        assert_eq!(finished.commands_failed, 0);
+        assert_eq!(finished.workers_busy, 0);
+        assert!(finished.tool_runtime_ns_total > 0);
+    }
+
+    #[test]
+    fn scheduler_metrics_busy_gauge_does_not_underflow() {
+        let metrics = SchedulerMetrics::default();
+        metrics.record_worker_busy_finished();
+        assert_eq!(metrics.snapshot().workers_busy, 0);
+
+        metrics.record_worker_busy_started();
+        metrics.record_worker_busy_finished();
+        metrics.record_worker_busy_finished();
+        assert_eq!(metrics.snapshot().workers_busy, 0);
+    }
+
+    #[test]
+    fn scheduler_metrics_include_processor_submission_backlog_in_ready_depth() {
+        let metrics = SchedulerMetrics::default();
+
+        metrics.record_pool_queue_depth(2);
+        metrics.record_submission_backlog_depth(5);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.pool_ready_queue_depth, 2);
+        assert_eq!(snapshot.submission_backlog_depth, 5);
+        assert_eq!(snapshot.ready_queue_depth, 7);
+        assert_eq!(snapshot.peak_queue_depth, 7);
+        assert_eq!(snapshot.peak_submission_backlog_depth, 5);
+
+        metrics.record_submission_backlog_depth(1);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.ready_queue_depth, 3);
+        assert_eq!(snapshot.peak_queue_depth, 7);
+        assert_eq!(snapshot.peak_submission_backlog_depth, 5);
+    }
+
+    #[test]
+    fn scheduler_metrics_distinguish_encode_outputs_from_successes() {
+        let metrics = SchedulerMetrics::default();
+
+        metrics.record_track_encode_output(true);
+        metrics.record_track_encode_output(false);
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.tracks_encode_attempted, 2);
+        assert_eq!(snapshot.tracks_encoded, 1);
+        assert_eq!(snapshot.tracks_encode_failed, 1);
+    }
+
+    #[test]
+    fn scheduler_metrics_reset_clears_external_processor_handle_state() {
+        let metrics = SchedulerMetrics::default();
+        metrics.record_jobs_queued(3);
+        metrics.record_pool_queue_depth(2);
+        metrics.record_submission_backlog_depth(4);
+        metrics.record_track_encode_output(false);
+        metrics.record_worker_busy_started();
+
+        metrics.reset();
+        assert_eq!(metrics.snapshot(), SchedulerMetricsSnapshot::default());
     }
 
     #[tokio::test]
@@ -742,7 +2241,7 @@ mod chunk_2_1_3_worker_recovery_tests {
     };
     use crate::convert::pipeline::tool::{ToolBinary, ToolCommand, ToolRunner};
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn track_id(index: usize) -> TrackId {

@@ -10,7 +10,7 @@ use super::{
     ConversionStatus,
 };
 use log::info;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Semaphore};
@@ -21,9 +21,10 @@ use crate::convert::pipeline::{
     boxed_work, build_pipeline_request, build_pipeline_request_from_settings, detect_source_kind, encode_realized_track_for_scheduler,
     encode_track_for_scheduler, finish_pipeline_album_for_scheduler, map_album_outcome,
     prepare_pipeline_item_for_scheduler, realize_track_for_scheduler, run_pipeline_item_with_tool_paths, scheduled_worker_failure_output, AlbumCompletionTracker,
-    AlbumReadiness, BroadcastReporter, PipelineRequest, RealToolRunner, ScheduledAlbum,
-    ScheduledMaterialization, ScheduledRealizedTrack, ScheduledTrackOutput, SharedWorkerPool,
-    SourceKind, TrackSourceRef, WorkKind, WorkUnit,
+    AlbumReadiness, BroadcastReporter, PipelineRequest, PoolLimits, RealToolRunner, ScheduledAlbum,
+    ScheduledMaterialization, ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics,
+    SchedulerMetricsSnapshot, SharedWorkerPool,
+    SourceKind, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
 };
 
 /// Configuration for the conversion processor.
@@ -42,6 +43,8 @@ pub struct ProcessorConfig {
 pub struct ConversionProcessor {
     config: ProcessorConfig,
     progress_tx: Option<broadcast::Sender<ProgressUpdate>>,
+    pool_limits: PoolLimits,
+    scheduler_metrics: Arc<SchedulerMetrics>,
 }
 
 /// Progress update from a worker.
@@ -96,12 +99,29 @@ impl ConversionProcessor {
         Self {
             config,
             progress_tx: None,
+            pool_limits: PoolLimits::default(),
+            scheduler_metrics: Arc::new(SchedulerMetrics::default()),
         }
     }
 
     /// Set progress channel.
     pub fn set_progress_channel(&mut self, tx: broadcast::Sender<ProgressUpdate>) {
         self.progress_tx = Some(tx);
+    }
+
+    /// Set shared scheduler queue limits. Defaults to the legacy unbounded queue.
+    pub fn set_pool_limits(&mut self, limits: PoolLimits) {
+        self.pool_limits = limits;
+    }
+
+    /// Return a lock-free metrics handle that remains valid while a conversion run is active.
+    pub fn scheduler_metrics(&self) -> Arc<SchedulerMetrics> {
+        self.scheduler_metrics.clone()
+    }
+
+    /// Read a point-in-time snapshot of scheduler metrics.
+    pub fn scheduler_metrics_snapshot(&self) -> SchedulerMetricsSnapshot {
+        self.scheduler_metrics.snapshot()
     }
 
     /// Process the conversion queue.
@@ -165,12 +185,15 @@ impl ConversionProcessor {
             }
         }
 
+        self.scheduler_metrics.reset();
         let outcomes = run_queue_with_shared_orchestrator(
             queued_items,
             progress_tx.clone(),
             progress_rx,
             self.config.tool_paths.clone(),
             self.config.worker_count.max(1),
+            self.pool_limits,
+            self.scheduler_metrics.clone(),
         )
         .await;
 
@@ -197,6 +220,7 @@ struct PendingAlbum {
     outputs: Vec<ScheduledTrackOutput>,
     finished: usize,
     expected: usize,
+    next_source_track: usize,
     job_cancel: CancellationToken,
     cancel_requested: bool,
 }
@@ -218,6 +242,336 @@ enum QueueWorkOutput {
         item_id: String,
         status: ConversionStatus,
     },
+    #[cfg(test)]
+    SyntheticEncoded {
+        job_id: String,
+        track_index: usize,
+    },
+}
+
+#[cfg(test)]
+struct SyntheticFanout {
+    job_id: String,
+    _item_id: String,
+    remaining: usize,
+    next_index: usize,
+}
+
+struct DeferredSubmission {
+    unit: WorkUnit<QueueWorkOutput>,
+    counted: bool,
+}
+
+struct SubmissionPump {
+    initial_items: VecDeque<ConversionItem>,
+    album_fanout: VecDeque<String>,
+    realized_encodes: VecDeque<(String, ScheduledRealizedTrack, CancellationToken)>,
+    album_postprocess: VecDeque<(ScheduledAlbum, Vec<ScheduledTrackOutput>)>,
+    #[cfg(test)]
+    synthetic_fanout: VecDeque<SyntheticFanout>,
+    deferred_unit: Option<DeferredSubmission>,
+    retry_after_busy: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpFlushProgress {
+    Progress,
+    Blocked,
+    Empty,
+}
+
+impl SubmissionPump {
+    fn new(items: Vec<ConversionItem>) -> Self {
+        Self {
+            initial_items: items.into_iter().collect(),
+            album_fanout: VecDeque::new(),
+            realized_encodes: VecDeque::new(),
+            album_postprocess: VecDeque::new(),
+            #[cfg(test)]
+            synthetic_fanout: VecDeque::new(),
+            deferred_unit: None,
+            retry_after_busy: false,
+        }
+    }
+
+    fn enqueue_album_fanout(&mut self, job_id: String) {
+        self.album_fanout.push_back(job_id);
+    }
+
+    fn enqueue_realized_encode(
+        &mut self,
+        job_id: String,
+        realized: ScheduledRealizedTrack,
+        job_cancel: CancellationToken,
+    ) {
+        self.realized_encodes.push_back((job_id, realized, job_cancel));
+    }
+
+    fn enqueue_album_postprocess(
+        &mut self,
+        album: ScheduledAlbum,
+        outputs: Vec<ScheduledTrackOutput>,
+    ) {
+        self.album_postprocess.push_back((album, outputs));
+    }
+
+    #[cfg(test)]
+    fn enqueue_synthetic_album_fanout(
+        &mut self,
+        job_id: String,
+        item_id: String,
+        tracks: usize,
+        metrics: &SchedulerMetrics,
+    ) {
+        if tracks > 0 {
+            metrics.record_jobs_queued(tracks as u64);
+            self.synthetic_fanout.push_back(SyntheticFanout {
+                job_id,
+                _item_id: item_id,
+                remaining: tracks,
+                next_index: 0,
+            });
+        }
+    }
+
+    fn should_retry_after_busy(&self) -> bool {
+        self.retry_after_busy
+    }
+
+    fn try_submit_unit(
+        &mut self,
+        pool: &SharedWorkerPool<QueueWorkOutput>,
+        unit: WorkUnit<QueueWorkOutput>,
+        counted: bool,
+    ) -> bool {
+        let submitted = if counted {
+            pool.try_submit_counted(unit)
+        } else {
+            pool.try_submit(unit)
+        };
+
+        match submitted {
+            Ok(()) => true,
+            Err(TrySubmitError::QueueBusy(unit)) => {
+                if !counted {
+                    pool.metrics().record_jobs_queued(1);
+                }
+                self.retry_after_busy = true;
+                self.deferred_unit = Some(DeferredSubmission { unit, counted: true });
+                false
+            }
+            Err(TrySubmitError::QueueFull { unit, .. }) => {
+                if !counted {
+                    pool.metrics().record_jobs_queued(1);
+                }
+                self.retry_after_busy = false;
+                self.deferred_unit = Some(DeferredSubmission { unit, counted: true });
+                false
+            }
+        }
+    }
+
+    fn flush_album_fanout_once<F>(
+        &mut self,
+        pool: &SharedWorkerPool<QueueWorkOutput>,
+        mut next_source_work: F,
+    ) -> PumpFlushProgress
+    where
+        F: FnMut(&str) -> Option<WorkUnit<QueueWorkOutput>>,
+    {
+        let Some(job_id) = self.album_fanout.pop_front() else {
+            return PumpFlushProgress::Empty;
+        };
+
+        let Some(unit) = next_source_work(&job_id) else {
+            return PumpFlushProgress::Progress;
+        };
+
+        self.album_fanout.push_back(job_id);
+        if self.try_submit_unit(pool, unit, true) {
+            PumpFlushProgress::Progress
+        } else {
+            PumpFlushProgress::Blocked
+        }
+    }
+
+    #[cfg(test)]
+    fn flush_synthetic_fanout_once(
+        &mut self,
+        pool: &SharedWorkerPool<QueueWorkOutput>,
+    ) -> PumpFlushProgress {
+        let Some(mut fanout) = self.synthetic_fanout.pop_front() else {
+            return PumpFlushProgress::Empty;
+        };
+
+        if fanout.remaining == 0 {
+            return PumpFlushProgress::Progress;
+        }
+
+        let track_index = fanout.next_index;
+        fanout.next_index += 1;
+        fanout.remaining -= 1;
+        let job_id = fanout.job_id.clone();
+        let unit_id = format!("synthetic-encode-{track_index:04}");
+        let unit = synthetic_queue_work_unit_for_processor_test(&job_id, unit_id, track_index);
+        if fanout.remaining > 0 {
+            self.synthetic_fanout.push_back(fanout);
+        }
+
+        if self.try_submit_unit(pool, unit, true) {
+            PumpFlushProgress::Progress
+        } else {
+            PumpFlushProgress::Blocked
+        }
+    }
+
+    fn flush(
+        &mut self,
+        pool: &SharedWorkerPool<QueueWorkOutput>,
+        pending_albums: &mut BTreeMap<String, PendingAlbum>,
+        terminal: &mut BTreeMap<String, ConversionStatus>,
+        job_to_item: &mut BTreeMap<String, String>,
+        tool_paths: &HashMap<String, PathBuf>,
+        progress_tx: &broadcast::Sender<ProgressUpdate>,
+        _cancel: &CancellationToken,
+        worker_count: usize,
+    ) {
+        self.retry_after_busy = false;
+        loop {
+            if let Some(deferred) = self.deferred_unit.take() {
+                if !self.try_submit_unit(pool, deferred.unit, deferred.counted) {
+                    return;
+                }
+                continue;
+            }
+
+            if let Some((album, outputs)) = self.album_postprocess.pop_front() {
+                let unit = build_album_postprocess_work(album, outputs, tool_paths, progress_tx);
+                if !self.try_submit_unit(pool, unit, true) {
+                    return;
+                }
+                continue;
+            }
+
+            if let Some((job_id, realized, job_cancel)) = self.realized_encodes.pop_front() {
+                let unit = build_realized_encode_work(
+                    job_id,
+                    realized,
+                    tool_paths,
+                    progress_tx,
+                    job_cancel,
+                );
+                if !self.try_submit_unit(pool, unit, true) {
+                    return;
+                }
+                continue;
+            }
+
+            match self.flush_album_fanout_once(pool, |job_id| {
+                next_album_source_work(pending_albums, job_id, tool_paths, progress_tx)
+            }) {
+                PumpFlushProgress::Progress => continue,
+                PumpFlushProgress::Blocked => return,
+                PumpFlushProgress::Empty => {}
+            }
+
+            #[cfg(test)]
+            match self.flush_synthetic_fanout_once(pool) {
+                PumpFlushProgress::Progress => continue,
+                PumpFlushProgress::Blocked => return,
+                PumpFlushProgress::Empty => {}
+            }
+
+            if let Some(item) = self.initial_items.pop_front() {
+                if let Some(unit) = build_initial_work(
+                    item,
+                    pool,
+                    terminal,
+                    job_to_item,
+                    tool_paths,
+                    progress_tx,
+                    worker_count,
+                ) {
+                    if !self.try_submit_unit(pool, unit, false) {
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    fn record_backlog(
+        &self,
+        metrics: &SchedulerMetrics,
+        pending_albums: &BTreeMap<String, PendingAlbum>,
+    ) {
+        metrics.record_submission_backlog_depth(self.submission_backlog_depth(pending_albums));
+    }
+
+    fn submission_backlog_depth(&self, pending_albums: &BTreeMap<String, PendingAlbum>) -> usize {
+        self.initial_items
+            .len()
+            .saturating_add(usize::from(self.deferred_unit.is_some()))
+            .saturating_add(self.realized_encodes.len())
+            .saturating_add(self.album_postprocess.len())
+            .saturating_add(self.pending_album_source_units(pending_albums))
+            .saturating_add(self.synthetic_fanout_backlog_depth())
+    }
+
+    #[cfg(test)]
+    fn synthetic_fanout_backlog_depth(&self) -> usize {
+        self.synthetic_fanout.iter().map(|fanout| fanout.remaining).sum()
+    }
+
+    #[cfg(not(test))]
+    fn synthetic_fanout_backlog_depth(&self) -> usize {
+        0
+    }
+
+    fn pending_album_source_units(&self, pending_albums: &BTreeMap<String, PendingAlbum>) -> usize {
+        self.album_fanout
+            .iter()
+            .filter_map(|job_id| pending_albums.get(job_id))
+            .map(|pending| {
+                let Some(album) = pending.album.as_ref() else {
+                    return 0;
+                };
+                album
+                    .source
+                    .tracks
+                    .iter()
+                    .skip(pending.next_source_track)
+                    .filter(|track| album.planned_final_path(&track.id).is_some())
+                    .count()
+            })
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn pending_work_units(&self) -> usize {
+        usize::from(self.deferred_unit.is_some())
+    }
+}
+
+fn record_terminal_status(
+    pool: &SharedWorkerPool<QueueWorkOutput>,
+    status: &ConversionStatus,
+) {
+    match status {
+        ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => {
+            pool.metrics().record_job_completed();
+        }
+        ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
+            pool.metrics().record_job_failed();
+        }
+        ConversionStatus::Queued
+        | ConversionStatus::Paused
+        | ConversionStatus::Processing { .. }
+        | ConversionStatus::NotConfigured => {}
+    }
 }
 
 async fn run_queue_with_shared_orchestrator(
@@ -226,98 +580,43 @@ async fn run_queue_with_shared_orchestrator(
     mut progress_rx: Option<broadcast::Receiver<ProgressUpdate>>,
     tool_paths: HashMap<String, PathBuf>,
     worker_count: usize,
+    pool_limits: PoolLimits,
+    metrics: Arc<SchedulerMetrics>,
 ) -> Vec<(String, ConversionStatus, Option<f32>)> {
     let cancel = CancellationToken::new();
-    let pool = SharedWorkerPool::<QueueWorkOutput>::new(Some(worker_count.max(1)), cancel.clone());
+    let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits_and_metrics(
+        Some(worker_count.max(1)),
+        cancel.clone(),
+        pool_limits,
+        metrics,
+    );
+    let total_items = queued_items.len();
+    let mut submissions = SubmissionPump::new(queued_items);
     let mut run = pool.start();
     let mut pending_albums: BTreeMap<String, PendingAlbum> = BTreeMap::new();
     let mut tracker = AlbumCompletionTracker::default();
     let mut terminal: BTreeMap<String, ConversionStatus> = BTreeMap::new();
     let mut job_to_item: BTreeMap<String, String> = BTreeMap::new();
     let mut last_progress_by_item: HashMap<String, f32> = HashMap::new();
-    let total_items = queued_items.len();
-
-    for item in queued_items {
-        let item_id = item.id.clone();
-        if !item.input_path.exists() {
-            terminal.insert(
-                item_id.clone(),
-                ConversionStatus::Failed {
-                    error: format!("Source file not found: {}", item.input_path.display()),
-                    log_path: None,
-                },
-            );
-            continue;
-        }
-
-        let request = match build_pipeline_request(&item) {
-            Ok(mut req) => {
-                req.worker_count = Some(worker_count.max(1));
-                req
-            }
-            Err(err) => {
-                terminal.insert(
-                    item_id.clone(),
-                    ConversionStatus::Failed {
-                        error: err.to_string(),
-                        log_path: None,
-                    },
-                );
-                continue;
-            }
-        };
-
-        job_to_item.insert(request.job_id.clone(), item_id.clone());
-
-        let source_kind = detect_source_kind(&request).ok();
-        if matches!(source_kind, Some(SourceKind::SingleFile)) {
-            submit_single_file_work(&pool, request, &tool_paths, &progress_tx).await;
-            continue;
-        }
-
-        let materialize_kind = match source_kind {
-            Some(SourceKind::SevenZip) => WorkKind::ArchiveExtract,
-            Some(SourceKind::CueImage) => WorkKind::MaterializeItem,
-            Some(SourceKind::SacdIso) => WorkKind::MaterializeItem,
-            Some(SourceKind::SingleFile) => unreachable!("single files are submitted as immediate work units"),
-            None => WorkKind::MaterializeItem,
-        };
-        let unit_prefix = match source_kind {
-            Some(SourceKind::SevenZip) => "archive-extract",
-            Some(SourceKind::CueImage) => "cue-materialize",
-            Some(SourceKind::SacdIso) => "sacd-materialize",
-            Some(SourceKind::SingleFile) => unreachable!("single files are submitted as immediate work units"),
-            None => "materialize",
-        };
-        let submit_tool_paths = tool_paths.clone();
-        let submit_progress_tx = progress_tx.clone();
-        let submit_item_id = item_id.clone();
-        pool.submit(WorkUnit {
-            job_id: request.job_id.clone(),
-            unit_id: format!("{unit_prefix}:{submit_item_id}"),
-            kind: materialize_kind,
-            task: boxed_work(move |worker_cancel| async move {
-                let runner = RealToolRunner::new(submit_tool_paths.clone());
-                let reporter = BroadcastReporter::new(submit_progress_tx, submit_item_id.clone());
-                let result = prepare_pipeline_item_for_scheduler(
-                    request,
-                    &runner,
-                    &reporter,
-                    &worker_cancel,
-                    &submit_tool_paths,
-                )
-                .await;
-                Ok(QueueWorkOutput::Materialized {
-                    item_id: submit_item_id,
-                    result,
-                })
-            }),
-        })
-        .await;
-    }
+    submissions.record_backlog(pool.metrics(), &pending_albums);
 
     while terminal.len() < total_items {
+        submissions.flush(
+            &pool,
+            &mut pending_albums,
+            &mut terminal,
+            &mut job_to_item,
+            &tool_paths,
+            &progress_tx,
+            &cancel,
+            worker_count.max(1),
+        );
+        submissions.record_backlog(pool.metrics(), &pending_albums);
+        if terminal.len() >= total_items {
+            break;
+        }
         tokio::select! {
+            _ = tokio::task::yield_now(), if submissions.should_retry_after_busy() => {},
             Ok(update) = async {
                 if let Some(ref mut rx) = progress_rx {
                     rx.recv().await
@@ -337,7 +636,9 @@ async fn run_queue_with_shared_orchestrator(
                                     report.published.as_ref(),
                                     report.durable_log.as_deref(),
                                 );
-                                terminal.insert(item_id, status);
+                                if terminal.insert(item_id, status.clone()).is_none() {
+                                    record_terminal_status(&pool, &status);
+                                }
                             }
                             ScheduledMaterialization::Ready(album) => {
                                 let job_id = album.req.job_id.clone();
@@ -347,16 +648,21 @@ async fn run_queue_with_shared_orchestrator(
                                     .iter()
                                     .filter(|track| album.planned_final_path(&track.id).is_some())
                                     .count();
+                                let staged_tracks_ready_for_encode = album
+                                    .source
+                                    .tracks
+                                    .iter()
+                                    .filter(|track| album.planned_final_path(&track.id).is_some())
+                                    .filter(|track| matches!(&track.source_ref, TrackSourceRef::StagedFile(_)))
+                                    .count();
+                                pool.metrics()
+                                    .record_tracks_materialized(staged_tracks_ready_for_encode as u64);
                                 tracker.register_album(job_id.clone(), expected, album.allow_partial());
+                                pool.metrics().record_jobs_queued(expected as u64);
                                 if expected == 0 {
-                                    submit_album_postprocess(
-                                        &pool,
-                                        album,
-                                        Vec::new(),
-                                        &tool_paths,
-                                        &progress_tx,
-                                    )
-                                    .await;
+                                    pool.metrics().record_jobs_queued(1);
+                                    submissions.enqueue_album_postprocess(album, Vec::new());
+                                    submissions.record_backlog(pool.metrics(), &pending_albums);
                                 } else {
                                     let job_cancel = cancel.child_token();
                                     pending_albums.insert(job_id.clone(), PendingAlbum {
@@ -364,43 +670,30 @@ async fn run_queue_with_shared_orchestrator(
                                         outputs: Vec::with_capacity(expected),
                                         finished: 0,
                                         expected,
-                                        job_cancel: job_cancel.clone(),
+                                        next_source_track: 0,
+                                        job_cancel,
                                         cancel_requested: false,
                                     });
-                                    if let Some(pending) = pending_albums.get(&job_id) {
-                                        if let Some(album) = pending.album.as_ref() {
-                                            submit_album_source_work(
-                                                &pool,
-                                                album,
-                                                &tool_paths,
-                                                &progress_tx,
-                                                job_cancel,
-                                            )
-                                            .await;
-                                        }
-                                    }
+                                    submissions.enqueue_album_fanout(job_id.clone());
+                                    submissions.record_backlog(pool.metrics(), &pending_albums);
                                 }
                             }
                         }
                     }
                     Ok(QueueWorkOutput::Realized { job_id, track }) => {
                         if pending_albums.contains_key(&job_id) {
+                            pool.metrics().record_tracks_materialized(1);
                             let job_cancel = pending_albums
                                 .get(&job_id)
                                 .map(|pending| pending.job_cancel.clone())
                                 .unwrap_or_else(|| cancel.child_token());
-                            submit_realized_encode_work(
-                                &pool,
-                                job_id,
-                                track,
-                                &tool_paths,
-                                &progress_tx,
-                                job_cancel,
-                            )
-                            .await;
+                            pool.metrics().record_jobs_queued(1);
+                            submissions.enqueue_realized_encode(job_id, track, job_cancel);
+                            submissions.record_backlog(pool.metrics(), &pending_albums);
                         }
                     }
                     Ok(QueueWorkOutput::Encoded { job_id, output }) => {
+                        pool.metrics().record_track_encode_output(output.ok);
                         let readiness = tracker.mark_track_finished(&job_id, output.ok);
                         let mut submit_postprocess: Option<(ScheduledAlbum, Vec<ScheduledTrackOutput>)> = None;
 
@@ -440,18 +733,19 @@ async fn run_queue_with_shared_orchestrator(
                         }
 
                         if let Some((album, outputs)) = submit_postprocess {
-                            submit_album_postprocess(
-                                &pool,
-                                album,
-                                outputs,
-                                &tool_paths,
-                                &progress_tx,
-                            )
-                            .await;
+                            pool.metrics().record_jobs_queued(1);
+                            submissions.enqueue_album_postprocess(album, outputs);
+                            submissions.record_backlog(pool.metrics(), &pending_albums);
                         }
                     }
                     Ok(QueueWorkOutput::PostProcessed { item_id, status }) => {
-                        terminal.insert(item_id, status);
+                        if terminal.insert(item_id, status.clone()).is_none() {
+                            record_terminal_status(&pool, &status);
+                        }
+                    }
+                    #[cfg(test)]
+                    Ok(QueueWorkOutput::SyntheticEncoded { job_id: _, track_index: _ }) => {
+                        // Test-only processor harness output. Production workers never emit this variant.
                     }
                     Err(err) => {
                         let item_id = job_to_item
@@ -464,10 +758,13 @@ async fn run_queue_with_shared_orchestrator(
                             result.unit_id,
                             result.kind
                         );
-                        terminal.entry(item_id).or_insert_with(|| ConversionStatus::Failed {
-                            error: format!("scheduler work unit failed: {err}"),
-                            log_path: None,
-                        });
+                        if !terminal.contains_key(&item_id) {
+                            pool.metrics().record_job_failed();
+                            terminal.insert(item_id, ConversionStatus::Failed {
+                                error: format!("scheduler work unit failed: {err}"),
+                                log_path: None,
+                            });
+                        }
                     }
                 }
             }
@@ -475,6 +772,8 @@ async fn run_queue_with_shared_orchestrator(
         }
     }
 
+    submissions.record_backlog(pool.metrics(), &pending_albums);
+    pool.metrics().record_submission_backlog_depth(0);
     cancel.cancel();
     run.shutdown().await;
 
@@ -487,17 +786,103 @@ async fn run_queue_with_shared_orchestrator(
         .collect()
 }
 
-async fn submit_single_file_work(
+fn build_initial_work(
+    item: ConversionItem,
     pool: &SharedWorkerPool<QueueWorkOutput>,
+    terminal: &mut BTreeMap<String, ConversionStatus>,
+    job_to_item: &mut BTreeMap<String, String>,
+    tool_paths: &HashMap<String, PathBuf>,
+    progress_tx: &broadcast::Sender<ProgressUpdate>,
+    worker_count: usize,
+) -> Option<WorkUnit<QueueWorkOutput>> {
+    let item_id = item.id.clone();
+    if !item.input_path.exists() {
+        pool.metrics().record_job_failed();
+        terminal.insert(
+            item_id.clone(),
+            ConversionStatus::Failed {
+                error: format!("Source file not found: {}", item.input_path.display()),
+                log_path: None,
+            },
+        );
+        return None;
+    }
+
+    let request = match build_pipeline_request(&item) {
+        Ok(mut req) => {
+            req.worker_count = Some(worker_count.max(1));
+            req
+        }
+        Err(err) => {
+            pool.metrics().record_job_failed();
+            terminal.insert(
+                item_id.clone(),
+                ConversionStatus::Failed {
+                    error: err.to_string(),
+                    log_path: None,
+                },
+            );
+            return None;
+        }
+    };
+
+    job_to_item.insert(request.job_id.clone(), item_id.clone());
+
+    let source_kind = detect_source_kind(&request).ok();
+    if matches!(source_kind, Some(SourceKind::SingleFile)) {
+        return Some(build_single_file_work(request, tool_paths, progress_tx));
+    }
+
+    let materialize_kind = match source_kind {
+        Some(SourceKind::SevenZip) => WorkKind::ArchiveExtract,
+        Some(SourceKind::CueImage) => WorkKind::MaterializeItem,
+        Some(SourceKind::SacdIso) => WorkKind::MaterializeItem,
+        Some(SourceKind::SingleFile) => unreachable!("single files are submitted as immediate work units"),
+        None => WorkKind::MaterializeItem,
+    };
+    let unit_prefix = match source_kind {
+        Some(SourceKind::SevenZip) => "archive-extract",
+        Some(SourceKind::CueImage) => "cue-materialize",
+        Some(SourceKind::SacdIso) => "sacd-materialize",
+        Some(SourceKind::SingleFile) => unreachable!("single files are submitted as immediate work units"),
+        None => "materialize",
+    };
+    let submit_tool_paths = tool_paths.clone();
+    let submit_progress_tx = progress_tx.clone();
+    let submit_item_id = item_id.clone();
+    Some(WorkUnit {
+        job_id: request.job_id.clone(),
+        unit_id: format!("{unit_prefix}:{submit_item_id}"),
+        kind: materialize_kind,
+        task: boxed_work(move |worker_cancel| async move {
+            let runner = RealToolRunner::new(submit_tool_paths.clone());
+            let reporter = BroadcastReporter::new(submit_progress_tx, submit_item_id.clone());
+            let result = prepare_pipeline_item_for_scheduler(
+                request,
+                &runner,
+                &reporter,
+                &worker_cancel,
+                &submit_tool_paths,
+            )
+            .await;
+            Ok(QueueWorkOutput::Materialized {
+                item_id: submit_item_id,
+                result,
+            })
+        }),
+    })
+}
+
+fn build_single_file_work(
     request: PipelineRequest,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-) {
+) -> WorkUnit<QueueWorkOutput> {
     let item_id = request.item_id.clone();
     let job_id = request.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
-    pool.submit(WorkUnit {
+    WorkUnit {
         job_id,
         unit_id: format!("single-file:{item_id}"),
         kind: WorkKind::SingleFile,
@@ -519,65 +904,68 @@ async fn submit_single_file_work(
             );
             Ok(QueueWorkOutput::PostProcessed { item_id, status })
         }),
-    })
-    .await;
+    }
 }
 
-async fn submit_album_source_work(
-    pool: &SharedWorkerPool<QueueWorkOutput>,
-    album: &ScheduledAlbum,
+fn next_album_source_work(
+    pending_albums: &mut BTreeMap<String, PendingAlbum>,
+    job_id: &str,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-    job_cancel: CancellationToken,
-) {
-    let convert_root = album.convert_root();
-    let _ = std::fs::create_dir_all(&convert_root);
-    for (track_index, track) in album.source.tracks.iter().cloned().enumerate() {
+) -> Option<WorkUnit<QueueWorkOutput>> {
+    let pending = pending_albums.get_mut(job_id)?;
+    loop {
+        let track_index = pending.next_source_track;
+        let album = pending.album.as_ref()?;
+        if track_index >= album.source.tracks.len() {
+            return None;
+        }
+
+        let track = album.source.tracks[track_index].clone();
+        pending.next_source_track += 1;
         let Some(final_path) = album.planned_final_path(&track.id) else {
             log::error!("missing planned final path for {}", track.id.source_ordinal);
             continue;
         };
-        match &track.source_ref {
+
+        let convert_root = album.convert_root();
+        let _ = std::fs::create_dir_all(&convert_root);
+        return Some(match &track.source_ref {
             TrackSourceRef::StagedFile(_) => {
                 let kind = if album.source.kind == SourceKind::SingleFile {
                     WorkKind::SingleFile
                 } else {
                     WorkKind::EncodeTrack { track_id: track.id.clone() }
                 };
-                submit_staged_encode_work(
-                    pool,
+                build_staged_encode_work(
                     album,
                     track_index,
                     track,
                     final_path,
-                    convert_root.clone(),
+                    convert_root,
                     kind,
                     tool_paths,
                     progress_tx,
-                    job_cancel.clone(),
+                    pending.job_cancel.clone(),
                 )
-                .await;
             }
             TrackSourceRef::ImageSegment { .. } | TrackSourceRef::SacdTrack { .. } => {
-                submit_realize_work(
-                    pool,
+                build_realize_work(
                     album,
                     track_index,
                     track,
                     final_path,
-                    convert_root.clone(),
+                    convert_root,
                     tool_paths,
                     progress_tx,
-                    job_cancel.clone(),
+                    pending.job_cancel.clone(),
                 )
-                .await;
             }
-        }
+        });
     }
 }
 
-async fn submit_realize_work(
-    pool: &SharedWorkerPool<QueueWorkOutput>,
+fn build_realize_work(
     album: &ScheduledAlbum,
     track_index: usize,
     track: crate::convert::pipeline::PreparedTrack,
@@ -586,7 +974,7 @@ async fn submit_realize_work(
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
     job_cancel: CancellationToken,
-) {
+) -> WorkUnit<QueueWorkOutput> {
     let req = album.req.clone();
     let staging_root = album.staging.root.clone();
     let staging_job = album.staging.job_id.clone();
@@ -600,7 +988,7 @@ async fn submit_realize_work(
         TrackSourceRef::SacdTrack { .. } => WorkKind::SacdExtractTrack { track_id: track_id.clone() },
         TrackSourceRef::StagedFile(_) => WorkKind::EncodeTrack { track_id: track_id.clone() },
     };
-    pool.submit(WorkUnit {
+    WorkUnit {
         job_id: job_id.clone(),
         unit_id: format!("realize-track:{:04}", track_id.source_ordinal),
         kind,
@@ -634,12 +1022,10 @@ async fn submit_realize_work(
                 Err(output) => Ok(QueueWorkOutput::Encoded { job_id, output }),
             }
         }),
-    })
-    .await;
+    }
 }
 
-async fn submit_staged_encode_work(
-    pool: &SharedWorkerPool<QueueWorkOutput>,
+fn build_staged_encode_work(
     album: &ScheduledAlbum,
     track_index: usize,
     track: crate::convert::pipeline::PreparedTrack,
@@ -649,7 +1035,7 @@ async fn submit_staged_encode_work(
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
     job_cancel: CancellationToken,
-) {
+) -> WorkUnit<QueueWorkOutput> {
     let req = album.req.clone();
     let staging_root = album.staging.root.clone();
     let staging_job = album.staging.job_id.clone();
@@ -658,7 +1044,7 @@ async fn submit_staged_encode_work(
     let job_id = album.req.job_id.clone();
     let item_id = album.req.item_id.clone();
     let track_id = track.id.clone();
-    pool.submit(WorkUnit {
+    WorkUnit {
         job_id: job_id.clone(),
         unit_id: format!("encode-track:{:04}", track_id.source_ordinal),
         kind,
@@ -699,18 +1085,16 @@ async fn submit_staged_encode_work(
             };
             Ok(QueueWorkOutput::Encoded { job_id, output })
         }),
-    })
-    .await;
+    }
 }
 
-async fn submit_realized_encode_work(
-    pool: &SharedWorkerPool<QueueWorkOutput>,
+fn build_realized_encode_work(
     job_id: String,
     realized: ScheduledRealizedTrack,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
     job_cancel: CancellationToken,
-) {
+) -> WorkUnit<QueueWorkOutput> {
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
     let item_id = realized.req.item_id.clone();
@@ -719,7 +1103,7 @@ async fn submit_realized_encode_work(
     let failure_track = realized.track.clone();
     let failure_realized_input = Some(realized.realized_path.clone());
     let failure_final_path = Some(realized.final_path.clone());
-    pool.submit(WorkUnit {
+    WorkUnit {
         job_id: job_id.clone(),
         unit_id: format!("encode-realized-track:{:04}", track_id.source_ordinal),
         kind: WorkKind::EncodeTrack { track_id },
@@ -753,22 +1137,20 @@ async fn submit_realized_encode_work(
             };
             Ok(QueueWorkOutput::Encoded { job_id, output })
         }),
-    })
-    .await;
+    }
 }
 
-async fn submit_album_postprocess(
-    pool: &SharedWorkerPool<QueueWorkOutput>,
+fn build_album_postprocess_work(
     album: ScheduledAlbum,
     outputs: Vec<ScheduledTrackOutput>,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-) {
+) -> WorkUnit<QueueWorkOutput> {
     let item_id = album.req.item_id.clone();
     let job_id = album.req.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
-    pool.submit(WorkUnit {
+    WorkUnit {
         job_id,
         unit_id: format!("album-postprocess:{item_id}"),
         kind: WorkKind::AlbumPostProcess,
@@ -790,8 +1172,7 @@ async fn submit_album_postprocess(
             );
             Ok(QueueWorkOutput::PostProcessed { item_id, status })
         }),
-    })
-    .await;
+    }
 }
 
 /// Run one conversion item through the shared scheduler graph.
@@ -813,6 +1194,8 @@ async fn run_single_item_with_shared_scheduler(
         None,
         tool_paths,
         worker_count.max(1),
+        PoolLimits::default(),
+        Arc::new(SchedulerMetrics::default()),
     )
     .await;
 
@@ -859,6 +1242,33 @@ pub async fn process_item_with_pipeline_settings(
     process_item(item, progress_tx, tool_paths, _file_semaphore, worker_count, _scratch_directory).await
 }
 
+#[cfg(test)]
+fn synthetic_queue_work_unit_for_processor_test(
+    job_id: &str,
+    unit_id: String,
+    track_index: usize,
+) -> WorkUnit<QueueWorkOutput> {
+    let job_id = job_id.to_string();
+    let output_job_id = job_id.clone();
+    WorkUnit {
+        job_id,
+        unit_id,
+        kind: WorkKind::EncodeTrack {
+            track_id: crate::convert::pipeline::TrackId {
+                source_ordinal: track_index as u32,
+                disc_number: None,
+                track_number: track_index as u32 + 1,
+            },
+        },
+        task: boxed_work(move |_cancel| async move {
+            Ok(QueueWorkOutput::SyntheticEncoded {
+                job_id: output_job_id,
+                track_index,
+            })
+        }),
+    }
+}
+
 /// Process a single conversion item. This direct path now delegates to the
 /// shared scheduler graph, so SACD/CUE/archive requests get the same
 /// materialization -> encode -> album-postprocess behavior as queued batches.
@@ -895,4 +1305,262 @@ pub async fn process_item(
     });
 
     run_single_item_with_shared_scheduler(item, progress_tx, tool_paths, worker_count).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_queue_work_unit(job_id: &str, unit_id: String) -> WorkUnit<QueueWorkOutput> {
+        let item_id = unit_id.clone();
+        WorkUnit {
+            job_id: job_id.to_string(),
+            unit_id,
+            kind: WorkKind::EncodeTrack {
+                track_id: crate::convert::pipeline::TrackId {
+                    source_ordinal: 0,
+                    disc_number: None,
+                    track_number: 1,
+                },
+            },
+            task: boxed_work(move |_cancel| async move {
+                let _ = item_id;
+                Err("test unit should remain queued".to_string())
+            }),
+        }
+    }
+
+    fn blocking_synthetic_processor_unit(
+        job_id: &str,
+        unit_id: &str,
+        track_index: usize,
+        started_tx: tokio::sync::oneshot::Sender<()>,
+        release_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> WorkUnit<QueueWorkOutput> {
+        let job_id = job_id.to_string();
+        let output_job_id = job_id.clone();
+        WorkUnit {
+            job_id,
+            unit_id: unit_id.to_string(),
+            kind: WorkKind::EncodeTrack {
+                track_id: crate::convert::pipeline::TrackId {
+                    source_ordinal: track_index as u32,
+                    disc_number: None,
+                    track_number: track_index as u32 + 1,
+                },
+            },
+            task: boxed_work(move |_cancel| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok(QueueWorkOutput::SyntheticEncoded {
+                    job_id: output_job_id,
+                    track_index,
+                })
+            }),
+        }
+    }
+
+    async fn expect_processor_scheduler_event(
+        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::convert::pipeline::SchedulerTestEvent>,
+        expected: crate::convert::pipeline::SchedulerTestEvent,
+    ) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("scheduler test event arrives before timeout")
+            .expect("scheduler test event sender remains live");
+        assert_eq!(event, expected);
+    }
+
+    #[test]
+    fn submission_pump_large_album_fanout_generates_only_one_deferred_unit_when_pool_is_full() {
+        let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
+            Some(1),
+            CancellationToken::new(),
+            PoolLimits { ready_capacity: Some(1) },
+        );
+        pool.try_submit(synthetic_queue_work_unit("resident", "resident".to_string()))
+            .expect("resident unit fills ready queue");
+
+        let mut pump = SubmissionPump::new(Vec::new());
+        pump.enqueue_album_fanout("album".to_string());
+        let mut generated = 0usize;
+        let progress = pump.flush_album_fanout_once(&pool, |job_id| {
+            assert_eq!(job_id, "album");
+            let unit_id = format!("album-track-{generated}");
+            generated += 1;
+            Some(synthetic_queue_work_unit(job_id, unit_id))
+        });
+
+        assert_eq!(progress, PumpFlushProgress::Blocked);
+        assert_eq!(generated, 1, "large fanout must stop after producing one deferred WorkUnit");
+        assert_eq!(pump.pending_work_units(), 1);
+        assert_eq!(pump.album_fanout.len(), 1, "album cursor remains pending for later capacity");
+        assert_eq!(pool.metrics().snapshot().pool_ready_queue_depth, 1);
+    }
+
+    #[tokio::test]
+    async fn processor_orchestrator_large_fanout_drains_saturated_results_without_unbounded_backlog() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
+            Some(1),
+            cancel.clone(),
+            PoolLimits { ready_capacity: Some(1) },
+        );
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        pool.metrics().set_test_event_sender(events_tx);
+        let mut run = pool.start();
+
+        for index in 0..5usize {
+            pool.submit(synthetic_queue_work_unit_for_processor_test(
+                "preload",
+                format!("preload-{index}"),
+                index,
+            ))
+            .await;
+        }
+        // With ready_capacity: 1, submits are serialized through the semaphore.
+        // The worker interleaves Started/Finished events for each unit. Wait for
+        // 5 Started events (ignoring Finished events between them). The 5th Started
+        // is the blocked send (channel full at capacity 4, 5th send pending).
+        {
+            let mut started_count = 0usize;
+            while started_count < 5 {
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    events_rx.recv(),
+                )
+                .await
+                .expect("scheduler event arrives before timeout")
+                .expect("event sender remains live");
+                if event == crate::convert::pipeline::SchedulerTestEvent::WorkerResultSendStarted {
+                    started_count += 1;
+                }
+            }
+        }
+
+        let (resident_started_tx, resident_started_rx) = tokio::sync::oneshot::channel();
+        let (release_resident_tx, release_resident_rx) = tokio::sync::oneshot::channel();
+        pool.try_submit(blocking_synthetic_processor_unit(
+            "resident",
+            "resident",
+            10_000,
+            resident_started_tx,
+            release_resident_rx,
+        ))
+        .expect("blocked worker leaves exactly one ready slot to fill");
+        assert_eq!(pool.metrics().snapshot().pool_ready_queue_depth, 1);
+
+        let mut submissions = SubmissionPump::new(Vec::new());
+        let mut pending_albums = BTreeMap::new();
+        let mut terminal = BTreeMap::new();
+        let mut job_to_item = BTreeMap::new();
+        let tool_paths = HashMap::new();
+        let (progress_tx, _progress_rx) = broadcast::channel(16);
+
+        submissions.enqueue_synthetic_album_fanout(
+            "large-album".to_string(),
+            "large-item".to_string(),
+            64,
+            pool.metrics(),
+        );
+        submissions.record_backlog(pool.metrics(), &pending_albums);
+        assert_eq!(pool.metrics().snapshot().submission_backlog_depth, 64);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            submissions.flush(
+                &pool,
+                &mut pending_albums,
+                &mut terminal,
+                &mut job_to_item,
+                &tool_paths,
+                &progress_tx,
+                &cancel,
+                1,
+            );
+        })
+        .await
+        .expect("processor submission flush returns while result channel and ready queue are full");
+        submissions.record_backlog(pool.metrics(), &pending_albums);
+        let blocked = pool.metrics().snapshot();
+        assert_eq!(submissions.pending_work_units(), 1);
+        assert_eq!(blocked.pool_ready_queue_depth, 1);
+        assert_eq!(blocked.submission_backlog_depth, 64);
+        assert_eq!(blocked.ready_queue_depth, 65);
+
+        let first_drained = tokio::time::timeout(std::time::Duration::from_secs(5), run.results.recv())
+            .await
+            .expect("processor can drain one result even while a large fanout is pending")
+            .expect("preloaded result is present");
+        assert!(matches!(
+            first_drained.outcome,
+            Ok(QueueWorkOutput::SyntheticEncoded { job_id, .. }) if job_id == "preload"
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), resident_started_rx)
+            .await
+            .expect("resident work starts after draining a result")
+            .expect("resident start signal is delivered");
+
+        submissions.flush(
+            &pool,
+            &mut pending_albums,
+            &mut terminal,
+            &mut job_to_item,
+            &tool_paths,
+            &progress_tx,
+            &cancel,
+            1,
+        );
+        submissions.record_backlog(pool.metrics(), &pending_albums);
+        let resumed = pool.metrics().snapshot();
+        assert_eq!(submissions.pending_work_units(), 1);
+        assert_eq!(resumed.pool_ready_queue_depth, 1);
+        assert_eq!(resumed.submission_backlog_depth, 63);
+        assert_eq!(resumed.ready_queue_depth, 64);
+        assert_eq!(resumed.peak_submission_backlog_depth, 64);
+
+        for _ in 0..4 {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run.results.recv())
+                .await
+                .expect("preloaded results drain after progress resumes")
+                .expect("preloaded result remains available");
+        }
+        release_resident_tx.send(()).expect("release resident worker");
+        let resident = tokio::time::timeout(std::time::Duration::from_secs(5), run.results.recv())
+            .await
+            .expect("resident result drains")
+            .expect("resident result exists");
+        assert!(matches!(
+            resident.outcome,
+            Ok(QueueWorkOutput::SyntheticEncoded { job_id, .. }) if job_id == "resident"
+        ));
+        let fanout = tokio::time::timeout(std::time::Duration::from_secs(5), run.results.recv())
+            .await
+            .expect("queued fanout unit drains")
+            .expect("fanout result exists");
+        assert!(matches!(
+            fanout.outcome,
+            Ok(QueueWorkOutput::SyntheticEncoded { job_id, .. }) if job_id == "large-album"
+        ));
+
+        run.shutdown().await;
+    }
+
+    #[test]
+    fn conversion_processor_exposes_stable_scheduler_metrics_handle() {
+        let processor = ConversionProcessor::new(ProcessorConfig {
+            worker_count: 1,
+            tool_paths: HashMap::new(),
+            default_destination_directory: None,
+            scratch_directory: None,
+        });
+
+        let metrics = processor.scheduler_metrics();
+        metrics.record_jobs_queued(2);
+        metrics.record_submission_backlog_depth(1);
+
+        let snapshot = processor.scheduler_metrics_snapshot();
+        assert_eq!(snapshot.jobs_queued, 2);
+        assert_eq!(snapshot.submission_backlog_depth, 1);
+        assert_eq!(snapshot.ready_queue_depth, 1);
+    }
 }
