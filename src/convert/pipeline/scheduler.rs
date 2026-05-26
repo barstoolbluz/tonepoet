@@ -644,6 +644,94 @@ mod tests {
         assert_eq!(completed, (0usize..100).collect::<Vec<_>>());
     }
 
+    /// 4.2: 1 archive with 20 tracks — extraction gates track fanout correctly.
+    ///
+    /// One materialization fans out 20 encode units into a 4-worker pool.
+    /// Postprocess fires only after all 20 tracks reach terminal state.
+    #[tokio::test]
+    async fn archive_twenty_track_fanout_gates_postprocess() {
+        let cancel = CancellationToken::new();
+        let pool = SharedWorkerPool::<TestSchedulerOutput>::new(Some(4), cancel.clone());
+        let mut run = pool.start();
+        let mut tracker = AlbumCompletionTracker::default();
+        let track_count = 20usize;
+        tracker.register_album("archive".to_string(), track_count, false);
+
+        pool.submit(WorkUnit {
+            job_id: "archive".to_string(),
+            unit_id: "archive-extract".to_string(),
+            kind: WorkKind::ArchiveExtract,
+            task: boxed_work(move |_cancel| async move {
+                Ok(TestSchedulerOutput::Materialized {
+                    job_id: "archive".to_string(),
+                    tracks: track_count,
+                })
+            }),
+        })
+        .await;
+
+        let mut encoded = Vec::new();
+        let mut postprocessed = false;
+        loop {
+            let result = run.results.recv().await.expect("worker result");
+            match result.outcome.expect("work output") {
+                TestSchedulerOutput::Materialized { job_id, tracks } => {
+                    for track_index in 0..tracks {
+                        let encode_job = job_id.clone();
+                        pool.submit(WorkUnit {
+                            job_id: job_id.clone(),
+                            unit_id: format!("encode-{track_index}"),
+                            kind: WorkKind::EncodeTrack {
+                                track_id: TrackId {
+                                    source_ordinal: track_index as u32,
+                                    disc_number: None,
+                                    track_number: track_index as u32 + 1,
+                                },
+                            },
+                            task: boxed_work(move |_cancel| async move {
+                                Ok(TestSchedulerOutput::Encoded {
+                                    job_id: encode_job,
+                                    track_index,
+                                })
+                            }),
+                        })
+                        .await;
+                    }
+                }
+                TestSchedulerOutput::Encoded { job_id, track_index } => {
+                    encoded.push(track_index);
+                    if tracker.mark_track_finished(&job_id, true)
+                        == AlbumReadiness::ReadyForPostProcess
+                    {
+                        assert_eq!(
+                            encoded.len(),
+                            track_count,
+                            "postprocess must wait for all {track_count} tracks"
+                        );
+                        pool.submit(WorkUnit {
+                            job_id: job_id.clone(),
+                            unit_id: "postprocess".to_string(),
+                            kind: WorkKind::AlbumPostProcess,
+                            task: boxed_work(move |_cancel| async move {
+                                Ok(TestSchedulerOutput::PostProcessed { job_id })
+                            }),
+                        })
+                        .await;
+                    }
+                }
+                TestSchedulerOutput::PostProcessed { .. } => {
+                    postprocessed = true;
+                    break;
+                }
+            }
+        }
+
+        run.shutdown().await;
+        encoded.sort();
+        assert_eq!(encoded, (0..track_count).collect::<Vec<_>>());
+        assert!(postprocessed, "postprocess must run after all tracks complete");
+    }
+
 }
 
 #[cfg(test)]
@@ -1064,4 +1152,338 @@ mod chunk_2_1_3_worker_recovery_tests {
         assert!(!postprocess_submitted, "fail-fast album never reaches postprocess readiness");
     }
 
+    /// 4.2: 5 singles + 2 multi-track sources + 1 archive — singles start
+    /// immediately; materialized tracks join the same worker pool.
+    ///
+    /// Materializations are gated so they block until released. All 5 singles
+    /// must complete while the materializations are still held.
+    #[tokio::test]
+    async fn mixed_workload_singles_complete_before_materialization_finishes() {
+        let pool_cancel = CancellationToken::new();
+        // 6 workers: enough to run all 5 singles + 1 materialization concurrently
+        let pool = SharedWorkerPool::<(&'static str, usize)>::new(Some(6), pool_cancel.clone());
+        let mut run = pool.start();
+
+        // Gates hold the 3 multi-track materializations
+        let (gate_sacd1, blocker_sacd1) = tool_gate();
+        let (gate_sacd2, blocker_sacd2) = tool_gate();
+        let (gate_archive, blocker_archive) = tool_gate();
+
+        let runner = Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker_sacd1),
+            ToolBehavior::BlockThenSucceed(blocker_sacd2),
+            ToolBehavior::BlockThenSucceed(blocker_archive),
+        ]));
+
+        // Submit 3 gated materializations
+        for (index, job) in ["sacd-1", "sacd-2", "archive"].iter().enumerate() {
+            let runner = runner.clone();
+            pool.submit(WorkUnit {
+                job_id: job.to_string(),
+                unit_id: format!("materialize-{job}"),
+                kind: WorkKind::MaterializeItem,
+                task: boxed_work(move |cancel| async move {
+                    runner
+                        .run(cmd(index), &cancel)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    Ok((*job, 0))
+                }),
+            })
+            .await;
+        }
+
+        // Submit 5 singles (no gating — should complete immediately)
+        for index in 0..5usize {
+            pool.submit(WorkUnit {
+                job_id: format!("single-{index}"),
+                unit_id: format!("single-{index}"),
+                kind: WorkKind::SingleFile,
+                task: boxed_work(move |_cancel| async move { Ok(("single", index)) }),
+            })
+            .await;
+        }
+
+        // Wait for all 3 materializations to reach their gates
+        let release_sacd1 = gate_sacd1.wait_started().await;
+        let release_sacd2 = gate_sacd2.wait_started().await;
+        let release_archive = gate_archive.wait_started().await;
+
+        // Drain the 5 singles — they must complete while materializations are blocked
+        let mut singles_done = BTreeSet::new();
+        while singles_done.len() < 5 {
+            let result = run.results.recv().await.expect("single result");
+            let (tag, index) = result.outcome.expect("single succeeds");
+            assert_eq!(tag, "single", "only singles should complete while gates are held");
+            singles_done.insert(index);
+        }
+        assert_eq!(singles_done, (0usize..5).collect::<BTreeSet<_>>());
+
+        // Release materializations — they should now complete
+        release_sacd1.release();
+        release_sacd2.release();
+        release_archive.release();
+
+        let mut materialized_jobs = BTreeSet::new();
+        while materialized_jobs.len() < 3 {
+            let result = run.results.recv().await.expect("materialize result");
+            materialized_jobs.insert(result.job_id.clone());
+        }
+        assert_eq!(
+            materialized_jobs,
+            ["archive", "sacd-1", "sacd-2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+
+        run.shutdown().await;
+    }
+
+}
+
+/// Test-only state machine model documenting the legal album lifecycle.
+///
+/// The scheduler primitives ([`SharedWorkerPool`] + [`AlbumCompletionTracker`])
+/// don't enforce this state machine directly — the orchestrator in `processor.rs`
+/// drives transitions. This model formalises the legal transitions so that
+/// regressions in the orchestrator surface as explicit illegal-transition failures.
+#[cfg(test)]
+mod lifecycle_model_tests {
+    use std::fmt;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        Queued,
+        Materializing,
+        TracksReady,
+        Encoding,
+        AllTerminal,
+        PostProcessing,
+        Published,
+        Failed,
+        Cancelled,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Event {
+        StartMaterialization,
+        MaterializationDone,
+        StartEncoding,
+        TrackDone,
+        AllTracksDone,
+        TrackFailed,
+        AllTracksTerminal,
+        StartPostProcess,
+        PostProcessDone,
+        Cancel,
+        /// fail-fast policy: first failure blocks the album
+        FailFastTriggered,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct IllegalTransition {
+        from: Phase,
+        event: Event,
+    }
+
+    impl fmt::Display for IllegalTransition {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "illegal transition: {:?} on {:?}", self.event, self.from)
+        }
+    }
+
+    /// Transition function encoding the legal album lifecycle.
+    fn transition(phase: Phase, event: Event) -> Result<Phase, IllegalTransition> {
+        use Event::*;
+        use Phase::*;
+
+        let next = match (phase, event) {
+            // — happy path —
+            (Queued, StartMaterialization) => Materializing,
+            (Materializing, MaterializationDone) => TracksReady,
+            (TracksReady, StartEncoding) => Encoding,
+            (Encoding, TrackDone) => Encoding,          // more tracks pending
+            (Encoding, AllTracksDone) => AllTerminal,    // all tracks ok
+            (AllTerminal, StartPostProcess) => PostProcessing,
+            (PostProcessing, PostProcessDone) => Published,
+
+            // — failure paths —
+            (Encoding, TrackFailed) => Encoding,         // allow-partial: keep going
+            (Encoding, FailFastTriggered) => Failed,     // fail-fast: immediate block
+            (Encoding, AllTracksTerminal) => AllTerminal, // allow-partial: some failed, all terminal
+            (Materializing, TrackFailed) => Failed,      // materialization itself failed
+            (AllTerminal, FailFastTriggered) => Failed,  // deferred failure accounting
+
+            // — cancellation —
+            (Queued, Cancel) => Cancelled,
+            (Materializing, Cancel) => Cancelled,
+            (TracksReady, Cancel) => Cancelled,
+            (Encoding, Cancel) => Cancelled,
+
+            // everything else is illegal
+            _ => return Err(IllegalTransition { from: phase, event }),
+        };
+        Ok(next)
+    }
+
+    // ── illegal transition tests (guidance doc 4.1) ──
+
+    #[test]
+    fn illegal_encoding_to_published_without_postprocess() {
+        // EncodingTrack -> Published without post-processing gate
+        let result = transition(Phase::Encoding, Event::PostProcessDone);
+        assert!(result.is_err(), "encoding must not skip to published");
+    }
+
+    #[test]
+    fn illegal_failed_track_to_postprocess_under_fail_fast() {
+        // TrackFailed -> AlbumReadyForPost under fail-fast policy
+        let result = transition(Phase::Failed, Event::StartPostProcess);
+        assert!(result.is_err(), "failed album must not enter postprocess");
+    }
+
+    #[test]
+    fn illegal_cancelled_to_postprocessing() {
+        let result = transition(Phase::Cancelled, Event::StartPostProcess);
+        assert!(result.is_err(), "cancelled album must not enter postprocess");
+    }
+
+    #[test]
+    fn illegal_queued_to_track_done() {
+        let result = transition(Phase::Queued, Event::TrackDone);
+        assert!(result.is_err(), "queued album must not jump to track done");
+    }
+
+    // ── additional illegal transition tests ──
+
+    const ALL_EVENTS: [Event; 11] = [
+        Event::StartMaterialization,
+        Event::MaterializationDone,
+        Event::StartEncoding,
+        Event::TrackDone,
+        Event::AllTracksDone,
+        Event::TrackFailed,
+        Event::AllTracksTerminal,
+        Event::StartPostProcess,
+        Event::PostProcessDone,
+        Event::Cancel,
+        Event::FailFastTriggered,
+    ];
+
+    #[test]
+    fn illegal_published_accepts_no_events() {
+        for event in ALL_EVENTS {
+            assert!(
+                transition(Phase::Published, event).is_err(),
+                "published is terminal — {event:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn illegal_failed_accepts_no_events() {
+        for event in ALL_EVENTS {
+            assert!(
+                transition(Phase::Failed, event).is_err(),
+                "failed is terminal — {event:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn illegal_cancelled_accepts_no_events() {
+        for event in ALL_EVENTS {
+            assert!(
+                transition(Phase::Cancelled, event).is_err(),
+                "cancelled is terminal — {event:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn illegal_queued_to_all_terminal() {
+        assert!(transition(Phase::Queued, Event::AllTracksDone).is_err());
+        assert!(transition(Phase::Queued, Event::AllTracksTerminal).is_err());
+    }
+
+    #[test]
+    fn illegal_materializing_to_published() {
+        assert!(transition(Phase::Materializing, Event::PostProcessDone).is_err());
+    }
+
+    // ── legal path tests ──
+
+    #[test]
+    fn legal_happy_path() {
+        let mut phase = Phase::Queued;
+        phase = transition(phase, Event::StartMaterialization).unwrap();
+        assert_eq!(phase, Phase::Materializing);
+        phase = transition(phase, Event::MaterializationDone).unwrap();
+        assert_eq!(phase, Phase::TracksReady);
+        phase = transition(phase, Event::StartEncoding).unwrap();
+        assert_eq!(phase, Phase::Encoding);
+        phase = transition(phase, Event::TrackDone).unwrap();
+        assert_eq!(phase, Phase::Encoding);
+        phase = transition(phase, Event::AllTracksDone).unwrap();
+        assert_eq!(phase, Phase::AllTerminal);
+        phase = transition(phase, Event::StartPostProcess).unwrap();
+        assert_eq!(phase, Phase::PostProcessing);
+        phase = transition(phase, Event::PostProcessDone).unwrap();
+        assert_eq!(phase, Phase::Published);
+    }
+
+    #[test]
+    fn legal_fail_fast_path() {
+        let mut phase = Phase::Queued;
+        phase = transition(phase, Event::StartMaterialization).unwrap();
+        phase = transition(phase, Event::MaterializationDone).unwrap();
+        phase = transition(phase, Event::StartEncoding).unwrap();
+        phase = transition(phase, Event::TrackDone).unwrap();
+        phase = transition(phase, Event::FailFastTriggered).unwrap();
+        assert_eq!(phase, Phase::Failed);
+    }
+
+    #[test]
+    fn legal_allow_partial_path() {
+        let mut phase = Phase::Queued;
+        phase = transition(phase, Event::StartMaterialization).unwrap();
+        phase = transition(phase, Event::MaterializationDone).unwrap();
+        phase = transition(phase, Event::StartEncoding).unwrap();
+        // some tracks fail, but we keep encoding
+        phase = transition(phase, Event::TrackFailed).unwrap();
+        assert_eq!(phase, Phase::Encoding);
+        phase = transition(phase, Event::TrackDone).unwrap();
+        assert_eq!(phase, Phase::Encoding);
+        // all tracks terminal (some ok, some failed)
+        phase = transition(phase, Event::AllTracksTerminal).unwrap();
+        assert_eq!(phase, Phase::AllTerminal);
+        phase = transition(phase, Event::StartPostProcess).unwrap();
+        phase = transition(phase, Event::PostProcessDone).unwrap();
+        assert_eq!(phase, Phase::Published);
+    }
+
+    #[test]
+    fn legal_cancellation_from_encoding() {
+        let mut phase = Phase::Queued;
+        phase = transition(phase, Event::StartMaterialization).unwrap();
+        phase = transition(phase, Event::MaterializationDone).unwrap();
+        phase = transition(phase, Event::StartEncoding).unwrap();
+        phase = transition(phase, Event::Cancel).unwrap();
+        assert_eq!(phase, Phase::Cancelled);
+    }
+
+    #[test]
+    fn legal_cancellation_from_queued() {
+        let phase = transition(Phase::Queued, Event::Cancel).unwrap();
+        assert_eq!(phase, Phase::Cancelled);
+    }
+
+    #[test]
+    fn legal_materialization_failure() {
+        let mut phase = Phase::Queued;
+        phase = transition(phase, Event::StartMaterialization).unwrap();
+        phase = transition(phase, Event::TrackFailed).unwrap();
+        assert_eq!(phase, Phase::Failed);
+    }
 }

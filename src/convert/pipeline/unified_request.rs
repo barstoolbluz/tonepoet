@@ -23,6 +23,7 @@ use crate::convert::pipeline::{
 use crate::convert::{ConversionError, ConversionItem, ConversionResult};
 
 pub fn build_pipeline_request(item: &ConversionItem) -> ConversionResult<PipelineRequest> {
+    // Return a prebuilt PipelineRequest with full PipelineSettings — bypass all builders.
     if let Some(request) = item.pipeline_request.clone() {
         request.settings.validate().map_err(|err| {
             ConversionError::ValidationError(format!("invalid prebuilt pipeline settings: {err}"))
