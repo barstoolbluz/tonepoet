@@ -616,6 +616,70 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
     })
 }
 
+/// Validate the encoded output's sample count against expected samples.
+///
+/// Only checks lossless PCM formats (FLAC, WAV, AIFF, WavPack, ALAC) where
+/// sample count must be preserved. Lossy (MP3, AAC, Opus) and DSD formats
+/// are skipped because codec padding or a different sample model makes strict
+/// comparison invalid.
+///
+/// Returns the actual probed sample count on success, or the original
+/// expected_samples if validation was skipped or the probe couldn't
+/// determine the sample count. Mismatches are logged as warnings, not
+/// fatal errors — the extraction-stage validation already caught source
+/// problems, so a post-encode drift may indicate an encoder quirk rather
+/// than data loss.
+async fn validate_encoded_output(
+    out_path: &Path,
+    expected_samples: Option<u64>,
+    target_format: &tonepoet_pipeline::AudioFormat,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Option<u64> {
+    let Some(expected) = expected_samples else {
+        return None;
+    };
+
+    if !target_format.is_pcm_lossless() {
+        return Some(expected);
+    }
+
+    let probe = match probe_realized_segment(out_path, runner, cancel).await {
+        Ok(probe) => probe,
+        Err(err) => {
+            log::warn!(
+                "post-encode sample validation skipped (probe failed): {} — {err}",
+                out_path.display()
+            );
+            return Some(expected);
+        }
+    };
+
+    let Some(actual) = probe.samples else {
+        log::warn!(
+            "post-encode sample validation skipped (no sample count): {}",
+            out_path.display()
+        );
+        return Some(expected);
+    };
+
+    let delta = actual.abs_diff(expected);
+    let allowed = if probe.exact {
+        0
+    } else {
+        (probe.sample_rate / 75).max(1) as u64
+    };
+
+    if delta > allowed {
+        log::warn!(
+            "post-encode sample drift: expected {expected}, got {actual}, allowed {allowed} — {}",
+            out_path.display()
+        );
+    }
+
+    Some(actual)
+}
+
 fn samples_from_stream_duration_ts(stream: &serde_json::Value, sample_rate: u32) -> Option<u64> {
     let duration_ts = stream.get("duration_ts").and_then(json_u64)?;
     let time_base = stream.get("time_base")?.as_str()?;
@@ -1560,6 +1624,14 @@ async fn convert_one_track_work(
                 );
                 Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_written_by_plan: false })
             } else {
+                let actual_samples = validate_encoded_output(
+                    &staged_path,
+                    track.expected_samples,
+                    &req.settings.target_format,
+                    &runner,
+                    &cancel,
+                )
+                .await;
                 let record = TrackRecord {
                     track_id: track.id.clone(),
                     outcome: TrackOutcome::Ok,
@@ -1576,7 +1648,7 @@ async fn convert_one_track_work(
                     track_id: track.id.clone(),
                     staged_path,
                     final_path,
-                    samples: track.expected_samples,
+                    samples: actual_samples.or(track.expected_samples),
                     metadata_written_by_plan: executed.metadata_written_by_plan,
                 };
                 Ok(ScheduledTrackOutput { index: track_index, record, artifact: Some(artifact), ok: true, metadata_written_by_plan: executed.metadata_written_by_plan })
@@ -3705,6 +3777,14 @@ pub async fn encode_realized_track_for_scheduler(
                 );
                 Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_written_by_plan: false })
             } else {
+                let actual_samples = validate_encoded_output(
+                    &staged_path,
+                    realized.track.expected_samples,
+                    &realized.req.settings.target_format,
+                    &runner,
+                    &realized.cancel,
+                )
+                .await;
                 let record = TrackRecord {
                     track_id: realized.track.id.clone(),
                     outcome: TrackOutcome::Ok,
@@ -3720,7 +3800,7 @@ pub async fn encode_realized_track_for_scheduler(
                     track_id: realized.track.id.clone(),
                     staged_path,
                     final_path: realized.final_path,
-                    samples: realized.track.expected_samples,
+                    samples: actual_samples.or(realized.track.expected_samples),
                     metadata_written_by_plan: executed.metadata_written_by_plan,
                     planned_command_hash: executed.command_hash,
                 };
@@ -7875,3 +7955,175 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 }
 // CHUNK_2_1_3_FAILURE_CANCELLATION_TESTS_END
+
+#[cfg(test)]
+mod validate_encoded_output_tests {
+    use super::*;
+    use crate::convert::pipeline::tool::{StubToolRunner, ToolOutput, ProcessExit, CommandRecord};
+
+    fn ffprobe_exact_json(sample_rate: u32, total_samples: u64) -> String {
+        format!(
+            r#"{{"streams":[{{"sample_rate":"{sample_rate}","duration_ts":{total_samples},"time_base":"1/{sample_rate}"}}],"format":{{}}}}"#
+        )
+    }
+
+    fn ffprobe_approx_json(sample_rate: u32, duration_secs: f64) -> String {
+        format!(
+            r#"{{"streams":[{{"sample_rate":"{sample_rate}","duration":"{duration_secs}"}}],"format":{{"duration":"{duration_secs}"}}}}"#
+        )
+    }
+
+    fn stub_with_probe(json: &str) -> StubToolRunner {
+        let runner = StubToolRunner::new();
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: json.to_string(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(1),
+            command: CommandRecord {
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(1),
+            },
+        });
+        runner
+    }
+
+    #[tokio::test]
+    async fn lossless_target_with_matching_samples_returns_actual() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(44100, 1_000_000));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output(
+            &out,
+            Some(1_000_000),
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+        )
+        .await;
+
+        assert_eq!(result, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn lossless_target_with_drifted_samples_returns_actual_and_warns() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.wav");
+        std::fs::write(&out, b"fake-wav").expect("write");
+        // Probe returns 1,000,100 but expected is 1,000,000 — drift of 100
+        let runner = stub_with_probe(&ffprobe_exact_json(44100, 1_000_100));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output(
+            &out,
+            Some(1_000_000),
+            &tonepoet_pipeline::AudioFormat::Wav,
+            &runner,
+            &cancel,
+        )
+        .await;
+
+        // Returns actual (probed) value, not expected
+        assert_eq!(result, Some(1_000_100));
+    }
+
+    #[tokio::test]
+    async fn lossy_target_skips_validation_returns_expected() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.mp3");
+        std::fs::write(&out, b"fake-mp3").expect("write");
+        // No probe should be called — runner has no responses queued
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output(
+            &out,
+            Some(1_000_000),
+            &tonepoet_pipeline::AudioFormat::Mp3,
+            &runner,
+            &cancel,
+        )
+        .await;
+
+        assert_eq!(result, Some(1_000_000));
+        // Verify no probe was attempted
+        assert_eq!(runner.transcript().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dsd_target_skips_validation_returns_expected() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.dsf");
+        std::fs::write(&out, b"fake-dsf").expect("write");
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output(
+            &out,
+            Some(1_000_000),
+            &tonepoet_pipeline::AudioFormat::Dsf,
+            &runner,
+            &cancel,
+        )
+        .await;
+
+        assert_eq!(result, Some(1_000_000));
+        assert_eq!(runner.transcript().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_expected_samples_returns_none() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output(
+            &out,
+            None,
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+        )
+        .await;
+
+        assert_eq!(result, None);
+        assert_eq!(runner.transcript().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn approximate_probe_allows_small_drift() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        // Expected 1,000,000. Duration 22.685 sec → round(22.685 * 44100) = 1,000,409.
+        // Drift = 409, allowed = 44100/75 = 588. 409 < 588 → within tolerance.
+        let runner = stub_with_probe(&ffprobe_approx_json(44100, 22.685));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output(
+            &out,
+            Some(1_000_000),
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+        )
+        .await;
+
+        assert!(result.is_some());
+        let actual = result.unwrap();
+        // Probed value should reflect the approximate duration, not the expected value
+        assert_ne!(actual, 1_000_000, "approximate probe should return a different value");
+        assert!(actual.abs_diff(1_000_000) <= 588, "drift {} should be within tolerance 588", actual.abs_diff(1_000_000));
+    }
+}
