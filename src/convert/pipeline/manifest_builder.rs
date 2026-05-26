@@ -4,7 +4,7 @@ use tonepoet_pipeline::fingerprint::{settings_fingerprint, SettingsFingerprint};
 use tonepoet_pipeline::settings::PipelineSettings;
 
 use super::manifest::{
-    file_sha256, planned_command_hash, tonepoet_pipeline_version,
+    file_sha256, tonepoet_pipeline_version,
     validate_album_relative_output_path, ConversionManifest, ConversionManifestTrack,
     ManifestError, TrackIdentity, ValidationStatus,
 };
@@ -23,7 +23,8 @@ pub struct ManifestTrackBuildInput {
     pub source_path: PathBuf,
     pub source_audio_md5: Option<String>,
     pub track_identity: TrackIdentity,
-    pub conversion_plan: tonepoet_pipeline::plan::ConversionPlan,
+    /// Pre-computed hash of the planned command sequence (from TrackArtifact).
+    pub planned_command_hash: String,
     pub album_relative_output_path: PathBuf,
     pub staged_output_path: PathBuf,
     pub validation_status: ValidationStatus,
@@ -71,7 +72,7 @@ pub fn build_manifest_track(
         input.track_identity,
         fingerprint,
         tonepoet_pipeline_version().to_string(),
-        planned_command_hash(&input.conversion_plan)?,
+        input.planned_command_hash,
         album_relative_output_path,
         output_metadata.len(),
         output_hash,

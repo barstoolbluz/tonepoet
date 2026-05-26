@@ -1572,6 +1572,7 @@ async fn convert_one_track_work(
                     duration: Some(executed.elapsed),
                 };
                 let artifact = TrackArtifact {
+                    planned_command_hash: None,
                     track_id: track.id.clone(),
                     staged_path,
                     final_path,
@@ -3245,6 +3246,7 @@ pub fn publish_album_output(
     Ok(PublishedAlbum {
         album_dir: plan.album_dir.clone(),
         entries: published_entries,
+        manifest_path: None,
     })
 }
 
@@ -3673,6 +3675,7 @@ pub async fn encode_realized_track_for_scheduler(
                     final_path: realized.final_path,
                     samples: realized.track.expected_samples,
                     metadata_written_by_plan: executed.metadata_written_by_plan,
+                    planned_command_hash: None,
                 };
                 Ok(ScheduledTrackOutput { index: realized.index, record, artifact: Some(artifact), ok: true, metadata_written_by_plan: executed.metadata_written_by_plan })
             }
@@ -4494,6 +4497,8 @@ async fn finalize_report(
             published: published.clone(),
             outcome: logged_outcome.clone(),
             durable_log: None,
+            settings_fingerprint: None,
+            manifest_path: None,
         };
         // Write the log alongside the album artifacts when possible,
         // fall back to the configured log root for blocked/failed jobs.
@@ -4553,6 +4558,8 @@ async fn finalize_report(
         published,
         outcome,
         durable_log,
+        settings_fingerprint: None,
+        manifest_path: None,
     }
 }
 
@@ -6845,6 +6852,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 final_path: fixture.final_paths[index].clone(),
                 samples: Some(44_100),
                 metadata_written_by_plan: false,
+                planned_command_hash: None,
             }),
             ok: true,
             metadata_written_by_plan: false,
@@ -7587,6 +7595,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         Ok(PublishedAlbum {
             album_dir: plan.album_dir.clone(),
             entries: published_entries,
+            manifest_path: None,
         })
     }
 

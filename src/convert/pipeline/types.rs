@@ -314,6 +314,10 @@ pub struct TrackArtifact {
     /// to skip the legacy metadata stage only when doing so is safe.
     #[serde(default)]
     pub metadata_written_by_plan: bool,
+    /// SHA-256 of the planned command sequence, computed during encoding.
+    /// Used by the manifest for rerun identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_command_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,6 +377,9 @@ pub enum PublishRole {
 pub struct PublishedAlbum {
     pub album_dir: PathBuf,
     pub entries: Vec<PublishedEntry>,
+    /// Path to the manifest file written during publish, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -466,6 +473,12 @@ pub struct PipelineReport {
     pub published: Option<PublishedAlbum>,
     pub outcome: AlbumOutcome,
     pub durable_log: Option<PathBuf>,
+    /// Settings fingerprint for conversion identity tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_fingerprint: Option<tonepoet_pipeline::SettingsFingerprint>,
+    /// Path to the conversion manifest, if one was written during publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
