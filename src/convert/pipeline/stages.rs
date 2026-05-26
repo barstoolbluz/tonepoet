@@ -6743,7 +6743,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     use crate::convert::pipeline::tool::blocking_test_runner::{
         tool_gate, BlockingToolRunner, ToolBehavior,
     };
-    use crate::convert::pipeline::tool::{StubToolRunner, ToolBinary};
+    use crate::convert::pipeline::tool::{CommandRecord, ProcessExit, StubToolRunner, ToolBinary, ToolOutput};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -7118,12 +7118,28 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[tokio::test]
-    #[ignore = "StubToolRunner returns empty ffprobe output causing MaterializeFailed before cancel check; needs faked ffprobe responses"]
     async fn cancellation_after_materialization_before_planning_uses_real_prepare_boundary() {
         let temp = tempfile::tempdir().expect("temp dir");
         let req = phase_request(temp.path(), "input.flac");
         let staging_root = staging_root_for_request(&req);
         let runner = StubToolRunner::new();
+        // Push a valid ffprobe response so the single-file materializer succeeds.
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: r#"{"streams":[{"sample_rate":"44100","duration":"300.0","bits_per_raw_sample":"16"}],"format":{"duration":"300.0"}}"#.to_string(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(10),
+            command: CommandRecord {
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: vec!["input.flac".to_string()],
+                cwd: None,
+                env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(10),
+            },
+        });
         let cancel = CancellationToken::new();
         let reporter = CancellingReporter::new(cancel.clone(), PipelineStage::Materialize);
 
