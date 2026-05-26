@@ -1003,3 +1003,527 @@ mod naming_template_bit_depth_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod materializer_cue_tests {
+    use super::*;
+    use crate::convert::pipeline::tool::StubToolRunner;
+    use crate::convert::pipeline::tool::ToolOutput;
+
+    // ── helpers ──
+
+    fn ffprobe_json_exact(sample_rate: u32, total_samples: u64, bit_depth: u32) -> String {
+        let time_base = format!("1/{sample_rate}");
+        format!(
+            r#"{{
+  "streams": [{{
+    "sample_rate": "{sample_rate}",
+    "duration_ts": {total_samples},
+    "time_base": "{time_base}",
+    "bits_per_raw_sample": "{bit_depth}"
+  }}],
+  "format": {{}}
+}}"#
+        )
+    }
+
+    fn ffprobe_json_approx(sample_rate: u32, duration_secs: f64) -> String {
+        format!(
+            r#"{{
+  "streams": [{{
+    "sample_rate": "{sample_rate}",
+    "duration": "{duration_secs}"
+  }}],
+  "format": {{
+    "duration": "{duration_secs}"
+  }}
+}}"#
+        )
+    }
+
+    fn stub_runner_with_probe(json: &str) -> StubToolRunner {
+        let runner = StubToolRunner::new();
+        runner.push_output(ToolOutput {
+            exit: crate::convert::pipeline::tool::ProcessExit::Code(0),
+            stdout_tail: json.to_string(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(10),
+            command: crate::convert::pipeline::tool::CommandRecord {
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: vec![],
+                cwd: None,
+                env_keys: vec![],
+                exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(10),
+            },
+        });
+        runner
+    }
+
+    fn write_file(path: &std::path::Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(path, contents).expect("write file");
+    }
+
+    fn cue_sheet_3_track() -> String {
+        r#"REM GENRE Rock
+REM DATE 1973
+PERFORMER "Pink Floyd"
+TITLE "The Dark Side of the Moon"
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Speak to Me"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Breathe"
+    INDEX 01 01:30:00
+  TRACK 03 AUDIO
+    TITLE "On the Run"
+    INDEX 01 04:13:00
+"#
+        .to_string()
+    }
+
+    fn cue_sheet_single_track() -> String {
+        r#"PERFORMER "Artist"
+TITLE "Album"
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Only Track"
+    INDEX 01 00:00:00
+"#
+        .to_string()
+    }
+
+    fn test_request(container: &Path) -> PipelineRequest {
+        PipelineRequest {
+            job_id: "test-job".to_string(),
+            item_id: "test-item".to_string(),
+            container: container.to_path_buf(),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            settings: tonepoet_pipeline::PipelineSettings::default(),
+            worker_count: None,
+            merge: false,
+            output_root: container.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+            },
+            log: LogPolicy {
+                root: container.parent().unwrap_or(Path::new(".")).to_path_buf(),
+                write_for_blocked: false,
+                write_json_log: false,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Disabled,
+                generate_cue: false,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        }
+    }
+
+    fn test_staging(temp: &tempfile::TempDir) -> StagingDir {
+        let root = temp.path().join("staging");
+        std::fs::create_dir_all(&root).expect("create staging dir");
+        StagingDir::new(root, "test-staging".to_string())
+    }
+
+    async fn materialize_cue(
+        cue_content: &str,
+        probe_json: &str,
+        temp: &tempfile::TempDir,
+    ) -> Result<PreparedSource, MaterializeError> {
+        let cue_path = temp.path().join("album.cue");
+        let audio_path = temp.path().join("album.flac");
+        write_file(&cue_path, cue_content.as_bytes());
+        write_file(&audio_path, b"fake-audio-data");
+
+        let runner = stub_runner_with_probe(probe_json);
+        let mut staging = test_staging(temp);
+        let cancel = CancellationToken::new();
+        let req = test_request(&cue_path);
+        let result = CueImageMaterializer
+            .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+            .await;
+        staging.disarm();
+        result
+    }
+
+    // ── Category A: happy path ──
+
+    #[tokio::test]
+    async fn three_track_cd_produces_correct_boundaries_and_metadata() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // 44100 Hz, 3 tracks: 0:00, 1:30, 4:13. Total ~10 minutes = 26,460,000 samples
+        let total_samples: u64 = 26_460_000;
+        let probe = ffprobe_json_exact(44100, total_samples, 16);
+        let source = materialize_cue(&cue_sheet_3_track(), &probe, &temp)
+            .await
+            .expect("materialize succeeds");
+
+        assert_eq!(source.kind, SourceKind::CueImage);
+        assert_eq!(source.tracks.len(), 3);
+
+        // Track 1: starts at 0:00:00 = frame 0 = sample 0
+        assert_eq!(source.tracks[0].id.track_number, 1);
+        assert_eq!(source.tracks[0].id.source_ordinal, 1);
+        let TrackSourceRef::ImageSegment { start_sample, samples, .. } = &source.tracks[0].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*start_sample, 0);
+
+        // Track 2: starts at 1:30:00 = 6750 frames = 6750 * 44100 / 75 = 3,969,000 samples
+        let TrackSourceRef::ImageSegment { start_sample: s2, .. } = &source.tracks[1].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*s2, 3_969_000);
+        assert_eq!(*samples, 3_969_000); // track 1 length = track 2 start - track 1 start
+
+        // Track 3: starts at 4:13:00 = 18975 frames = 18975 * 44100 / 75 = 11,157,300 samples
+        let TrackSourceRef::ImageSegment { start_sample: s3, samples: s3_len, .. } = &source.tracks[2].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*s3, 11_157_300);
+        assert_eq!(*s3_len, total_samples - 11_157_300);
+
+        // Metadata
+        assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("Speak to Me"));
+        assert_eq!(source.tracks[1].metadata.title.as_deref(), Some("Breathe"));
+        assert_eq!(source.tracks[2].metadata.title.as_deref(), Some("On the Run"));
+        assert_eq!(source.tracks[0].metadata.artist.as_deref(), Some("Pink Floyd"));
+
+        // Album metadata
+        assert_eq!(source.album_metadata.album.as_deref(), Some("The Dark Side of the Moon"));
+        assert_eq!(source.album_metadata.album_artist.as_deref(), Some("Pink Floyd"));
+        assert_eq!(source.album_metadata.genre.as_deref(), Some("Rock"));
+        assert_eq!(source.album_metadata.date.as_deref(), Some("1973"));
+
+        // Sample rate and bit depth propagated
+        assert_eq!(source.tracks[0].sample_rate, 44100);
+        assert_eq!(source.tracks[0].bit_depth, Some(16));
+        assert_eq!(source.tracks[0].expected_samples, Some(3_969_000));
+    }
+
+    #[tokio::test]
+    async fn single_track_cue_spans_entire_image() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let total_samples: u64 = 10_000_000;
+        let probe = ffprobe_json_exact(44100, total_samples, 16);
+        let source = materialize_cue(&cue_sheet_single_track(), &probe, &temp)
+            .await
+            .expect("materialize succeeds");
+
+        assert_eq!(source.tracks.len(), 1);
+        let TrackSourceRef::ImageSegment { start_sample, samples, .. } = &source.tracks[0].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*start_sample, 0);
+        assert_eq!(*samples, total_samples);
+        assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("Only Track"));
+    }
+
+    #[tokio::test]
+    async fn twelve_track_album_has_contiguous_non_overlapping_boundaries() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut cue = String::from("FILE \"album.flac\" WAVE\n");
+        for i in 1..=12 {
+            let mm = (i - 1) * 4;
+            cue.push_str(&format!(
+                "  TRACK {:02} AUDIO\n    TITLE \"Track {}\"\n    INDEX 01 {:02}:00:00\n",
+                i, i, mm
+            ));
+        }
+        // 12 tracks at 4 min each = 48 min. Total = 50 min = 132,300,000 samples at 44100
+        let total_samples: u64 = 132_300_000;
+        let probe = ffprobe_json_exact(44100, total_samples, 16);
+        let source = materialize_cue(&cue, &probe, &temp)
+            .await
+            .expect("materialize succeeds");
+
+        assert_eq!(source.tracks.len(), 12);
+
+        // Verify contiguous, non-overlapping
+        let mut prev_end: u64 = 0;
+        for track in &source.tracks {
+            let TrackSourceRef::ImageSegment { start_sample, samples, .. } = &track.source_ref else {
+                panic!("expected ImageSegment");
+            };
+            assert_eq!(*start_sample, prev_end, "track {} must start where previous ended", track.id.track_number);
+            assert!(*samples > 0, "track {} must have positive length", track.id.track_number);
+            prev_end = start_sample + samples;
+        }
+        assert_eq!(prev_end, total_samples);
+    }
+
+    // ── Category B: malformed CUE ──
+
+    #[tokio::test]
+    async fn empty_cue_sheet_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
+        let result = materialize_cue("", &probe, &temp).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cue_without_index_01_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "No Index"
+"#;
+        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
+        let result = materialize_cue(cue, &probe, &temp).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("INDEX 01"), "error should mention INDEX 01: {err}");
+    }
+
+    #[tokio::test]
+    async fn track_per_file_cue_rejected_as_not_single_image() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = r#"FILE "track1.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+FILE "track2.flac" WAVE
+  TRACK 02 AUDIO
+    INDEX 01 00:00:00
+"#;
+        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
+        let result = materialize_cue(cue, &probe, &temp).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn index_beyond_image_duration_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // Image is only 1,000,000 samples (~22.7 sec at 44100), but track 2 starts at 5:00
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 05:00:00
+"#;
+        let probe = ffprobe_json_exact(44100, 1_000_000, 16);
+        let result = materialize_cue(cue, &probe, &temp).await;
+        assert!(result.is_err());
+    }
+
+    // ── Category C: pregap/INDEX edge cases ──
+
+    #[tokio::test]
+    async fn pregap_index00_preserved_in_metadata_boundary_uses_index01() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track One"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Track Two"
+    INDEX 00 03:43:37
+    INDEX 01 03:45:00
+"#;
+        let total_samples: u64 = 20_000_000;
+        let probe = ffprobe_json_exact(44100, total_samples, 16);
+        let source = materialize_cue(cue, &probe, &temp)
+            .await
+            .expect("materialize succeeds");
+
+        assert_eq!(source.tracks.len(), 2);
+
+        // Track 2 boundary should use INDEX 01 (03:45:00), not INDEX 00 (03:43:37)
+        // INDEX 01 at 03:45:00 = 16875 frames = 16875 * 44100 / 75 = 9,922,500 samples
+        let TrackSourceRef::ImageSegment { start_sample, .. } = &source.tracks[1].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*start_sample, 9_922_500);
+
+        // INDEX 00 should be preserved in extras
+        let extras = &source.tracks[1].metadata.extra;
+        assert!(
+            extras.contains_key("index00_frames"),
+            "INDEX 00 should be preserved in metadata extras"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_1_starting_at_zero_has_start_sample_zero() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
+        let source = materialize_cue(&cue_sheet_single_track(), &probe, &temp)
+            .await
+            .expect("materialize succeeds");
+
+        let TrackSourceRef::ImageSegment { start_sample, .. } = &source.tracks[0].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*start_sample, 0);
+    }
+
+    // ── Category D: Unicode/encoding ──
+
+    #[tokio::test]
+    async fn utf8_bom_stripped_metadata_parsed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = format!(
+            "\u{FEFF}PERFORMER \"Artist\"\nTITLE \"Album\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Track\"\n    INDEX 01 00:00:00\n"
+        );
+        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
+        let source = materialize_cue(&cue, &probe, &temp)
+            .await
+            .expect("materialize succeeds with BOM");
+
+        assert_eq!(source.album_metadata.album_artist.as_deref(), Some("Artist"));
+        assert_eq!(source.album_metadata.album.as_deref(), Some("Album"));
+    }
+
+    #[tokio::test]
+    async fn non_ascii_metadata_preserved() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = "PERFORMER \"Björk\"\nTITLE \"Début\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Human Behaviour\"\n    PERFORMER \"Björk\"\n    INDEX 01 00:00:00\n";
+        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
+        let source = materialize_cue(cue, &probe, &temp)
+            .await
+            .expect("materialize succeeds with non-ASCII");
+
+        assert_eq!(source.album_metadata.album_artist.as_deref(), Some("Björk"));
+        assert_eq!(source.album_metadata.album.as_deref(), Some("Début"));
+        assert_eq!(source.tracks[0].metadata.artist.as_deref(), Some("Björk"));
+    }
+
+    // ── Category E: high sample rates ──
+
+    #[tokio::test]
+    async fn ninety_six_khz_boundary_computation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 01:00:00
+"#;
+        // 96kHz, 10 min = 57,600,000 samples
+        let total_samples: u64 = 57_600_000;
+        let probe = ffprobe_json_exact(96000, total_samples, 24);
+        let source = materialize_cue(cue, &probe, &temp)
+            .await
+            .expect("materialize succeeds at 96kHz");
+
+        // Track 2 at 01:00:00 = 4500 frames = 4500 * 96000 / 75 = 5,760,000 samples
+        let TrackSourceRef::ImageSegment { start_sample, .. } = &source.tracks[1].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*start_sample, 5_760_000);
+        assert_eq!(source.tracks[0].sample_rate, 96000);
+        assert_eq!(source.tracks[0].bit_depth, Some(24));
+    }
+
+    #[tokio::test]
+    async fn one_ninety_two_khz_boundary_computation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 02:00:00
+"#;
+        // 192kHz, 10 min = 115,200,000 samples
+        let total_samples: u64 = 115_200_000;
+        let probe = ffprobe_json_exact(192000, total_samples, 24);
+        let source = materialize_cue(cue, &probe, &temp)
+            .await
+            .expect("materialize succeeds at 192kHz");
+
+        // Track 2 at 02:00:00 = 9000 frames = 9000 * 192000 / 75 = 23,040,000 samples
+        let TrackSourceRef::ImageSegment { start_sample, .. } = &source.tracks[1].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*start_sample, 23_040_000);
+        assert_eq!(source.tracks[0].sample_rate, 192000);
+    }
+
+    // ── Category F: sample-count validation ──
+
+    #[tokio::test]
+    async fn approximate_duration_with_tiny_final_track_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // 2 tracks, second starts at 4:00:00 = 18000 frames = 10,584,000 samples at 44100
+        // Set total duration so final track is < sample_rate/20 = 2205 samples
+        // 10,584,000 + 2000 = 10,586,000. Duration = 10586000/44100 = ~240.045 sec
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 04:00:00
+"#;
+        let probe = ffprobe_json_approx(44100, 240.045);
+        let result = materialize_cue(cue, &probe, &temp).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("coarse"), "error should mention coarse probe: {err}");
+    }
+
+    #[tokio::test]
+    async fn exact_sample_count_allows_small_final_track() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // Same setup as above but with exact sample count — should succeed
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 04:00:00
+"#;
+        // 10,584,000 + 500 = 10,584,500 samples (tiny final track, but exact)
+        let probe = ffprobe_json_exact(44100, 10_584_500, 16);
+        let source = materialize_cue(cue, &probe, &temp)
+            .await
+            .expect("exact sample count allows small final track");
+
+        assert_eq!(source.tracks.len(), 2);
+        let TrackSourceRef::ImageSegment { samples, .. } = &source.tracks[1].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(*samples, 500);
+    }
+
+    // ── Category G: probe failure ──
+
+    #[tokio::test]
+    async fn ffprobe_failure_propagates_as_error() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_path = temp.path().join("album.cue");
+        let audio_path = temp.path().join("album.flac");
+        write_file(&cue_path, cue_sheet_single_track().as_bytes());
+        write_file(&audio_path, b"fake-audio-data");
+
+        let runner = StubToolRunner::new();
+        runner.push_failure("ffprobe: error reading input");
+
+        let mut staging = test_staging(&temp);
+        let cancel = CancellationToken::new();
+        let req = test_request(&cue_path);
+        let result = CueImageMaterializer
+            .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+            .await;
+        staging.disarm();
+
+        assert!(result.is_err());
+    }
+}
