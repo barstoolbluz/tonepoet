@@ -36,6 +36,8 @@ pub struct ExecutedTrackPlan {
     /// commands, or disposition-pruned encoder behavior.
     pub metadata_disposition: MetadataDisposition,
     pub metadata_written_by_plan: bool,
+    /// SHA-256 of the planned command sequence, for manifest rerun identity.
+    pub command_hash: Option<String>,
 }
 
 pub async fn execute_planned_track_conversion(
@@ -63,6 +65,7 @@ pub async fn execute_planned_track_conversion(
     )?;
     let plan = plan_conversion(&plan_request)
         .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
+    let command_hash = super::manifest::planned_command_hash(&plan).ok();
     let metadata_disposition = effective_metadata_disposition(&plan_request)?;
     let metadata_written_by_plan = metadata_disposition.writes_requested_policy();
 
@@ -97,6 +100,7 @@ pub async fn execute_planned_track_conversion(
                 elapsed: started.elapsed(),
                 metadata_disposition,
                 metadata_written_by_plan,
+                command_hash: command_hash.clone(),
             })
         }
         PlanAction::Execute {
@@ -130,6 +134,7 @@ pub async fn execute_planned_track_conversion(
                 elapsed: started.elapsed(),
                 metadata_disposition,
                 metadata_written_by_plan,
+                command_hash,
             })
         }
     };

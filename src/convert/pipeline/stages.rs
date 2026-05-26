@@ -1572,7 +1572,7 @@ async fn convert_one_track_work(
                     duration: Some(executed.elapsed),
                 };
                 let artifact = TrackArtifact {
-                    planned_command_hash: None,
+                    planned_command_hash: executed.command_hash,
                     track_id: track.id.clone(),
                     staged_path,
                     final_path,
@@ -3098,6 +3098,7 @@ pub fn publish_album_output(
     staging: StagingDir,
     plan: &PublishPlan,
     policy: PublishPolicy,
+    manifest: Option<&super::manifest::ConversionManifest>,
 ) -> Result<PublishedAlbum, PublishError> {
     if plan.entries.is_empty() {
         return Err(PublishError::StagingMissing);
@@ -3218,6 +3219,19 @@ pub fn publish_album_output(
         }
     }
 
+    // Write manifest into temp dir before atomic rename — it moves with the album.
+    let manifest_path = if let Some(manifest) = manifest {
+        match super::manifest::write_manifest_for_publish(&temp_dir, &plan.album_dir, manifest) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                log::warn!("manifest write failed (non-fatal): {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if let Err(err) = fs::rename(&temp_dir, &plan.album_dir) {
         let _ = fs::remove_dir_all(&temp_dir);
         if backup_made {
@@ -3246,7 +3260,7 @@ pub fn publish_album_output(
     Ok(PublishedAlbum {
         album_dir: plan.album_dir.clone(),
         entries: published_entries,
-        manifest_path: None,
+        manifest_path,
     })
 }
 
@@ -3675,7 +3689,7 @@ pub async fn encode_realized_track_for_scheduler(
                     final_path: realized.final_path,
                     samples: realized.track.expected_samples,
                     metadata_written_by_plan: executed.metadata_written_by_plan,
-                    planned_command_hash: None,
+                    planned_command_hash: executed.command_hash,
                 };
                 Ok(ScheduledTrackOutput { index: realized.index, record, artifact: Some(artifact), ok: true, metadata_written_by_plan: executed.metadata_written_by_plan })
             }
@@ -3916,12 +3930,26 @@ pub async fn finish_pipeline_album_for_scheduler(
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
 
+    // Build manifest from track artifacts (skip for merged conversions).
+    let conversion_manifest = if !req.merge {
+        match build_manifest_for_album(&req, &source_value, &artifacts, &plan_value) {
+            Ok(manifest) => Some(manifest),
+            Err(err) => {
+                log::warn!("manifest build failed (non-fatal): {err}");
+                None
+            }
+        }
+    } else {
+        // TODO: manifest for merged conversions (see project_manifest_merge_gap.md)
+        None
+    };
+
     emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
     match artifacts
         .as_ref()
         .ok_or(PublishError::StagingMissing)
         .and_then(|artifact_set| build_publish_plan(artifact_set, &req))
-        .and_then(|publish_plan| publish_album_output(staging, &publish_plan, req.publish.clone()))
+        .and_then(|publish_plan| publish_album_output(staging, &publish_plan, req.publish.clone(), conversion_manifest.as_ref()))
     {
         Ok(album) => {
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
@@ -4419,7 +4447,7 @@ pub async fn run_pipeline_item_with_tool_paths(
         .as_ref()
         .ok_or(PublishError::StagingMissing)
         .and_then(|artifact_set| build_publish_plan(artifact_set, &req))
-        .and_then(|publish_plan| publish_album_output(staging, &publish_plan, req.publish.clone()))
+        .and_then(|publish_plan| publish_album_output(staging, &publish_plan, req.publish.clone(), None))
     {
         Ok(album) => {
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
@@ -5754,6 +5782,66 @@ fn staging_parent_for(req: &PipelineRequest) -> PathBuf {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     parent.join(STAGING_PARENT_NAME)
+}
+
+/// Build a conversion manifest from track artifacts and source metadata.
+/// Returns None-equivalent error for merged conversions (not yet supported).
+fn build_manifest_for_album(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    artifacts: &Option<ArtifactSet>,
+    album_plan: &AlbumPlan,
+) -> Result<super::manifest::ConversionManifest, String> {
+    use super::manifest::{TrackIdentity, ValidationStatus};
+    use super::manifest_builder::{build_conversion_manifest, ManifestBuildInput, ManifestTrackBuildInput};
+
+    let artifact_set = artifacts.as_ref().ok_or("no artifacts available for manifest")?;
+    let track_artifacts = match &artifact_set.audio {
+        AudioArtifacts::Tracks(tracks) => tracks,
+        AudioArtifacts::Merged(_) => return Err("manifest for merged output not yet supported".into()),
+    };
+
+    let mut track_inputs = Vec::with_capacity(track_artifacts.len());
+    for artifact in track_artifacts {
+        let source_path = source
+            .tracks
+            .iter()
+            .find(|t| t.id == artifact.track_id)
+            .map(|t| match &t.source_ref {
+                TrackSourceRef::StagedFile(p) => p.clone(),
+                TrackSourceRef::ImageSegment { image, .. } => image.clone(),
+                TrackSourceRef::SacdTrack { iso, .. } => iso.clone(),
+            })
+            .unwrap_or_else(|| req.container.clone());
+
+        let album_relative = artifact
+            .final_path
+            .strip_prefix(&album_plan.album_dir)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| artifact.final_path.file_name().unwrap_or_default().into());
+
+        track_inputs.push(ManifestTrackBuildInput {
+            source_path,
+            source_audio_md5: None,
+            track_identity: TrackIdentity {
+                source_ordinal: artifact.track_id.source_ordinal as usize,
+                disc_number: artifact.track_id.disc_number,
+                track_number: Some(artifact.track_id.track_number),
+            },
+            planned_command_hash: artifact.planned_command_hash.clone().unwrap_or_default(),
+            album_relative_output_path: album_relative,
+            staged_output_path: artifact.staged_path.clone(),
+            validation_status: ValidationStatus::Passed,
+            record_output_hash: req.settings.verification.verify_after_encode,
+        });
+    }
+
+    build_conversion_manifest(ManifestBuildInput {
+        album_dir: album_plan.album_dir.clone(),
+        settings: req.settings.clone(),
+        tracks: track_inputs,
+    })
+    .map_err(|err| format!("manifest build: {err}"))
 }
 
 fn audio_artifact_count(artifacts: &ArtifactSet) -> usize {
@@ -7652,7 +7740,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             }],
         };
 
-        let published = publish_album_output(retry_staging, &retry_plan, publish)
+        let published = publish_album_output(retry_staging, &retry_plan, publish, None)
             .expect("normal publish repairs marker then publishes retry output");
 
         assert!(!marker_path.exists());
@@ -7695,7 +7783,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         };
         let publish = fixture.album.req.publish.clone();
         let staging = fixture.album.staging;
-        let published = publish_album_output(staging, &plan, publish)
+        let published = publish_album_output(staging, &plan, publish, None)
             .expect("publish repairs marker then publishes");
 
         assert!(!marker_path.exists());
