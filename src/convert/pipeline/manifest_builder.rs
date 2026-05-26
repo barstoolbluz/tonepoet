@@ -23,12 +23,36 @@ pub struct ManifestTrackBuildInput {
     pub source_path: PathBuf,
     pub source_audio_md5: Option<String>,
     pub track_identity: TrackIdentity,
-    /// Pre-computed hash of the planned command sequence (from TrackArtifact).
+    /// Pre-computed hash of the planned command sequence. Per-track entries
+    /// receive the track plan hash; merged entries receive the merge sequence
+    /// hash.
     pub planned_command_hash: String,
     pub album_relative_output_path: PathBuf,
     pub staged_output_path: PathBuf,
     pub validation_status: ValidationStatus,
     pub record_output_hash: bool,
+}
+
+impl ManifestTrackBuildInput {
+    pub fn merged_output(
+        source_path: PathBuf,
+        planned_command_hash: String,
+        album_relative_output_path: PathBuf,
+        staged_output_path: PathBuf,
+        validation_status: ValidationStatus,
+        record_output_hash: bool,
+    ) -> Self {
+        Self {
+            source_path,
+            source_audio_md5: None,
+            track_identity: TrackIdentity::merged_output(),
+            planned_command_hash,
+            album_relative_output_path,
+            staged_output_path,
+            validation_status,
+            record_output_hash,
+        }
+    }
 }
 
 pub fn build_conversion_manifest(input: ManifestBuildInput) -> Result<ConversionManifest, ManifestError> {
@@ -78,4 +102,59 @@ pub fn build_manifest_track(
         output_hash,
         input.validation_status,
     )
+}
+
+
+#[cfg(test)]
+mod manifest_merge_gap_tests {
+    use super::*;
+    use crate::convert::pipeline::manifest::{file_sha256, read_manifest, write_manifest};
+    use std::path::Path;
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent dir");
+        }
+        std::fs::write(path, bytes).expect("write file");
+    }
+
+    #[test]
+    fn merged_manifest_build_write_read_round_trips_single_manifest_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("album.cue");
+        let staged = temp.path().join("staging").join("merged.flac");
+        let output_rel = PathBuf::from("merged.flac");
+        let settings = PipelineSettings::default();
+        write_file(&source, b"FILE album.wav WAVE\n");
+        write_file(&staged, b"merged audio bytes");
+
+        let manifest = build_conversion_manifest(ManifestBuildInput {
+            album_dir: album_dir.clone(),
+            settings,
+            tracks: vec![ManifestTrackBuildInput::merged_output(
+                source.clone(),
+                "merge-sequence-hash".to_string(),
+                output_rel.clone(),
+                staged.clone(),
+                ValidationStatus::Passed,
+                true,
+            )],
+        })
+        .expect("build merged manifest");
+        write_manifest(&album_dir, &manifest).expect("write manifest");
+
+        let read = read_manifest(&album_dir)
+            .expect("read manifest")
+            .expect("manifest present");
+        let [entry] = read.tracks.as_slice() else { panic!("one merged output entry") };
+
+        assert_eq!(read.total_tracks, 1);
+        assert!(entry.track_identity.is_merged_output());
+        assert_eq!(entry.source_path, source);
+        assert_eq!(entry.output_path, output_rel);
+        assert_eq!(entry.output_size, 18);
+        assert_eq!(entry.output_hash, Some(file_sha256(&staged).expect("staged sha256")));
+        assert_eq!(entry.planned_command_hash, "merge-sequence-hash");
+    }
 }

@@ -326,6 +326,10 @@ pub struct MergedArtifact {
     pub final_path: PathBuf,
     pub total_samples: u64,
     pub source_tracks: Vec<TrackId>,
+    /// SHA-256 of the planned merge command sequence. Single-track merge
+    /// shortcuts reuse the wrapped track artifact hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_command_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

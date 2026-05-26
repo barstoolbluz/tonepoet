@@ -1736,6 +1736,7 @@ pub async fn merge_tracks(
             final_path: t.final_path.clone(),
             total_samples: t.samples.unwrap_or(0),
             source_tracks: vec![t.track_id.clone()],
+            planned_command_hash: t.planned_command_hash.clone(),
         };
         return Ok((
             ArtifactSet {
@@ -1855,11 +1856,41 @@ pub async fn merge_tracks(
 
     let source_tracks: Vec<TrackId> = track_artifacts.iter().map(|t| t.track_id.clone()).collect();
 
+    // Compute a stable hash of the merge command plan for manifest rerun identity.
+    // Source track identities, per-track planned hashes, and target format capture
+    // the merge identity. The concat list content is excluded because it contains
+    // volatile staging paths that change on every run.
+    let merge_command_hash = {
+        #[derive(serde::Serialize)]
+        struct MergeCommandSignature<'a> {
+            schema_version: u32,
+            mode: &'static str,
+            source_tracks: &'a [TrackId],
+            source_command_hashes: Vec<Option<String>>,
+            target_format: &'a tonepoet_pipeline::AudioFormat,
+        }
+        let source_hashes: Vec<Option<String>> = track_artifacts
+            .iter()
+            .map(|t| t.planned_command_hash.clone())
+            .collect();
+        let sig = MergeCommandSignature {
+            schema_version: 1,
+            mode: "ffmpeg-concat-demuxer",
+            source_tracks: &source_tracks,
+            source_command_hashes: source_hashes,
+            target_format: &req.settings.target_format,
+        };
+        serde_json::to_vec(&sig)
+            .map(|bytes| super::manifest::sha256_hex(&bytes))
+            .ok()
+    };
+
     let merged = MergedArtifact {
         staged_path: merged_staged,
         final_path: merged_final,
         total_samples: actual_samples,
         source_tracks,
+        planned_command_hash: merge_command_hash,
     };
 
     Ok((
@@ -3219,10 +3250,12 @@ pub fn publish_album_output(
         }
     }
 
-    // Write manifest into temp dir before atomic rename — it moves with the album.
+    // Write manifest into the temp dir before atomic rename; expose the final
+    // post-publish path in PublishedAlbum so PipelineReport cannot contain a
+    // stale temp-directory manifest path.
     let manifest_path = if let Some(manifest) = manifest {
         match super::manifest::write_manifest_for_publish(&temp_dir, &plan.album_dir, manifest) {
-            Ok(path) => Some(path),
+            Ok(_written_manifest_path) => Some(super::manifest::manifest_path(&plan.album_dir)),
             Err(err) => {
                 log::warn!("manifest write failed (non-fatal): {err}");
                 None
@@ -3930,18 +3963,14 @@ pub async fn finish_pipeline_album_for_scheduler(
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
 
-    // Build manifest from track artifacts (skip for merged conversions).
-    let conversion_manifest = if !req.merge {
-        match build_manifest_for_album(&req, &source_value, &artifacts, &plan_value) {
-            Ok(manifest) => Some(manifest),
-            Err(err) => {
-                log::warn!("manifest build failed (non-fatal): {err}");
-                None
-            }
+    // Build manifest from audio artifacts. Merged conversions are represented
+    // as one manifest entry whose track identity has `track_number: None`.
+    let conversion_manifest = match build_manifest_for_album(&req, &source_value, &artifacts, &plan_value) {
+        Ok(manifest) => Some(manifest),
+        Err(err) => {
+            log::warn!("manifest build failed (non-fatal): {err}");
+            None
         }
-    } else {
-        // TODO: manifest for merged conversions (see project_manifest_merge_gap.md)
-        None
     };
 
     emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
@@ -4494,6 +4523,12 @@ pub async fn run_pipeline_item_with_tool_paths(
     .await
 }
 
+fn pipeline_report_manifest_path(published: &Option<PublishedAlbum>) -> Option<std::path::PathBuf> {
+    published
+        .as_ref()
+        .and_then(|album| album.manifest_path.clone())
+}
+
 async fn finalize_report(
     req: &PipelineRequest,
     reporter: &dyn PipelineReporter,
@@ -4526,7 +4561,7 @@ async fn finalize_report(
             outcome: logged_outcome.clone(),
             durable_log: None,
             settings_fingerprint: None,
-            manifest_path: None,
+            manifest_path: pipeline_report_manifest_path(&published),
         };
         // Write the log alongside the album artifacts when possible,
         // fall back to the configured log root for blocked/failed jobs.
@@ -4583,11 +4618,11 @@ async fn finalize_report(
         source,
         plan,
         artifacts,
+        manifest_path: pipeline_report_manifest_path(&published),
         published,
         outcome,
         durable_log,
         settings_fingerprint: None,
-        manifest_path: None,
     }
 }
 
@@ -5784,8 +5819,8 @@ fn staging_parent_for(req: &PipelineRequest) -> PathBuf {
     parent.join(STAGING_PARENT_NAME)
 }
 
-/// Build a conversion manifest from track artifacts and source metadata.
-/// Returns None-equivalent error for merged conversions (not yet supported).
+/// Build a conversion manifest from audio artifacts and source metadata.
+/// Handles both per-track and merged artifact sets.
 fn build_manifest_for_album(
     req: &PipelineRequest,
     source: &PreparedSource,
@@ -5796,45 +5831,64 @@ fn build_manifest_for_album(
     use super::manifest_builder::{build_conversion_manifest, ManifestBuildInput, ManifestTrackBuildInput};
 
     let artifact_set = artifacts.as_ref().ok_or("no artifacts available for manifest")?;
-    let track_artifacts = match &artifact_set.audio {
-        AudioArtifacts::Tracks(tracks) => tracks,
-        AudioArtifacts::Merged(_) => return Err("manifest for merged output not yet supported".into()),
+    let album_relative = |final_path: &std::path::Path| -> Result<std::path::PathBuf, String> {
+        super::manifest::album_relative_output_path(&album_plan.album_dir, final_path).map_err(|err| {
+            format!(
+                "manifest output path must be inside album dir {}: {} ({err})",
+                album_plan.album_dir.display(),
+                final_path.display(),
+            )
+        })
     };
 
-    let mut track_inputs = Vec::with_capacity(track_artifacts.len());
-    for artifact in track_artifacts {
-        let source_path = source
-            .tracks
-            .iter()
-            .find(|t| t.id == artifact.track_id)
-            .map(|t| match &t.source_ref {
-                TrackSourceRef::StagedFile(p) => p.clone(),
-                TrackSourceRef::ImageSegment { image, .. } => image.clone(),
-                TrackSourceRef::SacdTrack { iso, .. } => iso.clone(),
-            })
-            .unwrap_or_else(|| req.container.clone());
+    let track_inputs = match &artifact_set.audio {
+        AudioArtifacts::Tracks(track_artifacts) => {
+            let mut inputs = Vec::with_capacity(track_artifacts.len());
+            for artifact in track_artifacts {
+                let source_path = source
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == artifact.track_id)
+                    .map(|t| match &t.source_ref {
+                        TrackSourceRef::StagedFile(p) => p.clone(),
+                        TrackSourceRef::ImageSegment { image, .. } => image.clone(),
+                        TrackSourceRef::SacdTrack { iso, .. } => iso.clone(),
+                    })
+                    .unwrap_or_else(|| req.container.clone());
 
-        let album_relative = artifact
-            .final_path
-            .strip_prefix(&album_plan.album_dir)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| artifact.final_path.file_name().unwrap_or_default().into());
+                inputs.push(ManifestTrackBuildInput {
+                    source_path,
+                    source_audio_md5: None,
+                    track_identity: TrackIdentity {
+                        source_ordinal: artifact.track_id.source_ordinal as usize,
+                        disc_number: artifact.track_id.disc_number,
+                        track_number: Some(artifact.track_id.track_number),
+                    },
+                    planned_command_hash: artifact.planned_command_hash.clone().unwrap_or_default(),
+                    album_relative_output_path: album_relative(&artifact.final_path)?,
+                    staged_output_path: artifact.staged_path.clone(),
+                    validation_status: ValidationStatus::Passed,
+                    record_output_hash: req.settings.verification.verify_after_encode,
+                });
+            }
+            inputs
+        }
+        AudioArtifacts::Merged(merged) => {
+            let planned_command_hash = merged
+                .planned_command_hash
+                .clone()
+                .ok_or_else(|| "merged artifact missing planned_command_hash".to_string())?;
 
-        track_inputs.push(ManifestTrackBuildInput {
-            source_path,
-            source_audio_md5: None,
-            track_identity: TrackIdentity {
-                source_ordinal: artifact.track_id.source_ordinal as usize,
-                disc_number: artifact.track_id.disc_number,
-                track_number: Some(artifact.track_id.track_number),
-            },
-            planned_command_hash: artifact.planned_command_hash.clone().unwrap_or_default(),
-            album_relative_output_path: album_relative,
-            staged_output_path: artifact.staged_path.clone(),
-            validation_status: ValidationStatus::Passed,
-            record_output_hash: req.settings.verification.verify_after_encode,
-        });
-    }
+            vec![ManifestTrackBuildInput::merged_output(
+                req.container.clone(),
+                planned_command_hash,
+                album_relative(&merged.final_path)?,
+                merged.staged_path.clone(),
+                ValidationStatus::Passed,
+                req.settings.verification.verify_after_encode,
+            )]
+        }
+    };
 
     build_conversion_manifest(ManifestBuildInput {
         album_dir: album_plan.album_dir.clone(),

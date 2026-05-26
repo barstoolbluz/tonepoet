@@ -426,6 +426,61 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
         )
     }
 
+    fn manifest_for_merged_output(
+        album_dir: &Path,
+        settings: &PipelineSettings,
+        source_path: &Path,
+        output_rel: &Path,
+        output_size: u64,
+    ) -> ConversionManifest {
+        let source_metadata = std::fs::metadata(source_path).expect("source metadata");
+        ConversionManifest::new(
+            album_dir.to_path_buf(),
+            settings.clone(),
+            vec![ConversionManifestTrack {
+                source_path: source_path.to_path_buf(),
+                source_size: source_metadata.len(),
+                source_mtime_secs: metadata_mtime_secs(&source_metadata).expect("source mtime"),
+                source_audio_md5: None,
+                track_identity: TrackIdentity::merged_output(),
+                settings_fingerprint: settings_fingerprint(settings),
+                planner_version: "test".to_string(),
+                planned_command_hash: "merge-plan-hash".to_string(),
+                output_path: output_rel.to_path_buf(),
+                output_size,
+                output_hash: None,
+                validation_status: ValidationStatus::Passed,
+                publish_timestamp: Utc::now(),
+            }],
+        )
+    }
+
+    fn alter_manifest_fingerprint_json(value: &mut serde_json::Value) {
+        fn alter_value(value: &mut serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::String(s) => {
+                    s.push_str("-changed");
+                    true
+                }
+                serde_json::Value::Number(n) => {
+                    // Flip the number to produce a different fingerprint
+                    *value = serde_json::Value::Number(
+                        serde_json::Number::from(n.as_u64().unwrap_or(0).wrapping_add(1)),
+                    );
+                    true
+                }
+                serde_json::Value::Object(map) => map.values_mut().any(alter_value),
+                serde_json::Value::Array(values) => values.iter_mut().any(alter_value),
+                _ => false,
+            }
+        }
+
+        let fingerprint = value
+            .get_mut("settings_fingerprint")
+            .expect("settings fingerprint field");
+        assert!(alter_value(fingerprint), "fingerprint JSON must contain a mutable component");
+    }
+
     #[test]
     fn successful_manifest_match_skips_when_policy_requests_skip() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -455,6 +510,74 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
         );
 
         assert!(matches!(decision, RerunDecision::Skip { .. }));
+    }
+
+    #[test]
+    fn merged_manifest_match_skips_when_policy_requests_skip() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("album.cue");
+        let output_rel = PathBuf::from("merged.flac");
+        let output = album_dir.join(&output_rel);
+        let settings = PipelineSettings::default();
+        write_file(&source, b"FILE album.wav WAVE\n");
+        write_file(&output, b"merged audio");
+        let manifest = manifest_for_merged_output(
+            &album_dir,
+            &settings,
+            &source,
+            &output_rel,
+            12,
+        );
+        write_manifest(&album_dir, &manifest).expect("write manifest");
+
+        let decision = decide_rerun(
+            &album_dir,
+            &settings,
+            OverwritePolicy::SkipIfManifestMatch,
+        );
+
+        assert!(matches!(decision, RerunDecision::Skip { .. }));
+    }
+
+    #[test]
+    fn merged_manifest_fingerprint_mismatch_redoes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("album.cue");
+        let output_rel = PathBuf::from("merged.flac");
+        let output = album_dir.join(&output_rel);
+        let settings = PipelineSettings::default();
+        write_file(&source, b"FILE album.wav WAVE\n");
+        write_file(&output, b"merged audio");
+        let manifest = manifest_for_merged_output(
+            &album_dir,
+            &settings,
+            &source,
+            &output_rel,
+            12,
+        );
+        let mut value = serde_json::to_value(&manifest).expect("manifest value");
+        alter_manifest_fingerprint_json(&mut value);
+        write_file(
+            &manifest_path(&album_dir),
+            &serde_json::to_vec_pretty(&value).expect("manifest json"),
+        );
+
+        let decision = decide_rerun(
+            &album_dir,
+            &settings,
+            OverwritePolicy::SkipIfManifestMatch,
+        );
+
+        assert!(matches!(
+            decision,
+            RerunDecision::Redo {
+                reason: RerunReason::ManifestFingerprintMismatch { .. },
+                publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+                ..
+            }
+        ));
     }
 
     #[test]

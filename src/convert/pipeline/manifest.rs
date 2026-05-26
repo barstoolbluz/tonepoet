@@ -101,6 +101,25 @@ pub struct TrackIdentity {
     pub track_number: Option<u32>,
 }
 
+impl TrackIdentity {
+    /// Identity marker for one output file produced from a merged source set.
+    ///
+    /// Existing manifest schema already permits `track_number: None`, so merged
+    /// albums can use a single `ConversionManifestTrack` without changing
+    /// `MANIFEST_VERSION` or teaching rerun code a second output collection.
+    pub fn merged_output() -> Self {
+        Self {
+            source_ordinal: 0,
+            disc_number: None,
+            track_number: None,
+        }
+    }
+
+    pub fn is_merged_output(&self) -> bool {
+        self.source_ordinal == 0 && self.disc_number.is_none() && self.track_number.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidationStatus {
     Passed,
@@ -260,9 +279,15 @@ pub fn write_manifest_for_publish(
     manifest: &ConversionManifest,
 ) -> Result<PathBuf, ManifestError> {
     validate_manifest_for_publish(final_album_dir, manifest)?;
-    let path = manifest_path(temp_album_dir);
-    write_manifest_file_unchecked(&path, manifest)?;
-    Ok(path)
+
+    let staged_path = manifest_path(temp_album_dir);
+    write_manifest_file_unchecked(&staged_path, manifest)?;
+
+    // The file is written under the temporary album directory so it moves with
+    // the atomic album rename, but callers need the durable post-publish path.
+    // Returning the final path prevents PipelineReport from exposing a stale
+    // temp-directory manifest path after publish succeeds.
+    Ok(manifest_path(final_album_dir))
 }
 
 fn write_manifest_file_unchecked(path: &Path, manifest: &ConversionManifest) -> Result<(), ManifestError> {
@@ -463,5 +488,154 @@ fn sync_parent_dir_best_effort(path: &Path) {
     };
     if let Ok(dir) = File::open(parent) {
         let _ = dir.sync_all();
+    }
+}
+
+
+#[cfg(test)]
+mod manifest_merge_gap_tests {
+    use super::*;
+    use tonepoet_pipeline::fingerprint::settings_fingerprint;
+
+    #[test]
+    fn merged_identity_marks_one_manifest_entry_for_merged_output() {
+        let identity = TrackIdentity::merged_output();
+
+        assert!(identity.is_merged_output());
+        assert_eq!(identity.source_ordinal, 0);
+        assert_eq!(identity.disc_number, None);
+        assert_eq!(identity.track_number, None);
+    }
+
+
+
+    #[test]
+    fn album_relative_output_path_rejects_paths_outside_album_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let outside_output = temp.path().join("OtherAlbum").join("01.flac");
+
+        let err = album_relative_output_path(&album_dir, &outside_output)
+            .expect_err("outside output path must be rejected");
+
+        assert!(matches!(err, ManifestError::OutputPathEscapesAlbum { .. }));
+    }
+
+    #[test]
+    fn album_relative_output_path_returns_valid_relative_path_for_album_child() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let output = album_dir.join("disc1").join("01.flac");
+
+        let relative = album_relative_output_path(&album_dir, &output)
+            .expect("inside-album output path");
+
+        assert_eq!(relative, PathBuf::from("disc1").join("01.flac"));
+    }
+
+    #[test]
+    fn write_manifest_for_publish_writes_temp_manifest_but_returns_final_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let temp_album_dir = temp.path().join("Album.tmp");
+        let final_album_dir = temp.path().join("Album");
+        fs::create_dir_all(&temp_album_dir).expect("create temp album dir");
+
+        let source = temp.path().join("source.flac");
+        fs::write(&source, b"source-audio").expect("write source");
+        let source_metadata = fs::metadata(&source).expect("source metadata");
+
+        let settings = PipelineSettings::default();
+        let fingerprint = settings_fingerprint(&settings);
+        let track = ConversionManifestTrack::new(
+            source,
+            &source_metadata,
+            None,
+            TrackIdentity {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: Some(1),
+            },
+            fingerprint,
+            "test-planner".to_string(),
+            "test-command-hash".to_string(),
+            PathBuf::from("01.flac"),
+            12,
+            None,
+            ValidationStatus::Passed,
+        )
+        .expect("manifest track");
+        let manifest = ConversionManifest::new(final_album_dir.clone(), settings, vec![track]);
+
+        let returned_path = write_manifest_for_publish(&temp_album_dir, &final_album_dir, &manifest)
+            .expect("write manifest for publish");
+
+        assert_eq!(returned_path, manifest_path(&final_album_dir));
+        assert!(manifest_path(&temp_album_dir).exists());
+        assert!(!returned_path.exists());
+    }
+
+    #[test]
+    fn pre_change_v1_per_track_fixture_deserializes_without_new_manifest_fields() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("source.flac");
+        let settings = PipelineSettings::default();
+        let settings_fingerprint = settings_fingerprint(&settings);
+
+        // This fixture intentionally models the pre-change v1 manifest envelope
+        // directly rather than serializing `ConversionManifest` with current code.
+        // It includes only fields that existed in the v1 per-track schema.
+        let fixture = format!(
+            r#"{{
+  "manifest_version": 1,
+  "album_dir": {album_dir_json},
+  "total_tracks": 1,
+  "settings": {settings_json},
+  "settings_fingerprint": {settings_fingerprint_json},
+  "tracks": [
+    {{
+      "source_path": {source_path_json},
+      "source_size": 12,
+      "source_mtime_secs": 1710000000,
+      "source_audio_md5": null,
+      "track_identity": {{
+        "source_ordinal": 1,
+        "disc_number": null,
+        "track_number": 1
+      }},
+      "settings_fingerprint": {settings_fingerprint_json},
+      "planner_version": "pre-change-test-planner",
+      "planned_command_hash": "pre-change-planned-command-hash",
+      "output_path": "01.flac",
+      "output_size": 13,
+      "output_hash": null,
+      "validation_status": "Passed",
+      "publish_timestamp": "2026-05-26T00:00:00Z"
+    }}
+  ]
+}}"#,
+            album_dir_json = serde_json::to_string(&album_dir).expect("album dir json"),
+            source_path_json = serde_json::to_string(&source).expect("source path json"),
+            settings_json = serde_json::to_string(&settings).expect("settings json"),
+            settings_fingerprint_json = serde_json::to_string(&settings_fingerprint).expect("fingerprint json"),
+        );
+
+        let fixture_value: serde_json::Value = serde_json::from_str(&fixture).expect("fixture JSON");
+        assert!(fixture_value.get("merged_output").is_none());
+        assert!(fixture_value["tracks"][0].get("merged_output").is_none());
+
+        let parsed: ConversionManifest = serde_json::from_str(&fixture).expect("deserialize pre-change v1 manifest");
+
+        validate_manifest(&album_dir, &parsed).expect("validate manifest");
+        assert_eq!(parsed.manifest_version, MANIFEST_VERSION);
+        assert_eq!(parsed.total_tracks, 1);
+        assert_eq!(parsed.tracks.len(), 1);
+        assert_eq!(parsed.settings_fingerprint, settings_fingerprint);
+        assert_eq!(parsed.tracks[0].track_identity.source_ordinal, 1);
+        assert_eq!(parsed.tracks[0].track_identity.disc_number, None);
+        assert_eq!(parsed.tracks[0].track_identity.track_number, Some(1));
+        assert!(!parsed.tracks[0].track_identity.is_merged_output());
+        assert_eq!(parsed.tracks[0].output_path, PathBuf::from("01.flac"));
+        assert_eq!(parsed.tracks[0].planned_command_hash, "pre-change-planned-command-hash");
     }
 }
