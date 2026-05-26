@@ -169,6 +169,7 @@ pub fn build_pipeline_request_from_legacy_options(
 
 /// Build PipelineSettings from legacy ConversionOptions fields.
 /// Used as a fallback when pipeline_settings is None (CLI path).
+// settings-sentinel-allow: legacy bridge constructs default then overrides from ConversionOptions
 pub fn pipeline_settings_from_legacy_options(options: &crate::convert::formats::ConversionOptions) -> PipelineSettings {
     use tonepoet_pipeline::enums as pe;
     let mut settings = PipelineSettings::default();
@@ -223,6 +224,7 @@ pub fn pipeline_settings_from_legacy_options(options: &crate::convert::formats::
     settings
 }
 
+// settings-sentinel-allow: legacy bridge constructs default then overrides from ConversionItem
 fn legacy_pipeline_settings_for_item(item: &ConversionItem) -> ConversionResult<PipelineSettings> {
     let mut settings = PipelineSettings::default();
     settings.target_format = main_audio_format_to_planner(item.output_format);

@@ -228,6 +228,10 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         }
     };
 
+    // settings-sentinel-allow: sub-struct defaults are correct here — user-facing
+    // settings (format, rate, depth, dither, resampler, RG) are set from pill state;
+    // codec-specific sub-structs (flac, mp3, aac, etc.) use defaults until the TUI
+    // exposes those settings.
     let mut dsd: tonepoet_pipeline::DsdSettings = Default::default();
     if is_dsd {
         dsd.noise_shaper = *format.noise_shaper.selected_value();
@@ -244,15 +248,19 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         dither_type,
         preferred_tool,
         force_encode: false,
+        // settings-sentinel-allow: codec sub-struct defaults until TUI exposes them
         flac: Default::default(),
         mp3: Default::default(),
         aac: Default::default(),
         opus: Default::default(),
+        // settings-sentinel-allow: remaining sub-struct defaults
         wavpack: Default::default(),
         ssrc: Default::default(),
         dsd,
+        // settings-sentinel-allow: metadata/verification defaults until TUI exposes them
         metadata: Default::default(),
         verification: Default::default(),
+        // settings-sentinel-allow: replay_gain.mode set from pill state below
         replay_gain: {
             let mut replay_gain: tonepoet_pipeline::ReplayGainSettings = Default::default();
             replay_gain.mode = replay_gain_mode;

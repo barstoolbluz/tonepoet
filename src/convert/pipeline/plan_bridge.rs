@@ -41,6 +41,7 @@ pub fn plan_request_for_track(
         .validate()
         .map_err(|err| ConvertError::Backend(format!("invalid pipeline settings: {err}")))?;
 
+    // settings-sentinel-allow: settings originates from request.settings.clone() (line 26)
     Ok(PlanRequest {
         input_path: realized_input.to_path_buf(),
         output_path: staged_output.to_path_buf(),
