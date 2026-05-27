@@ -902,3 +902,100 @@ pub(crate) mod blocking_test_runner {
         }
     }
 }
+
+#[cfg(test)]
+mod real_tool_runner_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn runner_with_override(binary: ToolBinary, program: &str) -> RealToolRunner {
+        let mut paths = HashMap::new();
+        paths.insert(binary.canonical_name().to_string(), PathBuf::from(program));
+        RealToolRunner::new(paths)
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_hung_process() {
+        let runner = runner_with_override(ToolBinary::Ffmpeg, "sleep");
+        let cancel = CancellationToken::new();
+        let cmd = ToolCommand {
+            binary: ToolBinary::Ffmpeg,
+            args: vec!["999".to_string()],
+            secret_args: vec![],
+            cwd: None,
+            env: vec![],
+            timeout: Duration::from_millis(100),
+        };
+
+        let start = std::time::Instant::now();
+        let result = runner.run(cmd, &cancel).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(ToolRunnerError::Timeout { .. })),
+            "expected Timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timeout should kill quickly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_running_process() {
+        let runner = runner_with_override(ToolBinary::Ffmpeg, "sleep");
+        let cancel = CancellationToken::new();
+        let cmd = ToolCommand {
+            binary: ToolBinary::Ffmpeg,
+            args: vec!["999".to_string()],
+            secret_args: vec![],
+            cwd: None,
+            env: vec![],
+            timeout: Duration::from_secs(60),
+        };
+
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_clone.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = runner.run(cmd, &cancel).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(ToolRunnerError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancellation should kill quickly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_completion_within_timeout() {
+        let runner = runner_with_override(ToolBinary::Ffmpeg, "echo");
+        let cancel = CancellationToken::new();
+        let cmd = ToolCommand {
+            binary: ToolBinary::Ffmpeg,
+            args: vec!["hello".to_string()],
+            secret_args: vec![],
+            cwd: None,
+            env: vec![],
+            timeout: Duration::from_secs(5),
+        };
+
+        let result = runner.run(cmd, &cancel).await;
+        let output = result.expect("echo should succeed");
+
+        assert_eq!(output.exit, ProcessExit::Code(0));
+        assert!(
+            output.stdout_tail.contains("hello"),
+            "stdout should contain 'hello', got: {}",
+            output.stdout_tail
+        );
+    }
+}
