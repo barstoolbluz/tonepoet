@@ -862,11 +862,16 @@ impl FormatState {
             return;
         };
 
+        // DSD is 1-bit but its effective dynamic range is ~20-24 bits.
+        // Treat DSD sources as 24-bit for the dither reduction comparison
+        // so that DSD→16bit correctly triggers Shibata dither.
+        let effective_source_bits = if source_bits == 1 { 24 } else { source_bits };
+
         let target = *self.bit_depth.selected_value();
         let target_bits = target.bits();
-        let desired = if source_bits > target_bits && target_bits <= 16 {
+        let desired = if effective_source_bits > target_bits && target_bits <= 16 {
             DitherType::Shibata
-        } else if source_bits > target_bits && target_bits == 24 {
+        } else if effective_source_bits > target_bits && target_bits == 24 {
             DitherType::TPDF
         } else {
             DitherType::None
