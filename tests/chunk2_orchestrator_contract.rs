@@ -9,7 +9,7 @@
 fn single_files_enter_the_shared_pool_as_immediate_work_units() {
     let processor = include_str!("../src/convert/processor.rs");
     assert!(processor.contains("WorkKind::SingleFile"));
-    assert!(processor.contains("build_single_file_work(request"));
+    assert!(processor.contains("build_single_file_work("));
     assert!(processor.contains("run_pipeline_item_with_tool_paths"));
     assert!(processor.contains("run_single_item_with_shared_scheduler"));
     assert!(processor.contains("run_queue_with_shared_orchestrator("));

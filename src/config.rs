@@ -72,11 +72,19 @@ pub struct ConversionSettings {
     pub append_lineage_to_comment: bool,
 }
 
+fn default_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .saturating_div(2)
+        .max(1)
+}
+
 impl Default for ConversionSettings {
     fn default() -> Self {
         Self {
             preferred_backend: "ffmpeg".to_string(),
-            worker_count: num_cpus::get().saturating_sub(1).max(1),
+            worker_count: default_worker_count(),
             process_priority: 0,
             calculate_replaygain: true,
             generate_cue_files: false,

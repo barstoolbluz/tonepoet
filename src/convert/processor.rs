@@ -18,13 +18,18 @@ use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::PipelineSettings;
 
 use crate::convert::pipeline::{
-    boxed_work, build_pipeline_request, build_pipeline_request_from_settings, detect_source_kind, encode_realized_track_for_scheduler,
-    encode_track_for_scheduler, finish_pipeline_album_for_scheduler, map_album_outcome,
-    prepare_pipeline_item_for_scheduler, realize_track_for_scheduler, run_pipeline_item_with_tool_paths, scheduled_worker_failure_output, AlbumCompletionTracker,
-    AlbumReadiness, BroadcastReporter, PipelineRequest, PoolLimits, RealToolRunner, ScheduledAlbum,
-    ScheduledMaterialization, ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics,
-    SchedulerMetricsSnapshot, SharedWorkerPool,
-    SourceKind, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
+    boxed_work, build_pipeline_request, build_pipeline_request_from_settings, detect_source_kind,
+    encode_realized_track_for_scheduler_with_tool_limits, encode_track_for_scheduler_with_tool_limits,
+    finish_pipeline_album_for_scheduler_with_tool_limits, map_album_outcome,
+    prepare_pipeline_item_for_scheduler, realize_track_for_scheduler_with_tool_limits,
+    run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_worker_failure_output,
+    AlbumCompletionTracker,
+    AlbumReadiness, BroadcastReporter, CueSidecarPolicy, FailurePolicy, LogPolicy,
+    NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PoolLimits,
+    PreparedTrack, PublishPolicy, RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
+    ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
+    SharedWorkerPool, SourceKind, SourceOptions, StagePolicy, StageRequirement, ToolConcurrencyLimits,
+    TrackId, TrackMetadata, TrackSelection, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
 };
 
 /// Configuration for the conversion processor.
@@ -45,6 +50,7 @@ pub struct ConversionProcessor {
     progress_tx: Option<broadcast::Sender<ProgressUpdate>>,
     pool_limits: PoolLimits,
     scheduler_metrics: Arc<SchedulerMetrics>,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
     /// External cancellation token from the TUI. When triggered, the
     /// scheduler cancels all in-flight workers and kills child processes.
     external_cancel: Option<CancellationToken>,
@@ -97,6 +103,15 @@ fn terminal_progress_for_status(
     }
 }
 
+fn effective_worker_count_for_tool_limits(
+    configured_worker_count: usize,
+    tool_concurrency_limits: &ToolConcurrencyLimits,
+) -> usize {
+    configured_worker_count
+        .max(1)
+        .max(tool_concurrency_limits.max_tool_concurrency())
+}
+
 impl ConversionProcessor {
     /// Create a new processor.
     pub fn new(config: ProcessorConfig) -> Self {
@@ -105,6 +120,7 @@ impl ConversionProcessor {
             progress_tx: None,
             pool_limits: PoolLimits::default(),
             scheduler_metrics: Arc::new(SchedulerMetrics::default()),
+            tool_concurrency_limits: Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
             external_cancel: None,
         }
     }
@@ -197,14 +213,19 @@ impl ConversionProcessor {
         }
 
         self.scheduler_metrics.reset();
+        let effective_worker_count = effective_worker_count_for_tool_limits(
+            self.config.worker_count,
+            self.tool_concurrency_limits.as_ref(),
+        );
         let outcomes = run_queue_with_shared_orchestrator(
             queued_items,
             progress_tx.clone(),
             progress_rx,
             self.config.tool_paths.clone(),
-            self.config.worker_count.max(1),
+            effective_worker_count,
             self.pool_limits,
             self.scheduler_metrics.clone(),
+            self.tool_concurrency_limits.clone(),
             self.external_cancel.take(),
         )
         .await;
@@ -447,6 +468,7 @@ impl SubmissionPump {
         progress_tx: &broadcast::Sender<ProgressUpdate>,
         _cancel: &CancellationToken,
         worker_count: usize,
+        tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
     ) {
         self.retry_after_busy = false;
         loop {
@@ -458,7 +480,13 @@ impl SubmissionPump {
             }
 
             if let Some((album, outputs)) = self.album_postprocess.pop_front() {
-                let unit = build_album_postprocess_work(album, outputs, tool_paths, progress_tx);
+                let unit = build_album_postprocess_work(
+                    album,
+                    outputs,
+                    tool_paths,
+                    progress_tx,
+                    tool_concurrency_limits.clone(),
+                );
                 if !self.try_submit_unit(pool, unit, true) {
                     return;
                 }
@@ -472,6 +500,7 @@ impl SubmissionPump {
                     tool_paths,
                     progress_tx,
                     job_cancel,
+                    tool_concurrency_limits.clone(),
                 );
                 if !self.try_submit_unit(pool, unit, true) {
                     return;
@@ -480,7 +509,13 @@ impl SubmissionPump {
             }
 
             match self.flush_album_fanout_once(pool, |job_id| {
-                next_album_source_work(pending_albums, job_id, tool_paths, progress_tx)
+                next_album_source_work(
+                    pending_albums,
+                    job_id,
+                    tool_paths,
+                    progress_tx,
+                    tool_concurrency_limits.clone(),
+                )
             }) {
                 PumpFlushProgress::Progress => continue,
                 PumpFlushProgress::Blocked => return,
@@ -503,6 +538,7 @@ impl SubmissionPump {
                     tool_paths,
                     progress_tx,
                     worker_count,
+                    tool_concurrency_limits.clone(),
                 ) {
                     if !self.try_submit_unit(pool, unit, false) {
                         return;
@@ -594,6 +630,7 @@ async fn run_queue_with_shared_orchestrator(
     worker_count: usize,
     pool_limits: PoolLimits,
     metrics: Arc<SchedulerMetrics>,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
     external_cancel: Option<CancellationToken>,
 ) -> Vec<(String, ConversionStatus, Option<f32>)> {
     let cancel = external_cancel.unwrap_or_else(CancellationToken::new);
@@ -623,6 +660,7 @@ async fn run_queue_with_shared_orchestrator(
             &progress_tx,
             &cancel,
             worker_count.max(1),
+            tool_concurrency_limits.clone(),
         );
         submissions.record_backlog(pool.metrics(), &pending_albums);
         if terminal.len() >= total_items {
@@ -807,6 +845,7 @@ fn build_initial_work(
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
     worker_count: usize,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> Option<WorkUnit<QueueWorkOutput>> {
     let item_id = item.id.clone();
     if !item.input_path.exists() {
@@ -843,7 +882,12 @@ fn build_initial_work(
 
     let source_kind = detect_source_kind(&request).ok();
     if matches!(source_kind, Some(SourceKind::SingleFile)) {
-        return Some(build_single_file_work(request, tool_paths, progress_tx));
+        return Some(build_single_file_work(
+            request,
+            tool_paths,
+            progress_tx,
+            tool_concurrency_limits,
+        ));
     }
 
     let materialize_kind = match source_kind {
@@ -890,11 +934,13 @@ fn build_single_file_work(
     request: PipelineRequest,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
     let item_id = request.item_id.clone();
     let job_id = request.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
+    let tool_concurrency_limits = tool_concurrency_limits.clone();
     WorkUnit {
         job_id,
         unit_id: format!("single-file:{item_id}"),
@@ -902,12 +948,13 @@ fn build_single_file_work(
         task: boxed_work(move |worker_cancel| async move {
             let runner = RealToolRunner::new(tool_paths.clone());
             let reporter = BroadcastReporter::new(progress_tx, item_id.clone());
-            let report = run_pipeline_item_with_tool_paths(
+            let report = run_pipeline_item_with_tool_paths_and_tool_limits(
                 request,
                 &runner,
                 &reporter,
                 &worker_cancel,
                 &tool_paths,
+                Some(tool_concurrency_limits),
             )
             .await;
             let status = map_album_outcome(
@@ -925,6 +972,7 @@ fn next_album_source_work(
     job_id: &str,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> Option<WorkUnit<QueueWorkOutput>> {
     let pending = pending_albums.get_mut(job_id)?;
     loop {
@@ -960,6 +1008,7 @@ fn next_album_source_work(
                     tool_paths,
                     progress_tx,
                     pending.job_cancel.clone(),
+                    tool_concurrency_limits.clone(),
                 )
             }
             TrackSourceRef::ImageSegment { .. } | TrackSourceRef::SacdTrack { .. } => {
@@ -972,6 +1021,7 @@ fn next_album_source_work(
                     tool_paths,
                     progress_tx,
                     pending.job_cancel.clone(),
+                    tool_concurrency_limits.clone(),
                 )
             }
         });
@@ -987,12 +1037,14 @@ fn build_realize_work(
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
     job_cancel: CancellationToken,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
     let req = album.req.clone();
     let staging_root = album.staging.root.clone();
     let staging_job = album.staging.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
+    let tool_concurrency_limits = tool_concurrency_limits.clone();
     let job_id = album.req.job_id.clone();
     let item_id = album.req.item_id.clone();
     let track_id = track.id.clone();
@@ -1017,7 +1069,7 @@ fn build_realize_work(
                 );
                 return Ok(QueueWorkOutput::Encoded { job_id, output });
             }
-            match realize_track_for_scheduler(
+            match realize_track_for_scheduler_with_tool_limits(
                 track_index,
                 track,
                 final_path,
@@ -1026,6 +1078,7 @@ fn build_realize_work(
                 staging_job,
                 convert_root,
                 tool_paths,
+                Some(tool_concurrency_limits),
                 &reporter,
                 job_cancel,
             )
@@ -1048,12 +1101,14 @@ fn build_staged_encode_work(
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
     job_cancel: CancellationToken,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
     let req = album.req.clone();
     let staging_root = album.staging.root.clone();
     let staging_job = album.staging.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
+    let tool_concurrency_limits = tool_concurrency_limits.clone();
     let job_id = album.req.job_id.clone();
     let item_id = album.req.item_id.clone();
     let track_id = track.id.clone();
@@ -1073,7 +1128,7 @@ fn build_staged_encode_work(
                 );
                 return Ok(QueueWorkOutput::Encoded { job_id, output });
             }
-            let output = match encode_track_for_scheduler(
+            let output = match encode_track_for_scheduler_with_tool_limits(
                 track_index,
                 track.clone(),
                 final_path.clone(),
@@ -1082,6 +1137,7 @@ fn build_staged_encode_work(
                 staging_job,
                 convert_root,
                 tool_paths,
+                Some(tool_concurrency_limits),
                 &reporter,
                 job_cancel,
             )
@@ -1107,9 +1163,11 @@ fn build_realized_encode_work(
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
     job_cancel: CancellationToken,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
+    let tool_concurrency_limits = tool_concurrency_limits.clone();
     let item_id = realized.req.item_id.clone();
     let track_id = realized.track.id.clone();
     let unit_index = realized.index;
@@ -1132,9 +1190,10 @@ fn build_realized_encode_work(
                 );
                 return Ok(QueueWorkOutput::Encoded { job_id, output });
             }
-            let output = match encode_realized_track_for_scheduler(
+            let output = match encode_realized_track_for_scheduler_with_tool_limits(
                 realized,
                 tool_paths,
+                Some(tool_concurrency_limits),
                 &reporter,
             )
             .await
@@ -1158,11 +1217,13 @@ fn build_album_postprocess_work(
     outputs: Vec<ScheduledTrackOutput>,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
     let item_id = album.req.item_id.clone();
     let job_id = album.req.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
+    let tool_concurrency_limits = tool_concurrency_limits.clone();
     WorkUnit {
         job_id,
         unit_id: format!("album-postprocess:{item_id}"),
@@ -1170,12 +1231,13 @@ fn build_album_postprocess_work(
         task: boxed_work(move |worker_cancel| async move {
             let runner = RealToolRunner::new(tool_paths);
             let reporter = BroadcastReporter::new(progress_tx, item_id.clone());
-            let report = finish_pipeline_album_for_scheduler(
+            let report = finish_pipeline_album_for_scheduler_with_tool_limits(
                 album,
                 outputs,
                 &runner,
                 &reporter,
                 &worker_cancel,
+                Some(tool_concurrency_limits),
             )
             .await;
             let status = map_album_outcome(
@@ -1201,14 +1263,20 @@ async fn run_single_item_with_shared_scheduler(
     worker_count: usize,
 ) -> ConversionResult<(String, ConversionStatus)> {
     let item_id = item.id.clone();
+    let tool_concurrency_limits = Arc::new(ToolConcurrencyLimits::from_available_parallelism());
+    let effective_worker_count = effective_worker_count_for_tool_limits(
+        worker_count,
+        tool_concurrency_limits.as_ref(),
+    );
     let mut outcomes = run_queue_with_shared_orchestrator(
         vec![item],
         progress_tx,
         None,
         tool_paths,
-        worker_count.max(1),
+        effective_worker_count,
         PoolLimits::default(),
         Arc::new(SchedulerMetrics::default()),
+        tool_concurrency_limits,
         None,
     )
     .await;
@@ -1385,6 +1453,65 @@ mod tests {
         assert_eq!(event, expected);
     }
 
+    fn pipeline_request_for_processor_limit_test(root: &std::path::Path) -> PipelineRequest {
+        PipelineRequest {
+            job_id: "processor-limit-job".to_string(),
+            item_id: "processor-limit-item".to_string(),
+            container: root.join("input.flac"),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            settings: PipelineSettings::default(),
+            worker_count: Some(1),
+            merge: false,
+            output_root: root.join("out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+            },
+            log: LogPolicy {
+                root: root.join("logs"),
+                write_for_blocked: true,
+                write_json_log: true,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Disabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Disabled,
+                generate_cue: false,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        }
+    }
+
+    fn prepared_track_for_processor_limit_test(root: &std::path::Path) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref: TrackSourceRef::StagedFile(root.join("input.flac")),
+            metadata: TrackMetadata {
+                title: Some("Track 1".to_string()),
+                track_number: Some(1),
+                ..TrackMetadata::default()
+            },
+            expected_samples: Some(44_100),
+            sample_rate: 44_100,
+            bit_depth: Some(16),
+        }
+    }
+
     #[test]
     fn submission_pump_large_album_fanout_generates_only_one_deferred_unit_when_pool_is_full() {
         let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
@@ -1490,6 +1617,7 @@ mod tests {
                 &progress_tx,
                 &cancel,
                 1,
+                Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
             );
         })
         .await
@@ -1523,6 +1651,7 @@ mod tests {
             &progress_tx,
             &cancel,
             1,
+            Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
         );
         submissions.record_backlog(pool.metrics(), &pending_albums);
         let resumed = pool.metrics().snapshot();
@@ -1557,6 +1686,75 @@ mod tests {
         ));
 
         run.shutdown().await;
+    }
+
+    #[test]
+    fn single_file_and_realized_work_units_capture_the_same_tool_limit_arc() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let request = pipeline_request_for_processor_limit_test(temp.path());
+        let track = prepared_track_for_processor_limit_test(temp.path());
+        let (progress_tx, _progress_rx) = broadcast::channel(4);
+        let tool_paths = HashMap::new();
+        let limits = Arc::new(ToolConcurrencyLimits::new(2, 8, 6, 8));
+        let initial_count = Arc::strong_count(&limits);
+
+        let single_file_unit = build_single_file_work(
+            request.clone(),
+            &tool_paths,
+            &progress_tx,
+            limits.clone(),
+        );
+        assert_eq!(
+            Arc::strong_count(&limits),
+            initial_count + 1,
+            "single-file fallback work captures a clone of the shared tool limit Arc"
+        );
+
+        let realized = ScheduledRealizedTrack {
+            index: 0,
+            track,
+            final_path: temp.path().join("out/track.flac"),
+            realized_path: temp.path().join("realized.wav"),
+            req: request,
+            staging_root: temp.path().join("staging"),
+            staging_job: "processor-limit-job".to_string(),
+            convert_root: temp.path().join("converted"),
+            cancel: CancellationToken::new(),
+        };
+        let realized_unit = build_realized_encode_work(
+            "processor-limit-job".to_string(),
+            realized,
+            &tool_paths,
+            &progress_tx,
+            CancellationToken::new(),
+            limits.clone(),
+        );
+        assert_eq!(
+            Arc::strong_count(&limits),
+            initial_count + 2,
+            "realized-track encode work captures another clone of the same shared tool limit Arc"
+        );
+
+        drop(single_file_unit);
+        drop(realized_unit);
+        assert_eq!(
+            Arc::strong_count(&limits),
+            initial_count,
+            "dropping the work units releases only their captured clones, not a separate limit object"
+        );
+    }
+
+    #[test]
+    fn configured_worker_count_is_escalated_to_max_tool_concurrency() {
+        let limits = ToolConcurrencyLimits::new(2, 8, 6, 8);
+
+        assert_eq!(
+            effective_worker_count_for_tool_limits(1, &limits),
+            8,
+            "configured worker_count=1 is raised so the largest tool family cannot be starved"
+        );
+        assert_eq!(effective_worker_count_for_tool_limits(0, &limits), 8);
+        assert_eq!(effective_worker_count_for_tool_limits(12, &limits), 12);
     }
 
     #[test]

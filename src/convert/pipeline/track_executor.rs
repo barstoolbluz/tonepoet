@@ -5,10 +5,12 @@
 //! result through `ToolRunner` and applies deterministic finalization.
 
 use std::collections::HashMap;
-use std::fs;
+use std::{fs, io};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::{
     plan_conversion, plan_topology, Finalization, MetadataDisposition,
@@ -23,7 +25,7 @@ use super::progress::{
     probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker,
     StreamSource, StreamingHeartbeat,
 };
-use super::tool::{CommandRecord, ToolBinary, ToolCommand, ToolRunner};
+use super::tool::{CommandRecord, EnvVar, ProcessExit, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
 use super::types::{PipelineRequest, PreparedTrack};
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,106 @@ pub struct ExecutedTrackPlan {
     pub command_hash: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolConcurrencyLimits {
+    sox: Arc<Semaphore>,
+    ffmpeg: Arc<Semaphore>,
+    ssrc: Arc<Semaphore>,
+    sox_max_concurrent: usize,
+    ffmpeg_max_concurrent: usize,
+    ssrc_max_concurrent: usize,
+    sox_omp_threads: u32,
+}
+
+impl ToolConcurrencyLimits {
+    pub fn new(
+        sox_max_concurrent: usize,
+        ffmpeg_max_concurrent: usize,
+        ssrc_max_concurrent: usize,
+        sox_omp_threads: u32,
+    ) -> Self {
+        let sox_max_concurrent = sox_max_concurrent.max(1);
+        let ffmpeg_max_concurrent = ffmpeg_max_concurrent.max(1);
+        let ssrc_max_concurrent = ssrc_max_concurrent.max(1);
+        let sox_omp_threads = sox_omp_threads.max(1);
+        Self {
+            sox: Arc::new(Semaphore::new(sox_max_concurrent)),
+            ffmpeg: Arc::new(Semaphore::new(ffmpeg_max_concurrent)),
+            ssrc: Arc::new(Semaphore::new(ssrc_max_concurrent)),
+            sox_max_concurrent,
+            ffmpeg_max_concurrent,
+            ssrc_max_concurrent,
+            sox_omp_threads,
+        }
+    }
+
+    pub fn from_available_parallelism() -> Self {
+        let total_cores = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        Self::from_total_cores(total_cores)
+    }
+
+    pub fn from_total_cores(total_cores: usize) -> Self {
+        let total_cores = total_cores.max(1);
+        let sox_max_concurrent = (total_cores / 8).max(1);
+        let sox_omp_threads = (total_cores / sox_max_concurrent)
+            .max(1)
+            .min(u32::MAX as usize) as u32;
+        let ffmpeg_max_concurrent = (total_cores / 2).max(1);
+        let ssrc_max_concurrent = (total_cores / 2).max(1);
+        Self::new(
+            sox_max_concurrent,
+            ffmpeg_max_concurrent,
+            ssrc_max_concurrent,
+            sox_omp_threads,
+        )
+    }
+
+    pub fn sox_omp_threads(&self) -> u32 {
+        self.sox_omp_threads
+    }
+
+    pub fn sox_max_concurrent(&self) -> usize {
+        self.sox_max_concurrent
+    }
+
+    pub fn ffmpeg_max_concurrent(&self) -> usize {
+        self.ffmpeg_max_concurrent
+    }
+
+    pub fn ssrc_max_concurrent(&self) -> usize {
+        self.ssrc_max_concurrent
+    }
+
+    pub fn max_tool_concurrency(&self) -> usize {
+        self.sox_max_concurrent
+            .max(self.ffmpeg_max_concurrent)
+            .max(self.ssrc_max_concurrent)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_ffmpeg_permit_for_test(&self) -> OwnedSemaphorePermit {
+        self.ffmpeg
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test holds FFmpeg-family permit")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ffmpeg_available_permits_for_test(&self) -> usize {
+        self.ffmpeg.available_permits()
+    }
+
+}
+
+impl Default for ToolConcurrencyLimits {
+    fn default() -> Self {
+        Self::from_available_parallelism()
+    }
+}
+
 pub async fn execute_planned_track_conversion(
     request: &PipelineRequest,
     track: &PreparedTrack,
@@ -49,6 +151,7 @@ pub async fn execute_planned_track_conversion(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     progress: &mut OperationProgressTracker<'_>,
     start_fraction: f32,
     end_fraction: f32,
@@ -113,6 +216,7 @@ pub async fn execute_planned_track_conversion(
                 runner,
                 cancel,
                 tool_paths,
+                tool_concurrency_limits,
                 progress,
                 start_fraction,
                 end_fraction,
@@ -267,6 +371,7 @@ async fn execute_commands(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     progress: &mut OperationProgressTracker<'_>,
     start_fraction: f32,
     end_fraction: f32,
@@ -296,20 +401,24 @@ async fn execute_commands(
             )
             .await;
 
-        let cmd = planned_command_to_tool_command(planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)?;
-        let output = run_planned_command(
-            cmd,
-            planned,
-            runner,
-            cancel,
-            tool_paths,
-            progress,
-            window_start,
-            window_end,
-            &label,
-        )
-        .await
-        .map_err(|err| format_tool_error(index, planned, err))?;
+        let mut cmd = planned_command_to_tool_command(planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)?;
+        let output = {
+            let _tool_permit =
+                acquire_tool_permit(&mut cmd, tool_concurrency_limits.as_ref(), cancel).await?;
+            run_planned_command(
+                cmd,
+                planned,
+                runner,
+                cancel,
+                tool_paths,
+                progress,
+                window_start,
+                window_end,
+                &label,
+            )
+            .await
+            .map_err(|err| format_tool_error(index, planned, err))?
+        };
         records.push(output.command);
 
         progress
@@ -324,6 +433,141 @@ async fn execute_commands(
     Ok(records)
 }
 
+async fn acquire_tool_permit(
+    cmd: &mut ToolCommand,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    cancel: &CancellationToken,
+) -> Result<Option<OwnedSemaphorePermit>, ConvertError> {
+    let Some(limits) = limits else {
+        return Ok(None);
+    };
+
+    match cmd.binary {
+        ToolBinary::Sox => {
+            set_sox_omp_threads(cmd, limits.sox_omp_threads());
+            acquire_owned_permit(limits.sox.clone(), cancel)
+                .await
+                .map(Some)
+        }
+        ToolBinary::Ffmpeg | ToolBinary::Ffprobe => acquire_owned_permit(limits.ffmpeg.clone(), cancel)
+            .await
+            .map(Some),
+        ToolBinary::Ssrc => acquire_owned_permit(limits.ssrc.clone(), cancel)
+            .await
+            .map(Some),
+        _ => Ok(None),
+    }
+}
+
+async fn acquire_owned_permit(
+    semaphore: Arc<Semaphore>,
+    cancel: &CancellationToken,
+) -> Result<OwnedSemaphorePermit, ConvertError> {
+    if cancel.is_cancelled() {
+        return Err(ConvertError::Realize("cancelled".to_string()));
+    }
+
+    tokio::select! {
+        biased;
+
+        _ = cancel.cancelled() => Err(ConvertError::Realize("cancelled".to_string())),
+        permit = semaphore.acquire_owned() => permit.map_err(|_| {
+            ConvertError::Backend("tool concurrency semaphore closed".to_string())
+        }),
+    }
+}
+
+pub(crate) async fn run_tool_command_with_concurrency(
+    mut cmd: ToolCommand,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<ToolOutput, ToolRunnerError> {
+    let _tool_permit = acquire_tool_permit(&mut cmd, limits, cancel)
+        .await
+        .map_err(|err| tool_permit_error_to_runner_error(err, &cmd))?;
+    runner.run(cmd, cancel).await
+}
+
+fn tool_permit_error_to_runner_error(err: ConvertError, cmd: &ToolCommand) -> ToolRunnerError {
+    match err {
+        ConvertError::Realize(message) if message == "cancelled" => ToolRunnerError::Cancelled {
+            command: command_record_for_unstarted_command(cmd),
+        },
+        other => ToolRunnerError::Io(io::Error::new(io::ErrorKind::Other, other.to_string())),
+    }
+}
+
+fn command_record_for_unstarted_command(cmd: &ToolCommand) -> CommandRecord {
+    CommandRecord {
+        binary: cmd.binary,
+        sanitized_args: cmd.args.clone(),
+        cwd: cmd.cwd.clone(),
+        env_keys: cmd.env.iter().map(|var| var.key.clone()).collect(),
+        exit: None,
+        stdout_tail: String::new(),
+        stderr_tail: String::new(),
+        elapsed: Duration::ZERO,
+    }
+}
+
+fn set_sox_omp_threads(cmd: &mut ToolCommand, threads: u32) {
+    cmd.env.retain(|var| !is_omp_num_threads_key(&var.key));
+    cmd.env.push(EnvVar {
+        key: "OMP_NUM_THREADS".to_string(),
+        value: super::types::SecretString::new(threads.to_string()),
+        secret: false,
+    });
+}
+
+#[cfg(windows)]
+fn is_omp_num_threads_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("OMP_NUM_THREADS")
+}
+
+#[cfg(not(windows))]
+fn is_omp_num_threads_key(key: &str) -> bool {
+    key == "OMP_NUM_THREADS"
+}
+
+
+#[cfg(test)]
+const CAPTURE_PLANNED_COMMAND_FOR_TEST_ARG: &str = "__tonepoet_capture_planned_command_for_test__";
+
+#[cfg(test)]
+fn should_capture_planned_command_for_test(cmd: &ToolCommand) -> bool {
+    cmd.args
+        .iter()
+        .any(|arg| arg == CAPTURE_PLANNED_COMMAND_FOR_TEST_ARG)
+}
+
+#[cfg(test)]
+fn successful_captured_tool_output_for_test(cmd: ToolCommand) -> ToolOutput {
+    let elapsed = Duration::from_millis(1);
+    let stdout_tail = cmd
+        .env
+        .iter()
+        .map(|var| format!("{}={}", var.key, var.value.expose()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ToolOutput {
+        exit: ProcessExit::Code(0),
+        stdout_tail: stdout_tail.clone(),
+        stderr_tail: String::new(),
+        elapsed,
+        command: CommandRecord {
+            binary: cmd.binary,
+            sanitized_args: cmd.args.clone(),
+            cwd: cmd.cwd.clone(),
+            env_keys: cmd.env.iter().map(|var| var.key.clone()).collect(),
+            exit: Some(ProcessExit::Code(0)),
+            stdout_tail,
+            stderr_tail: String::new(),
+            elapsed,
+        },
+    }
+}
+
 async fn run_planned_command(
     cmd: ToolCommand,
     planned: &PlannedCommand,
@@ -335,6 +579,11 @@ async fn run_planned_command(
     window_end: f32,
     label: &str,
 ) -> Result<super::tool::ToolOutput, ToolRunnerError> {
+    #[cfg(test)]
+    if should_capture_planned_command_for_test(&cmd) {
+        return Ok(successful_captured_tool_output_for_test(cmd));
+    }
+
     match cmd.binary {
         ToolBinary::Ffmpeg => {
             let expected = planned.expected_duration.unwrap_or(Duration::ZERO);
@@ -504,11 +753,411 @@ fn track_label(track: &PreparedTrack) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
+    use crate::convert::pipeline::tool::blocking_test_runner::{
+        tool_gate, BlockingToolRunner, ToolBehavior,
+    };
+    use crate::convert::pipeline::types::PipelineStage;
+    use tempfile::TempDir;
     use tonepoet_pipeline::{InputSource, OutputSink, ToolIdentifier};
 
     use super::*;
+
+    fn test_tool_command(binary: ToolBinary) -> ToolCommand {
+        ToolCommand {
+            binary,
+            args: vec!["--test".to_string()],
+            secret_args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    fn env_value<'a>(cmd: &'a ToolCommand, key: &str) -> Option<&'a str> {
+        cmd.env
+            .iter()
+            .find(|var| var.key == key)
+            .map(|var| var.value.expose())
+    }
+
+    fn env_value_for_key(var: &EnvVar, key: &str) -> bool {
+        var.key == key
+    }
+
+    fn planned_command_for_test(binary: ToolIdentifier, args: Vec<String>, out: &Path) -> PlannedCommand {
+        PlannedCommand::new(
+            binary,
+            args,
+            InputSource::Path(PathBuf::from("input.wav")),
+            OutputSink::Path(out.to_path_buf()),
+            Some(Duration::from_secs(1)),
+            "test command",
+        )
+    }
+
+    async fn execute_commands_for_test(
+        commands: Vec<PlannedCommand>,
+        runner: &dyn ToolRunner,
+        cancel: &CancellationToken,
+        limits: Option<Arc<ToolConcurrencyLimits>>,
+    ) -> Result<Vec<CommandRecord>, ConvertError> {
+        let mut progress = OperationProgressTracker::new(
+            "track-executor-test".to_string(),
+            PipelineStage::Convert,
+            None,
+        );
+        execute_commands(
+            &commands,
+            runner,
+            cancel,
+            &HashMap::new(),
+            limits,
+            &mut progress,
+            0.0,
+            1.0,
+            "test track".to_string(),
+        )
+        .await
+    }
+
+    #[test]
+    fn tool_concurrency_limits_from_total_cores_match_expected_defaults() {
+        let limits = ToolConcurrencyLimits::from_total_cores(16);
+        assert_eq!(limits.sox_max_concurrent(), 2);
+        assert_eq!(limits.ffmpeg_max_concurrent(), 8);
+        assert_eq!(limits.ssrc_max_concurrent(), 8);
+        assert_eq!(limits.sox_omp_threads(), 8);
+        assert_eq!(limits.max_tool_concurrency(), 8);
+
+        let tiny = ToolConcurrencyLimits::from_total_cores(1);
+        assert_eq!(tiny.sox_max_concurrent(), 1);
+        assert_eq!(tiny.ffmpeg_max_concurrent(), 1);
+        assert_eq!(tiny.ssrc_max_concurrent(), 1);
+        assert_eq!(tiny.sox_omp_threads(), 1);
+    }
+
+    #[tokio::test]
+    async fn sox_permit_caps_concurrent_sox_and_sets_omp_threads() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 4, 4, 6));
+        let cancel = CancellationToken::new();
+        let mut first = test_tool_command(ToolBinary::Sox);
+        first.env.push(EnvVar {
+            key: "OMP_NUM_THREADS".to_string(),
+            value: crate::convert::pipeline::types::SecretString::new("99".to_string()),
+            secret: false,
+        });
+        let first_permit = acquire_tool_permit(&mut first, Some(&limits), &cancel)
+            .await
+            .expect("first SoX permit acquired")
+            .expect("SoX has a permit");
+        assert_eq!(env_value(&first, "OMP_NUM_THREADS"), Some("6"));
+        assert_eq!(
+            first
+                .env
+                .iter()
+                .filter(|var| env_value_for_key(var, "OMP_NUM_THREADS"))
+                .count(),
+            1
+        );
+
+        let mut second = test_tool_command(ToolBinary::Sox);
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            acquire_tool_permit(&mut second, Some(&limits), &cancel),
+        )
+        .await;
+        assert!(blocked.is_err(), "second SoX waits while first permit is held");
+
+        drop(first_permit);
+        let second_permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_tool_permit(&mut second, Some(&limits), &cancel),
+        )
+        .await
+        .expect("second SoX permit available after release")
+        .expect("second SoX acquire succeeds")
+        .expect("SoX has a permit");
+        assert_eq!(env_value(&second, "OMP_NUM_THREADS"), Some("6"));
+        drop(second_permit);
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_uses_its_own_higher_limit_without_omp_injection() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 3, 1, 8));
+        let cancel = CancellationToken::new();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let mut cmd = test_tool_command(ToolBinary::Ffmpeg);
+            let permit = acquire_tool_permit(&mut cmd, Some(&limits), &cancel)
+                .await
+                .expect("FFmpeg permit acquired")
+                .expect("FFmpeg has a permit");
+            assert_eq!(env_value(&cmd, "OMP_NUM_THREADS"), None);
+            held.push(permit);
+        }
+
+        let mut fourth = test_tool_command(ToolBinary::Ffmpeg);
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            acquire_tool_permit(&mut fourth, Some(&limits), &cancel),
+        )
+        .await;
+        assert!(blocked.is_err(), "fourth FFmpeg waits at its own limit");
+        drop(held.pop());
+
+        let permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_tool_permit(&mut fourth, Some(&limits), &cancel),
+        )
+        .await
+        .expect("FFmpeg permit available after release")
+        .expect("fourth FFmpeg acquire succeeds")
+        .expect("FFmpeg has a permit");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn ffprobe_shares_the_ffmpeg_limit() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 8));
+        let cancel = CancellationToken::new();
+
+        let mut ffmpeg = test_tool_command(ToolBinary::Ffmpeg);
+        let ffmpeg_permit = acquire_tool_permit(&mut ffmpeg, Some(&limits), &cancel)
+            .await
+            .expect("FFmpeg permit acquired")
+            .expect("FFmpeg has a permit");
+
+        let mut ffprobe = test_tool_command(ToolBinary::Ffprobe);
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            acquire_tool_permit(&mut ffprobe, Some(&limits), &cancel),
+        )
+        .await;
+        assert!(blocked.is_err(), "FFprobe waits behind the FFmpeg family limit");
+
+        drop(ffmpeg_permit);
+        let ffprobe_permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_tool_permit(&mut ffprobe, Some(&limits), &cancel),
+        )
+        .await
+        .expect("FFprobe permit available after FFmpeg release")
+        .expect("FFprobe acquire succeeds")
+        .expect("FFprobe has a permit");
+        drop(ffprobe_permit);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_tool_permit_returns_promptly() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 4));
+        let cancel = CancellationToken::new();
+        let mut first = test_tool_command(ToolBinary::Sox);
+        let _held = acquire_tool_permit(&mut first, Some(&limits), &cancel)
+            .await
+            .expect("first SoX permit acquired")
+            .expect("SoX has a permit");
+
+        let waiter_limits = limits.clone();
+        let waiter_cancel = cancel.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut waiter = tokio::spawn(async move {
+            let mut waiting = test_tool_command(ToolBinary::Sox);
+            let _ = started_tx.send(());
+            let result = acquire_tool_permit(&mut waiting, Some(&waiter_limits), &waiter_cancel)
+                .await;
+            matches!(result, Err(ConvertError::Realize(message)) if message == "cancelled")
+        });
+
+        started_rx
+            .await
+            .expect("waiter task reached the permit acquire path");
+        tokio::select! {
+            joined = &mut waiter => {
+                let cancelled = joined.expect("waiter task joined");
+                panic!("waiter completed before cancellation; cancelled={cancelled}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+
+        cancel.cancel();
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("blocked semaphore wait wakes after cancellation")
+            .expect("waiter task joined");
+        assert!(
+            cancelled,
+            "cancelled acquire returns ConvertError::Realize after the waiter is blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_token_wins_over_immediately_available_tool_permit() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 4));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut cmd = test_tool_command(ToolBinary::Sox);
+        let err = acquire_tool_permit(&mut cmd, Some(&limits), &cancel)
+            .await
+            .expect_err("cancelled token is checked before taking an available permit");
+
+        assert!(
+            matches!(err, ConvertError::Realize(message) if message == "cancelled"),
+            "cancelled acquire returns ConvertError::Realize"
+        );
+        assert_eq!(
+            limits.sox.available_permits(),
+            1,
+            "pre-cancelled acquire must not consume the immediately available SoX permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_tool_limits_leave_commands_unchanged() {
+        let cancel = CancellationToken::new();
+        let mut cmd = test_tool_command(ToolBinary::Sox);
+        let permit = acquire_tool_permit(&mut cmd, None, &cancel)
+            .await
+            .expect("unlimited acquire succeeds");
+        assert!(permit.is_none());
+        assert!(cmd.env.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_commands_holds_tool_permit_until_command_future_finishes() {
+        let temp = TempDir::new().expect("temp dir");
+        let output = temp.path().join("ssrc-output.wav");
+        let limits = Arc::new(ToolConcurrencyLimits::new(4, 4, 1, 4));
+        let (gate, blocker) = tool_gate();
+        let runner = Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceedAndWrite {
+                gate: blocker,
+                path: output.clone(),
+                bytes: b"audio".to_vec(),
+            },
+        ]));
+        let cancel = CancellationToken::new();
+        let commands = vec![planned_command_for_test(
+            ToolIdentifier::Ssrc,
+            vec!["hold-permit".to_string()],
+            &output,
+        )];
+        let run_runner = runner.clone();
+        let run_limits = limits.clone();
+        let run_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            execute_commands_for_test(commands, run_runner.as_ref(), &run_cancel, Some(run_limits)).await
+        });
+
+        let release = gate.wait_started().await;
+        assert_eq!(
+            limits.ssrc.available_permits(),
+            0,
+            "execute_commands keeps the SSRC permit while the runner future is still pending"
+        );
+
+        release.release();
+        let records = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("blocked command completes after gate release")
+            .expect("execute task joins")
+            .expect("command succeeds");
+        assert_eq!(records.len(), 1);
+        assert_eq!(limits.ssrc.available_permits(), 1);
+        assert_eq!(std::fs::read(&output).expect("output written"), b"audio");
+    }
+
+    #[tokio::test]
+    async fn execute_commands_passes_sox_omp_threads_to_streaming_dispatch() {
+        let temp = TempDir::new().expect("temp dir");
+        let output = temp.path().join("sox-output.flac");
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 4, 4, 7));
+        let cancel = CancellationToken::new();
+        let runner = BlockingToolRunner::new();
+        let commands = vec![planned_command_for_test(
+            ToolIdentifier::Sox,
+            vec![CAPTURE_PLANNED_COMMAND_FOR_TEST_ARG.to_string()],
+            &output,
+        )];
+
+        let records = execute_commands_for_test(commands, &runner, &cancel, Some(limits))
+            .await
+            .expect("captured SoX command succeeds");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].binary, ToolBinary::Sox);
+        assert!(
+            records[0].env_keys.iter().any(|key| key == "OMP_NUM_THREADS"),
+            "SoX command reaches run_planned_command with the injected OpenMP variable"
+        );
+        assert!(
+            records[0].stdout_tail.lines().any(|line| line == "OMP_NUM_THREADS=7"),
+            "test capture preserves the injected OpenMP value passed into the streaming dispatch point"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_commands_uses_ssrc_semaphore_for_ssrc_commands() {
+        let temp = TempDir::new().expect("temp dir");
+        let output = temp.path().join("ssrc-gated.wav");
+        let limits = Arc::new(ToolConcurrencyLimits::new(8, 8, 1, 4));
+        let cancel = CancellationToken::new();
+        let held_ssrc = limits
+            .ssrc
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test holds the only SSRC permit");
+        let (gate, blocker) = tool_gate();
+        let runner = Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceedAndWrite {
+                gate: blocker,
+                path: output.clone(),
+                bytes: b"audio".to_vec(),
+            },
+        ]));
+        let commands = vec![planned_command_for_test(
+            ToolIdentifier::Ssrc,
+            vec!["wait-for-ssrc".to_string()],
+            &output,
+        )];
+        let run_runner = runner.clone();
+        let run_limits = limits.clone();
+        let run_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            execute_commands_for_test(commands, run_runner.as_ref(), &run_cancel, Some(run_limits)).await
+        });
+
+        // Verify the command hasn't started yet (SSRC permit exhausted)
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            runner.transcript().len(),
+            0,
+            "SSRC command must not reach the runner while its own semaphore is exhausted"
+        );
+        assert_eq!(
+            limits.ffmpeg.available_permits(),
+            8,
+            "waiting for SSRC does not consume FFmpeg-family permits"
+        );
+
+        drop(held_ssrc);
+        let release = tokio::time::timeout(Duration::from_secs(1), gate.wait_started())
+            .await
+            .expect("SSRC command starts after SSRC permit release");
+        release.release();
+        let records = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("SSRC command completes after permit release")
+            .expect("execute task joins")
+            .expect("command succeeds");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].binary, ToolBinary::Ssrc);
+    }
 
     #[test]
     fn deterministic_work_dir_reset_removes_stale_intermediates() {
@@ -767,6 +1416,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                     runner,
                     cancel,
                     &HashMap::new(),
+                    None,
                     &mut progress,
                     0.0,
                     1.0,

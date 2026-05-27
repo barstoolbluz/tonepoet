@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
@@ -26,7 +27,10 @@ use super::materializer_7z::SevenZipMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
 use super::materializer_single::SingleFileMaterializer;
-use super::track_executor::execute_planned_track_conversion;
+use super::track_executor::{
+    execute_planned_track_conversion, run_tool_command_with_concurrency,
+};
+pub use super::track_executor::ToolConcurrencyLimits;
 use super::plan_bridge::orchestrator_metadata_stage_required;
 use super::progress::{
     heartbeat, OperationProgressTracker,
@@ -207,6 +211,27 @@ pub async fn realize_track(
     cancel: &CancellationToken,
     progress_tracker: Option<&mut OperationProgressTracker<'_>>,
 ) -> Result<PathBuf, ConvertError> {
+    realize_track_with_tool_limits(
+        src,
+        req,
+        staging,
+        runner,
+        cancel,
+        None,
+        progress_tracker,
+    )
+    .await
+}
+
+pub async fn realize_track_with_tool_limits(
+    src: &TrackSourceRef,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+) -> Result<PathBuf, ConvertError> {
     if cancel.is_cancelled() {
         return Err(ConvertError::Realize("cancelled".to_string()));
     }
@@ -232,8 +257,17 @@ pub async fn realize_track(
             start_sample,
             samples,
         } => {
-            realize_image_segment(image, *start_sample, *samples, req, staging, runner, cancel)
-                .await
+            realize_image_segment(
+                image,
+                *start_sample,
+                *samples,
+                req,
+                staging,
+                runner,
+                cancel,
+                tool_concurrency_limits.as_ref(),
+            )
+            .await
         }
         TrackSourceRef::SacdTrack {
             iso,
@@ -279,6 +313,7 @@ async fn realize_image_segment(
     staging: &StagingDir,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<PathBuf, ConvertError> {
     if samples == 0 {
         return Err(ConvertError::TrackValidation(
@@ -297,8 +332,16 @@ async fn realize_image_segment(
     let out_path = realized_dir.join(cue_segment_output_name(image, start_sample, samples));
     let _ = fs::remove_file(&out_path);
 
-    let direct =
-        cut_segment_with_ffmpeg(image, start_sample, samples, &out_path, runner, cancel).await;
+    let direct = cut_segment_with_ffmpeg(
+        image,
+        start_sample,
+        samples,
+        &out_path,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await;
     if let Err(err) = direct {
         let _ = fs::remove_file(&out_path);
         if !has_path_extension(image, "wv") {
@@ -306,10 +349,24 @@ async fn realize_image_segment(
         }
 
         let fallback = async {
-            let wav_path =
-                ensure_decoded_wavpack_image(image, &realized_dir, runner, cancel).await?;
-            cut_segment_with_ffmpeg(&wav_path, start_sample, samples, &out_path, runner, cancel)
-                .await
+            let wav_path = ensure_decoded_wavpack_image(
+                image,
+                &realized_dir,
+                runner,
+                cancel,
+                tool_concurrency_limits,
+            )
+            .await?;
+            cut_segment_with_ffmpeg(
+                &wav_path,
+                start_sample,
+                samples,
+                &out_path,
+                runner,
+                cancel,
+                tool_concurrency_limits,
+            )
+            .await
         }
         .await;
 
@@ -319,7 +376,15 @@ async fn realize_image_segment(
         }
     }
 
-    if let Err(err) = validate_realized_segment(&out_path, samples, runner, cancel).await {
+    if let Err(err) = validate_realized_segment(
+        &out_path,
+        samples,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    {
         let _ = fs::remove_file(&out_path);
         return Err(err);
     }
@@ -334,6 +399,7 @@ async fn cut_segment_with_ffmpeg(
     out_path: &Path,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), ConvertError> {
     let end_sample = start_sample.checked_add(samples).ok_or_else(|| {
         ConvertError::TrackValidation("image segment sample range overflows".to_string())
@@ -373,7 +439,7 @@ async fn cut_segment_with_ffmpeg(
         timeout: DEFAULT_CONVERT_TIMEOUT,
     };
 
-    match runner.run(cmd, cancel).await {
+    match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await {
         Ok(_) => Ok(()),
         Err(ToolRunnerError::Cancelled { .. }) => {
             Err(ConvertError::Realize("cancelled".to_string()))
@@ -387,6 +453,7 @@ async fn ensure_decoded_wavpack_image(
     realized_dir: &Path,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<PathBuf, ConvertError> {
     let cache_dir = realized_dir.join("decoded-image-cache");
     fs::create_dir_all(&cache_dir)?;
@@ -418,7 +485,15 @@ async fn ensure_decoded_wavpack_image(
         ));
         let _ = fs::remove_file(&tmp_path);
 
-        if let Err(err) = decode_wavpack_image(input, &tmp_path, runner, cancel).await {
+        if let Err(err) = decode_wavpack_image(
+            input,
+            &tmp_path,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await
+        {
             let _ = fs::remove_file(&tmp_path);
             return Err(err);
         }
@@ -463,6 +538,7 @@ async fn decode_wavpack_image(
     out_path: &Path,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), ConvertError> {
     let cmd = ToolCommand {
         binary: ToolBinary::Wvunpack,
@@ -478,7 +554,7 @@ async fn decode_wavpack_image(
         timeout: DEFAULT_CONVERT_TIMEOUT,
     };
 
-    match runner.run(cmd, cancel).await {
+    match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await {
         Ok(_) => Ok(()),
         Err(ToolRunnerError::Cancelled { .. }) => {
             Err(ConvertError::Realize("cancelled".to_string()))
@@ -492,6 +568,7 @@ async fn validate_realized_segment(
     expected_samples: u64,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), ConvertError> {
     let metadata = fs::metadata(out_path).map_err(|err| {
         ConvertError::TrackValidation(format!(
@@ -506,7 +583,13 @@ async fn validate_realized_segment(
         )));
     }
 
-    let probe = probe_realized_segment(out_path, runner, cancel).await?;
+    let probe = probe_realized_segment_with_tool_limits(
+        out_path,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await?;
     let actual_samples = probe.samples.ok_or_else(|| {
         ConvertError::TrackValidation(format!(
             "could not measure realized segment samples: {}",
@@ -535,10 +618,20 @@ struct RealizedProbe {
     exact: bool,
 }
 
+#[allow(dead_code)]
 async fn probe_realized_segment(
     path: &Path,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+) -> Result<RealizedProbe, ConvertError> {
+    probe_realized_segment_with_tool_limits(path, runner, cancel, None).await
+}
+
+async fn probe_realized_segment_with_tool_limits(
+    path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<RealizedProbe, ConvertError> {
     let cmd = ToolCommand {
         binary: ToolBinary::Ffprobe,
@@ -561,7 +654,7 @@ async fn probe_realized_segment(
         timeout: Duration::from_secs(30),
     };
 
-    let output = match runner.run(cmd, cancel).await {
+    let output = match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await {
         Ok(output) => output,
         Err(ToolRunnerError::Cancelled { .. }) => {
             return Err(ConvertError::Realize("cancelled".to_string()))
@@ -628,12 +721,32 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
 /// fatal errors — the extraction-stage validation already caught source
 /// problems, so a post-encode drift may indicate an encoder quirk rather
 /// than data loss.
+#[allow(dead_code)]
 async fn validate_encoded_output(
     out_path: &Path,
     expected_samples: Option<u64>,
     target_format: &tonepoet_pipeline::AudioFormat,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+) -> Option<u64> {
+    validate_encoded_output_with_tool_limits(
+        out_path,
+        expected_samples,
+        target_format,
+        runner,
+        cancel,
+        None,
+    )
+    .await
+}
+
+async fn validate_encoded_output_with_tool_limits(
+    out_path: &Path,
+    expected_samples: Option<u64>,
+    target_format: &tonepoet_pipeline::AudioFormat,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Option<u64> {
     let Some(expected) = expected_samples else {
         return None;
@@ -643,7 +756,14 @@ async fn validate_encoded_output(
         return Some(expected);
     }
 
-    let probe = match probe_realized_segment(out_path, runner, cancel).await {
+    let probe = match probe_realized_segment_with_tool_limits(
+        out_path,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    {
         Ok(probe) => probe,
         Err(err) => {
             log::warn!(
@@ -1416,6 +1536,7 @@ async fn convert_tracks_with_reporter(
         cancel,
         reporter,
         &tool_paths,
+        None,
     )
     .await
 }
@@ -1429,6 +1550,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     cancel: &CancellationToken,
     reporter: Option<&dyn PipelineReporter>,
     tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> ConvertStageResult {
     let planned: BTreeMap<_, _> = plan
         .entries
@@ -1497,6 +1619,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
             convert_root.clone(),
             tool_paths.clone(),
             cancel.clone(),
+            tool_concurrency_limits.clone(),
             reporter,
         )
         .await
@@ -1557,18 +1680,20 @@ async fn convert_one_track_work(
     convert_root: PathBuf,
     tool_paths: HashMap<String, PathBuf>,
     cancel: CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     reporter: Option<&dyn PipelineReporter>,
 ) -> Result<ScheduledTrackOutput, String> {
     let staging = StagingDir::borrowed(staging_root, staging_job);
     let runner = RealToolRunner::new(tool_paths.clone());
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
-    let realized_input = match realize_track(
+    let realized_input = match realize_track_with_tool_limits(
         &track.source_ref,
         &req,
         &staging,
         &runner,
         &cancel,
+        tool_concurrency_limits.clone(),
         Some(&mut progress_tracker),
     )
     .await
@@ -1603,6 +1728,7 @@ async fn convert_one_track_work(
         &runner,
         &cancel,
         &tool_paths,
+        tool_concurrency_limits.clone(),
         &mut progress_tracker,
         0.0,
         1.0,
@@ -1623,12 +1749,13 @@ async fn convert_one_track_work(
                 );
                 Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_written_by_plan: false })
             } else {
-                let actual_samples = validate_encoded_output(
+                let actual_samples = validate_encoded_output_with_tool_limits(
                     &staged_path,
                     track.expected_samples,
                     &req.settings.target_format,
                     &runner,
                     &cancel,
+                    tool_concurrency_limits.as_ref(),
                 )
                 .await;
                 let record = TrackRecord {
@@ -1777,6 +1904,17 @@ pub async fn merge_tracks(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<(ArtifactSet, StageRecord), MergeError> {
+    merge_tracks_with_tool_limits(artifacts, req, staging, runner, cancel, None).await
+}
+
+pub async fn merge_tracks_with_tool_limits(
+    artifacts: ArtifactSet,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<(ArtifactSet, StageRecord), MergeError> {
     if !req.merge {
         return Ok((
             artifacts,
@@ -1858,7 +1996,9 @@ pub async fn merge_tracks(
         timeout: Duration::from_secs(3600),
     };
 
-    let merge_result = runner.run(cmd, cancel).await;
+    let merge_result =
+        run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits.as_ref())
+            .await;
     let _ = fs::remove_file(&concat_list);
 
     if let Err(e) = merge_result {
@@ -1888,7 +2028,14 @@ pub async fn merge_tracks(
         timeout: Duration::from_secs(30),
     };
 
-    let probe_output = match runner.run(probe_cmd, cancel).await {
+    let probe_output = match run_tool_command_with_concurrency(
+        probe_cmd,
+        runner,
+        cancel,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await
+    {
         Ok(o) => o,
         Err(e) => {
             let _ = fs::remove_file(&merged_staged);
@@ -2048,6 +2195,17 @@ pub async fn apply_metadata(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<StageRecord, MetadataError> {
+    apply_metadata_with_tool_limits(artifacts, source, req, runner, cancel, None).await
+}
+
+pub async fn apply_metadata_with_tool_limits(
+    artifacts: &ArtifactSet,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<StageRecord, MetadataError> {
     if req.stages.metadata == StageRequirement::Disabled {
         return Ok(StageRecord {
             stage: PipelineStage::Metadata,
@@ -2084,6 +2242,7 @@ pub async fn apply_metadata(
                         &source.album_metadata,
                         runner,
                         cancel,
+                        tool_concurrency_limits.as_ref(),
                     )
                     .await?;
                 }
@@ -2104,6 +2263,7 @@ pub async fn apply_metadata(
                 &source.album_metadata,
                 runner,
                 cancel,
+                tool_concurrency_limits.as_ref(),
             )
             .await?;
         }
@@ -2149,6 +2309,7 @@ async fn tag_audio_file(
     album: &AlbumMetadata,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), MetadataError> {
     let ext = path
         .extension()
@@ -2313,7 +2474,9 @@ async fn tag_audio_file(
         }
     };
 
-    runner.run(cmd, cancel).await.map_err(MetadataError::Tool)?;
+    run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
+        .await
+        .map_err(MetadataError::Tool)?;
 
     if matches!(ext.as_str(), "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif") {
         let tmp = path.with_extension(format!(
@@ -2334,6 +2497,16 @@ pub async fn apply_replaygain(
     req: &PipelineRequest,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
+) -> Result<StageRecord, ReplayGainError> {
+    apply_replaygain_with_tool_limits(artifacts, req, runner, cancel, None).await
+}
+
+pub async fn apply_replaygain_with_tool_limits(
+    artifacts: &ArtifactSet,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> Result<StageRecord, ReplayGainError> {
     if req.stages.replaygain == StageRequirement::Disabled {
         return Ok(StageRecord {
@@ -2375,8 +2548,7 @@ pub async fn apply_replaygain(
         env: vec![],
         timeout: Duration::from_secs(600),
     };
-    runner
-        .run(cmd, cancel)
+    run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits.as_ref())
         .await
         .map_err(ReplayGainError::Tool)?;
     Ok(StageRecord {
@@ -3656,6 +3828,35 @@ pub async fn encode_track_for_scheduler(
     reporter: &dyn PipelineReporter,
     cancel: CancellationToken,
 ) -> Result<ScheduledTrackOutput, String> {
+    encode_track_for_scheduler_with_tool_limits(
+        track_index,
+        track,
+        final_path,
+        req,
+        staging_root,
+        staging_job,
+        convert_root,
+        tool_paths,
+        None,
+        reporter,
+        cancel,
+    )
+    .await
+}
+
+pub async fn encode_track_for_scheduler_with_tool_limits(
+    track_index: usize,
+    track: PreparedTrack,
+    final_path: PathBuf,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    reporter: &dyn PipelineReporter,
+    cancel: CancellationToken,
+) -> Result<ScheduledTrackOutput, String> {
     convert_one_track_work(
         track_index,
         track,
@@ -3666,6 +3867,7 @@ pub async fn encode_track_for_scheduler(
         convert_root,
         tool_paths,
         cancel,
+        tool_concurrency_limits,
         Some(reporter),
     )
     .await
@@ -3686,16 +3888,46 @@ pub async fn realize_track_for_scheduler(
     reporter: &dyn PipelineReporter,
     cancel: CancellationToken,
 ) -> Result<ScheduledRealizedTrack, ScheduledTrackOutput> {
+    realize_track_for_scheduler_with_tool_limits(
+        track_index,
+        track,
+        final_path,
+        req,
+        staging_root,
+        staging_job,
+        convert_root,
+        tool_paths,
+        None,
+        reporter,
+        cancel,
+    )
+    .await
+}
+
+pub async fn realize_track_for_scheduler_with_tool_limits(
+    track_index: usize,
+    track: PreparedTrack,
+    final_path: PathBuf,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    reporter: &dyn PipelineReporter,
+    cancel: CancellationToken,
+) -> Result<ScheduledRealizedTrack, ScheduledTrackOutput> {
     let staging = StagingDir::borrowed(staging_root.clone(), staging_job.clone());
     let runner = RealToolRunner::new(tool_paths);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, Some(reporter));
-    match realize_track(
+    match realize_track_with_tool_limits(
         &track.source_ref,
         &req,
         &staging,
         &runner,
         &cancel,
+        tool_concurrency_limits,
         Some(&mut progress_tracker),
     )
     .await
@@ -3724,6 +3956,15 @@ pub async fn realize_track_for_scheduler(
 pub async fn encode_realized_track_for_scheduler(
     realized: ScheduledRealizedTrack,
     tool_paths: HashMap<String, PathBuf>,
+    reporter: &dyn PipelineReporter,
+) -> Result<ScheduledTrackOutput, String> {
+    encode_realized_track_for_scheduler_with_tool_limits(realized, tool_paths, None, reporter).await
+}
+
+pub async fn encode_realized_track_for_scheduler_with_tool_limits(
+    realized: ScheduledRealizedTrack,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     reporter: &dyn PipelineReporter,
 ) -> Result<ScheduledTrackOutput, String> {
     let runner = RealToolRunner::new(tool_paths.clone());
@@ -3758,6 +3999,7 @@ pub async fn encode_realized_track_for_scheduler(
         &runner,
         &realized.cancel,
         &tool_paths,
+        tool_concurrency_limits.clone(),
         &mut progress_tracker,
         0.0,
         1.0,
@@ -3778,12 +4020,13 @@ pub async fn encode_realized_track_for_scheduler(
                 );
                 Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_written_by_plan: false })
             } else {
-                let actual_samples = validate_encoded_output(
+                let actual_samples = validate_encoded_output_with_tool_limits(
                     &staged_path,
                     realized.track.expected_samples,
                     &realized.req.settings.target_format,
                     &runner,
                     &realized.cancel,
+                    tool_concurrency_limits.as_ref(),
                 )
                 .await;
                 let record = TrackRecord {
@@ -3821,6 +4064,7 @@ pub async fn encode_realized_track_for_scheduler(
         }
     }
 }
+
 
 fn push_stage_and_reaggregate(mut outcome: AlbumOutcome, record: StageRecord, _policy: FailurePolicy) -> AlbumOutcome {
     push_stage(&mut outcome, record);
@@ -3889,6 +4133,25 @@ pub async fn finish_pipeline_album_for_scheduler(
     reporter: &dyn PipelineReporter,
     cancel: &CancellationToken,
 ) -> PipelineReport {
+    finish_pipeline_album_for_scheduler_with_tool_limits(
+        album,
+        track_outputs,
+        runner,
+        reporter,
+        cancel,
+        None,
+    )
+    .await
+}
+
+pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
+    album: ScheduledAlbum,
+    track_outputs: Vec<ScheduledTrackOutput>,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> PipelineReport {
     let req = album.req;
     let item_id = req.item_id.clone();
     let staging = album.staging;
@@ -3927,7 +4190,16 @@ pub async fn finish_pipeline_album_for_scheduler(
 
     if req.merge {
         emit_stage_started(reporter, &item_id, PipelineStage::Merge).await;
-        match merge_tracks(artifacts.take().expect("artifacts present"), &req, &staging, runner, cancel).await {
+        match merge_tracks_with_tool_limits(
+            artifacts.take().expect("artifacts present"),
+            &req,
+            &staging,
+            runner,
+            cancel,
+            tool_concurrency_limits.clone(),
+        )
+        .await
+        {
             Ok((merged_artifacts, record)) => {
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
@@ -3957,7 +4229,16 @@ pub async fn finish_pipeline_album_for_scheduler(
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
         } else {
-            match apply_metadata(artifacts.as_ref().expect("artifacts present"), source.as_ref().expect("source present"), &req, runner, cancel).await {
+            match apply_metadata_with_tool_limits(
+                artifacts.as_ref().expect("artifacts present"),
+                source.as_ref().expect("source present"),
+                &req,
+                runner,
+                cancel,
+                tool_concurrency_limits.clone(),
+            )
+            .await
+            {
                 Ok(record) => {
                     emit_stage_finished(reporter, &item_id, record.clone()).await;
                     stages.push(record);
@@ -3979,7 +4260,15 @@ pub async fn finish_pipeline_album_for_scheduler(
 
     if req.stages.replaygain == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
-        match apply_replaygain(artifacts.as_ref().expect("artifacts present"), &req, runner, cancel).await {
+        match apply_replaygain_with_tool_limits(
+            artifacts.as_ref().expect("artifacts present"),
+            &req,
+            runner,
+            cancel,
+            tool_concurrency_limits.clone(),
+        )
+        .await
+        {
             Ok(record) => {
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
@@ -4102,6 +4391,25 @@ pub async fn run_pipeline_item_with_tool_paths(
     reporter: &dyn PipelineReporter,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
+) -> PipelineReport {
+    run_pipeline_item_with_tool_paths_and_tool_limits(
+        req,
+        runner,
+        reporter,
+        cancel,
+        tool_paths,
+        None,
+    )
+    .await
+}
+
+pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
+    req: PipelineRequest,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> PipelineReport {
     let item_id = req.item_id.clone();
     let mut source = None;
@@ -4291,6 +4599,7 @@ pub async fn run_pipeline_item_with_tool_paths(
         cancel,
         Some(reporter),
         tool_paths,
+        tool_concurrency_limits.clone(),
     )
     .await;
     emit_stage_finished(reporter, &item_id, converted.record.clone()).await;
@@ -4338,12 +4647,13 @@ pub async fn run_pipeline_item_with_tool_paths(
 
     if req.merge {
         emit_stage_started(reporter, &item_id, PipelineStage::Merge).await;
-        match merge_tracks(
+        match merge_tracks_with_tool_limits(
             artifacts.take().expect("artifacts present"),
             &req,
             &staging,
             runner,
             cancel,
+            tool_concurrency_limits.clone(),
         )
         .await
         {
@@ -4384,12 +4694,13 @@ pub async fn run_pipeline_item_with_tool_paths(
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
         } else {
-            match apply_metadata(
+            match apply_metadata_with_tool_limits(
                 artifacts.as_ref().expect("artifacts present"),
                 source.as_ref().expect("source present"),
                 &req,
                 runner,
                 cancel,
+                tool_concurrency_limits.clone(),
             )
             .await
             {
@@ -4427,11 +4738,12 @@ pub async fn run_pipeline_item_with_tool_paths(
 
     if req.stages.replaygain == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
-        match apply_replaygain(
+        match apply_replaygain_with_tool_limits(
             artifacts.as_ref().expect("artifacts present"),
             &req,
             runner,
             cancel,
+            tool_concurrency_limits.clone(),
         )
         .await
         {
@@ -7172,6 +7484,61 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
+
+    #[tokio::test]
+    async fn realized_image_segment_waits_on_ffmpeg_family_limit_before_runner() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let req = phase_request(temp.path(), "input.flac");
+        let image = temp.path().join("image.flac");
+        std::fs::write(&image, b"fake image").expect("image file");
+        let staging = StagingDir::new(temp.path().join("staging"), req.job_id.clone());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let limits = std::sync::Arc::new(ToolConcurrencyLimits::new(4, 1, 4, 4));
+        let held_ffmpeg = limits.hold_ffmpeg_permit_for_test().await;
+        assert_eq!(limits.ffmpeg_available_permits_for_test(), 0);
+
+        let src = TrackSourceRef::ImageSegment {
+            image,
+            start_sample: 0,
+            samples: 44_100,
+        };
+        let (gate, blocker) = tool_gate();
+        let runner = std::sync::Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker),
+        ]));
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run_runner = runner.clone();
+        let run_limits = limits.clone();
+        let handle = tokio::spawn(async move {
+            realize_track_with_tool_limits(
+                &src,
+                &req,
+                &staging,
+                run_runner.as_ref(),
+                &run_cancel,
+                Some(run_limits),
+                None,
+            )
+            .await
+        });
+
+        let not_started = tokio::time::timeout(std::time::Duration::from_millis(25), gate.wait_started()).await;
+        assert!(
+            not_started.is_err(),
+            "realized image-segment FFmpeg work must wait on the shared FFmpeg-family semaphore before runner.run starts"
+        );
+        assert!(runner.transcript().is_empty());
+
+        cancel.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("blocked realization wakes after cancellation")
+            .expect("realization task joins")
+            .expect_err("cancelled semaphore wait aborts realization");
+        assert!(err.to_string().contains("cancelled"));
+        drop(held_ffmpeg);
+    }
 
     #[tokio::test]
     async fn cancellation_before_materialization_enters_no_phase_and_leaves_no_staging() {
