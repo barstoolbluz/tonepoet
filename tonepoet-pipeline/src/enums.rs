@@ -311,6 +311,25 @@ impl DsdRate {
         }
     }
 
+    /// Low-pass cutoff for DSD→PCM Auto conversion. Strips shaped noise above
+    /// the source DSD rate's clean audio bandwidth before rate conversion.
+    /// Applied as `sinc -<hz>` in the Auto path only — custom/Sinc paths
+    /// are unaffected.
+    ///
+    /// DSD512 and DSD1024 return `None` because their clean bandwidth
+    /// (192/384 kHz) meets or exceeds the default target PCM Nyquist
+    /// (176.4/352.8 kHz), so the rate conversion's anti-aliasing filter
+    /// handles noise suppression.
+    #[must_use]
+    pub const fn default_pcm_lowpass_hz(self) -> Option<u32> {
+        match self {
+            Self::Dsd64 => Some(25_000),
+            Self::Dsd128 => Some(48_000),
+            Self::Dsd256 => Some(96_000),
+            Self::Dsd512 | Self::Dsd1024 => None,
+        }
+    }
+
     /// Recommended noise shaper for PCM→DSD Auto preset at this rate.
     ///
     /// Higher rates allow lower-order modulators because the wider frequency

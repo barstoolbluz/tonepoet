@@ -874,6 +874,21 @@ impl FormatState {
         self.dither.select_value(&desired);
     }
 
+    /// Set PCM defaults when the source is DSD. Called when the user switches
+    /// from a DSD output format to a PCM output format while viewing a DSD source.
+    /// Sets the recommended target sample rate and 24-bit depth.
+    pub fn cascade_dsd_source_to_pcm_defaults(&mut self, source_sample_rate: u32) {
+        if self.is_dsd_selected() {
+            return;
+        }
+        let Some(dsd_rate) = tonepoet_pipeline::DsdRate::from_hz(source_sample_rate) else {
+            return;
+        };
+        let target_hz = dsd_rate.default_pcm_target_hz();
+        self.sample_rate.select_value(&target_hz);
+        self.bit_depth.select_value(&BitDepthChoice::Int24);
+    }
+
     /// Set noise shaper and modulator order to the recommended defaults for the
     /// current DSD rate. Called when the user switches to a DSD format or changes
     /// the DSD rate pill — not during constraint reapplication, so preset values
@@ -1121,6 +1136,10 @@ impl ConvertState {
     /// Source bit depth for format-pane side effects such as auto-dither.
     pub fn current_source_bit_depth(&self) -> Option<u32> {
         self.source.mode.current_bit_depth()
+    }
+
+    pub fn current_source_sample_rate(&self) -> Option<u32> {
+        self.source.mode.current_info().map(|info| info.sample_rate)
     }
 }
 

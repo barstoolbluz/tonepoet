@@ -1255,6 +1255,19 @@ fn add_sox_dsd_to_pcm_effects(
             args.push(target_rate_hz.to_string());
         }
         DsdLowpassMethod::Auto | DsdLowpassMethod::SoxUltra => {
+            // Strip DSD shaped noise before rate conversion. The cutoff is
+            // tied to the source DSD rate's clean audio bandwidth so the
+            // downstream PCM doesn't encode inaudible ultrasonic noise.
+            if let Some(source_hz) = context.request.source.sample_rate_hz {
+                if let Some(dsd_rate) = crate::enums::DsdRate::from_hz(source_hz) {
+                    if let Some(lowpass_hz) = dsd_rate.default_pcm_lowpass_hz() {
+                        args.push("sinc".into());
+                        args.push("-a".into());
+                        args.push("180".into());
+                        args.push(format!("-{lowpass_hz}"));
+                    }
+                }
+            }
             args.push("rate".into());
             args.push(
                 mapping::sox_dsd_lowpass_rate_flag(

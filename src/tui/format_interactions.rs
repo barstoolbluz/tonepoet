@@ -18,8 +18,10 @@ pub fn handle_format_row_step(format: &mut FormatState, forward: bool, source_bi
 
 /// Convert-screen wrapper that supplies the probed source bit depth.
 pub fn handle_convert_format_row_step(convert: &mut ConvertState, forward: bool) {
+    let before_dsd = convert.format.is_dsd_selected();
     let source_bits = convert.current_source_bit_depth();
     handle_format_row_step(&mut convert.format, forward, source_bits);
+    cascade_dsd_source_to_pcm(convert, before_dsd);
 }
 
 /// Apply a mouse click on a format-pane pill. Returns true when handled.
@@ -52,6 +54,23 @@ pub fn handle_format_button(
 
 /// Convert-screen wrapper that supplies the probed source bit depth.
 pub fn handle_convert_format_button(convert: &mut ConvertState, button: TuiButton) -> bool {
+    let before_dsd = convert.format.is_dsd_selected();
     let source_bits = convert.current_source_bit_depth();
-    handle_format_button(&mut convert.format, button, source_bits)
+    let handled = handle_format_button(&mut convert.format, button, source_bits);
+    if handled {
+        cascade_dsd_source_to_pcm(convert, before_dsd);
+    }
+    handled
+}
+
+/// If the format just changed from DSD to PCM and the source is a DSD file,
+/// auto-select the recommended PCM sample rate and 24-bit depth.
+fn cascade_dsd_source_to_pcm(convert: &mut ConvertState, was_dsd_before: bool) {
+    // Only cascade when transitioning FROM DSD output TO PCM output
+    if !was_dsd_before || convert.format.is_dsd_selected() {
+        return;
+    }
+    if let Some(source_rate) = convert.current_source_sample_rate() {
+        convert.format.cascade_dsd_source_to_pcm_defaults(source_rate);
+    }
 }
