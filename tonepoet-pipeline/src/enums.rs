@@ -311,6 +311,35 @@ impl DsdRate {
         }
     }
 
+    /// Recommended noise shaper for PCM→DSD Auto preset at this rate.
+    ///
+    /// Higher rates allow lower-order modulators because the wider frequency
+    /// space provides more room for shaped noise. DSD1024 uses SDM (simpler,
+    /// perfectly stable) rather than CLANS because the noise budget is enormous.
+    #[must_use]
+    pub const fn default_noise_shaper(self) -> DsdNoiseShaper {
+        match self {
+            Self::Dsd64 | Self::Dsd128 | Self::Dsd256 | Self::Dsd512 => DsdNoiseShaper::Clans,
+            Self::Dsd1024 => DsdNoiseShaper::Sdm,
+        }
+    }
+
+    /// Recommended modulator order for PCM→DSD Auto preset at this rate.
+    ///
+    /// DSD64 needs maximum shaping (8th order) because the noise budget is
+    /// tightest. Each doubling of rate allows one order less. DSD1024 uses
+    /// 4th order — ample headroom with minimal feedback complexity.
+    #[must_use]
+    pub const fn default_modulator_order(self) -> ModulatorOrder {
+        match self {
+            Self::Dsd64 => ModulatorOrder::Order8,
+            Self::Dsd128 => ModulatorOrder::Order7,
+            Self::Dsd256 => ModulatorOrder::Order6,
+            Self::Dsd512 => ModulatorOrder::Order5,
+            Self::Dsd1024 => ModulatorOrder::Order4,
+        }
+    }
+
     /// Parse a DSD rate from a sample rate in Hz.
     #[must_use]
     pub const fn from_hz(hz: u32) -> Option<Self> {

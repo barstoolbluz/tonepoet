@@ -830,10 +830,15 @@ impl FormatState {
             self.apply_format_constraints();
             if self.is_dsd_selected() {
                 self.dither.select_value(&DitherType::None);
+                self.cascade_dsd_rate_defaults();
             } else if !self.dither_overridden {
                 self.apply_auto_dither(source_bits);
             }
             return;
+        }
+
+        if row == FormatField::DsdRate {
+            self.cascade_dsd_rate_defaults();
         }
 
         if row == FormatField::BitDepth && before_depth != *self.bit_depth.selected_value() {
@@ -867,6 +872,17 @@ impl FormatState {
             DitherType::None
         };
         self.dither.select_value(&desired);
+    }
+
+    /// Set noise shaper and modulator order to the recommended defaults for the
+    /// current DSD rate. Called when the user switches to a DSD format or changes
+    /// the DSD rate pill — not during constraint reapplication, so preset values
+    /// and manual overrides are preserved.
+    fn cascade_dsd_rate_defaults(&mut self) {
+        if let Some(dsd_rate) = tonepoet_pipeline::DsdRate::from_hz(*self.sample_rate.selected_value()) {
+            self.noise_shaper.select_value(&dsd_rate.default_noise_shaper());
+            self.modulator_order.select_value(&dsd_rate.default_modulator_order());
+        }
     }
 
     /// Recalculate which options are enabled based on the selected format.
