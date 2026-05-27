@@ -36,7 +36,7 @@ use tonepoet_pipeline::{
 /// - target_format: Custom { extension: "sent", display_name: "Sentinel Audio" }
 /// - target_sample_rate: PcmHz(96_000)
 /// - target_bit_depth: Pcm(Float32)
-/// - resample_quality: Ultra
+/// - resample_quality: High
 /// - nyquist_transition: BrickWall
 /// - dither_type: Gesemann
 /// - preferred_tool: Custom("sentinel-tool")
@@ -88,7 +88,7 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
         },
         target_sample_rate: RateTarget::PcmHz(96_000),
         target_bit_depth: BitDepthTarget::Pcm(PcmBitDepth::Float32),
-        resample_quality: ResampleQuality::Ultra,
+        resample_quality: ResampleQuality::High,
         nyquist_transition: NyquistTransition::BrickWall,
         dither_type: DitherType::Gesemann,
         preferred_tool: PreferredTool::Custom("sentinel-tool".to_string()),
@@ -722,7 +722,7 @@ fn rich_legacy_flac_options() -> ConversionOptions {
     options.preserve_metadata = false;
     options.calculate_replaygain = true;
     options.replaygain_mode = Some(WizardReplayGainMode::Both);
-    options.resample_quality = Some(4);
+    options.resample_quality = Some(2);
     options.nyquist_transition = Some(WizardNyquistTransition::BrickWall);
     options.dither_type = Some(WizardDitherType::Gesemann);
     options.target_sample_rate = Some(96_000);
@@ -815,7 +815,7 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "target_format", flac.target_format, AudioFormat::Flac);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "target_sample_rate", flac.target_sample_rate, RateTarget::PcmHz(96_000));
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "target_bit_depth", flac.target_bit_depth, BitDepthTarget::Pcm(PcmBitDepth::Int24));
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "resample_quality", flac.resample_quality, ResampleQuality::Ultra);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "resample_quality", flac.resample_quality, ResampleQuality::High);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "nyquist_transition", flac.nyquist_transition, NyquistTransition::BrickWall);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "dither_type", flac.dither_type, DitherType::Gesemann);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "preferred_tool", flac.preferred_tool, PreferredTool::Sox);

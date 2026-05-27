@@ -696,9 +696,9 @@ impl FormatState {
         ]);
 
         let resampler = PillState::new(vec![
+            (ResamplerChoice::Soxr, "soxr"),
             (ResamplerChoice::Sox, "sox"),
             (ResamplerChoice::Ssrc, "ssrc"),
-            (ResamplerChoice::Soxr, "soxr"),
         ]);
 
         let dither = PillState::new(vec![
@@ -872,6 +872,39 @@ impl FormatState {
             DitherType::None
         };
         self.dither.select_value(&desired);
+    }
+
+    /// Set PCM output defaults to match a PCM source. Called when a source is
+    /// first probed or when the output format is PCM and source info becomes
+    /// available. Selects the closest available sample rate and bit depth pills,
+    /// then applies auto-dither based on the resulting source/target combination.
+    pub fn cascade_pcm_source_defaults(
+        &mut self,
+        source_sample_rate: u32,
+        source_bit_depth: Option<u32>,
+        source_is_float: bool,
+    ) {
+        if self.is_dsd_selected() {
+            return;
+        }
+        // Match source sample rate if it's in the pill options.
+        self.sample_rate.select_value(&source_sample_rate);
+        // Match source bit depth, preserving float vs integer distinction.
+        if let Some(bits) = source_bit_depth {
+            let depth = if source_is_float {
+                match bits {
+                    0..=32 => BitDepthChoice::Float32,
+                    _ => BitDepthChoice::Float64,
+                }
+            } else {
+                match bits {
+                    0..=16 => BitDepthChoice::Int16,
+                    17..=24 => BitDepthChoice::Int24,
+                    _ => BitDepthChoice::Int32,
+                }
+            };
+            self.bit_depth.select_value(&depth);
+        }
     }
 
     /// Set PCM defaults when the source is DSD. Called when the user switches
@@ -1140,6 +1173,28 @@ impl ConvertState {
 
     pub fn current_source_sample_rate(&self) -> Option<u32> {
         self.source.mode.current_info().map(|info| info.sample_rate)
+    }
+
+    /// Apply source-aware format pane defaults after a probe completes.
+    /// For PCM sources: matches sample rate and bit depth to source.
+    /// For DSD sources with PCM output: sets recommended target rate and 24-bit.
+    pub fn apply_source_defaults(&mut self) {
+        let Some(info) = self.source.mode.current_info() else {
+            return;
+        };
+        let source_rate = info.sample_rate;
+        let source_bits = info.bit_depth;
+        let source_is_float = info.codec.contains("Float");
+        let is_dsd_source = tonepoet_pipeline::DsdRate::from_hz(source_rate).is_some();
+
+        if is_dsd_source {
+            if !self.format.is_dsd_selected() {
+                self.format.cascade_dsd_source_to_pcm_defaults(source_rate);
+            }
+        } else {
+            self.format.cascade_pcm_source_defaults(source_rate, source_bits, source_is_float);
+        }
+        self.format.apply_auto_dither(source_bits);
     }
 }
 

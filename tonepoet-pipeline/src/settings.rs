@@ -59,7 +59,7 @@ impl Default for PipelineSettings {
             target_format: AudioFormat::Flac,
             target_sample_rate: RateTarget::Source,
             target_bit_depth: BitDepthTarget::Source,
-            resample_quality: ResampleQuality::High,
+            resample_quality: ResampleQuality::Ultra,
             nyquist_transition: NyquistTransition::Gentle,
             dither_type: DitherType::None,
             preferred_tool: PreferredTool::Auto,

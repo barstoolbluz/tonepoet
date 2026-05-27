@@ -369,6 +369,9 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         }
                         super::app::SourceMode::Empty => {}
                     }
+
+                    // Apply source-aware format defaults now that probe info is available.
+                    app.convert.apply_source_defaults();
                 }
                 Err(_) => {
                     // Cache the failure so we don't retry; renderer falls back

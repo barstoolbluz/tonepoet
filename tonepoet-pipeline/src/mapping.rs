@@ -9,11 +9,12 @@ use crate::enums::{
 use crate::error::{PlanningError, Result};
 use crate::settings::SsrcSettings;
 
-/// Map resample quality to SoXR precision.
+/// Map resample quality to SoXR precision (bits).
+/// Ultra uses precision=33, the maximum ffmpeg allows (~199 dB rejection).
 #[must_use]
 pub const fn soxr_precision(quality: ResampleQuality) -> u8 {
     match quality {
-        ResampleQuality::Ultra => 32,
+        ResampleQuality::Ultra => 33,
         ResampleQuality::VeryHigh => 28,
         ResampleQuality::High => 24,
         ResampleQuality::Medium => 20,
