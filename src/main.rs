@@ -723,7 +723,7 @@ fn add_item_to_queue(
 fn build_pipeline_request_template(
     output: &Option<PathBuf>,
     options: &ConversionOptions,
-    output_format: AudioFormat,
+    _output_format: AudioFormat,
     merge: bool,
     archive_password: &Option<String>,
     replaygain: &Option<String>,

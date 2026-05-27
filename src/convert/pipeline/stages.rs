@@ -29,8 +29,7 @@ use super::materializer_single::SingleFileMaterializer;
 use super::track_executor::execute_planned_track_conversion;
 use super::plan_bridge::orchestrator_metadata_stage_required;
 use super::progress::{
-    heartbeat, probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker,
-    StreamSource, StreamingHeartbeat,
+    heartbeat, OperationProgressTracker,
 };
 use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{CommandRecord, RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
@@ -1426,7 +1425,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     plan: &AlbumPlan,
     req: &PipelineRequest,
     staging: &StagingDir,
-    runner: &dyn ToolRunner,
+    _runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     reporter: Option<&dyn PipelineReporter>,
     tool_paths: &HashMap<String, PathBuf>,
@@ -1668,6 +1667,7 @@ async fn convert_one_track_work(
     }
 }
 
+#[allow(dead_code)]
 fn track_expected_duration(track: &PreparedTrack) -> Option<Duration> {
     if track.sample_rate == 0 {
         return None;
@@ -1729,6 +1729,7 @@ fn convert_track_message(
     )
 }
 
+#[allow(dead_code)]
 fn convert_track_failure_message(
     track_number: usize,
     total_tracks: usize,
@@ -3457,8 +3458,8 @@ pub async fn prepare_pipeline_item_for_scheduler(
 ) -> ScheduledMaterialization {
     let item_id = req.item_id.clone();
     let mut stages = Vec::new();
-    let mut source: Option<PreparedSource> = None;
-    let mut plan: Option<AlbumPlan> = None;
+    let source: Option<PreparedSource> = None;
+    let plan: Option<AlbumPlan> = None;
 
     if cancel.is_cancelled() {
         let outcome = AlbumOutcome::Blocked {

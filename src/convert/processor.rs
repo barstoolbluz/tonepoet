@@ -56,6 +56,7 @@ pub struct ProgressUpdate {
 }
 
 /// Helper to send phase progress updates.
+#[allow(dead_code)]
 async fn send_phase_update(
     tx: &broadcast::Sender<ProgressUpdate>,
     item_id: &str,
