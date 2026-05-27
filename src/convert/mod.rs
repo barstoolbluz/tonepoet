@@ -77,6 +77,9 @@ pub struct ConversionManager {
     pub config: ConversionConfig,
     paused: bool,
     stop_requested: bool,
+    /// Cancellation token for the active conversion run. Triggered by
+    /// `stop_all_conversions()` to kill in-flight child processes.
+    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 /// Configuration for the conversion system
@@ -147,6 +150,7 @@ impl ConversionManager {
             config,
             paused: false,
             stop_requested: false,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -330,10 +334,21 @@ impl ConversionManager {
         false
     }
 
-    /// Stop all conversions
+    /// Get a cancellation token for a new conversion run. Each call
+    /// replaces the stored token so the previous run's token becomes inert.
+    pub fn conversion_cancel_token(&mut self) -> tokio_util::sync::CancellationToken {
+        self.cancel_token = tokio_util::sync::CancellationToken::new();
+        self.stop_requested = false;
+        self.cancel_token.clone()
+    }
+
+    /// Stop all conversions by cancelling the active token and marking
+    /// queued items. The cancellation propagates through the worker pool
+    /// to kill in-flight SoX/ffmpeg child processes.
     pub fn stop_all_conversions(&mut self) {
         self.stop_requested = true;
         self.paused = false;
+        self.cancel_token.cancel();
         // Cancel all queued items
         if let Ok(mut queue) = self.queue.try_write() {
             for item in queue.all_items_mut() {

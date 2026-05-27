@@ -400,7 +400,7 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     }
 
     app.processing_active = true;
-    app.manager.clear_stop_request();
+    let cancel_token = app.manager.conversion_cancel_token();
 
     let queue = app.manager.queue.clone();
     let processor_config = crate::convert::ProcessorConfig {
@@ -413,6 +413,7 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         let mut processor = crate::convert::ConversionProcessor::new(processor_config);
+        processor.set_cancel_token(cancel_token);
 
         // Bridge progress broadcasts to the TUI event loop.
         let (progress_tx, mut progress_rx) =

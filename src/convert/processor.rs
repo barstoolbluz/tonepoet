@@ -45,6 +45,9 @@ pub struct ConversionProcessor {
     progress_tx: Option<broadcast::Sender<ProgressUpdate>>,
     pool_limits: PoolLimits,
     scheduler_metrics: Arc<SchedulerMetrics>,
+    /// External cancellation token from the TUI. When triggered, the
+    /// scheduler cancels all in-flight workers and kills child processes.
+    external_cancel: Option<CancellationToken>,
 }
 
 /// Progress update from a worker.
@@ -102,12 +105,19 @@ impl ConversionProcessor {
             progress_tx: None,
             pool_limits: PoolLimits::default(),
             scheduler_metrics: Arc::new(SchedulerMetrics::default()),
+            external_cancel: None,
         }
     }
 
     /// Set progress channel.
     pub fn set_progress_channel(&mut self, tx: broadcast::Sender<ProgressUpdate>) {
         self.progress_tx = Some(tx);
+    }
+
+    /// Set an external cancellation token from the TUI. When triggered,
+    /// the scheduler will cancel all workers and kill child processes.
+    pub fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.external_cancel = Some(token);
     }
 
     /// Set shared scheduler queue limits. Defaults to the legacy unbounded queue.
@@ -195,6 +205,7 @@ impl ConversionProcessor {
             self.config.worker_count.max(1),
             self.pool_limits,
             self.scheduler_metrics.clone(),
+            self.external_cancel.take(),
         )
         .await;
 
@@ -583,8 +594,9 @@ async fn run_queue_with_shared_orchestrator(
     worker_count: usize,
     pool_limits: PoolLimits,
     metrics: Arc<SchedulerMetrics>,
+    external_cancel: Option<CancellationToken>,
 ) -> Vec<(String, ConversionStatus, Option<f32>)> {
-    let cancel = CancellationToken::new();
+    let cancel = external_cancel.unwrap_or_else(CancellationToken::new);
     let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits_and_metrics(
         Some(worker_count.max(1)),
         cancel.clone(),
@@ -1197,6 +1209,7 @@ async fn run_single_item_with_shared_scheduler(
         worker_count.max(1),
         PoolLimits::default(),
         Arc::new(SchedulerMetrics::default()),
+        None,
     )
     .await;
 
