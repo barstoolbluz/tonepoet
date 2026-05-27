@@ -35,24 +35,20 @@ pub const fn sox_rate_quality_flag(quality: ResampleQuality) -> &'static str {
 }
 
 /// Map DSD auto presets to SoX's very-high-quality rate flag.
-/// sox_ng v14.6.1 supports -v (175 dB rejection, 95% bandwidth) but not -u.
 #[must_use]
 pub const fn sox_dsd_auto_rate_flag() -> &'static str {
     "-v"
 }
 
-/// Map a DSD low-pass policy to the SoX `rate` quality flag used when the
-/// path is not using the explicit sinc filter. `Auto` follows the normal
-/// resampling-quality setting; `SoxVeryHigh` pins SoX's very-high-quality path.
-/// sox_ng v14.6.1 supports -v (175 dB) but not -u.
+/// Map a DSD low-pass policy to the SoX `rate` quality flag.
+/// DSD paths use `-v` (very high quality) matching the original implementation.
 #[must_use]
 pub const fn sox_dsd_lowpass_rate_flag(
     lowpass: DsdLowpassMethod,
-    quality: ResampleQuality,
+    _quality: ResampleQuality,
 ) -> &'static str {
     match lowpass {
-        DsdLowpassMethod::SoxUltra => "-v",
-        DsdLowpassMethod::Auto => sox_rate_quality_flag(quality),
+        DsdLowpassMethod::Auto | DsdLowpassMethod::SoxUltra => "-v",
         DsdLowpassMethod::Sinc => "-v",
     }
 }

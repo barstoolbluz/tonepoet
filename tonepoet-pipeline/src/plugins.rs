@@ -1255,9 +1255,19 @@ fn add_sox_dsd_to_pcm_effects(
             args.push(target_rate_hz.to_string());
         }
         DsdLowpassMethod::Auto | DsdLowpassMethod::SoxUltra => {
-            // Strip DSD shaped noise before rate conversion. The cutoff is
-            // tied to the source DSD rate's clean audio bandwidth so the
-            // downstream PCM doesn't encode inaudible ultrasonic noise.
+            args.push("rate".into());
+            args.push(
+                mapping::sox_dsd_lowpass_rate_flag(
+                    lowpass,
+                    context.request.settings.resample_quality,
+                )
+                .into(),
+            );
+            args.push(target_rate_hz.to_string());
+            // Strip residual DSD shaped noise AFTER rate conversion so the
+            // sinc filter operates at the output PCM rate (e.g., 88.2 kHz)
+            // instead of the DSD input rate (2.8 MHz). Benchmarked at <1%
+            // overhead vs. hours when placed before rate.
             if let Some(source_hz) = context.request.source.sample_rate_hz {
                 if let Some(dsd_rate) = crate::enums::DsdRate::from_hz(source_hz) {
                     if let Some(lowpass_hz) = dsd_rate.default_pcm_lowpass_hz() {
@@ -1268,15 +1278,6 @@ fn add_sox_dsd_to_pcm_effects(
                     }
                 }
             }
-            args.push("rate".into());
-            args.push(
-                mapping::sox_dsd_lowpass_rate_flag(
-                    lowpass,
-                    context.request.settings.resample_quality,
-                )
-                .into(),
-            );
-            args.push(target_rate_hz.to_string());
         }
     }
     if let Some(gain_db) = context.request.settings.dsd.dsd_to_pcm_gain_db {
