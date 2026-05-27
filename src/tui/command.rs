@@ -3739,6 +3739,7 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
                 }
             }
             app.convert.source.mode = mode;
+            app.convert.apply_source_defaults();
             app.recent.record_use_with_db(&first, &app.db);
 
             // Persist batch state for crash recovery.
