@@ -920,6 +920,7 @@ impl FormatState {
         let target_hz = dsd_rate.default_pcm_target_hz();
         self.sample_rate.select_value(&target_hz);
         self.bit_depth.select_value(&BitDepthChoice::Int24);
+        self.resampler.select_value(&ResamplerChoice::Sox);
     }
 
     /// Set noise shaper and modulator order to the recommended defaults for the
