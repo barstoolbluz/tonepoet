@@ -812,7 +812,7 @@ fn build_sox_encode_pcm(
 ) -> Result<PlannedCommand> {
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec![input];
+    let mut args = vec!["-S".into(), input];
     add_sox_output_format_args(context, &mut args, target_format, target_depth);
     args.push(output);
     if apply_processing {
@@ -837,7 +837,7 @@ fn build_sox_encode_lossy(
 ) -> Result<PlannedCommand> {
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec![input];
+    let mut args = vec!["-S".into(), input];
     match target_format {
         AudioFormat::Mp3 => {
             args.push("-C".into());
@@ -880,7 +880,7 @@ fn build_sox_resample(
 ) -> Result<PlannedCommand> {
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec![input];
+    let mut args = vec!["-S".into(), input];
     if let Some(depth) = target_depth {
         add_sox_bit_depth_args(&mut args, depth);
     }
@@ -911,7 +911,7 @@ fn build_sox_pcm_to_dsd(
     }
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec![input, output];
+    let mut args = vec!["-S".into(), input, output];
     add_sox_pcm_to_dsd_effects(context, &mut args, target_rate, filter);
     Ok(PlannedCommand::new(
         ToolIdentifier::Sox,
@@ -939,7 +939,7 @@ fn build_sox_dsd_to_pcm(
     }
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec![input];
+    let mut args = vec!["-S".into(), input];
     add_sox_output_format_args(context, &mut args, target_format, target_depth);
     args.push(output);
     add_sox_dsd_to_pcm_effects(context, &mut args, target_rate_hz, target_depth, lowpass);
@@ -968,7 +968,7 @@ fn build_sox_dsd_rate_change(
     }
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec![input, output];
+    let mut args = vec!["-S".into(), input, output];
     add_sox_dsd_rate_change_effects(context, &mut args, target_rate, lowpass);
     Ok(PlannedCommand::new(
         ToolIdentifier::Sox,
