@@ -29,7 +29,7 @@ pub use formats::{
 };
 pub use labels::{detect_pressing_info, LabelInfo};
 pub use metadata::{extract_metadata_from_flac, extract_year_from_flac_files, FlacMetadata};
-pub use processor::{process_item, ConversionProcessor, ProcessorConfig, ProgressUpdate};
+pub use processor::{process_item, ConversionProcessor, LifecycleEvent, ProcessorConfig, ProgressUpdate};
 pub use queue::{ConversionItem, ConversionPhase, ConversionQueue, ConversionStatus};
 pub use renaming::{
     apply_all_tags, apply_folder_renaming, rename_audio_files, update_album_tags, update_title_tags,
@@ -303,14 +303,31 @@ impl ConversionManager {
         }
     }
 
+    fn record_closed_track_epoch(item: &mut ConversionItem, track_index: u32, epoch: u64) {
+        item.closed_track_epochs
+            .entry(track_index)
+            .and_modify(|closed| *closed = (*closed).max(epoch))
+            .or_insert(epoch);
+    }
+
+    fn record_and_clear_active_tracks(item: &mut ConversionItem) {
+        let epochs: Vec<(u32, u64)> = item
+            .active_tracks
+            .iter()
+            .map(|(track_index, progress)| (*track_index, progress.epoch))
+            .collect();
+        for (track_index, epoch) in epochs {
+            Self::record_closed_track_epoch(item, track_index, epoch);
+        }
+        item.active_tracks.clear();
+    }
+
     /// Update item status by ID
     pub fn update_item_status(&self, id: &str, status: ConversionStatus, _progress: f32) -> bool {
         if let Ok(mut queue) = self.queue.try_write() {
             if let Some(item) = queue.find_item_mut(id) {
                 // Clear per-track sub-lines when the item-level phase moves
                 // past Converting (e.g. into Tagging, PostProcessing, Finalizing).
-                // Track workers don't emit terminal events, so these rows would
-                // otherwise persist through the album-level stages.
                 if !item.active_tracks.is_empty() {
                     let new_phase = match &status {
                         ConversionStatus::Processing { phase, .. } => *phase,
@@ -323,7 +340,7 @@ impl ConversionManager {
                             | Some(crate::convert::ConversionPhase::Finalizing)
                     ) || !matches!(&status, ConversionStatus::Processing { .. });
                     if dominated {
-                        item.active_tracks.clear();
+                        Self::record_and_clear_active_tracks(item);
                     }
                 }
 
@@ -338,7 +355,8 @@ impl ConversionManager {
                     | ConversionStatus::Partial { .. }
                     | ConversionStatus::Failed { .. }
                     | ConversionStatus::Cancelled => {
-                        item.active_tracks.clear();
+                        Self::record_and_clear_active_tracks(item);
+                        item.closed_track_epochs.clear();
                         item.completed_at = Some(chrono::Utc::now());
                         match &status {
                             ConversionStatus::Completed { output_path, .. }
@@ -366,16 +384,56 @@ impl ConversionManager {
         track_index: u32,
         status: &ConversionStatus,
         progress: f32,
+        track_epoch: Option<u64>,
     ) {
+        let Some(incoming_epoch) = track_epoch else {
+            return;
+        };
+
         if let Ok(mut queue) = self.queue.try_write() {
             if let Some(item) = queue.find_item_mut(id) {
+                if matches!(
+                    item.closed_track_epochs.get(&track_index),
+                    Some(closed_epoch) if *closed_epoch >= incoming_epoch
+                ) {
+                    return;
+                }
+                if matches!(
+                    item.active_tracks.get(&track_index),
+                    Some(active) if active.epoch > incoming_epoch
+                ) {
+                    return;
+                }
+
                 if let ConversionStatus::Processing { message, phase, phase_progress, .. } = status {
+                    // Track rows are only valid while the parent item can still be in
+                    // track conversion. Epoch checks cover known cleared generations;
+                    // this state gate also rejects delayed ticks when no prior row
+                    // existed from which a closed epoch could be recorded.
+                    if matches!(
+                        &item.status,
+                        ConversionStatus::Processing {
+                            phase: Some(
+                                ConversionPhase::Tagging
+                                    | ConversionPhase::PostProcessing
+                                    | ConversionPhase::Finalizing,
+                            ),
+                            ..
+                        } | ConversionStatus::Completed { .. }
+                            | ConversionStatus::Partial { .. }
+                            | ConversionStatus::Failed { .. }
+                            | ConversionStatus::Cancelled
+                    ) {
+                        return;
+                    }
+
                     let msg = message.as_deref().unwrap_or("");
                     let (label, step, tool_pct) = parse_track_message(msg);
                     item.active_tracks.insert(track_index, crate::convert::queue::TrackProgress {
                         track_label: label,
                         step_description: step,
                         progress_fraction: tool_pct,
+                        epoch: incoming_epoch,
                     });
                     // Advance the item progress bar so it doesn't freeze during encoding.
                     // Use the overall windowed progress which advances monotonically.
@@ -393,9 +451,38 @@ impl ConversionManager {
                         *item_phase_progress = *phase_progress;
                     }
                 } else {
-                    // Track finished or failed — remove its row.
+                    let cleared_epoch = item
+                        .active_tracks
+                        .get(&track_index)
+                        .map(|active| active.epoch.max(incoming_epoch))
+                        .unwrap_or(incoming_epoch);
+                    Self::record_closed_track_epoch(item, track_index, cleared_epoch);
                     item.active_tracks.remove(&track_index);
                 }
+            }
+        }
+    }
+
+    pub fn clear_track_progress(&self, id: &str, track_index: u32, track_epoch: u64) {
+        if let Ok(mut queue) = self.queue.try_write() {
+            if let Some(item) = queue.find_item_mut(id) {
+                if matches!(
+                    &item.status,
+                    ConversionStatus::Completed { .. }
+                        | ConversionStatus::Partial { .. }
+                        | ConversionStatus::Failed { .. }
+                        | ConversionStatus::Cancelled
+                ) {
+                    return;
+                }
+                if matches!(
+                    item.active_tracks.get(&track_index),
+                    Some(active) if active.epoch > track_epoch
+                ) {
+                    return;
+                }
+                Self::record_closed_track_epoch(item, track_index, track_epoch);
+                item.active_tracks.remove(&track_index);
             }
         }
     }
@@ -716,4 +803,230 @@ fn parse_track_message(message: &str) -> (String, String, f32) {
     }
 
     (core.to_string(), String::new(), tool_pct)
+}
+
+#[cfg(test)]
+mod per_track_epoch_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_manager_with_item() -> (ConversionManager, String) {
+        let manager = ConversionManager::new(ConversionConfig::default());
+        let mut item = ConversionItem::default();
+        item.id = "item-1".to_string();
+        item.input_path = PathBuf::from("/tmp/input.flac");
+        item.status = ConversionStatus::Processing {
+            progress: 0.0,
+            message: Some("Starting".to_string()),
+            file_progress: None,
+            phase: Some(ConversionPhase::Converting),
+            phase_progress: Some(0.0),
+        };
+        manager
+            .queue
+            .try_write()
+            .expect("queue write lock")
+            .items_mut()
+            .push_back(item);
+        (manager, "item-1".to_string())
+    }
+
+    fn processing_status(message: &str, progress: f32, phase: ConversionPhase) -> ConversionStatus {
+        ConversionStatus::Processing {
+            progress,
+            message: Some(message.to_string()),
+            file_progress: None,
+            phase: Some(phase),
+            phase_progress: Some(progress),
+        }
+    }
+
+    #[test]
+    fn stale_track_epoch_is_rejected_after_newer_clear() {
+        let (manager, item_id) = test_manager_with_item();
+        let (progress_tx, _progress_rx) = tokio::sync::broadcast::channel(4);
+        let old_reporter = crate::convert::pipeline::BroadcastReporter::new(
+            progress_tx.clone(),
+            None,
+            item_id.clone(),
+            Some(0),
+        );
+        let new_reporter = crate::convert::pipeline::BroadcastReporter::new(
+            progress_tx,
+            None,
+            item_id.clone(),
+            Some(0),
+        );
+        let old_epoch = old_reporter.track_epoch().expect("old reporter epoch");
+        let new_epoch = new_reporter.track_epoch().expect("new reporter epoch");
+        assert!(old_epoch < new_epoch);
+
+        let old_update = processing_status(
+            "Track 1 - step 1 of 2 - encoding · 10% of current track",
+            25.0,
+            ConversionPhase::Converting,
+        );
+        manager.update_track_progress(&item_id, 0, &old_update, 25.0, Some(old_epoch));
+        manager.clear_track_progress(&item_id, 0, new_epoch);
+        manager.update_track_progress(&item_id, 0, &old_update, 25.0, Some(old_epoch));
+
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let item = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item exists");
+        assert!(item.active_tracks.get(&0).is_none());
+        assert_eq!(item.closed_track_epochs.get(&0), Some(&new_epoch));
+    }
+
+    #[test]
+    fn item_terminal_status_clears_active_tracks_and_closed_epochs() {
+        let (manager, item_id) = test_manager_with_item();
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue.find_item_mut(&item_id).expect("item exists");
+            item.active_tracks.insert(
+                0,
+                crate::convert::queue::TrackProgress {
+                    track_label: "Track 1".to_string(),
+                    step_description: "encoding".to_string(),
+                    progress_fraction: 0.5,
+                    epoch: 7,
+                },
+            );
+            item.closed_track_epochs.insert(0, 7);
+        }
+
+        assert!(manager.update_item_status(
+            &item_id,
+            ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            },
+            100.0,
+        ));
+
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let item = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item exists");
+        assert!(item.active_tracks.is_empty());
+        assert!(item.closed_track_epochs.is_empty());
+    }
+
+    #[test]
+    fn phase_change_backstop_clears_active_tracks_and_records_epochs() {
+        let (manager, item_id) = test_manager_with_item();
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue.find_item_mut(&item_id).expect("item exists");
+            item.active_tracks.insert(
+                0,
+                crate::convert::queue::TrackProgress {
+                    track_label: "Track 1".to_string(),
+                    step_description: "encoding".to_string(),
+                    progress_fraction: 0.5,
+                    epoch: 7,
+                },
+            );
+        }
+
+        assert!(manager.update_item_status(
+            &item_id,
+            processing_status("Writing metadata", 85.0, ConversionPhase::Tagging),
+            85.0,
+        ));
+
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let item = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item exists");
+        assert!(item.active_tracks.is_empty());
+        assert_eq!(item.closed_track_epochs.get(&0), Some(&7));
+    }
+
+    #[test]
+    fn delayed_track_processing_after_tagging_is_rejected() {
+        let (manager, item_id) = test_manager_with_item();
+        assert!(manager.update_item_status(
+            &item_id,
+            processing_status("Writing metadata", 85.0, ConversionPhase::Tagging),
+            85.0,
+        ));
+
+        let delayed_update = processing_status(
+            "Track 1 - step 1 of 2 - encoding · 10% of current track",
+            45.0,
+            ConversionPhase::Converting,
+        );
+        manager.update_track_progress(&item_id, 0, &delayed_update, 45.0, Some(99));
+
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let item = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item exists");
+        assert!(item.active_tracks.is_empty());
+        assert!(item.closed_track_epochs.is_empty());
+    }
+
+    #[test]
+    fn delayed_track_processing_after_terminal_is_rejected() {
+        let (manager, item_id) = test_manager_with_item();
+        assert!(manager.update_item_status(
+            &item_id,
+            ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            },
+            100.0,
+        ));
+
+        let delayed_update = processing_status(
+            "Track 1 - step 1 of 2 - encoding · 10% of current track",
+            45.0,
+            ConversionPhase::Converting,
+        );
+        manager.update_track_progress(&item_id, 0, &delayed_update, 45.0, Some(99));
+
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let item = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item exists");
+        assert!(item.active_tracks.is_empty());
+        assert!(item.closed_track_epochs.is_empty());
+    }
+
+
+    #[test]
+    fn delayed_clear_track_after_terminal_does_not_record_closed_epoch() {
+        let (manager, item_id) = test_manager_with_item();
+        assert!(manager.update_item_status(
+            &item_id,
+            ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            },
+            100.0,
+        ));
+
+        manager.clear_track_progress(&item_id, 0, 99);
+
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let item = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item exists");
+        assert!(item.active_tracks.is_empty());
+        assert!(item.closed_track_epochs.is_empty());
+    }
 }

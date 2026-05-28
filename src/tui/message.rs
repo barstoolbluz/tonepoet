@@ -63,8 +63,15 @@ pub enum AppMessage {
     ConversionProgress {
         item_id: String,
         track_index: Option<u32>,
+        track_epoch: Option<u64>,
         progress: f32,
         status: crate::convert::ConversionStatus,
+    },
+    /// A track-scoped worker ended without relying on broadcast delivery.
+    ClearTrackProgress {
+        item_id: String,
+        track_index: u32,
+        track_epoch: u64,
     },
     /// All conversions completed
     ConversionComplete { completed: usize, failed: usize },

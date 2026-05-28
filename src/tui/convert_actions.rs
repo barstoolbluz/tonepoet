@@ -9,10 +9,78 @@ use crate::convert::formats::{
 use crate::convert::simple_wizard::ReplayGainMode;
 use tonepoet_pipeline::enums as pipeline_enums;
 use tonepoet_pipeline::PipelineSettings;
-use crate::convert::ConversionStatus;
+use crate::convert::{ConversionStatus, LifecycleEvent, ProgressUpdate};
 
 use super::app::*;
 use super::message::AppMessage;
+
+
+fn progress_to_app_message(update: ProgressUpdate) -> AppMessage {
+    AppMessage::ConversionProgress {
+        item_id: update.item_id,
+        track_index: update.track_index,
+        track_epoch: update.track_epoch,
+        progress: update.progress,
+        status: update.status,
+    }
+}
+
+fn lifecycle_to_app_message(event: LifecycleEvent) -> AppMessage {
+    match event {
+        LifecycleEvent::ClearTrack {
+            item_id,
+            track_index,
+            track_epoch,
+        } => AppMessage::ClearTrackProgress {
+            item_id,
+            track_index,
+            track_epoch,
+        },
+        LifecycleEvent::ItemTerminal {
+            item_id,
+            progress,
+            status,
+        } => AppMessage::ConversionProgress {
+            item_id,
+            track_index: None,
+            track_epoch: None,
+            progress,
+            status,
+        },
+    }
+}
+
+async fn forward_conversion_events(
+    mut progress_rx: tokio::sync::broadcast::Receiver<ProgressUpdate>,
+    mut lifecycle_rx: mpsc::UnboundedReceiver<LifecycleEvent>,
+    ui_tx: mpsc::Sender<AppMessage>,
+) {
+    let mut progress_closed = false;
+    let mut lifecycle_closed = false;
+
+    while !progress_closed || !lifecycle_closed {
+        tokio::select! {
+            lifecycle = lifecycle_rx.recv(), if !lifecycle_closed => {
+                match lifecycle {
+                    Some(event) => {
+                        let _ = ui_tx.try_send(lifecycle_to_app_message(event));
+                    }
+                    None => lifecycle_closed = true,
+                }
+            }
+            progress = progress_rx.recv(), if !progress_closed => {
+                match progress {
+                    Ok(update) => {
+                        let _ = ui_tx.try_send(progress_to_app_message(update));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => progress_closed = true,
+                }
+            }
+            else => break,
+        }
+    }
+}
 
 /// Build ConversionOptions from current pill and pane state.
 ///
@@ -415,27 +483,15 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         let mut processor = crate::convert::ConversionProcessor::new(processor_config);
         processor.set_cancel_token(cancel_token);
 
-        // Bridge progress broadcasts to the TUI event loop.
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::broadcast::channel::<crate::convert::ProgressUpdate>(256);
+        // Bridge progress broadcasts and lifecycle events to the TUI event loop.
+        let (progress_tx, progress_rx) = tokio::sync::broadcast::channel::<ProgressUpdate>(256);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel::<LifecycleEvent>();
         processor.set_progress_channel(progress_tx);
+        processor.set_lifecycle_channel(lifecycle_tx);
 
         let ui_tx = tx_clone.clone();
         let progress_forwarder = tokio::spawn(async move {
-            loop {
-                match progress_rx.recv().await {
-                    Ok(update) => {
-                        let _ = ui_tx.try_send(AppMessage::ConversionProgress {
-                            item_id: update.item_id,
-                            track_index: update.track_index,
-                            progress: update.progress,
-                            status: update.status,
-                        });
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
+            forward_conversion_events(progress_rx, lifecycle_rx, ui_tx).await;
         });
 
         if let Err(e) = processor
@@ -477,4 +533,136 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
                 .await;
         }
     });
+}
+
+#[cfg(test)]
+mod lifecycle_forwarder_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn processing_update(item_id: &str, progress: f32) -> ProgressUpdate {
+        ProgressUpdate {
+            item_id: item_id.to_string(),
+            track_index: Some(0),
+            track_epoch: Some(1),
+            progress,
+            status: ConversionStatus::Processing {
+                progress,
+                message: Some(format!("Track 1 - step 1 of 1 - encoding · {progress}% of current track")),
+                file_progress: None,
+                phase: Some(crate::convert::ConversionPhase::Converting),
+                phase_progress: Some(progress),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn dual_channel_forwarder_skips_lagged_progress_and_forwards_lifecycle() {
+        let (progress_tx, progress_rx) = tokio::sync::broadcast::channel(1);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::channel(8);
+
+        let _ = progress_tx.send(processing_update("stale", 10.0));
+        let _ = progress_tx.send(processing_update("fresh", 20.0));
+        lifecycle_tx
+            .send(LifecycleEvent::ClearTrack {
+                item_id: "item-1".to_string(),
+                track_index: 2,
+                track_epoch: 9,
+            })
+            .expect("lifecycle send succeeds");
+        drop(progress_tx);
+        drop(lifecycle_tx);
+
+        forward_conversion_events(progress_rx, lifecycle_rx, ui_tx).await;
+
+        let mut saw_fresh_progress = false;
+        let mut saw_stale_progress = false;
+        let mut saw_clear = false;
+        while let Ok(message) = ui_rx.try_recv() {
+            match message {
+                AppMessage::ConversionProgress { item_id, progress, .. } => {
+                    if item_id == "fresh" && (progress - 20.0).abs() < f32::EPSILON {
+                        saw_fresh_progress = true;
+                    }
+                    if item_id == "stale" {
+                        saw_stale_progress = true;
+                    }
+                }
+                AppMessage::ClearTrackProgress {
+                    item_id,
+                    track_index,
+                    track_epoch,
+                } => {
+                    saw_clear = item_id == "item-1" && track_index == 2 && track_epoch == 9;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_fresh_progress);
+        assert!(!saw_stale_progress);
+        assert!(saw_clear);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_forwarder_does_not_block_when_ui_channel_is_full() {
+        let (progress_tx, progress_rx) = tokio::sync::broadcast::channel(1);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::channel(1);
+        ui_tx
+            .try_send(AppMessage::StatusMessage("filled".to_string()))
+            .expect("pre-fill UI channel");
+
+        let handle = tokio::spawn(forward_conversion_events(progress_rx, lifecycle_rx, ui_tx));
+        lifecycle_tx
+            .send(LifecycleEvent::ClearTrack {
+                item_id: "item-1".to_string(),
+                track_index: 0,
+                track_epoch: 1,
+            })
+            .expect("lifecycle send succeeds");
+        drop(progress_tx);
+        drop(lifecycle_tx);
+
+        tokio::time::timeout(std::time::Duration::from_millis(10), handle)
+            .await
+            .expect("forwarder exits without waiting for UI capacity")
+            .expect("forwarder task succeeds");
+
+        match ui_rx.try_recv().expect("original fill message remains") {
+            AppMessage::StatusMessage(value) => assert_eq!(value, "filled"),
+            other => panic!("expected original status message, got {other:?}"),
+        }
+        assert!(ui_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn lifecycle_item_terminal_maps_to_item_progress_message() {
+        let message = lifecycle_to_app_message(LifecycleEvent::ItemTerminal {
+            item_id: "item-1".to_string(),
+            progress: 100.0,
+            status: ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            },
+        });
+
+        match message {
+            AppMessage::ConversionProgress {
+                item_id,
+                track_index,
+                track_epoch,
+                progress,
+                status,
+            } => {
+                assert_eq!(item_id, "item-1");
+                assert_eq!(track_index, None);
+                assert_eq!(track_epoch, None);
+                assert_eq!(progress, 100.0);
+                assert!(matches!(status, ConversionStatus::Completed { .. }));
+            }
+            other => panic!("expected item progress message, got {other:?}"),
+        }
+    }
 }

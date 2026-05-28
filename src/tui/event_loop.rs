@@ -170,15 +170,25 @@ fn check_pending_browse_rename(app: &mut AppState) {
 /// Handle async messages from background tasks
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
+        AppMessage::ClearTrackProgress {
+            item_id,
+            track_index,
+            track_epoch,
+        } => {
+            app.manager
+                .clear_track_progress(&item_id, track_index, track_epoch);
+        }
         AppMessage::ConversionProgress {
             item_id,
             track_index,
+            track_epoch,
             progress,
             status,
         } => {
             // Track-scoped updates only affect display sub-lines.
             if let Some(idx) = track_index {
-                app.manager.update_track_progress(&item_id, idx, &status, progress);
+                app.manager
+                    .update_track_progress(&item_id, idx, &status, progress, track_epoch);
                 return;
             }
 

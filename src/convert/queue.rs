@@ -3,7 +3,7 @@
 use super::formats::{AudioFormat, ConversionOptions, FileFormat};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 /// Phases of conversion process
@@ -131,6 +131,7 @@ pub struct TrackProgress {
     pub track_label: String,
     pub step_description: String,
     pub progress_fraction: f32,
+    pub epoch: u64,
 }
 
 /// A single item in the conversion queue
@@ -176,7 +177,10 @@ pub struct ConversionItem {
     /// Per-track progress for multi-track sources. Keyed by track_index.
     /// Transient display state only — not serialized.
     #[serde(skip)]
-    pub active_tracks: std::collections::BTreeMap<u32, TrackProgress>,
+    pub active_tracks: BTreeMap<u32, TrackProgress>,
+    /// Highest epoch cleared per track_index. Transient display guard state.
+    #[serde(skip)]
+    pub closed_track_epochs: BTreeMap<u32, u64>,
 }
 
 impl Default for ConversionItem {
@@ -197,7 +201,8 @@ impl Default for ConversionItem {
             archive_password: None,
             pipeline_settings: None,
             pipeline_request: None,
-            active_tracks: std::collections::BTreeMap::new(),
+            active_tracks: BTreeMap::new(),
+            closed_track_epochs: BTreeMap::new(),
         }
     }
 }
@@ -227,7 +232,8 @@ impl ConversionItem {
             archive_password,
             pipeline_settings,
             pipeline_request: None,
-            active_tracks: std::collections::BTreeMap::new(),
+            active_tracks: BTreeMap::new(),
+            closed_track_epochs: BTreeMap::new(),
         }
     }
 

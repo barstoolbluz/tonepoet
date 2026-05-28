@@ -4,11 +4,15 @@
 //! `PipelineReporter`. Tests subscribe to a `RecordingReporter` to
 //! prove terminal-event ordering directly.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+use tokio::sync::mpsc;
 
 use async_trait::async_trait;
 
 use super::types::{PipelineStage, StageOutcome, StageRecord};
+use crate::convert::processor::LifecycleEvent;
 use crate::convert::ConversionStatus;
 
 #[derive(Debug, Clone)]
@@ -73,6 +77,8 @@ impl PipelineReporter for RecordingReporter {
 // TUI broadcast reporter
 // ===========================================================================
 
+static NEXT_TRACK_EPOCH: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Clone, Copy)]
 struct StageProgressWindow {
     phase: crate::convert::ConversionPhase,
@@ -108,23 +114,42 @@ impl Default for BroadcastReporterState {
 /// terminal states.
 pub struct BroadcastReporter {
     tx: tokio::sync::broadcast::Sender<crate::convert::ProgressUpdate>,
+    lifecycle_tx: Option<mpsc::UnboundedSender<LifecycleEvent>>,
     item_id: String,
     track_index: Option<u32>,
+    track_epoch: Option<u64>,
     state: std::sync::Mutex<BroadcastReporterState>,
 }
 
 impl BroadcastReporter {
     pub fn new(
         tx: tokio::sync::broadcast::Sender<crate::convert::ProgressUpdate>,
+        lifecycle_tx: Option<mpsc::UnboundedSender<LifecycleEvent>>,
         item_id: impl Into<String>,
         track_index: Option<u32>,
     ) -> Self {
+        let track_epoch = track_index.map(|_| NEXT_TRACK_EPOCH.fetch_add(1, Ordering::Relaxed));
         Self {
             tx,
+            lifecycle_tx,
             item_id: item_id.into(),
             track_index,
+            track_epoch,
             state: std::sync::Mutex::new(BroadcastReporterState::default()),
         }
+    }
+
+    pub fn track_epoch(&self) -> Option<u64> {
+        self.track_epoch
+    }
+
+    pub fn track_lifecycle_guard(&self) -> TrackProgressLifecycleGuard {
+        TrackProgressLifecycleGuard::new(
+            self.lifecycle_tx.clone(),
+            self.item_id.clone(),
+            self.track_index,
+            self.track_epoch,
+        )
     }
 
     fn window(stage: PipelineStage) -> StageProgressWindow {
@@ -284,6 +309,7 @@ impl BroadcastReporter {
         let _ = self.tx.send(crate::convert::ProgressUpdate {
             item_id: self.item_id.clone(),
             track_index: self.track_index,
+            track_epoch: self.track_epoch,
             progress,
             status: crate::convert::ConversionStatus::Processing {
                 progress,
@@ -315,11 +341,77 @@ impl BroadcastReporter {
             progress
         };
 
+        if self.track_index.is_none() {
+            if let Some(tx) = &self.lifecycle_tx {
+                if tx
+                    .send(LifecycleEvent::ItemTerminal {
+                        item_id: self.item_id.clone(),
+                        progress,
+                        status: status.clone(),
+                    })
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+
         let _ = self.tx.send(crate::convert::ProgressUpdate {
             item_id: self.item_id.clone(),
             track_index: self.track_index,
+            track_epoch: self.track_epoch,
             progress,
             status,
+        });
+    }
+}
+
+pub struct TrackProgressLifecycleGuard {
+    lifecycle_tx: Option<mpsc::UnboundedSender<LifecycleEvent>>,
+    item_id: String,
+    track_index: Option<u32>,
+    track_epoch: Option<u64>,
+    armed: bool,
+}
+
+impl TrackProgressLifecycleGuard {
+    fn new(
+        lifecycle_tx: Option<mpsc::UnboundedSender<LifecycleEvent>>,
+        item_id: String,
+        track_index: Option<u32>,
+        track_epoch: Option<u64>,
+    ) -> Self {
+        let armed = lifecycle_tx.is_some() && track_index.is_some() && track_epoch.is_some();
+        Self {
+            lifecycle_tx,
+            item_id,
+            track_index,
+            track_epoch,
+            armed,
+        }
+    }
+
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TrackProgressLifecycleGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (Some(tx), Some(track_index), Some(track_epoch)) = (
+            self.lifecycle_tx.as_ref(),
+            self.track_index,
+            self.track_epoch,
+        ) else {
+            return;
+        };
+        let _ = tx.send(LifecycleEvent::ClearTrack {
+            item_id: self.item_id.clone(),
+            track_index,
+            track_epoch,
         });
     }
 }
@@ -412,7 +504,7 @@ mod broadcast_reporter_tests {
         tokio::sync::broadcast::Receiver<crate::convert::ProgressUpdate>,
     ) {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
-        (BroadcastReporter::new(tx, "item-1", None), rx)
+        (BroadcastReporter::new(tx, None, "item-1", None), rx)
     }
 
     async fn next_update(
@@ -665,10 +757,135 @@ mod broadcast_reporter_tests {
     }
 
     #[tokio::test]
+    async fn item_level_reporter_emits_item_terminal_on_lifecycle_channel() {
+        let (progress_tx, mut progress_rx) = tokio::sync::broadcast::channel(4);
+        let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reporter = BroadcastReporter::new(progress_tx, Some(lifecycle_tx), "item-1", None);
+
+        reporter
+            .emit(PipelineEvent::Terminal {
+                item_id: "item-1".to_string(),
+                status: crate::convert::ConversionStatus::Completed {
+                    output_path: PathBuf::from("/tmp/out.flac"),
+                    log_path: None,
+                },
+            })
+            .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv())
+            .await
+            .expect("item terminal lifecycle event arrives")
+            .expect("lifecycle channel remains open");
+        match event {
+            LifecycleEvent::ItemTerminal {
+                item_id,
+                progress,
+                status,
+            } => {
+                assert_eq!(item_id, "item-1");
+                assert_eq!(progress, 100.0);
+                assert!(matches!(status, crate::convert::ConversionStatus::Completed { .. }));
+            }
+            other => panic!("expected ItemTerminal lifecycle event, got {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), progress_rx.recv())
+                .await
+                .is_err(),
+            "live lifecycle terminal path should not also send broadcast terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn item_level_reporter_falls_back_to_broadcast_when_lifecycle_receiver_is_closed() {
+        let (progress_tx, mut progress_rx) = tokio::sync::broadcast::channel(4);
+        let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(lifecycle_rx);
+        let reporter = BroadcastReporter::new(progress_tx, Some(lifecycle_tx), "item-1", None);
+
+        reporter
+            .emit(PipelineEvent::Terminal {
+                item_id: "item-1".to_string(),
+                status: crate::convert::ConversionStatus::Completed {
+                    output_path: PathBuf::from("/tmp/out.flac"),
+                    log_path: None,
+                },
+            })
+            .await;
+
+        let terminal = next_update(&mut progress_rx).await;
+        assert_eq!(terminal.item_id, "item-1");
+        assert_eq!(terminal.track_index, None);
+        assert_eq!(terminal.track_epoch, None);
+        assert_eq!(terminal.progress, 100.0);
+        assert!(matches!(
+            terminal.status,
+            crate::convert::ConversionStatus::Completed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn track_lifecycle_guard_sends_clear_track_on_drop() {
+        let (progress_tx, _progress_rx) = tokio::sync::broadcast::channel(4);
+        let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reporter = BroadcastReporter::new(progress_tx, Some(lifecycle_tx), "item-1", Some(3));
+        let epoch = reporter.track_epoch().expect("track reporter has an epoch");
+
+        let guard = reporter.track_lifecycle_guard();
+        drop(guard);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv())
+            .await
+            .expect("clear-track event arrives")
+            .expect("lifecycle channel remains open");
+        match event {
+            LifecycleEvent::ClearTrack {
+                item_id,
+                track_index,
+                track_epoch,
+            } => {
+                assert_eq!(item_id, "item-1");
+                assert_eq!(track_index, 3);
+                assert_eq!(track_epoch, epoch);
+            }
+            other => panic!("expected ClearTrack lifecycle event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disarmed_track_lifecycle_guard_sends_no_clear_track() {
+        let (progress_tx, _progress_rx) = tokio::sync::broadcast::channel(4);
+        let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reporter = BroadcastReporter::new(progress_tx, Some(lifecycle_tx), "item-1", Some(3));
+
+        reporter.track_lifecycle_guard().disarm();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), lifecycle_rx.recv())
+                .await
+                .is_err(),
+            "disarmed guard must not send ClearTrack"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_reporters_receive_monotonic_epochs() {
+        let (progress_tx, _progress_rx) = tokio::sync::broadcast::channel(4);
+        let first = BroadcastReporter::new(progress_tx.clone(), None, "item-1", Some(0));
+        let second = BroadcastReporter::new(progress_tx, None, "item-1", Some(0));
+
+        assert!(
+            first.track_epoch().expect("first epoch") < second.track_epoch().expect("second epoch"),
+            "newer track reporters must have greater epochs"
+        );
+    }
+
+    #[tokio::test]
     async fn send_error_does_not_fail_emit() {
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         drop(rx);
-        let reporter = BroadcastReporter::new(tx, "item-1", None);
+        let reporter = BroadcastReporter::new(tx, None, "item-1", None);
         reporter
             .emit(PipelineEvent::StageStarted {
                 item_id: "item-1".to_string(),
