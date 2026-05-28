@@ -4,7 +4,7 @@
 //! `PipelineReporter`. Tests subscribe to a `RecordingReporter` to
 //! prove terminal-event ordering directly.
 
-use std::sync::{atomic::{AtomicU64, Ordering}, Mutex};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 
@@ -99,62 +99,6 @@ impl Default for BroadcastReporterState {
     }
 }
 
-static NEXT_TRACK_PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(1);
-
-/// Emits a guaranteed track-clear lifecycle update when a track-scoped worker leaves scope.
-///
-/// The guard owns the reliable lifecycle sender and item/track identity, so it
-/// does not borrow the reporter across `.await` points. Dropping it sends a
-/// typed display-lifecycle update. It carries no item-level progress or status
-/// and removes only the matching `active_tracks` row.
-#[must_use = "keep the guard alive for the full lifetime of the track-scoped worker"]
-pub struct TrackProgressLifecycleGuard {
-    tx: Option<tokio::sync::mpsc::UnboundedSender<crate::convert::ProgressLifecycleUpdate>>,
-    item_id: String,
-    track_index: Option<u32>,
-    track_epoch: Option<u64>,
-    active: bool,
-}
-
-impl TrackProgressLifecycleGuard {
-    fn new(reporter: &BroadcastReporter) -> Self {
-        Self {
-            tx: reporter.lifecycle_tx.clone(),
-            item_id: reporter.item_id.clone(),
-            track_index: reporter.track_index,
-            track_epoch: reporter.track_epoch,
-            active: true,
-        }
-    }
-
-    /// Disable the clear update. This is intended only for tests or for future
-    /// callers that transfer lifecycle ownership to another guard.
-    #[allow(dead_code)]
-    pub fn disarm(mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for TrackProgressLifecycleGuard {
-    fn drop(&mut self) {
-        let (Some(tx), Some(track_index), Some(track_epoch)) =
-            (&self.tx, self.track_index, self.track_epoch)
-        else {
-            return;
-        };
-        if !self.active {
-            return;
-        }
-
-        let _ = tx.send(crate::convert::ProgressLifecycleUpdate::clear_track(
-            self.item_id.clone(),
-            track_index,
-            track_epoch,
-        ));
-    }
-}
-
-
 /// Forwards pipeline events to the TUI progress broadcast channel.
 ///
 /// `RecordingReporter` remains available for tests that need the full event
@@ -164,38 +108,20 @@ impl Drop for TrackProgressLifecycleGuard {
 /// terminal states.
 pub struct BroadcastReporter {
     tx: tokio::sync::broadcast::Sender<crate::convert::ProgressUpdate>,
-    lifecycle_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::convert::ProgressLifecycleUpdate>>,
     item_id: String,
-    track_index: Option<u32>,
-    track_epoch: Option<u64>,
     state: std::sync::Mutex<BroadcastReporterState>,
 }
 
 impl BroadcastReporter {
     pub fn new(
         tx: tokio::sync::broadcast::Sender<crate::convert::ProgressUpdate>,
-        lifecycle_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::convert::ProgressLifecycleUpdate>>,
         item_id: impl Into<String>,
-        track_index: Option<u32>,
     ) -> Self {
-        let track_epoch = track_index.map(|_| NEXT_TRACK_PROGRESS_EPOCH.fetch_add(1, Ordering::Relaxed));
         Self {
             tx,
-            lifecycle_tx,
             item_id: item_id.into(),
-            track_index,
-            track_epoch,
             state: std::sync::Mutex::new(BroadcastReporterState::default()),
         }
-    }
-
-    /// Create a guard that guarantees cleanup for this reporter's track row.
-    ///
-    /// Track-scoped workers should keep the returned value in scope for the
-    /// whole worker body. For album-level reporters (`track_index == None`) the
-    /// guard is a no-op.
-    pub fn track_lifecycle_guard(&self) -> TrackProgressLifecycleGuard {
-        TrackProgressLifecycleGuard::new(self)
     }
 
     fn window(stage: PipelineStage) -> StageProgressWindow {
@@ -352,24 +278,17 @@ impl BroadcastReporter {
             progress = rounded;
         }
 
-        let status = crate::convert::ConversionStatus::Processing {
+        let _ = self.tx.send(crate::convert::ProgressUpdate {
+            item_id: self.item_id.clone(),
             progress,
-            message,
-            file_progress: None,
-            phase: Some(window.phase),
-            phase_progress: Some(Self::phase_progress(window, progress)),
-        };
-        let update = match (self.track_index, self.track_epoch) {
-            (Some(track_index), Some(track_epoch)) => crate::convert::ProgressUpdate::track_status(
-                self.item_id.clone(),
-                track_index,
-                track_epoch,
+            status: crate::convert::ConversionStatus::Processing {
                 progress,
-                status,
-            ),
-            _ => crate::convert::ProgressUpdate::item_status(self.item_id.clone(), progress, status),
-        };
-        let _ = self.tx.send(update);
+                message,
+                file_progress: None,
+                phase: Some(window.phase),
+                phase_progress: Some(Self::phase_progress(window, progress)),
+            },
+        });
     }
 
     fn send_terminal(&self, status: crate::convert::ConversionStatus) {
@@ -392,38 +311,11 @@ impl BroadcastReporter {
             progress
         };
 
-        match (self.track_index, self.track_epoch, &self.lifecycle_tx) {
-            (Some(track_index), Some(track_epoch), Some(tx)) => {
-                let _ = tx.send(crate::convert::ProgressLifecycleUpdate::clear_track(
-                    self.item_id.clone(),
-                    track_index,
-                    track_epoch,
-                ));
-            }
-            (None, _, Some(tx)) => {
-                let _ = tx.send(crate::convert::ProgressLifecycleUpdate::item_terminal(
-                    self.item_id.clone(),
-                    progress,
-                    status,
-                ));
-            }
-            (Some(track_index), Some(track_epoch), None) => {
-                let _ = self.tx.send(crate::convert::ProgressUpdate::track_status(
-                    self.item_id.clone(),
-                    track_index,
-                    track_epoch,
-                    progress,
-                    status,
-                ));
-            }
-            _ => {
-                let _ = self.tx.send(crate::convert::ProgressUpdate::item_status(
-                    self.item_id.clone(),
-                    progress,
-                    status,
-                ));
-            }
-        }
+        let _ = self.tx.send(crate::convert::ProgressUpdate {
+            item_id: self.item_id.clone(),
+            progress,
+            status,
+        });
     }
 }
 
@@ -506,33 +398,16 @@ impl PipelineReporter for BroadcastReporter {
 }
 
 #[cfg(test)]
-mod tests {
+mod broadcast_reporter_tests {
     use super::*;
-    use crate::convert::{ProgressLifecycleUpdateKind, ProgressUpdateKind, ProgressUpdateScope};
     use std::path::PathBuf;
 
     fn reporter_pair() -> (
         BroadcastReporter,
         tokio::sync::broadcast::Receiver<crate::convert::ProgressUpdate>,
-        tokio::sync::mpsc::UnboundedReceiver<crate::convert::ProgressLifecycleUpdate>,
-    ) {
-        reporter_pair_with_track_index(None)
-    }
-
-    fn reporter_pair_with_track_index(
-        track_index: Option<u32>,
-    ) -> (
-        BroadcastReporter,
-        tokio::sync::broadcast::Receiver<crate::convert::ProgressUpdate>,
-        tokio::sync::mpsc::UnboundedReceiver<crate::convert::ProgressLifecycleUpdate>,
     ) {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
-        let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
-        (
-            BroadcastReporter::new(tx, Some(lifecycle_tx), "item-1", track_index),
-            rx,
-            lifecycle_rx,
-        )
+        (BroadcastReporter::new(tx, "item-1"), rx)
     }
 
     async fn next_update(
@@ -541,96 +416,9 @@ mod tests {
         rx.recv().await.expect("progress update")
     }
 
-    fn status_payload(
-        update: crate::convert::ProgressUpdate,
-    ) -> (Option<u32>, Option<u64>, f32, crate::convert::ConversionStatus) {
-        match update.kind {
-            ProgressUpdateKind::Status {
-                scope,
-                progress,
-                status,
-            } => (scope.track_index(), scope.track_epoch(), progress, status),
-        }
-    }
-
-    async fn next_lifecycle_update(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::convert::ProgressLifecycleUpdate>,
-    ) -> crate::convert::ProgressLifecycleUpdate {
-        rx.recv().await.expect("lifecycle update")
-    }
-
-    fn clear_track_payload(update: crate::convert::ProgressLifecycleUpdate) -> (u32, u64) {
-        match update.kind {
-            ProgressLifecycleUpdateKind::ClearTrack {
-                track_index,
-                track_epoch,
-            } => (track_index, track_epoch),
-            other => panic!("expected clear-track lifecycle update, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn track_index_is_propagated_on_processing_and_terminal_updates() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair_with_track_index(Some(3));
-
-        reporter
-            .emit(PipelineEvent::Progress {
-                item_id: "item-1".to_string(),
-                stage: PipelineStage::Convert,
-                phase_progress: 0.14,
-                message: Some("track 4 (Right Off) · Convert DSD to PCM · 14%".to_string()),
-            })
-            .await;
-        let (track_index, _track_epoch, _, status) = status_payload(next_update(&mut rx).await);
-        assert_eq!(track_index, Some(3));
-        assert!(matches!(
-            status,
-            crate::convert::ConversionStatus::Processing { .. }
-        ));
-
-        reporter
-            .emit(PipelineEvent::Terminal {
-                item_id: "item-1".to_string(),
-                status: crate::convert::ConversionStatus::Failed {
-                    error: "track failed".to_string(),
-                    log_path: None,
-                },
-            })
-            .await;
-        let (terminal_track_index, terminal_epoch) =
-            clear_track_payload(next_lifecycle_update(&mut lifecycle_rx).await);
-        assert_eq!(terminal_track_index, 3);
-        assert_eq!(terminal_epoch, _track_epoch.expect("track status has epoch"));
-    }
-
-    #[tokio::test]
-    async fn track_lifecycle_guard_emits_typed_clear_on_drop() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair_with_track_index(Some(3));
-
-        {
-            let _guard = reporter.track_lifecycle_guard();
-        }
-
-        let clear = next_lifecycle_update(&mut lifecycle_rx).await;
-        let (track_index, _) = clear_track_payload(clear);
-        assert_eq!(track_index, 3);
-    }
-
-    #[tokio::test]
-    async fn album_level_lifecycle_guard_is_noop() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair_with_track_index(None);
-
-        {
-            let _guard = reporter.track_lifecycle_guard();
-        }
-
-        assert!(rx.try_recv().is_err());
-        assert!(lifecycle_rx.try_recv().is_err());
-    }
-
     #[tokio::test]
     async fn stage_start_maps_to_phase_and_window_start() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::StageStarted {
                 item_id: "item-1".to_string(),
@@ -638,9 +426,9 @@ mod tests {
             })
             .await;
 
-        let (_, _track_epoch, progress, status) = status_payload(next_update(&mut rx).await);
-        assert_eq!(progress, 20.0);
-        match status {
+        let update = next_update(&mut rx).await;
+        assert_eq!(update.progress, 20.0);
+        match update.status {
             crate::convert::ConversionStatus::Processing {
                 phase,
                 phase_progress,
@@ -657,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn convert_progress_maps_into_convert_window() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::Progress {
                 item_id: "item-1".to_string(),
@@ -667,9 +455,9 @@ mod tests {
             })
             .await;
 
-        let (_, _track_epoch, progress, status) = status_payload(next_update(&mut rx).await);
-        assert_eq!(progress, 50.0);
-        match status {
+        let update = next_update(&mut rx).await;
+        assert_eq!(update.progress, 50.0);
+        match update.status {
             crate::convert::ConversionStatus::Processing { phase_progress, .. } => {
                 assert_eq!(phase_progress, Some(50.0))
             }
@@ -679,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn processing_progress_is_monotonic() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::Progress {
                 item_id: "item-1".to_string(),
@@ -688,8 +476,8 @@ mod tests {
                 message: Some("Converted track 2 of 2".to_string()),
             })
             .await;
-        let (_, _, first_progress, _) = status_payload(next_update(&mut rx).await);
-        assert_eq!(first_progress, 80.0);
+        let first = next_update(&mut rx).await;
+        assert_eq!(first.progress, 80.0);
 
         reporter
             .emit(PipelineEvent::Progress {
@@ -699,13 +487,13 @@ mod tests {
                 message: Some("late duplicate progress".to_string()),
             })
             .await;
-        let (_, _, second_progress, _) = status_payload(next_update(&mut rx).await);
-        assert_eq!(second_progress, 80.0);
+        let second = next_update(&mut rx).await;
+        assert_eq!(second.progress, 80.0);
     }
 
     #[tokio::test]
     async fn failed_terminal_preserves_last_progress() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::Progress {
                 item_id: "item-1".to_string(),
@@ -714,8 +502,8 @@ mod tests {
                 message: Some("Converting track 1 of 4".to_string()),
             })
             .await;
-        let (_, _, progress_value, _) = status_payload(next_update(&mut rx).await);
-        assert_eq!(progress_value, 35.0);
+        let progress = next_update(&mut rx).await;
+        assert_eq!(progress.progress, 35.0);
 
         reporter
             .emit(PipelineEvent::Terminal {
@@ -726,18 +514,13 @@ mod tests {
                 },
             })
             .await;
-        match next_lifecycle_update(&mut lifecycle_rx).await.kind {
-            ProgressLifecycleUpdateKind::ItemTerminal { progress, status } => {
-                assert_eq!(progress, 35.0);
-                assert!(matches!(status, crate::convert::ConversionStatus::Failed { .. }));
-            }
-            other => panic!("expected item terminal lifecycle update, got {other:?}"),
-        }
+        let terminal = next_update(&mut rx).await;
+        assert_eq!(terminal.progress, 35.0);
     }
 
     #[tokio::test]
     async fn completed_terminal_reaches_one_hundred() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::Terminal {
                 item_id: "item-1".to_string(),
@@ -748,15 +531,13 @@ mod tests {
             })
             .await;
 
-        match next_lifecycle_update(&mut lifecycle_rx).await.kind {
-            ProgressLifecycleUpdateKind::ItemTerminal { progress, .. } => assert_eq!(progress, 100.0),
-            other => panic!("expected item terminal lifecycle update, got {other:?}"),
-        }
+        let terminal = next_update(&mut rx).await;
+        assert_eq!(terminal.progress, 100.0);
     }
 
     #[tokio::test]
     async fn stage_finish_maps_to_window_end() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::StageFinished {
                 item_id: "item-1".to_string(),
@@ -767,9 +548,9 @@ mod tests {
             })
             .await;
 
-        let (_, _track_epoch, progress, status) = status_payload(next_update(&mut rx).await);
-        assert_eq!(progress, 93.0);
-        match status {
+        let update = next_update(&mut rx).await;
+        assert_eq!(update.progress, 93.0);
+        match update.status {
             crate::convert::ConversionStatus::Processing { message, phase, .. } => {
                 assert_eq!(phase, Some(crate::convert::ConversionPhase::PostProcessing));
                 assert_eq!(message.as_deref(), Some("ReplayGain complete"));
@@ -780,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_stage_reports_skip_message_at_window_end() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::StageFinished {
                 item_id: "item-1".to_string(),
@@ -791,9 +572,9 @@ mod tests {
             })
             .await;
 
-        let (_, _track_epoch, progress, status) = status_payload(next_update(&mut rx).await);
-        assert_eq!(progress, 95.0);
-        match status {
+        let update = next_update(&mut rx).await;
+        assert_eq!(update.progress, 95.0);
+        match update.status {
             crate::convert::ConversionStatus::Processing { message, .. } => {
                 assert_eq!(message.as_deref(), Some("Feature extraction skipped"));
             }
@@ -803,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_terminal_preserves_last_progress() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::Progress {
                 item_id: "item-1".to_string(),
@@ -812,8 +593,8 @@ mod tests {
                 message: Some("Converting track 1 of 2".to_string()),
             })
             .await;
-        let (_, _, progress_value, _) = status_payload(next_update(&mut rx).await);
-        assert_eq!(progress_value, 50.0);
+        let progress = next_update(&mut rx).await;
+        assert_eq!(progress.progress, 50.0);
 
         reporter
             .emit(PipelineEvent::Terminal {
@@ -821,18 +602,13 @@ mod tests {
                 status: crate::convert::ConversionStatus::Cancelled,
             })
             .await;
-        match next_lifecycle_update(&mut lifecycle_rx).await.kind {
-            ProgressLifecycleUpdateKind::ItemTerminal { progress, status } => {
-                assert_eq!(progress, 50.0);
-                assert!(matches!(status, crate::convert::ConversionStatus::Cancelled));
-            }
-            other => panic!("expected item terminal lifecycle update, got {other:?}"),
-        }
+        let terminal = next_update(&mut rx).await;
+        assert_eq!(terminal.progress, 50.0);
     }
 
     #[tokio::test]
     async fn cancelled_terminal_keeps_cancelled_at_message_as_last_processing_update() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::Progress {
                 item_id: "item-1".to_string(),
@@ -841,8 +617,9 @@ mod tests {
                 message: Some("Cancelled at 37%".to_string()),
             })
             .await;
-        let (_, _, progress_value, status) = status_payload(next_update(&mut rx).await);
-        match status {
+        let progress = next_update(&mut rx).await;
+        let progress_value = progress.progress;
+        match progress.status {
             crate::convert::ConversionStatus::Processing { message, .. } => {
                 assert_eq!(message.as_deref(), Some("Cancelled at 37%"));
             }
@@ -855,18 +632,17 @@ mod tests {
                 status: crate::convert::ConversionStatus::Cancelled,
             })
             .await;
-        match next_lifecycle_update(&mut lifecycle_rx).await.kind {
-            ProgressLifecycleUpdateKind::ItemTerminal { progress, status } => {
-                assert_eq!(progress, progress_value);
-                assert!(matches!(status, crate::convert::ConversionStatus::Cancelled));
-            }
-            other => panic!("expected item terminal lifecycle update, got {other:?}"),
-        }
+        let terminal = next_update(&mut rx).await;
+        assert_eq!(terminal.progress, progress_value);
+        assert!(matches!(
+            terminal.status,
+            crate::convert::ConversionStatus::Cancelled
+        ));
     }
 
     #[tokio::test]
     async fn partial_terminal_reaches_one_hundred() {
-        let (reporter, mut rx, mut lifecycle_rx) = reporter_pair();
+        let (reporter, mut rx) = reporter_pair();
         reporter
             .emit(PipelineEvent::Terminal {
                 item_id: "item-1".to_string(),
@@ -879,17 +655,15 @@ mod tests {
             })
             .await;
 
-        match next_lifecycle_update(&mut lifecycle_rx).await.kind {
-            ProgressLifecycleUpdateKind::ItemTerminal { progress, .. } => assert_eq!(progress, 100.0),
-            other => panic!("expected item terminal lifecycle update, got {other:?}"),
-        }
+        let terminal = next_update(&mut rx).await;
+        assert_eq!(terminal.progress, 100.0);
     }
 
     #[tokio::test]
     async fn send_error_does_not_fail_emit() {
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         drop(rx);
-        let reporter = BroadcastReporter::new(tx, None, "item-1", None);
+        let reporter = BroadcastReporter::new(tx, "item-1");
         reporter
             .emit(PipelineEvent::StageStarted {
                 item_id: "item-1".to_string(),

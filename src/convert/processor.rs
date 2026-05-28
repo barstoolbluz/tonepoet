@@ -13,7 +13,7 @@ use log::info;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio::sync::{broadcast, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::PipelineSettings;
 
@@ -48,7 +48,6 @@ pub struct ProcessorConfig {
 pub struct ConversionProcessor {
     config: ProcessorConfig,
     progress_tx: Option<broadcast::Sender<ProgressUpdate>>,
-    lifecycle_tx: Option<mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     pool_limits: PoolLimits,
     scheduler_metrics: Arc<SchedulerMetrics>,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
@@ -58,167 +57,11 @@ pub struct ConversionProcessor {
 }
 
 /// Progress update from a worker.
-/// Progress telemetry that is allowed to be lossy.
-///
-/// Item-level status belongs to [`ProgressUpdateScope::Item`]. Track-scoped
-/// status updates are transient display samples only: they may update
-/// `active_tracks[idx]`, but they must not mutate the parent queue row's status,
-/// lifecycle timestamps, output path, or item-level progress accounting.
-///
-/// Cleanup and terminal lifecycle transitions do **not** travel on this bounded
-/// broadcast channel. They use [`ProgressLifecycleUpdate`] over a reliable
-/// channel so a lagging broadcast receiver cannot lose display cleanup.
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
     pub item_id: String,
-    pub kind: ProgressUpdateKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressUpdateScope {
-    Item,
-    Track {
-        track_index: u32,
-        track_epoch: u64,
-    },
-}
-
-impl ProgressUpdateScope {
-    pub fn track_index(self) -> Option<u32> {
-        match self {
-            ProgressUpdateScope::Item => None,
-            ProgressUpdateScope::Track { track_index, .. } => Some(track_index),
-        }
-    }
-
-    pub fn track_epoch(self) -> Option<u64> {
-        match self {
-            ProgressUpdateScope::Item => None,
-            ProgressUpdateScope::Track { track_epoch, .. } => Some(track_epoch),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ProgressUpdateKind {
-    Status {
-        scope: ProgressUpdateScope,
-        progress: f32,
-        status: ConversionStatus,
-    },
-}
-
-/// Reliable lifecycle/control updates. These are intentionally separate from
-/// high-frequency progress telemetry so cleanup and terminal state transitions
-/// cannot be skipped by `broadcast::RecvError::Lagged(_)`.
-#[derive(Debug, Clone)]
-pub struct ProgressLifecycleUpdate {
-    pub item_id: String,
-    pub kind: ProgressLifecycleUpdateKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum ProgressLifecycleUpdateKind {
-    /// Clear the row owned by one track reporter generation.
-    ClearTrack {
-        track_index: u32,
-        track_epoch: u64,
-    },
-    /// Final item status/progress. This clears all active tracks and updates the
-    /// parent queue row through the same `ConversionProgress` UI path as before.
-    ItemTerminal {
-        progress: f32,
-        status: ConversionStatus,
-    },
-}
-
-impl ProgressUpdate {
-    pub fn item_status(
-        item_id: impl Into<String>,
-        progress: f32,
-        status: ConversionStatus,
-    ) -> Self {
-        Self {
-            item_id: item_id.into(),
-            kind: ProgressUpdateKind::Status {
-                scope: ProgressUpdateScope::Item,
-                progress,
-                status,
-            },
-        }
-    }
-
-    pub fn track_status(
-        item_id: impl Into<String>,
-        track_index: u32,
-        track_epoch: u64,
-        progress: f32,
-        status: ConversionStatus,
-    ) -> Self {
-        Self {
-            item_id: item_id.into(),
-            kind: ProgressUpdateKind::Status {
-                scope: ProgressUpdateScope::Track {
-                    track_index,
-                    track_epoch,
-                },
-                progress,
-                status,
-            },
-        }
-    }
-
-    /// Compatibility constructor for older non-track call sites.
-    pub fn status(
-        item_id: impl Into<String>,
-        track_index: Option<u32>,
-        progress: f32,
-        status: ConversionStatus,
-    ) -> Self {
-        match track_index {
-            Some(track_index) => Self::track_status(item_id, track_index, 0, progress, status),
-            None => Self::item_status(item_id, progress, status),
-        }
-    }
-
-    pub fn track_index(&self) -> Option<u32> {
-        match &self.kind {
-            ProgressUpdateKind::Status { scope, .. } => scope.track_index(),
-        }
-    }
-
-    pub fn track_epoch(&self) -> Option<u64> {
-        match &self.kind {
-            ProgressUpdateKind::Status { scope, .. } => scope.track_epoch(),
-        }
-    }
-}
-
-impl ProgressLifecycleUpdate {
-    pub fn clear_track(
-        item_id: impl Into<String>,
-        track_index: u32,
-        track_epoch: u64,
-    ) -> Self {
-        Self {
-            item_id: item_id.into(),
-            kind: ProgressLifecycleUpdateKind::ClearTrack {
-                track_index,
-                track_epoch,
-            },
-        }
-    }
-
-    pub fn item_terminal(
-        item_id: impl Into<String>,
-        progress: f32,
-        status: ConversionStatus,
-    ) -> Self {
-        Self {
-            item_id: item_id.into(),
-            kind: ProgressLifecycleUpdateKind::ItemTerminal { progress, status },
-        }
-    }
+    pub progress: f32,
+    pub status: ConversionStatus,
 }
 
 /// Helper to send phase progress updates.
@@ -233,34 +76,19 @@ async fn send_phase_update(
 ) {
     let overall_progress = phase.calculate_overall_progress(phase_progress);
 
-    let _ = tx.send(ProgressUpdate::item_status(
-        item_id.to_string(),
-        overall_progress,
-        ConversionStatus::Processing {
+    let _ = tx.send(ProgressUpdate {
+        item_id: item_id.to_string(),
+        progress: overall_progress,
+        status: ConversionStatus::Processing {
             progress: overall_progress,
             message,
             file_progress,
             phase: Some(phase),
             phase_progress: Some(phase_progress),
         },
-    ));
+    });
 }
 
-
-fn item_level_progress_for_accounting(update: ProgressUpdate) -> Option<(String, f32)> {
-    match update {
-        ProgressUpdate {
-            item_id,
-            kind:
-                ProgressUpdateKind::Status {
-                    scope: ProgressUpdateScope::Item,
-                    progress,
-                    ..
-                },
-        } => Some((item_id, progress)),
-        ProgressUpdate { .. } => None,
-    }
-}
 fn terminal_progress_for_status(
     status: &ConversionStatus,
     last_known_progress: Option<f32>,
@@ -273,31 +101,6 @@ fn terminal_progress_for_status(
         }
         ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => 0.0,
     }
-}
-
-fn send_item_terminal_update(
-    progress_tx: &broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
-    item_id: String,
-    progress: f32,
-    status: ConversionStatus,
-) {
-    if let Some(tx) = lifecycle_tx {
-        if tx
-            .send(ProgressLifecycleUpdate::item_terminal(
-                item_id.clone(),
-                progress,
-                status.clone(),
-            ))
-            .is_ok()
-        {
-            return;
-        }
-    }
-
-    // Compatibility fallback for callers that have not installed the reliable
-    // lifecycle channel. The TUI path always installs it.
-    let _ = progress_tx.send(ProgressUpdate::item_status(item_id, progress, status));
 }
 
 fn effective_worker_count_for_tool_limits(
@@ -315,7 +118,6 @@ impl ConversionProcessor {
         Self {
             config,
             progress_tx: None,
-            lifecycle_tx: None,
             pool_limits: PoolLimits::default(),
             scheduler_metrics: Arc::new(SchedulerMetrics::default()),
             tool_concurrency_limits: Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
@@ -326,12 +128,6 @@ impl ConversionProcessor {
     /// Set progress channel.
     pub fn set_progress_channel(&mut self, tx: broadcast::Sender<ProgressUpdate>) {
         self.progress_tx = Some(tx);
-    }
-
-
-    /// Set reliable lifecycle channel for cleanup and terminal UI transitions.
-    pub fn set_lifecycle_channel(&mut self, tx: mpsc::UnboundedSender<ProgressLifecycleUpdate>) {
-        self.lifecycle_tx = Some(tx);
     }
 
     /// Set an external cancellation token from the TUI. When triggered,
@@ -386,7 +182,6 @@ impl ConversionProcessor {
             self.progress_tx = Some(tx.clone());
             tx
         };
-        let lifecycle_tx = self.lifecycle_tx.clone();
 
         let mut queued_items: Vec<_> = {
             let q = queue.read().await;
@@ -407,8 +202,6 @@ impl ConversionProcessor {
             }
             let mut q = queue.write().await;
             if let Some(queue_item) = q.find_item_mut(&item.id) {
-                queue_item.active_tracks.clear();
-                queue_item.closed_track_epochs.clear();
                 queue_item.status = ConversionStatus::Processing {
                     progress: 0.0,
                     message: Some(format!("Starting conversion to {}", item.output_format)),
@@ -427,7 +220,6 @@ impl ConversionProcessor {
         let outcomes = run_queue_with_shared_orchestrator(
             queued_items,
             progress_tx.clone(),
-            lifecycle_tx.clone(),
             progress_rx,
             self.config.tool_paths.clone(),
             effective_worker_count,
@@ -440,17 +232,13 @@ impl ConversionProcessor {
 
         for (item_id, final_status, last_progress) in outcomes {
             let progress = terminal_progress_for_status(&final_status, last_progress);
-            send_item_terminal_update(
-                &progress_tx,
-                lifecycle_tx.as_ref(),
-                item_id.clone(),
+            let _ = progress_tx.send(ProgressUpdate {
+                item_id: item_id.clone(),
                 progress,
-                final_status.clone(),
-            );
+                status: final_status.clone(),
+            });
             let mut q = queue.write().await;
             if let Some(queue_item) = q.find_item_mut(&item_id) {
-                queue_item.active_tracks.clear();
-                queue_item.closed_track_epochs.clear();
                 queue_item.status = final_status;
                 queue_item.completed_at = Some(chrono::Utc::now());
             }
@@ -678,7 +466,6 @@ impl SubmissionPump {
         job_to_item: &mut BTreeMap<String, String>,
         tool_paths: &HashMap<String, PathBuf>,
         progress_tx: &broadcast::Sender<ProgressUpdate>,
-        lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
         _cancel: &CancellationToken,
         worker_count: usize,
         tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
@@ -698,7 +485,6 @@ impl SubmissionPump {
                     outputs,
                     tool_paths,
                     progress_tx,
-                    lifecycle_tx,
                     tool_concurrency_limits.clone(),
                 );
                 if !self.try_submit_unit(pool, unit, true) {
@@ -713,7 +499,6 @@ impl SubmissionPump {
                     realized,
                     tool_paths,
                     progress_tx,
-                    lifecycle_tx,
                     job_cancel,
                     tool_concurrency_limits.clone(),
                 );
@@ -729,7 +514,6 @@ impl SubmissionPump {
                     job_id,
                     tool_paths,
                     progress_tx,
-                    lifecycle_tx,
                     tool_concurrency_limits.clone(),
                 )
             }) {
@@ -753,7 +537,6 @@ impl SubmissionPump {
                     job_to_item,
                     tool_paths,
                     progress_tx,
-                    lifecycle_tx,
                     worker_count,
                     tool_concurrency_limits.clone(),
                 ) {
@@ -842,7 +625,6 @@ fn record_terminal_status(
 async fn run_queue_with_shared_orchestrator(
     queued_items: Vec<ConversionItem>,
     progress_tx: broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     mut progress_rx: Option<broadcast::Receiver<ProgressUpdate>>,
     tool_paths: HashMap<String, PathBuf>,
     worker_count: usize,
@@ -876,7 +658,6 @@ async fn run_queue_with_shared_orchestrator(
             &mut job_to_item,
             &tool_paths,
             &progress_tx,
-            lifecycle_tx.as_ref(),
             &cancel,
             worker_count.max(1),
             tool_concurrency_limits.clone(),
@@ -894,9 +675,7 @@ async fn run_queue_with_shared_orchestrator(
                     std::future::pending::<Result<ProgressUpdate, broadcast::error::RecvError>>().await
                 }
             }, if progress_rx.is_some() => {
-                if let Some((item_id, progress)) = item_level_progress_for_accounting(update) {
-                    last_progress_by_item.insert(item_id, progress);
-                }
+                last_progress_by_item.insert(update.item_id.clone(), update.progress);
             }
             Some(result) = run.results.recv() => {
                 match result.outcome {
@@ -1065,7 +844,6 @@ fn build_initial_work(
     job_to_item: &mut BTreeMap<String, String>,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     worker_count: usize,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> Option<WorkUnit<QueueWorkOutput>> {
@@ -1108,7 +886,6 @@ fn build_initial_work(
             request,
             tool_paths,
             progress_tx,
-            lifecycle_tx,
             tool_concurrency_limits,
         ));
     }
@@ -1129,7 +906,6 @@ fn build_initial_work(
     };
     let submit_tool_paths = tool_paths.clone();
     let submit_progress_tx = progress_tx.clone();
-    let lifecycle_tx = lifecycle_tx.cloned();
     let submit_item_id = item_id.clone();
     Some(WorkUnit {
         job_id: request.job_id.clone(),
@@ -1137,7 +913,7 @@ fn build_initial_work(
         kind: materialize_kind,
         task: boxed_work(move |worker_cancel| async move {
             let runner = RealToolRunner::new(submit_tool_paths.clone());
-            let reporter = BroadcastReporter::new(submit_progress_tx, lifecycle_tx, submit_item_id.clone(), None);
+            let reporter = BroadcastReporter::new(submit_progress_tx, submit_item_id.clone());
             let result = prepare_pipeline_item_for_scheduler(
                 request,
                 &runner,
@@ -1158,14 +934,12 @@ fn build_single_file_work(
     request: PipelineRequest,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
     let item_id = request.item_id.clone();
     let job_id = request.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
-    let lifecycle_tx = lifecycle_tx.cloned();
     let tool_concurrency_limits = tool_concurrency_limits.clone();
     WorkUnit {
         job_id,
@@ -1173,7 +947,7 @@ fn build_single_file_work(
         kind: WorkKind::SingleFile,
         task: boxed_work(move |worker_cancel| async move {
             let runner = RealToolRunner::new(tool_paths.clone());
-            let reporter = BroadcastReporter::new(progress_tx, lifecycle_tx, item_id.clone(), None);
+            let reporter = BroadcastReporter::new(progress_tx, item_id.clone());
             let report = run_pipeline_item_with_tool_paths_and_tool_limits(
                 request,
                 &runner,
@@ -1198,7 +972,6 @@ fn next_album_source_work(
     job_id: &str,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> Option<WorkUnit<QueueWorkOutput>> {
     let pending = pending_albums.get_mut(job_id)?;
@@ -1234,7 +1007,6 @@ fn next_album_source_work(
                     kind,
                     tool_paths,
                     progress_tx,
-                    lifecycle_tx,
                     pending.job_cancel.clone(),
                     tool_concurrency_limits.clone(),
                 )
@@ -1248,7 +1020,6 @@ fn next_album_source_work(
                     convert_root,
                     tool_paths,
                     progress_tx,
-                    lifecycle_tx,
                     pending.job_cancel.clone(),
                     tool_concurrency_limits.clone(),
                 )
@@ -1265,7 +1036,6 @@ fn build_realize_work(
     convert_root: PathBuf,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     job_cancel: CancellationToken,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
@@ -1274,7 +1044,6 @@ fn build_realize_work(
     let staging_job = album.staging.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
-    let lifecycle_tx = lifecycle_tx.cloned();
     let tool_concurrency_limits = tool_concurrency_limits.clone();
     let job_id = album.req.job_id.clone();
     let item_id = album.req.item_id.clone();
@@ -1289,8 +1058,7 @@ fn build_realize_work(
         unit_id: format!("realize-track:{:04}", track_id.source_ordinal),
         kind,
         task: boxed_work(move |_worker_cancel| async move {
-            let reporter = BroadcastReporter::new(progress_tx, lifecycle_tx, item_id, Some(track_index as u32));
-            let _track_lifecycle = reporter.track_lifecycle_guard();
+            let reporter = BroadcastReporter::new(progress_tx, item_id);
             if job_cancel.is_cancelled() {
                 let output = scheduled_worker_failure_output(
                     track_index,
@@ -1332,7 +1100,6 @@ fn build_staged_encode_work(
     kind: WorkKind,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     job_cancel: CancellationToken,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
@@ -1341,7 +1108,6 @@ fn build_staged_encode_work(
     let staging_job = album.staging.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
-    let lifecycle_tx = lifecycle_tx.cloned();
     let tool_concurrency_limits = tool_concurrency_limits.clone();
     let job_id = album.req.job_id.clone();
     let item_id = album.req.item_id.clone();
@@ -1351,8 +1117,7 @@ fn build_staged_encode_work(
         unit_id: format!("encode-track:{:04}", track_id.source_ordinal),
         kind,
         task: boxed_work(move |_worker_cancel| async move {
-            let reporter = BroadcastReporter::new(progress_tx, lifecycle_tx, item_id, Some(track_index as u32));
-            let _track_lifecycle = reporter.track_lifecycle_guard();
+            let reporter = BroadcastReporter::new(progress_tx, item_id);
             if job_cancel.is_cancelled() {
                 let output = scheduled_worker_failure_output(
                     track_index,
@@ -1397,13 +1162,11 @@ fn build_realized_encode_work(
     realized: ScheduledRealizedTrack,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     job_cancel: CancellationToken,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
-    let lifecycle_tx = lifecycle_tx.cloned();
     let tool_concurrency_limits = tool_concurrency_limits.clone();
     let item_id = realized.req.item_id.clone();
     let track_id = realized.track.id.clone();
@@ -1416,8 +1179,7 @@ fn build_realized_encode_work(
         unit_id: format!("encode-realized-track:{:04}", track_id.source_ordinal),
         kind: WorkKind::EncodeTrack { track_id },
         task: boxed_work(move |_worker_cancel| async move {
-            let reporter = BroadcastReporter::new(progress_tx, lifecycle_tx, item_id, Some(unit_index as u32));
-            let _track_lifecycle = reporter.track_lifecycle_guard();
+            let reporter = BroadcastReporter::new(progress_tx, item_id);
             if job_cancel.is_cancelled() {
                 let output = scheduled_worker_failure_output(
                     unit_index,
@@ -1455,14 +1217,12 @@ fn build_album_postprocess_work(
     outputs: Vec<ScheduledTrackOutput>,
     tool_paths: &HashMap<String, PathBuf>,
     progress_tx: &broadcast::Sender<ProgressUpdate>,
-    lifecycle_tx: Option<&mpsc::UnboundedSender<ProgressLifecycleUpdate>>,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
 ) -> WorkUnit<QueueWorkOutput> {
     let item_id = album.req.item_id.clone();
     let job_id = album.req.job_id.clone();
     let tool_paths = tool_paths.clone();
     let progress_tx = progress_tx.clone();
-    let lifecycle_tx = lifecycle_tx.cloned();
     let tool_concurrency_limits = tool_concurrency_limits.clone();
     WorkUnit {
         job_id,
@@ -1470,7 +1230,7 @@ fn build_album_postprocess_work(
         kind: WorkKind::AlbumPostProcess,
         task: boxed_work(move |worker_cancel| async move {
             let runner = RealToolRunner::new(tool_paths);
-            let reporter = BroadcastReporter::new(progress_tx, lifecycle_tx, item_id.clone(), None);
+            let reporter = BroadcastReporter::new(progress_tx, item_id.clone());
             let report = finish_pipeline_album_for_scheduler_with_tool_limits(
                 album,
                 outputs,
@@ -1511,7 +1271,6 @@ async fn run_single_item_with_shared_scheduler(
     let mut outcomes = run_queue_with_shared_orchestrator(
         vec![item],
         progress_tx,
-        None,
         None,
         tool_paths,
         effective_worker_count,
@@ -1615,17 +1374,17 @@ pub async fn process_item(
         ));
     }
 
-    let _ = progress_tx.send(ProgressUpdate::item_status(
-        item.id.clone(),
-        0.0,
-        ConversionStatus::Processing {
+    let _ = progress_tx.send(ProgressUpdate {
+        item_id: item.id.clone(),
+        progress: 0.0,
+        status: ConversionStatus::Processing {
             progress: 0.0,
             message: Some(format!("Starting conversion to {}", item.output_format)),
             file_progress: None,
             phase: None,
             phase_progress: None,
         },
-    ));
+    });
 
     run_single_item_with_shared_scheduler(item, progress_tx, tool_paths, worker_count).await
 }
@@ -1633,59 +1392,6 @@ pub async fn process_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clear_track_lifecycle_update_carries_required_track_index_and_epoch() {
-        let update = ProgressLifecycleUpdate::clear_track("item-1".to_string(), 7, 42);
-
-        match update.kind {
-            ProgressLifecycleUpdateKind::ClearTrack {
-                track_index,
-                track_epoch,
-            } => {
-                assert_eq!(track_index, 7);
-                assert_eq!(track_epoch, 42);
-            }
-            other => panic!("expected ClearTrack lifecycle variant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn progress_accounting_uses_only_item_scoped_status_updates() {
-        let accounted = item_level_progress_for_accounting(ProgressUpdate::item_status(
-            "item-1".to_string(),
-            37.0,
-            ConversionStatus::Processing {
-                progress: 37.0,
-                message: Some("item progress".to_string()),
-                file_progress: None,
-                phase: Some(ConversionPhase::Converting),
-                phase_progress: Some(37.0),
-            },
-        ));
-        assert_eq!(accounted, Some(("item-1".to_string(), 37.0)));
-
-        let track_status = item_level_progress_for_accounting(ProgressUpdate::track_status(
-            "item-1".to_string(),
-            3,
-            42,
-            0.0,
-            ConversionStatus::Processing {
-                progress: 0.0,
-                message: Some("track progress".to_string()),
-                file_progress: None,
-                phase: Some(ConversionPhase::Converting),
-                phase_progress: Some(0.0),
-            },
-        ));
-        assert!(track_status.is_none());
-
-        let clear = ProgressLifecycleUpdate::clear_track("item-1".to_string(), 3, 42);
-        assert!(matches!(
-            clear.kind,
-            ProgressLifecycleUpdateKind::ClearTrack { .. }
-        ));
-    }
 
     fn synthetic_queue_work_unit(job_id: &str, unit_id: String) -> WorkUnit<QueueWorkOutput> {
         let item_id = unit_id.clone();
@@ -1841,8 +1547,6 @@ mod tests {
             cancel.clone(),
             PoolLimits { ready_capacity: Some(1) },
         );
-        let (lifecycle_tx, _lifecycle_rx) = tokio::sync::mpsc::unbounded_channel::<ProgressLifecycleUpdate>();
-        let lifecycle_tx = Some(lifecycle_tx);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         pool.metrics().set_test_event_sender(events_tx);
         let mut run = pool.start();
@@ -1911,7 +1615,6 @@ mod tests {
                 &mut job_to_item,
                 &tool_paths,
                 &progress_tx,
-                None,
                 &cancel,
                 1,
                 Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
@@ -1946,7 +1649,6 @@ mod tests {
             &mut job_to_item,
             &tool_paths,
             &progress_tx,
-            lifecycle_tx.as_ref(),
             &cancel,
             1,
             Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
@@ -2000,7 +1702,6 @@ mod tests {
             request.clone(),
             &tool_paths,
             &progress_tx,
-            None,
             limits.clone(),
         );
         assert_eq!(
@@ -2025,7 +1726,6 @@ mod tests {
             realized,
             &tool_paths,
             &progress_tx,
-            None,
             CancellationToken::new(),
             limits.clone(),
         );

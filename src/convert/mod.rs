@@ -29,11 +29,8 @@ pub use formats::{
 };
 pub use labels::{detect_pressing_info, LabelInfo};
 pub use metadata::{extract_metadata_from_flac, extract_year_from_flac_files, FlacMetadata};
-pub use processor::{
-    process_item, ConversionProcessor, ProcessorConfig, ProgressLifecycleUpdate, ProgressLifecycleUpdateKind, ProgressUpdate, ProgressUpdateKind, ProgressUpdateScope,
-};
-pub use queue::{ConversionItem, ConversionPhase, ConversionQueue, ConversionStatus, TrackProgress};
-use self::queue::{apply_item_status_update, clear_item_track_progress};
+pub use processor::{process_item, ConversionProcessor, ProcessorConfig, ProgressUpdate};
+pub use queue::{ConversionItem, ConversionPhase, ConversionQueue, ConversionStatus};
 pub use renaming::{
     apply_all_tags, apply_folder_renaming, rename_audio_files, update_album_tags, update_title_tags,
 };
@@ -306,69 +303,31 @@ impl ConversionManager {
         }
     }
 
-    /// Update item status by ID.
-    ///
-    /// A `track_index` scopes the update to one concurrent track. Track-scoped
-    /// terminal states must not complete, fail, cancel, or otherwise finalize the
-    /// whole queue item; the album/item-level reporter is the only authority for
-    /// item terminal state.
-    pub fn update_item_status(
-        &self,
-        id: &str,
-        status: ConversionStatus,
-        progress: f32,
-        track_index: Option<u32>,
-        track_epoch: Option<u64>,
-    ) -> bool {
+    /// Update item status by ID
+    pub fn update_item_status(&self, id: &str, status: ConversionStatus, _progress: f32) -> bool {
         if let Ok(mut queue) = self.queue.try_write() {
             if let Some(item) = queue.find_item_mut(id) {
-                let item_level_update = track_index.is_none();
-                let starts_processing = item_level_update
-                    && matches!(&status, ConversionStatus::Processing { .. });
-                let item_level_terminal = item_level_update;
-                let completed_output_path = if item_level_terminal {
-                    match &status {
-                        ConversionStatus::Completed { output_path, .. }
-                        | ConversionStatus::Partial { output_path, .. } => Some(output_path.clone()),
-                        _ => None,
+                // Just use the status as-is - it already has all the correct fields including phase
+                item.status = status.clone();
+
+                // Update timestamps based on status
+                match &status {
+                    ConversionStatus::Processing { .. } if item.started_at.is_none() => {
+                        item.started_at = Some(chrono::Utc::now());
                     }
-                } else {
-                    None
-                };
-                let sets_completed_at = item_level_terminal
-                    && matches!(
-                        &status,
-                        ConversionStatus::Completed { .. }
-                            | ConversionStatus::Partial { .. }
-                            | ConversionStatus::Failed { .. }
-                            | ConversionStatus::Cancelled
-                    );
-
-                apply_item_status_update(item, status, progress, track_index, track_epoch);
-
-                // Manager-only metadata. The status/active-track state machine is
-                // centralized in queue::apply_item_status_update().
-                if starts_processing && item.started_at.is_none() {
-                    item.started_at = Some(chrono::Utc::now());
-                }
-                if sets_completed_at {
-                    item.completed_at = Some(chrono::Utc::now());
-                    if let Some(output_path) = completed_output_path {
-                        item.output_path = Some(output_path);
+                    ConversionStatus::Completed { output_path, .. } => {
+                        item.completed_at = Some(chrono::Utc::now());
+                        item.output_path = Some(output_path.clone());
                     }
+                    ConversionStatus::Partial { output_path, .. } => {
+                        item.completed_at = Some(chrono::Utc::now());
+                        item.output_path = Some(output_path.clone());
+                    }
+                    ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
+                        item.completed_at = Some(chrono::Utc::now());
+                    }
+                    _ => {}
                 }
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Clear one active per-track display row without changing item-level status,
-    /// progress, timestamps, output path, persistence, or history.
-    pub fn clear_track_progress(&self, id: &str, track_index: u32, track_epoch: u64) -> bool {
-        if let Ok(mut queue) = self.queue.try_write() {
-            if let Some(item) = queue.find_item_mut(id) {
-                clear_item_track_progress(item, track_index, track_epoch);
                 return true;
             }
         }
@@ -395,8 +354,6 @@ impl ConversionManager {
             for item in queue.all_items_mut() {
                 match &item.status {
                     ConversionStatus::Queued | ConversionStatus::Processing { .. } => {
-                        item.active_tracks.clear();
-                        item.closed_track_epochs.clear();
                         item.status = ConversionStatus::Cancelled;
                     }
                     _ => {}
@@ -643,84 +600,6 @@ impl ConversionManager {
 
         Ok(())
     }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn manager_track_scoped_processing_does_not_set_started_at_or_change_parent_status() {
-        let manager = ConversionManager::new(ConversionConfig::default());
-        {
-            let mut queue = manager.queue.try_write().expect("queue lock is available");
-            let mut item = ConversionItem::default();
-            item.id = "item-1".to_string();
-            item.status = ConversionStatus::Queued;
-            item.pipeline_settings = Some(tonepoet_pipeline::PipelineSettings::default());
-            assert!(item.started_at.is_none());
-            queue.add_item_direct(item);
-        }
-
-        assert!(manager.update_item_status(
-            "item-1",
-            ConversionStatus::Processing {
-                progress: 64.0,
-                message: Some("track 1 (Right Off) · Encode FLAC · 64%".to_string()),
-                file_progress: None,
-                phase: Some(ConversionPhase::Converting),
-                phase_progress: Some(64.0),
-            },
-            64.0,
-            Some(0),
-        Some(1)));
-
-        let queue = manager.queue.try_read().expect("queue lock is available");
-        let item = queue
-            .all_items()
-            .into_iter()
-            .find(|item| item.id == "item-1")
-            .expect("test item exists");
-        assert!(item.started_at.is_none());
-        assert!(matches!(&item.status, ConversionStatus::Queued));
-        assert!(item.active_tracks.contains_key(&0));
-    }
-
-    #[test]
-    fn manager_clear_track_progress_does_not_set_started_at_or_change_status() {
-        let manager = ConversionManager::new(ConversionConfig::default());
-        {
-            let mut queue = manager.queue.try_write().expect("queue lock is available");
-            let mut item = ConversionItem::default();
-            item.id = "item-1".to_string();
-            item.pipeline_settings = Some(tonepoet_pipeline::PipelineSettings::default());
-            item.active_tracks.insert(
-                0,
-                TrackProgress {
-                    track_label: "track 1 (Right Off)".to_string(),
-                    step_description: "Convert DSD to PCM".to_string(),
-                    progress_fraction: 0.14,
-                    lifecycle_epoch: 1,
-                },
-            );
-            assert!(item.started_at.is_none());
-            queue.add_item_direct(item);
-        }
-
-        assert!(manager.clear_track_progress("item-1", 0, 1));
-
-        let queue = manager.queue.try_read().expect("queue lock is available");
-        let item = queue
-            .all_items()
-            .into_iter()
-            .find(|item| item.id == "item-1")
-            .expect("test item exists");
-        assert!(item.started_at.is_none());
-        assert!(matches!(&item.status, ConversionStatus::NotConfigured));
-        assert!(item.active_tracks.is_empty());
-    }
-
 }
 
 /// Progress information for the conversion process
