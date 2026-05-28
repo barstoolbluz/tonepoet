@@ -71,6 +71,12 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         );
         app.button_map
             .record_button(TuiButton::QueueItem(idx), item_area);
+        // Register a narrow hit target over the indicator character for expand/collapse.
+        if !item.active_tracks.is_empty() {
+            let expand_area = Rect::new(inner.x, item_area.y, 2, 1);
+            app.button_map
+                .record_button(TuiButton::QueueItemExpand(idx), expand_area);
+        }
         y += 1;
         visible_count += 1;
 
@@ -116,7 +122,7 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             _ => None,
         };
         // Render per-track sub-lines for multi-track sources.
-        if !item.active_tracks.is_empty() {
+        if !item.active_tracks.is_empty() && !item.tracks_collapsed {
             let max_sub_lines = 5_usize;
             let total_tracks = item.active_tracks.len();
             for (shown, (_idx, tp)) in item.active_tracks.iter().enumerate() {
@@ -154,6 +160,21 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 f.render_widget(sub_line, sub_area);
                 y += 1;
             }
+        } else if !item.active_tracks.is_empty() && item.tracks_collapsed {
+            // Collapsed summary line.
+            if y < inner.y + inner.height {
+                let n = item.active_tracks.len();
+                let summary_area = Rect::new(inner.x, y, inner.width, 1);
+                let summary = Paragraph::new(Line::from(vec![
+                    Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{n} tracks converting\u{2026}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                f.render_widget(summary, summary_area);
+                y += 1;
+            }
         } else if let Some((text, color)) = detail_line {
             // Single-file compat: render the single detail line as before.
             if y < inner.y + inner.height {
@@ -184,9 +205,14 @@ fn draw_queue_item(
         return;
     }
 
-    // Selection indicator
+    // Selection indicator — show expand/collapse arrow when tracks are active.
+    let has_tracks = !item.active_tracks.is_empty();
     let sel_char = if item.selected {
         "*"
+    } else if has_tracks && !item.tracks_collapsed {
+        "\u{25bc}" // ▼ expanded
+    } else if has_tracks && item.tracks_collapsed {
+        "\u{25b6}" // ▶ collapsed
     } else if is_selected {
         ">"
     } else {

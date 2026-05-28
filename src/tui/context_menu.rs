@@ -221,6 +221,8 @@ pub enum ContextAction {
     ClearCompleted,
     /// Show item info / error detail.
     ShowItemInfo,
+    /// Toggle per-track sub-line collapse/expand.
+    ToggleTrackCollapse,
 
     // ── Global ──────────────────────────────────────────────────────
     /// Switch to a specific screen.
@@ -613,6 +615,15 @@ pub fn build_queue_item_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 
     if let Some(qi) = item_ref {
         items.push(item("Info", ContextAction::ShowItemInfo));
+
+        if !qi.active_tracks.is_empty() {
+            let label = if qi.tracks_collapsed {
+                "Expand tracks"
+            } else {
+                "Collapse tracks"
+            };
+            items.push(item(label, ContextAction::ToggleTrackCollapse));
+        }
 
         match &qi.status {
             ConversionStatus::Failed { .. } => {
@@ -1273,6 +1284,11 @@ pub fn execute_context_action(
                         app.active_overlay = ActiveOverlay::ItemInfo { item: qi.clone() };
                     }
                 }
+            }
+        }
+        ContextAction::ToggleTrackCollapse => {
+            if let Some(qi) = app.items_snapshot.get(app.selected_index) {
+                app.manager.toggle_track_collapse(&qi.id);
             }
         }
 

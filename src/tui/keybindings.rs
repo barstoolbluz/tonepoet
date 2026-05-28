@@ -1240,6 +1240,15 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
             app.set_status("Selected all items");
         }
 
+        // Toggle per-track sub-line collapse
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            if let Some(item) = app.items_snapshot.get(app.selected_index) {
+                if !item.active_tracks.is_empty() {
+                    app.manager.toggle_track_collapse(&item.id);
+                }
+            }
+        }
+
         // Item info
         (KeyCode::Enter, KeyModifiers::NONE) => {
             if let Some(item) = app.items_snapshot.get(app.selected_index) {
@@ -9794,6 +9803,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::QueueItem(idx) => {
                 app.selected_index = idx;
                 app.queue_focus = QueueFocus::FileList;
+            }
+            TuiButton::QueueItemExpand(idx) => {
+                app.selected_index = idx;
+                if let Some(item) = app.items_snapshot.get(idx) {
+                    if !item.active_tracks.is_empty() {
+                        app.manager.toggle_track_collapse(&item.id);
+                    }
+                }
             }
             TuiButton::AddFiles | TuiButton::AddFolder => {
                 app.active_overlay = ActiveOverlay::FileInput {

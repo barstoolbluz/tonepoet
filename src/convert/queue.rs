@@ -181,6 +181,9 @@ pub struct ConversionItem {
     /// Highest epoch cleared per track_index. Transient display guard state.
     #[serde(skip)]
     pub closed_track_epochs: BTreeMap<u32, u64>,
+    /// Whether per-track sub-lines are collapsed in the queue display.
+    #[serde(skip)]
+    pub tracks_collapsed: bool,
 }
 
 impl Default for ConversionItem {
@@ -203,6 +206,7 @@ impl Default for ConversionItem {
             pipeline_request: None,
             active_tracks: BTreeMap::new(),
             closed_track_epochs: BTreeMap::new(),
+            tracks_collapsed: false,
         }
     }
 }
@@ -234,6 +238,7 @@ impl ConversionItem {
             pipeline_request: None,
             active_tracks: BTreeMap::new(),
             closed_track_epochs: BTreeMap::new(),
+            tracks_collapsed: false,
         }
     }
 

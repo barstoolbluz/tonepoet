@@ -80,6 +80,7 @@ pub enum TuiButton {
 
     // Queue items
     QueueItem(usize),
+    QueueItemExpand(usize),
 
     // Overlay buttons
     OverlayConfirm,
@@ -228,7 +229,8 @@ impl TuiButton {
             | Self::ClearFinished
             | Self::ClearAll
             | Self::RetryFailed
-            | Self::QueueItem(_) => Some(AppScreen::Queue),
+            | Self::QueueItem(_)
+            | Self::QueueItemExpand(_) => Some(AppScreen::Queue),
             Self::BrowseEntry(_)
             | Self::BrowseColumn(_)
             | Self::BrowseList

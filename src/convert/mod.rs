@@ -487,6 +487,15 @@ impl ConversionManager {
         }
     }
 
+    /// Toggle the collapsed/expanded state for per-track sub-lines.
+    pub fn toggle_track_collapse(&self, id: &str) {
+        if let Ok(mut queue) = self.queue.try_write() {
+            if let Some(item) = queue.find_item_mut(id) {
+                item.tracks_collapsed = !item.tracks_collapsed;
+            }
+        }
+    }
+
     /// Get a cancellation token for a new conversion run. Each call
     /// replaces the stored token so the previous run's token becomes inert.
     pub fn conversion_cancel_token(&mut self) -> tokio_util::sync::CancellationToken {
