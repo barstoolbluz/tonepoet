@@ -170,32 +170,48 @@ fn check_pending_browse_rename(app: &mut AppState) {
 /// Handle async messages from background tasks
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
+        AppMessage::ClearTrackProgress {
+            item_id,
+            track_index,
+            track_epoch,
+        } => {
+            app.manager.clear_track_progress(&item_id, track_index, track_epoch);
+        },
         AppMessage::ConversionProgress {
             item_id,
+            scope,
             progress,
             status,
         } => {
-            // Capture terminal state info BEFORE the status is moved into the item.
-            let history_data = match &status {
-                crate::convert::ConversionStatus::Completed { output_path, .. } => Some((
-                    true,
-                    Some(output_path.display().to_string()),
-                    None::<String>,
-                )),
-                crate::convert::ConversionStatus::Partial { output_path, .. } => Some((
-                    true,
-                    Some(output_path.display().to_string()),
-                    None::<String>,
-                )),
-                crate::convert::ConversionStatus::Failed { error, .. } => {
-                    Some((false, None, Some(error.clone())))
+            let (track_index, track_epoch) = scope.track_parts();
+            // Capture item-level terminal state info BEFORE the status is moved
+            // into the item. Track-scoped terminal updates only affect the
+            // corresponding per-track display row and must not save history for
+            // the whole queue item.
+            let history_data = if scope.is_item() {
+                match &status {
+                    crate::convert::ConversionStatus::Completed { output_path, .. } => Some((
+                        true,
+                        Some(output_path.display().to_string()),
+                        None::<String>,
+                    )),
+                    crate::convert::ConversionStatus::Partial { output_path, .. } => Some((
+                        true,
+                        Some(output_path.display().to_string()),
+                        None::<String>,
+                    )),
+                    crate::convert::ConversionStatus::Failed { error, .. } => {
+                        Some((false, None, Some(error.clone())))
+                    }
+                    _ => None,
                 }
-                _ => None,
+            } else {
+                None
             };
 
-            app.manager.update_item_status(&item_id, status, progress);
+            app.manager.update_item_status(&item_id, status, progress, track_index, track_epoch);
 
-            // Save queue + record history on terminal states.
+            // Save queue + record history on item-level terminal states.
             if let Some((success, output_path, error_msg)) = history_data {
                 app.save_queue();
 

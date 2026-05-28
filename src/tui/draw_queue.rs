@@ -74,61 +74,96 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         y += 1;
         visible_count += 1;
 
-        // Render detail line for items with extra context
-        let detail_line: Option<(String, Color)> = match &item.status {
-            ConversionStatus::Processing {
-                message: Some(msg),
-                phase,
-                ..
-            } if !msg.is_empty() => Some((msg.clone(), super::theme::GREEN)),
-            ConversionStatus::Completed { output_path, .. } => {
-                let path = output_path.display().to_string();
-                if !path.is_empty() {
-                    Some((path, super::theme::GREEN))
-                } else {
-                    None
-                }
+        // Render detail line(s) for items with extra context. Multi-track
+        // processing items get stable per-track sub-lines; single-file items
+        // keep the legacy one-line detail message.
+        for (text, color) in detail_lines_for_item(item) {
+            if y >= inner.y + inner.height {
+                break;
             }
-            ConversionStatus::Partial {
-                output_path,
-                successful,
-                failed,
-                ..
-            } => {
-                let path = output_path.display().to_string();
-                if !path.is_empty() {
-                    Some((
-                        format!(
-                            "{}/{} ok \u{2192} {}",
-                            successful,
-                            successful + failed,
-                            path
-                        ),
-                        Color::Yellow,
-                    ))
-                } else {
-                    None
-                }
-            }
-            ConversionStatus::Failed { error, .. } if !error.is_empty() => {
-                Some((error.clone(), Color::Red))
-            }
-            _ => None,
-        };
-        if let Some((text, color)) = detail_line {
-            if y < inner.y + inner.height {
-                let detail_area = Rect::new(inner.x, y, inner.width, 1);
-                let detail = Paragraph::new(Line::from(vec![
-                    Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(text, Style::default().fg(color)),
-                ]));
-                f.render_widget(detail, detail_area);
-                y += 1;
-            }
+            render_detail_line(f, inner, y, text, color);
+            y += 1;
         }
     }
 
     app.visible_height = visible_count;
+}
+
+fn render_detail_line(f: &mut Frame, inner: Rect, y: u16, text: String, color: Color) {
+    let detail_area = Rect::new(inner.x, y, inner.width, 1);
+    let detail = Paragraph::new(Line::from(vec![
+        Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
+        Span::styled(text, Style::default().fg(color)),
+    ]));
+    f.render_widget(detail, detail_area);
+}
+
+const MAX_VISIBLE_TRACK_ROWS: usize = 5;
+
+fn detail_lines_for_item(item: &ConversionItem) -> Vec<(String, Color)> {
+    if matches!(item.status, ConversionStatus::Processing { .. }) && !item.active_tracks.is_empty() {
+        let total_tracks = item.active_tracks.len();
+        // Show up to five concrete track rows. If more tracks are active, append
+        // a separate summary row after those five rows so truncation is explicit
+        // and callers do not need to infer whether the cap includes the summary.
+        let track_lines = total_tracks.min(MAX_VISIBLE_TRACK_ROWS);
+
+        let mut lines = Vec::with_capacity(track_lines + usize::from(total_tracks > track_lines));
+        for track in item.active_tracks.values().take(track_lines) {
+            let progress_percent = (track.progress_fraction * 100.0).clamp(0.0, 100.0);
+            lines.push((
+                format!(
+                    "{} · {} · {:.0}%",
+                    track.track_label, track.step_description, progress_percent
+                ),
+                super::theme::GREEN,
+            ));
+        }
+
+        if total_tracks > track_lines {
+            lines.push((
+                format!("... and {} more tracks", total_tracks - track_lines),
+                Color::DarkGray,
+            ));
+        }
+
+        return lines;
+    }
+
+    match &item.status {
+        ConversionStatus::Processing {
+            message: Some(msg),
+            ..
+        } if !msg.is_empty() => vec![(msg.clone(), super::theme::GREEN)],
+        ConversionStatus::Completed { output_path, .. } => {
+            let path = output_path.display().to_string();
+            if path.is_empty() {
+                Vec::new()
+            } else {
+                vec![(path, super::theme::GREEN)]
+            }
+        }
+        ConversionStatus::Partial {
+            output_path,
+            successful,
+            failed,
+            ..
+        } => {
+            let path = output_path.display().to_string();
+            if path.is_empty() {
+                Vec::new()
+            } else {
+                vec![(
+                    format!("{}/{} ok \u{2192} {}", successful, successful + failed, path),
+                    Color::Yellow,
+                )]
+            }
+        }
+        ConversionStatus::Failed { error, .. } if !error.is_empty() => {
+            vec![(error.clone(), Color::Red)]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Draw a single queue item on one line
@@ -394,4 +429,93 @@ fn draw_action_bar(f: &mut Frame, area: Rect, app: &mut AppState) {
 
     let bar = Paragraph::new(Line::from(spans));
     f.render_widget(bar, area);
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::{ConversionPhase, TrackProgress};
+
+    fn processing_item(message: Option<&str>) -> ConversionItem {
+        let mut item = ConversionItem::default();
+        item.status = ConversionStatus::Processing {
+            progress: 25.0,
+            message: message.map(str::to_string),
+            file_progress: None,
+            phase: Some(ConversionPhase::Converting),
+            phase_progress: Some(25.0),
+        };
+        item
+    }
+
+    fn track(label: &str, step: &str, progress_fraction: f32) -> TrackProgress {
+        TrackProgress {
+            track_label: label.to_string(),
+            step_description: step.to_string(),
+            progress_fraction,
+            lifecycle_epoch: 0,
+        }
+    }
+
+    fn detail_texts(item: &ConversionItem) -> Vec<String> {
+        detail_lines_for_item(item)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    #[test]
+    fn single_file_processing_uses_legacy_detail_line_when_no_active_tracks() {
+        let item = processing_item(Some("Converting single file · 42%"));
+
+        assert_eq!(detail_texts(&item), vec!["Converting single file · 42%"]);
+    }
+
+    #[test]
+    fn multi_track_detail_lines_render_in_btree_key_order() {
+        let mut item = processing_item(Some("this message should not be used"));
+        item.active_tracks
+            .insert(2, track("track 3 (Blue in Green)", "Convert DSD to PCM", 0.33));
+        item.active_tracks
+            .insert(0, track("track 1 (Right Off)", "Convert DSD to PCM", 0.14));
+        item.active_tracks
+            .insert(1, track("track 2 (Yesternow)", "Convert DSD to PCM", 0.07));
+
+        assert_eq!(
+            detail_texts(&item),
+            vec![
+                "track 1 (Right Off) · Convert DSD to PCM · 14%",
+                "track 2 (Yesternow) · Convert DSD to PCM · 7%",
+                "track 3 (Blue in Green) · Convert DSD to PCM · 33%",
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_track_detail_lines_truncate_to_five_tracks_plus_more_line() {
+        let mut item = processing_item(Some("this message should not be used"));
+        for idx in 0..7 {
+            item.active_tracks.insert(
+                idx,
+                track(
+                    &format!("track {}", idx + 1),
+                    "Convert DSD to PCM",
+                    (idx as f32 + 1.0) / 100.0,
+                ),
+            );
+        }
+
+        assert_eq!(
+            detail_texts(&item),
+            vec![
+                "track 1 · Convert DSD to PCM · 1%",
+                "track 2 · Convert DSD to PCM · 2%",
+                "track 3 · Convert DSD to PCM · 3%",
+                "track 4 · Convert DSD to PCM · 4%",
+                "track 5 · Convert DSD to PCM · 5%",
+                "... and 2 more tracks",
+            ]
+        );
+    }
 }

@@ -638,9 +638,12 @@ async fn run_convert(
         );
 
         while let Ok(update) = progress_rx_owned.recv().await {
-            let pct = update.progress.min(100.0).max(0.0) as u64;
+            let (progress, status) = match &update.kind {
+                tonepoet::convert::ProgressUpdateKind::Status { progress, status, .. } => (*progress, status),
+            };
+            let pct = progress.min(100.0).max(0.0) as u64;
             pb.set_position(pct);
-            match &update.status {
+            match status {
                 ConversionStatus::Processing { message, phase, .. } => {
                     let phase_name = phase
                         .as_ref()

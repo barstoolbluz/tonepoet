@@ -52,14 +52,52 @@ pub struct TagsMbContext {
     pub fallback_seed: Option<crate::tui::command::SacdMbSeed>,
 }
 
+/// Scope for a progress message delivered to the TUI.
+///
+/// This keeps track identity type-safe at the app-message boundary: track-scoped
+/// progress must carry both a track index and a lifecycle epoch, while item-level
+/// progress carries neither. That prevents invalid states such as
+/// `Some(track_index)` paired with `None` epoch from reaching the event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppProgressScope {
+    Item,
+    Track { track_index: u32, track_epoch: u64 },
+}
+
+impl AppProgressScope {
+    pub fn track_parts(self) -> (Option<u32>, Option<u64>) {
+        match self {
+            AppProgressScope::Item => (None, None),
+            AppProgressScope::Track {
+                track_index,
+                track_epoch,
+            } => (Some(track_index), Some(track_epoch)),
+        }
+    }
+
+    pub fn is_item(self) -> bool {
+        matches!(self, AppProgressScope::Item)
+    }
+}
+
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
-    /// A conversion item's progress was updated
+    /// A conversion item or one of its concurrent tracks reported progress.
+    /// Track-scoped terminal statuses must not finalize the whole item.
     ConversionProgress {
         item_id: String,
+        scope: AppProgressScope,
         progress: f32,
         status: crate::convert::ConversionStatus,
+    },
+    /// A typed display-lifecycle update that clears one active per-track row.
+    /// This is intentionally separate from `ConversionProgress` so it cannot
+    /// participate in item-level progress, timestamp, or terminal accounting.
+    ClearTrackProgress {
+        item_id: String,
+        track_index: u32,
+        track_epoch: u64,
     },
     /// All conversions completed
     ConversionComplete { completed: usize, failed: usize },
