@@ -868,6 +868,30 @@ where
     }
 }
 
+/// Check whether a path is a non-ISO archive that cannot be audio-probed.
+/// Returns true for .7z, .zip, .rar, .tar, etc. but NOT .iso (which might
+/// be an SACD that `probe_audio` handles via magic-byte detection).
+fn is_nonprobeable_archive(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_lowercase())
+        .unwrap_or_default();
+    if name.ends_with(".tar.gz")
+        || name.ends_with(".tar.bz2")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".tar.zst")
+        || name.ends_with(".tar.lz")
+        || name.ends_with(".tar.lzma")
+    {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_lowercase().as_str(), "7z" | "zip" | "rar" | "tar" | "cab" | "dmg" | "tgz" | "tbz2" | "txz"))
+        .unwrap_or(false)
+}
+
 pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMessage>) {
     match cmd {
         Command::Quit => {
@@ -1009,19 +1033,24 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(format!("Path not found: {}", expanded));
                 return;
             }
-            // Probe the file first
-            let info = match crate::tui::probe::probe_audio(&p) {
-                Ok(i) => i,
-                Err(e) => {
-                    // Reset to Empty on probe failure — :e abandons any
-                    // existing source (single or batch) regardless.
-                    app.convert.source.mode = SourceMode::Empty;
-                    app.set_status(format!("Probe error: {}", e));
-                    return;
-                }
+            // Archives (7z, zip, rar, etc.) can't be probed by ffmpeg — skip
+            // the probe and load with info=None. The materializer handles
+            // extraction during conversion. ISOs are excluded because SACD
+            // ISOs have their own probe path via magic-byte detection.
+            let (info, metadata) = if is_nonprobeable_archive(&p) {
+                (None, crate::tui::probe::SourceMetadata::default())
+            } else {
+                let info = match crate::tui::probe::probe_audio(&p) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        app.convert.source.mode = SourceMode::Empty;
+                        app.set_status(format!("Probe error: {}", e));
+                        return;
+                    }
+                };
+                let metadata = crate::tui::probe::read_metadata(&p).unwrap_or_default();
+                (Some(info), metadata)
             };
-            // Read metadata (best-effort).
-            let metadata = crate::tui::probe::read_metadata(&p).unwrap_or_default();
             // Populate the editable metadata pane from the source tags.
             app.convert.metadata.title = metadata.title.clone();
             app.convert.metadata.artist = metadata.artist.clone();
@@ -1029,7 +1058,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.convert.metadata.genre = metadata.genre.clone();
             app.convert.metadata.year = metadata.year.clone();
 
-            app.convert.source.mode = SourceMode::from_single(p.clone(), Some(info), metadata);
+            app.convert.source.mode = SourceMode::from_single(p.clone(), info, metadata);
             app.set_status(format!(
                 "Loaded: {}",
                 p.file_name().unwrap_or_default().to_string_lossy()
@@ -3677,15 +3706,20 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
             let path_count = paths.len();
 
             // Probe the first file before touching any state so preset
-            // application stays atomic with a successful load.
-            let info = match crate::tui::probe::probe_audio(&first) {
-                Ok(i) => i,
-                Err(e) => {
-                    app.set_status(format!("probe error: {}", e));
-                    return;
+            // application stays atomic with a successful load. Archives
+            // (7z, zip, rar, etc.) can't be probed — skip and proceed
+            // with info=None.
+            let (info, metadata) = if is_nonprobeable_archive(&first) {
+                (None, crate::tui::probe::SourceMetadata::default())
+            } else {
+                match crate::tui::probe::probe_audio(&first) {
+                    Ok(i) => (Some(i), crate::tui::probe::read_metadata(&first).unwrap_or_default()),
+                    Err(e) => {
+                        app.set_status(format!("probe error: {}", e));
+                        return;
+                    }
                 }
             };
-            let metadata = crate::tui::probe::read_metadata(&first).unwrap_or_default();
 
             // Load preset (if any) after a successful probe.
             if let Some(name) = &preset {
@@ -3715,7 +3749,7 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
                     metadata: meta_slot,
                     ..
                 } => {
-                    *slot = Some(info);
+                    *slot = info;
                     *meta_slot = metadata;
                 }
                 SourceMode::Batch {
@@ -3723,7 +3757,7 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
                     cursor_metadata,
                     ..
                 } => {
-                    *cursor_info = Some(info);
+                    *cursor_info = info;
                     *cursor_metadata = metadata;
                 }
                 SourceMode::MultiTrack {
@@ -3731,7 +3765,7 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
                     metadata: meta_slot,
                     ..
                 } => {
-                    *slot = Some(info);
+                    *slot = info;
                     *meta_slot = metadata;
                 }
                 SourceMode::Empty => {
