@@ -172,9 +172,16 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
     match msg {
         AppMessage::ConversionProgress {
             item_id,
+            track_index,
             progress,
             status,
         } => {
+            // Track-scoped updates only affect display sub-lines.
+            if let Some(idx) = track_index {
+                app.manager.update_track_progress(&item_id, idx, &status, progress);
+                return;
+            }
+
             // Capture terminal state info BEFORE the status is moved into the item.
             let history_data = match &status {
                 crate::convert::ConversionStatus::Completed { output_path, .. } => Some((

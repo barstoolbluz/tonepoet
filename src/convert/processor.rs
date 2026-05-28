@@ -57,9 +57,15 @@ pub struct ConversionProcessor {
 }
 
 /// Progress update from a worker.
+///
+/// When `track_index` is `Some(idx)`, the update describes one concurrent
+/// track inside a multi-track source (SACD ISO, CUE+image, 7z archive).
+/// The TUI routes these to per-track sub-lines below the parent item row.
+/// When `track_index` is `None`, the update applies to the item itself.
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
     pub item_id: String,
+    pub track_index: Option<u32>,
     pub progress: f32,
     pub status: ConversionStatus,
 }
@@ -78,6 +84,7 @@ async fn send_phase_update(
 
     let _ = tx.send(ProgressUpdate {
         item_id: item_id.to_string(),
+        track_index: None,
         progress: overall_progress,
         status: ConversionStatus::Processing {
             progress: overall_progress,
@@ -234,11 +241,13 @@ impl ConversionProcessor {
             let progress = terminal_progress_for_status(&final_status, last_progress);
             let _ = progress_tx.send(ProgressUpdate {
                 item_id: item_id.clone(),
+                track_index: None,
                 progress,
                 status: final_status.clone(),
             });
             let mut q = queue.write().await;
             if let Some(queue_item) = q.find_item_mut(&item_id) {
+                queue_item.active_tracks.clear();
                 queue_item.status = final_status;
                 queue_item.completed_at = Some(chrono::Utc::now());
             }
@@ -913,7 +922,7 @@ fn build_initial_work(
         kind: materialize_kind,
         task: boxed_work(move |worker_cancel| async move {
             let runner = RealToolRunner::new(submit_tool_paths.clone());
-            let reporter = BroadcastReporter::new(submit_progress_tx, submit_item_id.clone());
+            let reporter = BroadcastReporter::new(submit_progress_tx, submit_item_id.clone(), None);
             let result = prepare_pipeline_item_for_scheduler(
                 request,
                 &runner,
@@ -947,7 +956,7 @@ fn build_single_file_work(
         kind: WorkKind::SingleFile,
         task: boxed_work(move |worker_cancel| async move {
             let runner = RealToolRunner::new(tool_paths.clone());
-            let reporter = BroadcastReporter::new(progress_tx, item_id.clone());
+            let reporter = BroadcastReporter::new(progress_tx, item_id.clone(), None);
             let report = run_pipeline_item_with_tool_paths_and_tool_limits(
                 request,
                 &runner,
@@ -1058,7 +1067,7 @@ fn build_realize_work(
         unit_id: format!("realize-track:{:04}", track_id.source_ordinal),
         kind,
         task: boxed_work(move |_worker_cancel| async move {
-            let reporter = BroadcastReporter::new(progress_tx, item_id);
+            let reporter = BroadcastReporter::new(progress_tx, item_id, Some(track_index as u32));
             if job_cancel.is_cancelled() {
                 let output = scheduled_worker_failure_output(
                     track_index,
@@ -1085,7 +1094,10 @@ fn build_realize_work(
             .await
             {
                 Ok(track) => Ok(QueueWorkOutput::Realized { job_id, track }),
-                Err(output) => Ok(QueueWorkOutput::Encoded { job_id, output }),
+                Err(output) => {
+                    log::warn!("track realization failed: {:?}", output.record.outcome);
+                    Ok(QueueWorkOutput::Encoded { job_id, output })
+                }
             }
         }),
     }
@@ -1117,7 +1129,7 @@ fn build_staged_encode_work(
         unit_id: format!("encode-track:{:04}", track_id.source_ordinal),
         kind,
         task: boxed_work(move |_worker_cancel| async move {
-            let reporter = BroadcastReporter::new(progress_tx, item_id);
+            let reporter = BroadcastReporter::new(progress_tx, item_id, Some(track_index as u32));
             if job_cancel.is_cancelled() {
                 let output = scheduled_worker_failure_output(
                     track_index,
@@ -1144,13 +1156,16 @@ fn build_staged_encode_work(
             .await
             {
                 Ok(output) => output,
-                Err(err) => scheduled_worker_failure_output(
-                    track_index,
-                    &track,
-                    None,
-                    Some(final_path),
-                    format!("encode worker failed: {err}"),
-                ),
+                Err(err) => {
+                    log::warn!("staged encode worker failed for track {}: {err}", track_index);
+                    scheduled_worker_failure_output(
+                        track_index,
+                        &track,
+                        None,
+                        Some(final_path),
+                        format!("encode worker failed: {err}"),
+                    )
+                }
             };
             Ok(QueueWorkOutput::Encoded { job_id, output })
         }),
@@ -1179,7 +1194,7 @@ fn build_realized_encode_work(
         unit_id: format!("encode-realized-track:{:04}", track_id.source_ordinal),
         kind: WorkKind::EncodeTrack { track_id },
         task: boxed_work(move |_worker_cancel| async move {
-            let reporter = BroadcastReporter::new(progress_tx, item_id);
+            let reporter = BroadcastReporter::new(progress_tx, item_id, Some(unit_index as u32));
             if job_cancel.is_cancelled() {
                 let output = scheduled_worker_failure_output(
                     unit_index,
@@ -1199,13 +1214,16 @@ fn build_realized_encode_work(
             .await
             {
                 Ok(output) => output,
-                Err(err) => scheduled_worker_failure_output(
-                    unit_index,
-                    &failure_track,
-                    failure_realized_input.clone(),
-                    failure_final_path.clone(),
-                    format!("realized encode worker failed: {err}"),
-                ),
+                Err(err) => {
+                    log::warn!("realized encode worker failed for track {}: {err}", unit_index);
+                    scheduled_worker_failure_output(
+                        unit_index,
+                        &failure_track,
+                        failure_realized_input.clone(),
+                        failure_final_path.clone(),
+                        format!("realized encode worker failed: {err}"),
+                    )
+                }
             };
             Ok(QueueWorkOutput::Encoded { job_id, output })
         }),
@@ -1230,7 +1248,7 @@ fn build_album_postprocess_work(
         kind: WorkKind::AlbumPostProcess,
         task: boxed_work(move |worker_cancel| async move {
             let runner = RealToolRunner::new(tool_paths);
-            let reporter = BroadcastReporter::new(progress_tx, item_id.clone());
+            let reporter = BroadcastReporter::new(progress_tx, item_id.clone(), None);
             let report = finish_pipeline_album_for_scheduler_with_tool_limits(
                 album,
                 outputs,
@@ -1376,6 +1394,7 @@ pub async fn process_item(
 
     let _ = progress_tx.send(ProgressUpdate {
         item_id: item.id.clone(),
+        track_index: None,
         progress: 0.0,
         status: ConversionStatus::Processing {
             progress: 0.0,

@@ -55,9 +55,14 @@ pub struct TagsMbContext {
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
-    /// A conversion item's progress was updated
+    /// A conversion item or one of its concurrent tracks reported progress.
+    /// When `track_index` is `Some(idx)`, the update describes one track
+    /// inside a multi-track source. The TUI routes these to per-track
+    /// sub-lines below the parent item row. When `None`, the update
+    /// applies to the item itself.
     ConversionProgress {
         item_id: String,
+        track_index: Option<u32>,
         progress: f32,
         status: crate::convert::ConversionStatus,
     },

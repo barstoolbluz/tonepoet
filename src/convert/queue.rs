@@ -125,6 +125,14 @@ pub enum ConversionStatus {
     Cancelled,
 }
 
+/// Per-track progress state for multi-track sources (SACD, CUE, 7z).
+#[derive(Debug, Clone)]
+pub struct TrackProgress {
+    pub track_label: String,
+    pub step_description: String,
+    pub progress_fraction: f32,
+}
+
 /// A single item in the conversion queue
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionItem {
@@ -165,6 +173,10 @@ pub struct ConversionItem {
     /// remain until PR 10 finishes CLI/TUI surface).
     #[serde(default)]
     pub pipeline_request: Option<crate::convert::pipeline::PipelineRequest>,
+    /// Per-track progress for multi-track sources. Keyed by track_index.
+    /// Transient display state only — not serialized.
+    #[serde(skip)]
+    pub active_tracks: std::collections::BTreeMap<u32, TrackProgress>,
 }
 
 impl Default for ConversionItem {
@@ -185,6 +197,7 @@ impl Default for ConversionItem {
             archive_password: None,
             pipeline_settings: None,
             pipeline_request: None,
+            active_tracks: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -214,6 +227,7 @@ impl ConversionItem {
             archive_password,
             pipeline_settings,
             pipeline_request: None,
+            active_tracks: std::collections::BTreeMap::new(),
         }
     }
 

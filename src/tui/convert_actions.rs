@@ -427,6 +427,7 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
                     Ok(update) => {
                         let _ = ui_tx.try_send(AppMessage::ConversionProgress {
                             item_id: update.item_id,
+                            track_index: update.track_index,
                             progress: update.progress,
                             status: update.status,
                         });

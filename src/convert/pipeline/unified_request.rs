@@ -4,7 +4,7 @@
 //! the UI/backend surface exposes and maps them into the pure planner's
 //! `PipelineSettings` type before the orchestrator starts materialization.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tonepoet_pipeline::{
     AacProfile as PlannerAacProfile, AudioFormat as PlannerAudioFormat, BitDepthTarget,
@@ -76,12 +76,17 @@ pub fn build_pipeline_request_from_settings(
         ConversionError::ValidationError(format!("invalid pipeline settings: {err}"))
     })?;
 
-    let output_root = item.options.output_dir.clone().unwrap_or_else(|| {
-        item.input_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf()
-    });
+    let output_root = item
+        .options
+        .output_dir
+        .clone()
+        .map(|p| expand_tilde(&p))
+        .unwrap_or_else(|| {
+            item.input_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
 
     let cue_policy = if is_cue_capable_path(&item.input_path) {
         CueSidecarPolicy::PreferSidecar
@@ -599,4 +604,20 @@ fn is_cue_capable_path(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .map(|ext| AUDIO_IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Expand a leading `~` or `~/` to the user's home directory.
+fn expand_tilde(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
 }

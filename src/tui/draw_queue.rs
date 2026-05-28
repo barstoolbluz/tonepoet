@@ -115,7 +115,47 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             }
             _ => None,
         };
-        if let Some((text, color)) = detail_line {
+        // Render per-track sub-lines for multi-track sources.
+        if !item.active_tracks.is_empty() {
+            let max_sub_lines = 5_usize;
+            let total_tracks = item.active_tracks.len();
+            for (shown, (_idx, tp)) in item.active_tracks.iter().enumerate() {
+                if y >= inner.y + inner.height {
+                    break;
+                }
+                if shown >= max_sub_lines {
+                    let more = total_tracks - max_sub_lines;
+                    let more_area = Rect::new(inner.x, y, inner.width, 1);
+                    let more_text = Paragraph::new(Line::from(vec![
+                        Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("... and {} more tracks", more),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                    f.render_widget(more_text, more_area);
+                    y += 1;
+                    break;
+                }
+                let pct = (tp.progress_fraction * 100.0).round() as u8;
+                let sub_text = if tp.step_description.is_empty() {
+                    format!("{} \u{00b7} {}%", tp.track_label, pct)
+                } else {
+                    format!(
+                        "{} \u{00b7} {} \u{00b7} {}%",
+                        tp.track_label, tp.step_description, pct
+                    )
+                };
+                let sub_area = Rect::new(inner.x, y, inner.width, 1);
+                let sub_line = Paragraph::new(Line::from(vec![
+                    Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(sub_text, Style::default().fg(super::theme::BLUE)),
+                ]));
+                f.render_widget(sub_line, sub_area);
+                y += 1;
+            }
+        } else if let Some((text, color)) = detail_line {
+            // Single-file compat: render the single detail line as before.
             if y < inner.y + inner.height {
                 let detail_area = Rect::new(inner.x, y, inner.width, 1);
                 let detail = Paragraph::new(Line::from(vec![
@@ -216,16 +256,19 @@ fn draw_queue_item(
     let line = Paragraph::new(Line::from(spans)).style(row_style);
     f.render_widget(line, area);
 
-    // For processing items, draw a CRT aperture-grille progress bar
+    // For processing items, draw a CRT aperture-grille progress bar.
+    // Use overall progress (0-100 across all pipeline stages) rather than
+    // phase_progress (0-100 within the current stage) so the bar advances
+    // continuously instead of resetting to 0 at each phase boundary.
     if let ConversionStatus::Processing {
+        progress: overall_progress,
         phase,
-        phase_progress,
         ..
     } = &item.status
     {
         let progress_width = area.width.saturating_sub(max_name_len as u16 + 12);
         if progress_width > 10 {
-            let pct_value = phase_progress.unwrap_or(0.0);
+            let pct_value = *overall_progress;
             let phase_label = phase
                 .as_ref()
                 .map(|p| p.short_name())
@@ -259,11 +302,11 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             Style::default(),
         ),
         ConversionStatus::Processing {
+            progress: overall_progress,
             phase,
-            phase_progress,
             ..
         } => {
-            let pct = phase_progress.unwrap_or(0.0);
+            let pct = *overall_progress;
             let phase_name = phase
                 .as_ref()
                 .map(|p| p.short_name())

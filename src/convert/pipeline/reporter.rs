@@ -109,6 +109,7 @@ impl Default for BroadcastReporterState {
 pub struct BroadcastReporter {
     tx: tokio::sync::broadcast::Sender<crate::convert::ProgressUpdate>,
     item_id: String,
+    track_index: Option<u32>,
     state: std::sync::Mutex<BroadcastReporterState>,
 }
 
@@ -116,10 +117,12 @@ impl BroadcastReporter {
     pub fn new(
         tx: tokio::sync::broadcast::Sender<crate::convert::ProgressUpdate>,
         item_id: impl Into<String>,
+        track_index: Option<u32>,
     ) -> Self {
         Self {
             tx,
             item_id: item_id.into(),
+            track_index,
             state: std::sync::Mutex::new(BroadcastReporterState::default()),
         }
     }
@@ -280,6 +283,7 @@ impl BroadcastReporter {
 
         let _ = self.tx.send(crate::convert::ProgressUpdate {
             item_id: self.item_id.clone(),
+            track_index: self.track_index,
             progress,
             status: crate::convert::ConversionStatus::Processing {
                 progress,
@@ -313,6 +317,7 @@ impl BroadcastReporter {
 
         let _ = self.tx.send(crate::convert::ProgressUpdate {
             item_id: self.item_id.clone(),
+            track_index: self.track_index,
             progress,
             status,
         });
@@ -407,7 +412,7 @@ mod broadcast_reporter_tests {
         tokio::sync::broadcast::Receiver<crate::convert::ProgressUpdate>,
     ) {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
-        (BroadcastReporter::new(tx, "item-1"), rx)
+        (BroadcastReporter::new(tx, "item-1", None), rx)
     }
 
     async fn next_update(
@@ -663,7 +668,7 @@ mod broadcast_reporter_tests {
     async fn send_error_does_not_fail_emit() {
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         drop(rx);
-        let reporter = BroadcastReporter::new(tx, "item-1");
+        let reporter = BroadcastReporter::new(tx, "item-1", None);
         reporter
             .emit(PipelineEvent::StageStarted {
                 item_id: "item-1".to_string(),

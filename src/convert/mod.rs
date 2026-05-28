@@ -307,7 +307,26 @@ impl ConversionManager {
     pub fn update_item_status(&self, id: &str, status: ConversionStatus, _progress: f32) -> bool {
         if let Ok(mut queue) = self.queue.try_write() {
             if let Some(item) = queue.find_item_mut(id) {
-                // Just use the status as-is - it already has all the correct fields including phase
+                // Clear per-track sub-lines when the item-level phase moves
+                // past Converting (e.g. into Tagging, PostProcessing, Finalizing).
+                // Track workers don't emit terminal events, so these rows would
+                // otherwise persist through the album-level stages.
+                if !item.active_tracks.is_empty() {
+                    let new_phase = match &status {
+                        ConversionStatus::Processing { phase, .. } => *phase,
+                        _ => None,
+                    };
+                    let dominated = matches!(
+                        new_phase,
+                        Some(crate::convert::ConversionPhase::Tagging)
+                            | Some(crate::convert::ConversionPhase::PostProcessing)
+                            | Some(crate::convert::ConversionPhase::Finalizing)
+                    ) || !matches!(&status, ConversionStatus::Processing { .. });
+                    if dominated {
+                        item.active_tracks.clear();
+                    }
+                }
+
                 item.status = status.clone();
 
                 // Update timestamps based on status
@@ -315,16 +334,19 @@ impl ConversionManager {
                     ConversionStatus::Processing { .. } if item.started_at.is_none() => {
                         item.started_at = Some(chrono::Utc::now());
                     }
-                    ConversionStatus::Completed { output_path, .. } => {
+                    ConversionStatus::Completed { .. }
+                    | ConversionStatus::Partial { .. }
+                    | ConversionStatus::Failed { .. }
+                    | ConversionStatus::Cancelled => {
+                        item.active_tracks.clear();
                         item.completed_at = Some(chrono::Utc::now());
-                        item.output_path = Some(output_path.clone());
-                    }
-                    ConversionStatus::Partial { output_path, .. } => {
-                        item.completed_at = Some(chrono::Utc::now());
-                        item.output_path = Some(output_path.clone());
-                    }
-                    ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
-                        item.completed_at = Some(chrono::Utc::now());
+                        match &status {
+                            ConversionStatus::Completed { output_path, .. }
+                            | ConversionStatus::Partial { output_path, .. } => {
+                                item.output_path = Some(output_path.clone());
+                            }
+                            _ => {}
+                        }
                     }
                     _ => {}
                 }
@@ -332,6 +354,50 @@ impl ConversionManager {
             }
         }
         false
+    }
+
+    /// Update per-track progress for a multi-track source. Track-scoped
+    /// updates affect display sub-lines AND advance the item's progress
+    /// bar (so it doesn't freeze during encoding). They never touch item
+    /// status text, timestamps, or output paths.
+    pub fn update_track_progress(
+        &self,
+        id: &str,
+        track_index: u32,
+        status: &ConversionStatus,
+        progress: f32,
+    ) {
+        if let Ok(mut queue) = self.queue.try_write() {
+            if let Some(item) = queue.find_item_mut(id) {
+                if let ConversionStatus::Processing { message, phase, phase_progress, .. } = status {
+                    let msg = message.as_deref().unwrap_or("");
+                    let (label, step, tool_pct) = parse_track_message(msg);
+                    item.active_tracks.insert(track_index, crate::convert::queue::TrackProgress {
+                        track_label: label,
+                        step_description: step,
+                        progress_fraction: tool_pct,
+                    });
+                    // Advance the item progress bar so it doesn't freeze during encoding.
+                    // Use the overall windowed progress which advances monotonically.
+                    if let ConversionStatus::Processing {
+                        progress: ref mut item_progress,
+                        phase: ref mut item_phase,
+                        phase_progress: ref mut item_phase_progress,
+                        ..
+                    } = item.status
+                    {
+                        if progress > *item_progress {
+                            *item_progress = progress;
+                        }
+                        *item_phase = *phase;
+                        *item_phase_progress = *phase_progress;
+                    }
+                } else {
+                    // Track finished or failed — remove its row.
+                    item.active_tracks.remove(&track_index);
+                }
+            }
+        }
     }
 
     /// Get a cancellation token for a new conversion run. Each call
@@ -610,4 +676,44 @@ pub struct ConversionProgress {
     pub failed_files: usize,
     pub current_file: Option<String>,
     pub overall_progress: f32,
+}
+
+/// Parse a track progress message into (label, step_description, tool_pct).
+///
+/// Messages from track workers follow the pattern:
+///   "{label} - step {n} of {m} - {description} · {pct}% of current track · elapsed 0:03"
+///
+/// `tool_pct` is the tool's own percentage (0.0–1.0), NOT the windowed item
+/// progress. This comes from the "N% of current track" suffix that the SoX
+/// probe injects.
+fn parse_track_message(message: &str) -> (String, String, f32) {
+    let mut tool_pct: f32 = 0.0;
+
+    // Extract tool percentage from "· N% of current track" suffix.
+    for segment in message.split(" · ") {
+        let segment = segment.trim();
+        if let Some(rest) = segment.strip_suffix("% of current track") {
+            if let Ok(pct) = rest.trim().parse::<f32>() {
+                tool_pct = (pct / 100.0).clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    // Strip all "· ..." suffixes to get the core label.
+    let core = message.split(" · ").next().unwrap_or(message);
+    let core = core.strip_prefix("Starting ").unwrap_or(core);
+    let core = core.strip_prefix("Finished ").unwrap_or(core);
+
+    // Split on " - step N of M - " to get track label and step description.
+    if let Some(step_pos) = core.find(" - step ") {
+        let label = &core[..step_pos];
+        let after_step = &core[step_pos + 3..]; // skip " - "
+        if let Some(desc_pos) = after_step.find(" - ") {
+            let desc = &after_step[desc_pos + 3..];
+            return (label.to_string(), desc.to_string(), tool_pct);
+        }
+        return (label.to_string(), after_step.to_string(), tool_pct);
+    }
+
+    (core.to_string(), String::new(), tool_pct)
 }
