@@ -1154,10 +1154,11 @@ fn add_sox_pcm_effects(
     if let Some(rate) = target_rate_hz {
         args.push("rate".into());
         args.push(mapping::sox_rate_quality_flag(context.request.settings.resample_quality).into());
-        args.push(rate.to_string());
-        if let Some(rolloff) = mapping::sox_rolloff(context.request.settings.nyquist_transition) {
-            args.push(rolloff.into());
+        if let Some(bandwidth_pct) = mapping::sox_bandwidth_percent(context.request.settings.nyquist_transition) {
+            args.push("-b".into());
+            args.push(bandwidth_pct.into());
         }
+        args.push(rate.to_string());
     }
     let depth_allows_dither = match target_depth {
         Some(depth) => !depth.is_float(),

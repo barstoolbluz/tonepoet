@@ -63,13 +63,25 @@ pub const fn ffmpeg_cutoff(transition: NyquistTransition) -> f32 {
     }
 }
 
-/// Map Nyquist transition to SoX rolloff value.
+/// Map Nyquist transition to SoX rolloff value (fraction, for non-SoX consumers).
 #[must_use]
 pub const fn sox_rolloff(transition: NyquistTransition) -> Option<&'static str> {
     match transition {
         NyquistTransition::Gentle => Some("0.95"),
         NyquistTransition::Medium => Some("0.97"),
         NyquistTransition::Steep | NyquistTransition::Sharp => Some("0.997"),
+        NyquistTransition::BrickWall => None,
+    }
+}
+
+/// Map Nyquist transition to SoX `-b` bandwidth percentage.
+/// SoX `rate` effect accepts `-b 74-99.7` as a percentage, not a fraction.
+#[must_use]
+pub const fn sox_bandwidth_percent(transition: NyquistTransition) -> Option<&'static str> {
+    match transition {
+        NyquistTransition::Gentle => Some("95"),
+        NyquistTransition::Medium => Some("97"),
+        NyquistTransition::Steep | NyquistTransition::Sharp => Some("99.7"),
         NyquistTransition::BrickWall => None,
     }
 }

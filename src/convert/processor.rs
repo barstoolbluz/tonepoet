@@ -788,6 +788,9 @@ async fn run_queue_with_shared_orchestrator(
                         }
                     }
                     Ok(QueueWorkOutput::Encoded { job_id, output }) => {
+                        if !output.ok {
+                            log::warn!("track encode failed: job={job_id} track={} outcome={:?}", output.index, output.record.outcome);
+                        }
                         pool.metrics().record_track_encode_output(output.ok);
                         let readiness = tracker.mark_track_finished(&job_id, output.ok);
                         let mut submit_postprocess: Option<(ScheduledAlbum, Vec<ScheduledTrackOutput>)> = None;
