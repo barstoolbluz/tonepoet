@@ -311,7 +311,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         target_format,
         target_sample_rate,
         target_bit_depth,
-        resample_quality: pipeline_enums::ResampleQuality::High,
+        resample_quality: pipeline_enums::ResampleQuality::Ultra,
         nyquist_transition,
         dither_type,
         preferred_tool,
