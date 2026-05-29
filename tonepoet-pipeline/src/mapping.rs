@@ -14,7 +14,7 @@ use crate::settings::SsrcSettings;
 #[must_use]
 pub const fn soxr_precision(quality: ResampleQuality) -> u8 {
     match quality {
-        ResampleQuality::Ultra => 33,
+        ResampleQuality::Insane | ResampleQuality::Ultra => 33,
         ResampleQuality::VeryHigh => 28,
         ResampleQuality::High => 24,
         ResampleQuality::Medium => 20,
@@ -26,7 +26,7 @@ pub const fn soxr_precision(quality: ResampleQuality) -> u8 {
 #[must_use]
 pub const fn sox_rate_quality_flag(quality: ResampleQuality) -> &'static str {
     match quality {
-        ResampleQuality::Ultra => "-v",
+        ResampleQuality::Insane | ResampleQuality::Ultra => "-v",
         ResampleQuality::VeryHigh => "-h",
         ResampleQuality::High => "-m",
         ResampleQuality::Medium => "-l",
@@ -171,6 +171,7 @@ pub const fn ssrc_profile(settings: SsrcSettings, quality: ResampleQuality) -> S
         return profile;
     }
     match quality {
+        ResampleQuality::Insane => SsrcProfile::Insane,
         ResampleQuality::Ultra => SsrcProfile::High,
         ResampleQuality::VeryHigh => SsrcProfile::Long,
         ResampleQuality::High => SsrcProfile::Standard,

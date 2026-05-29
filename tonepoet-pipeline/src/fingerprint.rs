@@ -384,6 +384,7 @@ fn resample_quality(value: ResampleQuality) -> &'static str {
         ResampleQuality::High => "High",
         ResampleQuality::VeryHigh => "VeryHigh",
         ResampleQuality::Ultra => "Ultra",
+        ResampleQuality::Insane => "Insane",
     }
 }
 

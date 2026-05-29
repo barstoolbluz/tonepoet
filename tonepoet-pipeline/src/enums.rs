@@ -428,6 +428,8 @@ pub enum ResampleQuality {
     VeryHigh,
     /// Maximum practical quality.
     Ultra,
+    /// Theoretical perfection (SSRC insane profile, 200 dB stopband).
+    Insane,
 }
 
 /// Nyquist transition-band preference.

@@ -309,9 +309,8 @@ impl ToolPlugin for SsrcPlugin {
                 "--profile".into(),
                 profile.as_arg().into(),
             ];
-            if context.request.settings.ssrc.two_pass {
-                args.push("--twopass".into());
-            }
+            // NOTE: --twopass was removed in SSRC v2.4.2. The ssrc.two_pass
+            // setting is preserved in the config surface but silently ignored.
             args.push("--dither".into());
             args.push(mapping::ssrc_dither_id(context.request.settings.dither_type).to_string());
             if let Some(depth) = *target_bit_depth {
