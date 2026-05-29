@@ -2327,7 +2327,8 @@ async fn tag_audio_file(
     if let Some(ref v) = meta.album_artist {
         push_tag_value(&mut tags, "ALBUMARTIST", v);
     }
-    if let Some(ref v) = album.album {
+    let album_tag = album.extra.get("album_tag_override").or(album.album.as_ref());
+    if let Some(v) = album_tag {
         push_tag_value(&mut tags, "ALBUM", v);
     }
     if let Some(ref v) = meta.genre {
@@ -3564,7 +3565,13 @@ pub fn write_durable_log(report: &PipelineReport, log: &LogPolicy) -> Result<Pat
 // Orchestrator  (PR 4 body, final shape)
 // ===========================================================================
 
-fn enrich_source_with_label_info(source: &mut PreparedSource, container: &Path) {
+fn enrich_source_with_label_info(source: &mut PreparedSource, container: &Path, req: &PipelineRequest) {
+    super::source_heuristics::maybe_enrich(
+        source,
+        container,
+        req.source.archive_password.as_ref().map(|s| s.expose()),
+        req.naming.folder_template.as_deref(),
+    );
     super::label_resolver::enrich_with_label_info(
         &mut source.album_metadata,
         container,
@@ -3776,7 +3783,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
         );
     }
 
-    enrich_source_with_label_info(&mut prepared, &req.container);
+    enrich_source_with_label_info(&mut prepared, &req.container, &req);
 
     emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
     let album_plan = match plan_outputs(&prepared, &req) {
@@ -4560,7 +4567,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     // Enrich album metadata with label/pressing info before planning.
     // Tag-sourced values take priority; the resolver only fills gaps.
     if let Some(ref mut src) = source {
-        enrich_source_with_label_info(src, &req.container);
+        enrich_source_with_label_info(src, &req.container, &req);
     }
 
     emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
@@ -6957,7 +6964,7 @@ mod naming_template_tests {
         let mut req = template_request(Some("%COUNTRY%/%PRESSING%/%ARTIST%/%ALBUM%".to_string()));
         req.container = PathBuf::from("/tmp/The Beatles - Let It Be QRP.7z");
 
-        enrich_source_with_label_info(&mut source, &req.container);
+        enrich_source_with_label_info(&mut source, &req.container, &req);
         let plan = plan_outputs(&source, &req).unwrap();
 
         assert_eq!(

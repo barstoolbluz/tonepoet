@@ -34,6 +34,11 @@ lazy_static! {
         m.insert("Impex", "Impex Records Reissue LP  24-96");
         m.insert("Intervention", "Intervention Records Reissue LP  24-96");
         m.insert("Friday Music", "Friday Music Reissue LP  24-96");
+        m.insert("FRM", "Friday Music Reissue LP  24-96");
+        m.insert("Frm", "Friday Music Reissue LP  24-96");
+        m.insert("FRM_KG", "Friday Music KG-Mastered Reissue LP  24-96");
+        m.insert("Frm_Kg", "Friday Music KG-Mastered Reissue LP  24-96");
+        m.insert("Frm_KG", "Friday Music KG-Mastered Reissue LP  24-96");
 
         // UK variations
         m.insert("UK", "UK First-Press LP  24-96");

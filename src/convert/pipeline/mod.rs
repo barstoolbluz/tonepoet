@@ -31,6 +31,7 @@ pub mod rerun;
 pub mod transactional_state;
 pub mod progress;
 pub mod reporter;
+pub mod source_heuristics;
 pub mod stages;
 pub mod tool;
 pub mod types;
