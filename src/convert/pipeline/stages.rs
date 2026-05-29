@@ -4340,14 +4340,19 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
 
-    // Build manifest from audio artifacts. Merged conversions are represented
-    // as one manifest entry whose track identity has `track_number: None`.
-    let conversion_manifest = match build_manifest_for_album(&req, &source_value, &artifacts, &plan_value) {
-        Ok(manifest) => Some(manifest),
-        Err(err) => {
-            log::warn!("manifest build failed (non-fatal): {err}");
-            None
+    // Build manifest from audio artifacts only when the publish policy
+    // requests it. The manifest is used by the rerun gate to detect
+    // identical conversions; most users don't need it.
+    let conversion_manifest = if req.publish.write_manifest {
+        match build_manifest_for_album(&req, &source_value, &artifacts, &plan_value) {
+            Ok(manifest) => Some(manifest),
+            Err(err) => {
+                log::warn!("manifest build failed (non-fatal): {err}");
+                None
+            }
         }
+    } else {
+        None
     };
 
     emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
@@ -6445,6 +6450,7 @@ mod conversion_log_tests {
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
                 same_filesystem_required: false,
+                write_manifest: false,
             },
             log: LogPolicy {
                 root: PathBuf::from("/out/.tonepoet-logs"),
@@ -6734,6 +6740,7 @@ mod naming_template_tests {
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
                 same_filesystem_required: false,
+                write_manifest: false,
             },
             log: LogPolicy {
                 root: PathBuf::from("/out/.tonepoet-logs"),
@@ -7251,6 +7258,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             publish: PublishPolicy {
                 overwrite,
                 same_filesystem_required: false,
+                write_manifest: true,
             },
             log: LogPolicy {
                 root: root.join("logs"),

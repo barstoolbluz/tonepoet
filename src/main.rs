@@ -825,6 +825,7 @@ fn build_pipeline_request_template(
                 OverwritePolicy::FailIfExists
             },
             same_filesystem_required: false,
+            write_manifest: false,
         },
         log: LogPolicy {
             root: output_root.join(".tonepoet-logs"),

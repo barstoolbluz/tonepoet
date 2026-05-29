@@ -3959,6 +3959,7 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                     publish: PublishPolicy {
                         overwrite: OverwritePolicy::FailIfExists,
                         same_filesystem_required: false,
+                        write_manifest: false,
                     },
                     log: LogPolicy {
                         root: output_root.join(".tonepoet-logs"),

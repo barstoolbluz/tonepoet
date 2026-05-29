@@ -1123,6 +1123,7 @@ FILE "album.flac" WAVE
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
                 same_filesystem_required: false,
+                write_manifest: false,
             },
             log: LogPolicy {
                 root: container.parent().unwrap_or(Path::new(".")).to_path_buf(),

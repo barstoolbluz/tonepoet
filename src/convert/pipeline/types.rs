@@ -102,6 +102,10 @@ pub enum NamingCollisionPolicy {
 pub struct PublishPolicy {
     pub overwrite: OverwritePolicy,
     pub same_filesystem_required: bool,
+    /// Write `.tonepoet-manifest.json` to the output directory. Used by the
+    /// rerun gate to detect identical conversions. Default: false.
+    #[serde(default)]
+    pub write_manifest: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

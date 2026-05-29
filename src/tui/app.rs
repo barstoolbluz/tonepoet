@@ -842,6 +842,7 @@ impl FormatState {
         }
 
         if row == FormatField::BitDepth && before_depth != *self.bit_depth.selected_value() {
+            self.dither_overridden = false;
             self.apply_auto_dither(source_bits);
         }
 
@@ -1209,6 +1210,7 @@ impl ConvertState {
         } else {
             self.format.cascade_pcm_source_defaults(source_rate, source_bits, source_is_float);
         }
+        self.format.dither_overridden = false;
         self.format.apply_auto_dither(source_bits);
     }
 }

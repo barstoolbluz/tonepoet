@@ -836,7 +836,10 @@ fn conversion_is_stream_copy_only(request: &PlanRequest) -> bool {
 
 fn audio_content_matches_requested(request: &PlanRequest) -> bool {
     let settings = &request.settings;
-    if settings.force_encode || settings.dither_type != DitherType::None {
+    if settings.force_encode {
+        return false;
+    }
+    if settings.dither_type != DitherType::None && !requested_depth_matches_source(request) {
         return false;
     }
     if request.source.format != settings.target_format {
@@ -1033,9 +1036,7 @@ fn plan_from_pcm(
         BitDepthTarget::Source => false,
         BitDepthTarget::Pcm(depth) => request.source.bit_depth != Some(depth),
     };
-    let needs_processing = processing_rate.is_some()
-        || depth_change
-        || request.settings.dither_type != DitherType::None;
+    let needs_processing = processing_rate.is_some() || depth_change;
     let needs_ssrc = processing_rate.is_some()
         && (request.settings.nyquist_transition == NyquistTransition::BrickWall
             || request.settings.ssrc.force);

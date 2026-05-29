@@ -1552,6 +1552,7 @@ mod tests {
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
                 same_filesystem_required: false,
+                write_manifest: false,
             },
             log: LogPolicy {
                 root: root.join("logs"),
