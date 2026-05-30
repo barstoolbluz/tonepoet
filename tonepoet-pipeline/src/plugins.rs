@@ -1135,7 +1135,8 @@ fn add_sox_output_format_args(
 fn add_sox_bit_depth_args(args: &mut Vec<String>, depth: PcmBitDepth) {
     args.push("-b".into());
     args.push(match depth {
-        PcmBitDepth::Float32 | PcmBitDepth::Float64 => "32".into(),
+        PcmBitDepth::Float32 => "32".into(),
+        PcmBitDepth::Float64 => "64".into(),
         _ => depth.bits().to_string(),
     });
     if depth.is_float() {

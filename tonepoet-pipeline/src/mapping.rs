@@ -208,7 +208,7 @@ pub fn ffmpeg_pcm_codec(depth: PcmBitDepth, format: &AudioFormat) -> Result<&'st
 /// True when a format can safely contain floating-point PCM in tonepoet workflows.
 #[must_use]
 pub fn supports_float(format: &AudioFormat) -> bool {
-    matches!(format, AudioFormat::Wav | AudioFormat::WavPack)
+    matches!(format, AudioFormat::Wav | AudioFormat::Aiff | AudioFormat::WavPack)
 }
 
 /// FFmpeg sample format for a PCM bit depth.

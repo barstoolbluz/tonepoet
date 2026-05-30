@@ -1055,17 +1055,18 @@ impl FormatState {
                     }
                 }
             }
-            AudioFormat::Flac | AudioFormat::Aiff | AudioFormat::Alac => {
+            AudioFormat::Flac | AudioFormat::Alac => {
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
             }
-            AudioFormat::Wav | AudioFormat::WavPack => {
-                // WAV and WavPack support all depths currently exposed, except 64f below.
+            AudioFormat::WavPack => {
+                // Float32 supported, Float64 rejected by WavPack encoder.
+                self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
+            }
+            AudioFormat::Wav | AudioFormat::Aiff => {
+                // Full range including float32 and float64.
             }
         }
-
-        // Backend does not support 64-bit float output yet.
-        self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
 
         self.clamp_disabled_selections();
         if !FormatField::visible_rows(self.is_dsd_selected()).contains(&self.field_focus) {
