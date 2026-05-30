@@ -29,6 +29,10 @@ pub struct PlanRequest {
     pub settings: PipelineSettings,
     /// Optional work directory for deterministic intermediate paths.
     pub intermediate_dir: Option<PathBuf>,
+    /// Extra ffmpeg output flags for the selected container (e.g., `["-rf64", "auto"]`).
+    /// Inserted before the output path in the ffmpeg command. Empty for most containers.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub container_ffmpeg_flags: Vec<String>,
 }
 
 impl PlanRequest {

@@ -573,6 +573,7 @@ fn build_ffmpeg_encode_pcm(
         add_ffmpeg_audio_filter_args(context, &mut args, target_rate_hz, Some(target_depth))?;
     }
     add_ffmpeg_pcm_encoder_args(context, &mut args, target_format, target_depth)?;
+    add_ffmpeg_container_flags(context, &mut args);
     args.push(output);
     Ok(PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
@@ -652,6 +653,7 @@ fn build_ffmpeg_encode_lossy(
             ));
         }
     }
+    add_ffmpeg_container_flags(context, &mut args);
     args.push(output);
     Ok(PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
@@ -989,6 +991,14 @@ fn ffmpeg_base_input_args(input: &str) -> Vec<String> {
         "-map".into(),
         "0:a:0".into(),
     ]
+}
+
+/// Insert extra ffmpeg flags for the selected container (e.g., `-rf64 auto`).
+/// No-op when no container override is active.
+fn add_ffmpeg_container_flags(context: &PlanContext<'_>, args: &mut Vec<String>) {
+    for flag in &context.request.container_ffmpeg_flags {
+        args.push(flag.clone());
+    }
 }
 
 fn add_ffmpeg_metadata_args(

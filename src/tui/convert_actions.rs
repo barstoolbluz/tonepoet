@@ -230,6 +230,15 @@ pub fn try_pills_to_options(
         generate_cue_files: config.conversion.generate_cue_files,
         cue_generation_mode: config.conversion.cue_generation_mode.clone(),
         pipeline_settings: Some(pipeline_settings),
+        container_extension: if format.selected_container_index > 0 {
+            Some(format.selected_extension().to_string())
+        } else {
+            None
+        },
+        container_ffmpeg_flags: format.selected_container().ffmpeg_flags
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         ..ConversionOptions::default()
     })
 }

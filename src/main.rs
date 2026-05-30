@@ -855,6 +855,8 @@ fn build_pipeline_request_template(
         } else {
             FailurePolicy::FailAlbumOnAnyTrackFailure
         },
+        container_extension: None,
+        container_ffmpeg_flags: Vec::new(),
     })
 }
 

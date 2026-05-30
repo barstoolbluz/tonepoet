@@ -48,6 +48,7 @@ pub fn plan_request_for_track(
         source,
         settings,
         intermediate_dir: Some(intermediate_dir),
+        container_ffmpeg_flags: request.container_ffmpeg_flags.clone(),
     })
 }
 

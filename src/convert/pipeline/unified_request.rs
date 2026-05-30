@@ -154,6 +154,8 @@ pub fn build_pipeline_request_from_settings(
             generate_cue: item.options.generate_cue_files,
         },
         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        container_extension: item.options.container_extension.clone(),
+        container_ffmpeg_flags: item.options.container_ffmpeg_flags.clone(),
     })
 }
 

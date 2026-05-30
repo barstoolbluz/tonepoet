@@ -240,6 +240,8 @@ pub fn extract_wizard_settings(
         write_log_file: false,            // Set from app config, not wizard
         generate_cue_files: false,        // Set from app config, not wizard
         cue_generation_mode: "IfMerging".to_string(), // Set from app config, not wizard
+        container_extension: None,
+        container_ffmpeg_flags: Vec::new(),
     };
 
     (format, options)
@@ -585,6 +587,8 @@ pub fn preset_to_conversion_options(
         write_log_file: false,            // Presets don't include this (set from app config)
         generate_cue_files: false,        // Presets don't include this (set from app config)
         cue_generation_mode: "IfMerging".to_string(), // Presets don't include this (set from app config)
+        container_extension: None,
+        container_ffmpeg_flags: Vec::new(),
     }
 }
 

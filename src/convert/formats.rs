@@ -104,11 +104,82 @@ impl AudioFormat {
             Self::Mp3,
             Self::Alac,
             Self::Wav,
+            Self::Aiff,
             Self::WavPack,
             Self::Dsf,
             Self::Dff,
         ]
     }
+
+    /// Available container options for this codec. Index 0 is the default.
+    pub fn available_containers(&self) -> &'static [ContainerOption] {
+        match self {
+            Self::Flac => &[
+                ContainerOption { extension: "flac", display_name: "FLAC", ffmpeg_flags: &[] },
+                ContainerOption { extension: "ogg", display_name: "OGG", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+            ],
+            Self::Wav => &[
+                ContainerOption { extension: "wav", display_name: "WAV", ffmpeg_flags: &[] },
+                ContainerOption { extension: "wav", display_name: "RF64", ffmpeg_flags: &["-rf64", "auto"] },
+                ContainerOption { extension: "w64", display_name: "W64", ffmpeg_flags: &[] },
+            ],
+            Self::Aiff => &[
+                ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[] },
+            ],
+            Self::WavPack => &[
+                ContainerOption { extension: "wv", display_name: "WavPack", ffmpeg_flags: &[] },
+            ],
+            Self::Mp3 => &[
+                ContainerOption { extension: "mp3", display_name: "MP3", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+            ],
+            Self::Aac => &[
+                ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[] },
+                ContainerOption { extension: "aac", display_name: "AAC (raw)", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[] },
+                ContainerOption { extension: "m4b", display_name: "M4B", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+            ],
+            Self::Opus => &[
+                ContainerOption { extension: "opus", display_name: "Opus", ffmpeg_flags: &[] },
+                ContainerOption { extension: "webm", display_name: "WebM", ffmpeg_flags: &[] },
+                ContainerOption { extension: "weba", display_name: "WebA", ffmpeg_flags: &["-f", "webm"] },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+            ],
+            Self::Alac => &[
+                ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[] },
+            ],
+            Self::Dsf => &[
+                ContainerOption { extension: "dsf", display_name: "DSF", ffmpeg_flags: &[] },
+            ],
+            Self::Dff => &[
+                ContainerOption { extension: "dff", display_name: "DFF", ffmpeg_flags: &[] },
+            ],
+        }
+    }
+
+    /// Default container for this codec (index 0 of available_containers).
+    pub fn default_container(&self) -> &'static ContainerOption {
+        &self.available_containers()[0]
+    }
+}
+
+/// A container option for an audio codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerOption {
+    /// File extension without the leading dot.
+    pub extension: &'static str,
+    /// Human-readable name shown in the UI.
+    pub display_name: &'static str,
+    /// Extra ffmpeg output flags needed for this container.
+    /// Empty for containers that ffmpeg auto-detects from extension.
+    pub ffmpeg_flags: &'static [&'static str],
 }
 
 impl std::fmt::Display for AudioFormat {
@@ -213,6 +284,17 @@ pub struct ConversionOptions {
     /// CUE generation mode: "Always" or "IfMerging"
     #[serde(default = "default_cue_generation_mode")]
     pub cue_generation_mode: String,
+
+    /// Container extension override. `None` = codec default.
+    /// When set, the output file uses this extension instead of the
+    /// codec's default (e.g., `Some("webm")` for Opus in WebM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_extension: Option<String>,
+
+    /// Extra ffmpeg output flags for the selected container.
+    /// Empty for containers that ffmpeg auto-detects from extension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub container_ffmpeg_flags: Vec<String>,
 }
 
 impl Default for ConversionOptions {
@@ -244,6 +326,8 @@ impl Default for ConversionOptions {
             write_log_file: false,
             generate_cue_files: false,
             cue_generation_mode: "IfMerging".to_string(),
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
         }
     }
 }

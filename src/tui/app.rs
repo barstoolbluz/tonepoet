@@ -699,6 +699,9 @@ pub struct FormatState {
     pub advanced_open: bool,
     /// False until the user explicitly picks a dither algorithm. Bit-depth changes may update it.
     pub dither_overridden: bool,
+    /// Selected container index into `AudioFormat::available_containers()`.
+    /// 0 = codec default. Reset to 0 when the format pill changes.
+    pub selected_container_index: usize,
 }
 
 impl FormatState {
@@ -792,9 +795,21 @@ impl FormatState {
             field_focus: FormatField::Format,
             advanced_open: false,
             dither_overridden: false,
+            selected_container_index: 0,
         };
         state.apply_format_constraints();
         state
+    }
+
+    /// The currently selected container for the active codec.
+    pub fn selected_container(&self) -> &'static crate::convert::formats::ContainerOption {
+        let containers = self.format.selected_value().available_containers();
+        containers.get(self.selected_container_index).unwrap_or(&containers[0])
+    }
+
+    /// The file extension for the currently selected container.
+    pub fn selected_extension(&self) -> &'static str {
+        self.selected_container().extension
     }
 
     pub fn is_dsd_selected(&self) -> bool {
@@ -869,6 +884,7 @@ impl FormatState {
         }
 
         if row == FormatField::Format && before_format != *self.format.selected_value() {
+            self.selected_container_index = 0;
             self.apply_format_constraints();
             if self.is_dsd_selected() {
                 self.dither.select_value(&DitherType::None);
