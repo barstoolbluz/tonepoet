@@ -129,9 +129,13 @@ impl AudioFormat {
             ],
             Self::Aiff => &[
                 ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
             ],
             Self::WavPack => &[
                 ContainerOption { extension: "wv", display_name: "WavPack", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
             ],
             Self::Mp3 => &[
                 ContainerOption { extension: "mp3", display_name: "MP3", ffmpeg_flags: &[] },
