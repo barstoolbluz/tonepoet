@@ -107,6 +107,16 @@ impl ConvertFocus {
     }
 }
 
+
+/// Convert screen layout mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConvertLayout {
+    /// All four panes use their standard fixed heights.
+    Default,
+    /// One pane is maximized; the other panes collapse to title bars.
+    Maximized(ConvertFocus),
+}
+
 /// ReplayGain mode for the format pane pill
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReplayGainChoice {
@@ -1130,6 +1140,9 @@ pub struct MetadataState {
     pub genre: Option<String>,
     pub year: Option<String>,
     pub advanced_open: bool,
+    /// Scroll offset for the convert-screen metadata file list. The cursor
+    /// itself lives on SourceMode::Batch / SourceMode::MultiTrack.
+    pub file_scroll: usize,
 }
 
 /// State for the output options pane
@@ -1169,6 +1182,11 @@ pub struct ConvertState {
     pub format: FormatState,
     pub output_options: OutputOptionsState,
     pub focus: ConvertFocus,
+    pub layout: ConvertLayout,
+    /// Last pane title-bar click used for double-click maximize/restore.
+    pub pane_title_last_click: Option<(ConvertFocus, std::time::Instant)>,
+    /// Last metadata file-row click used for double-click edit.
+    pub metadata_file_last_click: Option<(usize, std::time::Instant)>,
 }
 
 impl ConvertState {
@@ -1179,7 +1197,46 @@ impl ConvertState {
             format: FormatState::new(),
             output_options: OutputOptionsState::new(),
             focus: ConvertFocus::Source,
+            layout: ConvertLayout::Default,
+            pane_title_last_click: None,
+            metadata_file_last_click: None,
         }
+    }
+
+    /// Whether a specific pane is currently collapsed to its title bar.
+    pub fn is_collapsed(&self, pane: ConvertFocus) -> bool {
+        match self.layout {
+            ConvertLayout::Default => false,
+            ConvertLayout::Maximized(maximized) => pane != maximized,
+        }
+    }
+
+    /// Whether a specific pane is currently maximized.
+    pub fn is_maximized(&self, pane: ConvertFocus) -> bool {
+        self.layout == ConvertLayout::Maximized(pane)
+    }
+
+    /// Toggle a pane between maximized and default layout.
+    pub fn toggle_maximize(&mut self, pane: ConvertFocus) {
+        self.layout = match self.layout {
+            ConvertLayout::Maximized(current) if current == pane => ConvertLayout::Default,
+            _ => ConvertLayout::Maximized(pane),
+        };
+    }
+
+    /// Reset metadata file-list view state after the convert source changes.
+    /// The logical cursor lives on SourceMode, so source replacement invalidates
+    /// the metadata list scroll window and any pending row double-click state.
+    pub fn reset_metadata_file_list_state(&mut self) {
+        self.metadata.file_scroll = 0;
+        self.metadata_file_last_click = None;
+    }
+
+    /// Replace the convert source mode and reset metadata list state in one
+    /// place so source changes cannot leave stale scroll or double-click state.
+    pub fn set_source_mode(&mut self, mode: SourceMode) {
+        self.reset_metadata_file_list_state();
+        self.source.mode = mode;
     }
 
     /// Source bit depth for format-pane side effects such as auto-dither.
@@ -2338,6 +2395,9 @@ impl AppState {
                 format: FormatState::new(),
                 output_options,
                 focus: ConvertFocus::Source,
+                layout: ConvertLayout::Default,
+                pane_title_last_click: None,
+                metadata_file_last_click: None,
             },
             preset: PresetState::default(),
             browse: crate::tui::browse::BrowseState::new(),
@@ -2586,7 +2646,7 @@ impl AppState {
                 // Unreachable — valid.is_empty() check guards against 0 paths.
             }
         }
-        self.convert.source.mode = mode;
+        self.convert.set_source_mode(mode);
 
         // Record the first file in the recent-files history.
         self.recent.record_use_with_db(&first, &self.db);

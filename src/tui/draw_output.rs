@@ -25,7 +25,13 @@ use super::theme;
 ///   7 replaygain / conversion preset
 ///   8 blank
 ///   9 bottom border
-pub fn draw_format_pane(f: &mut Frame, area: Rect, format_state: &FormatState, focused: bool) {
+pub fn draw_format_pane(
+    f: &mut Frame,
+    area: Rect,
+    format_state: &FormatState,
+    focused: bool,
+    maximized: bool,
+) {
     if area.height < 6 || area.width < 30 {
         return;
     }
@@ -34,19 +40,7 @@ pub fn draw_format_pane(f: &mut Frame, area: Rect, format_state: &FormatState, f
     let w = area.width as usize;
     let is_dsd = format_state.is_dsd_selected();
 
-    let title = " format ";
-    let adv_label = " advanced ";
-    let dash_count = w.saturating_sub(2 + title.len() + adv_label.len() + 2);
-
-    let top_line = Line::from(vec![
-        Span::styled("┌", theme::border(border_color)),
-        Span::styled(title, theme::border(border_color)),
-        Span::styled("─".repeat(dash_count), theme::border(border_color)),
-        Span::raw(" "),
-        Span::styled("a", theme::muted()),
-        Span::styled("dvanced", theme::border(border_color)),
-        Span::styled(" ┐", theme::border(border_color)),
-    ]);
+    let top_line = format_title_line(border_color, w, maximized);
 
     let bot_line = Line::from(Span::styled(
         format!("└{}┘", "─".repeat(w.saturating_sub(2))),
@@ -178,9 +172,51 @@ pub fn draw_format_pane(f: &mut Frame, area: Rect, format_state: &FormatState, f
     }
 
     lines.push(bordered_line(border_color, w, vec![]));
+    let target_len_before_bottom = area.height.saturating_sub(1) as usize;
+    while lines.len() < target_len_before_bottom {
+        lines.push(bordered_line(border_color, w, vec![]));
+    }
     lines.push(bot_line);
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+
+/// Draw the collapsed format title bar.
+pub fn draw_format_title_bar(f: &mut Frame, area: Rect, focused: bool) {
+    if area.height < 1 || area.width < 12 {
+        return;
+    }
+    let border_color = if focused { theme::GREEN } else { theme::TEXT_DIM };
+    f.render_widget(
+        Paragraph::new(vec![format_title_line(border_color, area.width as usize, false)]),
+        area,
+    );
+}
+
+fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maximized: bool) -> Line<'a> {
+    let title = " format ";
+    let indicator = if maximized { "◼" } else { "◻" };
+    let left_spans = vec![
+        Span::styled("╒ ", theme::border(border_color)),
+        Span::styled(indicator, theme::border(border_color)),
+        Span::styled(title, theme::border(border_color)),
+    ];
+    let right_spans = vec![
+        Span::styled("a", theme::muted()),
+        Span::styled("dvanced", theme::border(border_color)),
+        Span::styled(" ╕", theme::border(border_color)),
+    ];
+    let fixed_width = Line::from(left_spans.clone()).width()
+        + Line::from(right_spans.clone()).width();
+    let fill_count = width.saturating_sub(fixed_width);
+    let mut spans = left_spans;
+    spans.push(Span::styled(
+        "═".repeat(fill_count),
+        theme::border(border_color),
+    ));
+    spans.extend(right_spans);
+    Line::from(spans)
 }
 
 /// Register all click targets for the dynamic format pane. This mirrors the

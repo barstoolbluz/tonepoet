@@ -42,8 +42,9 @@ pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
             if n <= 1 {
                 return BASE;
             }
-            // Header: summary(1) + formats(1). Pill: expand(1).
-            let header: u16 = 2;
+            // Header: summary(1) + selected cursor preview(1) + formats(1).
+            // Pill: expand(1).
+            let header: u16 = 3;
             let visible = n.min(10);
             let track_rows = ((visible + per_row - 1) / per_row) as u16;
             let overflow: u16 = if n > 10 { 1 } else { 0 };
@@ -77,7 +78,13 @@ pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
 /// - `Empty` → placeholder "press :browse..."
 /// - `Single { .. }` → rich single-file layout (path, format, duration)
 /// - `Batch { .. }` → summary + inline list + `[expand]` pill
-pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused: bool) {
+pub fn draw_source_pane(
+    f: &mut Frame,
+    area: Rect,
+    source: &SourceState,
+    focused: bool,
+    maximized: bool,
+) {
     if area.height < 4 || area.width < 30 {
         return;
     }
@@ -89,24 +96,13 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
     };
     let w = area.width as usize;
 
-    // Top border with title: ┌ source ─── advanced ┐
+    // Top border with title-bar chrome.
     let title = match source.mode {
         SourceMode::Batch { .. } => " source (batch) ",
         SourceMode::MultiTrack { .. } => " source (tracks) ",
         _ => " source ",
     };
-    let adv_label = " advanced ";
-    let dash_count = w.saturating_sub(2 + title.len() + adv_label.len() + 2);
-
-    let top_line = Line::from(vec![
-        Span::styled("┌", theme::border(border_color)),
-        Span::styled(title, theme::border(border_color)),
-        Span::styled("─".repeat(dash_count), theme::border(border_color)),
-        Span::raw(" "),
-        Span::styled("a", theme::muted()),
-        Span::styled("dvanced", theme::border(border_color)),
-        Span::styled(" ┐", theme::border(border_color)),
-    ]);
+    let top_line = source_title_line(border_color, w, title, maximized);
 
     // Bottom border: └───┘
     let bot_line = Line::from(Span::styled(
@@ -165,10 +161,63 @@ pub fn draw_source_pane(f: &mut Frame, area: Rect, source: &SourceState, focused
 
     let mut lines = vec![top_line];
     lines.extend(content_lines);
+    let target_len_before_bottom = area.height.saturating_sub(1) as usize;
+    while lines.len() < target_len_before_bottom {
+        lines.push(bordered_line(border_color, w, vec![]));
+    }
     lines.push(bot_line);
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+}
+
+
+/// Draw the collapsed source title bar.
+pub fn draw_source_title_bar(f: &mut Frame, area: Rect, source: &SourceState, focused: bool) {
+    if area.height < 1 || area.width < 12 {
+        return;
+    }
+    let border_color = if focused { theme::AMBER } else { theme::TEXT_DIM };
+    let title = match source.mode {
+        SourceMode::Batch { .. } => " source (batch) ",
+        SourceMode::MultiTrack { .. } => " source (tracks) ",
+        _ => " source ",
+    };
+    f.render_widget(Paragraph::new(vec![source_title_line(
+        border_color,
+        area.width as usize,
+        title,
+        false,
+    )]), area);
+}
+
+fn source_title_line<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    title: &'a str,
+    maximized: bool,
+) -> Line<'a> {
+    let indicator = if maximized { "◼" } else { "◻" };
+    let left_spans = vec![
+        Span::styled("╒ ", theme::border(border_color)),
+        Span::styled(indicator, theme::border(border_color)),
+        Span::styled(title, theme::border(border_color)),
+    ];
+    let right_spans = vec![
+        Span::styled("a", theme::muted()),
+        Span::styled("dvanced", theme::border(border_color)),
+        Span::styled(" ╕", theme::border(border_color)),
+    ];
+    let fixed_width = Line::from(left_spans.clone()).width()
+        + Line::from(right_spans.clone()).width();
+    let fill_count = width.saturating_sub(fixed_width);
+    let mut spans = left_spans;
+    spans.push(Span::styled(
+        "═".repeat(fill_count),
+        theme::border(border_color),
+    ));
+    spans.extend(right_spans);
+    Line::from(spans)
 }
 
 /// Render the Empty placeholder content.
@@ -270,7 +319,7 @@ fn render_batch<'a>(
     w: usize,
     paths: &[std::path::PathBuf],
     cursor: usize,
-    _cursor_info: Option<&SourceInfo>,
+    cursor_info: Option<&SourceInfo>,
     total_size: u64,
     album_count: usize,
     format_histogram: &[(AudioFormat, usize)],
@@ -296,7 +345,42 @@ fn render_batch<'a>(
         ],
     ));
 
-    // Line 2: format histogram, e.g. "FLAC (3) · WAV (2)"
+    // Line 2: currently previewed file. This is the same shared cursor used
+    // by the metadata file list, so moving in either pane keeps the source
+    // audio preview and metadata tag preview synchronized.
+    let cursor = cursor.min(n.saturating_sub(1));
+    let cursor_name = paths
+        .get(cursor)
+        .map(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default();
+    let cursor_audio = cursor_info
+        .map(batch_cursor_audio_summary)
+        .unwrap_or_else(|| "probing…".to_string());
+    let selected_text = format!(
+        "{}/{} {} │ {}",
+        cursor + 1,
+        n,
+        cursor_name,
+        cursor_audio
+    );
+    lines.push(bordered_line(
+        border_color,
+        w,
+        vec![
+            Span::styled("   selected  ", theme::muted()),
+            Span::styled(
+                truncate_to(&selected_text, w.saturating_sub(15)),
+                theme::bold(theme::CYAN),
+            ),
+        ],
+    ));
+
+    // Line 3: format histogram, e.g. "FLAC (3) · WAV (2)"
     let hist_str = if format_histogram.is_empty() {
         "(no recognised audio extensions)".to_string()
     } else {
@@ -311,35 +395,43 @@ fn render_batch<'a>(
         w,
         vec![
             Span::styled("   formats   ", theme::muted()),
-            Span::styled(hist_str, theme::text()),
+            Span::styled(truncate_to(&hist_str, w.saturating_sub(15)), theme::text()),
         ],
     ));
 
-    // Inline file list (same horizontal layout as multi-track).
-    let header_rows: u16 = 2; // summary + formats
+    // Inline file list. The list is cursor-windowed rather than always
+    // starting at zero, so cursor moves from the source pane and from the
+    // metadata pane stay visible without adding another persistent scroll
+    // field to SourceMode::Batch.
+    let header_rows: u16 = 3; // summary + selected preview + formats
     let tracks_per_row: usize = if w >= 100 { 2 } else { 1 };
-    let mut track_area = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
-    let tentative_max = track_area * tracks_per_row;
-    if n > tentative_max {
-        track_area = track_area.saturating_sub(1); // reserve for overflow row
-    }
-    let max_visible = track_area * tracks_per_row;
-    let end = n.min(max_visible);
+    let list_rows = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
+    let has_overflow = n > list_rows.saturating_mul(tracks_per_row);
+    let item_rows = if has_overflow && list_rows > 1 {
+        list_rows - 1
+    } else {
+        list_rows
+    };
+    let max_visible = item_rows.saturating_mul(tracks_per_row);
+    let start = batch_window_start(cursor, n, max_visible);
+    let end = n.min(start.saturating_add(max_visible));
     let col_width = if tracks_per_row == 2 {
         w.saturating_sub(4) / 2
     } else {
         w.saturating_sub(4)
     };
 
-    // Column-first layout: items 1..N in left column, N+1..2N in right.
-    let num_rows = (end + tracks_per_row - 1) / tracks_per_row;
+    // Column-first layout within the visible window.
+    let visible_count = end.saturating_sub(start);
+    let num_rows = (visible_count + tracks_per_row - 1) / tracks_per_row;
     for row in 0..num_rows {
         let mut row_spans = Vec::new();
         for col in 0..tracks_per_row {
-            let abs = row + col * num_rows;
-            if abs >= end {
+            let offset = row + col * num_rows;
+            if offset >= visible_count {
                 break;
             }
+            let abs = start + offset;
             let filename = paths
                 .get(abs)
                 .map(|p| {
@@ -354,19 +446,30 @@ fn render_batch<'a>(
             } else {
                 Color::White
             };
-            let truncated = truncate_to(&filename, col_width.saturating_sub(4));
+            let prefix = if abs == cursor { "▶ " } else { "  " };
+            let numbered = format!("{}{}. {}", prefix, abs + 1, filename);
+            let truncated = truncate_to(&numbered, col_width.saturating_sub(3));
             let padded = format!("   {:<width$}", truncated, width = col_width.saturating_sub(3));
             row_spans.push(Span::styled(padded, Style::default().fg(fg)));
         }
         lines.push(bordered_line(border_color, w, row_spans));
     }
 
-    if end < n {
+    if has_overflow && list_rows > item_rows {
+        let before = start;
+        let after = n.saturating_sub(end);
+        let message = if before > 0 && after > 0 {
+            format!("   showing {}-{} of {} · {} before · {} after", start + 1, end, n, before, after)
+        } else if before > 0 {
+            format!("   showing {}-{} of {} · {} before", start + 1, end, n, before)
+        } else {
+            format!("   showing {}-{} of {} · {} after", start + 1, end, n, after)
+        };
         lines.push(bordered_line(
             border_color,
             w,
             vec![Span::styled(
-                format!("   ... and {} more", n - end),
+                truncate_to(&message, w.saturating_sub(4)),
                 Style::default().fg(Color::DarkGray),
             )],
         ));
@@ -375,6 +478,45 @@ fn render_batch<'a>(
     lines.push(two_pill_row(border_color, w, EXPAND_PILL_LABEL));
 
     lines
+}
+
+fn batch_cursor_audio_summary(info: &SourceInfo) -> String {
+    let mut parts = Vec::new();
+    if !info.format_name.is_empty() {
+        parts.push(info.format_name.clone());
+    }
+    if !info.codec.is_empty() {
+        parts.push(info.codec_display());
+    }
+    if info.sample_rate > 0 {
+        parts.push(info.sample_rate_display());
+    }
+    if info.channels > 0 {
+        parts.push(info.channels_display());
+    }
+    let duration = info.duration_display();
+    if !duration.is_empty() {
+        parts.push(duration);
+    }
+    if info.file_size > 0 {
+        parts.push(info.size_display());
+    }
+    if parts.is_empty() {
+        "probed".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn batch_window_start(cursor: usize, total: usize, visible_capacity: usize) -> usize {
+    if total == 0 || visible_capacity == 0 || total <= visible_capacity {
+        return 0;
+    }
+    let cursor = cursor.min(total - 1);
+    let half_window = visible_capacity / 2;
+    cursor
+        .saturating_sub(half_window)
+        .min(total.saturating_sub(visible_capacity))
 }
 
 /// Format a byte count as human-readable (e.g., "892.3 MB").
@@ -399,23 +541,64 @@ fn format_size(bytes: u64) -> String {
 /// Shorten a path for display: replace $HOME with ~ and left-truncate
 /// with "..." if it's longer than `max_chars`.
 fn shorten_path(path: &std::path::Path, max_chars: usize) -> String {
-    let s = path.display().to_string();
-    let s = if let Ok(home) = std::env::var("HOME") {
-        if s.starts_with(&home) {
-            format!("~{}", &s[home.len()..])
+    let display = if let Ok(home) = std::env::var("HOME") {
+        let home_path = std::path::Path::new(&home);
+        if let Ok(rest) = path.strip_prefix(home_path) {
+            let rest = rest.display().to_string();
+            if rest.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", rest)
+            }
         } else {
-            s
+            path.display().to_string()
         }
     } else {
-        s
+        path.display().to_string()
     };
-    if s.chars().count() > max_chars && max_chars > 3 {
-        let skip = s.chars().count() - (max_chars - 3);
-        let trunc: String = s.chars().skip(skip).collect();
-        format!("...{}", trunc)
-    } else {
-        s
+
+    truncate_left_to_chars(&display, max_chars)
+}
+
+/// Return the terminal-cell display width ratatui will use for this text.
+fn text_width(s: &str) -> usize {
+    Line::from(s).width()
+}
+
+/// Left-truncate to at most `max_width` terminal cells without slicing the
+/// input at a byte offset. Wide Unicode characters and combining marks are
+/// measured using ratatui's display-width calculation.
+fn truncate_left_to_chars(s: &str, max_width: usize) -> String {
+    if text_width(s) <= max_width {
+        return s.to_string();
     }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let ellipsis = "...";
+    let ellipsis_width = text_width(ellipsis);
+    if max_width <= ellipsis_width {
+        let mut out = String::new();
+        for ch in s.chars().rev() {
+            let candidate = format!("{}{}", ch, out);
+            if text_width(&candidate) > max_width {
+                break;
+            }
+            out = candidate;
+        }
+        return out;
+    }
+
+    let mut tail = String::new();
+    for ch in s.chars().rev() {
+        let candidate = format!("{}{}", ch, tail);
+        if ellipsis_width + text_width(&candidate) > max_width {
+            break;
+        }
+        tail = candidate;
+    }
+    format!("{}{}", ellipsis, tail)
 }
 
 /// Render the "browse files" pill row, right-aligned inside the source pane.
@@ -632,12 +815,38 @@ fn render_multi_track<'a>(
     lines
 }
 
-fn truncate_to(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else if max > 3 {
-        format!("{}...", &s[..max - 3])
-    } else {
-        s[..max].to_string()
+/// Right-truncate to at most `max_width` terminal cells without slicing the
+/// input at a byte offset. Wide Unicode characters and combining marks are
+/// measured using ratatui's display-width calculation.
+fn truncate_to(s: &str, max_width: usize) -> String {
+    if text_width(s) <= max_width {
+        return s.to_string();
     }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let ellipsis = "...";
+    let ellipsis_width = text_width(ellipsis);
+    if max_width <= ellipsis_width {
+        let mut out = String::new();
+        for ch in s.chars() {
+            let candidate = format!("{}{}", out, ch);
+            if text_width(&candidate) > max_width {
+                break;
+            }
+            out = candidate;
+        }
+        return out;
+    }
+
+    let mut head = String::new();
+    for ch in s.chars() {
+        let candidate = format!("{}{}", head, ch);
+        if text_width(&candidate) + ellipsis_width > max_width {
+            break;
+        }
+        head = candidate;
+    }
+    format!("{}{}", head, ellipsis)
 }

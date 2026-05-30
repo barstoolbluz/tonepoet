@@ -23,6 +23,7 @@ pub fn draw_output_options_pane(
     total_source_size: u64,
     format: &FormatState,
     focused: bool,
+    maximized: bool,
 ) {
     if area.height < 5 || area.width < 30 {
         return;
@@ -36,19 +37,7 @@ pub fn draw_output_options_pane(
     let w = area.width as usize;
 
     // Top border
-    let title = " output options ";
-    let adv_label = " advanced ";
-    let dash_count = w.saturating_sub(2 + title.len() + adv_label.len() + 2);
-
-    let top_line = Line::from(vec![
-        Span::styled("┌", theme::border(border_color)),
-        Span::styled(title, theme::border(border_color)),
-        Span::styled("─".repeat(dash_count), theme::border(border_color)),
-        Span::raw(" "),
-        Span::styled("a", theme::muted()),
-        Span::styled("dvanced", theme::border(border_color)),
-        Span::styled(" ┐", theme::border(border_color)),
-    ]);
+    let top_line = output_options_title_line(border_color, w, maximized);
 
     let bot_line = Line::from(Span::styled(
         format!("└{}┘", "─".repeat(w.saturating_sub(2))),
@@ -64,15 +53,7 @@ pub fn draw_output_options_pane(
     let dest_display = opts
         .dest_path
         .as_ref()
-        .map(|p| {
-            let s = p.display().to_string();
-            if let Ok(home) = std::env::var("HOME") {
-                if s.starts_with(&home) {
-                    return format!("~{}", &s[home.len()..]);
-                }
-            }
-            s
-        })
+        .map(shorten_path_for_display)
         .unwrap_or_else(|| "—".to_string());
 
     let dest_label_style = if is_dest_focused {
@@ -167,10 +148,60 @@ pub fn draw_output_options_pane(
     lines.push(file_row);
     lines.push(merge_row);
     lines.push(est_row);
+    let target_len_before_bottom = area.height.saturating_sub(1) as usize;
+    while lines.len() < target_len_before_bottom {
+        lines.push(bordered_line(border_color, w, vec![]));
+    }
     lines.push(bot_line);
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+}
+
+
+/// Draw the collapsed output-options title bar.
+pub fn draw_output_options_title_bar(f: &mut Frame, area: Rect, focused: bool) {
+    if area.height < 1 || area.width < 12 {
+        return;
+    }
+    let border_color = if focused { theme::CYAN } else { theme::TEXT_DIM };
+    f.render_widget(
+        Paragraph::new(vec![output_options_title_line(
+            border_color,
+            area.width as usize,
+            false,
+        )]),
+        area,
+    );
+}
+
+fn output_options_title_line<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    maximized: bool,
+) -> Line<'a> {
+    let title = " output options ";
+    let indicator = if maximized { "◼" } else { "◻" };
+    let left_spans = vec![
+        Span::styled("╒ ", theme::border(border_color)),
+        Span::styled(indicator, theme::border(border_color)),
+        Span::styled(title, theme::border(border_color)),
+    ];
+    let right_spans = vec![
+        Span::styled("a", theme::muted()),
+        Span::styled("dvanced", theme::border(border_color)),
+        Span::styled(" ╕", theme::border(border_color)),
+    ];
+    let fixed_width = Line::from(left_spans.clone()).width()
+        + Line::from(right_spans.clone()).width();
+    let fill_count = width.saturating_sub(fixed_width);
+    let mut spans = left_spans;
+    spans.push(Span::styled(
+        "═".repeat(fill_count),
+        theme::border(border_color),
+    ));
+    spans.extend(right_spans);
+    Line::from(spans)
 }
 
 /// Build a bordered line with a label, pill spans, and optional suffix
@@ -341,14 +372,55 @@ fn format_size_estimate(bytes: u64) -> String {
     }
 }
 
-/// Truncate a string to at most `max_chars` characters, adding "..." if truncated.
-fn truncate_to(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else if max_chars > 3 {
-        let truncated: String = s.chars().take(max_chars - 3).collect();
-        format!("{}...", truncated)
-    } else {
-        s.chars().take(max_chars).collect()
+fn shorten_path_for_display(path: &std::path::PathBuf) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = std::path::Path::new(&home);
+        if let Ok(rest) = path.strip_prefix(home_path) {
+            let rest = rest.display().to_string();
+            if rest.is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest);
+        }
     }
+    path.display().to_string()
+}
+
+fn text_width(s: &str) -> usize {
+    Line::from(s).width()
+}
+
+/// Truncate a string to at most `max_width` terminal cells, adding "..." if
+/// truncated, without slicing the input at byte offsets.
+fn truncate_to(s: &str, max_width: usize) -> String {
+    if text_width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let ellipsis = "...";
+    let ellipsis_width = text_width(ellipsis);
+    if max_width <= ellipsis_width {
+        let mut out = String::new();
+        for ch in s.chars() {
+            let candidate = format!("{}{}", out, ch);
+            if text_width(&candidate) > max_width {
+                break;
+            }
+            out = candidate;
+        }
+        return out;
+    }
+
+    let mut out = String::new();
+    for ch in s.chars() {
+        let candidate = format!("{}{}", out, ch);
+        if text_width(&candidate) + ellipsis_width > max_width {
+            break;
+        }
+        out = candidate;
+    }
+    format!("{}{}", out, ellipsis)
 }

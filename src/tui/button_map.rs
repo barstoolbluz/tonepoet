@@ -47,12 +47,16 @@ pub enum TuiButton {
     PresetsButton,
     SaveButton,
     AdvancedToggle(ConvertFocus),
+    /// Collapse/maximize toggle indicator in pane title bars.
+    MaximizeToggle(ConvertFocus),
 
     // Convert screen editable fields
     DestPathField,
     FolderTemplateField,
     FilenameTemplateField,
     MetadataField(MetadataFieldKind),
+    /// Convert metadata file-list row (absolute source index).
+    MetadataFileRow(usize),
 
     // Convert screen: "browse files..." pill on source pane → opens browse screen
     SourceBrowseButton,
@@ -206,10 +210,12 @@ impl TuiButton {
             | Self::PresetsButton
             | Self::SaveButton
             | Self::AdvancedToggle(_)
+            | Self::MaximizeToggle(_)
             | Self::DestPathField
             | Self::FolderTemplateField
             | Self::FilenameTemplateField
             | Self::MetadataField(_)
+            | Self::MetadataFileRow(_)
             | Self::SourceBrowseButton
             | Self::SourceExpandButton
             | Self::SourceAnalyzeButton
@@ -250,23 +256,38 @@ impl TuiButton {
 #[derive(Debug, Clone)]
 pub struct ButtonRenderMap {
     button_bounds: Vec<(TuiButton, Rect)>,
+    metadata_file_list_visible_rows: Option<usize>,
 }
 
 impl ButtonRenderMap {
     pub fn new() -> Self {
         Self {
             button_bounds: Vec::new(),
+            metadata_file_list_visible_rows: None,
         }
     }
 
     /// Clear all recorded button positions (call at start of each render)
     pub fn clear(&mut self) {
         self.button_bounds.clear();
+        self.metadata_file_list_visible_rows = None;
     }
 
     /// Record that a button was rendered at the given screen coordinates
     pub fn record_button(&mut self, button: TuiButton, screen_rect: Rect) {
         self.button_bounds.push((button, screen_rect));
+    }
+
+    /// Record the current metadata file-list viewport size. This is transient
+    /// UI geometry, cleared at the start of each render alongside button
+    /// hitboxes. It deliberately does not live in ConvertState.
+    pub fn record_metadata_file_list_visible_rows(&mut self, visible_rows: usize) {
+        self.metadata_file_list_visible_rows = Some(visible_rows);
+    }
+
+    /// Return the metadata file-list viewport size from the most recent render.
+    pub fn metadata_file_list_visible_rows(&self) -> Option<usize> {
+        self.metadata_file_list_visible_rows
     }
 
     /// Find the screen rect for a specific button (for cursor-relative menus).

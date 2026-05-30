@@ -25,6 +25,10 @@ pub const COMMAND_NAMES: &[&str] = &[
     "edit",
     "o",
     "output",
+    "max",
+    "maximize",
+    "adv",
+    "advanced",
     "cd",
     "queue",
     "queue!",
@@ -273,6 +277,10 @@ pub enum Command {
     Commit {
         start: bool,
     },
+    /// Toggle maximize/restore for the focused Convert pane.
+    Maximize,
+    /// Toggle the focused Convert pane's advanced section.
+    Advanced,
     /// Start processing whatever's already in the queue. No new batch.
     /// Triggered by `:go` / `:start`.
     Go,
@@ -541,6 +549,8 @@ pub fn parse_command(input: &str) -> Command {
         }
         "commit" => Command::Commit { start: false },
         "Commit" => Command::Commit { start: true },
+        "max" | "maximize" => Command::Maximize,
+        "adv" | "advanced" => Command::Advanced,
         "go" | "start" => Command::Go,
         "expand" | "x" => Command::Expand,
         "batch" => Command::Batch(args.to_string()),
@@ -892,6 +902,27 @@ fn is_nonprobeable_archive(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
+    if app.convert.is_collapsed(focus) {
+        app.convert.layout = ConvertLayout::Maximized(focus);
+    }
+    app.convert.focus = focus;
+    match focus {
+        ConvertFocus::Source => {
+            app.convert.source.advanced_open = !app.convert.source.advanced_open;
+        }
+        ConvertFocus::Metadata => {
+            app.convert.metadata.advanced_open = !app.convert.metadata.advanced_open;
+        }
+        ConvertFocus::Format => {
+            app.convert.format.advanced_open = !app.convert.format.advanced_open;
+        }
+        ConvertFocus::OutputOptions => {
+            app.convert.output_options.advanced_open = !app.convert.output_options.advanced_open;
+        }
+    }
+}
+
 pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMessage>) {
     match cmd {
         Command::Quit => {
@@ -1043,7 +1074,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 let info = match crate::tui::probe::probe_audio(&p) {
                     Ok(i) => i,
                     Err(e) => {
-                        app.convert.source.mode = SourceMode::Empty;
+                        app.convert.set_source_mode(SourceMode::Empty);
                         app.set_status(format!("Probe error: {}", e));
                         return;
                     }
@@ -1058,7 +1089,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.convert.metadata.genre = metadata.genre.clone();
             app.convert.metadata.year = metadata.year.clone();
 
-            app.convert.source.mode = SourceMode::from_single(p.clone(), info, metadata);
+            app.convert.set_source_mode(SourceMode::from_single(p.clone(), info, metadata));
             app.set_status(format!(
                 "Loaded: {}",
                 p.file_name().unwrap_or_default().to_string_lossy()
@@ -1105,6 +1136,20 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
         }
         Command::Commit { start } => {
             execute_commit(app, tx, start);
+        }
+        Command::Maximize => {
+            if app.current_screen == AppScreen::Convert {
+                app.convert.toggle_maximize(app.convert.focus);
+            } else {
+                app.set_status(":max only works on the Convert screen");
+            }
+        }
+        Command::Advanced => {
+            if app.current_screen == AppScreen::Convert {
+                toggle_convert_advanced(app, app.convert.focus);
+            } else {
+                app.set_status(":adv only works on the Convert screen");
+            }
         }
         Command::Go => {
             execute_go(app, tx);
@@ -3772,7 +3817,7 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
                     // Unreachable given paths.is_empty() check above.
                 }
             }
-            app.convert.source.mode = mode;
+            app.convert.set_source_mode(mode);
             app.convert.apply_source_defaults();
             app.recent.record_use_with_db(&first, &app.db);
 
@@ -4020,7 +4065,7 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
     };
 
     // Clear source pane so a subsequent `:queue` arrives fresh.
-    app.convert.source.mode = SourceMode::Empty;
+    app.convert.set_source_mode(SourceMode::Empty);
     app.convert.metadata = MetadataState::default();
     let _ = app.db.clear_batch_state();
 

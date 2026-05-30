@@ -144,8 +144,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 // Overlays have already been dispatched earlier in handle_key,
                 // so at this point Convert has the key exclusively.
                 if app.previous_screen.is_some() {
-                    app.convert.source.mode = SourceMode::Empty;
+                    app.convert.set_source_mode(SourceMode::Empty);
                     app.convert.metadata = MetadataState::default();
+                    app.convert.layout = ConvertLayout::Default;
+                    app.convert.pane_title_last_click = None;
+                    app.convert.metadata_file_last_click = None;
                     let origin = app.previous_screen.take().unwrap_or(AppScreen::Browse);
                     app.current_screen = origin;
                     if origin == AppScreen::Browse {
@@ -228,9 +231,9 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
 
 // ── Convert screen keybindings ───────────────────────────────────────
 
-fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppMessage>) {
+fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     match (key.code, key.modifiers) {
-        // Tab between panes
+        // Tab between panes. This remains unconditional in both Default and Maximized modes.
         (KeyCode::Tab, KeyModifiers::NONE) => {
             app.convert.focus = app.convert.focus.next();
         }
@@ -238,10 +241,11 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
             app.convert.focus = app.convert.focus.prev();
         }
 
-        // Within Source pane + MultiTrack: Up/Down moves track cursor, Space toggles selection
+        // Source pane + MultiTrack navigation.
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source
-                && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+                && !app.convert.is_collapsed(ConvertFocus::Source)
+                && matches!(&app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
         {
             if let SourceMode::MultiTrack { cursor, scroll, .. } = &mut app.convert.source.mode {
                 if *cursor > 0 {
@@ -254,18 +258,12 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source
-                && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+                && !app.convert.is_collapsed(ConvertFocus::Source)
+                && matches!(&app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
         {
-            if let SourceMode::MultiTrack {
-                cursor,
-                scroll,
-                tracks,
-                ..
-            } = &mut app.convert.source.mode
-            {
+            if let SourceMode::MultiTrack { cursor, scroll, tracks, .. } = &mut app.convert.source.mode {
                 if *cursor + 1 < tracks.len() {
                     *cursor += 1;
-                    // Keep cursor visible (max_visible = 6 in render)
                     if *cursor >= *scroll + 6 {
                         *scroll = cursor.saturating_sub(5);
                     }
@@ -274,59 +272,83 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         }
         (KeyCode::Char(' '), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source
-                && matches!(app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
+                && !app.convert.is_collapsed(ConvertFocus::Source)
+                && matches!(&app.convert.source.mode, SourceMode::MultiTrack { .. }) =>
         {
-            if let SourceMode::MultiTrack {
-                cursor, selected, ..
-            } = &mut app.convert.source.mode
-            {
+            if let SourceMode::MultiTrack { cursor, selected, .. } = &mut app.convert.source.mode {
                 if let Some(sel) = selected.get_mut(*cursor) {
                     *sel = !*sel;
                 }
             }
         }
 
-        // Within Format pane: Up/Down moves between pill rows
+        // Metadata pane file-list navigation. Batch mode reuses the source batch cursor.
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-            if app.convert.focus == ConvertFocus::Format =>
+            if app.convert.focus == ConvertFocus::Metadata
+                && !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && matches!(&app.convert.source.mode, SourceMode::Batch { .. } | SourceMode::MultiTrack { .. }) =>
+        {
+            move_metadata_cursor(app, -1, tx);
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Metadata
+                && !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && matches!(&app.convert.source.mode, SourceMode::Batch { .. } | SourceMode::MultiTrack { .. }) =>
+        {
+            move_metadata_cursor(app, 1, tx);
+        }
+        (KeyCode::Enter, KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Metadata
+                && !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && matches!(&app.convert.source.mode, SourceMode::Batch { .. } | SourceMode::MultiTrack { .. }) =>
+        {
+            open_convert_cursor_metadata_editor(app);
+        }
+
+        // Format pane navigation.
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Format
+                && !app.convert.is_collapsed(ConvertFocus::Format) =>
         {
             app.convert.format.focus_prev();
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-            if app.convert.focus == ConvertFocus::Format =>
+            if app.convert.focus == ConvertFocus::Format
+                && !app.convert.is_collapsed(ConvertFocus::Format) =>
         {
             app.convert.format.focus_next();
         }
-
-        // Within Format pane: Left/Right changes pill selection
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
-            if app.convert.focus == ConvertFocus::Format =>
+            if app.convert.focus == ConvertFocus::Format
+                && !app.convert.is_collapsed(ConvertFocus::Format) =>
         {
             super::format_interactions::handle_convert_format_row_step(&mut app.convert, false);
             app.preset.mark_modified();
         }
         (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
-            if app.convert.focus == ConvertFocus::Format =>
+            if app.convert.focus == ConvertFocus::Format
+                && !app.convert.is_collapsed(ConvertFocus::Format) =>
         {
             super::format_interactions::handle_convert_format_row_step(&mut app.convert, true);
             app.preset.mark_modified();
         }
 
-        // Within Output Options pane: Up/Down moves between fields
+        // Output options pane navigation.
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-            if app.convert.focus == ConvertFocus::OutputOptions =>
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
         {
             app.convert.output_options.field_focus = app.convert.output_options.field_focus.prev();
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-            if app.convert.focus == ConvertFocus::OutputOptions =>
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
         {
             app.convert.output_options.field_focus = app.convert.output_options.field_focus.next();
         }
-
-        // Within Output Options: Left/Right on merge mode pill
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
                 && app.convert.output_options.field_focus == OutputOptionsField::MergeMode =>
         {
             app.convert.output_options.merge.select_prev();
@@ -334,20 +356,17 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
         }
         (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
                 && app.convert.output_options.field_focus == OutputOptionsField::MergeMode =>
         {
             app.convert.output_options.merge.select_next();
             app.preset.mark_modified();
         }
 
-        // Source pane default action: in Batch mode open the BatchList
-        // expand overlay (view/manage the file list); in Single/Empty
-        // mode open FileInput to edit the source path.
-        // Previously `e`/Enter in batch mode opened FileInput with the
-        // cursor path pre-filled, which would silently replace the
-        // whole batch with a single file if the user committed.
+        // Source pane default action.
         (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE)
-            if app.convert.focus == ConvertFocus::Source =>
+            if app.convert.focus == ConvertFocus::Source
+                && !app.convert.is_collapsed(ConvertFocus::Source) =>
         {
             if app.convert.source.mode.is_batch() {
                 app.active_overlay = ActiveOverlay::BatchList { scroll: 0 };
@@ -365,29 +384,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
             }
         }
 
-        // Advanced toggle (stub)
-        (KeyCode::Char('a'), KeyModifiers::NONE) => match app.convert.focus {
-            ConvertFocus::Source => {
-                app.convert.source.advanced_open = !app.convert.source.advanced_open;
-            }
-            ConvertFocus::Metadata => {
-                app.convert.metadata.advanced_open = !app.convert.metadata.advanced_open;
-            }
-            ConvertFocus::Format => {
-                app.convert.format.advanced_open = !app.convert.format.advanced_open;
-            }
-            ConvertFocus::OutputOptions => {
-                app.convert.output_options.advanced_open =
-                    !app.convert.output_options.advanced_open;
-            }
-        },
-
-        // Commit is now command-mode only: `:commit` (enqueue) or
-        // `:Commit` (enqueue + start). No keyboard shortcuts — consistent
-        // with the vi-style philosophy and the "no back door" invariant.
-        // Esc cancels batch review (handled in handle_key top-level).
-
-        // Open presets overlay
+        // Open presets overlay.
         (KeyCode::Char('p'), KeyModifiers::NONE) => {
             app.preset.overlay_list = super::presets::list_presets();
             app.preset.overlay_selected = 0;
@@ -395,7 +392,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
             app.preset.overlay_open = true;
         }
 
-        // Save preset
+        // Save preset.
         (KeyCode::Char('s'), KeyModifiers::NONE) => {
             if let Some(name) = &app.preset.active_preset.clone() {
                 let preset = super::presets::TuiPreset::from_pill_state(
@@ -411,7 +408,6 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, _tx: &mpsc::Sender<AppM
                     Err(e) => app.set_status(format!("Save failed: {}", e)),
                 }
             } else {
-                // No active preset — open overlay in naming mode
                 app.preset.overlay_list = super::presets::list_presets();
                 app.preset.overlay_selected = 0;
                 app.preset.naming_input = Some(super::text_input::TextInputState::empty());
@@ -1131,8 +1127,11 @@ fn load_browse_selection(
                     app.convert.metadata.year = metadata.year.clone();
                     // Browse Enter loads a single file — abandon any
                     // pending batch from a previous :queue.
-                    app.convert.source.mode =
-                        SourceMode::from_single(path.clone(), Some(info), metadata);
+                    app.convert.set_source_mode(SourceMode::from_single(
+                        path.clone(),
+                        Some(info),
+                        metadata,
+                    ));
                     app.set_status(format!(
                         "Loaded: {}",
                         path.file_name().unwrap_or_default().to_string_lossy()
@@ -4274,6 +4273,14 @@ pub fn open_metadata_editor(app: &mut AppState) {
 /// construct the editor state, and installs it on the app. Sidecar
 /// data wins on every field it provides; ScarletBook fills gaps.
 pub(super) fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::path::PathBuf) {
+    open_metadata_editor_for_sacd_at_track(app, iso_path, None);
+}
+
+fn open_metadata_editor_for_sacd_at_track(
+    app: &mut AppState,
+    iso_path: std::path::PathBuf,
+    initial_track: Option<usize>,
+) {
     let md = match super::sacd::parse_sacd_iso(&iso_path) {
         Ok(m) => m,
         Err(e) => {
@@ -4301,7 +4308,10 @@ pub(super) fn open_metadata_editor_for_sacd(app: &mut AppState, iso_path: std::p
         });
 
     match build_sacd_editor_state(&iso_path, &md, sidecar.as_ref()) {
-        Ok((state, area_label, n_tracks)) => {
+        Ok((mut state, area_label, n_tracks)) => {
+            if let Some(track_index) = initial_track {
+                focus_metadata_editor_on_track(&mut state, track_index);
+            }
             let src = if sidecar.is_some() {
                 "sidecar+ScarletBook"
             } else if sidecar_parse_error.is_some() {
@@ -8305,6 +8315,235 @@ fn move_batch_cursor(app: &mut AppState, new_cursor: usize, _tx: &mpsc::Sender<A
     ));
 }
 
+
+fn move_metadata_cursor(app: &mut AppState, delta: isize, tx: &mpsc::Sender<AppMessage>) {
+    let (len, cursor) = match &app.convert.source.mode {
+        SourceMode::Batch { paths, cursor, .. } => (paths.len(), *cursor),
+        SourceMode::MultiTrack { tracks, cursor, .. } => (tracks.len(), *cursor),
+        _ => return,
+    };
+    if len == 0 {
+        return;
+    }
+    let new_cursor = if delta < 0 {
+        cursor.saturating_sub((-delta) as usize)
+    } else {
+        cursor.saturating_add(delta as usize).min(len - 1)
+    };
+    if new_cursor == cursor {
+        return;
+    }
+    set_metadata_cursor(app, new_cursor, tx);
+}
+
+fn set_metadata_cursor(app: &mut AppState, index: usize, tx: &mpsc::Sender<AppMessage>) {
+    let batch_len = match &app.convert.source.mode {
+        SourceMode::Batch { paths, .. } => Some(paths.len()),
+        _ => None,
+    };
+    if let Some(len) = batch_len {
+        if index < len {
+            move_batch_cursor(app, index, tx);
+        }
+        ensure_metadata_cursor_visible(app, metadata_file_list_visible_rows(app));
+        return;
+    }
+
+    if let SourceMode::MultiTrack { tracks, cursor, scroll, .. } = &mut app.convert.source.mode {
+        if index < tracks.len() {
+            *cursor = index;
+            if *cursor < *scroll {
+                *scroll = *cursor;
+            } else if *cursor >= *scroll + 6 {
+                *scroll = cursor.saturating_sub(5);
+            }
+        }
+    }
+    ensure_metadata_cursor_visible(app, metadata_file_list_visible_rows(app));
+}
+
+fn metadata_file_list_visible_rows(app: &AppState) -> usize {
+    // The register pass records this as transient UI geometry in ButtonRenderMap,
+    // which is cleared at the start of each render. Keep it out of ConvertState
+    // so draw/register remains read-only with respect to convert state.
+    app.button_map
+        .metadata_file_list_visible_rows()
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn ensure_metadata_cursor_visible(app: &mut AppState, visible: usize) {
+    let visible = visible.max(1);
+    let (len, cursor) = match &app.convert.source.mode {
+        SourceMode::Batch { paths, cursor, .. } => (paths.len(), *cursor),
+        SourceMode::MultiTrack { tracks, cursor, .. } => (tracks.len(), *cursor),
+        _ => return,
+    };
+    if len == 0 || len <= visible {
+        app.convert.metadata.file_scroll = 0;
+        return;
+    }
+    let max_scroll = len.saturating_sub(visible);
+    if cursor < app.convert.metadata.file_scroll {
+        app.convert.metadata.file_scroll = cursor;
+    } else if cursor >= app.convert.metadata.file_scroll + visible {
+        app.convert.metadata.file_scroll = cursor + 1 - visible;
+    }
+    app.convert.metadata.file_scroll = app.convert.metadata.file_scroll.min(max_scroll);
+}
+
+fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
+    if app.convert.is_collapsed(focus) {
+        app.convert.layout = ConvertLayout::Maximized(focus);
+    }
+    app.convert.focus = focus;
+    match focus {
+        ConvertFocus::Source => {
+            app.convert.source.advanced_open = !app.convert.source.advanced_open;
+        }
+        ConvertFocus::Metadata => {
+            app.convert.metadata.advanced_open = !app.convert.metadata.advanced_open;
+        }
+        ConvertFocus::Format => {
+            app.convert.format.advanced_open = !app.convert.format.advanced_open;
+        }
+        ConvertFocus::OutputOptions => {
+            app.convert.output_options.advanced_open = !app.convert.output_options.advanced_open;
+        }
+    }
+}
+
+
+fn clear_convert_double_click_state_for_button(app: &mut AppState, button: Option<TuiButton>) {
+    if app.current_screen != AppScreen::Convert {
+        return;
+    }
+
+    match button {
+        Some(TuiButton::Pane(_)) => {
+            app.convert.metadata_file_last_click = None;
+        }
+        Some(TuiButton::MetadataFileRow(_)) => {
+            app.convert.pane_title_last_click = None;
+        }
+        _ => {
+            app.convert.pane_title_last_click = None;
+            app.convert.metadata_file_last_click = None;
+        }
+    }
+}
+
+fn open_convert_cursor_metadata_editor(app: &mut AppState) {
+    let initial_track = match &app.convert.source.mode {
+        SourceMode::MultiTrack { cursor, .. } => Some(*cursor),
+        _ => None,
+    };
+
+    let Some(path) = app.convert.source.mode.current_path().cloned() else {
+        app.set_status("metadata: no source file selected");
+        return;
+    };
+
+    if super::sacd::is_sacd_iso(&path) {
+        open_metadata_editor_for_sacd_at_track(app, path, initial_track);
+        return;
+    }
+
+    let mut paths = vec![path];
+    let mut entries = match super::probe::read_all_tags_merged(&paths) {
+        Ok(e) => e,
+        Err(e) => {
+            app.set_status(format!("Failed to read tags: {}", e));
+            return;
+        }
+    };
+
+    if paths.len() == 1 {
+        inject_sidecar_cuesheet_if_present(&mut entries, &paths[0]);
+        apply_embedded_cuesheet_per_track(&mut entries);
+    }
+    super::probe::sort_paths_and_entries_by_track(&mut paths, &mut entries);
+
+    let file_labels: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect();
+
+    let mut state = super::app::MetadataEditorState {
+        paths,
+        entries,
+        cursor: 0,
+        scroll: 0,
+        last_click: None,
+        edit_input: None,
+        add_key_input: None,
+        phase: super::app::MetadataEditorPhase::Editing,
+        dirty: false,
+        deleted: Vec::new(),
+        file_labels,
+        detail_field_idx: 0,
+        detail_cursor: 0,
+        detail_scroll: 0,
+        detail_edit: None,
+        mb_back: None,
+        gnudb_back: None,
+        read_only: false,
+        sacd_sidecar_path: None,
+        sacd_area_kind: None,
+        sacd_stereo_durations: None,
+        sacd_multi_channel_durations: None,
+    };
+    if let Some(track_index) = initial_track {
+        focus_metadata_editor_on_track(&mut state, track_index);
+    }
+    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+}
+
+fn focus_metadata_editor_on_track(
+    state: &mut super::app::MetadataEditorState,
+    track_index: usize,
+) {
+    if state.entries.is_empty() {
+        return;
+    }
+
+    let preferred_keys = ["TITLE", "ARTIST", "PERFORMER", "TRACKNUMBER", "ISRC"];
+    let preferred = preferred_keys.iter().find_map(|key| {
+        state.entries.iter().position(|entry| {
+            entry.display_key.eq_ignore_ascii_case(key)
+                && !entry.is_binary
+                && entry.per_file_values.len() > track_index
+        })
+    });
+    let fallback = state.entries.iter().position(|entry| {
+        !entry.is_binary && entry.per_file_values.len() > track_index
+    });
+    let Some(field_idx) = preferred.or(fallback) else {
+        state.cursor = state.cursor.min(state.entries.len().saturating_sub(1));
+        ensure_cursor_visible(state);
+        return;
+    };
+
+    state.cursor = field_idx;
+    ensure_cursor_visible(state);
+
+    let values_len = state.entries[field_idx].per_file_values.len();
+    if values_len > 1 {
+        state.detail_field_idx = field_idx;
+        state.detail_cursor = track_index.min(values_len - 1);
+        state.detail_scroll = 0;
+        state.detail_edit = None;
+        state.last_click = None;
+        state.phase = super::app::MetadataEditorPhase::DetailEdit;
+        ensure_detail_visible(state);
+    }
+}
+
 /// Remove the file at the batch cursor from the batch. If the batch
 /// drops to 0 files, transitions to `SourceMode::Empty`. If it drops
 /// to 1 file, promotes to `SourceMode::Single` and spawns a background
@@ -8337,7 +8576,7 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     };
 
     if remaining_paths.is_empty() {
-        app.convert.source.mode = SourceMode::Empty;
+        app.convert.set_source_mode(SourceMode::Empty);
         return;
     }
 
@@ -8346,15 +8585,15 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         // If this is the same file we already had info for, carry it over.
         if old_cursor_path.as_ref() == Some(&path) {
             if let Some((info, metadata)) = old_cursor_info {
-                app.convert.source.mode = SourceMode::from_single(path, Some(info), metadata);
+                app.convert.set_source_mode(SourceMode::from_single(path, Some(info), metadata));
                 return;
             }
         }
-        app.convert.source.mode = SourceMode::from_single(
+        app.convert.set_source_mode(SourceMode::from_single(
             path.clone(),
             None,
             crate::tui::probe::SourceMetadata::default(),
-        );
+        ));
         super::browse::spawn_audio_probe(path, tx.clone());
         return;
     }
@@ -8387,7 +8626,7 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         false
     };
 
-    app.convert.source.mode = new_mode;
+    app.convert.set_source_mode(new_mode);
 
     if need_probe {
         if let Some(p) = new_cursor_path {
@@ -9028,8 +9267,11 @@ fn load_recent_as_source(app: &mut AppState, path: &std::path::Path) {
             app.convert.metadata.year = metadata.year.clone();
             // Loading from recent replaces the source — abandon any
             // pending batch from a previous :queue.
-            app.convert.source.mode =
-                SourceMode::from_single(path.to_path_buf(), Some(info), metadata);
+            app.convert.set_source_mode(SourceMode::from_single(
+                path.to_path_buf(),
+                Some(info),
+                metadata,
+            ));
             app.set_status(format!(
                 "Loaded: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -9058,7 +9300,7 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
                 Ok(i) => i,
                 Err(e) => {
                     // Reset to Empty on probe failure.
-                    app.convert.source.mode = SourceMode::Empty;
+                    app.convert.set_source_mode(SourceMode::Empty);
                     app.set_status(format!("Probe error: {}", e));
                     return;
                 }
@@ -9071,8 +9313,11 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
             app.convert.metadata.genre = metadata.genre.clone();
             app.convert.metadata.year = metadata.year.clone();
             // FileInput replaces the source — abandon any pending batch.
-            app.convert.source.mode =
-                SourceMode::from_single(path.to_path_buf(), Some(info), metadata);
+            app.convert.set_source_mode(SourceMode::from_single(
+                path.to_path_buf(),
+                Some(info),
+                metadata,
+            ));
             app.set_status(format!(
                 "Loaded: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -9412,6 +9657,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         mouse.kind,
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
     ) {
+        if app.current_screen == AppScreen::Convert {
+            clear_convert_double_click_state_for_button(app, None);
+        }
         if !matches!(app.active_overlay, ActiveOverlay::None) {
             return;
         }
@@ -9429,6 +9677,27 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     _ => {}
                 }
             }
+        } else if app.current_screen == AppScreen::Convert {
+            if matches!(
+                app.button_map.find_button_at(mouse.column, mouse.row),
+                Some(TuiButton::MetadataFileRow(_)) | Some(TuiButton::Pane(ConvertFocus::Metadata))
+            ) && !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && matches!(&app.convert.source.mode, SourceMode::Batch { .. } | SourceMode::MultiTrack { .. })
+            {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        for _ in 0..3 {
+                            move_metadata_cursor(app, -1, tx);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        for _ in 0..3 {
+                            move_metadata_cursor(app, 1, tx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         return;
     }
@@ -9443,6 +9712,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // - Left-click on empty space or non-selectable area: close only.
     if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
         if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            clear_convert_double_click_state_for_button(app, None);
             if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
                 // Right-click: close old menu (the user is going to open
                 // a new one). Drop any parked overlay state since the
@@ -9490,6 +9760,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // shows the menu, just like Windows Explorer / macOS Finder.
     // Skip if another (non-context-menu) overlay is already active.
     if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+        clear_convert_double_click_state_for_button(app, None);
         if matches!(app.active_overlay, ActiveOverlay::None) {
             let x = mouse.column;
             let y = mouse.row;
@@ -9527,6 +9798,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
     let x = mouse.column;
     let y = mouse.row;
+    let clicked_button = app.button_map.find_button_at(x, y);
+    let double_click_candidate = if matches!(app.active_overlay, ActiveOverlay::None) {
+        clicked_button
+    } else {
+        None
+    };
+    clear_convert_double_click_state_for_button(app, double_click_candidate);
 
     // If wizard is active, forward to wizard
     if app.current_screen == AppScreen::Wizard {
@@ -9603,7 +9881,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
     // Check button map — skip screen-specific buttons if they belong
     // to a different screen (stale button_map from the previous frame).
-    if let Some(button) = app.button_map.find_button_at(x, y) {
+    if let Some(button) = clicked_button {
         if let Some(btn_screen) = button.screen() {
             if btn_screen != app.current_screen {
                 return; // Stale button from a previous screen's render.
@@ -9612,7 +9890,29 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         match button {
             // ── Convert screen: pane focus ──
             TuiButton::Pane(focus) => {
-                app.convert.focus = focus;
+                let now = std::time::Instant::now();
+                let is_double = app
+                    .convert
+                    .pane_title_last_click
+                    .map(|(prev_focus, prev_time)| {
+                        prev_focus == focus && now.duration_since(prev_time).as_millis() < 300
+                    })
+                    .unwrap_or(false);
+
+                if is_double {
+                    app.convert.toggle_maximize(focus);
+                    app.convert.pane_title_last_click = None;
+                } else {
+                    app.convert.focus = focus;
+                    app.convert.pane_title_last_click = Some((focus, now));
+                }
+                app.current_screen = AppScreen::Convert;
+            }
+            TuiButton::MaximizeToggle(focus) => {
+                app.convert.toggle_maximize(focus);
+                if app.convert.is_maximized(focus) {
+                    app.convert.focus = focus;
+                }
                 app.current_screen = AppScreen::Convert;
             }
 
@@ -9752,25 +10052,32 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     label: label.to_string(),
                 };
             }
+            TuiButton::MetadataFileRow(index) => {
+                app.convert.focus = ConvertFocus::Metadata;
+                let now = std::time::Instant::now();
+                let is_double = app
+                    .convert
+                    .metadata_file_last_click
+                    .map(|(prev, prev_time)| {
+                        prev == index && now.duration_since(prev_time).as_millis() < 300
+                    })
+                    .unwrap_or(false);
+
+                // Single click always selects the row. Only a second click on the
+                // same row within the double-click window opens the editor.
+                set_metadata_cursor(app, index, tx);
+
+                if is_double {
+                    app.convert.metadata_file_last_click = None;
+                    open_convert_cursor_metadata_editor(app);
+                } else {
+                    app.convert.metadata_file_last_click = Some((index, now));
+                }
+            }
 
             // ── Convert screen: advanced toggle per pane ──
             TuiButton::AdvancedToggle(focus) => {
-                app.convert.focus = focus;
-                match focus {
-                    ConvertFocus::Source => {
-                        app.convert.source.advanced_open = !app.convert.source.advanced_open;
-                    }
-                    ConvertFocus::Metadata => {
-                        app.convert.metadata.advanced_open = !app.convert.metadata.advanced_open;
-                    }
-                    ConvertFocus::Format => {
-                        app.convert.format.advanced_open = !app.convert.format.advanced_open;
-                    }
-                    ConvertFocus::OutputOptions => {
-                        app.convert.output_options.advanced_open =
-                            !app.convert.output_options.advanced_open;
-                    }
-                }
+                toggle_convert_advanced(app, focus);
             }
 
             // ── Convert screen: format pane pills ──

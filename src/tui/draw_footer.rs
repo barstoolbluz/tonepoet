@@ -169,6 +169,7 @@ fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
         AppScreen::Convert => vec![
             h("tab", "pane", theme::BLUE, 0),
             h("←→", "select", theme::BLUE, 0),
+            h(":max", "pane", theme::BLUE, 2),
             h(":commit", "enqueue", theme::GREEN, 0),
         ],
         AppScreen::Browse => vec![

@@ -207,6 +207,8 @@ pub enum ContextAction {
     CommitAndStart,
     /// Load a named preset into the format pills.
     LoadPreset(String),
+    /// Toggle maximize/restore for a Convert pane.
+    TogglePaneMaximize(ConvertFocus),
 
     // ── Queue screen ────────────────────────────────────────────────
     /// Start processing (`:go`).
@@ -582,6 +584,22 @@ pub fn build_convert_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     }
 
     items.push(item("Browse for source", ContextAction::BrowseForSource));
+
+    let pane_items = [
+        (ConvertFocus::Source, "Source"),
+        (ConvertFocus::Metadata, "Metadata"),
+        (ConvertFocus::Format, "Format"),
+        (ConvertFocus::OutputOptions, "Output Options"),
+    ];
+    items.push(separator());
+    for (focus, name) in &pane_items {
+        let label = if app.convert.is_maximized(*focus) {
+            format!("Restore {}", name)
+        } else {
+            format!("Maximize {}", name)
+        };
+        items.push(item(&label, ContextAction::TogglePaneMaximize(*focus)));
+    }
 
     // Presets grouped by codec — same tree structure as the browse
     // entry's Convert submenu, but here just for loading (not queuing).
@@ -1221,6 +1239,12 @@ pub fn execute_context_action(
         ContextAction::LoadPreset(name) => {
             let cmd = super::command::Command::Preset(name);
             super::command::execute_command(app, cmd, tx);
+        }
+        ContextAction::TogglePaneMaximize(pane) => {
+            app.convert.toggle_maximize(pane);
+            if app.convert.is_maximized(pane) {
+                app.convert.focus = pane;
+            }
         }
 
         // ── Queue ───────────────────────────────────────────────────
