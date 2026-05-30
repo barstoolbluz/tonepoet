@@ -135,12 +135,14 @@ pub const fn soxr_dither_method(dither: DitherType) -> Option<&'static str> {
     match dither {
         DitherType::None => Some("none"),
         DitherType::Tpdf | DitherType::SlopedTpdf => Some("triangular"),
-        DitherType::Shibata | DitherType::LowShibata | DitherType::HighShibata => Some("shibata"),
+        DitherType::Shibata => Some("shibata"),
+        DitherType::LowShibata => Some("low_shibata"),
+        DitherType::HighShibata => Some("high_shibata"),
         DitherType::FWeighted => Some("f_weighted"),
-        DitherType::ModifiedEWeighted | DitherType::ImprovedEWeighted => {
-            Some("modified_e_weighted")
-        }
-        DitherType::Lipshitz | DitherType::Gesemann => None,
+        DitherType::ModifiedEWeighted => Some("modified_e_weighted"),
+        DitherType::ImprovedEWeighted => Some("improved_e_weighted"),
+        DitherType::Lipshitz => Some("lipshitz"),
+        DitherType::Gesemann => None, // no ffmpeg equivalent
     }
 }
 
