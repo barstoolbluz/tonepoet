@@ -1058,6 +1058,11 @@ impl FormatState {
             AudioFormat::Flac | AudioFormat::Alac => {
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
+                for opt in &mut self.sample_rate.options {
+                    if opt.value > 384_000 {
+                        opt.enabled = false;
+                    }
+                }
             }
             AudioFormat::WavPack => {
                 // Float32 supported, Float64 rejected by WavPack encoder.
