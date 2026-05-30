@@ -401,7 +401,7 @@ impl SourceMode {
                     } else {
                         "Multichannel"
                     };
-                    let tracks: Vec<MultiTrackEntry> = area_info
+                    let mut tracks: Vec<MultiTrackEntry> = area_info
                         .tracks
                         .iter()
                         .enumerate()
@@ -416,10 +416,42 @@ impl SourceMode {
                         })
                         .collect();
 
+                    // Merge sidecar metadata (titles, artists) into the track
+                    // list and album metadata. ScarletBook text fields are
+                    // often empty; the XML sidecar has the real metadata.
+                    let sidecar = crate::tui::sacd_sidecar::find_sidecar_for_iso(&path)
+                        .and_then(|p| crate::tui::sacd_sidecar::parse_sidecar(&p).ok());
+                    if let Some(ref sc) = sidecar {
+                        for st in &sc.tracks {
+                            if let Some(track) = tracks.iter_mut().find(|t| t.number == st.id) {
+                                if let Some(title) = st.meta.get("TITLE") {
+                                    if track.title.is_none() || track.title.as_deref() == Some("") {
+                                        track.title = Some(title.clone());
+                                    }
+                                }
+                                if let Some(artist) = st.meta.get("ARTIST") {
+                                    if track.performer.is_none() || track.performer.as_deref() == Some("") {
+                                        track.performer = Some(artist.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let album_title = sacd.album_title().map(|s| s.to_string());
                     let album_artist = sacd.album_artist().map(|s| s.to_string());
 
                     let mut meta = metadata;
+                    if let Some(ref sc) = sidecar {
+                        if let Some(first) = sc.tracks.first() {
+                            if let Some(album) = first.meta.get("ALBUM") {
+                                meta.album = Some(album.clone());
+                            }
+                            if let Some(artist) = first.meta.get("ARTIST") {
+                                meta.artist = Some(artist.clone());
+                            }
+                        }
+                    }
                     if meta.album.is_none() {
                         meta.album = album_title.clone();
                     }
