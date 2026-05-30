@@ -275,7 +275,7 @@ fn template_row_with_pills<'a>(
 
     let content_width: usize = spans.iter().map(|s| s.width()).sum();
     let pills_total = load_w + 1 + build_w; // pills + gap
-    let padding = width.saturating_sub(content_width + pills_total + 2); // +2 for gap + border
+    let padding = width.saturating_sub(content_width + pills_total + 1); // +1 for right border
     spans.push(Span::raw(" ".repeat(padding)));
     spans.push(load_pill);
     spans.push(Span::raw(" "));
