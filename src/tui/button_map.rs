@@ -42,6 +42,7 @@ pub enum TuiButton {
     ModulatorOrderPill(usize),
     ConversionPresetPill(usize),
     MergePill(usize),
+    ContainerPill(usize),
 
     // Convert screen controls
     PresetsButton,
@@ -207,6 +208,7 @@ impl TuiButton {
             | Self::ModulatorOrderPill(_)
             | Self::ConversionPresetPill(_)
             | Self::MergePill(_)
+            | Self::ContainerPill(_)
             | Self::PresetsButton
             | Self::SaveButton
             | Self::AdvancedToggle(_)

@@ -10095,6 +10095,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.preset.mark_modified();
                 }
             }
+            TuiButton::ContainerPill(i) => {
+                app.convert.focus = ConvertFocus::Format;
+                let containers = app.convert.format.format.selected_value().available_containers();
+                if i < containers.len() {
+                    app.convert.format.selected_container_index = i;
+                    app.preset.mark_modified();
+                }
+            }
             TuiButton::MergePill(i) => {
                 app.convert.focus = ConvertFocus::OutputOptions;
                 app.convert.output_options.field_focus = OutputOptionsField::MergeMode;

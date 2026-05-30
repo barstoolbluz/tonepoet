@@ -124,6 +124,8 @@ impl AudioFormat {
                 ContainerOption { extension: "wav", display_name: "WAV", ffmpeg_flags: &[] },
                 ContainerOption { extension: "wav", display_name: "RF64", ffmpeg_flags: &["-rf64", "auto"] },
                 ContainerOption { extension: "w64", display_name: "W64", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
             ],
             Self::Aiff => &[
                 ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[] },
