@@ -108,6 +108,14 @@ impl ConvertFocus {
 }
 
 
+/// Which field is focused in the format-specific settings overlay.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FormatSettingsFocus {
+    Compression,
+    Verify,
+    Md5,
+}
+
 /// Convert screen layout mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConvertLayout {
@@ -702,6 +710,12 @@ pub struct FormatState {
     /// Selected container index into `AudioFormat::available_containers()`.
     /// 0 = codec default. Reset to 0 when the format pill changes.
     pub selected_container_index: usize,
+    /// FLAC compression level (0-8). Visible below-the-fold when FLAC + maximized.
+    pub flac_compression_level: u8,
+    /// FLAC verify-during-encode toggle.
+    pub flac_verify: PillState<bool>,
+    /// FLAC MD5 checksum toggle.
+    pub flac_md5: PillState<bool>,
 }
 
 impl FormatState {
@@ -796,6 +810,13 @@ impl FormatState {
             advanced_open: false,
             dither_overridden: false,
             selected_container_index: 0,
+            flac_compression_level: 8,
+            flac_verify: PillState::new(vec![
+                (false, "off"), (true, "on"),
+            ]),
+            flac_md5: PillState::new(vec![
+                (true, "on"), (false, "off"),
+            ]),
         };
         state.apply_format_constraints();
         state
@@ -1531,6 +1552,14 @@ pub enum ActiveOverlay {
         preview: String,
         /// Current field value (for "active" badge).
         active_template: Option<String>,
+    },
+    /// Format-specific settings overlay (e.g. FLAC compression/verify/md5).
+    /// Owns temporary copies; committed on Enter, discarded on Esc.
+    FormatSettings {
+        compression_input: crate::tui::text_input::TextInputState,
+        verify: bool,
+        md5: bool,
+        focus: FormatSettingsFocus,
     },
 }
 

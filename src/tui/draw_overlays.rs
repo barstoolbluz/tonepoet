@@ -9,8 +9,8 @@ use ratatui::{
 };
 
 use super::app::{
-    ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState, MbSelectState,
-    SourceMode,
+    ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState,
+    FormatSettingsFocus, MbSelectState, SourceMode,
 };
 use super::button_map::TuiButton;
 use super::theme;
@@ -175,6 +175,15 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
                 active_template.as_deref(),
                 &mut app.button_map,
             );
+        }
+        ActiveOverlay::FormatSettings {
+            ref compression_input,
+            verify,
+            md5,
+            focus,
+        } => {
+            let compression_input = compression_input.clone();
+            draw_format_settings(f, &compression_input, verify, md5, focus, &mut app.button_map);
         }
     }
 
@@ -825,6 +834,126 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
     ]))
     .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
+}
+
+/// Draw the format-specific settings overlay (FLAC compression/verify/MD5).
+fn draw_format_settings(
+    f: &mut Frame,
+    compression_input: &super::text_input::TextInputState,
+    verify: bool,
+    md5: bool,
+    focus: FormatSettingsFocus,
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
+    let area = f.size();
+    let popup_width = area.width.saturating_sub(4).min(50);
+    let popup = centered_rect(popup_width, 9, area);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::GREEN))
+        .title(Span::styled(
+            " FLAC Settings ",
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // compression
+            Constraint::Length(1), // verify
+            Constraint::Length(1), // md5
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // footer
+            Constraint::Min(0),   // absorb remainder
+        ])
+        .split(inner);
+
+    // Compression level (text input field)
+    let comp_focused = focus == FormatSettingsFocus::Compression;
+    let comp_label_style = if comp_focused { theme::bright() } else { theme::muted() };
+    let visible_width = chunks[1].width.saturating_sub(16) as usize; // label takes ~15 chars
+    let (view, cursor_col) = compression_input.view(visible_width.max(1));
+    let display_val = if view.is_empty() { " ".to_string() } else { view };
+    let input_bg = if comp_focused {
+        Color::Rgb(40, 40, 40)
+    } else {
+        Color::Rgb(30, 30, 30)
+    };
+    let comp_line = Line::from(vec![
+        Span::styled("  compression  ", comp_label_style),
+        Span::styled(format!(" {} ", display_val), Style::default().fg(Color::White).bg(input_bg)),
+    ]);
+    f.render_widget(Paragraph::new(comp_line), chunks[1]);
+    if comp_focused {
+        f.set_cursor(chunks[1].x + 16 + cursor_col, chunks[1].y);
+    }
+
+    // Verify toggle pills
+    let verify_focused = focus == FormatSettingsFocus::Verify;
+    let verify_label_style = if verify_focused { theme::bright() } else { theme::muted() };
+    let (off_style, on_style) = toggle_pill_styles(verify, verify_focused);
+    let verify_line = Line::from(vec![
+        Span::styled("  verify       ", verify_label_style),
+        Span::styled(" off ", off_style),
+        Span::raw(" "),
+        Span::styled(" on ", on_style),
+    ]);
+    f.render_widget(Paragraph::new(verify_line), chunks[2]);
+    // Register click targets for verify pills
+    let vx = chunks[2].x + 15;
+    buttons.record_button(TuiButton::FormatSettingsVerify(0), Rect::new(vx, chunks[2].y, 5, 1));
+    buttons.record_button(TuiButton::FormatSettingsVerify(1), Rect::new(vx + 6, chunks[2].y, 4, 1));
+
+    // MD5 checksum toggle pills
+    let md5_focused = focus == FormatSettingsFocus::Md5;
+    let md5_label_style = if md5_focused { theme::bright() } else { theme::muted() };
+    let (on_style_md5, off_style_md5) = toggle_pill_styles(md5, md5_focused);
+    let md5_line = Line::from(vec![
+        Span::styled("  md5 checksum ", md5_label_style),
+        Span::styled(" on ", on_style_md5),
+        Span::raw(" "),
+        Span::styled(" off ", off_style_md5),
+    ]);
+    f.render_widget(Paragraph::new(md5_line), chunks[3]);
+    // Register click targets for md5 pills
+    let mx = chunks[3].x + 15;
+    buttons.record_button(TuiButton::FormatSettingsMd5(0), Rect::new(mx, chunks[3].y, 4, 1));
+    buttons.record_button(TuiButton::FormatSettingsMd5(1), Rect::new(mx + 5, chunks[3].y, 5, 1));
+
+    // Footer
+    let footer = Paragraph::new(Line::from(vec![
+        footer_pill("Enter save", theme::GREEN),
+        pill_gap(),
+        footer_pill("Esc cancel", theme::PURPLE),
+    ]))
+    .alignment(Alignment::Center);
+    f.render_widget(footer, chunks[5]);
+}
+
+/// Style pair for a boolean toggle rendered as two pills.
+/// Returns (false_style, true_style).
+fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
+    let active = Style::default()
+        .fg(theme::PILL_ACTIVE_FG)
+        .bg(theme::GREEN)
+        .add_modifier(Modifier::BOLD);
+    let inactive = if focused {
+        Style::default().fg(theme::TEXT_DIM)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    if value {
+        (inactive, active) // false=dim, true=active
+    } else {
+        (active, inactive) // false=active, true=dim
+    }
 }
 
 /// Draw the vim-style command line at the bottom of the screen

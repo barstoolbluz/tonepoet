@@ -1564,6 +1564,93 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
+        ActiveOverlay::FormatSettings {
+            mut compression_input,
+            mut verify,
+            mut md5,
+            mut focus,
+        } => {
+            match key.code {
+                KeyCode::Enter => {
+                    // Commit: parse compression, write all values to FormatState.
+                    let level: u8 = compression_input
+                        .text
+                        .trim()
+                        .parse()
+                        .unwrap_or(8)
+                        .min(8);
+                    app.convert.format.flac_compression_level = level;
+                    let verify_idx = if verify { 1 } else { 0 };
+                    app.convert.format.flac_verify.selected = verify_idx;
+                    // md5 pill order: (true, "on"), (false, "off")
+                    let md5_idx = if md5 { 0 } else { 1 };
+                    app.convert.format.flac_md5.selected = md5_idx;
+                    app.preset.mark_modified();
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Esc => {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Up => {
+                    focus = match focus {
+                        FormatSettingsFocus::Compression => FormatSettingsFocus::Md5,
+                        FormatSettingsFocus::Verify => FormatSettingsFocus::Compression,
+                        FormatSettingsFocus::Md5 => FormatSettingsFocus::Verify,
+                    };
+                    app.active_overlay = ActiveOverlay::FormatSettings {
+                        compression_input,
+                        verify,
+                        md5,
+                        focus,
+                    };
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    focus = match focus {
+                        FormatSettingsFocus::Compression => FormatSettingsFocus::Verify,
+                        FormatSettingsFocus::Verify => FormatSettingsFocus::Md5,
+                        FormatSettingsFocus::Md5 => FormatSettingsFocus::Compression,
+                    };
+                    app.active_overlay = ActiveOverlay::FormatSettings {
+                        compression_input,
+                        verify,
+                        md5,
+                        focus,
+                    };
+                }
+                _ => {
+                    match focus {
+                        FormatSettingsFocus::Compression => {
+                            super::text_input::handle_text_input_key(
+                                &mut compression_input,
+                                &key,
+                            );
+                        }
+                        FormatSettingsFocus::Verify => {
+                            if matches!(
+                                key.code,
+                                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                            ) {
+                                verify = !verify;
+                            }
+                        }
+                        FormatSettingsFocus::Md5 => {
+                            if matches!(
+                                key.code,
+                                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                            ) {
+                                md5 = !md5;
+                            }
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::FormatSettings {
+                        compression_input,
+                        verify,
+                        md5,
+                        focus,
+                    };
+                }
+            }
+        }
         ActiveOverlay::BatchList { scroll } => {
             handle_batch_list_key(app, key, scroll, tx);
         }
@@ -5454,6 +5541,20 @@ fn handle_generic_overlay_mouse(
                 (
                     Rect::new(x, y, w, h),
                     vec![("Enter save", "enter"), ("Esc cancel", "esc")],
+                )
+            }
+            ActiveOverlay::FormatSettings { .. } => {
+                let w: u16 = area.0.saturating_sub(4).min(50);
+                let h: u16 = 9;
+                let x = (area.0.saturating_sub(w)) / 2;
+                let y = (area.1.saturating_sub(h)) / 2;
+                (
+                    Rect::new(x, y, w, h),
+                    vec![
+                        ("↑↓ navigate", "↑↓"),
+                        ("Enter save", "enter"),
+                        ("Esc cancel", "esc"),
+                    ],
                 )
             }
             ActiveOverlay::Verify { .. } => {
@@ -10101,6 +10202,28 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 if i < containers.len() && containers[i].enabled {
                     app.convert.format.selected_container_index = i;
                     app.preset.mark_modified();
+                }
+            }
+            TuiButton::FormatSettingsButton => {
+                app.convert.focus = ConvertFocus::Format;
+                let fmt = &app.convert.format;
+                app.active_overlay = ActiveOverlay::FormatSettings {
+                    compression_input: super::text_input::TextInputState::new(
+                        fmt.flac_compression_level.to_string(),
+                    ),
+                    verify: *fmt.flac_verify.selected_value(),
+                    md5: *fmt.flac_md5.selected_value(),
+                    focus: FormatSettingsFocus::Compression,
+                };
+            }
+            TuiButton::FormatSettingsVerify(i) => {
+                if let ActiveOverlay::FormatSettings { ref mut verify, .. } = app.active_overlay {
+                    *verify = i == 1; // 0 = off, 1 = on
+                }
+            }
+            TuiButton::FormatSettingsMd5(i) => {
+                if let ActiveOverlay::FormatSettings { ref mut md5, .. } = app.active_overlay {
+                    *md5 = i == 0; // 0 = on, 1 = off
                 }
             }
             TuiButton::MergePill(i) => {

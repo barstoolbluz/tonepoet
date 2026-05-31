@@ -334,8 +334,11 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         dither_type,
         preferred_tool,
         force_encode: false,
-        // settings-sentinel-allow: codec sub-struct defaults until TUI exposes them
-        flac: Default::default(),
+        flac: tonepoet_pipeline::FlacSettings {
+            compression_level: format.flac_compression_level,
+            verify: *format.flac_verify.selected_value(),
+            write_md5: *format.flac_md5.selected_value(),
+        },
         mp3: Default::default(),
         aac: Default::default(),
         opus: Default::default(),

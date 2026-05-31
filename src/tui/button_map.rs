@@ -43,6 +43,12 @@ pub enum TuiButton {
     ConversionPresetPill(usize),
     MergePill(usize),
     ContainerPill(usize),
+    /// ⚙ pill on the container row (below-the-fold) to open format-specific settings overlay.
+    FormatSettingsButton,
+    /// Verify toggle pills inside the FormatSettings overlay.
+    FormatSettingsVerify(usize),
+    /// MD5 toggle pills inside the FormatSettings overlay.
+    FormatSettingsMd5(usize),
 
     // Convert screen controls
     PresetsButton,
@@ -196,7 +202,9 @@ impl TuiButton {
             | Self::TemplatePickerRow(_)
             | Self::TemplatePickerApply
             | Self::TemplatePickerDelete
-            | Self::TemplatePickerClose => None,
+            | Self::TemplatePickerClose
+            | Self::FormatSettingsVerify(_)
+            | Self::FormatSettingsMd5(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)
@@ -209,6 +217,7 @@ impl TuiButton {
             | Self::ConversionPresetPill(_)
             | Self::MergePill(_)
             | Self::ContainerPill(_)
+            | Self::FormatSettingsButton
             | Self::PresetsButton
             | Self::SaveButton
             | Self::AdvancedToggle(_)

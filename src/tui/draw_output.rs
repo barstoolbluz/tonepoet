@@ -9,8 +9,7 @@ use ratatui::{
 };
 
 use super::app::{FormatField, FormatState};
-use super::button_map::{ButtonRenderMap, TuiButton};
-use super::pill::{render_pill_spans, PillState};
+use super::pill::render_pill_spans;
 use super::theme;
 
 /// Draw the format pane with green border.
@@ -174,6 +173,8 @@ pub fn draw_format_pane(
 
     // Below-the-fold: container selector when maximized and codec has alternatives.
     let containers = format_state.format.selected_value().available_containers();
+    let has_format_settings = *format_state.format.selected_value()
+        == crate::convert::formats::AudioFormat::Flac;
     if maximized && containers.len() > 1 {
         lines.push(bordered_line(border_color, w, vec![]));
         let container_spans: Vec<Span> = containers
@@ -195,14 +196,21 @@ pub fn draw_format_pane(
                 spans
             })
             .collect();
-        lines.push(pill_row(
-            border_color,
-            w,
-            "container ",
-            "",
-            &container_spans,
-            focused,
-        ));
+        if has_format_settings {
+            // Render container row with right-aligned ⚙ pill.
+            lines.push(container_row_with_gear(
+                border_color, w, &container_spans, focused,
+            ));
+        } else {
+            lines.push(pill_row(
+                border_color,
+                w,
+                "container ",
+                "",
+                &container_spans,
+                focused,
+            ));
+        }
     }
 
     lines.push(bordered_line(border_color, w, vec![]));
@@ -251,110 +259,6 @@ fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maxi
     ));
     spans.extend(right_spans);
     Line::from(spans)
-}
-
-/// Register all click targets for the dynamic format pane. This mirrors the
-/// rendered 10-row layout above and is intended for `convert_screen::register_buttons`.
-pub fn register_format_pane_buttons(
-    buttons: &mut ButtonRenderMap,
-    area: Rect,
-    format_state: &FormatState,
-) {
-    let label_col = area.x + 17;
-    register_pill_row(
-        buttons,
-        &format_state.format,
-        area.y + 2,
-        label_col,
-        |i| TuiButton::FormatPill(i),
-    );
-
-    if format_state.is_dsd_selected() {
-        register_pill_row(
-            buttons,
-            &format_state.sample_rate,
-            area.y + 3,
-            label_col,
-            |i| TuiButton::RatePill(i),
-        );
-        register_pill_row(
-            buttons,
-            &format_state.noise_shaper,
-            area.y + 5,
-            label_col,
-            |i| TuiButton::NoiseShaperPill(i),
-        );
-        register_pill_row(
-            buttons,
-            &format_state.modulator_order,
-            area.y + 6,
-            label_col,
-            |i| TuiButton::ModulatorOrderPill(i),
-        );
-        register_pill_row(
-            buttons,
-            &format_state.conversion_preset,
-            area.y + 7,
-            label_col,
-            |i| TuiButton::ConversionPresetPill(i),
-        );
-    } else {
-        register_pill_row(
-            buttons,
-            &format_state.sample_rate,
-            area.y + 3,
-            label_col,
-            |i| TuiButton::RatePill(i),
-        );
-        register_pill_row(
-            buttons,
-            &format_state.bit_depth,
-            area.y + 4,
-            label_col,
-            |i| TuiButton::DepthPill(i),
-        );
-        register_pill_row(
-            buttons,
-            &format_state.resampler,
-            area.y + 5,
-            label_col,
-            |i| TuiButton::ResamplerPill(i),
-        );
-        register_pill_row(
-            buttons,
-            &format_state.dither,
-            area.y + 6,
-            label_col,
-            |i| TuiButton::DitherPill(i),
-        );
-        register_pill_row(
-            buttons,
-            &format_state.replaygain,
-            area.y + 7,
-            label_col,
-            |i| TuiButton::ReplayGainPill(i),
-        );
-    }
-}
-
-fn register_pill_row<T: Clone>(
-    buttons: &mut ButtonRenderMap,
-    state: &PillState<T>,
-    y: u16,
-    start_x: u16,
-    make_button: impl Fn(usize) -> TuiButton,
-) {
-    let mut x = start_x;
-    for (i, opt) in state.options.iter().enumerate() {
-        if i > 0 {
-            x += 2;
-        }
-        let pill_width = opt.label.chars().count() as u16 + 2;
-        if opt.enabled {
-            buttons.record_button(make_button(i), Rect::new(x, y, pill_width, 1));
-        }
-        x += pill_width;
-    }
 }
 
 fn static_row<'a>(
@@ -418,6 +322,37 @@ fn bordered_line<'a>(
     let mut spans = vec![Span::styled("│", theme::border(border_color))];
     spans.extend(content);
     spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled("│", theme::border(border_color)));
+    Line::from(spans)
+}
+
+/// Container row with a right-aligned ⚙ pill for format-specific settings.
+fn container_row_with_gear<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    pills: &[Span<'a>],
+    focused: bool,
+) -> Line<'a> {
+    let label_style = if focused { theme::bright() } else { theme::muted() };
+    let gear_pill = Span::styled(
+        " ⚙ ",
+        Style::default()
+            .fg(theme::PILL_ACTIVE_FG)
+            .bg(theme::BLUE)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let mut spans = vec![
+        Span::styled("│", theme::border(border_color)),
+        Span::styled("   container   ", label_style),
+    ];
+    spans.extend_from_slice(pills);
+
+    let content_width: usize = spans.iter().map(|s| s.width()).sum();
+    let gear_width = gear_pill.width();
+    let padding = width.saturating_sub(content_width + gear_width + 1); // +1 for right border
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(gear_pill);
     spans.push(Span::styled("│", theme::border(border_color)));
     Line::from(spans)
 }

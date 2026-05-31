@@ -262,8 +262,16 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             }
             x += w + 1; // pill width + gap
         }
-    }
 
+        // Right-aligned ⚙ pill for format-specific settings (currently FLAC only).
+        if *state.format.selected_value() == crate::convert::formats::AudioFormat::Flac {
+            let gear_x = area.x + area.width.saturating_sub(4);
+            buttons.record_button(
+                TuiButton::FormatSettingsButton,
+                ratatui::layout::Rect::new(gear_x, container_row_y, 3, 1),
+            );
+        }
+    }
 }
 
 fn register_output_options_buttons(app: &mut AppState, area: Rect) {
