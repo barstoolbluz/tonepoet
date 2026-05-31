@@ -30,6 +30,10 @@ pub enum AudioFormat {
     Dsf,
     /// DSD Interchange File Format.
     Dff,
+    /// DTS Coherent Acoustics.
+    Dts,
+    /// Dolby Digital (AC-3).
+    Ac3,
     /// Caller-defined extension point for a registered tool.
     Custom {
         /// Stable extension without the leading dot.
@@ -54,6 +58,8 @@ impl AudioFormat {
             Self::Alac => "m4a",
             Self::Dsf => "dsf",
             Self::Dff => "dff",
+            Self::Dts => "dts",
+            Self::Ac3 => "ac3",
             Self::Custom { extension, .. } => extension.as_str(),
         }
     }
@@ -72,6 +78,8 @@ impl AudioFormat {
             Self::Alac => "ALAC",
             Self::Dsf => "DSF",
             Self::Dff => "DFF",
+            Self::Dts => "DTS",
+            Self::Ac3 => "AC3",
             Self::Custom { display_name, .. } => display_name.as_str(),
         }
     }
@@ -94,7 +102,7 @@ impl AudioFormat {
     /// True for lossy targets.
     #[must_use]
     pub fn is_lossy(&self) -> bool {
-        matches!(self, Self::Mp3 | Self::Aac | Self::Opus)
+        matches!(self, Self::Mp3 | Self::Aac | Self::Opus | Self::Dts | Self::Ac3)
     }
 
     /// True when FFmpeg's built-in encoders can normally write this format.
@@ -110,6 +118,8 @@ impl AudioFormat {
                 | Self::Aac
                 | Self::Opus
                 | Self::Alac
+                | Self::Dts
+                | Self::Ac3
         )
     }
 

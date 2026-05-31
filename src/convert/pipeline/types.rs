@@ -53,6 +53,12 @@ pub struct PipelineRequest {
     pub log: LogPolicy,
     pub stages: StagePolicy,
     pub failure_policy: FailurePolicy,
+    /// Container extension override. `None` = codec default extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_extension: Option<String>,
+    /// Extra ffmpeg output flags for the selected container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub container_ffmpeg_flags: Vec<String>,
 }
 
 impl PipelineRequest {

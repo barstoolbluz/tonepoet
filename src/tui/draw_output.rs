@@ -2,6 +2,7 @@
 
 use ratatui::{
     layout::Rect,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -168,6 +169,39 @@ pub fn draw_format_pane(
                 focused && format_state.field_focus == FormatField::ReplayGain,
             ),
             focused && format_state.field_focus == FormatField::ReplayGain,
+        ));
+    }
+
+    // Below-the-fold: container selector when maximized and codec has alternatives.
+    let containers = format_state.format.selected_value().available_containers();
+    if maximized && containers.len() > 1 {
+        lines.push(bordered_line(border_color, w, vec![]));
+        let container_spans: Vec<Span> = containers
+            .iter()
+            .enumerate()
+            .flat_map(|(i, c)| {
+                let selected = i == format_state.selected_container_index;
+                let style = if !c.enabled {
+                    Style::default().fg(ratatui::style::Color::DarkGray)
+                } else if selected {
+                    Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::TEXT_DIM)
+                };
+                let mut spans = vec![Span::styled(format!(" {} ", c.display_name), style)];
+                if i + 1 < containers.len() {
+                    spans.push(Span::styled(" ", Style::default()));
+                }
+                spans
+            })
+            .collect();
+        lines.push(pill_row(
+            border_color,
+            w,
+            "container ",
+            "",
+            &container_spans,
+            focused,
         ));
     }
 

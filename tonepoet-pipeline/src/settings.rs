@@ -626,7 +626,7 @@ pub fn default_pcm_depth_for_format(format: &AudioFormat) -> PcmBitDepth {
         AudioFormat::Wav => PcmBitDepth::Int24,
         AudioFormat::Aiff => PcmBitDepth::Int24,
         AudioFormat::Flac | AudioFormat::WavPack | AudioFormat::Alac => PcmBitDepth::Int24,
-        AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus => PcmBitDepth::Int16,
+        AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus | AudioFormat::Dts | AudioFormat::Ac3 => PcmBitDepth::Int16,
         AudioFormat::Dsf | AudioFormat::Dff | AudioFormat::Custom { .. } => PcmBitDepth::Int24,
     }
 }

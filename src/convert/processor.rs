@@ -1566,6 +1566,8 @@ mod tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
         }
     }
 

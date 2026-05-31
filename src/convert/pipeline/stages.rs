@@ -1394,7 +1394,7 @@ pub fn plan_outputs(
         reject_escaping_path(&rel).map_err(PlanError::InvalidTemplate)?;
 
         let mut final_path = normalize_path(&album_dir.join(rel));
-        append_default_extension(&mut final_path, &req.settings.target_format);
+        append_default_extension(&mut final_path, &req.settings.target_format, req.container_extension.as_deref());
         if !path_is_under_root(&final_path, &output_root) {
             return Err(PlanError::PathOutsideOutputRoot(
                 final_path.display().to_string(),
@@ -5634,16 +5634,21 @@ fn normalized_collision_key(path: &Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
 }
 
-fn append_default_extension(path: &mut PathBuf, format: &PlannerAudioFormat) {
+fn append_default_extension(
+    path: &mut PathBuf,
+    format: &PlannerAudioFormat,
+    container_extension: Option<&str>,
+) {
+    let ext = container_extension.unwrap_or(format.extension());
     if path
         .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case(format.extension()))
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case(ext))
         .unwrap_or(false)
     {
         return;
     }
-    path.set_extension(format.extension());
+    path.set_extension(ext);
 }
 
 fn append_collision_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -6464,6 +6469,8 @@ mod conversion_log_tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::AllowPartialAlbum,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
         }
     }
 
@@ -6754,6 +6761,8 @@ mod naming_template_tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
         }
     }
 
@@ -7267,6 +7276,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             },
             stages,
             failure_policy: policy,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
         }
     }
 

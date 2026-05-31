@@ -4022,6 +4022,8 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                         generate_cue: false,
                     },
                     failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+                    container_extension: options.container_extension.clone(),
+                    container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
                 };
 
                 if let Ok(mut q) = app.manager.queue.try_write() {

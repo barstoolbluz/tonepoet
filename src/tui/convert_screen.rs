@@ -230,18 +230,40 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
     let label_col = area.x + 17;
     register_pill_row(buttons, &state.format, area.y + 2, label_col, |i| TuiButton::FormatPill(i));
 
+    let last_standard_row;
     if state.is_dsd_selected() {
         register_pill_row(buttons, &state.sample_rate, area.y + 3, label_col, |i| TuiButton::RatePill(i));
         register_pill_row(buttons, &state.noise_shaper, area.y + 5, label_col, |i| TuiButton::NoiseShaperPill(i));
         register_pill_row(buttons, &state.modulator_order, area.y + 6, label_col, |i| TuiButton::ModulatorOrderPill(i));
         register_pill_row(buttons, &state.conversion_preset, area.y + 7, label_col, |i| TuiButton::ConversionPresetPill(i));
+        last_standard_row = 7;
     } else {
         register_pill_row(buttons, &state.sample_rate, area.y + 3, label_col, |i| TuiButton::RatePill(i));
         register_pill_row(buttons, &state.bit_depth, area.y + 4, label_col, |i| TuiButton::DepthPill(i));
         register_pill_row(buttons, &state.resampler, area.y + 5, label_col, |i| TuiButton::ResamplerPill(i));
         register_pill_row(buttons, &state.dither, area.y + 6, label_col, |i| TuiButton::DitherPill(i));
         register_pill_row(buttons, &state.replaygain, area.y + 7, label_col, |i| TuiButton::ReplayGainPill(i));
+        last_standard_row = 7;
     }
+
+    // Below-the-fold: container pill buttons when maximized.
+    let containers = state.format.selected_value().available_containers();
+    let is_maximized = app.convert.is_maximized(ConvertFocus::Format);
+    if is_maximized && containers.len() > 1 {
+        let container_row_y = area.y + last_standard_row + 2; // +1 blank + 1 container row
+        let mut x = label_col;
+        for (i, c) in containers.iter().enumerate() {
+            let w = c.display_name.len() as u16 + 2; // " name "
+            if c.enabled && container_row_y < area.y + area.height {
+                buttons.record_button(
+                    TuiButton::ContainerPill(i),
+                    ratatui::layout::Rect::new(x, container_row_y, w, 1),
+                );
+            }
+            x += w + 1; // pill width + gap
+        }
+    }
+
 }
 
 fn register_output_options_buttons(app: &mut AppState, area: Rect) {

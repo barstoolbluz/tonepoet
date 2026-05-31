@@ -29,6 +29,10 @@ pub struct PlanRequest {
     pub settings: PipelineSettings,
     /// Optional work directory for deterministic intermediate paths.
     pub intermediate_dir: Option<PathBuf>,
+    /// Extra ffmpeg output flags for the selected container (e.g., `["-rf64", "auto"]`).
+    /// Inserted before the output path in the ffmpeg command. Empty for most containers.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub container_ffmpeg_flags: Vec<String>,
 }
 
 impl PlanRequest {
@@ -893,7 +897,7 @@ fn source_codec_matches_target(request: &PlanRequest) -> bool {
         // Lossy streams have user-controlled rate-control settings that SourceInfo
         // cannot currently prove equal to the requested target. Re-encode rather
         // than silently preserving an unwanted bitrate, profile, or quality.
-        AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus => false,
+        AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus | AudioFormat::Dts | AudioFormat::Ac3 => false,
         // A caller-defined plugin owns the meaning of equality for custom formats;
         // the built-in planner will ask the plugin to encode instead of copying.
         AudioFormat::Custom { .. } => false,
@@ -911,7 +915,7 @@ fn encoder_settings_allow_stream_copy(settings: &PipelineSettings) -> bool {
         | AudioFormat::Alac
         | AudioFormat::Dsf
         | AudioFormat::Dff => true,
-        AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus | AudioFormat::Custom { .. } => {
+        AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus | AudioFormat::Dts | AudioFormat::Ac3 | AudioFormat::Custom { .. } => {
             false
         }
     }

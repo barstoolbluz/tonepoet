@@ -36,6 +36,14 @@ pub enum AudioFormat {
     Dsf,
     /// DSDIFF (Philips DSD Interchange File Format)
     Dff,
+    /// DTS Coherent Acoustics
+    Dts,
+    /// Dolby Digital (AC-3)
+    Ac3,
+    /// Monkey's Audio (decode-only — not encodable by ffmpeg or SoX)
+    Ape,
+    /// Linear PCM (raw headerless, or via WAV/AIFF container)
+    Lpcm,
 }
 
 impl AudioFormat {
@@ -52,6 +60,10 @@ impl AudioFormat {
             Self::Alac => "m4a",
             Self::Dsf => "dsf",
             Self::Dff => "dff",
+            Self::Dts => "dts",
+            Self::Ac3 => "ac3",
+            Self::Ape => "ape",
+            Self::Lpcm => "pcm",
         }
     }
 
@@ -66,8 +78,12 @@ impl AudioFormat {
             Self::Aac => "AAC",
             Self::Opus => "Opus",
             Self::Alac => "ALAC",
-            Self::Dsf => "DSF",
+            Self::Dsf => "DSD",
             Self::Dff => "DFF",
+            Self::Dts => "DTS",
+            Self::Ac3 => "AC3",
+            Self::Ape => "APE",
+            Self::Lpcm => "LPCM",
         }
     }
 
@@ -75,7 +91,7 @@ impl AudioFormat {
     pub fn is_lossless(&self) -> bool {
         matches!(
             self,
-            Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac | Self::Dsf | Self::Dff
+            Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac | Self::Dsf | Self::Dff | Self::Ape | Self::Lpcm
         )
     }
 
@@ -92,7 +108,16 @@ impl AudioFormat {
             Self::Alac,
             Self::Dsf,
             Self::Dff,
+            Self::Dts,
+            Self::Ac3,
+            Self::Ape,
+            Self::Lpcm,
         ]
+    }
+
+    /// Additional output formats shown below-the-fold when the format pane is maximized.
+    pub fn advanced_output() -> Vec<Self> {
+        vec![Self::Dts, Self::Ac3, Self::Ape, Self::Lpcm]
     }
 
     /// Formats shown as pills in the main TUI convert screen
@@ -104,11 +129,117 @@ impl AudioFormat {
             Self::Mp3,
             Self::Alac,
             Self::Wav,
+            Self::Aiff,
             Self::WavPack,
             Self::Dsf,
-            Self::Dff,
+            Self::Dts,
+            Self::Ac3,
+            Self::Lpcm,
         ]
     }
+
+    /// Available container options for this codec. Index 0 is the default.
+    pub fn available_containers(&self) -> &'static [ContainerOption] {
+        match self {
+            Self::Flac => &[
+                ContainerOption { extension: "flac", display_name: "FLAC", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "ogg", display_name: "OGG", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Wav => &[
+                ContainerOption { extension: "wav", display_name: "WAV", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "wav", display_name: "RF64", ffmpeg_flags: &["-rf64", "auto"], enabled: true },
+                ContainerOption { extension: "w64", display_name: "W64", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Aiff => &[
+                ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::WavPack => &[
+                ContainerOption { extension: "wv", display_name: "WavPack", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Mp3 => &[
+                ContainerOption { extension: "mp3", display_name: "MP3", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Aac => &[
+                ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "aac", display_name: "AAC (raw)", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "m4b", display_name: "M4B", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Opus => &[
+                ContainerOption { extension: "opus", display_name: "Opus", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "webm", display_name: "WebM", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "weba", display_name: "WebA", ffmpeg_flags: &["-f", "webm"], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Alac => &[
+                ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Dsf => &[
+                ContainerOption { extension: "dsf", display_name: "DSF", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "dff", display_name: "DFF", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "wv", display_name: "WavPack", ffmpeg_flags: &[], enabled: false },
+                ContainerOption { extension: "flac", display_name: "FLAC (DoP)", ffmpeg_flags: &[], enabled: false },
+                ContainerOption { extension: "wav", display_name: "WAV (DoP)", ffmpeg_flags: &[], enabled: false },
+            ],
+            Self::Dff => &[
+                ContainerOption { extension: "dff", display_name: "DFF", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Dts => &[
+                ContainerOption { extension: "dts", display_name: "DTS", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Ac3 => &[
+                ContainerOption { extension: "ac3", display_name: "AC3", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Ape => &[
+                ContainerOption { extension: "ape", display_name: "APE", ffmpeg_flags: &[], enabled: false },
+            ],
+            Self::Lpcm => &[
+                ContainerOption { extension: "wav", display_name: "WAV", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "pcm", display_name: "PCM (raw)", ffmpeg_flags: &[], enabled: false },
+            ],
+        }
+    }
+
+    /// Default container for this codec (index 0 of available_containers).
+    pub fn default_container(&self) -> &'static ContainerOption {
+        &self.available_containers()[0]
+    }
+}
+
+/// A container option for an audio codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerOption {
+    /// File extension without the leading dot.
+    pub extension: &'static str,
+    /// Human-readable name shown in the UI.
+    pub display_name: &'static str,
+    /// Extra ffmpeg output flags needed for this container.
+    /// Empty for containers that ffmpeg auto-detects from extension.
+    pub ffmpeg_flags: &'static [&'static str],
+    /// Whether this container is currently functional. Disabled containers
+    /// are shown grayed out in the UI and are not selectable.
+    pub enabled: bool,
 }
 
 impl std::fmt::Display for AudioFormat {
@@ -213,6 +344,17 @@ pub struct ConversionOptions {
     /// CUE generation mode: "Always" or "IfMerging"
     #[serde(default = "default_cue_generation_mode")]
     pub cue_generation_mode: String,
+
+    /// Container extension override. `None` = codec default.
+    /// When set, the output file uses this extension instead of the
+    /// codec's default (e.g., `Some("webm")` for Opus in WebM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_extension: Option<String>,
+
+    /// Extra ffmpeg output flags for the selected container.
+    /// Empty for containers that ffmpeg auto-detects from extension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub container_ffmpeg_flags: Vec<String>,
 }
 
 impl Default for ConversionOptions {
@@ -244,6 +386,8 @@ impl Default for ConversionOptions {
             write_log_file: false,
             generate_cue_files: false,
             cue_generation_mode: "IfMerging".to_string(),
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
         }
     }
 }
@@ -463,6 +607,10 @@ impl AudioFormat {
             AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
                 compression_level: 0, // DSD passthrough — no compression parameter
             },
+            AudioFormat::Dts => QualitySettings::Flac { compression_level: 0 },
+            AudioFormat::Ac3 => QualitySettings::Flac { compression_level: 0 },
+            AudioFormat::Ape => QualitySettings::Flac { compression_level: 0 },
+            AudioFormat::Lpcm => QualitySettings::Wav { bit_depth: 16, sample_rate: 44100 },
         }
     }
 }

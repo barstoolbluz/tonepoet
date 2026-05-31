@@ -48,6 +48,7 @@ pub fn plan_request_for_track(
         source,
         settings,
         intermediate_dir: Some(intermediate_dir),
+        container_ffmpeg_flags: request.container_ffmpeg_flags.clone(),
     })
 }
 
@@ -124,6 +125,10 @@ pub fn planner_format_from_main(format: crate::convert::AudioFormat) -> PlannerF
         crate::convert::AudioFormat::Alac => PlannerFormat::Alac,
         crate::convert::AudioFormat::Dsf => PlannerFormat::Dsf,
         crate::convert::AudioFormat::Dff => PlannerFormat::Dff,
+        crate::convert::AudioFormat::Dts => PlannerFormat::Dts,
+        crate::convert::AudioFormat::Ac3 => PlannerFormat::Ac3,
+        crate::convert::AudioFormat::Ape => PlannerFormat::Flac, // Ape is decode-only; default target is FLAC
+        crate::convert::AudioFormat::Lpcm => PlannerFormat::Wav, // LPCM maps to WAV container
     }
 }
 
@@ -154,6 +159,8 @@ fn codec_for_format(format: &PlannerFormat) -> PlannerCodec {
         PlannerFormat::Opus => PlannerCodec::Opus,
         PlannerFormat::Alac => PlannerCodec::Alac,
         PlannerFormat::Dsf | PlannerFormat::Dff => PlannerCodec::Dsd,
+        PlannerFormat::Dts => PlannerCodec::Custom("DTS".to_string()),
+        PlannerFormat::Ac3 => PlannerCodec::Custom("AC3".to_string()),
         PlannerFormat::Custom { display_name, .. } => PlannerCodec::Custom(display_name.clone()),
     }
 }

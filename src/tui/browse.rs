@@ -142,7 +142,11 @@ impl FormatFilter {
             Self::Only(AudioFormat::WavPack) => Self::Only(AudioFormat::Aiff),
             Self::Only(AudioFormat::Aiff) => Self::Only(AudioFormat::Dsf),
             Self::Only(AudioFormat::Dsf) => Self::Only(AudioFormat::Dff),
-            Self::Only(AudioFormat::Dff) => Self::Off,
+            Self::Only(AudioFormat::Dff) => Self::Only(AudioFormat::Dts),
+            Self::Only(AudioFormat::Dts) => Self::Only(AudioFormat::Ac3),
+            Self::Only(AudioFormat::Ac3) => Self::Only(AudioFormat::Ape),
+            Self::Only(AudioFormat::Ape) => Self::Only(AudioFormat::Lpcm),
+            Self::Only(AudioFormat::Lpcm) => Self::Off,
         }
     }
 
@@ -2050,8 +2054,12 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
         EntryKind::AudioFile(AudioFormat::Opus) => 17,
         EntryKind::AudioFile(AudioFormat::Dsf) => 18,
         EntryKind::AudioFile(AudioFormat::Dff) => 19,
-        EntryKind::SacdIso => 20,
-        EntryKind::Archive => 20,
+        EntryKind::AudioFile(AudioFormat::Dts) => 20,
+        EntryKind::AudioFile(AudioFormat::Ac3) => 21,
+        EntryKind::AudioFile(AudioFormat::Ape) => 22,
+        EntryKind::AudioFile(AudioFormat::Lpcm) => 23,
+        EntryKind::SacdIso => 25,
+        EntryKind::Archive => 25,
         EntryKind::OtherFile => 30,
     }
 }
