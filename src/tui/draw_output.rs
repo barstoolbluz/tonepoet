@@ -205,6 +205,42 @@ pub fn draw_format_pane(
         ));
     }
 
+    // Below-the-fold: advanced format row when maximized.
+    if maximized {
+        use crate::convert::formats::AudioFormat;
+        let advanced = AudioFormat::advanced_output();
+        if !advanced.is_empty() {
+            lines.push(bordered_line(border_color, w, vec![]));
+            let selected_fmt = *format_state.format.selected_value();
+            let adv_spans: Vec<Span> = advanced
+                .iter()
+                .flat_map(|fmt| {
+                    let is_selected = *fmt == selected_fmt;
+                    let encodable = !matches!(fmt, AudioFormat::Ape);
+                    let style = if !encodable {
+                        Style::default().fg(ratatui::style::Color::DarkGray)
+                    } else if is_selected {
+                        Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::TEXT_DIM)
+                    };
+                    vec![
+                        Span::styled(format!(" {} ", fmt.name()), style),
+                        Span::styled(" ", Style::default()),
+                    ]
+                })
+                .collect();
+            lines.push(pill_row(
+                border_color,
+                w,
+                "more      ",
+                "",
+                &adv_spans,
+                focused,
+            ));
+        }
+    }
+
     lines.push(bordered_line(border_color, w, vec![]));
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
     while lines.len() < target_len_before_bottom {

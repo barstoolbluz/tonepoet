@@ -25,7 +25,9 @@ use super::progress::{
     probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker,
     StreamSource, StreamingHeartbeat,
 };
-use super::tool::{CommandRecord, EnvVar, ProcessExit, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
+use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
+#[cfg(test)]
+use super::tool::ProcessExit;
 use super::types::{PipelineRequest, PreparedTrack};
 
 #[derive(Debug, Clone)]

@@ -263,6 +263,30 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             x += w + 1; // pill width + gap
         }
     }
+
+    // Below-the-fold: advanced format pill buttons when maximized.
+    if is_maximized {
+        use crate::convert::formats::AudioFormat;
+        let advanced = AudioFormat::advanced_output();
+        // Advanced row is 2 rows below the container row (or 2 below last standard if no containers)
+        let adv_row_y = if containers.len() > 1 {
+            area.y + last_standard_row + 4 // blank + container + blank + advanced
+        } else {
+            area.y + last_standard_row + 2 // blank + advanced
+        };
+        let mut ax = label_col;
+        for (i, fmt) in advanced.iter().enumerate() {
+            let encodable = !matches!(fmt, AudioFormat::Ape);
+            let w = fmt.name().len() as u16 + 2;
+            if encodable && adv_row_y < area.y + area.height {
+                buttons.record_button(
+                    TuiButton::AdvancedFormatPill(i),
+                    ratatui::layout::Rect::new(ax, adv_row_y, w, 1),
+                );
+            }
+            ax += w + 1;
+        }
+    }
 }
 
 fn register_output_options_buttons(app: &mut AppState, area: Rect) {

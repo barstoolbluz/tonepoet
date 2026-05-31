@@ -143,6 +143,12 @@ pub fn extract_wizard_settings(
         AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
             compression_level: 0,
         },
+
+        // Input-only / decode-only formats — not selectable as wizard output,
+        // but the match must be exhaustive. Fall back to FLAC quality defaults.
+        AudioFormat::Dts | AudioFormat::Ac3 | AudioFormat::Ape | AudioFormat::Lpcm => {
+            QualitySettings::Flac { compression_level: 8 }
+        }
     };
 
     // Extract destination path from wizard
@@ -517,6 +523,11 @@ pub fn preset_to_conversion_options(
         AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
             compression_level: 0,
         },
+        // Input-only / decode-only formats — not selectable as output,
+        // but the match must be exhaustive. Fall back to FLAC quality defaults.
+        AudioFormat::Dts | AudioFormat::Ac3 | AudioFormat::Ape | AudioFormat::Lpcm => {
+            QualitySettings::Flac { compression_level: 8 }
+        }
     };
 
     ConversionOptions {

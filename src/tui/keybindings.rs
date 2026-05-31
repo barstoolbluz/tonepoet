@@ -10103,6 +10103,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.preset.mark_modified();
                 }
             }
+            TuiButton::AdvancedFormatPill(i) => {
+                app.convert.focus = ConvertFocus::Format;
+                let advanced = crate::convert::formats::AudioFormat::advanced_output();
+                if let Some(&fmt) = advanced.get(i) {
+                    let encodable = !matches!(fmt, crate::convert::formats::AudioFormat::Ape);
+                    if encodable {
+                        app.convert.format.format.select_value(&fmt);
+                        app.convert.format.selected_container_index = 0;
+                        app.convert.format.apply_format_constraints();
+                        app.preset.mark_modified();
+                    }
+                }
+            }
             TuiButton::MergePill(i) => {
                 app.convert.focus = ConvertFocus::OutputOptions;
                 app.convert.output_options.field_focus = OutputOptionsField::MergeMode;

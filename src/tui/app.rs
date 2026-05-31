@@ -1084,8 +1084,29 @@ impl FormatState {
                 // Float32 supported, Float64 rejected by WavPack encoder.
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
             }
-            AudioFormat::Wav | AudioFormat::Aiff => {
+            AudioFormat::Wav | AudioFormat::Aiff | AudioFormat::Lpcm => {
                 // Full range including float32 and float64.
+            }
+            // Dts/Ac3 are lossy, 48kHz only
+            AudioFormat::Dts | AudioFormat::Ac3 => {
+                self.bit_depth.set_all_enabled(false);
+                self.dither.set_all_enabled(false);
+                self.sample_rate.select_value(&48_000);
+                for opt in &mut self.sample_rate.options {
+                    if opt.value != 48_000 {
+                        opt.enabled = false;
+                    }
+                }
+            }
+            // Ape is lossless but not encodable; same constraints as FLAC
+            AudioFormat::Ape => {
+                self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
+                self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
+                for opt in &mut self.sample_rate.options {
+                    if opt.value > 384_000 {
+                        opt.enabled = false;
+                    }
+                }
             }
         }
 

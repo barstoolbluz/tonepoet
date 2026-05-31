@@ -283,6 +283,10 @@ fn format_description(format: AudioFormat) -> String {
         AudioFormat::Alac => "Apple Lossless Audio Codec - Lossless compression, Apple ecosystem",
         AudioFormat::Dsf => "DSD Stream File - 1-bit DSD audio container",
         AudioFormat::Dff => "DSDIFF - Philips DSD Interchange File Format",
+        AudioFormat::Dts => "DTS Coherent Acoustics - Multichannel lossy surround codec",
+        AudioFormat::Ac3 => "Dolby Digital (AC-3) - Lossy surround sound codec",
+        AudioFormat::Ape => "Monkey's Audio - Lossless compression (decode-only)",
+        AudioFormat::Lpcm => "Linear PCM - Raw uncompressed audio",
     }
     .to_string()
 }

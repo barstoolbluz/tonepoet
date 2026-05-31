@@ -36,6 +36,14 @@ pub enum AudioFormat {
     Dsf,
     /// DSDIFF (Philips DSD Interchange File Format)
     Dff,
+    /// DTS Coherent Acoustics
+    Dts,
+    /// Dolby Digital (AC-3)
+    Ac3,
+    /// Monkey's Audio (decode-only — not encodable by ffmpeg or SoX)
+    Ape,
+    /// Linear PCM (raw headerless, or via WAV/AIFF container)
+    Lpcm,
 }
 
 impl AudioFormat {
@@ -52,6 +60,10 @@ impl AudioFormat {
             Self::Alac => "m4a",
             Self::Dsf => "dsf",
             Self::Dff => "dff",
+            Self::Dts => "dts",
+            Self::Ac3 => "ac3",
+            Self::Ape => "ape",
+            Self::Lpcm => "pcm",
         }
     }
 
@@ -68,6 +80,10 @@ impl AudioFormat {
             Self::Alac => "ALAC",
             Self::Dsf => "DSD",
             Self::Dff => "DFF",
+            Self::Dts => "DTS",
+            Self::Ac3 => "AC3",
+            Self::Ape => "APE",
+            Self::Lpcm => "LPCM",
         }
     }
 
@@ -75,7 +91,7 @@ impl AudioFormat {
     pub fn is_lossless(&self) -> bool {
         matches!(
             self,
-            Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac | Self::Dsf | Self::Dff
+            Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac | Self::Dsf | Self::Dff | Self::Ape | Self::Lpcm
         )
     }
 
@@ -92,7 +108,16 @@ impl AudioFormat {
             Self::Alac,
             Self::Dsf,
             Self::Dff,
+            Self::Dts,
+            Self::Ac3,
+            Self::Ape,
+            Self::Lpcm,
         ]
+    }
+
+    /// Additional output formats shown below-the-fold when the format pane is maximized.
+    pub fn advanced_output() -> Vec<Self> {
+        vec![Self::Dts, Self::Ac3, Self::Ape, Self::Lpcm]
     }
 
     /// Formats shown as pills in the main TUI convert screen
@@ -169,6 +194,26 @@ impl AudioFormat {
             ],
             Self::Dff => &[
                 ContainerOption { extension: "dff", display_name: "DFF", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Dts => &[
+                ContainerOption { extension: "dts", display_name: "DTS", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Ac3 => &[
+                ContainerOption { extension: "ac3", display_name: "AC3", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
+            ],
+            Self::Ape => &[
+                ContainerOption { extension: "ape", display_name: "APE", ffmpeg_flags: &[], enabled: false },
+            ],
+            Self::Lpcm => &[
+                ContainerOption { extension: "wav", display_name: "WAV", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "pcm", display_name: "PCM (raw)", ffmpeg_flags: &[], enabled: false },
             ],
         }
     }
@@ -559,6 +604,10 @@ impl AudioFormat {
             AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
                 compression_level: 0, // DSD passthrough — no compression parameter
             },
+            AudioFormat::Dts => QualitySettings::Flac { compression_level: 0 },
+            AudioFormat::Ac3 => QualitySettings::Flac { compression_level: 0 },
+            AudioFormat::Ape => QualitySettings::Flac { compression_level: 0 },
+            AudioFormat::Lpcm => QualitySettings::Wav { bit_depth: 16, sample_rate: 44100 },
         }
     }
 }

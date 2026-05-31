@@ -184,6 +184,10 @@ pub fn try_pills_to_options(
         AudioFormat::Dsf | AudioFormat::Dff => QualitySettings::Flac {
             compression_level: 0,
         },
+        // Input-only / decode-only formats: fall back to FLAC defaults
+        AudioFormat::Dts | AudioFormat::Ac3 | AudioFormat::Ape | AudioFormat::Lpcm => {
+            QualitySettings::Flac { compression_level: 8 }
+        }
     };
 
     let (calculate_replaygain, replaygain_mode) = if is_dsd {
@@ -372,6 +376,11 @@ fn map_audio_format(format: AudioFormat, container_ext: Option<&str>) -> pipelin
         (AudioFormat::Alac, _) => pipeline_enums::AudioFormat::Alac,
         (AudioFormat::Dsf, _) => pipeline_enums::AudioFormat::Dsf,
         (AudioFormat::Dff, _) => pipeline_enums::AudioFormat::Dff,
+        (AudioFormat::Dts, _) => pipeline_enums::AudioFormat::Dts,
+        (AudioFormat::Ac3, _) => pipeline_enums::AudioFormat::Ac3,
+        (AudioFormat::Ape, _) => pipeline_enums::AudioFormat::Flac, // Ape is decode-only; target FLAC
+        (AudioFormat::Lpcm, Some("aiff")) => pipeline_enums::AudioFormat::Aiff,
+        (AudioFormat::Lpcm, _) => pipeline_enums::AudioFormat::Wav,
     }
 }
 

@@ -646,10 +646,24 @@ fn build_ffmpeg_encode_lossy(
             args.push("-compression_level".into());
             args.push(context.request.settings.opus.complexity.to_string());
         }
+        AudioFormat::Dts => {
+            args.push("-c:a".into());
+            args.push("dca".into());
+            args.push("-strict".into());
+            args.push("-2".into());
+            args.push("-b:a".into());
+            args.push("768k".into());
+        }
+        AudioFormat::Ac3 => {
+            args.push("-c:a".into());
+            args.push("ac3".into());
+            args.push("-b:a".into());
+            args.push("448k".into());
+        }
         _ => {
             return Err(PlanningError::unsupported_format(
                 target_format.clone(),
-                "FFmpeg lossy encoder only supports MP3, AAC, and Opus",
+                "FFmpeg lossy encoder does not support this target format",
             ));
         }
     }

@@ -329,6 +329,10 @@ fn main_audio_format_to_planner(format: crate::convert::AudioFormat) -> PlannerA
         crate::convert::AudioFormat::Alac => PlannerAudioFormat::Alac,
         crate::convert::AudioFormat::Dsf => PlannerAudioFormat::Dsf,
         crate::convert::AudioFormat::Dff => PlannerAudioFormat::Dff,
+        crate::convert::AudioFormat::Dts => PlannerAudioFormat::Dts,
+        crate::convert::AudioFormat::Ac3 => PlannerAudioFormat::Ac3,
+        crate::convert::AudioFormat::Ape => PlannerAudioFormat::Flac, // Ape is decode-only; default target is FLAC
+        crate::convert::AudioFormat::Lpcm => PlannerAudioFormat::Wav, // LPCM maps to WAV container
     }
 }
 

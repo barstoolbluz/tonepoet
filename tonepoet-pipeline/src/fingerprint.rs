@@ -305,6 +305,8 @@ fn audio_format(value: &AudioFormat) -> String {
         AudioFormat::Alac => "Alac".to_string(),
         AudioFormat::Dsf => "Dsf".to_string(),
         AudioFormat::Dff => "Dff".to_string(),
+        AudioFormat::Dts => "Dts".to_string(),
+        AudioFormat::Ac3 => "Ac3".to_string(),
         AudioFormat::Custom {
             extension,
             display_name,
