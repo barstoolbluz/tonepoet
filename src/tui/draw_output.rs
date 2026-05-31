@@ -197,9 +197,9 @@ pub fn draw_format_pane(
             })
             .collect();
         if has_format_settings {
-            // Render container row with right-aligned ⚙ pill.
-            lines.push(container_row_with_gear(
-                border_color, w, &container_spans, focused,
+            let fmt_name = format_state.format.selected_value().name().to_lowercase();
+            lines.push(container_row_with_settings_pill(
+                border_color, w, &container_spans, focused, &fmt_name,
             ));
         } else {
             lines.push(pill_row(
@@ -326,19 +326,22 @@ fn bordered_line<'a>(
     Line::from(spans)
 }
 
-/// Container row with a right-aligned ⚙ pill for format-specific settings.
-fn container_row_with_gear<'a>(
+/// Container row with a right-aligned `<format> settings` pill.
+fn container_row_with_settings_pill<'a>(
     border_color: ratatui::style::Color,
     width: usize,
     pills: &[Span<'a>],
     focused: bool,
+    format_name: &str,
 ) -> Line<'a> {
     let label_style = if focused { theme::bright() } else { theme::muted() };
-    let gear_pill = Span::styled(
-        " ⚙ ",
+    let pill_text = format!(" {} settings ", format_name);
+    let pill_width = pill_text.len();
+    let settings_pill = Span::styled(
+        pill_text,
         Style::default()
             .fg(theme::PILL_ACTIVE_FG)
-            .bg(theme::BLUE)
+            .bg(theme::PURPLE)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -349,10 +352,17 @@ fn container_row_with_gear<'a>(
     spans.extend_from_slice(pills);
 
     let content_width: usize = spans.iter().map(|s| s.width()).sum();
-    let gear_width = gear_pill.width();
-    let padding = width.saturating_sub(content_width + gear_width + 1); // +1 for right border
-    spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(gear_pill);
+    let needed = content_width + pill_width + 1; // +1 for right border
+    if needed + 1 <= width {
+        // Enough room: pad, then pill, then border.
+        let padding = width - needed;
+        spans.push(Span::raw(" ".repeat(padding)));
+        spans.push(settings_pill);
+    } else {
+        // Too narrow: skip the pill, pad normally.
+        let padding = width.saturating_sub(content_width + 1);
+        spans.push(Span::raw(" ".repeat(padding)));
+    }
     spans.push(Span::styled("│", theme::border(border_color)));
     Line::from(spans)
 }

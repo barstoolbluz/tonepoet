@@ -5545,7 +5545,8 @@ fn handle_generic_overlay_mouse(
             }
             ActiveOverlay::FormatSettings { .. } => {
                 let w: u16 = area.0.saturating_sub(4).min(50);
-                let h: u16 = 9;
+                let field_count: u16 = 3; // compression, verify, md5
+                let h: u16 = field_count + 6;
                 let x = (area.0.saturating_sub(w)) / 2;
                 let y = (area.1.saturating_sub(h)) / 2;
                 (
@@ -6336,7 +6337,82 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
     }
 }
 
-/// Mouse handler for the template builder overlay.
+/// Fully self-contained mouse handler for the FormatSettings overlay.
+/// Handles outside-click-close, content pill clicks, and footer pills
+/// without delegating to handle_generic_overlay_mouse.
+fn handle_format_settings_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return; // only left clicks matter
+    }
+
+    let mx = mouse.column;
+    let my = mouse.row;
+
+    // Compute popup geometry (must match draw_format_settings + hint/rect).
+    let term = crossterm::terminal::size().unwrap_or((80, 24));
+    let popup_w = term.0.saturating_sub(4).min(50);
+    let field_count: u16 = 3;
+    let popup_h = field_count + 6;
+    let popup_x = (term.0.saturating_sub(popup_w)) / 2;
+    let popup_y = (term.1.saturating_sub(popup_h)) / 2;
+
+    let in_popup = mx >= popup_x
+        && mx < popup_x + popup_w
+        && my >= popup_y
+        && my < popup_y + popup_h;
+
+    if !in_popup {
+        app.active_overlay = ActiveOverlay::None;
+        return;
+    }
+
+    // Check button_map for overlay pills (verify/md5 toggles).
+    match app.button_map.find_button_at(mx, my) {
+        Some(TuiButton::FormatSettingsVerify(i)) => {
+            if let ActiveOverlay::FormatSettings {
+                ref mut verify, ..
+            } = app.active_overlay
+            {
+                *verify = i == 1; // 0 = off, 1 = on
+            }
+            return;
+        }
+        Some(TuiButton::FormatSettingsMd5(i)) => {
+            if let ActiveOverlay::FormatSettings { ref mut md5, .. } = app.active_overlay
+            {
+                *md5 = i == 0; // 0 = on, 1 = off
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Footer row: last row inside the border = popup_y + popup_h - 2.
+    // Layout: border, blank, fields(3), blank, footer, border.
+    // Footer = popup_y + 1 (border) + field_count + 2 (blank + fields-end blank)
+    let footer_y = popup_y + 1 + field_count + 2;
+    if my == footer_y {
+        // Hit-test the two footer pills: "Enter save" and "Esc cancel".
+        // They are center-aligned. Approximate: if click is in the left
+        // half of the inner area, treat as save; right half as cancel.
+        let inner_center = popup_x + popup_w / 2;
+        if mx < inner_center {
+            // Save: synthesize Enter.
+            let fake = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            handle_overlay_key(app, fake, tx);
+        } else {
+            // Cancel: synthesize Esc.
+            let fake = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            handle_overlay_key(app, fake, tx);
+        }
+    }
+    // Any other in-popup click is silently consumed.
+}
+
 fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
     let mx = mouse.column;
@@ -9722,6 +9798,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
+    // FormatSettings: dedicated handler for pill clicks inside the overlay.
+    if matches!(app.active_overlay, ActiveOverlay::FormatSettings { .. }) {
+        handle_format_settings_mouse(app, mouse, tx);
+        return;
+    }
+
     // Generic overlay mouse: click-outside-to-close + footer pill clicks
     // for all overlays (except MetadataEditor which has its own handler,
     // and ContextMenu which has its own hover/click system).
@@ -10216,16 +10298,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     focus: FormatSettingsFocus::Compression,
                 };
             }
-            TuiButton::FormatSettingsVerify(i) => {
-                if let ActiveOverlay::FormatSettings { ref mut verify, .. } = app.active_overlay {
-                    *verify = i == 1; // 0 = off, 1 = on
-                }
-            }
-            TuiButton::FormatSettingsMd5(i) => {
-                if let ActiveOverlay::FormatSettings { ref mut md5, .. } = app.active_overlay {
-                    *md5 = i == 0; // 0 = on, 1 = off
-                }
-            }
             TuiButton::MergePill(i) => {
                 app.convert.focus = ConvertFocus::OutputOptions;
                 app.convert.output_options.field_focus = OutputOptionsField::MergeMode;
@@ -10573,7 +10645,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::TemplatePickerRow(_)
             | TuiButton::TemplatePickerApply
             | TuiButton::TemplatePickerDelete
-            | TuiButton::TemplatePickerClose => {
+            | TuiButton::TemplatePickerClose
+            | TuiButton::FormatSettingsVerify(_)
+            | TuiButton::FormatSettingsMd5(_) => {
                 // Handled in dedicated mouse handlers; no-op here.
             }
         }

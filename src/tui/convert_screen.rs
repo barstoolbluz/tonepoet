@@ -263,12 +263,14 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             x += w + 1; // pill width + gap
         }
 
-        // Right-aligned ⚙ pill for format-specific settings (currently FLAC only).
+        // Right-aligned "<format> settings" pill for codec-specific settings.
         if *state.format.selected_value() == crate::convert::formats::AudioFormat::Flac {
-            let gear_x = area.x + area.width.saturating_sub(4);
+            let fmt_name = state.format.selected_value().name().to_lowercase();
+            let pill_w = fmt_name.len() as u16 + 11; // " {name} settings " length
+            let pill_x = area.x + area.width.saturating_sub(pill_w + 1); // +1 for border
             buttons.record_button(
                 TuiButton::FormatSettingsButton,
-                ratatui::layout::Rect::new(gear_x, container_row_y, 3, 1),
+                ratatui::layout::Rect::new(pill_x, container_row_y, pill_w, 1),
             );
         }
     }

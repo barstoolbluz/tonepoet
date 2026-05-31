@@ -847,7 +847,9 @@ fn draw_format_settings(
 ) {
     let area = f.size();
     let popup_width = area.width.saturating_sub(4).min(50);
-    let popup = centered_rect(popup_width, 9, area);
+    let field_count: u16 = 3; // compression, verify, md5 — grows for other formats
+    let popup_height = field_count + 6; // borders(2) + blank(1) + fields + blank(1) + footer(1) + absorb(1)
+    let popup = centered_rect(popup_width, popup_height, area);
 
     f.render_widget(Clear, popup);
     let block = Block::default()
@@ -914,7 +916,7 @@ fn draw_format_settings(
     // MD5 checksum toggle pills
     let md5_focused = focus == FormatSettingsFocus::Md5;
     let md5_label_style = if md5_focused { theme::bright() } else { theme::muted() };
-    let (on_style_md5, off_style_md5) = toggle_pill_styles(md5, md5_focused);
+    let (off_style_md5, on_style_md5) = toggle_pill_styles(md5, md5_focused);
     let md5_line = Line::from(vec![
         Span::styled("  md5 checksum ", md5_label_style),
         Span::styled(" on ", on_style_md5),
