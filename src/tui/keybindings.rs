@@ -6331,6 +6331,26 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .iter()
                 .position(|(br, _)| *br == bitrate);
         }
+        FormatSettingsKind::Mp3 {
+            mode,
+            vbr_quality_input,
+            bitrate_input,
+            ..
+        } => {
+            app.convert.format.mp3_mode = *mode;
+            let vbr_q: u8 = vbr_quality_input.text.trim().parse().unwrap_or(0).min(9);
+            app.convert.format.mp3_vbr_quality = vbr_q;
+            let bitrate: u32 = bitrate_input
+                .text
+                .trim()
+                .parse()
+                .unwrap_or(320)
+                .clamp(8, 1000);
+            app.convert.format.mp3_bitrate_kbps = bitrate;
+            app.convert.format.mp3_quality_preset = MP3_BITRATE_PRESETS
+                .iter()
+                .position(|(br, _)| *br == bitrate);
+        }
     }
     app.preset.mark_modified();
 }
@@ -6354,6 +6374,23 @@ fn format_settings_focus_next(kind: &FormatSettingsKind, focus: FormatSettingsFo
             FormatSettingsFocus::OpusBitrate => FormatSettingsFocus::OpusComplexity,
             _ => FormatSettingsFocus::OpusContentType,
         },
+        FormatSettingsKind::Mp3 { mode, .. } => {
+            use tonepoet_pipeline::enums::Mp3Mode;
+            if *mode == Mp3Mode::Vbr {
+                // VBR: Mode → VbrQuality (2 fields)
+                match focus {
+                    FormatSettingsFocus::Mp3Mode => FormatSettingsFocus::Mp3VbrQuality,
+                    _ => FormatSettingsFocus::Mp3Mode,
+                }
+            } else {
+                // CBR/ABR: Mode → Preset → Bitrate (3 fields)
+                match focus {
+                    FormatSettingsFocus::Mp3Mode => FormatSettingsFocus::Mp3Preset,
+                    FormatSettingsFocus::Mp3Preset => FormatSettingsFocus::Mp3Bitrate,
+                    _ => FormatSettingsFocus::Mp3Mode,
+                }
+            }
+        }
     }
 }
 
@@ -6375,6 +6412,21 @@ fn format_settings_focus_prev(kind: &FormatSettingsKind, focus: FormatSettingsFo
             FormatSettingsFocus::OpusBitrate => FormatSettingsFocus::OpusQuality,
             _ => FormatSettingsFocus::OpusBitrate,
         },
+        FormatSettingsKind::Mp3 { mode, .. } => {
+            use tonepoet_pipeline::enums::Mp3Mode;
+            if *mode == Mp3Mode::Vbr {
+                match focus {
+                    FormatSettingsFocus::Mp3Mode => FormatSettingsFocus::Mp3VbrQuality,
+                    _ => FormatSettingsFocus::Mp3Mode,
+                }
+            } else {
+                match focus {
+                    FormatSettingsFocus::Mp3Mode => FormatSettingsFocus::Mp3Bitrate,
+                    FormatSettingsFocus::Mp3Preset => FormatSettingsFocus::Mp3Mode,
+                    _ => FormatSettingsFocus::Mp3Preset,
+                }
+            }
+        }
     }
 }
 
@@ -6495,6 +6547,50 @@ fn handle_format_settings_field_key(
                 _ => {}
             }
         }
+        FormatSettingsKind::Mp3 {
+            mode,
+            vbr_quality_input,
+            quality_preset,
+            bitrate_input,
+        } => {
+            use tonepoet_pipeline::enums::Mp3Mode;
+            match focus {
+                FormatSettingsFocus::Mp3Mode => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let modes = [Mp3Mode::Vbr, Mp3Mode::Cbr, Mp3Mode::Abr];
+                        let cur = modes.iter().position(|m| m == mode).unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { modes.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % modes.len()
+                        };
+                        *mode = modes[next];
+                    }
+                }
+                FormatSettingsFocus::Mp3VbrQuality => {
+                    super::text_input::handle_text_input_key(vbr_quality_input, key);
+                }
+                FormatSettingsFocus::Mp3Preset => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let presets = MP3_BITRATE_PRESETS;
+                        let cur = quality_preset.unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { presets.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % presets.len()
+                        };
+                        *quality_preset = Some(next);
+                        bitrate_input.text = presets[next].0.to_string();
+                        bitrate_input.cursor = bitrate_input.text.len();
+                    }
+                }
+                FormatSettingsFocus::Mp3Bitrate => {
+                    super::text_input::handle_text_input_key(bitrate_input, key);
+                    *quality_preset = None;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -6588,6 +6684,22 @@ fn handle_format_settings_mouse(
                     }
                     return;
                 }
+                (FormatSettingsKind::Mp3 { ref mut mode, .. }, TuiButton::FormatSettingsMp3Mode(i)) => {
+                    use tonepoet_pipeline::enums::Mp3Mode;
+                    let modes = [Mp3Mode::Vbr, Mp3Mode::Cbr, Mp3Mode::Abr];
+                    if let Some(&m) = modes.get(i) {
+                        *mode = m;
+                    }
+                    return;
+                }
+                (FormatSettingsKind::Mp3 { ref mut quality_preset, ref mut bitrate_input, .. }, TuiButton::FormatSettingsMp3Preset(i)) => {
+                    if i < MP3_BITRATE_PRESETS.len() {
+                        *quality_preset = Some(i);
+                        bitrate_input.text = MP3_BITRATE_PRESETS[i].0.to_string();
+                        bitrate_input.cursor = bitrate_input.text.len();
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -6619,6 +6731,17 @@ fn handle_format_settings_mouse(
                 y if y == field4_y => Some(FormatSettingsFocus::OpusComplexity),
                 _ => None,
             },
+            FormatSettingsKind::Mp3 { mode, .. } => {
+                use tonepoet_pipeline::enums::Mp3Mode;
+                let is_vbr = *mode == Mp3Mode::Vbr;
+                match my {
+                    y if y == field1_y => Some(FormatSettingsFocus::Mp3Mode),
+                    y if y == field2_y && is_vbr => Some(FormatSettingsFocus::Mp3VbrQuality),
+                    y if y == field3_y && !is_vbr => Some(FormatSettingsFocus::Mp3Preset),
+                    y if y == field4_y && !is_vbr => Some(FormatSettingsFocus::Mp3Bitrate),
+                    _ => None, // greyed rows return None → click ignored
+                }
+            }
         };
         if let Some(f) = new_focus {
             *focus = f;
@@ -10557,6 +10680,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         },
                         FormatSettingsFocus::OpusContentType,
                     ),
+                    crate::convert::formats::AudioFormat::Mp3 => (
+                        FormatSettingsKind::Mp3 {
+                            mode: fmt.mp3_mode,
+                            vbr_quality_input: super::text_input::TextInputState::new(
+                                fmt.mp3_vbr_quality.to_string(),
+                            ),
+                            quality_preset: fmt.mp3_quality_preset,
+                            bitrate_input: super::text_input::TextInputState::new(
+                                fmt.mp3_bitrate_kbps.to_string(),
+                            ),
+                        },
+                        FormatSettingsFocus::Mp3Mode,
+                    ),
                     _ => return,
                 };
                 app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
@@ -10914,7 +11050,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsAacProfile(_)
             | TuiButton::FormatSettingsAacQuality(_)
             | TuiButton::FormatSettingsOpusContentType(_)
-            | TuiButton::FormatSettingsOpusQuality(_) => {
+            | TuiButton::FormatSettingsOpusQuality(_)
+            | TuiButton::FormatSettingsMp3Mode(_)
+            | TuiButton::FormatSettingsMp3Preset(_) => {
                 // Handled in dedicated mouse handlers; no-op here.
             }
         }

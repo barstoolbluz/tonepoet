@@ -124,6 +124,11 @@ pub enum FormatSettingsFocus {
     OpusQuality,
     OpusBitrate,
     OpusComplexity,
+    // MP3
+    Mp3Mode,
+    Mp3VbrQuality,
+    Mp3Preset,
+    Mp3Bitrate,
 }
 
 /// Format-specific overlay state, keyed by codec.
@@ -144,6 +149,12 @@ pub enum FormatSettingsKind {
         quality_preset: Option<usize>,
         bitrate_input: crate::tui::text_input::TextInputState,
         complexity_input: crate::tui::text_input::TextInputState,
+    },
+    Mp3 {
+        mode: tonepoet_pipeline::enums::Mp3Mode,
+        vbr_quality_input: crate::tui::text_input::TextInputState,
+        quality_preset: Option<usize>,
+        bitrate_input: crate::tui::text_input::TextInputState,
     },
 }
 
@@ -762,7 +773,24 @@ pub struct FormatState {
     pub opus_bitrate_kbps: u32,
     /// Opus encoder complexity (0-10). Default: 10.
     pub opus_complexity: u8,
+    /// MP3 encoding mode (VBR, CBR, ABR). Default: VBR.
+    pub mp3_mode: tonepoet_pipeline::enums::Mp3Mode,
+    /// MP3 bitrate preset index into MP3_BITRATE_PRESETS. None = custom.
+    pub mp3_quality_preset: Option<usize>,
+    /// MP3 VBR quality (0-9, 0=best). Default: 0.
+    pub mp3_vbr_quality: u8,
+    /// MP3 CBR/ABR bitrate in kbps (8-1000). Default: 320.
+    pub mp3_bitrate_kbps: u32,
 }
+
+// MP3 bitrate presets (used by CBR and ABR modes).
+pub const MP3_BITRATE_PRESETS: &[(u32, &str)] = &[
+    (320, "insane"),
+    (256, "high"),
+    (192, "standard"),
+    (128, "portable"),
+    (64, "voice"),
+];
 
 // AAC quality preset tables keyed by profile.
 pub const AAC_LC_PRESETS: &[(u32, &str)] = &[
@@ -909,6 +937,10 @@ impl FormatState {
             opus_quality_preset: Some(1), // "high" = index 1 (192 kbps)
             opus_bitrate_kbps: 192,
             opus_complexity: 10,
+            mp3_mode: tonepoet_pipeline::enums::Mp3Mode::Vbr,
+            mp3_quality_preset: Some(0), // "insane" = index 0 (320 kbps)
+            mp3_vbr_quality: 0,
+            mp3_bitrate_kbps: 320,
         };
         state.apply_format_constraints();
         state

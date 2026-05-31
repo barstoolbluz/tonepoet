@@ -852,6 +852,7 @@ fn draw_format_settings(
         FormatSettingsKind::Flac { .. } => " FLAC Settings ",
         FormatSettingsKind::Aac { .. } => " AAC Settings ",
         FormatSettingsKind::Opus { .. } => " Opus Settings ",
+        FormatSettingsKind::Mp3 { .. } => " MP3 Settings ",
     };
 
     f.render_widget(Clear, popup);
@@ -901,6 +902,12 @@ fn draw_format_settings(
             bitrate_input,
             complexity_input,
         } => draw_opus_fields(f, *content_type, *quality_preset, bitrate_input, complexity_input, focus, &chunks, buttons),
+        FormatSettingsKind::Mp3 {
+            mode,
+            vbr_quality_input,
+            quality_preset,
+            bitrate_input,
+        } => draw_mp3_fields(f, *mode, vbr_quality_input, *quality_preset, bitrate_input, focus, &chunks, buttons),
     }
 
     // Footer (shared)
@@ -1220,6 +1227,151 @@ fn draw_opus_fields(
     }
 }
 
+fn draw_mp3_fields(
+    f: &mut Frame,
+    mode: tonepoet_pipeline::enums::Mp3Mode,
+    vbr_quality_input: &super::text_input::TextInputState,
+    quality_preset: Option<usize>,
+    bitrate_input: &super::text_input::TextInputState,
+    focus: FormatSettingsFocus,
+    chunks: &[Rect],
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
+    use tonepoet_pipeline::enums::Mp3Mode;
+
+    let is_vbr = mode == Mp3Mode::Vbr;
+    let greyed = Style::default().fg(Color::DarkGray);
+    let greyed_bg = Color::Rgb(20, 20, 20);
+
+    // Row 1: Mode pills (VBR/CBR/ABR) — always active
+    let mode_focused = focus == FormatSettingsFocus::Mp3Mode;
+    let mode_label_style = if mode_focused { theme::bright() } else { theme::muted() };
+    let modes = [
+        (Mp3Mode::Vbr, "VBR"),
+        (Mp3Mode::Cbr, "CBR"),
+        (Mp3Mode::Abr, "ABR"),
+    ];
+    let mut mode_spans = vec![Span::styled("  mode         ", mode_label_style)];
+    let mut mx = chunks[1].x + 15;
+    for (i, (m, label)) in modes.iter().enumerate() {
+        let selected = *m == mode;
+        let style = if selected {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if mode_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        mode_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(
+            TuiButton::FormatSettingsMp3Mode(i),
+            Rect::new(mx, chunks[1].y, pill_w, 1),
+        );
+        mx += pill_w;
+        if i + 1 < modes.len() {
+            mode_spans.push(Span::raw(" "));
+            mx += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(mode_spans)), chunks[1]);
+
+    // Row 2: VBR quality text entry — greyed when CBR/ABR
+    let vbr_focused = focus == FormatSettingsFocus::Mp3VbrQuality;
+    let vbr_label_style = if !is_vbr { greyed } else if vbr_focused { theme::bright() } else { theme::muted() };
+    let visible_width = chunks[2].width.saturating_sub(16) as usize;
+    let (view, cursor_col) = vbr_quality_input.view(visible_width.max(1));
+    let display_val = if view.is_empty() { " ".to_string() } else { view };
+    let input_bg = if !is_vbr {
+        greyed_bg
+    } else if vbr_focused {
+        Color::Rgb(40, 40, 40)
+    } else {
+        Color::Rgb(30, 30, 30)
+    };
+    let fg = if !is_vbr { Color::DarkGray } else { Color::White };
+    let vbr_line = Line::from(vec![
+        Span::styled("  vbr quality  ", vbr_label_style),
+        Span::styled(
+            format!(" {} ", display_val),
+            Style::default().fg(fg).bg(input_bg),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(vbr_line), chunks[2]);
+    if vbr_focused && is_vbr {
+        f.set_cursor(chunks[2].x + 16 + cursor_col, chunks[2].y);
+    }
+
+    // Row 3: Preset pills — greyed when VBR
+    let preset_focused = focus == FormatSettingsFocus::Mp3Preset;
+    let preset_label_style = if is_vbr { greyed } else if preset_focused { theme::bright() } else { theme::muted() };
+    let presets = super::app::MP3_BITRATE_PRESETS;
+    let mut preset_spans = vec![Span::styled("  preset       ", preset_label_style)];
+    let mut px = chunks[3].x + 15;
+    for (i, (_bitrate, label)) in presets.iter().enumerate() {
+        let selected = quality_preset == Some(i);
+        let style = if is_vbr {
+            greyed
+        } else if selected {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if preset_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        preset_spans.push(Span::styled(pill_text, style));
+        // Only register click targets when active (not greyed).
+        if !is_vbr {
+            buttons.record_button(
+                TuiButton::FormatSettingsMp3Preset(i),
+                Rect::new(px, chunks[3].y, pill_w, 1),
+            );
+        }
+        px += pill_w;
+        if i + 1 < presets.len() {
+            preset_spans.push(Span::raw(" "));
+            px += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(preset_spans)), chunks[3]);
+
+    // Row 4: Bitrate text entry — greyed when VBR
+    let br_focused = focus == FormatSettingsFocus::Mp3Bitrate;
+    let br_label_style = if is_vbr { greyed } else if br_focused { theme::bright() } else { theme::muted() };
+    let visible_width_br = chunks[4].width.saturating_sub(22) as usize;
+    let (view_br, cursor_col_br) = bitrate_input.view(visible_width_br.max(1));
+    let display_val_br = if view_br.is_empty() { " ".to_string() } else { view_br };
+    let br_bg = if is_vbr {
+        greyed_bg
+    } else if br_focused {
+        Color::Rgb(40, 40, 40)
+    } else {
+        Color::Rgb(30, 30, 30)
+    };
+    let br_fg = if is_vbr { Color::DarkGray } else { Color::White };
+    let br_line = Line::from(vec![
+        Span::styled("  bitrate      ", br_label_style),
+        Span::styled(
+            format!(" {} ", display_val_br),
+            Style::default().fg(br_fg).bg(br_bg),
+        ),
+        Span::styled(" kbps", if is_vbr { greyed } else { theme::muted() }),
+    ]);
+    f.render_widget(Paragraph::new(br_line), chunks[4]);
+    if br_focused && !is_vbr {
+        f.set_cursor(chunks[4].x + 16 + cursor_col_br, chunks[4].y);
+    }
+}
+
 fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
     let active = Style::default()
         .fg(theme::PILL_ACTIVE_FG)
@@ -1243,6 +1395,7 @@ pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
         FormatSettingsKind::Flac { .. } => 3,
         FormatSettingsKind::Aac { .. } => 3,
         FormatSettingsKind::Opus { .. } => 4,
+        FormatSettingsKind::Mp3 { .. } => 4,
     }
 }
 
@@ -1266,6 +1419,15 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
         }
         FormatSettingsKind::Opus { .. } => {
             let presets = super::app::OPUS_PRESETS;
+            let pills_width: usize = presets
+                .iter()
+                .map(|(_, label)| label.len() + 2)
+                .sum::<usize>()
+                + presets.len().saturating_sub(1);
+            label_width + pills_width
+        }
+        FormatSettingsKind::Mp3 { .. } => {
+            let presets = super::app::MP3_BITRATE_PRESETS;
             let pills_width: usize = presets
                 .iter()
                 .map(|(_, label)| label.len() + 2)

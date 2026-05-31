@@ -269,6 +269,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             crate::convert::formats::AudioFormat::Flac
                 | crate::convert::formats::AudioFormat::Aac
                 | crate::convert::formats::AudioFormat::Opus
+                | crate::convert::formats::AudioFormat::Mp3
         ) {
             let fmt_name = state.format.selected_value().name().to_lowercase();
             let pill_w = fmt_name.len() as u16 + 11; // " {name} settings " length

@@ -339,7 +339,11 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             verify: *format.flac_verify.selected_value(),
             write_md5: *format.flac_md5.selected_value(),
         },
-        mp3: Default::default(),
+        mp3: tonepoet_pipeline::Mp3Settings {
+            mode: format.mp3_mode,
+            bitrate_kbps: format.mp3_bitrate_kbps,
+            vbr_quality: format.mp3_vbr_quality,
+        },
         aac: tonepoet_pipeline::AacSettings {
             profile: format.aac_profile,
             bitrate_kbps: format.aac_bitrate_kbps,

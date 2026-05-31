@@ -57,6 +57,10 @@ pub enum TuiButton {
     FormatSettingsOpusContentType(usize),
     /// Opus quality preset pills inside the FormatSettings overlay.
     FormatSettingsOpusQuality(usize),
+    /// MP3 mode pills inside the FormatSettings overlay.
+    FormatSettingsMp3Mode(usize),
+    /// MP3 bitrate preset pills inside the FormatSettings overlay.
+    FormatSettingsMp3Preset(usize),
 
     // Convert screen controls
     PresetsButton,
@@ -216,7 +220,9 @@ impl TuiButton {
             | Self::FormatSettingsAacProfile(_)
             | Self::FormatSettingsAacQuality(_)
             | Self::FormatSettingsOpusContentType(_)
-            | Self::FormatSettingsOpusQuality(_) => None,
+            | Self::FormatSettingsOpusQuality(_)
+            | Self::FormatSettingsMp3Mode(_)
+            | Self::FormatSettingsMp3Preset(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)
