@@ -132,6 +132,9 @@ impl AudioFormat {
             Self::Aiff,
             Self::WavPack,
             Self::Dsf,
+            Self::Dts,
+            Self::Ac3,
+            Self::Lpcm,
         ]
     }
 
