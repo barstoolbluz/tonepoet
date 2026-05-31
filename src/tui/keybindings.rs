@@ -5482,7 +5482,7 @@ fn handle_generic_overlay_mouse(
             ActiveOverlay::FormatSettings { ref kind, .. } => {
                 let min_w = super::draw_overlays::format_settings_min_width(kind);
                 let w: u16 = area.0.saturating_sub(4).min(min_w);
-                let field_count: u16 = 3;
+                let field_count = super::draw_overlays::format_settings_field_count(kind);
                 let h: u16 = field_count + 6;
                 let x = (area.0.saturating_sub(w)) / 2;
                 let y = (area.1.saturating_sub(h)) / 2;
@@ -6306,6 +6306,31 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .iter()
                 .position(|(br, _)| *br == bitrate);
         }
+        FormatSettingsKind::Opus {
+            content_type,
+            bitrate_input,
+            complexity_input,
+            ..
+        } => {
+            let bitrate: u32 = bitrate_input
+                .text
+                .trim()
+                .parse()
+                .unwrap_or(192)
+                .clamp(6, 510);
+            let complexity: u8 = complexity_input
+                .text
+                .trim()
+                .parse()
+                .unwrap_or(10)
+                .min(10);
+            app.convert.format.opus_content_type = *content_type;
+            app.convert.format.opus_bitrate_kbps = bitrate;
+            app.convert.format.opus_complexity = complexity;
+            app.convert.format.opus_quality_preset = OPUS_PRESETS
+                .iter()
+                .position(|(br, _)| *br == bitrate);
+        }
     }
     app.preset.mark_modified();
 }
@@ -6323,6 +6348,12 @@ fn format_settings_focus_next(kind: &FormatSettingsKind, focus: FormatSettingsFo
             FormatSettingsFocus::AacQuality => FormatSettingsFocus::AacBitrate,
             _ => FormatSettingsFocus::AacProfile,
         },
+        FormatSettingsKind::Opus { .. } => match focus {
+            FormatSettingsFocus::OpusContentType => FormatSettingsFocus::OpusQuality,
+            FormatSettingsFocus::OpusQuality => FormatSettingsFocus::OpusBitrate,
+            FormatSettingsFocus::OpusBitrate => FormatSettingsFocus::OpusComplexity,
+            _ => FormatSettingsFocus::OpusContentType,
+        },
     }
 }
 
@@ -6337,6 +6368,12 @@ fn format_settings_focus_prev(kind: &FormatSettingsKind, focus: FormatSettingsFo
             FormatSettingsFocus::AacProfile => FormatSettingsFocus::AacBitrate,
             FormatSettingsFocus::AacQuality => FormatSettingsFocus::AacProfile,
             _ => FormatSettingsFocus::AacQuality,
+        },
+        FormatSettingsKind::Opus { .. } => match focus {
+            FormatSettingsFocus::OpusContentType => FormatSettingsFocus::OpusComplexity,
+            FormatSettingsFocus::OpusQuality => FormatSettingsFocus::OpusContentType,
+            FormatSettingsFocus::OpusBitrate => FormatSettingsFocus::OpusQuality,
+            _ => FormatSettingsFocus::OpusBitrate,
         },
     }
 }
@@ -6409,8 +6446,51 @@ fn handle_format_settings_field_key(
                 }
                 FormatSettingsFocus::AacBitrate => {
                     super::text_input::handle_text_input_key(bitrate_input, key);
-                    // Any edit deselects quality preset.
                     *quality_preset = None;
+                }
+                _ => {}
+            }
+        }
+        FormatSettingsKind::Opus {
+            content_type,
+            quality_preset,
+            bitrate_input,
+            complexity_input,
+        } => {
+            use tonepoet_pipeline::enums::OpusContentType;
+            match focus {
+                FormatSettingsFocus::OpusContentType => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let types = [OpusContentType::Auto, OpusContentType::Music, OpusContentType::Speech];
+                        let cur = types.iter().position(|t| t == content_type).unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { types.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % types.len()
+                        };
+                        *content_type = types[next];
+                    }
+                }
+                FormatSettingsFocus::OpusQuality => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let presets = OPUS_PRESETS;
+                        let cur = quality_preset.unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { presets.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % presets.len()
+                        };
+                        *quality_preset = Some(next);
+                        bitrate_input.text = presets[next].0.to_string();
+                        bitrate_input.cursor = bitrate_input.text.len();
+                    }
+                }
+                FormatSettingsFocus::OpusBitrate => {
+                    super::text_input::handle_text_input_key(bitrate_input, key);
+                    *quality_preset = None;
+                }
+                FormatSettingsFocus::OpusComplexity => {
+                    super::text_input::handle_text_input_key(complexity_input, key);
                 }
                 _ => {}
             }
@@ -6435,13 +6515,15 @@ fn handle_format_settings_mouse(
 
     // Compute popup geometry (must match draw_format_settings + hint/rect).
     let term = crossterm::terminal::size().unwrap_or((80, 24));
-    let min_w = if let ActiveOverlay::FormatSettings { ref kind, .. } = app.active_overlay {
-        super::draw_overlays::format_settings_min_width(kind)
+    let (min_w, field_count) = if let ActiveOverlay::FormatSettings { ref kind, .. } = app.active_overlay {
+        (
+            super::draw_overlays::format_settings_min_width(kind),
+            super::draw_overlays::format_settings_field_count(kind),
+        )
     } else {
-        50
+        (50, 3)
     };
     let popup_w = term.0.saturating_sub(4).min(min_w);
-    let field_count: u16 = 3;
     let popup_h = field_count + 6;
     let popup_x = (term.0.saturating_sub(popup_w)) / 2;
     let popup_y = (term.1.saturating_sub(popup_h)) / 2;
@@ -6490,16 +6572,32 @@ fn handle_format_settings_mouse(
                     }
                     return;
                 }
+                (FormatSettingsKind::Opus { ref mut content_type, .. }, TuiButton::FormatSettingsOpusContentType(i)) => {
+                    use tonepoet_pipeline::enums::OpusContentType;
+                    let types = [OpusContentType::Auto, OpusContentType::Music, OpusContentType::Speech];
+                    if let Some(&t) = types.get(i) {
+                        *content_type = t;
+                    }
+                    return;
+                }
+                (FormatSettingsKind::Opus { ref mut quality_preset, ref mut bitrate_input, .. }, TuiButton::FormatSettingsOpusQuality(i)) => {
+                    if i < OPUS_PRESETS.len() {
+                        *quality_preset = Some(i);
+                        bitrate_input.text = OPUS_PRESETS[i].0.to_string();
+                        bitrate_input.cursor = bitrate_input.text.len();
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
     }
 
     // Click-to-focus: clicking on a field row sets focus to that field.
-    // Layout: border(+0), blank(+1), field1(+2), field2(+3), field3(+4), blank(+5), footer(+6).
     let field1_y = popup_y + 2;
     let field2_y = popup_y + 3;
     let field3_y = popup_y + 4;
+    let field4_y = popup_y + 5;
     if let ActiveOverlay::FormatSettings { ref kind, ref mut focus, .. } = app.active_overlay {
         let new_focus = match kind {
             FormatSettingsKind::Flac { .. } => match my {
@@ -6512,6 +6610,13 @@ fn handle_format_settings_mouse(
                 y if y == field1_y => Some(FormatSettingsFocus::AacProfile),
                 y if y == field2_y => Some(FormatSettingsFocus::AacQuality),
                 y if y == field3_y => Some(FormatSettingsFocus::AacBitrate),
+                _ => None,
+            },
+            FormatSettingsKind::Opus { .. } => match my {
+                y if y == field1_y => Some(FormatSettingsFocus::OpusContentType),
+                y if y == field2_y => Some(FormatSettingsFocus::OpusQuality),
+                y if y == field3_y => Some(FormatSettingsFocus::OpusBitrate),
+                y if y == field4_y => Some(FormatSettingsFocus::OpusComplexity),
                 _ => None,
             },
         };
@@ -10439,6 +10544,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         },
                         FormatSettingsFocus::AacProfile,
                     ),
+                    crate::convert::formats::AudioFormat::Opus => (
+                        FormatSettingsKind::Opus {
+                            content_type: fmt.opus_content_type,
+                            quality_preset: fmt.opus_quality_preset,
+                            bitrate_input: super::text_input::TextInputState::new(
+                                fmt.opus_bitrate_kbps.to_string(),
+                            ),
+                            complexity_input: super::text_input::TextInputState::new(
+                                fmt.opus_complexity.to_string(),
+                            ),
+                        },
+                        FormatSettingsFocus::OpusContentType,
+                    ),
                     _ => return,
                 };
                 app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
@@ -10794,7 +10912,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsVerify(_)
             | TuiButton::FormatSettingsMd5(_)
             | TuiButton::FormatSettingsAacProfile(_)
-            | TuiButton::FormatSettingsAacQuality(_) => {
+            | TuiButton::FormatSettingsAacQuality(_)
+            | TuiButton::FormatSettingsOpusContentType(_)
+            | TuiButton::FormatSettingsOpusQuality(_) => {
                 // Handled in dedicated mouse handlers; no-op here.
             }
         }

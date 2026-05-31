@@ -53,6 +53,10 @@ pub enum TuiButton {
     FormatSettingsAacProfile(usize),
     /// AAC quality preset pills inside the FormatSettings overlay.
     FormatSettingsAacQuality(usize),
+    /// Opus content type pills inside the FormatSettings overlay.
+    FormatSettingsOpusContentType(usize),
+    /// Opus quality preset pills inside the FormatSettings overlay.
+    FormatSettingsOpusQuality(usize),
 
     // Convert screen controls
     PresetsButton,
@@ -210,7 +214,9 @@ impl TuiButton {
             | Self::FormatSettingsVerify(_)
             | Self::FormatSettingsMd5(_)
             | Self::FormatSettingsAacProfile(_)
-            | Self::FormatSettingsAacQuality(_) => None,
+            | Self::FormatSettingsAacQuality(_)
+            | Self::FormatSettingsOpusContentType(_)
+            | Self::FormatSettingsOpusQuality(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)

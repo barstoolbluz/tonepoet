@@ -119,6 +119,11 @@ pub enum FormatSettingsFocus {
     AacProfile,
     AacQuality,
     AacBitrate,
+    // Opus
+    OpusContentType,
+    OpusQuality,
+    OpusBitrate,
+    OpusComplexity,
 }
 
 /// Format-specific overlay state, keyed by codec.
@@ -133,6 +138,12 @@ pub enum FormatSettingsKind {
         profile: tonepoet_pipeline::enums::AacProfile,
         quality_preset: Option<usize>,
         bitrate_input: crate::tui::text_input::TextInputState,
+    },
+    Opus {
+        content_type: tonepoet_pipeline::enums::OpusContentType,
+        quality_preset: Option<usize>,
+        bitrate_input: crate::tui::text_input::TextInputState,
+        complexity_input: crate::tui::text_input::TextInputState,
     },
 }
 
@@ -743,6 +754,14 @@ pub struct FormatState {
     pub aac_quality_preset: Option<usize>,
     /// AAC bitrate in kbps (8-1024). Default: 256.
     pub aac_bitrate_kbps: u32,
+    /// Opus content type (Auto, Music, Speech). Default: Auto.
+    pub opus_content_type: tonepoet_pipeline::enums::OpusContentType,
+    /// Opus quality preset index into OPUS_PRESETS. None = custom.
+    pub opus_quality_preset: Option<usize>,
+    /// Opus bitrate in kbps (6-510). Default: 192.
+    pub opus_bitrate_kbps: u32,
+    /// Opus encoder complexity (0-10). Default: 10.
+    pub opus_complexity: u8,
 }
 
 // AAC quality preset tables keyed by profile.
@@ -761,6 +780,15 @@ pub const AAC_HEV2_PRESETS: &[(u32, &str)] = &[
     (64, "high"),
     (48, "standard"),
     (32, "portable"),
+];
+
+// Opus quality presets.
+pub const OPUS_PRESETS: &[(u32, &str)] = &[
+    (320, "insane"),
+    (192, "high"),
+    (128, "standard"),
+    (96, "portable"),
+    (64, "voice"),
 ];
 
 /// Get the quality preset table for the given AAC profile.
@@ -877,6 +905,10 @@ impl FormatState {
             aac_profile: tonepoet_pipeline::enums::AacProfile::LcAac,
             aac_quality_preset: Some(1), // "high" = index 1 in LC presets
             aac_bitrate_kbps: 256,
+            opus_content_type: tonepoet_pipeline::enums::OpusContentType::Auto,
+            opus_quality_preset: Some(1), // "high" = index 1 (192 kbps)
+            opus_bitrate_kbps: 192,
+            opus_complexity: 10,
         };
         state.apply_format_constraints();
         state

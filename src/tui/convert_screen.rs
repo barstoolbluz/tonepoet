@@ -266,7 +266,9 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
         // Right-aligned "<format> settings" pill for codec-specific settings.
         if matches!(
             *state.format.selected_value(),
-            crate::convert::formats::AudioFormat::Flac | crate::convert::formats::AudioFormat::Aac
+            crate::convert::formats::AudioFormat::Flac
+                | crate::convert::formats::AudioFormat::Aac
+                | crate::convert::formats::AudioFormat::Opus
         ) {
             let fmt_name = state.format.selected_value().name().to_lowercase();
             let pill_w = fmt_name.len() as u16 + 11; // " {name} settings " length

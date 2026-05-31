@@ -844,13 +844,14 @@ fn draw_format_settings(
     let area = f.size();
     let min_width = format_settings_min_width(kind);
     let popup_width = area.width.saturating_sub(4).min(min_width);
-    let field_count: u16 = 3; // all current formats have 3 fields
+    let field_count: u16 = format_settings_field_count(kind);
     let popup_height = field_count + 6;
     let popup = centered_rect(popup_width, popup_height, area);
 
     let title = match kind {
         FormatSettingsKind::Flac { .. } => " FLAC Settings ",
         FormatSettingsKind::Aac { .. } => " AAC Settings ",
+        FormatSettingsKind::Opus { .. } => " Opus Settings ",
     };
 
     f.render_widget(Clear, popup);
@@ -866,18 +867,22 @@ fn draw_format_settings(
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
+    // Dynamic layout: blank, N fields, blank, footer, absorb.
+    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // blank
+    for _ in 0..field_count {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // blank
+    constraints.push(Constraint::Length(1)); // footer
+    constraints.push(Constraint::Min(0));    // absorb
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // blank
-            Constraint::Length(1), // field 1
-            Constraint::Length(1), // field 2
-            Constraint::Length(1), // field 3
-            Constraint::Length(1), // blank
-            Constraint::Length(1), // footer
-            Constraint::Min(0),   // absorb
-        ])
+        .constraints(constraints)
         .split(inner);
+
+    // Footer is at chunks[field_count + 2] (blank + fields + blank + footer).
+    let footer_idx = (field_count + 2) as usize;
 
     match kind {
         FormatSettingsKind::Flac {
@@ -890,6 +895,12 @@ fn draw_format_settings(
             quality_preset,
             bitrate_input,
         } => draw_aac_fields(f, *profile, *quality_preset, bitrate_input, focus, &chunks, buttons),
+        FormatSettingsKind::Opus {
+            content_type,
+            quality_preset,
+            bitrate_input,
+            complexity_input,
+        } => draw_opus_fields(f, *content_type, *quality_preset, bitrate_input, complexity_input, focus, &chunks, buttons),
     }
 
     // Footer (shared)
@@ -899,7 +910,7 @@ fn draw_format_settings(
         footer_pill("Esc cancel", theme::PURPLE),
     ]))
     .alignment(Alignment::Center);
-    f.render_widget(footer, chunks[5]);
+    f.render_widget(footer, chunks[footer_idx]);
 }
 
 fn draw_flac_fields(
@@ -1079,6 +1090,136 @@ fn draw_aac_fields(
 
 /// Style pair for a boolean toggle rendered as two pills.
 /// Returns (false_style, true_style).
+fn draw_opus_fields(
+    f: &mut Frame,
+    content_type: tonepoet_pipeline::enums::OpusContentType,
+    quality_preset: Option<usize>,
+    bitrate_input: &super::text_input::TextInputState,
+    complexity_input: &super::text_input::TextInputState,
+    focus: FormatSettingsFocus,
+    chunks: &[Rect],
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
+    use tonepoet_pipeline::enums::OpusContentType;
+
+    // Content type pills: auto / music / speech
+    let ct_focused = focus == FormatSettingsFocus::OpusContentType;
+    let ct_label_style = if ct_focused { theme::bright() } else { theme::muted() };
+    let types = [
+        (OpusContentType::Auto, "auto"),
+        (OpusContentType::Music, "music"),
+        (OpusContentType::Speech, "speech"),
+    ];
+    let mut ct_spans = vec![Span::styled("  content type ", ct_label_style)];
+    let mut cx = chunks[1].x + 15;
+    for (i, (t, label)) in types.iter().enumerate() {
+        let selected = *t == content_type;
+        let style = if selected {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if ct_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        ct_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(
+            TuiButton::FormatSettingsOpusContentType(i),
+            Rect::new(cx, chunks[1].y, pill_w, 1),
+        );
+        cx += pill_w;
+        if i + 1 < types.len() {
+            ct_spans.push(Span::raw(" "));
+            cx += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(ct_spans)), chunks[1]);
+
+    // Quality preset pills
+    let qual_focused = focus == FormatSettingsFocus::OpusQuality;
+    let qual_label_style = if qual_focused { theme::bright() } else { theme::muted() };
+    let presets = super::app::OPUS_PRESETS;
+    let mut qual_spans = vec![Span::styled("  quality      ", qual_label_style)];
+    let mut qx = chunks[2].x + 15;
+    for (i, (_bitrate, label)) in presets.iter().enumerate() {
+        let selected = quality_preset == Some(i);
+        let style = if selected {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if qual_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        qual_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(
+            TuiButton::FormatSettingsOpusQuality(i),
+            Rect::new(qx, chunks[2].y, pill_w, 1),
+        );
+        qx += pill_w;
+        if i + 1 < presets.len() {
+            qual_spans.push(Span::raw(" "));
+            qx += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(qual_spans)), chunks[2]);
+
+    // Bitrate text entry field
+    let br_focused = focus == FormatSettingsFocus::OpusBitrate;
+    let br_label_style = if br_focused { theme::bright() } else { theme::muted() };
+    let visible_width = chunks[3].width.saturating_sub(22) as usize;
+    let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
+    let display_val = if view.is_empty() { " ".to_string() } else { view };
+    let input_bg = if br_focused {
+        Color::Rgb(40, 40, 40)
+    } else {
+        Color::Rgb(30, 30, 30)
+    };
+    let br_line = Line::from(vec![
+        Span::styled("  bitrate      ", br_label_style),
+        Span::styled(
+            format!(" {} ", display_val),
+            Style::default().fg(Color::White).bg(input_bg),
+        ),
+        Span::styled(" kbps", theme::muted()),
+    ]);
+    f.render_widget(Paragraph::new(br_line), chunks[3]);
+    if br_focused {
+        f.set_cursor(chunks[3].x + 16 + cursor_col, chunks[3].y);
+    }
+
+    // Complexity text entry field
+    let comp_focused = focus == FormatSettingsFocus::OpusComplexity;
+    let comp_label_style = if comp_focused { theme::bright() } else { theme::muted() };
+    let visible_width_c = chunks[4].width.saturating_sub(16) as usize;
+    let (view_c, cursor_col_c) = complexity_input.view(visible_width_c.max(1));
+    let display_val_c = if view_c.is_empty() { " ".to_string() } else { view_c };
+    let comp_bg = if comp_focused {
+        Color::Rgb(40, 40, 40)
+    } else {
+        Color::Rgb(30, 30, 30)
+    };
+    let comp_line = Line::from(vec![
+        Span::styled("  complexity   ", comp_label_style),
+        Span::styled(
+            format!(" {} ", display_val_c),
+            Style::default().fg(Color::White).bg(comp_bg),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(comp_line), chunks[4]);
+    if comp_focused {
+        f.set_cursor(chunks[4].x + 16 + cursor_col_c, chunks[4].y);
+    }
+}
+
 fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
     let active = Style::default()
         .fg(theme::PILL_ACTIVE_FG)
@@ -1096,29 +1237,43 @@ fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
     }
 }
 
+/// Number of editable fields in the overlay for a given format kind.
+pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
+    match kind {
+        FormatSettingsKind::Flac { .. } => 3,
+        FormatSettingsKind::Aac { .. } => 3,
+        FormatSettingsKind::Opus { .. } => 4,
+    }
+}
+
 /// Compute the popup width for a format settings overlay.
 /// Uses the widest possible content across ALL states of this format
-/// (e.g. LC presets for AAC, which are the widest) so the box doesn't
-/// resize when the user changes settings inside the overlay.
+/// so the box doesn't resize when the user changes settings inside.
 pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
-    let label_width: usize = 15; // all labels are 15 chars
+    let label_width: usize = 15;
     let content_width = match kind {
         FormatSettingsKind::Flac { .. } => {
-            // Widest: "  md5 checksum " + " on " + " " + " off " = 25
-            label_width + 4 + 1 + 5
+            label_width + 4 + 1 + 5 // md5 checksum row
         }
         FormatSettingsKind::Aac { .. } => {
-            // Always size for LC presets (the widest: insane/high/standard/portable).
             let presets = super::app::AAC_LC_PRESETS;
             let pills_width: usize = presets
                 .iter()
-                .map(|(_, label)| label.len() + 2) // " label "
+                .map(|(_, label)| label.len() + 2)
                 .sum::<usize>()
-                + presets.len().saturating_sub(1); // gaps between pills
+                + presets.len().saturating_sub(1);
+            label_width + pills_width
+        }
+        FormatSettingsKind::Opus { .. } => {
+            let presets = super::app::OPUS_PRESETS;
+            let pills_width: usize = presets
+                .iter()
+                .map(|(_, label)| label.len() + 2)
+                .sum::<usize>()
+                + presets.len().saturating_sub(1);
             label_width + pills_width
         }
     };
-    // +2 for left/right borders, +4 for breathing room
     (content_width + 6) as u16
 }
 

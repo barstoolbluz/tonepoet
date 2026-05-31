@@ -344,7 +344,11 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             profile: format.aac_profile,
             bitrate_kbps: format.aac_bitrate_kbps,
         },
-        opus: Default::default(),
+        opus: tonepoet_pipeline::OpusSettings {
+            content_type: format.opus_content_type,
+            bitrate_kbps: format.opus_bitrate_kbps,
+            complexity: format.opus_complexity,
+        },
         // settings-sentinel-allow: remaining sub-struct defaults
         wavpack: Default::default(),
         ssrc: Default::default(),
