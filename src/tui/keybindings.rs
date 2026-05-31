@@ -1564,90 +1564,26 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
-        ActiveOverlay::FormatSettings {
-            mut compression_input,
-            mut verify,
-            mut md5,
-            mut focus,
-        } => {
+        ActiveOverlay::FormatSettings { mut kind, mut focus } => {
             match key.code {
                 KeyCode::Enter => {
-                    // Commit: parse compression, write all values to FormatState.
-                    let level: u8 = compression_input
-                        .text
-                        .trim()
-                        .parse()
-                        .unwrap_or(8)
-                        .min(8);
-                    app.convert.format.flac_compression_level = level;
-                    let verify_idx = if verify { 1 } else { 0 };
-                    app.convert.format.flac_verify.selected = verify_idx;
-                    // md5 pill order: (true, "on"), (false, "off")
-                    let md5_idx = if md5 { 0 } else { 1 };
-                    app.convert.format.flac_md5.selected = md5_idx;
-                    app.preset.mark_modified();
+                    commit_format_settings(app, &kind);
                     app.active_overlay = ActiveOverlay::None;
                 }
                 KeyCode::Esc => {
                     app.active_overlay = ActiveOverlay::None;
                 }
                 KeyCode::Up => {
-                    focus = match focus {
-                        FormatSettingsFocus::Compression => FormatSettingsFocus::Md5,
-                        FormatSettingsFocus::Verify => FormatSettingsFocus::Compression,
-                        FormatSettingsFocus::Md5 => FormatSettingsFocus::Verify,
-                    };
-                    app.active_overlay = ActiveOverlay::FormatSettings {
-                        compression_input,
-                        verify,
-                        md5,
-                        focus,
-                    };
+                    focus = format_settings_focus_prev(&kind, focus);
+                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
                 }
                 KeyCode::Down | KeyCode::Tab => {
-                    focus = match focus {
-                        FormatSettingsFocus::Compression => FormatSettingsFocus::Verify,
-                        FormatSettingsFocus::Verify => FormatSettingsFocus::Md5,
-                        FormatSettingsFocus::Md5 => FormatSettingsFocus::Compression,
-                    };
-                    app.active_overlay = ActiveOverlay::FormatSettings {
-                        compression_input,
-                        verify,
-                        md5,
-                        focus,
-                    };
+                    focus = format_settings_focus_next(&kind, focus);
+                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
                 }
                 _ => {
-                    match focus {
-                        FormatSettingsFocus::Compression => {
-                            super::text_input::handle_text_input_key(
-                                &mut compression_input,
-                                &key,
-                            );
-                        }
-                        FormatSettingsFocus::Verify => {
-                            if matches!(
-                                key.code,
-                                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-                            ) {
-                                verify = !verify;
-                            }
-                        }
-                        FormatSettingsFocus::Md5 => {
-                            if matches!(
-                                key.code,
-                                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-                            ) {
-                                md5 = !md5;
-                            }
-                        }
-                    }
-                    app.active_overlay = ActiveOverlay::FormatSettings {
-                        compression_input,
-                        verify,
-                        md5,
-                        focus,
-                    };
+                    handle_format_settings_field_key(&mut kind, focus, &key);
+                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
                 }
             }
         }
@@ -5543,9 +5479,10 @@ fn handle_generic_overlay_mouse(
                     vec![("Enter save", "enter"), ("Esc cancel", "esc")],
                 )
             }
-            ActiveOverlay::FormatSettings { .. } => {
-                let w: u16 = area.0.saturating_sub(4).min(50);
-                let field_count: u16 = 3; // compression, verify, md5
+            ActiveOverlay::FormatSettings { ref kind, .. } => {
+                let min_w = super::draw_overlays::format_settings_min_width(kind);
+                let w: u16 = area.0.saturating_sub(4).min(min_w);
+                let field_count: u16 = 3;
                 let h: u16 = field_count + 6;
                 let x = (area.0.saturating_sub(w)) / 2;
                 let y = (area.1.saturating_sub(h)) / 2;
@@ -6337,6 +6274,150 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
     }
 }
 
+/// Commit format settings overlay values to FormatState.
+fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
+    match kind {
+        FormatSettingsKind::Flac {
+            compression_input,
+            verify,
+            md5,
+        } => {
+            let level: u8 = compression_input.text.trim().parse().unwrap_or(8).min(8);
+            app.convert.format.flac_compression_level = level;
+            app.convert.format.flac_verify.selected = if *verify { 1 } else { 0 };
+            app.convert.format.flac_md5.selected = if *md5 { 0 } else { 1 };
+        }
+        FormatSettingsKind::Aac {
+            profile,
+            bitrate_input,
+            ..
+        } => {
+            let bitrate: u32 = bitrate_input
+                .text
+                .trim()
+                .parse()
+                .unwrap_or(256)
+                .clamp(8, 1024);
+            app.convert.format.aac_profile = *profile;
+            app.convert.format.aac_bitrate_kbps = bitrate;
+            // Recompute quality_preset from the committed bitrate.
+            let presets = aac_presets_for_profile(*profile);
+            app.convert.format.aac_quality_preset = presets
+                .iter()
+                .position(|(br, _)| *br == bitrate);
+        }
+    }
+    app.preset.mark_modified();
+}
+
+/// Focus cycle helpers for FormatSettings overlay.
+fn format_settings_focus_next(kind: &FormatSettingsKind, focus: FormatSettingsFocus) -> FormatSettingsFocus {
+    match kind {
+        FormatSettingsKind::Flac { .. } => match focus {
+            FormatSettingsFocus::Compression => FormatSettingsFocus::Verify,
+            FormatSettingsFocus::Verify => FormatSettingsFocus::Md5,
+            _ => FormatSettingsFocus::Compression,
+        },
+        FormatSettingsKind::Aac { .. } => match focus {
+            FormatSettingsFocus::AacProfile => FormatSettingsFocus::AacQuality,
+            FormatSettingsFocus::AacQuality => FormatSettingsFocus::AacBitrate,
+            _ => FormatSettingsFocus::AacProfile,
+        },
+    }
+}
+
+fn format_settings_focus_prev(kind: &FormatSettingsKind, focus: FormatSettingsFocus) -> FormatSettingsFocus {
+    match kind {
+        FormatSettingsKind::Flac { .. } => match focus {
+            FormatSettingsFocus::Compression => FormatSettingsFocus::Md5,
+            FormatSettingsFocus::Verify => FormatSettingsFocus::Compression,
+            _ => FormatSettingsFocus::Verify,
+        },
+        FormatSettingsKind::Aac { .. } => match focus {
+            FormatSettingsFocus::AacProfile => FormatSettingsFocus::AacBitrate,
+            FormatSettingsFocus::AacQuality => FormatSettingsFocus::AacProfile,
+            _ => FormatSettingsFocus::AacQuality,
+        },
+    }
+}
+
+/// Handle field-specific keypresses within the FormatSettings overlay.
+fn handle_format_settings_field_key(
+    kind: &mut FormatSettingsKind,
+    focus: FormatSettingsFocus,
+    key: &KeyEvent,
+) {
+    match kind {
+        FormatSettingsKind::Flac {
+            compression_input,
+            verify,
+            md5,
+        } => match focus {
+            FormatSettingsFocus::Compression => {
+                super::text_input::handle_text_input_key(compression_input, key);
+            }
+            FormatSettingsFocus::Verify => {
+                if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                    *verify = !*verify;
+                }
+            }
+            FormatSettingsFocus::Md5 => {
+                if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                    *md5 = !*md5;
+                }
+            }
+            _ => {}
+        },
+        FormatSettingsKind::Aac {
+            profile,
+            quality_preset,
+            bitrate_input,
+        } => {
+            use tonepoet_pipeline::enums::AacProfile;
+            match focus {
+                FormatSettingsFocus::AacProfile => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let profiles = [AacProfile::LcAac, AacProfile::HeAac, AacProfile::HeAacV2];
+                        let cur = profiles.iter().position(|p| p == profile).unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { profiles.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % profiles.len()
+                        };
+                        *profile = profiles[next];
+                        // Reset to "high" preset for the new profile (index 1, or 0 if only 3 presets).
+                        let presets = aac_presets_for_profile(*profile);
+                        let high_idx = presets.iter().position(|(_, l)| *l == "high").unwrap_or(0);
+                        *quality_preset = Some(high_idx);
+                        bitrate_input.text = presets[high_idx].0.to_string();
+                        bitrate_input.cursor = bitrate_input.text.len();
+                    }
+                }
+                FormatSettingsFocus::AacQuality => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let presets = aac_presets_for_profile(*profile);
+                        let cur = quality_preset.unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { presets.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % presets.len()
+                        };
+                        *quality_preset = Some(next);
+                        bitrate_input.text = presets[next].0.to_string();
+                        bitrate_input.cursor = bitrate_input.text.len();
+                    }
+                }
+                FormatSettingsFocus::AacBitrate => {
+                    super::text_input::handle_text_input_key(bitrate_input, key);
+                    // Any edit deselects quality preset.
+                    *quality_preset = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Fully self-contained mouse handler for the FormatSettings overlay.
 /// Handles outside-click-close, content pill clicks, and footer pills
 /// without delegating to handle_generic_overlay_mouse.
@@ -6354,7 +6435,12 @@ fn handle_format_settings_mouse(
 
     // Compute popup geometry (must match draw_format_settings + hint/rect).
     let term = crossterm::terminal::size().unwrap_or((80, 24));
-    let popup_w = term.0.saturating_sub(4).min(50);
+    let min_w = if let ActiveOverlay::FormatSettings { ref kind, .. } = app.active_overlay {
+        super::draw_overlays::format_settings_min_width(kind)
+    } else {
+        50
+    };
+    let popup_w = term.0.saturating_sub(4).min(min_w);
     let field_count: u16 = 3;
     let popup_h = field_count + 6;
     let popup_x = (term.0.saturating_sub(popup_w)) / 2;
@@ -6370,30 +6456,72 @@ fn handle_format_settings_mouse(
         return;
     }
 
-    // Check button_map for overlay pills (verify/md5 toggles).
-    match app.button_map.find_button_at(mx, my) {
-        Some(TuiButton::FormatSettingsVerify(i)) => {
-            if let ActiveOverlay::FormatSettings {
-                ref mut verify, ..
-            } = app.active_overlay
-            {
-                *verify = i == 1; // 0 = off, 1 = on
+    // Check button_map for overlay pills.
+    if let Some(button) = app.button_map.find_button_at(mx, my) {
+        if let ActiveOverlay::FormatSettings { ref mut kind, .. } = app.active_overlay {
+            match (&mut *kind, button) {
+                (FormatSettingsKind::Flac { ref mut verify, .. }, TuiButton::FormatSettingsVerify(i)) => {
+                    *verify = i == 1;
+                    return;
+                }
+                (FormatSettingsKind::Flac { ref mut md5, .. }, TuiButton::FormatSettingsMd5(i)) => {
+                    *md5 = i == 0;
+                    return;
+                }
+                (FormatSettingsKind::Aac { ref mut profile, ref mut quality_preset, ref mut bitrate_input }, TuiButton::FormatSettingsAacProfile(i)) => {
+                    use tonepoet_pipeline::enums::AacProfile;
+                    let profiles = [AacProfile::LcAac, AacProfile::HeAac, AacProfile::HeAacV2];
+                    if let Some(&p) = profiles.get(i) {
+                        *profile = p;
+                        let presets = aac_presets_for_profile(p);
+                        let high_idx = presets.iter().position(|(_, l)| *l == "high").unwrap_or(0);
+                        *quality_preset = Some(high_idx);
+                        bitrate_input.text = presets[high_idx].0.to_string();
+                        bitrate_input.cursor = bitrate_input.text.len();
+                    }
+                    return;
+                }
+                (FormatSettingsKind::Aac { ref mut quality_preset, ref mut bitrate_input, profile, .. }, TuiButton::FormatSettingsAacQuality(i)) => {
+                    let presets = aac_presets_for_profile(*profile);
+                    if i < presets.len() {
+                        *quality_preset = Some(i);
+                        bitrate_input.text = presets[i].0.to_string();
+                        bitrate_input.cursor = bitrate_input.text.len();
+                    }
+                    return;
+                }
+                _ => {}
             }
-            return;
         }
-        Some(TuiButton::FormatSettingsMd5(i)) => {
-            if let ActiveOverlay::FormatSettings { ref mut md5, .. } = app.active_overlay
-            {
-                *md5 = i == 0; // 0 = on, 1 = off
-            }
-            return;
-        }
-        _ => {}
     }
 
-    // Footer row: last row inside the border = popup_y + popup_h - 2.
-    // Layout: border, blank, fields(3), blank, footer, border.
-    // Footer = popup_y + 1 (border) + field_count + 2 (blank + fields-end blank)
+    // Click-to-focus: clicking on a field row sets focus to that field.
+    // Layout: border(+0), blank(+1), field1(+2), field2(+3), field3(+4), blank(+5), footer(+6).
+    let field1_y = popup_y + 2;
+    let field2_y = popup_y + 3;
+    let field3_y = popup_y + 4;
+    if let ActiveOverlay::FormatSettings { ref kind, ref mut focus, .. } = app.active_overlay {
+        let new_focus = match kind {
+            FormatSettingsKind::Flac { .. } => match my {
+                y if y == field1_y => Some(FormatSettingsFocus::Compression),
+                y if y == field2_y => Some(FormatSettingsFocus::Verify),
+                y if y == field3_y => Some(FormatSettingsFocus::Md5),
+                _ => None,
+            },
+            FormatSettingsKind::Aac { .. } => match my {
+                y if y == field1_y => Some(FormatSettingsFocus::AacProfile),
+                y if y == field2_y => Some(FormatSettingsFocus::AacQuality),
+                y if y == field3_y => Some(FormatSettingsFocus::AacBitrate),
+                _ => None,
+            },
+        };
+        if let Some(f) = new_focus {
+            *focus = f;
+            return;
+        }
+    }
+
+    // Footer row.
     let footer_y = popup_y + 1 + field_count + 2;
     if my == footer_y {
         // Hit-test the two footer pills: "Enter save" and "Esc cancel".
@@ -10289,14 +10417,31 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::FormatSettingsButton => {
                 app.convert.focus = ConvertFocus::Format;
                 let fmt = &app.convert.format;
-                app.active_overlay = ActiveOverlay::FormatSettings {
-                    compression_input: super::text_input::TextInputState::new(
-                        fmt.flac_compression_level.to_string(),
+                let selected = *fmt.format.selected_value();
+                let (kind, focus) = match selected {
+                    crate::convert::formats::AudioFormat::Flac => (
+                        FormatSettingsKind::Flac {
+                            compression_input: super::text_input::TextInputState::new(
+                                fmt.flac_compression_level.to_string(),
+                            ),
+                            verify: *fmt.flac_verify.selected_value(),
+                            md5: *fmt.flac_md5.selected_value(),
+                        },
+                        FormatSettingsFocus::Compression,
                     ),
-                    verify: *fmt.flac_verify.selected_value(),
-                    md5: *fmt.flac_md5.selected_value(),
-                    focus: FormatSettingsFocus::Compression,
+                    crate::convert::formats::AudioFormat::Aac => (
+                        FormatSettingsKind::Aac {
+                            profile: fmt.aac_profile,
+                            quality_preset: fmt.aac_quality_preset,
+                            bitrate_input: super::text_input::TextInputState::new(
+                                fmt.aac_bitrate_kbps.to_string(),
+                            ),
+                        },
+                        FormatSettingsFocus::AacProfile,
+                    ),
+                    _ => return,
                 };
+                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
             }
             TuiButton::MergePill(i) => {
                 app.convert.focus = ConvertFocus::OutputOptions;
@@ -10647,7 +10792,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::TemplatePickerDelete
             | TuiButton::TemplatePickerClose
             | TuiButton::FormatSettingsVerify(_)
-            | TuiButton::FormatSettingsMd5(_) => {
+            | TuiButton::FormatSettingsMd5(_)
+            | TuiButton::FormatSettingsAacProfile(_)
+            | TuiButton::FormatSettingsAacQuality(_) => {
                 // Handled in dedicated mouse handlers; no-op here.
             }
         }

@@ -491,7 +491,6 @@ pub fn preset_to_conversion_options(
                     tonepoet_backend::types::AacProfile::LcAac => AacProfile::Lc,
                     tonepoet_backend::types::AacProfile::HeAac => AacProfile::He,
                     tonepoet_backend::types::AacProfile::HeAacV2 => AacProfile::HeV2,
-                    tonepoet_backend::types::AacProfile::LdAac => AacProfile::Lc, // Map LD to LC
                 })
                 .unwrap_or(AacProfile::Lc);
             let bitrate = 256; // Default AAC bitrate

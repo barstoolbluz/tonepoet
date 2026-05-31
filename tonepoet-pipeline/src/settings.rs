@@ -356,13 +356,19 @@ pub struct FlacSettings {
     pub compression_level: u8,
     /// Verify while encoding where the encoder supports it.
     pub verify: bool,
+    /// Write MD5 checksum of raw audio to STREAMINFO. Default: true.
+    #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+    pub write_md5: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for FlacSettings {
     fn default() -> Self {
         Self {
-            compression_level: 5,
+            compression_level: 8,
             verify: false,
+            write_md5: true,
         }
     }
 }
@@ -397,8 +403,6 @@ pub struct AacSettings {
     pub profile: AacProfile,
     /// Target bitrate in kbps.
     pub bitrate_kbps: u32,
-    /// Prefer libfdk_aac for HE profiles. The command remains deterministic.
-    pub prefer_fdk_for_he: bool,
 }
 
 impl Default for AacSettings {
@@ -406,7 +410,6 @@ impl Default for AacSettings {
         Self {
             profile: AacProfile::LcAac,
             bitrate_kbps: 256,
-            prefer_fdk_for_he: true,
         }
     }
 }

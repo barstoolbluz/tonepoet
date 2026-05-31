@@ -232,7 +232,6 @@ pub const fn ffmpeg_aac_profile(profile: AacProfile) -> &'static str {
         AacProfile::LcAac => "aac_low",
         AacProfile::HeAac => "aac_he",
         AacProfile::HeAacV2 => "aac_he_v2",
-        AacProfile::LdAac => "aac_ld",
     }
 }
 

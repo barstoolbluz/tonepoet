@@ -28,7 +28,7 @@ The crate root re-exports the public items from these modules.
 - `NyquistTransition`: `Gentle`, `Medium`, `Steep`, `Sharp`, `BrickWall`
 - `PreferredTool`: `Auto`, `Ffmpeg`, `Sox`, `Ssrc`, `Custom(String)`
 - `Mp3Mode`: `Cbr`, `Vbr`, `Abr`
-- `AacProfile`: `LcAac`, `HeAac`, `HeAacV2`, `LdAac`
+- `AacProfile`: `LcAac`, `HeAac`, `HeAacV2`
 - `ReplayGainMode`: `Track`, `Album`, `Both`
 - `OpusContentType`: `Auto`, `Music`, `Speech`
 - `WavPackMode`: `Normal`, `Fast`, `High`, `VeryHigh`
@@ -63,7 +63,7 @@ The crate root re-exports the public items from these modules.
   - Methods: `validate`, `explicit_dsd_rate`
 - `FlacSettings`: `compression_level`, `verify`
 - `Mp3Settings`: `mode`, `bitrate_kbps`, `vbr_quality`
-- `AacSettings`: `profile`, `bitrate_kbps`, `prefer_fdk_for_he`
+- `AacSettings`: `profile`, `bitrate_kbps`
 - `OpusSettings`: `content_type`, `bitrate_kbps`, `complexity`
 - `WavPackSettings`: `mode`
 - `SsrcSettings`: `force`, `two_pass`, `insane_mode`, `profile`

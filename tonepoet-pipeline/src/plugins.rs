@@ -625,12 +625,7 @@ fn build_ffmpeg_encode_lossy(
         }
         AudioFormat::Aac => {
             args.push("-c:a".into());
-            let use_fdk = context.request.settings.aac.prefer_fdk_for_he
-                && matches!(
-                    context.request.settings.aac.profile,
-                    AacProfile::HeAac | AacProfile::HeAacV2
-                );
-            args.push(if use_fdk { "libfdk_aac" } else { "aac" }.into());
+            args.push("libfdk_aac".into());
             args.push("-profile:a".into());
             args.push(mapping::ffmpeg_aac_profile(context.request.settings.aac.profile).into());
             args.push("-b:a".into());
@@ -1107,6 +1102,10 @@ fn add_ffmpeg_pcm_encoder_args(
             args.push("flac".into());
             args.push("-compression_level".into());
             args.push(context.request.settings.flac.compression_level.to_string());
+            if !context.request.settings.flac.write_md5 {
+                args.push("-flags".into());
+                args.push("-md5".into());
+            }
         }
         AudioFormat::Wav | AudioFormat::Aiff => {
             args.push("-c:a".into());

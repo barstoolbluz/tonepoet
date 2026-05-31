@@ -126,7 +126,6 @@ fn legacy_compat_pipeline_settings_cover_the_legacy_option_surface_explicitly() 
         "mp3.vbr_quality",
         "aac.profile",
         "aac.bitrate_kbps",
-        "aac.prefer_fdk_for_he",
         "opus.content_type",
         "opus.bitrate_kbps",
         "opus.complexity",

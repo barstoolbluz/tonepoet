@@ -340,7 +340,10 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             write_md5: *format.flac_md5.selected_value(),
         },
         mp3: Default::default(),
-        aac: Default::default(),
+        aac: tonepoet_pipeline::AacSettings {
+            profile: format.aac_profile,
+            bitrate_kbps: format.aac_bitrate_kbps,
+        },
         opus: Default::default(),
         // settings-sentinel-allow: remaining sub-struct defaults
         wavpack: Default::default(),

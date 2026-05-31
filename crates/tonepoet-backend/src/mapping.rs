@@ -178,7 +178,6 @@ pub fn get_aac_profile_string(profile: AacProfile) -> String {
         AacProfile::LcAac => "aac_low".to_string(),
         AacProfile::HeAac => "aac_he".to_string(),
         AacProfile::HeAacV2 => "aac_he_v2".to_string(),
-        AacProfile::LdAac => "aac_ld".to_string(),
     }
 }
 

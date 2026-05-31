@@ -27,7 +27,6 @@ use tonepoet_pipeline::{
 /// - mp3.vbr_quality: 7
 /// - aac.profile: HeAacV2
 /// - aac.bitrate_kbps: 384
-/// - aac.prefer_fdk_for_he: false
 /// - opus.content_type: Speech
 /// - opus.bitrate_kbps: 111
 /// - opus.complexity: 7
@@ -72,6 +71,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
         flac: FlacSettings {
             compression_level: 8,
             verify: true,
+            write_md5: false,
         },
         mp3: Mp3Settings {
             mode: Mp3Mode::Abr,
@@ -81,7 +81,6 @@ fn flac_md5_sentinel() -> PipelineSettings {
         aac: AacSettings {
             profile: AacProfile::HeAacV2,
             bitrate_kbps: 384,
-            prefer_fdk_for_he: false,
         },
         opus: OpusSettings {
             content_type: OpusContentType::Speech,
@@ -219,6 +218,9 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     assert_mutation_changes_fingerprint!(covered, base, "flac.verify", |settings| {
         settings.flac.verify = false;
     });
+    assert_mutation_changes_fingerprint!(covered, base, "flac.write_md5", |settings| {
+        settings.flac.write_md5 = true;
+    });
     assert_mutation_changes_fingerprint!(covered, base, "mp3.mode", |settings| {
         settings.mp3.mode = Mp3Mode::Cbr;
     });
@@ -233,9 +235,6 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     });
     assert_mutation_changes_fingerprint!(covered, base, "aac.bitrate_kbps", |settings| {
         settings.aac.bitrate_kbps = 383;
-    });
-    assert_mutation_changes_fingerprint!(covered, base, "aac.prefer_fdk_for_he", |settings| {
-        settings.aac.prefer_fdk_for_he = true;
     });
     assert_mutation_changes_fingerprint!(covered, base, "opus.content_type", |settings| {
         settings.opus.content_type = OpusContentType::Music;

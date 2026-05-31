@@ -48,7 +48,7 @@ use tonepoet_pipeline::{
 /// - mp3.vbr_quality: 7
 /// - aac.profile: HeAacV2
 /// - aac.bitrate_kbps: 384
-/// - aac.prefer_fdk_for_he: false
+
 /// - opus.content_type: Speech
 /// - opus.bitrate_kbps: 111
 /// - opus.complexity: 7
@@ -105,7 +105,6 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
         aac: AacSettings {
             profile: AacProfile::HeAacV2,
             bitrate_kbps: 384,
-            prefer_fdk_for_he: false,
         },
         opus: OpusSettings {
             content_type: OpusContentType::Speech,
@@ -223,7 +222,6 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.mp3.vbr_quality, &expected.mp3.vbr_quality, "mp3.vbr_quality");
     assert_eq!(&actual.aac.profile, &expected.aac.profile, "aac.profile");
     assert_eq!(&actual.aac.bitrate_kbps, &expected.aac.bitrate_kbps, "aac.bitrate_kbps");
-    assert_eq!(&actual.aac.prefer_fdk_for_he, &expected.aac.prefer_fdk_for_he, "aac.prefer_fdk_for_he");
     assert_eq!(&actual.opus.content_type, &expected.opus.content_type, "opus.content_type");
     assert_eq!(&actual.opus.bitrate_kbps, &expected.opus.bitrate_kbps, "opus.bitrate_kbps");
     assert_eq!(&actual.opus.complexity, &expected.opus.complexity, "opus.complexity");
@@ -298,7 +296,6 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "mp3.vbr_quality", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "aac.profile", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "aac.bitrate_kbps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "aac.prefer_fdk_for_he", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "opus.content_type", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "opus.bitrate_kbps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "opus.complexity", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
@@ -354,7 +351,6 @@ fn field_differs_from_default(
         "mp3.vbr_quality" => settings.mp3.vbr_quality != default.mp3.vbr_quality,
         "aac.profile" => settings.aac.profile != default.aac.profile,
         "aac.bitrate_kbps" => settings.aac.bitrate_kbps != default.aac.bitrate_kbps,
-        "aac.prefer_fdk_for_he" => settings.aac.prefer_fdk_for_he != default.aac.prefer_fdk_for_he,
         "opus.content_type" => settings.opus.content_type != default.opus.content_type,
         "opus.bitrate_kbps" => settings.opus.bitrate_kbps != default.opus.bitrate_kbps,
         "opus.complexity" => settings.opus.complexity != default.opus.complexity,
@@ -472,7 +468,6 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, mp3.vbr_quality, "mp3.vbr_quality");
     assert_covered_by_non_default!(default, raw, raw, aac.profile, "aac.profile");
     assert_covered_by_non_default!(default, raw, raw, aac.bitrate_kbps, "aac.bitrate_kbps");
-    assert_covered_by_non_default!(default, raw, raw, aac.prefer_fdk_for_he, "aac.prefer_fdk_for_he");
     assert_covered_by_non_default!(default, raw, raw, opus.content_type, "opus.content_type");
     assert_covered_by_non_default!(default, raw, raw, opus.bitrate_kbps, "opus.bitrate_kbps");
     assert_covered_by_non_default!(default, raw, raw, opus.complexity, "opus.complexity");
@@ -530,7 +525,6 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, mp3.vbr_quality, "mp3.vbr_quality");
     assert_covered_by_non_default!(default, flac, custom, aac.profile, "aac.profile");
     assert_covered_by_non_default!(default, flac, custom, aac.bitrate_kbps, "aac.bitrate_kbps");
-    assert_covered_by_non_default!(default, flac, custom, aac.prefer_fdk_for_he, "aac.prefer_fdk_for_he");
     assert_covered_by_non_default!(default, flac, custom, opus.content_type, "opus.content_type");
     assert_covered_by_non_default!(default, flac, custom, opus.bitrate_kbps, "opus.bitrate_kbps");
     assert_covered_by_non_default!(default, flac, custom, opus.complexity, "opus.complexity");
@@ -661,7 +655,6 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("mp3.vbr_quality", LegacyProjectionStatus::Translated),
     ("aac.profile", LegacyProjectionStatus::Translated),
     ("aac.bitrate_kbps", LegacyProjectionStatus::Translated),
-    ("aac.prefer_fdk_for_he", LegacyProjectionStatus::Derived),
     ("opus.content_type", LegacyProjectionStatus::Defaulted),
     ("opus.bitrate_kbps", LegacyProjectionStatus::Translated),
     ("opus.complexity", LegacyProjectionStatus::Translated),
@@ -827,7 +820,6 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "mp3.vbr_quality", mp3.mp3.vbr_quality, Mp3Settings::default().vbr_quality);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "aac.profile", aac.aac.profile, AacProfile::HeAacV2);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "aac.bitrate_kbps", aac.aac.bitrate_kbps, 96);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "aac.prefer_fdk_for_he", flac.aac.prefer_fdk_for_he, false);
     assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "opus.content_type", opus.opus.content_type, OpusContentType::Auto);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "opus.bitrate_kbps", opus.opus.bitrate_kbps, 160);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "opus.complexity", opus.opus.complexity, 5);

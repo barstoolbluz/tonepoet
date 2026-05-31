@@ -111,9 +111,29 @@ impl ConvertFocus {
 /// Which field is focused in the format-specific settings overlay.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FormatSettingsFocus {
+    // FLAC
     Compression,
     Verify,
     Md5,
+    // AAC
+    AacProfile,
+    AacQuality,
+    AacBitrate,
+}
+
+/// Format-specific overlay state, keyed by codec.
+#[derive(Debug, Clone)]
+pub enum FormatSettingsKind {
+    Flac {
+        compression_input: crate::tui::text_input::TextInputState,
+        verify: bool,
+        md5: bool,
+    },
+    Aac {
+        profile: tonepoet_pipeline::enums::AacProfile,
+        quality_preset: Option<usize>,
+        bitrate_input: crate::tui::text_input::TextInputState,
+    },
 }
 
 /// Convert screen layout mode.
@@ -714,8 +734,45 @@ pub struct FormatState {
     pub flac_compression_level: u8,
     /// FLAC verify-during-encode toggle.
     pub flac_verify: PillState<bool>,
-    /// FLAC MD5 checksum toggle.
+    /// FLAC MD5 checksum toggle (default: on).
     pub flac_md5: PillState<bool>,
+    /// AAC profile (LC, HE, HEv2). Default: LC.
+    pub aac_profile: tonepoet_pipeline::enums::AacProfile,
+    /// AAC quality preset index into the profile-specific preset table.
+    /// None = custom (user manually entered a bitrate).
+    pub aac_quality_preset: Option<usize>,
+    /// AAC bitrate in kbps (8-1024). Default: 256.
+    pub aac_bitrate_kbps: u32,
+}
+
+// AAC quality preset tables keyed by profile.
+pub const AAC_LC_PRESETS: &[(u32, &str)] = &[
+    (320, "insane"),
+    (256, "high"),
+    (192, "standard"),
+    (128, "portable"),
+];
+pub const AAC_HE_PRESETS: &[(u32, &str)] = &[
+    (128, "high"),
+    (80, "standard"),
+    (64, "portable"),
+];
+pub const AAC_HEV2_PRESETS: &[(u32, &str)] = &[
+    (64, "high"),
+    (48, "standard"),
+    (32, "portable"),
+];
+
+/// Get the quality preset table for the given AAC profile.
+pub fn aac_presets_for_profile(
+    profile: tonepoet_pipeline::enums::AacProfile,
+) -> &'static [(u32, &'static str)] {
+    use tonepoet_pipeline::enums::AacProfile;
+    match profile {
+        AacProfile::LcAac => AAC_LC_PRESETS,
+        AacProfile::HeAac => AAC_HE_PRESETS,
+        AacProfile::HeAacV2 => AAC_HEV2_PRESETS,
+    }
 }
 
 impl FormatState {
@@ -817,6 +874,9 @@ impl FormatState {
             flac_md5: PillState::new(vec![
                 (true, "on"), (false, "off"),
             ]),
+            aac_profile: tonepoet_pipeline::enums::AacProfile::LcAac,
+            aac_quality_preset: Some(1), // "high" = index 1 in LC presets
+            aac_bitrate_kbps: 256,
         };
         state.apply_format_constraints();
         state
@@ -1553,12 +1613,11 @@ pub enum ActiveOverlay {
         /// Current field value (for "active" badge).
         active_template: Option<String>,
     },
-    /// Format-specific settings overlay (e.g. FLAC compression/verify/md5).
-    /// Owns temporary copies; committed on Enter, discarded on Esc.
+    /// Format-specific settings overlay (e.g. FLAC compression/verify/md5,
+    /// AAC profile/quality/bitrate). Owns temporary copies; committed on
+    /// Enter, discarded on Esc.
     FormatSettings {
-        compression_input: crate::tui::text_input::TextInputState,
-        verify: bool,
-        md5: bool,
+        kind: FormatSettingsKind,
         focus: FormatSettingsFocus,
     },
 }

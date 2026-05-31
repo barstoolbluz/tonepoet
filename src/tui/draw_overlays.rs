@@ -10,7 +10,7 @@ use ratatui::{
 
 use super::app::{
     ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState,
-    FormatSettingsFocus, MbSelectState, SourceMode,
+    FormatSettingsFocus, FormatSettingsKind, MbSelectState, SourceMode,
 };
 use super::button_map::TuiButton;
 use super::theme;
@@ -177,13 +177,11 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             );
         }
         ActiveOverlay::FormatSettings {
-            ref compression_input,
-            verify,
-            md5,
+            ref kind,
             focus,
         } => {
-            let compression_input = compression_input.clone();
-            draw_format_settings(f, &compression_input, verify, md5, focus, &mut app.button_map);
+            let kind = kind.clone();
+            draw_format_settings(f, &kind, focus, &mut app.button_map);
         }
     }
 
@@ -836,27 +834,31 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
     f.render_widget(help, chunks[2]);
 }
 
-/// Draw the format-specific settings overlay (FLAC compression/verify/MD5).
+/// Draw the format-specific settings overlay, dispatching on codec kind.
 fn draw_format_settings(
     f: &mut Frame,
-    compression_input: &super::text_input::TextInputState,
-    verify: bool,
-    md5: bool,
+    kind: &FormatSettingsKind,
     focus: FormatSettingsFocus,
     buttons: &mut super::button_map::ButtonRenderMap,
 ) {
     let area = f.size();
-    let popup_width = area.width.saturating_sub(4).min(50);
-    let field_count: u16 = 3; // compression, verify, md5 — grows for other formats
-    let popup_height = field_count + 6; // borders(2) + blank(1) + fields + blank(1) + footer(1) + absorb(1)
+    let min_width = format_settings_min_width(kind);
+    let popup_width = area.width.saturating_sub(4).min(min_width);
+    let field_count: u16 = 3; // all current formats have 3 fields
+    let popup_height = field_count + 6;
     let popup = centered_rect(popup_width, popup_height, area);
+
+    let title = match kind {
+        FormatSettingsKind::Flac { .. } => " FLAC Settings ",
+        FormatSettingsKind::Aac { .. } => " AAC Settings ",
+    };
 
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::GREEN))
         .title(Span::styled(
-            " FLAC Settings ",
+            title,
             Style::default()
                 .fg(theme::GREEN)
                 .add_modifier(Modifier::BOLD),
@@ -868,19 +870,51 @@ fn draw_format_settings(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // blank
-            Constraint::Length(1), // compression
-            Constraint::Length(1), // verify
-            Constraint::Length(1), // md5
+            Constraint::Length(1), // field 1
+            Constraint::Length(1), // field 2
+            Constraint::Length(1), // field 3
             Constraint::Length(1), // blank
             Constraint::Length(1), // footer
-            Constraint::Min(0),   // absorb remainder
+            Constraint::Min(0),   // absorb
         ])
         .split(inner);
 
+    match kind {
+        FormatSettingsKind::Flac {
+            compression_input,
+            verify,
+            md5,
+        } => draw_flac_fields(f, compression_input, *verify, *md5, focus, &chunks, buttons),
+        FormatSettingsKind::Aac {
+            profile,
+            quality_preset,
+            bitrate_input,
+        } => draw_aac_fields(f, *profile, *quality_preset, bitrate_input, focus, &chunks, buttons),
+    }
+
+    // Footer (shared)
+    let footer = Paragraph::new(Line::from(vec![
+        footer_pill("Enter save", theme::GREEN),
+        pill_gap(),
+        footer_pill("Esc cancel", theme::PURPLE),
+    ]))
+    .alignment(Alignment::Center);
+    f.render_widget(footer, chunks[5]);
+}
+
+fn draw_flac_fields(
+    f: &mut Frame,
+    compression_input: &super::text_input::TextInputState,
+    verify: bool,
+    md5: bool,
+    focus: FormatSettingsFocus,
+    chunks: &[Rect],
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
     // Compression level (text input field)
     let comp_focused = focus == FormatSettingsFocus::Compression;
     let comp_label_style = if comp_focused { theme::bright() } else { theme::muted() };
-    let visible_width = chunks[1].width.saturating_sub(16) as usize; // label takes ~15 chars
+    let visible_width = chunks[1].width.saturating_sub(16) as usize;
     let (view, cursor_col) = compression_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
     let input_bg = if comp_focused {
@@ -890,7 +924,10 @@ fn draw_format_settings(
     };
     let comp_line = Line::from(vec![
         Span::styled("  compression  ", comp_label_style),
-        Span::styled(format!(" {} ", display_val), Style::default().fg(Color::White).bg(input_bg)),
+        Span::styled(
+            format!(" {} ", display_val),
+            Style::default().fg(Color::White).bg(input_bg),
+        ),
     ]);
     f.render_widget(Paragraph::new(comp_line), chunks[1]);
     if comp_focused {
@@ -908,10 +945,12 @@ fn draw_format_settings(
         Span::styled(" on ", on_style),
     ]);
     f.render_widget(Paragraph::new(verify_line), chunks[2]);
-    // Register click targets for verify pills
     let vx = chunks[2].x + 15;
     buttons.record_button(TuiButton::FormatSettingsVerify(0), Rect::new(vx, chunks[2].y, 5, 1));
-    buttons.record_button(TuiButton::FormatSettingsVerify(1), Rect::new(vx + 6, chunks[2].y, 4, 1));
+    buttons.record_button(
+        TuiButton::FormatSettingsVerify(1),
+        Rect::new(vx + 6, chunks[2].y, 4, 1),
+    );
 
     // MD5 checksum toggle pills
     let md5_focused = focus == FormatSettingsFocus::Md5;
@@ -924,19 +963,118 @@ fn draw_format_settings(
         Span::styled(" off ", off_style_md5),
     ]);
     f.render_widget(Paragraph::new(md5_line), chunks[3]);
-    // Register click targets for md5 pills
     let mx = chunks[3].x + 15;
     buttons.record_button(TuiButton::FormatSettingsMd5(0), Rect::new(mx, chunks[3].y, 4, 1));
-    buttons.record_button(TuiButton::FormatSettingsMd5(1), Rect::new(mx + 5, chunks[3].y, 5, 1));
+    buttons.record_button(
+        TuiButton::FormatSettingsMd5(1),
+        Rect::new(mx + 5, chunks[3].y, 5, 1),
+    );
+}
 
-    // Footer
-    let footer = Paragraph::new(Line::from(vec![
-        footer_pill("Enter save", theme::GREEN),
-        pill_gap(),
-        footer_pill("Esc cancel", theme::PURPLE),
-    ]))
-    .alignment(Alignment::Center);
-    f.render_widget(footer, chunks[5]);
+fn draw_aac_fields(
+    f: &mut Frame,
+    profile: tonepoet_pipeline::enums::AacProfile,
+    quality_preset: Option<usize>,
+    bitrate_input: &super::text_input::TextInputState,
+    focus: FormatSettingsFocus,
+    chunks: &[Rect],
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
+    use tonepoet_pipeline::enums::AacProfile;
+
+    // Profile pills: LC / HE / HEv2
+    let prof_focused = focus == FormatSettingsFocus::AacProfile;
+    let prof_label_style = if prof_focused { theme::bright() } else { theme::muted() };
+    let profiles = [
+        (AacProfile::LcAac, "LC"),
+        (AacProfile::HeAac, "HE"),
+        (AacProfile::HeAacV2, "HEv2"),
+    ];
+    let mut prof_spans = vec![Span::styled("  profile      ", prof_label_style)];
+    let mut px = chunks[1].x + 15;
+    for (i, (p, label)) in profiles.iter().enumerate() {
+        let selected = *p == profile;
+        let style = if selected {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if prof_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        prof_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(
+            TuiButton::FormatSettingsAacProfile(i),
+            Rect::new(px, chunks[1].y, pill_w, 1),
+        );
+        px += pill_w;
+        if i + 1 < profiles.len() {
+            prof_spans.push(Span::raw(" "));
+            px += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(prof_spans)), chunks[1]);
+
+    // Quality preset pills (profile-dependent)
+    let qual_focused = focus == FormatSettingsFocus::AacQuality;
+    let qual_label_style = if qual_focused { theme::bright() } else { theme::muted() };
+    let presets = super::app::aac_presets_for_profile(profile);
+    let mut qual_spans = vec![Span::styled("  quality      ", qual_label_style)];
+    let mut qx = chunks[2].x + 15;
+    for (i, (_bitrate, label)) in presets.iter().enumerate() {
+        let selected = quality_preset == Some(i);
+        let style = if selected {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if qual_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        qual_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(
+            TuiButton::FormatSettingsAacQuality(i),
+            Rect::new(qx, chunks[2].y, pill_w, 1),
+        );
+        qx += pill_w;
+        if i + 1 < presets.len() {
+            qual_spans.push(Span::raw(" "));
+            qx += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(qual_spans)), chunks[2]);
+
+    // Bitrate text entry field
+    let br_focused = focus == FormatSettingsFocus::AacBitrate;
+    let br_label_style = if br_focused { theme::bright() } else { theme::muted() };
+    let visible_width = chunks[3].width.saturating_sub(22) as usize; // label(15) + suffix(~7)
+    let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
+    let display_val = if view.is_empty() { " ".to_string() } else { view };
+    let input_bg = if br_focused {
+        Color::Rgb(40, 40, 40)
+    } else {
+        Color::Rgb(30, 30, 30)
+    };
+    let br_line = Line::from(vec![
+        Span::styled("  bitrate      ", br_label_style),
+        Span::styled(
+            format!(" {} ", display_val),
+            Style::default().fg(Color::White).bg(input_bg),
+        ),
+        Span::styled(" kbps", theme::muted()),
+    ]);
+    f.render_widget(Paragraph::new(br_line), chunks[3]);
+    if br_focused {
+        f.set_cursor(chunks[3].x + 16 + cursor_col, chunks[3].y);
+    }
 }
 
 /// Style pair for a boolean toggle rendered as two pills.
@@ -956,6 +1094,32 @@ fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
     } else {
         (active, inactive) // false=active, true=dim
     }
+}
+
+/// Compute the popup width for a format settings overlay.
+/// Uses the widest possible content across ALL states of this format
+/// (e.g. LC presets for AAC, which are the widest) so the box doesn't
+/// resize when the user changes settings inside the overlay.
+pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
+    let label_width: usize = 15; // all labels are 15 chars
+    let content_width = match kind {
+        FormatSettingsKind::Flac { .. } => {
+            // Widest: "  md5 checksum " + " on " + " " + " off " = 25
+            label_width + 4 + 1 + 5
+        }
+        FormatSettingsKind::Aac { .. } => {
+            // Always size for LC presets (the widest: insane/high/standard/portable).
+            let presets = super::app::AAC_LC_PRESETS;
+            let pills_width: usize = presets
+                .iter()
+                .map(|(_, label)| label.len() + 2) // " label "
+                .sum::<usize>()
+                + presets.len().saturating_sub(1); // gaps between pills
+            label_width + pills_width
+        }
+    };
+    // +2 for left/right borders, +4 for breathing room
+    (content_width + 6) as u16
 }
 
 /// Draw the vim-style command line at the bottom of the screen

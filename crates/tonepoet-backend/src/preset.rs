@@ -107,7 +107,6 @@ pub fn parse_preset_toml(content: &str) -> Result<ConversionSettings> {
             "lcaac" => Some(AacProfile::LcAac),
             "heaac" => Some(AacProfile::HeAac),
             "heaacv2" => Some(AacProfile::HeAacV2),
-            "ldaac" => Some(AacProfile::LdAac),
             _ => None,
         });
 

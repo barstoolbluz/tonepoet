@@ -173,8 +173,10 @@ pub fn draw_format_pane(
 
     // Below-the-fold: container selector when maximized and codec has alternatives.
     let containers = format_state.format.selected_value().available_containers();
-    let has_format_settings = *format_state.format.selected_value()
-        == crate::convert::formats::AudioFormat::Flac;
+    let has_format_settings = matches!(
+        *format_state.format.selected_value(),
+        crate::convert::formats::AudioFormat::Flac | crate::convert::formats::AudioFormat::Aac
+    );
     if maximized && containers.len() > 1 {
         lines.push(bordered_line(border_color, w, vec![]));
         let container_spans: Vec<Span> = containers

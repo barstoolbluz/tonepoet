@@ -444,11 +444,6 @@ fn apply_explicit_pipeline_defaults(settings: &mut PipelineSettings, item: &Conv
         && matches!(settings.target_format, PlannerAudioFormat::Flac)
         && settings.verification.prefer_native_flac_verify;
 
-    settings.aac.prefer_fdk_for_he = matches!(
-        settings.aac.profile,
-        PlannerAacProfile::HeAac | PlannerAacProfile::HeAacV2
-    );
-
     settings.ssrc.force = settings.ssrc.force
         || matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
     settings.ssrc.two_pass = true;
@@ -564,7 +559,6 @@ fn backend_aac_profile(value: tonepoet_backend::AacProfile) -> PlannerAacProfile
         tonepoet_backend::AacProfile::LcAac => PlannerAacProfile::LcAac,
         tonepoet_backend::AacProfile::HeAac => PlannerAacProfile::HeAac,
         tonepoet_backend::AacProfile::HeAacV2 => PlannerAacProfile::HeAacV2,
-        tonepoet_backend::AacProfile::LdAac => PlannerAacProfile::LdAac,
     }
 }
 

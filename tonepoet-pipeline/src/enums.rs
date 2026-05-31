@@ -500,8 +500,6 @@ pub enum AacProfile {
     HeAac,
     /// HE-AAC v2.
     HeAacV2,
-    /// Low-delay AAC.
-    LdAac,
 }
 
 /// ReplayGain scanning mode.

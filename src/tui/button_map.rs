@@ -49,6 +49,10 @@ pub enum TuiButton {
     FormatSettingsVerify(usize),
     /// MD5 toggle pills inside the FormatSettings overlay.
     FormatSettingsMd5(usize),
+    /// AAC profile pills inside the FormatSettings overlay.
+    FormatSettingsAacProfile(usize),
+    /// AAC quality preset pills inside the FormatSettings overlay.
+    FormatSettingsAacQuality(usize),
 
     // Convert screen controls
     PresetsButton,
@@ -204,7 +208,9 @@ impl TuiButton {
             | Self::TemplatePickerDelete
             | Self::TemplatePickerClose
             | Self::FormatSettingsVerify(_)
-            | Self::FormatSettingsMd5(_) => None,
+            | Self::FormatSettingsMd5(_)
+            | Self::FormatSettingsAacProfile(_)
+            | Self::FormatSettingsAacQuality(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)

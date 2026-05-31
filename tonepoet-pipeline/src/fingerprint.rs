@@ -66,12 +66,12 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "force_encode",
     "flac.compression_level",
     "flac.verify",
+    "flac.write_md5",
     "mp3.mode",
     "mp3.bitrate_kbps",
     "mp3.vbr_quality",
     "aac.profile",
     "aac.bitrate_kbps",
-    "aac.prefer_fdk_for_he",
     "opus.content_type",
     "opus.bitrate_kbps",
     "opus.complexity",
@@ -181,6 +181,7 @@ fn push_pipeline_settings(writer: &mut FingerprintWriter, settings: &PipelineSet
 fn push_flac(writer: &mut FingerprintWriter, settings: &FlacSettings) {
     writer.field_string("flac.compression_level", settings.compression_level.to_string());
     writer.field_static("flac.verify", bool_value(settings.verify));
+    writer.field_static("flac.write_md5", bool_value(settings.write_md5));
 }
 
 fn push_mp3(writer: &mut FingerprintWriter, settings: &Mp3Settings) {
@@ -192,7 +193,6 @@ fn push_mp3(writer: &mut FingerprintWriter, settings: &Mp3Settings) {
 fn push_aac(writer: &mut FingerprintWriter, settings: &AacSettings) {
     writer.field_static("aac.profile", aac_profile(settings.profile));
     writer.field_string("aac.bitrate_kbps", settings.bitrate_kbps.to_string());
-    writer.field_static("aac.prefer_fdk_for_he", bool_value(settings.prefer_fdk_for_he));
 }
 
 fn push_opus(writer: &mut FingerprintWriter, settings: &OpusSettings) {
@@ -429,7 +429,6 @@ fn aac_profile(value: AacProfile) -> &'static str {
         AacProfile::LcAac => "LcAac",
         AacProfile::HeAac => "HeAac",
         AacProfile::HeAacV2 => "HeAacV2",
-        AacProfile::LdAac => "LdAac",
     }
 }
 

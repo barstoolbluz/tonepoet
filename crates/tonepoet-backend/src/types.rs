@@ -86,7 +86,6 @@ pub enum AacProfile {
     LcAac,   // Low Complexity
     HeAac,   // High Efficiency (SBR)
     HeAacV2, // HE-AAC v2 (SBR + PS)
-    LdAac,   // Low Delay
 }
 
 /// ReplayGain modes
