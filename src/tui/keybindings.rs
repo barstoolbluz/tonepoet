@@ -10098,7 +10098,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::ContainerPill(i) => {
                 app.convert.focus = ConvertFocus::Format;
                 let containers = app.convert.format.format.selected_value().available_containers();
-                if i < containers.len() {
+                if i < containers.len() && containers[i].enabled {
                     app.convert.format.selected_container_index = i;
                     app.preset.mark_modified();
                 }

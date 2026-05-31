@@ -66,7 +66,7 @@ impl AudioFormat {
             Self::Aac => "AAC",
             Self::Opus => "Opus",
             Self::Alac => "ALAC",
-            Self::Dsf => "DSF",
+            Self::Dsf => "DSD",
             Self::Dff => "DFF",
         }
     }
@@ -107,7 +107,6 @@ impl AudioFormat {
             Self::Aiff,
             Self::WavPack,
             Self::Dsf,
-            Self::Dff,
         ]
     }
 
@@ -115,57 +114,61 @@ impl AudioFormat {
     pub fn available_containers(&self) -> &'static [ContainerOption] {
         match self {
             Self::Flac => &[
-                ContainerOption { extension: "flac", display_name: "FLAC", ffmpeg_flags: &[] },
-                ContainerOption { extension: "ogg", display_name: "OGG", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+                ContainerOption { extension: "flac", display_name: "FLAC", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "ogg", display_name: "OGG", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
             ],
             Self::Wav => &[
-                ContainerOption { extension: "wav", display_name: "WAV", ffmpeg_flags: &[] },
-                ContainerOption { extension: "wav", display_name: "RF64", ffmpeg_flags: &["-rf64", "auto"] },
-                ContainerOption { extension: "w64", display_name: "W64", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+                ContainerOption { extension: "wav", display_name: "WAV", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "wav", display_name: "RF64", ffmpeg_flags: &["-rf64", "auto"], enabled: true },
+                ContainerOption { extension: "w64", display_name: "W64", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
             ],
             Self::Aiff => &[
-                ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+                ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
             ],
             Self::WavPack => &[
-                ContainerOption { extension: "wv", display_name: "WavPack", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+                ContainerOption { extension: "wv", display_name: "WavPack", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
             ],
             Self::Mp3 => &[
-                ContainerOption { extension: "mp3", display_name: "MP3", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+                ContainerOption { extension: "mp3", display_name: "MP3", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
             ],
             Self::Aac => &[
-                ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[] },
-                ContainerOption { extension: "aac", display_name: "AAC (raw)", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[] },
-                ContainerOption { extension: "m4b", display_name: "M4B", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+                ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "aac", display_name: "AAC (raw)", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "m4b", display_name: "M4B", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
             ],
             Self::Opus => &[
-                ContainerOption { extension: "opus", display_name: "Opus", ffmpeg_flags: &[] },
-                ContainerOption { extension: "webm", display_name: "WebM", ffmpeg_flags: &[] },
-                ContainerOption { extension: "weba", display_name: "WebA", ffmpeg_flags: &["-f", "webm"] },
-                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[] },
+                ContainerOption { extension: "opus", display_name: "Opus", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "webm", display_name: "WebM", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "weba", display_name: "WebA", ffmpeg_flags: &["-f", "webm"], enabled: true },
+                ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mkv", display_name: "MKV", ffmpeg_flags: &[], enabled: true },
             ],
             Self::Alac => &[
-                ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[] },
-                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[] },
+                ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
             ],
             Self::Dsf => &[
-                ContainerOption { extension: "dsf", display_name: "DSF", ffmpeg_flags: &[] },
+                ContainerOption { extension: "dsf", display_name: "DSF", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "dff", display_name: "DFF", ffmpeg_flags: &[], enabled: true },
+                ContainerOption { extension: "wv", display_name: "WavPack", ffmpeg_flags: &[], enabled: false },
+                ContainerOption { extension: "flac", display_name: "FLAC (DoP)", ffmpeg_flags: &[], enabled: false },
+                ContainerOption { extension: "wav", display_name: "WAV (DoP)", ffmpeg_flags: &[], enabled: false },
             ],
             Self::Dff => &[
-                ContainerOption { extension: "dff", display_name: "DFF", ffmpeg_flags: &[] },
+                ContainerOption { extension: "dff", display_name: "DFF", ffmpeg_flags: &[], enabled: true },
             ],
         }
     }
@@ -186,6 +189,9 @@ pub struct ContainerOption {
     /// Extra ffmpeg output flags needed for this container.
     /// Empty for containers that ffmpeg auto-detects from extension.
     pub ffmpeg_flags: &'static [&'static str],
+    /// Whether this container is currently functional. Disabled containers
+    /// are shown grayed out in the UI and are not selectable.
+    pub enabled: bool,
 }
 
 impl std::fmt::Display for AudioFormat {

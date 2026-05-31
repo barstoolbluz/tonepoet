@@ -248,7 +248,12 @@ pub fn try_pills_to_options(
 /// This is the lossless handoff from dynamic TUI rows into command planning.
 /// It validates on every build, including release builds.
 pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<PipelineSettings, String> {
-    let target_format = map_audio_format(*format.format.selected_value());
+    let container_ext = if format.selected_container_index > 0 {
+        Some(format.selected_extension())
+    } else {
+        None
+    };
+    let target_format = map_audio_format(*format.format.selected_value(), container_ext);
     let selected_rate = *format.sample_rate.selected_value();
     let is_dsd = format.is_dsd_selected();
 
@@ -351,18 +356,22 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
     Ok(settings)
 }
 
-fn map_audio_format(format: AudioFormat) -> pipeline_enums::AudioFormat {
-    match format {
-        AudioFormat::Flac => pipeline_enums::AudioFormat::Flac,
-        AudioFormat::Wav => pipeline_enums::AudioFormat::Wav,
-        AudioFormat::Aiff => pipeline_enums::AudioFormat::Aiff,
-        AudioFormat::WavPack => pipeline_enums::AudioFormat::WavPack,
-        AudioFormat::Mp3 => pipeline_enums::AudioFormat::Mp3,
-        AudioFormat::Aac => pipeline_enums::AudioFormat::Aac,
-        AudioFormat::Opus => pipeline_enums::AudioFormat::Opus,
-        AudioFormat::Alac => pipeline_enums::AudioFormat::Alac,
-        AudioFormat::Dsf => pipeline_enums::AudioFormat::Dsf,
-        AudioFormat::Dff => pipeline_enums::AudioFormat::Dff,
+fn map_audio_format(format: AudioFormat, container_ext: Option<&str>) -> pipeline_enums::AudioFormat {
+    match (format, container_ext) {
+        // DSD container routing: "DSD" pill is internally Dsf;
+        // selecting DFF container maps to the pipeline's Dff variant.
+        (AudioFormat::Dsf, Some("dff")) => pipeline_enums::AudioFormat::Dff,
+        // All other formats map 1:1.
+        (AudioFormat::Flac, _) => pipeline_enums::AudioFormat::Flac,
+        (AudioFormat::Wav, _) => pipeline_enums::AudioFormat::Wav,
+        (AudioFormat::Aiff, _) => pipeline_enums::AudioFormat::Aiff,
+        (AudioFormat::WavPack, _) => pipeline_enums::AudioFormat::WavPack,
+        (AudioFormat::Mp3, _) => pipeline_enums::AudioFormat::Mp3,
+        (AudioFormat::Aac, _) => pipeline_enums::AudioFormat::Aac,
+        (AudioFormat::Opus, _) => pipeline_enums::AudioFormat::Opus,
+        (AudioFormat::Alac, _) => pipeline_enums::AudioFormat::Alac,
+        (AudioFormat::Dsf, _) => pipeline_enums::AudioFormat::Dsf,
+        (AudioFormat::Dff, _) => pipeline_enums::AudioFormat::Dff,
     }
 }
 

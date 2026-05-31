@@ -254,7 +254,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
         let mut x = label_col;
         for (i, c) in containers.iter().enumerate() {
             let w = c.display_name.len() as u16 + 2; // " name "
-            if container_row_y < area.y + area.height {
+            if c.enabled && container_row_y < area.y + area.height {
                 buttons.record_button(
                     TuiButton::ContainerPill(i),
                     ratatui::layout::Rect::new(x, container_row_y, w, 1),

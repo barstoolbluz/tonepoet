@@ -181,7 +181,9 @@ pub fn draw_format_pane(
             .enumerate()
             .flat_map(|(i, c)| {
                 let selected = i == format_state.selected_container_index;
-                let style = if selected {
+                let style = if !c.enabled {
+                    Style::default().fg(ratatui::style::Color::DarkGray)
+                } else if selected {
                     Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme::TEXT_DIM)
