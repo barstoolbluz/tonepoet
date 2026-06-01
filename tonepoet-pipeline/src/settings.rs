@@ -237,6 +237,12 @@ fn validate_encoder_settings(settings: &PipelineSettings) -> Result<()> {
             "expected 0 through 10",
         ));
     }
+    if settings.wavpack.hybrid && !(24..=9600).contains(&settings.wavpack.hybrid_bitrate_kbps) {
+        return Err(PlanningError::invalid_settings(
+            "wavpack.hybrid_bitrate_kbps",
+            "expected 24 through 9600 kbps/ch",
+        ));
+    }
     Ok(())
 }
 
@@ -442,12 +448,21 @@ impl Default for OpusSettings {
 pub struct WavPackSettings {
     /// Compression mode.
     pub mode: WavPackMode,
+    /// Enable hybrid (lossy) mode at a target bitrate.
+    pub hybrid: bool,
+    /// Target bitrate in kbps per channel for hybrid mode. Valid 24–9600.
+    pub hybrid_bitrate_kbps: u32,
+    /// Write lossless correction (.wvc) sidecar alongside hybrid .wv.
+    pub correction_file: bool,
 }
 
 impl Default for WavPackSettings {
     fn default() -> Self {
         Self {
             mode: WavPackMode::Normal,
+            hybrid: false,
+            hybrid_bitrate_kbps: 320,
+            correction_file: true,
         }
     }
 }

@@ -76,6 +76,9 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "opus.bitrate_kbps",
     "opus.complexity",
     "wavpack.mode",
+    "wavpack.hybrid",
+    "wavpack.hybrid_bitrate_kbps",
+    "wavpack.correction_file",
     "ssrc.force",
     "ssrc.two_pass",
     "ssrc.insane_mode",
@@ -203,6 +206,12 @@ fn push_opus(writer: &mut FingerprintWriter, settings: &OpusSettings) {
 
 fn push_wavpack(writer: &mut FingerprintWriter, settings: &WavPackSettings) {
     writer.field_static("wavpack.mode", wavpack_mode(settings.mode));
+    writer.field_static("wavpack.hybrid", bool_value(settings.hybrid));
+    writer.field_string(
+        "wavpack.hybrid_bitrate_kbps",
+        settings.hybrid_bitrate_kbps.to_string(),
+    );
+    writer.field_static("wavpack.correction_file", bool_value(settings.correction_file));
 }
 
 fn push_ssrc(writer: &mut FingerprintWriter, settings: &SsrcSettings) {

@@ -6351,6 +6351,23 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .iter()
                 .position(|(br, _)| *br == bitrate);
         }
+        FormatSettingsKind::WavPack {
+            mode,
+            hybrid,
+            bitrate_input,
+            correction,
+        } => {
+            app.convert.format.wavpack_mode = *mode;
+            app.convert.format.wavpack_hybrid = *hybrid;
+            let bitrate: u32 = bitrate_input
+                .text
+                .trim()
+                .parse()
+                .unwrap_or(320)
+                .clamp(24, 9600);
+            app.convert.format.wavpack_bitrate_kbps = bitrate;
+            app.convert.format.wavpack_correction = *correction;
+        }
     }
     app.preset.mark_modified();
 }
@@ -6391,6 +6408,23 @@ fn format_settings_focus_next(kind: &FormatSettingsKind, focus: FormatSettingsFo
                 }
             }
         }
+        FormatSettingsKind::WavPack { hybrid, .. } => {
+            if *hybrid {
+                // Hybrid on: Mode → Hybrid → Bitrate → Correction (4 fields)
+                match focus {
+                    FormatSettingsFocus::WavPackMode => FormatSettingsFocus::WavPackHybrid,
+                    FormatSettingsFocus::WavPackHybrid => FormatSettingsFocus::WavPackBitrate,
+                    FormatSettingsFocus::WavPackBitrate => FormatSettingsFocus::WavPackCorrection,
+                    _ => FormatSettingsFocus::WavPackMode,
+                }
+            } else {
+                // Hybrid off: Mode → Hybrid (2 fields)
+                match focus {
+                    FormatSettingsFocus::WavPackMode => FormatSettingsFocus::WavPackHybrid,
+                    _ => FormatSettingsFocus::WavPackMode,
+                }
+            }
+        }
     }
 }
 
@@ -6424,6 +6458,21 @@ fn format_settings_focus_prev(kind: &FormatSettingsKind, focus: FormatSettingsFo
                     FormatSettingsFocus::Mp3Mode => FormatSettingsFocus::Mp3Bitrate,
                     FormatSettingsFocus::Mp3Preset => FormatSettingsFocus::Mp3Mode,
                     _ => FormatSettingsFocus::Mp3Preset,
+                }
+            }
+        }
+        FormatSettingsKind::WavPack { hybrid, .. } => {
+            if *hybrid {
+                match focus {
+                    FormatSettingsFocus::WavPackMode => FormatSettingsFocus::WavPackCorrection,
+                    FormatSettingsFocus::WavPackHybrid => FormatSettingsFocus::WavPackMode,
+                    FormatSettingsFocus::WavPackBitrate => FormatSettingsFocus::WavPackHybrid,
+                    _ => FormatSettingsFocus::WavPackBitrate,
+                }
+            } else {
+                match focus {
+                    FormatSettingsFocus::WavPackMode => FormatSettingsFocus::WavPackHybrid,
+                    _ => FormatSettingsFocus::WavPackMode,
                 }
             }
         }
@@ -6591,6 +6640,42 @@ fn handle_format_settings_field_key(
                 _ => {}
             }
         }
+        FormatSettingsKind::WavPack {
+            mode,
+            hybrid,
+            bitrate_input,
+            correction,
+        } => {
+            use tonepoet_pipeline::enums::WavPackMode;
+            match focus {
+                FormatSettingsFocus::WavPackMode => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let modes = [WavPackMode::Fast, WavPackMode::Normal, WavPackMode::High, WavPackMode::VeryHigh];
+                        let cur = modes.iter().position(|m| m == mode).unwrap_or(1);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { modes.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % modes.len()
+                        };
+                        *mode = modes[next];
+                    }
+                }
+                FormatSettingsFocus::WavPackHybrid => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        *hybrid = !*hybrid;
+                    }
+                }
+                FormatSettingsFocus::WavPackBitrate => {
+                    super::text_input::handle_text_input_key(bitrate_input, key);
+                }
+                FormatSettingsFocus::WavPackCorrection => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        *correction = !*correction;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -6700,6 +6785,22 @@ fn handle_format_settings_mouse(
                     }
                     return;
                 }
+                (FormatSettingsKind::WavPack { ref mut mode, .. }, TuiButton::FormatSettingsWavPackMode(i)) => {
+                    use tonepoet_pipeline::enums::WavPackMode;
+                    let modes = [WavPackMode::Fast, WavPackMode::Normal, WavPackMode::High, WavPackMode::VeryHigh];
+                    if let Some(&m) = modes.get(i) {
+                        *mode = m;
+                    }
+                    return;
+                }
+                (FormatSettingsKind::WavPack { ref mut hybrid, .. }, TuiButton::FormatSettingsWavPackHybrid(i)) => {
+                    *hybrid = i == 1; // 0 = off, 1 = on
+                    return;
+                }
+                (FormatSettingsKind::WavPack { ref mut correction, .. }, TuiButton::FormatSettingsWavPackCorrection(i)) => {
+                    *correction = i == 1; // 0 = off, 1 = on
+                    return;
+                }
                 _ => {}
             }
         }
@@ -6739,7 +6840,16 @@ fn handle_format_settings_mouse(
                     y if y == field2_y && is_vbr => Some(FormatSettingsFocus::Mp3VbrQuality),
                     y if y == field3_y && !is_vbr => Some(FormatSettingsFocus::Mp3Preset),
                     y if y == field4_y && !is_vbr => Some(FormatSettingsFocus::Mp3Bitrate),
-                    _ => None, // greyed rows return None → click ignored
+                    _ => None,
+                }
+            }
+            FormatSettingsKind::WavPack { hybrid, .. } => {
+                match my {
+                    y if y == field1_y => Some(FormatSettingsFocus::WavPackMode),
+                    y if y == field2_y => Some(FormatSettingsFocus::WavPackHybrid),
+                    y if y == field3_y && *hybrid => Some(FormatSettingsFocus::WavPackBitrate),
+                    y if y == field4_y && *hybrid => Some(FormatSettingsFocus::WavPackCorrection),
+                    _ => None,
                 }
             }
         };
@@ -10693,6 +10803,17 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         },
                         FormatSettingsFocus::Mp3Mode,
                     ),
+                    crate::convert::formats::AudioFormat::WavPack => (
+                        FormatSettingsKind::WavPack {
+                            mode: fmt.wavpack_mode,
+                            hybrid: fmt.wavpack_hybrid,
+                            bitrate_input: super::text_input::TextInputState::new(
+                                fmt.wavpack_bitrate_kbps.to_string(),
+                            ),
+                            correction: fmt.wavpack_correction,
+                        },
+                        FormatSettingsFocus::WavPackMode,
+                    ),
                     _ => return,
                 };
                 app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
@@ -11052,7 +11173,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsOpusContentType(_)
             | TuiButton::FormatSettingsOpusQuality(_)
             | TuiButton::FormatSettingsMp3Mode(_)
-            | TuiButton::FormatSettingsMp3Preset(_) => {
+            | TuiButton::FormatSettingsMp3Preset(_)
+            | TuiButton::FormatSettingsWavPackMode(_)
+            | TuiButton::FormatSettingsWavPackHybrid(_)
+            | TuiButton::FormatSettingsWavPackCorrection(_) => {
                 // Handled in dedicated mouse handlers; no-op here.
             }
         }

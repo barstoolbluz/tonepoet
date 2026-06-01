@@ -61,6 +61,12 @@ pub enum TuiButton {
     FormatSettingsMp3Mode(usize),
     /// MP3 bitrate preset pills inside the FormatSettings overlay.
     FormatSettingsMp3Preset(usize),
+    /// WavPack mode pills inside the FormatSettings overlay.
+    FormatSettingsWavPackMode(usize),
+    /// WavPack hybrid toggle pills inside the FormatSettings overlay.
+    FormatSettingsWavPackHybrid(usize),
+    /// WavPack correction toggle pills inside the FormatSettings overlay.
+    FormatSettingsWavPackCorrection(usize),
 
     // Convert screen controls
     PresetsButton,
@@ -222,7 +228,10 @@ impl TuiButton {
             | Self::FormatSettingsOpusContentType(_)
             | Self::FormatSettingsOpusQuality(_)
             | Self::FormatSettingsMp3Mode(_)
-            | Self::FormatSettingsMp3Preset(_) => None,
+            | Self::FormatSettingsMp3Preset(_)
+            | Self::FormatSettingsWavPackMode(_)
+            | Self::FormatSettingsWavPackHybrid(_)
+            | Self::FormatSettingsWavPackCorrection(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)

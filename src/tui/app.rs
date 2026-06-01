@@ -129,6 +129,11 @@ pub enum FormatSettingsFocus {
     Mp3VbrQuality,
     Mp3Preset,
     Mp3Bitrate,
+    // WavPack
+    WavPackMode,
+    WavPackHybrid,
+    WavPackBitrate,
+    WavPackCorrection,
 }
 
 /// Format-specific overlay state, keyed by codec.
@@ -155,6 +160,12 @@ pub enum FormatSettingsKind {
         vbr_quality_input: crate::tui::text_input::TextInputState,
         quality_preset: Option<usize>,
         bitrate_input: crate::tui::text_input::TextInputState,
+    },
+    WavPack {
+        mode: tonepoet_pipeline::enums::WavPackMode,
+        hybrid: bool,
+        bitrate_input: crate::tui::text_input::TextInputState,
+        correction: bool,
     },
 }
 
@@ -781,6 +792,14 @@ pub struct FormatState {
     pub mp3_vbr_quality: u8,
     /// MP3 CBR/ABR bitrate in kbps (8-1000). Default: 320.
     pub mp3_bitrate_kbps: u32,
+    /// WavPack compression mode. Default: Normal.
+    pub wavpack_mode: tonepoet_pipeline::enums::WavPackMode,
+    /// WavPack hybrid (lossy) mode. Default: false.
+    pub wavpack_hybrid: bool,
+    /// WavPack hybrid bitrate in kbps/ch (24-9600). Default: 320.
+    pub wavpack_bitrate_kbps: u32,
+    /// Write .wvc correction file alongside hybrid .wv. Default: true.
+    pub wavpack_correction: bool,
 }
 
 // MP3 bitrate presets (used by CBR and ABR modes).
@@ -941,6 +960,10 @@ impl FormatState {
             mp3_quality_preset: Some(0), // "insane" = index 0 (320 kbps)
             mp3_vbr_quality: 0,
             mp3_bitrate_kbps: 320,
+            wavpack_mode: tonepoet_pipeline::enums::WavPackMode::Normal,
+            wavpack_hybrid: false,
+            wavpack_bitrate_kbps: 320,
+            wavpack_correction: true,
         };
         state.apply_format_constraints();
         state

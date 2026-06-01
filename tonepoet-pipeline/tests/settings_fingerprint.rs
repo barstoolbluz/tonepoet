@@ -31,6 +31,9 @@ use tonepoet_pipeline::{
 /// - opus.bitrate_kbps: 111
 /// - opus.complexity: 7
 /// - wavpack.mode: VeryHigh
+/// - wavpack.hybrid: true
+/// - wavpack.hybrid_bitrate_kbps: 256
+/// - wavpack.correction_file: false
 /// - ssrc.force: true
 /// - ssrc.two_pass: false
 /// - ssrc.insane_mode: true
@@ -89,6 +92,9 @@ fn flac_md5_sentinel() -> PipelineSettings {
         },
         wavpack: WavPackSettings {
             mode: WavPackMode::VeryHigh,
+            hybrid: true,
+            hybrid_bitrate_kbps: 256,
+            correction_file: false,
         },
         ssrc: SsrcSettings {
             force: true,
@@ -136,7 +142,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 48);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 51);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();
@@ -247,6 +253,20 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     });
     assert_mutation_changes_fingerprint!(covered, base, "wavpack.mode", |settings| {
         settings.wavpack.mode = WavPackMode::High;
+    });
+    assert_mutation_changes_fingerprint!(covered, base, "wavpack.hybrid", |settings| {
+        settings.wavpack.hybrid = false;
+    });
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "wavpack.hybrid_bitrate_kbps",
+        |settings| {
+            settings.wavpack.hybrid_bitrate_kbps = 512;
+        }
+    );
+    assert_mutation_changes_fingerprint!(covered, base, "wavpack.correction_file", |settings| {
+        settings.wavpack.correction_file = true;
     });
     assert_mutation_changes_fingerprint!(covered, base, "ssrc.force", |settings| {
         settings.ssrc.force = false;

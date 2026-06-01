@@ -179,6 +179,7 @@ pub fn draw_format_pane(
             | crate::convert::formats::AudioFormat::Aac
             | crate::convert::formats::AudioFormat::Opus
             | crate::convert::formats::AudioFormat::Mp3
+            | crate::convert::formats::AudioFormat::WavPack
     );
     if maximized && containers.len() > 1 {
         lines.push(bordered_line(border_color, w, vec![]));

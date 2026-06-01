@@ -853,6 +853,7 @@ fn draw_format_settings(
         FormatSettingsKind::Aac { .. } => " AAC Settings ",
         FormatSettingsKind::Opus { .. } => " Opus Settings ",
         FormatSettingsKind::Mp3 { .. } => " MP3 Settings ",
+        FormatSettingsKind::WavPack { .. } => " WavPack Settings ",
     };
 
     f.render_widget(Clear, popup);
@@ -908,6 +909,12 @@ fn draw_format_settings(
             quality_preset,
             bitrate_input,
         } => draw_mp3_fields(f, *mode, vbr_quality_input, *quality_preset, bitrate_input, focus, &chunks, buttons),
+        FormatSettingsKind::WavPack {
+            mode,
+            hybrid,
+            bitrate_input,
+            correction,
+        } => draw_wavpack_fields(f, *mode, *hybrid, bitrate_input, *correction, focus, &chunks, buttons),
     }
 
     // Footer (shared)
@@ -1372,6 +1379,122 @@ fn draw_mp3_fields(
     }
 }
 
+fn draw_wavpack_fields(
+    f: &mut Frame,
+    mode: tonepoet_pipeline::enums::WavPackMode,
+    hybrid: bool,
+    bitrate_input: &super::text_input::TextInputState,
+    correction: bool,
+    focus: FormatSettingsFocus,
+    chunks: &[Rect],
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
+    use tonepoet_pipeline::enums::WavPackMode;
+
+    let greyed = Style::default().fg(Color::DarkGray);
+    let greyed_bg = Color::Rgb(20, 20, 20);
+
+    // Row 1: Mode pills (fast/normal/high/very high) — always active
+    let mode_focused = focus == FormatSettingsFocus::WavPackMode;
+    let mode_label_style = if mode_focused { theme::bright() } else { theme::muted() };
+    let modes = [
+        (WavPackMode::Fast, "fast"),
+        (WavPackMode::Normal, "normal"),
+        (WavPackMode::High, "high"),
+        (WavPackMode::VeryHigh, "very high"),
+    ];
+    let mut mode_spans = vec![Span::styled("  mode         ", mode_label_style)];
+    let mut mx = chunks[1].x + 15;
+    for (i, (m, label)) in modes.iter().enumerate() {
+        let selected = *m == mode;
+        let style = if selected {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if mode_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        mode_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(
+            TuiButton::FormatSettingsWavPackMode(i),
+            Rect::new(mx, chunks[1].y, pill_w, 1),
+        );
+        mx += pill_w;
+        if i + 1 < modes.len() {
+            mode_spans.push(Span::raw(" "));
+            mx += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(mode_spans)), chunks[1]);
+
+    // Row 2: Hybrid toggle (off/on) — always active
+    let hyb_focused = focus == FormatSettingsFocus::WavPackHybrid;
+    let hyb_label_style = if hyb_focused { theme::bright() } else { theme::muted() };
+    let (off_style, on_style) = toggle_pill_styles(hybrid, hyb_focused);
+    let hyb_line = Line::from(vec![
+        Span::styled("  hybrid       ", hyb_label_style),
+        Span::styled(" off ", off_style),
+        Span::raw(" "),
+        Span::styled(" on ", on_style),
+    ]);
+    f.render_widget(Paragraph::new(hyb_line), chunks[2]);
+    let hx = chunks[2].x + 15;
+    buttons.record_button(TuiButton::FormatSettingsWavPackHybrid(0), Rect::new(hx, chunks[2].y, 5, 1));
+    buttons.record_button(TuiButton::FormatSettingsWavPackHybrid(1), Rect::new(hx + 6, chunks[2].y, 4, 1));
+
+    // Row 3: Bitrate text entry — greyed when hybrid off
+    let br_focused = focus == FormatSettingsFocus::WavPackBitrate;
+    let br_label_style = if !hybrid { greyed } else if br_focused { theme::bright() } else { theme::muted() };
+    let visible_width = chunks[3].width.saturating_sub(24) as usize;
+    let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
+    let display_val = if view.is_empty() { " ".to_string() } else { view };
+    let br_bg = if !hybrid { greyed_bg } else if br_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let br_fg = if !hybrid { Color::DarkGray } else { Color::White };
+    let br_line = Line::from(vec![
+        Span::styled("  bitrate      ", br_label_style),
+        Span::styled(
+            format!(" {} ", display_val),
+            Style::default().fg(br_fg).bg(br_bg),
+        ),
+        Span::styled(" kbps/ch", if !hybrid { greyed } else { theme::muted() }),
+    ]);
+    f.render_widget(Paragraph::new(br_line), chunks[3]);
+    if br_focused && hybrid {
+        f.set_cursor(chunks[3].x + 16 + cursor_col, chunks[3].y);
+    }
+
+    // Row 4: Correction toggle (off/on) — greyed when hybrid off
+    let cor_focused = focus == FormatSettingsFocus::WavPackCorrection;
+    let cor_label_style = if !hybrid { greyed } else if cor_focused { theme::bright() } else { theme::muted() };
+    if hybrid {
+        let (cor_off, cor_on) = toggle_pill_styles(correction, cor_focused);
+        let cor_line = Line::from(vec![
+            Span::styled("  correction   ", cor_label_style),
+            Span::styled(" off ", cor_off),
+            Span::raw(" "),
+            Span::styled(" on ", cor_on),
+        ]);
+        f.render_widget(Paragraph::new(cor_line), chunks[4]);
+        let cx = chunks[4].x + 15;
+        buttons.record_button(TuiButton::FormatSettingsWavPackCorrection(0), Rect::new(cx, chunks[4].y, 5, 1));
+        buttons.record_button(TuiButton::FormatSettingsWavPackCorrection(1), Rect::new(cx + 6, chunks[4].y, 4, 1));
+    } else {
+        let cor_line = Line::from(vec![
+            Span::styled("  correction   ", cor_label_style),
+            Span::styled(" off ", greyed),
+            Span::raw(" "),
+            Span::styled(" on ", greyed),
+        ]);
+        f.render_widget(Paragraph::new(cor_line), chunks[4]);
+        // No buttons registered when greyed
+    }
+}
+
 fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
     let active = Style::default()
         .fg(theme::PILL_ACTIVE_FG)
@@ -1396,6 +1519,7 @@ pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
         FormatSettingsKind::Aac { .. } => 3,
         FormatSettingsKind::Opus { .. } => 4,
         FormatSettingsKind::Mp3 { .. } => 4,
+        FormatSettingsKind::WavPack { .. } => 4,
     }
 }
 
@@ -1433,6 +1557,13 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
                 .map(|(_, label)| label.len() + 2)
                 .sum::<usize>()
                 + presets.len().saturating_sub(1);
+            label_width + pills_width
+        }
+        FormatSettingsKind::WavPack { .. } => {
+            // Widest row: mode pills (fast/normal/high/very high)
+            let labels = ["fast", "normal", "high", "very high"];
+            let pills_width: usize = labels.iter().map(|l| l.len() + 2).sum::<usize>()
+                + labels.len().saturating_sub(1);
             label_width + pills_width
         }
     };

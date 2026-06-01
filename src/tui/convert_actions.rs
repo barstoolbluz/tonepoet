@@ -354,7 +354,12 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             complexity: format.opus_complexity,
         },
         // settings-sentinel-allow: remaining sub-struct defaults
-        wavpack: Default::default(),
+        wavpack: tonepoet_pipeline::WavPackSettings {
+            mode: format.wavpack_mode,
+            hybrid: format.wavpack_hybrid,
+            hybrid_bitrate_kbps: format.wavpack_bitrate_kbps,
+            correction_file: format.wavpack_correction,
+        },
         ssrc: Default::default(),
         dsd,
         // settings-sentinel-allow: metadata/verification defaults until TUI exposes them

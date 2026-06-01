@@ -559,6 +559,12 @@ fn build_ffmpeg_encode_pcm(
     target_depth: PcmBitDepth,
     apply_processing: bool,
 ) -> Result<PlannedCommand> {
+    // WavPack hybrid mode requires the native wavpack CLI (ffmpeg can't do hybrid).
+    if matches!(target_format, AudioFormat::WavPack)
+        && context.request.settings.wavpack.hybrid
+    {
+        return build_wavpack_hybrid_encode(context, step);
+    }
     if !target_format.ffmpeg_encodable() {
         return Err(PlanningError::unsupported_format(
             target_format.clone(),
@@ -1132,6 +1138,48 @@ fn add_ffmpeg_pcm_encoder_args(
         }
     }
     Ok(())
+}
+
+/// Build a PlannedCommand for native `wavpack` CLI in hybrid mode.
+/// Produces a lossy .wv file (+ optional .wvc correction sidecar).
+fn build_wavpack_hybrid_encode(
+    context: &PlanContext<'_>,
+    step: &PlanStep,
+) -> Result<PlannedCommand> {
+    let input = required_input_path(step)?;
+    let output = required_output_path(step)?;
+    let settings = &context.request.settings.wavpack;
+
+    let mut args: Vec<String> = Vec::new();
+
+    // Compression mode flag
+    let mode_flag = mapping::wavpack_mode_flag(settings.mode);
+    if !mode_flag.is_empty() {
+        args.push(mode_flag.into());
+    }
+
+    // Hybrid bitrate
+    args.push("-b".into());
+    args.push(settings.hybrid_bitrate_kbps.to_string());
+
+    // Correction file
+    if settings.correction_file {
+        args.push("-c".into());
+    }
+
+    // Input and output
+    args.push(input);
+    args.push("-o".into());
+    args.push(output);
+
+    Ok(PlannedCommand::new(
+        ToolIdentifier::Custom("wavpack".to_string()),
+        args,
+        step.input.clone(),
+        step.output.clone(),
+        context.request.source.duration,
+        step.description.clone(),
+    ))
 }
 
 fn add_sox_output_format_args(

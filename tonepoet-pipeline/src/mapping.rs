@@ -265,6 +265,17 @@ pub const fn wavpack_compression_level(mode: WavPackMode) -> u8 {
     }
 }
 
+/// WavPack CLI mode flag for native `wavpack` command.
+#[must_use]
+pub const fn wavpack_mode_flag(mode: WavPackMode) -> &'static str {
+    match mode {
+        WavPackMode::Fast => "-f",
+        WavPackMode::Normal => "",
+        WavPackMode::High => "-h",
+        WavPackMode::VeryHigh => "-hh",
+    }
+}
+
 /// SoX-DSD shaper string such as `clans-8`.
 #[must_use]
 pub fn dsd_shaper_name(shaper: DsdNoiseShaper, order: ModulatorOrder) -> String {
