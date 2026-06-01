@@ -1065,10 +1065,15 @@ fn ffmpeg_audio_filter(
         "precision={}",
         mapping::soxr_precision(settings.resample_quality)
     ));
-    opts.push(format!(
-        "cutoff={:.3}",
-        mapping::ffmpeg_cutoff(settings.nyquist_transition)
-    ));
+    let cutoff = settings.soxr_resampler.cutoff
+        .unwrap_or_else(|| mapping::ffmpeg_cutoff(settings.nyquist_transition));
+    opts.push(format!("cutoff={:.3}", cutoff));
+    if settings.soxr_resampler.chebyshev {
+        opts.push("cheby=1".to_string());
+    }
+    if let Some(phase) = settings.soxr_resampler.phase {
+        opts.push(format!("phase_shift={}", phase));
+    }
     if settings.dither_type != DitherType::None {
         let method = mapping::soxr_dither_method(settings.dither_type).ok_or_else(|| {
             PlanningError::invalid_settings(
@@ -1221,11 +1226,25 @@ fn add_sox_pcm_effects(
     target_depth: Option<PcmBitDepth>,
 ) {
     if let Some(rate) = target_rate_hz {
+        let sox_rs = &context.request.settings.sox_resampler;
         args.push("rate".into());
         args.push(mapping::sox_rate_quality_flag(context.request.settings.resample_quality).into());
-        if let Some(bandwidth_pct) = mapping::sox_bandwidth_percent(context.request.settings.nyquist_transition) {
+        // Chebyshev (-s) and bandwidth (-b) are mutually exclusive.
+        if sox_rs.chebyshev {
+            args.push("-s".into());
+        } else if let Some(bw) = sox_rs.bandwidth_pct {
+            args.push("-b".into());
+            args.push(format!("{}", bw));
+        } else if let Some(bandwidth_pct) = mapping::sox_bandwidth_percent(context.request.settings.nyquist_transition) {
             args.push("-b".into());
             args.push(bandwidth_pct.into());
+        }
+        if let Some(phase) = sox_rs.phase {
+            args.push("-p".into());
+            args.push(phase.to_string());
+        }
+        if sox_rs.allow_aliasing {
+            args.push("-a".into());
         }
         args.push(rate.to_string());
     }

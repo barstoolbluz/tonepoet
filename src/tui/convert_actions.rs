@@ -369,6 +369,17 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             insane_mode: format.ssrc_insane_mode,
             profile: format.ssrc_profile,
         },
+        sox_resampler: tonepoet_pipeline::SoxResamplerSettings {
+            chebyshev: format.sox_chebyshev,
+            bandwidth_pct: format.sox_bandwidth,
+            phase: format.sox_phase,
+            allow_aliasing: format.sox_allow_aliasing,
+        },
+        soxr_resampler: tonepoet_pipeline::SoxrResamplerSettings {
+            chebyshev: format.soxr_chebyshev,
+            cutoff: format.soxr_cutoff,
+            phase: format.soxr_phase,
+        },
         dsd,
         // settings-sentinel-allow: metadata/verification defaults until TUI exposes them
         metadata: Default::default(),

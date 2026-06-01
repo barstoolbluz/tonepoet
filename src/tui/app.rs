@@ -817,6 +817,20 @@ pub struct FormatState {
     pub ssrc_profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
     /// SSRC insane mode (force insane profile). Default: false.
     pub ssrc_insane_mode: bool,
+    /// Sox chebyshev/steep filter (-s). Default: false.
+    pub sox_chebyshev: bool,
+    /// Sox bandwidth override (74.0-99.7%). None = derived from NyquistTransition.
+    pub sox_bandwidth: Option<f32>,
+    /// Sox phase (0-100). None = sox default.
+    pub sox_phase: Option<u8>,
+    /// Sox allow aliasing (-a). Default: false.
+    pub sox_allow_aliasing: bool,
+    /// Soxr chebyshev filter (cheby=1). Default: false.
+    pub soxr_chebyshev: bool,
+    /// Soxr cutoff override (0.0-1.0). None = derived from NyquistTransition.
+    pub soxr_cutoff: Option<f32>,
+    /// Soxr phase (0-100). None = soxr default.
+    pub soxr_phase: Option<u8>,
 }
 
 // MP3 bitrate presets (used by CBR and ABR modes).
@@ -986,6 +1000,13 @@ impl FormatState {
             resample_quality: tonepoet_pipeline::enums::ResampleQuality::Ultra,
             ssrc_profile: None,
             ssrc_insane_mode: false,
+            sox_chebyshev: false,
+            sox_bandwidth: None,
+            sox_phase: None,
+            sox_allow_aliasing: false,
+            soxr_chebyshev: false,
+            soxr_cutoff: None,
+            soxr_phase: None,
         };
         state.apply_format_constraints();
         state

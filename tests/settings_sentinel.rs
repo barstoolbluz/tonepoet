@@ -18,7 +18,8 @@ use tonepoet_pipeline::{
     NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
     SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
-    SsrcProfile, SsrcSettings, TrellisSettings, VerificationSettings, WavPackMode,
+    SoxResamplerSettings, SoxrResamplerSettings, SsrcProfile, SsrcSettings, TrellisSettings,
+    VerificationSettings, WavPackMode,
     WavPackSettings,
 };
 
@@ -59,6 +60,13 @@ use tonepoet_pipeline::{
 /// - ssrc.force: true
 
 /// - ssrc.insane_mode: true
+/// - sox_resampler.chebyshev: true
+/// - sox_resampler.bandwidth_pct: Some(97.0)
+/// - sox_resampler.phase: Some(25)
+/// - sox_resampler.allow_aliasing: true
+/// - soxr_resampler.chebyshev: true
+/// - soxr_resampler.cutoff: Some(0.97)
+/// - soxr_resampler.phase: Some(25)
 /// - ssrc.profile: Some(Long)
 /// - dsd.noise_shaper: Crfb
 /// - dsd.modulator_order: Order7
@@ -124,6 +132,17 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             force: true,
             insane_mode: true,
             profile: Some(SsrcProfile::Long),
+        },
+        sox_resampler: SoxResamplerSettings {
+            chebyshev: true,
+            bandwidth_pct: Some(97.0),
+            phase: Some(25),
+            allow_aliasing: true,
+        },
+        soxr_resampler: SoxrResamplerSettings {
+            chebyshev: true,
+            cutoff: Some(0.97),
+            phase: Some(25),
         },
         dsd: DsdSettings {
             noise_shaper: DsdNoiseShaper::Crfb,
@@ -237,6 +256,13 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.ssrc.force, &expected.ssrc.force, "ssrc.force");
 
     assert_eq!(&actual.ssrc.insane_mode, &expected.ssrc.insane_mode, "ssrc.insane_mode");
+    assert_eq!(&actual.sox_resampler.chebyshev, &expected.sox_resampler.chebyshev, "sox_resampler.chebyshev");
+    assert_eq!(&actual.sox_resampler.bandwidth_pct, &expected.sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
+    assert_eq!(&actual.sox_resampler.phase, &expected.sox_resampler.phase, "sox_resampler.phase");
+    assert_eq!(&actual.sox_resampler.allow_aliasing, &expected.sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
+    assert_eq!(&actual.soxr_resampler.chebyshev, &expected.soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
+    assert_eq!(&actual.soxr_resampler.cutoff, &expected.soxr_resampler.cutoff, "soxr_resampler.cutoff");
+    assert_eq!(&actual.soxr_resampler.phase, &expected.soxr_resampler.phase, "soxr_resampler.phase");
     assert_eq!(&actual.ssrc.profile, &expected.ssrc.profile, "ssrc.profile");
     assert_eq!(&actual.dsd.noise_shaper, &expected.dsd.noise_shaper, "dsd.noise_shaper");
     assert_eq!(&actual.dsd.modulator_order, &expected.dsd.modulator_order, "dsd.modulator_order");
@@ -314,6 +340,13 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "ssrc.force", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
 
     SentinelFieldInventoryRow { path: "ssrc.insane_mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.chebyshev", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.bandwidth_pct", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.allow_aliasing", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "soxr_resampler.chebyshev", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "soxr_resampler.cutoff", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "soxr_resampler.phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "ssrc.profile", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.noise_shaper", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.modulator_order", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
@@ -372,6 +405,13 @@ fn field_differs_from_default(
         "ssrc.force" => settings.ssrc.force != default.ssrc.force,
 
         "ssrc.insane_mode" => settings.ssrc.insane_mode != default.ssrc.insane_mode,
+        "sox_resampler.chebyshev" => settings.sox_resampler.chebyshev != default.sox_resampler.chebyshev,
+        "sox_resampler.bandwidth_pct" => settings.sox_resampler.bandwidth_pct != default.sox_resampler.bandwidth_pct,
+        "sox_resampler.phase" => settings.sox_resampler.phase != default.sox_resampler.phase,
+        "sox_resampler.allow_aliasing" => settings.sox_resampler.allow_aliasing != default.sox_resampler.allow_aliasing,
+        "soxr_resampler.chebyshev" => settings.soxr_resampler.chebyshev != default.soxr_resampler.chebyshev,
+        "soxr_resampler.cutoff" => settings.soxr_resampler.cutoff != default.soxr_resampler.cutoff,
+        "soxr_resampler.phase" => settings.soxr_resampler.phase != default.soxr_resampler.phase,
         "ssrc.profile" => settings.ssrc.profile != default.ssrc.profile,
         "dsd.noise_shaper" => settings.dsd.noise_shaper != default.dsd.noise_shaper,
         "dsd.modulator_order" => settings.dsd.modulator_order != default.dsd.modulator_order,
@@ -492,6 +532,13 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, ssrc.force, "ssrc.force");
 
     assert_covered_by_non_default!(default, raw, raw, ssrc.insane_mode, "ssrc.insane_mode");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.chebyshev, "sox_resampler.chebyshev");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.phase, "sox_resampler.phase");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
+    assert_covered_by_non_default!(default, raw, raw, soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
+    assert_covered_by_non_default!(default, raw, raw, soxr_resampler.cutoff, "soxr_resampler.cutoff");
+    assert_covered_by_non_default!(default, raw, raw, soxr_resampler.phase, "soxr_resampler.phase");
     assert_covered_by_non_default!(default, raw, raw, ssrc.profile, "ssrc.profile");
     assert_covered_by_non_default!(default, raw, raw, dsd.noise_shaper, "dsd.noise_shaper");
     assert_covered_by_non_default!(default, raw, raw, dsd.modulator_order, "dsd.modulator_order");
@@ -552,6 +599,13 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, ssrc.force, "ssrc.force");
 
     assert_covered_by_non_default!(default, flac, custom, ssrc.insane_mode, "ssrc.insane_mode");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.chebyshev, "sox_resampler.chebyshev");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.phase, "sox_resampler.phase");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
+    assert_covered_by_non_default!(default, flac, custom, soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
+    assert_covered_by_non_default!(default, flac, custom, soxr_resampler.cutoff, "soxr_resampler.cutoff");
+    assert_covered_by_non_default!(default, flac, custom, soxr_resampler.phase, "soxr_resampler.phase");
     assert_covered_by_non_default!(default, flac, custom, ssrc.profile, "ssrc.profile");
     assert_covered_by_non_default!(default, flac, custom, dsd.noise_shaper, "dsd.noise_shaper");
     assert_covered_by_non_default!(default, flac, custom, dsd.modulator_order, "dsd.modulator_order");
@@ -685,6 +739,13 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("ssrc.force", LegacyProjectionStatus::Derived),
 
     ("ssrc.insane_mode", LegacyProjectionStatus::Translated),
+    ("sox_resampler.chebyshev", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.bandwidth_pct", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.phase", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.allow_aliasing", LegacyProjectionStatus::Defaulted),
+    ("soxr_resampler.chebyshev", LegacyProjectionStatus::Defaulted),
+    ("soxr_resampler.cutoff", LegacyProjectionStatus::Defaulted),
+    ("soxr_resampler.phase", LegacyProjectionStatus::Defaulted),
     ("ssrc.profile", LegacyProjectionStatus::Derived),
     ("dsd.noise_shaper", LegacyProjectionStatus::Unrepresentable),
     ("dsd.modulator_order", LegacyProjectionStatus::Unrepresentable),
@@ -853,6 +914,13 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.force", flac.ssrc.force, true);
 
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "ssrc.insane_mode", flac.ssrc.insane_mode, true);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.chebyshev", flac.sox_resampler.chebyshev, default.sox_resampler.chebyshev, sentinel.sox_resampler.chebyshev);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.bandwidth_pct", flac.sox_resampler.bandwidth_pct, default.sox_resampler.bandwidth_pct, sentinel.sox_resampler.bandwidth_pct);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.phase", flac.sox_resampler.phase, default.sox_resampler.phase, sentinel.sox_resampler.phase);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.allow_aliasing", flac.sox_resampler.allow_aliasing, default.sox_resampler.allow_aliasing, sentinel.sox_resampler.allow_aliasing);
+    assert_legacy_unrepresentable!(covered, "soxr_resampler.chebyshev", flac.soxr_resampler.chebyshev, default.soxr_resampler.chebyshev, sentinel.soxr_resampler.chebyshev);
+    assert_legacy_unrepresentable!(covered, "soxr_resampler.cutoff", flac.soxr_resampler.cutoff, default.soxr_resampler.cutoff, sentinel.soxr_resampler.cutoff);
+    assert_legacy_unrepresentable!(covered, "soxr_resampler.phase", flac.soxr_resampler.phase, default.soxr_resampler.phase, sentinel.soxr_resampler.phase);
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.profile", flac.ssrc.profile, Some(SsrcProfile::Insane));
     assert_legacy_unrepresentable!(covered, "dsd.noise_shaper", flac.dsd.noise_shaper, default.dsd.noise_shaper, sentinel.dsd.noise_shaper);
     assert_legacy_unrepresentable!(covered, "dsd.modulator_order", flac.dsd.modulator_order, default.dsd.modulator_order, sentinel.dsd.modulator_order);

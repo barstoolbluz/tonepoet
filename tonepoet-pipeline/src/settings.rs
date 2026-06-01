@@ -43,6 +43,10 @@ pub struct PipelineSettings {
     pub wavpack: WavPackSettings,
     /// SSRC brick-wall resampling options.
     pub ssrc: SsrcSettings,
+    /// Sox rate-effect resampler overrides.
+    pub sox_resampler: SoxResamplerSettings,
+    /// Soxr (ffmpeg aresample) resampler overrides.
+    pub soxr_resampler: SoxrResamplerSettings,
     /// DSD-specific conversion options.
     pub dsd: DsdSettings,
     /// Metadata and tag behavior.
@@ -70,6 +74,8 @@ impl Default for PipelineSettings {
             opus: OpusSettings::default(),
             wavpack: WavPackSettings::default(),
             ssrc: SsrcSettings::default(),
+            sox_resampler: SoxResamplerSettings::default(),
+            soxr_resampler: SoxrResamplerSettings::default(),
             dsd: DsdSettings::default(),
             metadata: MetadataSettings::default(),
             verification: VerificationSettings::default(),
@@ -242,6 +248,49 @@ fn validate_encoder_settings(settings: &PipelineSettings) -> Result<()> {
             "wavpack.hybrid_bitrate_kbps",
             "expected 24 through 9600 kbps/ch",
         ));
+    }
+    if let Some(bw) = settings.sox_resampler.bandwidth_pct {
+        if !(74.0..=99.7).contains(&bw) {
+            return Err(PlanningError::invalid_settings(
+                "sox_resampler.bandwidth_pct",
+                "expected 74.0 through 99.7",
+            ));
+        }
+    }
+    if settings.sox_resampler.chebyshev
+        && matches!(
+            settings.resample_quality,
+            ResampleQuality::Low | ResampleQuality::Medium
+        )
+    {
+        return Err(PlanningError::invalid_settings(
+            "sox_resampler.chebyshev",
+            "chebyshev (-s) requires resample_quality >= High",
+        ));
+    }
+    if let Some(ph) = settings.sox_resampler.phase {
+        if ph > 100 {
+            return Err(PlanningError::invalid_settings(
+                "sox_resampler.phase",
+                "expected 0 through 100",
+            ));
+        }
+    }
+    if let Some(cutoff) = settings.soxr_resampler.cutoff {
+        if !(0.0..=1.0).contains(&cutoff) {
+            return Err(PlanningError::invalid_settings(
+                "soxr_resampler.cutoff",
+                "expected 0.0 through 1.0",
+            ));
+        }
+    }
+    if let Some(ph) = settings.soxr_resampler.phase {
+        if ph > 100 {
+            return Err(PlanningError::invalid_settings(
+                "soxr_resampler.phase",
+                "expected 0 through 100",
+            ));
+        }
     }
     Ok(())
 }
@@ -485,6 +534,55 @@ impl Default for SsrcSettings {
             force: false,
             insane_mode: false,
             profile: None,
+        }
+    }
+}
+
+/// Sox rate-effect resampler settings. `Option` fields override derived
+/// values from `ResampleQuality`/`NyquistTransition` when `Some`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SoxResamplerSettings {
+    /// Enable steep/Chebyshev filter (`-s` flag). Only valid with quality ≥ High.
+    pub chebyshev: bool,
+    /// Override bandwidth percentage (74.0–99.7). Mutually exclusive with chebyshev.
+    pub bandwidth_pct: Option<f32>,
+    /// Phase shift (0–100).
+    pub phase: Option<u8>,
+    /// Allow aliasing (`-a` flag).
+    pub allow_aliasing: bool,
+}
+
+impl Default for SoxResamplerSettings {
+    fn default() -> Self {
+        Self {
+            chebyshev: false,
+            bandwidth_pct: None,
+            phase: None,
+            allow_aliasing: false,
+        }
+    }
+}
+
+/// Soxr (ffmpeg aresample) resampler settings. `Option` fields override
+/// derived values from `ResampleQuality`/`NyquistTransition` when `Some`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SoxrResamplerSettings {
+    /// Enable Chebyshev filter (`cheby=1`).
+    pub chebyshev: bool,
+    /// Override cutoff (0.0–1.0).
+    pub cutoff: Option<f32>,
+    /// Phase shift (0–100).
+    pub phase: Option<u8>,
+}
+
+impl Default for SoxrResamplerSettings {
+    fn default() -> Self {
+        Self {
+            chebyshev: false,
+            cutoff: None,
+            phase: None,
         }
     }
 }

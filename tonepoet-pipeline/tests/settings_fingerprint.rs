@@ -5,8 +5,8 @@ use tonepoet_pipeline::{
     NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
     SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
-    SsrcProfile, SsrcSettings, TrellisSettings, VerificationSettings, WavPackMode,
-    WavPackSettings,
+    SoxResamplerSettings, SoxrResamplerSettings, SsrcProfile, SsrcSettings, TrellisSettings,
+    VerificationSettings, WavPackMode, WavPackSettings,
 };
 
 /// Valid fingerprint base with named fields for compile-time drift detection.
@@ -37,6 +37,13 @@ use tonepoet_pipeline::{
 /// - ssrc.force: true
 /// - ssrc.insane_mode: true
 /// - ssrc.profile: Some(Long)
+/// - sox_resampler.chebyshev: true
+/// - sox_resampler.bandwidth_pct: Some(97.0)
+/// - sox_resampler.phase: Some(25)
+/// - sox_resampler.allow_aliasing: true
+/// - soxr_resampler.chebyshev: true
+/// - soxr_resampler.cutoff: Some(0.97)
+/// - soxr_resampler.phase: Some(25)
 /// - dsd.noise_shaper: Crfb
 /// - dsd.modulator_order: Order7
 /// - dsd.trellis.lookahead: 17
@@ -100,6 +107,17 @@ fn flac_md5_sentinel() -> PipelineSettings {
             insane_mode: true,
             profile: Some(SsrcProfile::Long),
         },
+        sox_resampler: SoxResamplerSettings {
+            chebyshev: true,
+            bandwidth_pct: Some(97.0),
+            phase: Some(25),
+            allow_aliasing: true,
+        },
+        soxr_resampler: SoxrResamplerSettings {
+            chebyshev: true,
+            cutoff: Some(0.97),
+            phase: Some(25),
+        },
         dsd: DsdSettings {
             noise_shaper: DsdNoiseShaper::Crfb,
             modulator_order: ModulatorOrder::Order7,
@@ -140,7 +158,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 50);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 57);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();
@@ -274,6 +292,47 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     });
     assert_mutation_changes_fingerprint!(covered, base, "ssrc.profile", |settings| {
         settings.ssrc.profile = Some(SsrcProfile::High);
+    });
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "sox_resampler.chebyshev",
+        |settings| {
+            settings.sox_resampler.chebyshev = false;
+        }
+    );
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "sox_resampler.bandwidth_pct",
+        |settings| {
+            settings.sox_resampler.bandwidth_pct = Some(99.0);
+        }
+    );
+    assert_mutation_changes_fingerprint!(covered, base, "sox_resampler.phase", |settings| {
+        settings.sox_resampler.phase = Some(50);
+    });
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "sox_resampler.allow_aliasing",
+        |settings| {
+            settings.sox_resampler.allow_aliasing = false;
+        }
+    );
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "soxr_resampler.chebyshev",
+        |settings| {
+            settings.soxr_resampler.chebyshev = false;
+        }
+    );
+    assert_mutation_changes_fingerprint!(covered, base, "soxr_resampler.cutoff", |settings| {
+        settings.soxr_resampler.cutoff = Some(0.99);
+    });
+    assert_mutation_changes_fingerprint!(covered, base, "soxr_resampler.phase", |settings| {
+        settings.soxr_resampler.phase = Some(50);
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.noise_shaper", |settings| {
         settings.dsd.noise_shaper = DsdNoiseShaper::Sdm;

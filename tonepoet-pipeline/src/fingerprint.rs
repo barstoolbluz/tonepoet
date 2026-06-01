@@ -14,8 +14,8 @@ use crate::enums::{
 };
 use crate::settings::{
     AacSettings, DsdSettings, FlacSettings, MetadataSettings, Mp3Settings, OpusSettings,
-    PipelineSettings, ReplayGainSettings, SincFilterSettings, SsrcSettings, TrellisSettings,
-    VerificationSettings, WavPackSettings,
+    PipelineSettings, ReplayGainSettings, SincFilterSettings, SoxResamplerSettings,
+    SoxrResamplerSettings, SsrcSettings, TrellisSettings, VerificationSettings, WavPackSettings,
 };
 
 /// Deterministic SHA-256 digest for [`PipelineSettings`].
@@ -82,6 +82,13 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "ssrc.force",
     "ssrc.insane_mode",
     "ssrc.profile",
+    "sox_resampler.chebyshev",
+    "sox_resampler.bandwidth_pct",
+    "sox_resampler.phase",
+    "sox_resampler.allow_aliasing",
+    "soxr_resampler.chebyshev",
+    "soxr_resampler.cutoff",
+    "soxr_resampler.phase",
     "dsd.noise_shaper",
     "dsd.modulator_order",
     "dsd.trellis",
@@ -174,6 +181,8 @@ fn push_pipeline_settings(writer: &mut FingerprintWriter, settings: &PipelineSet
     push_opus(writer, &settings.opus);
     push_wavpack(writer, &settings.wavpack);
     push_ssrc(writer, &settings.ssrc);
+    push_sox_resampler(writer, &settings.sox_resampler);
+    push_soxr_resampler(writer, &settings.soxr_resampler);
     push_dsd(writer, &settings.dsd);
     push_metadata(writer, &settings.metadata);
     push_verification(writer, &settings.verification);
@@ -217,6 +226,32 @@ fn push_ssrc(writer: &mut FingerprintWriter, settings: &SsrcSettings) {
     writer.field_static("ssrc.force", bool_value(settings.force));
     writer.field_static("ssrc.insane_mode", bool_value(settings.insane_mode));
     writer.field_string("ssrc.profile", option_static(settings.profile.map(ssrc_profile)));
+}
+
+fn push_sox_resampler(writer: &mut FingerprintWriter, settings: &SoxResamplerSettings) {
+    writer.field_static("sox_resampler.chebyshev", bool_value(settings.chebyshev));
+    writer.field_string(
+        "sox_resampler.bandwidth_pct",
+        option_f32(settings.bandwidth_pct),
+    );
+    writer.field_string("sox_resampler.phase", option_u8(settings.phase));
+    writer.field_static(
+        "sox_resampler.allow_aliasing",
+        bool_value(settings.allow_aliasing),
+    );
+}
+
+fn push_soxr_resampler(writer: &mut FingerprintWriter, settings: &SoxrResamplerSettings) {
+    writer.field_static("soxr_resampler.chebyshev", bool_value(settings.chebyshev));
+    writer.field_string("soxr_resampler.cutoff", option_f32(settings.cutoff));
+    writer.field_string("soxr_resampler.phase", option_u8(settings.phase));
+}
+
+fn option_u8(value: Option<u8>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "None".to_string(),
+    }
 }
 
 fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {

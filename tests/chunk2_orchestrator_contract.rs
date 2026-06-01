@@ -136,6 +136,13 @@ fn legacy_compat_pipeline_settings_cover_the_legacy_option_surface_explicitly() 
         "ssrc.force",
 
         "ssrc.insane_mode",
+        "sox_resampler.chebyshev",
+        "sox_resampler.bandwidth_pct",
+        "sox_resampler.phase",
+        "sox_resampler.allow_aliasing",
+        "soxr_resampler.chebyshev",
+        "soxr_resampler.cutoff",
+        "soxr_resampler.phase",
         "ssrc.profile",
         "settings.dsd = DsdSettings::default()",
         "metadata.transfer_tags",
