@@ -8,19 +8,20 @@ use super::app::{ConvertState, FormatField, FormatState};
 use super::button_map::TuiButton;
 
 /// Apply a keyboard-style next/previous action to the focused format row.
-pub fn handle_format_row_step(format: &mut FormatState, forward: bool, source_bits: Option<u32>) {
+pub fn handle_format_row_step(format: &mut FormatState, forward: bool, source_bits: Option<u32>, source_rate: Option<u32>) {
     if forward {
-        format.select_focused_next(source_bits);
+        format.select_focused_next(source_bits, source_rate);
     } else {
-        format.select_focused_prev(source_bits);
+        format.select_focused_prev(source_bits, source_rate);
     }
 }
 
-/// Convert-screen wrapper that supplies the probed source bit depth.
+/// Convert-screen wrapper that supplies the probed source bit depth and rate.
 pub fn handle_convert_format_row_step(convert: &mut ConvertState, forward: bool) {
     let before_dsd = convert.format.is_dsd_selected();
     let source_bits = convert.current_source_bit_depth();
-    handle_format_row_step(&mut convert.format, forward, source_bits);
+    let source_rate = convert.current_source_sample_rate();
+    handle_format_row_step(&mut convert.format, forward, source_bits, source_rate);
     cascade_dsd_source_to_pcm(convert, before_dsd);
 }
 
@@ -29,34 +30,36 @@ pub fn handle_format_button(
     format: &mut FormatState,
     button: TuiButton,
     source_bits: Option<u32>,
+    source_rate: Option<u32>,
 ) -> bool {
     match button {
-        TuiButton::FormatPill(index) => format.select_row_index(FormatField::Format, index, source_bits),
+        TuiButton::FormatPill(index) => format.select_row_index(FormatField::Format, index, source_bits, source_rate),
         TuiButton::RatePill(index) => {
             let row = if format.is_dsd_selected() {
                 FormatField::DsdRate
             } else {
                 FormatField::SampleRate
             };
-            format.select_row_index(row, index, source_bits);
+            format.select_row_index(row, index, source_bits, source_rate);
         }
-        TuiButton::DepthPill(index) => format.select_row_index(FormatField::BitDepth, index, source_bits),
-        TuiButton::ResamplerPill(index) => format.select_row_index(FormatField::Resampler, index, source_bits),
-        TuiButton::DitherPill(index) => format.select_row_index(FormatField::Dither, index, source_bits),
-        TuiButton::ReplayGainPill(index) => format.select_row_index(FormatField::ReplayGain, index, source_bits),
-        TuiButton::NoiseShaperPill(index) => format.select_row_index(FormatField::NoiseShaper, index, source_bits),
-        TuiButton::ModulatorOrderPill(index) => format.select_row_index(FormatField::ModulatorOrder, index, source_bits),
-        TuiButton::ConversionPresetPill(index) => format.select_row_index(FormatField::ConversionPreset, index, source_bits),
+        TuiButton::DepthPill(index) => format.select_row_index(FormatField::BitDepth, index, source_bits, source_rate),
+        TuiButton::ResamplerPill(index) => format.select_row_index(FormatField::Resampler, index, source_bits, source_rate),
+        TuiButton::DitherPill(index) => format.select_row_index(FormatField::Dither, index, source_bits, source_rate),
+        TuiButton::ReplayGainPill(index) => format.select_row_index(FormatField::ReplayGain, index, source_bits, source_rate),
+        TuiButton::NoiseShaperPill(index) => format.select_row_index(FormatField::NoiseShaper, index, source_bits, source_rate),
+        TuiButton::ModulatorOrderPill(index) => format.select_row_index(FormatField::ModulatorOrder, index, source_bits, source_rate),
+        TuiButton::ConversionPresetPill(index) => format.select_row_index(FormatField::ConversionPreset, index, source_bits, source_rate),
         _ => return false,
     }
     true
 }
 
-/// Convert-screen wrapper that supplies the probed source bit depth.
+/// Convert-screen wrapper that supplies the probed source bit depth and rate.
 pub fn handle_convert_format_button(convert: &mut ConvertState, button: TuiButton) -> bool {
     let before_dsd = convert.format.is_dsd_selected();
     let source_bits = convert.current_source_bit_depth();
-    let handled = handle_format_button(&mut convert.format, button, source_bits);
+    let source_rate = convert.current_source_sample_rate();
+    let handled = handle_format_button(&mut convert.format, button, source_bits, source_rate);
     if handled {
         cascade_dsd_source_to_pcm(convert, before_dsd);
     }

@@ -65,7 +65,7 @@ pub fn draw_format_pane(
         lines.push(pill_row(
             border_color,
             w,
-            "DSD rate  ",
+            "DSD rate   ",
             "",
             &render_pill_spans(
                 &format_state.sample_rate,
@@ -76,14 +76,14 @@ pub fn draw_format_pane(
         lines.push(static_row(
             border_color,
             w,
-            "bit depth ",
+            "bit depth  ",
             "1-bit",
             focused && format_state.field_focus == FormatField::BitDepth,
         ));
         lines.push(pill_row(
             border_color,
             w,
-            "noise sh. ",
+            "noise sh.  ",
             "",
             &render_pill_spans(
                 &format_state.noise_shaper,
@@ -94,7 +94,7 @@ pub fn draw_format_pane(
         lines.push(pill_row(
             border_color,
             w,
-            "mod order ",
+            "mod order  ",
             "",
             &render_pill_spans(
                 &format_state.modulator_order,
@@ -105,7 +105,7 @@ pub fn draw_format_pane(
         lines.push(pill_row(
             border_color,
             w,
-            "preset    ",
+            "preset     ",
             "",
             &render_pill_spans(
                 &format_state.conversion_preset,
@@ -139,7 +139,7 @@ pub fn draw_format_pane(
         lines.push(pill_row(
             border_color,
             w,
-            "resampler ",
+            "resampler  ",
             "",
             &render_pill_spans(
                 &format_state.resampler,
@@ -150,7 +150,7 @@ pub fn draw_format_pane(
         lines.push(pill_row(
             border_color,
             w,
-            "dither    ",
+            "dither     ",
             "",
             &render_pill_spans(
                 &format_state.dither,
@@ -161,7 +161,7 @@ pub fn draw_format_pane(
         lines.push(pill_row(
             border_color,
             w,
-            "replaygain",
+            "replaygain ",
             "",
             &render_pill_spans(
                 &format_state.replaygain,

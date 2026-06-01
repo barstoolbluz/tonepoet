@@ -227,6 +227,7 @@ impl BitDepthChoice {
 /// PCM resampler preference exposed in the format pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResamplerChoice {
+    None,
     Sox,
     Ssrc,
     Soxr,
@@ -239,6 +240,7 @@ pub type DsdConversionPreset = DsdFilterPreset;
 impl ResamplerChoice {
     pub const fn label(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Sox => "sox",
             Self::Ssrc => "ssrc",
             Self::Soxr => "soxr",
@@ -760,6 +762,8 @@ pub struct FormatState {
     pub advanced_open: bool,
     /// False until the user explicitly picks a dither algorithm. Bit-depth changes may update it.
     pub dither_overridden: bool,
+    /// False until the user explicitly picks a resampler. Rate/source changes may reset it.
+    pub resampler_overridden: bool,
     /// Selected container index into `AudioFormat::available_containers()`.
     /// 0 = codec default. Reset to 0 when the format pill changes.
     pub selected_container_index: usize,
@@ -887,14 +891,15 @@ impl FormatState {
         ]);
 
         let resampler = PillState::new(vec![
+            (ResamplerChoice::None, "none"),
             (ResamplerChoice::Soxr, "soxr"),
             (ResamplerChoice::Sox, "sox"),
             (ResamplerChoice::Ssrc, "ssrc"),
         ]);
 
         let dither = PillState::new(vec![
-            (DitherType::TPDF, "TPDF"),
             (DitherType::None, "none"),
+            (DitherType::TPDF, "TPDF"),
             (DitherType::Shibata, "Shibata"),
             (DitherType::LowShibata, "Low-Shibata"),
             (DitherType::HighShibata, "High-Shibata"),
@@ -903,9 +908,9 @@ impl FormatState {
         ]);
 
         let replaygain = PillState::new(vec![
+            (ReplayGainChoice::Both, "both"),
             (ReplayGainChoice::Album, "album"),
             (ReplayGainChoice::Track, "track"),
-            (ReplayGainChoice::Both, "both"),
             (ReplayGainChoice::Off, "off"),
         ]);
 
@@ -941,6 +946,7 @@ impl FormatState {
             field_focus: FormatField::Format,
             advanced_open: false,
             dither_overridden: false,
+            resampler_overridden: false,
             selected_container_index: 0,
             flac_compression_level: 8,
             flac_verify: PillState::new(vec![
@@ -1004,25 +1010,25 @@ impl FormatState {
 
     /// Select the next enabled pill in the focused row and run row-specific side effects.
     /// Key and mouse handlers should use this instead of calling `focused_pill_mut()` directly.
-    pub fn select_focused_next(&mut self, source_bits: Option<u32>) {
+    pub fn select_focused_next(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
         let before_depth = *self.bit_depth.selected_value();
         let before_format = *self.format.selected_value();
         let focused = self.field_focus;
         self.focused_pill_mut().select_next();
-        self.after_user_selection(focused, before_format, before_depth, source_bits);
+        self.after_user_selection(focused, before_format, before_depth, source_bits, source_rate);
     }
 
     /// Select the previous enabled pill in the focused row and run row-specific side effects.
-    pub fn select_focused_prev(&mut self, source_bits: Option<u32>) {
+    pub fn select_focused_prev(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
         let before_depth = *self.bit_depth.selected_value();
         let before_format = *self.format.selected_value();
         let focused = self.field_focus;
         self.focused_pill_mut().select_prev();
-        self.after_user_selection(focused, before_format, before_depth, source_bits);
+        self.after_user_selection(focused, before_format, before_depth, source_bits, source_rate);
     }
 
     /// Select a concrete pill index for mouse handlers and run row-specific side effects.
-    pub fn select_row_index(&mut self, row: FormatField, index: usize, source_bits: Option<u32>) {
+    pub fn select_row_index(&mut self, row: FormatField, index: usize, source_bits: Option<u32>, source_rate: Option<u32>) {
         let before_depth = *self.bit_depth.selected_value();
         let before_format = *self.format.selected_value();
         self.field_focus = row;
@@ -1037,7 +1043,7 @@ impl FormatState {
             FormatField::ModulatorOrder => select_enabled_index(&mut self.modulator_order, index),
             FormatField::ConversionPreset => select_enabled_index(&mut self.conversion_preset, index),
         }
-        self.after_user_selection(row, before_format, before_depth, source_bits);
+        self.after_user_selection(row, before_format, before_depth, source_bits, source_rate);
     }
 
     fn after_user_selection(
@@ -1046,19 +1052,27 @@ impl FormatState {
         before_format: AudioFormat,
         before_depth: BitDepthChoice,
         source_bits: Option<u32>,
+        source_rate: Option<u32>,
     ) {
         if row == FormatField::Dither {
             self.mark_dither_overridden();
         }
+        if row == FormatField::Resampler {
+            self.resampler_overridden = true;
+        }
 
         if row == FormatField::Format && before_format != *self.format.selected_value() {
             self.selected_container_index = 0;
+            self.resampler_overridden = false;
             self.apply_format_constraints();
             if self.is_dsd_selected() {
                 self.dither.select_value(&DitherType::None);
                 self.cascade_dsd_rate_defaults();
-            } else if !self.dither_overridden {
-                self.apply_auto_dither(source_bits);
+            } else {
+                if !self.dither_overridden {
+                    self.apply_auto_dither(source_bits);
+                }
+                self.apply_auto_resampler(source_rate);
             }
             return;
         }
@@ -1070,6 +1084,11 @@ impl FormatState {
         if row == FormatField::BitDepth && before_depth != *self.bit_depth.selected_value() {
             self.dither_overridden = false;
             self.apply_auto_dither(source_bits);
+        }
+
+        if row == FormatField::SampleRate {
+            self.resampler_overridden = false;
+            self.apply_auto_resampler(source_rate);
         }
 
         self.apply_format_constraints();
@@ -1113,6 +1132,22 @@ impl FormatState {
             DitherType::None
         };
         self.dither.select_value(&desired);
+    }
+
+    /// Auto-select resampler based on source vs target sample rate.
+    /// Called when source changes, target rate changes, or format changes.
+    pub fn apply_auto_resampler(&mut self, source_rate: Option<u32>) {
+        if self.resampler_overridden || self.is_dsd_selected() {
+            return;
+        }
+        let target_rate = *self.sample_rate.selected_value();
+        if source_rate == Some(target_rate) || source_rate.is_none() {
+            // Same rate or unknown source → no resampling needed
+            self.resampler.select_value(&ResamplerChoice::None);
+        } else {
+            // Rate change → default to soxr
+            self.resampler.select_value(&ResamplerChoice::Soxr);
+        }
     }
 
     /// Set PCM output defaults to match a PCM source. Called when a source is
@@ -1512,6 +1547,8 @@ impl ConvertState {
         }
         self.format.dither_overridden = false;
         self.format.apply_auto_dither(source_bits);
+        self.format.resampler_overridden = false;
+        self.format.apply_auto_resampler(Some(source_rate));
     }
 }
 

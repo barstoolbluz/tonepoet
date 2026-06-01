@@ -281,6 +281,10 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
                 BitDepthChoice::Float64 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Float64),
             };
             let (tool, transition) = match *format.resampler.selected_value() {
+                ResamplerChoice::None => (
+                    pipeline_enums::PreferredTool::Auto,
+                    pipeline_enums::NyquistTransition::Gentle,
+                ),
                 ResamplerChoice::Sox => (
                     pipeline_enums::PreferredTool::Sox,
                     pipeline_enums::NyquistTransition::Gentle,
