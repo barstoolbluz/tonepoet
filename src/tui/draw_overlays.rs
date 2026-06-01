@@ -855,6 +855,8 @@ fn draw_format_settings(
         FormatSettingsKind::Mp3 { .. } => " MP3 Settings ",
         FormatSettingsKind::WavPack { .. } => " WavPack Settings ",
         FormatSettingsKind::Ssrc { .. } => " SSRC Settings ",
+        FormatSettingsKind::Sox { .. } => " Sox Settings ",
+        FormatSettingsKind::Soxr { .. } => " Soxr Settings ",
     };
 
     f.render_widget(Clear, popup);
@@ -920,6 +922,17 @@ fn draw_format_settings(
             profile,
             insane,
         } => draw_ssrc_fields(f, *profile, *insane, focus, &chunks, buttons),
+        FormatSettingsKind::Sox {
+            chebyshev,
+            bandwidth_input,
+            phase_input,
+            allow_aliasing,
+        } => draw_sox_fields(f, *chebyshev, bandwidth_input, phase_input, *allow_aliasing, focus, &chunks, buttons),
+        FormatSettingsKind::Soxr {
+            chebyshev,
+            cutoff_input,
+            phase_input,
+        } => draw_soxr_fields(f, *chebyshev, cutoff_input, phase_input, focus, &chunks, buttons),
     }
 
     // Footer (shared)
@@ -1565,6 +1578,142 @@ fn draw_ssrc_fields(
     buttons.record_button(TuiButton::FormatSettingsSsrcInsane(1), Rect::new(ix + 6, chunks[2].y, 4, 1));
 }
 
+fn draw_sox_fields(
+    f: &mut Frame,
+    chebyshev: bool,
+    bandwidth_input: &super::text_input::TextInputState,
+    phase_input: &super::text_input::TextInputState,
+    allow_aliasing: bool,
+    focus: FormatSettingsFocus,
+    chunks: &[Rect],
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
+    let greyed = Style::default().fg(Color::DarkGray);
+    let greyed_bg = Color::Rgb(20, 20, 20);
+
+    // Row 1: Chebyshev toggle (off/on)
+    // TODO: grey when quality < High (need quality passed in or read from app state)
+    let cheb_focused = focus == FormatSettingsFocus::SoxChebyshev;
+    let cheb_label_style = if cheb_focused { theme::bright() } else { theme::muted() };
+    let (off_style, on_style) = toggle_pill_styles(chebyshev, cheb_focused);
+    let cheb_line = Line::from(vec![
+        Span::styled("  chebyshev    ", cheb_label_style),
+        Span::styled(" off ", off_style),
+        Span::raw(" "),
+        Span::styled(" on ", on_style),
+    ]);
+    f.render_widget(Paragraph::new(cheb_line), chunks[1]);
+    let cx = chunks[1].x + 15;
+    buttons.record_button(TuiButton::FormatSettingsSoxChebyshev(0), Rect::new(cx, chunks[1].y, 5, 1));
+    buttons.record_button(TuiButton::FormatSettingsSoxChebyshev(1), Rect::new(cx + 6, chunks[1].y, 4, 1));
+
+    // Row 2: Bandwidth text entry — greyed when chebyshev on
+    let bw_focused = focus == FormatSettingsFocus::SoxBandwidth;
+    let bw_label_style = if chebyshev { greyed } else if bw_focused { theme::bright() } else { theme::muted() };
+    let visible_width = chunks[2].width.saturating_sub(20) as usize;
+    let (view, cursor_col) = bandwidth_input.view(visible_width.max(1));
+    let display_val = if view.is_empty() { " ".to_string() } else { view };
+    let bw_bg = if chebyshev { greyed_bg } else if bw_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let bw_fg = if chebyshev { Color::DarkGray } else { Color::White };
+    let bw_line = Line::from(vec![
+        Span::styled("  bandwidth    ", bw_label_style),
+        Span::styled(format!(" {} ", display_val), Style::default().fg(bw_fg).bg(bw_bg)),
+        Span::styled(" %", if chebyshev { greyed } else { theme::muted() }),
+    ]);
+    f.render_widget(Paragraph::new(bw_line), chunks[2]);
+    if bw_focused && !chebyshev {
+        f.set_cursor(chunks[2].x + 16 + cursor_col, chunks[2].y);
+    }
+
+    // Row 3: Phase text entry
+    let ph_focused = focus == FormatSettingsFocus::SoxPhase;
+    let ph_label_style = if ph_focused { theme::bright() } else { theme::muted() };
+    let visible_width_ph = chunks[3].width.saturating_sub(16) as usize;
+    let (view_ph, cursor_col_ph) = phase_input.view(visible_width_ph.max(1));
+    let display_val_ph = if view_ph.is_empty() { " ".to_string() } else { view_ph };
+    let ph_bg = if ph_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let ph_line = Line::from(vec![
+        Span::styled("  phase        ", ph_label_style),
+        Span::styled(format!(" {} ", display_val_ph), Style::default().fg(Color::White).bg(ph_bg)),
+    ]);
+    f.render_widget(Paragraph::new(ph_line), chunks[3]);
+    if ph_focused {
+        f.set_cursor(chunks[3].x + 16 + cursor_col_ph, chunks[3].y);
+    }
+
+    // Row 4: Allow aliasing toggle (off/on)
+    let al_focused = focus == FormatSettingsFocus::SoxAliasing;
+    let al_label_style = if al_focused { theme::bright() } else { theme::muted() };
+    let (al_off, al_on) = toggle_pill_styles(allow_aliasing, al_focused);
+    let al_line = Line::from(vec![
+        Span::styled("  aliasing     ", al_label_style),
+        Span::styled(" off ", al_off),
+        Span::raw(" "),
+        Span::styled(" on ", al_on),
+    ]);
+    f.render_widget(Paragraph::new(al_line), chunks[4]);
+    let ax = chunks[4].x + 15;
+    buttons.record_button(TuiButton::FormatSettingsSoxAliasing(0), Rect::new(ax, chunks[4].y, 5, 1));
+    buttons.record_button(TuiButton::FormatSettingsSoxAliasing(1), Rect::new(ax + 6, chunks[4].y, 4, 1));
+}
+
+fn draw_soxr_fields(
+    f: &mut Frame,
+    chebyshev: bool,
+    cutoff_input: &super::text_input::TextInputState,
+    phase_input: &super::text_input::TextInputState,
+    focus: FormatSettingsFocus,
+    chunks: &[Rect],
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
+    // Row 1: Chebyshev toggle (off/on)
+    let cheb_focused = focus == FormatSettingsFocus::SoxrChebyshev;
+    let cheb_label_style = if cheb_focused { theme::bright() } else { theme::muted() };
+    let (off_style, on_style) = toggle_pill_styles(chebyshev, cheb_focused);
+    let cheb_line = Line::from(vec![
+        Span::styled("  chebyshev    ", cheb_label_style),
+        Span::styled(" off ", off_style),
+        Span::raw(" "),
+        Span::styled(" on ", on_style),
+    ]);
+    f.render_widget(Paragraph::new(cheb_line), chunks[1]);
+    let cx = chunks[1].x + 15;
+    buttons.record_button(TuiButton::FormatSettingsSoxrChebyshev(0), Rect::new(cx, chunks[1].y, 5, 1));
+    buttons.record_button(TuiButton::FormatSettingsSoxrChebyshev(1), Rect::new(cx + 6, chunks[1].y, 4, 1));
+
+    // Row 2: Cutoff text entry
+    let co_focused = focus == FormatSettingsFocus::SoxrCutoff;
+    let co_label_style = if co_focused { theme::bright() } else { theme::muted() };
+    let visible_width = chunks[2].width.saturating_sub(16) as usize;
+    let (view, cursor_col) = cutoff_input.view(visible_width.max(1));
+    let display_val = if view.is_empty() { " ".to_string() } else { view };
+    let co_bg = if co_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let co_line = Line::from(vec![
+        Span::styled("  cutoff       ", co_label_style),
+        Span::styled(format!(" {} ", display_val), Style::default().fg(Color::White).bg(co_bg)),
+    ]);
+    f.render_widget(Paragraph::new(co_line), chunks[2]);
+    if co_focused {
+        f.set_cursor(chunks[2].x + 16 + cursor_col, chunks[2].y);
+    }
+
+    // Row 3: Phase text entry
+    let ph_focused = focus == FormatSettingsFocus::SoxrPhase;
+    let ph_label_style = if ph_focused { theme::bright() } else { theme::muted() };
+    let visible_width_ph = chunks[3].width.saturating_sub(16) as usize;
+    let (view_ph, cursor_col_ph) = phase_input.view(visible_width_ph.max(1));
+    let display_val_ph = if view_ph.is_empty() { " ".to_string() } else { view_ph };
+    let ph_bg = if ph_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let ph_line = Line::from(vec![
+        Span::styled("  phase        ", ph_label_style),
+        Span::styled(format!(" {} ", display_val_ph), Style::default().fg(Color::White).bg(ph_bg)),
+    ]);
+    f.render_widget(Paragraph::new(ph_line), chunks[3]);
+    if ph_focused {
+        f.set_cursor(chunks[3].x + 16 + cursor_col_ph, chunks[3].y);
+    }
+}
+
 fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
     let active = Style::default()
         .fg(theme::PILL_ACTIVE_FG)
@@ -1591,6 +1740,8 @@ pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
         FormatSettingsKind::Mp3 { .. } => 4,
         FormatSettingsKind::WavPack { .. } => 4,
         FormatSettingsKind::Ssrc { .. } => 2,
+        FormatSettingsKind::Sox { .. } => 4,
+        FormatSettingsKind::Soxr { .. } => 3,
     }
 }
 
@@ -1641,6 +1792,10 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
             let pills_width: usize = labels.iter().map(|l| l.len() + 2).sum::<usize>()
                 + labels.len().saturating_sub(1);
             label_width + pills_width
+        }
+        FormatSettingsKind::Sox { .. } | FormatSettingsKind::Soxr { .. } => {
+            // Widest row is toggle: " off " + " " + " on " = 10
+            label_width + 10
         }
     };
     (content_width + 6) as u16

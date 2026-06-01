@@ -306,11 +306,15 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             qx += w + 1; // pill + gap
         }
         // Right-aligned "ssrc settings" pill when SSRC selected
-        if matches!(
-            *state.resampler.selected_value(),
-            crate::tui::app::ResamplerChoice::Ssrc
-        ) {
-            let pill_w: u16 = 15; // " ssrc settings "
+        // Right-aligned "<resampler> settings" pill
+        let resampler_name = match *state.resampler.selected_value() {
+            crate::tui::app::ResamplerChoice::Ssrc => Some("ssrc"),
+            crate::tui::app::ResamplerChoice::Sox => Some("sox"),
+            crate::tui::app::ResamplerChoice::Soxr => Some("soxr"),
+            _ => None,
+        };
+        if let Some(name) = resampler_name {
+            let pill_w = name.len() as u16 + 11; // " {name} settings "
             let pill_x = area.x + area.width.saturating_sub(pill_w + 1);
             buttons.record_button(
                 TuiButton::ResamplerSettingsButton,

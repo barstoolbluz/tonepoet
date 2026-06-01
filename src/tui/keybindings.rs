@@ -6372,6 +6372,46 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
             app.convert.format.ssrc_profile = *profile;
             app.convert.format.ssrc_insane_mode = *insane;
         }
+        FormatSettingsKind::Sox {
+            chebyshev,
+            bandwidth_input,
+            phase_input,
+            allow_aliasing,
+        } => {
+            app.convert.format.sox_chebyshev = *chebyshev;
+            app.convert.format.sox_bandwidth = bandwidth_input
+                .text
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| (74.0..=99.7).contains(v));
+            app.convert.format.sox_phase = phase_input
+                .text
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|v| *v <= 100);
+            app.convert.format.sox_allow_aliasing = *allow_aliasing;
+        }
+        FormatSettingsKind::Soxr {
+            chebyshev,
+            cutoff_input,
+            phase_input,
+        } => {
+            app.convert.format.soxr_chebyshev = *chebyshev;
+            app.convert.format.soxr_cutoff = cutoff_input
+                .text
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| (0.0..=1.0).contains(v));
+            app.convert.format.soxr_phase = phase_input
+                .text
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|v| *v <= 100);
+        }
     }
     app.preset.mark_modified();
 }
@@ -6433,6 +6473,28 @@ fn format_settings_focus_next(kind: &FormatSettingsKind, focus: FormatSettingsFo
             FormatSettingsFocus::SsrcProfile => FormatSettingsFocus::SsrcInsane,
             _ => FormatSettingsFocus::SsrcProfile,
         },
+        FormatSettingsKind::Sox { chebyshev, .. } => {
+            if *chebyshev {
+                // Chebyshev on: skip bandwidth
+                match focus {
+                    FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxPhase,
+                    FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxAliasing,
+                    _ => FormatSettingsFocus::SoxChebyshev,
+                }
+            } else {
+                match focus {
+                    FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxBandwidth,
+                    FormatSettingsFocus::SoxBandwidth => FormatSettingsFocus::SoxPhase,
+                    FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxAliasing,
+                    _ => FormatSettingsFocus::SoxChebyshev,
+                }
+            }
+        }
+        FormatSettingsKind::Soxr { .. } => match focus {
+            FormatSettingsFocus::SoxrChebyshev => FormatSettingsFocus::SoxrCutoff,
+            FormatSettingsFocus::SoxrCutoff => FormatSettingsFocus::SoxrPhase,
+            _ => FormatSettingsFocus::SoxrChebyshev,
+        },
     }
 }
 
@@ -6487,6 +6549,27 @@ fn format_settings_focus_prev(kind: &FormatSettingsKind, focus: FormatSettingsFo
         FormatSettingsKind::Ssrc { .. } => match focus {
             FormatSettingsFocus::SsrcProfile => FormatSettingsFocus::SsrcInsane,
             _ => FormatSettingsFocus::SsrcProfile,
+        },
+        FormatSettingsKind::Sox { chebyshev, .. } => {
+            if *chebyshev {
+                match focus {
+                    FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxAliasing,
+                    FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxChebyshev,
+                    _ => FormatSettingsFocus::SoxPhase,
+                }
+            } else {
+                match focus {
+                    FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxAliasing,
+                    FormatSettingsFocus::SoxBandwidth => FormatSettingsFocus::SoxChebyshev,
+                    FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxBandwidth,
+                    _ => FormatSettingsFocus::SoxPhase,
+                }
+            }
+        }
+        FormatSettingsKind::Soxr { .. } => match focus {
+            FormatSettingsFocus::SoxrChebyshev => FormatSettingsFocus::SoxrPhase,
+            FormatSettingsFocus::SoxrCutoff => FormatSettingsFocus::SoxrChebyshev,
+            _ => FormatSettingsFocus::SoxrCutoff,
         },
     }
 }
@@ -6721,6 +6804,48 @@ fn handle_format_settings_field_key(
                 _ => {}
             }
         }
+        FormatSettingsKind::Sox {
+            chebyshev,
+            bandwidth_input,
+            phase_input,
+            allow_aliasing,
+        } => match focus {
+            FormatSettingsFocus::SoxChebyshev => {
+                if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                    *chebyshev = !*chebyshev;
+                }
+            }
+            FormatSettingsFocus::SoxBandwidth => {
+                super::text_input::handle_text_input_key(bandwidth_input, key);
+            }
+            FormatSettingsFocus::SoxPhase => {
+                super::text_input::handle_text_input_key(phase_input, key);
+            }
+            FormatSettingsFocus::SoxAliasing => {
+                if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                    *allow_aliasing = !*allow_aliasing;
+                }
+            }
+            _ => {}
+        },
+        FormatSettingsKind::Soxr {
+            chebyshev,
+            cutoff_input,
+            phase_input,
+        } => match focus {
+            FormatSettingsFocus::SoxrChebyshev => {
+                if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                    *chebyshev = !*chebyshev;
+                }
+            }
+            FormatSettingsFocus::SoxrCutoff => {
+                super::text_input::handle_text_input_key(cutoff_input, key);
+            }
+            FormatSettingsFocus::SoxrPhase => {
+                super::text_input::handle_text_input_key(phase_input, key);
+            }
+            _ => {}
+        },
     }
 }
 
@@ -6865,6 +6990,18 @@ fn handle_format_settings_mouse(
                     *insane = i == 1;
                     return;
                 }
+                (FormatSettingsKind::Sox { ref mut chebyshev, .. }, TuiButton::FormatSettingsSoxChebyshev(i)) => {
+                    *chebyshev = i == 1;
+                    return;
+                }
+                (FormatSettingsKind::Sox { ref mut allow_aliasing, .. }, TuiButton::FormatSettingsSoxAliasing(i)) => {
+                    *allow_aliasing = i == 1;
+                    return;
+                }
+                (FormatSettingsKind::Soxr { ref mut chebyshev, .. }, TuiButton::FormatSettingsSoxrChebyshev(i)) => {
+                    *chebyshev = i == 1;
+                    return;
+                }
                 _ => {}
             }
         }
@@ -6919,6 +7056,19 @@ fn handle_format_settings_mouse(
             FormatSettingsKind::Ssrc { .. } => match my {
                 y if y == field1_y => Some(FormatSettingsFocus::SsrcProfile),
                 y if y == field2_y => Some(FormatSettingsFocus::SsrcInsane),
+                _ => None,
+            },
+            FormatSettingsKind::Sox { chebyshev, .. } => match my {
+                y if y == field1_y => Some(FormatSettingsFocus::SoxChebyshev),
+                y if y == field2_y && !*chebyshev => Some(FormatSettingsFocus::SoxBandwidth),
+                y if y == field3_y => Some(FormatSettingsFocus::SoxPhase),
+                y if y == field4_y => Some(FormatSettingsFocus::SoxAliasing),
+                _ => None,
+            },
+            FormatSettingsKind::Soxr { .. } => match my {
+                y if y == field1_y => Some(FormatSettingsFocus::SoxrChebyshev),
+                y if y == field2_y => Some(FormatSettingsFocus::SoxrCutoff),
+                y if y == field3_y => Some(FormatSettingsFocus::SoxrPhase),
                 _ => None,
             },
         };
@@ -10905,20 +11055,43 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::ResamplerSettingsButton => {
                 app.convert.focus = ConvertFocus::Format;
-                if matches!(
-                    *app.convert.format.resampler.selected_value(),
-                    ResamplerChoice::Ssrc
-                ) {
-                    let fmt = &app.convert.format;
-                    let kind = FormatSettingsKind::Ssrc {
-                        profile: fmt.ssrc_profile,
-                        insane: fmt.ssrc_insane_mode,
-                    };
-                    app.active_overlay = ActiveOverlay::FormatSettings {
-                        kind,
-                        focus: FormatSettingsFocus::SsrcProfile,
-                    };
-                }
+                let fmt = &app.convert.format;
+                let (kind, focus) = match *fmt.resampler.selected_value() {
+                    ResamplerChoice::Ssrc => (
+                        FormatSettingsKind::Ssrc {
+                            profile: fmt.ssrc_profile,
+                            insane: fmt.ssrc_insane_mode,
+                        },
+                        FormatSettingsFocus::SsrcProfile,
+                    ),
+                    ResamplerChoice::Sox => (
+                        FormatSettingsKind::Sox {
+                            chebyshev: fmt.sox_chebyshev,
+                            bandwidth_input: super::text_input::TextInputState::new(
+                                fmt.sox_bandwidth.map(|v| format!("{}", v)).unwrap_or_default(),
+                            ),
+                            phase_input: super::text_input::TextInputState::new(
+                                fmt.sox_phase.map(|v| v.to_string()).unwrap_or_default(),
+                            ),
+                            allow_aliasing: fmt.sox_allow_aliasing,
+                        },
+                        FormatSettingsFocus::SoxChebyshev,
+                    ),
+                    ResamplerChoice::Soxr => (
+                        FormatSettingsKind::Soxr {
+                            chebyshev: fmt.soxr_chebyshev,
+                            cutoff_input: super::text_input::TextInputState::new(
+                                fmt.soxr_cutoff.map(|v| format!("{}", v)).unwrap_or_default(),
+                            ),
+                            phase_input: super::text_input::TextInputState::new(
+                                fmt.soxr_phase.map(|v| v.to_string()).unwrap_or_default(),
+                            ),
+                        },
+                        FormatSettingsFocus::SoxrChebyshev,
+                    ),
+                    _ => return,
+                };
+                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
             }
             TuiButton::MergePill(i) => {
                 app.convert.focus = ConvertFocus::OutputOptions;
@@ -11280,7 +11453,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsWavPackHybrid(_)
             | TuiButton::FormatSettingsWavPackCorrection(_)
             | TuiButton::FormatSettingsSsrcProfile(_)
-            | TuiButton::FormatSettingsSsrcInsane(_) => {
+            | TuiButton::FormatSettingsSsrcInsane(_)
+            | TuiButton::FormatSettingsSoxChebyshev(_)
+            | TuiButton::FormatSettingsSoxAliasing(_)
+            | TuiButton::FormatSettingsSoxrChebyshev(_) => {
                 // Handled in dedicated mouse handlers; no-op here.
             }
         }

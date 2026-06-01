@@ -75,6 +75,12 @@ pub enum TuiButton {
     FormatSettingsSsrcProfile(usize),
     /// SSRC insane toggle pills inside the FormatSettings overlay.
     FormatSettingsSsrcInsane(usize),
+    /// Sox chebyshev toggle pills inside the FormatSettings overlay.
+    FormatSettingsSoxChebyshev(usize),
+    /// Sox aliasing toggle pills inside the FormatSettings overlay.
+    FormatSettingsSoxAliasing(usize),
+    /// Soxr chebyshev toggle pills inside the FormatSettings overlay.
+    FormatSettingsSoxrChebyshev(usize),
 
     // Convert screen controls
     PresetsButton,
@@ -241,7 +247,10 @@ impl TuiButton {
             | Self::FormatSettingsWavPackHybrid(_)
             | Self::FormatSettingsWavPackCorrection(_)
             | Self::FormatSettingsSsrcProfile(_)
-            | Self::FormatSettingsSsrcInsane(_) => None,
+            | Self::FormatSettingsSsrcInsane(_)
+            | Self::FormatSettingsSoxChebyshev(_)
+            | Self::FormatSettingsSoxAliasing(_)
+            | Self::FormatSettingsSoxrChebyshev(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)

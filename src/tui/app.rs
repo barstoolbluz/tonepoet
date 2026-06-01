@@ -137,6 +137,15 @@ pub enum FormatSettingsFocus {
     // SSRC
     SsrcProfile,
     SsrcInsane,
+    // Sox
+    SoxChebyshev,
+    SoxBandwidth,
+    SoxPhase,
+    SoxAliasing,
+    // Soxr
+    SoxrChebyshev,
+    SoxrCutoff,
+    SoxrPhase,
 }
 
 /// Format-specific overlay state, keyed by codec.
@@ -173,6 +182,17 @@ pub enum FormatSettingsKind {
     Ssrc {
         profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
         insane: bool,
+    },
+    Sox {
+        chebyshev: bool,
+        bandwidth_input: crate::tui::text_input::TextInputState,
+        phase_input: crate::tui::text_input::TextInputState,
+        allow_aliasing: bool,
+    },
+    Soxr {
+        chebyshev: bool,
+        cutoff_input: crate::tui::text_input::TextInputState,
+        phase_input: crate::tui::text_input::TextInputState,
     },
 }
 

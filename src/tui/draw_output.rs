@@ -262,18 +262,20 @@ pub fn draw_format_pane(
         })
         .collect();
 
-        let is_ssrc = matches!(
-            *format_state.resampler.selected_value(),
-            ResamplerChoice::Ssrc
-        );
-        if is_ssrc {
+        let resampler_name = match *format_state.resampler.selected_value() {
+            ResamplerChoice::Ssrc => Some("ssrc"),
+            ResamplerChoice::Sox => Some("sox"),
+            ResamplerChoice::Soxr => Some("soxr"),
+            _ => None,
+        };
+        if let Some(name) = resampler_name {
             lines.push(row_with_settings_pill(
                 border_color,
                 w,
                 "preset     ",
                 &quality_pills,
                 focused,
-                "ssrc",
+                name,
             ));
         } else {
             lines.push(pill_row(
