@@ -281,6 +281,43 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             );
         }
     }
+
+    // Below-the-fold: quality pill row when maximized and resampler is active.
+    if is_maximized
+        && !matches!(
+            *state.resampler.selected_value(),
+            crate::tui::app::ResamplerChoice::None
+        )
+    {
+        let quality_row_y = if containers.len() > 1 {
+            area.y + last_standard_row + 5 // after blank + container + blank + resampler header
+        } else {
+            area.y + last_standard_row + 4 // after blank + blank + resampler header (no container)
+        };
+        // Register quality pills
+        let mut qx = label_col;
+        let quality_labels = ["low", "med", "high", "vhigh", "ultra", "insane"];
+        for (i, label) in quality_labels.iter().enumerate() {
+            let w = label.len() as u16 + 2; // " label "
+            buttons.record_button(
+                TuiButton::ResampleQualityPill(i),
+                ratatui::layout::Rect::new(qx, quality_row_y, w, 1),
+            );
+            qx += w + 1; // pill + gap
+        }
+        // Right-aligned "ssrc settings" pill when SSRC selected
+        if matches!(
+            *state.resampler.selected_value(),
+            crate::tui::app::ResamplerChoice::Ssrc
+        ) {
+            let pill_w: u16 = 15; // " ssrc settings "
+            let pill_x = area.x + area.width.saturating_sub(pill_w + 1);
+            buttons.record_button(
+                TuiButton::ResamplerSettingsButton,
+                ratatui::layout::Rect::new(pill_x, quality_row_y, pill_w, 1),
+            );
+        }
+    }
 }
 
 fn register_output_options_buttons(app: &mut AppState, area: Rect) {

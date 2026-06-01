@@ -57,7 +57,7 @@ use tonepoet_pipeline::{
 /// - wavpack.hybrid_bitrate_kbps: 256
 /// - wavpack.correction_file: false
 /// - ssrc.force: true
-/// - ssrc.two_pass: false
+
 /// - ssrc.insane_mode: true
 /// - ssrc.profile: Some(Long)
 /// - dsd.noise_shaper: Crfb
@@ -122,7 +122,6 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
         },
         ssrc: SsrcSettings {
             force: true,
-            two_pass: false,
             insane_mode: true,
             profile: Some(SsrcProfile::Long),
         },
@@ -236,7 +235,7 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.wavpack.hybrid_bitrate_kbps, &expected.wavpack.hybrid_bitrate_kbps, "wavpack.hybrid_bitrate_kbps");
     assert_eq!(&actual.wavpack.correction_file, &expected.wavpack.correction_file, "wavpack.correction_file");
     assert_eq!(&actual.ssrc.force, &expected.ssrc.force, "ssrc.force");
-    assert_eq!(&actual.ssrc.two_pass, &expected.ssrc.two_pass, "ssrc.two_pass");
+
     assert_eq!(&actual.ssrc.insane_mode, &expected.ssrc.insane_mode, "ssrc.insane_mode");
     assert_eq!(&actual.ssrc.profile, &expected.ssrc.profile, "ssrc.profile");
     assert_eq!(&actual.dsd.noise_shaper, &expected.dsd.noise_shaper, "dsd.noise_shaper");
@@ -313,7 +312,7 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "wavpack.hybrid_bitrate_kbps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "wavpack.correction_file", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "ssrc.force", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "ssrc.two_pass", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+
     SentinelFieldInventoryRow { path: "ssrc.insane_mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "ssrc.profile", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.noise_shaper", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
@@ -371,7 +370,7 @@ fn field_differs_from_default(
         "wavpack.hybrid_bitrate_kbps" => settings.wavpack.hybrid_bitrate_kbps != default.wavpack.hybrid_bitrate_kbps,
         "wavpack.correction_file" => settings.wavpack.correction_file != default.wavpack.correction_file,
         "ssrc.force" => settings.ssrc.force != default.ssrc.force,
-        "ssrc.two_pass" => settings.ssrc.two_pass != default.ssrc.two_pass,
+
         "ssrc.insane_mode" => settings.ssrc.insane_mode != default.ssrc.insane_mode,
         "ssrc.profile" => settings.ssrc.profile != default.ssrc.profile,
         "dsd.noise_shaper" => settings.dsd.noise_shaper != default.dsd.noise_shaper,
@@ -491,7 +490,7 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, wavpack.hybrid_bitrate_kbps, "wavpack.hybrid_bitrate_kbps");
     assert_covered_by_non_default!(default, raw, raw, wavpack.correction_file, "wavpack.correction_file");
     assert_covered_by_non_default!(default, raw, raw, ssrc.force, "ssrc.force");
-    assert_covered_by_non_default!(default, raw, raw, ssrc.two_pass, "ssrc.two_pass");
+
     assert_covered_by_non_default!(default, raw, raw, ssrc.insane_mode, "ssrc.insane_mode");
     assert_covered_by_non_default!(default, raw, raw, ssrc.profile, "ssrc.profile");
     assert_covered_by_non_default!(default, raw, raw, dsd.noise_shaper, "dsd.noise_shaper");
@@ -551,7 +550,7 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, wavpack.hybrid_bitrate_kbps, "wavpack.hybrid_bitrate_kbps");
     assert_covered_by_non_default!(default, flac, custom, wavpack.correction_file, "wavpack.correction_file");
     assert_covered_by_non_default!(default, flac, custom, ssrc.force, "ssrc.force");
-    assert_covered_by_non_default!(default, flac, custom, ssrc.two_pass, "ssrc.two_pass");
+
     assert_covered_by_non_default!(default, flac, custom, ssrc.insane_mode, "ssrc.insane_mode");
     assert_covered_by_non_default!(default, flac, custom, ssrc.profile, "ssrc.profile");
     assert_covered_by_non_default!(default, flac, custom, dsd.noise_shaper, "dsd.noise_shaper");
@@ -684,7 +683,7 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("wavpack.hybrid_bitrate_kbps", LegacyProjectionStatus::Defaulted),
     ("wavpack.correction_file", LegacyProjectionStatus::Defaulted),
     ("ssrc.force", LegacyProjectionStatus::Derived),
-    ("ssrc.two_pass", LegacyProjectionStatus::Defaulted),
+
     ("ssrc.insane_mode", LegacyProjectionStatus::Translated),
     ("ssrc.profile", LegacyProjectionStatus::Derived),
     ("dsd.noise_shaper", LegacyProjectionStatus::Unrepresentable),
@@ -852,7 +851,7 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_unrepresentable!(covered, "wavpack.hybrid_bitrate_kbps", wavpack.wavpack.hybrid_bitrate_kbps, default.wavpack.hybrid_bitrate_kbps, sentinel.wavpack.hybrid_bitrate_kbps);
     assert_legacy_unrepresentable!(covered, "wavpack.correction_file", wavpack.wavpack.correction_file, default.wavpack.correction_file, sentinel.wavpack.correction_file);
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.force", flac.ssrc.force, true);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "ssrc.two_pass", flac.ssrc.two_pass, true);
+
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "ssrc.insane_mode", flac.ssrc.insane_mode, true);
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.profile", flac.ssrc.profile, Some(SsrcProfile::Insane));
     assert_legacy_unrepresentable!(covered, "dsd.noise_shaper", flac.dsd.noise_shaper, default.dsd.noise_shaper, sentinel.dsd.noise_shaper);

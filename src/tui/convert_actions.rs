@@ -333,7 +333,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         target_format,
         target_sample_rate,
         target_bit_depth,
-        resample_quality: pipeline_enums::ResampleQuality::Ultra,
+        resample_quality: format.resample_quality,
         nyquist_transition,
         dither_type,
         preferred_tool,
@@ -364,7 +364,11 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             hybrid_bitrate_kbps: format.wavpack_bitrate_kbps,
             correction_file: format.wavpack_correction,
         },
-        ssrc: Default::default(),
+        ssrc: tonepoet_pipeline::SsrcSettings {
+            force: false,
+            insane_mode: format.ssrc_insane_mode,
+            profile: format.ssrc_profile,
+        },
         dsd,
         // settings-sentinel-allow: metadata/verification defaults until TUI exposes them
         metadata: Default::default(),

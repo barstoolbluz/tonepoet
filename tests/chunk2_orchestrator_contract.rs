@@ -134,7 +134,7 @@ fn legacy_compat_pipeline_settings_cover_the_legacy_option_surface_explicitly() 
         "wavpack.hybrid_bitrate_kbps",
         "wavpack.correction_file",
         "ssrc.force",
-        "ssrc.two_pass",
+
         "ssrc.insane_mode",
         "ssrc.profile",
         "settings.dsd = DsdSettings::default()",

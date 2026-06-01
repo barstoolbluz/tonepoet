@@ -80,7 +80,6 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "wavpack.hybrid_bitrate_kbps",
     "wavpack.correction_file",
     "ssrc.force",
-    "ssrc.two_pass",
     "ssrc.insane_mode",
     "ssrc.profile",
     "dsd.noise_shaper",
@@ -216,7 +215,6 @@ fn push_wavpack(writer: &mut FingerprintWriter, settings: &WavPackSettings) {
 
 fn push_ssrc(writer: &mut FingerprintWriter, settings: &SsrcSettings) {
     writer.field_static("ssrc.force", bool_value(settings.force));
-    writer.field_static("ssrc.two_pass", bool_value(settings.two_pass));
     writer.field_static("ssrc.insane_mode", bool_value(settings.insane_mode));
     writer.field_string("ssrc.profile", option_static(settings.profile.map(ssrc_profile)));
 }

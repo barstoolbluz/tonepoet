@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{FormatField, FormatState};
+use super::app::{FormatField, FormatState, ResamplerChoice};
 use super::pill::render_pill_spans;
 use super::theme;
 
@@ -219,6 +219,74 @@ pub fn draw_format_pane(
         }
     }
 
+    // Below-the-fold: quality pill row when maximized and resampler is active.
+    let resampler_active = maximized
+        && !matches!(
+            *format_state.resampler.selected_value(),
+            ResamplerChoice::None
+        );
+    if resampler_active {
+        lines.push(bordered_line(border_color, w, vec![]));
+        let resample_label_style = if focused { theme::bright() } else { theme::muted() };
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![Span::styled("   resampling", resample_label_style)],
+        ));
+        use tonepoet_pipeline::enums::ResampleQuality;
+        let quality_pills: Vec<Span> = [
+            (ResampleQuality::Low, "low"),
+            (ResampleQuality::Medium, "med"),
+            (ResampleQuality::High, "high"),
+            (ResampleQuality::VeryHigh, "vhigh"),
+            (ResampleQuality::Ultra, "ultra"),
+            (ResampleQuality::Insane, "insane"),
+        ]
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (q, label))| {
+            let selected = *q == format_state.resample_quality;
+            let style = if selected {
+                Style::default()
+                    .fg(theme::PILL_ACTIVE_FG)
+                    .bg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT_DIM)
+            };
+            let mut spans = vec![Span::styled(format!(" {} ", label), style)];
+            if i < 5 {
+                spans.push(Span::styled(" ", Style::default()));
+            }
+            spans
+        })
+        .collect();
+
+        let is_ssrc = matches!(
+            *format_state.resampler.selected_value(),
+            ResamplerChoice::Ssrc
+        );
+        if is_ssrc {
+            lines.push(row_with_settings_pill(
+                border_color,
+                w,
+                "preset     ",
+                &quality_pills,
+                focused,
+                "ssrc",
+            ));
+        } else {
+            lines.push(pill_row(
+                border_color,
+                w,
+                "preset     ",
+                "",
+                &quality_pills,
+                focused,
+            ));
+        }
+    }
+
     lines.push(bordered_line(border_color, w, vec![]));
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
     while lines.len() < target_len_before_bottom {
@@ -338,10 +406,22 @@ fn container_row_with_settings_pill<'a>(
     width: usize,
     pills: &[Span<'a>],
     focused: bool,
-    format_name: &str,
+    settings_name: &str,
+) -> Line<'a> {
+    row_with_settings_pill(border_color, width, "container  ", pills, focused, settings_name)
+}
+
+/// Generic row with left-aligned pills and a right-aligned settings pill.
+fn row_with_settings_pill<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    label: &'a str,
+    pills: &[Span<'a>],
+    focused: bool,
+    settings_name: &str,
 ) -> Line<'a> {
     let label_style = if focused { theme::bright() } else { theme::muted() };
-    let pill_text = format!(" {} settings ", format_name);
+    let pill_text = format!(" {} settings ", settings_name);
     let pill_width = pill_text.len();
     let settings_pill = Span::styled(
         pill_text,
@@ -353,7 +433,7 @@ fn container_row_with_settings_pill<'a>(
 
     let mut spans = vec![
         Span::styled("│", theme::border(border_color)),
-        Span::styled("   container   ", label_style),
+        Span::styled(format!("   {}  ", label), label_style),
     ];
     spans.extend_from_slice(pills);
 

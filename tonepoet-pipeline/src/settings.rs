@@ -473,8 +473,6 @@ impl Default for WavPackSettings {
 pub struct SsrcSettings {
     /// Force SSRC when `nyquist_transition` is `BrickWall`.
     pub force: bool,
-    /// Use two-pass processing where available.
-    pub two_pass: bool,
     /// Force the highest SSRC profile.
     pub insane_mode: bool,
     /// Optional explicit profile. `insane_mode` wins.
@@ -485,7 +483,6 @@ impl Default for SsrcSettings {
     fn default() -> Self {
         Self {
             force: false,
-            two_pass: true,
             insane_mode: false,
             profile: None,
         }

@@ -6368,6 +6368,10 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
             app.convert.format.wavpack_bitrate_kbps = bitrate;
             app.convert.format.wavpack_correction = *correction;
         }
+        FormatSettingsKind::Ssrc { profile, insane } => {
+            app.convert.format.ssrc_profile = *profile;
+            app.convert.format.ssrc_insane_mode = *insane;
+        }
     }
     app.preset.mark_modified();
 }
@@ -6425,6 +6429,10 @@ fn format_settings_focus_next(kind: &FormatSettingsKind, focus: FormatSettingsFo
                 }
             }
         }
+        FormatSettingsKind::Ssrc { .. } => match focus {
+            FormatSettingsFocus::SsrcProfile => FormatSettingsFocus::SsrcInsane,
+            _ => FormatSettingsFocus::SsrcProfile,
+        },
     }
 }
 
@@ -6476,6 +6484,10 @@ fn format_settings_focus_prev(kind: &FormatSettingsKind, focus: FormatSettingsFo
                 }
             }
         }
+        FormatSettingsKind::Ssrc { .. } => match focus {
+            FormatSettingsFocus::SsrcProfile => FormatSettingsFocus::SsrcInsane,
+            _ => FormatSettingsFocus::SsrcProfile,
+        },
     }
 }
 
@@ -6676,6 +6688,39 @@ fn handle_format_settings_field_key(
                 _ => {}
             }
         }
+        FormatSettingsKind::Ssrc {
+            profile,
+            insane,
+        } => {
+            use tonepoet_pipeline::enums::SsrcProfile;
+            match focus {
+                FormatSettingsFocus::SsrcProfile => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let profiles = [
+                            None,
+                            Some(SsrcProfile::Fast),
+                            Some(SsrcProfile::Short),
+                            Some(SsrcProfile::Standard),
+                            Some(SsrcProfile::Long),
+                            Some(SsrcProfile::High),
+                        ];
+                        let cur = profiles.iter().position(|p| p == profile).unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { profiles.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % profiles.len()
+                        };
+                        *profile = profiles[next];
+                    }
+                }
+                FormatSettingsFocus::SsrcInsane => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        *insane = !*insane;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -6798,7 +6843,26 @@ fn handle_format_settings_mouse(
                     return;
                 }
                 (FormatSettingsKind::WavPack { ref mut correction, .. }, TuiButton::FormatSettingsWavPackCorrection(i)) => {
-                    *correction = i == 1; // 0 = off, 1 = on
+                    *correction = i == 1;
+                    return;
+                }
+                (FormatSettingsKind::Ssrc { ref mut profile, .. }, TuiButton::FormatSettingsSsrcProfile(i)) => {
+                    use tonepoet_pipeline::enums::SsrcProfile;
+                    let profiles = [
+                        None,
+                        Some(SsrcProfile::Fast),
+                        Some(SsrcProfile::Short),
+                        Some(SsrcProfile::Standard),
+                        Some(SsrcProfile::Long),
+                        Some(SsrcProfile::High),
+                    ];
+                    if let Some(p) = profiles.get(i) {
+                        *profile = *p;
+                    }
+                    return;
+                }
+                (FormatSettingsKind::Ssrc { ref mut insane, .. }, TuiButton::FormatSettingsSsrcInsane(i)) => {
+                    *insane = i == 1;
                     return;
                 }
                 _ => {}
@@ -6852,6 +6916,11 @@ fn handle_format_settings_mouse(
                     _ => None,
                 }
             }
+            FormatSettingsKind::Ssrc { .. } => match my {
+                y if y == field1_y => Some(FormatSettingsFocus::SsrcProfile),
+                y if y == field2_y => Some(FormatSettingsFocus::SsrcInsane),
+                _ => None,
+            },
         };
         if let Some(f) = new_focus {
             *focus = f;
@@ -10818,6 +10887,39 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 };
                 app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
             }
+            TuiButton::ResampleQualityPill(i) => {
+                use tonepoet_pipeline::enums::ResampleQuality;
+                app.convert.focus = ConvertFocus::Format;
+                let qualities = [
+                    ResampleQuality::Low,
+                    ResampleQuality::Medium,
+                    ResampleQuality::High,
+                    ResampleQuality::VeryHigh,
+                    ResampleQuality::Ultra,
+                    ResampleQuality::Insane,
+                ];
+                if let Some(&q) = qualities.get(i) {
+                    app.convert.format.resample_quality = q;
+                    app.preset.mark_modified();
+                }
+            }
+            TuiButton::ResamplerSettingsButton => {
+                app.convert.focus = ConvertFocus::Format;
+                if matches!(
+                    *app.convert.format.resampler.selected_value(),
+                    ResamplerChoice::Ssrc
+                ) {
+                    let fmt = &app.convert.format;
+                    let kind = FormatSettingsKind::Ssrc {
+                        profile: fmt.ssrc_profile,
+                        insane: fmt.ssrc_insane_mode,
+                    };
+                    app.active_overlay = ActiveOverlay::FormatSettings {
+                        kind,
+                        focus: FormatSettingsFocus::SsrcProfile,
+                    };
+                }
+            }
             TuiButton::MergePill(i) => {
                 app.convert.focus = ConvertFocus::OutputOptions;
                 app.convert.output_options.field_focus = OutputOptionsField::MergeMode;
@@ -11176,7 +11278,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsMp3Preset(_)
             | TuiButton::FormatSettingsWavPackMode(_)
             | TuiButton::FormatSettingsWavPackHybrid(_)
-            | TuiButton::FormatSettingsWavPackCorrection(_) => {
+            | TuiButton::FormatSettingsWavPackCorrection(_)
+            | TuiButton::FormatSettingsSsrcProfile(_)
+            | TuiButton::FormatSettingsSsrcInsane(_) => {
                 // Handled in dedicated mouse handlers; no-op here.
             }
         }

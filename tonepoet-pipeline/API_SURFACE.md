@@ -66,7 +66,7 @@ The crate root re-exports the public items from these modules.
 - `AacSettings`: `profile`, `bitrate_kbps`
 - `OpusSettings`: `content_type`, `bitrate_kbps`, `complexity`
 - `WavPackSettings`: `mode`, `hybrid`, `hybrid_bitrate_kbps`, `correction_file`
-- `SsrcSettings`: `force`, `two_pass`, `insane_mode`, `profile`
+- `SsrcSettings`: `force`, `insane_mode`, `profile`
 - `DsdSettings`: `noise_shaper`, `modulator_order`, `trellis`, `pcm_to_dsd_filter`, `dsd_to_pcm_lowpass`, `dsd_to_pcm_gain_db`, `sinc`, `gain_compensation`
 - `TrellisSettings`: `lookahead`, `nodes`, `latency`
 - `SincFilterSettings`: `oversample_factor`, `taps`, `passband_hz`, `transition_hz`, `kaiser_beta`, `linear_phase`, `allow_aliasing`

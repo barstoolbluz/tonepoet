@@ -270,7 +270,7 @@ fn legacy_pipeline_settings_for_item(item: &ConversionItem) -> ConversionResult<
         })
         .unwrap_or(NyquistTransition::Gentle);
     settings.ssrc.force = matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
-    settings.ssrc.two_pass = true;
+
     settings.ssrc.insane_mode = item
         .options
         .ssrc_insane_mode
@@ -446,7 +446,7 @@ fn apply_explicit_pipeline_defaults(settings: &mut PipelineSettings, item: &Conv
 
     settings.ssrc.force = settings.ssrc.force
         || matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
-    settings.ssrc.two_pass = true;
+
     if settings.ssrc.insane_mode {
         settings.ssrc.profile = Some(SsrcProfile::Insane);
     } else if settings.ssrc.force && settings.ssrc.profile.is_none() {

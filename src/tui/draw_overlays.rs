@@ -854,6 +854,7 @@ fn draw_format_settings(
         FormatSettingsKind::Opus { .. } => " Opus Settings ",
         FormatSettingsKind::Mp3 { .. } => " MP3 Settings ",
         FormatSettingsKind::WavPack { .. } => " WavPack Settings ",
+        FormatSettingsKind::Ssrc { .. } => " SSRC Settings ",
     };
 
     f.render_widget(Clear, popup);
@@ -915,6 +916,10 @@ fn draw_format_settings(
             bitrate_input,
             correction,
         } => draw_wavpack_fields(f, *mode, *hybrid, bitrate_input, *correction, focus, &chunks, buttons),
+        FormatSettingsKind::Ssrc {
+            profile,
+            insane,
+        } => draw_ssrc_fields(f, *profile, *insane, focus, &chunks, buttons),
     }
 
     // Footer (shared)
@@ -1495,6 +1500,71 @@ fn draw_wavpack_fields(
     }
 }
 
+fn draw_ssrc_fields(
+    f: &mut Frame,
+    profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
+    insane: bool,
+    focus: FormatSettingsFocus,
+    chunks: &[Rect],
+    buttons: &mut super::button_map::ButtonRenderMap,
+) {
+    use tonepoet_pipeline::enums::SsrcProfile;
+
+    // Row 1: Profile pills (fast/short/std/long/high)
+    let prof_focused = focus == FormatSettingsFocus::SsrcProfile;
+    let prof_label_style = if prof_focused { theme::bright() } else { theme::muted() };
+    let profiles = [
+        (SsrcProfile::Fast, "fast"),
+        (SsrcProfile::Short, "short"),
+        (SsrcProfile::Standard, "std"),
+        (SsrcProfile::Long, "long"),
+        (SsrcProfile::High, "high"),
+    ];
+    let mut prof_spans = vec![Span::styled("  profile      ", prof_label_style)];
+    let mut px = chunks[1].x + 15;
+    for (i, (p, label)) in profiles.iter().enumerate() {
+        let selected = profile == Some(*p);
+        let style = if selected {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if prof_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        prof_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(
+            TuiButton::FormatSettingsSsrcProfile(i),
+            Rect::new(px, chunks[1].y, pill_w, 1),
+        );
+        px += pill_w;
+        if i + 1 < profiles.len() {
+            prof_spans.push(Span::raw(" "));
+            px += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(prof_spans)), chunks[1]);
+
+    // Row 2: Insane toggle (off/on)
+    let ins_focused = focus == FormatSettingsFocus::SsrcInsane;
+    let ins_label_style = if ins_focused { theme::bright() } else { theme::muted() };
+    let (off_style, on_style) = toggle_pill_styles(insane, ins_focused);
+    let ins_line = Line::from(vec![
+        Span::styled("  insane       ", ins_label_style),
+        Span::styled(" off ", off_style),
+        Span::raw(" "),
+        Span::styled(" on ", on_style),
+    ]);
+    f.render_widget(Paragraph::new(ins_line), chunks[2]);
+    let ix = chunks[2].x + 15;
+    buttons.record_button(TuiButton::FormatSettingsSsrcInsane(0), Rect::new(ix, chunks[2].y, 5, 1));
+    buttons.record_button(TuiButton::FormatSettingsSsrcInsane(1), Rect::new(ix + 6, chunks[2].y, 4, 1));
+}
+
 fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
     let active = Style::default()
         .fg(theme::PILL_ACTIVE_FG)
@@ -1520,6 +1590,7 @@ pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
         FormatSettingsKind::Opus { .. } => 4,
         FormatSettingsKind::Mp3 { .. } => 4,
         FormatSettingsKind::WavPack { .. } => 4,
+        FormatSettingsKind::Ssrc { .. } => 2,
     }
 }
 
@@ -1560,8 +1631,13 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
             label_width + pills_width
         }
         FormatSettingsKind::WavPack { .. } => {
-            // Widest row: mode pills (fast/normal/high/very high)
             let labels = ["fast", "normal", "high", "very high"];
+            let pills_width: usize = labels.iter().map(|l| l.len() + 2).sum::<usize>()
+                + labels.len().saturating_sub(1);
+            label_width + pills_width
+        }
+        FormatSettingsKind::Ssrc { .. } => {
+            let labels = ["fast", "short", "std", "long", "high"];
             let pills_width: usize = labels.iter().map(|l| l.len() + 2).sum::<usize>()
                 + labels.len().saturating_sub(1);
             label_width + pills_width

@@ -67,6 +67,14 @@ pub enum TuiButton {
     FormatSettingsWavPackHybrid(usize),
     /// WavPack correction toggle pills inside the FormatSettings overlay.
     FormatSettingsWavPackCorrection(usize),
+    /// Resample quality pills (below-the-fold on format pane).
+    ResampleQualityPill(usize),
+    /// Resampler-specific settings pill (e.g. "ssrc settings").
+    ResamplerSettingsButton,
+    /// SSRC profile pills inside the FormatSettings overlay.
+    FormatSettingsSsrcProfile(usize),
+    /// SSRC insane toggle pills inside the FormatSettings overlay.
+    FormatSettingsSsrcInsane(usize),
 
     // Convert screen controls
     PresetsButton,
@@ -231,7 +239,9 @@ impl TuiButton {
             | Self::FormatSettingsMp3Preset(_)
             | Self::FormatSettingsWavPackMode(_)
             | Self::FormatSettingsWavPackHybrid(_)
-            | Self::FormatSettingsWavPackCorrection(_) => None,
+            | Self::FormatSettingsWavPackCorrection(_)
+            | Self::FormatSettingsSsrcProfile(_)
+            | Self::FormatSettingsSsrcInsane(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)
@@ -245,6 +255,8 @@ impl TuiButton {
             | Self::MergePill(_)
             | Self::ContainerPill(_)
             | Self::FormatSettingsButton
+            | Self::ResampleQualityPill(_)
+            | Self::ResamplerSettingsButton
             | Self::PresetsButton
             | Self::SaveButton
             | Self::AdvancedToggle(_)

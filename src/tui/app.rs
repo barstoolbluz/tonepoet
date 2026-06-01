@@ -134,6 +134,9 @@ pub enum FormatSettingsFocus {
     WavPackHybrid,
     WavPackBitrate,
     WavPackCorrection,
+    // SSRC
+    SsrcProfile,
+    SsrcInsane,
 }
 
 /// Format-specific overlay state, keyed by codec.
@@ -166,6 +169,10 @@ pub enum FormatSettingsKind {
         hybrid: bool,
         bitrate_input: crate::tui::text_input::TextInputState,
         correction: bool,
+    },
+    Ssrc {
+        profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
+        insane: bool,
     },
 }
 
@@ -804,6 +811,12 @@ pub struct FormatState {
     pub wavpack_bitrate_kbps: u32,
     /// Write .wvc correction file alongside hybrid .wv. Default: true.
     pub wavpack_correction: bool,
+    /// Resampling quality preset. Default: Ultra.
+    pub resample_quality: tonepoet_pipeline::enums::ResampleQuality,
+    /// SSRC explicit profile override. None = derive from resample_quality.
+    pub ssrc_profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
+    /// SSRC insane mode (force insane profile). Default: false.
+    pub ssrc_insane_mode: bool,
 }
 
 // MP3 bitrate presets (used by CBR and ABR modes).
@@ -970,6 +983,9 @@ impl FormatState {
             wavpack_hybrid: false,
             wavpack_bitrate_kbps: 320,
             wavpack_correction: true,
+            resample_quality: tonepoet_pipeline::enums::ResampleQuality::Ultra,
+            ssrc_profile: None,
+            ssrc_insane_mode: false,
         };
         state.apply_format_constraints();
         state

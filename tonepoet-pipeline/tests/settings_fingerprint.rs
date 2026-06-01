@@ -35,7 +35,6 @@ use tonepoet_pipeline::{
 /// - wavpack.hybrid_bitrate_kbps: 256
 /// - wavpack.correction_file: false
 /// - ssrc.force: true
-/// - ssrc.two_pass: false
 /// - ssrc.insane_mode: true
 /// - ssrc.profile: Some(Long)
 /// - dsd.noise_shaper: Crfb
@@ -98,7 +97,6 @@ fn flac_md5_sentinel() -> PipelineSettings {
         },
         ssrc: SsrcSettings {
             force: true,
-            two_pass: false,
             insane_mode: true,
             profile: Some(SsrcProfile::Long),
         },
@@ -142,7 +140,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 51);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 50);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();
@@ -270,9 +268,6 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     });
     assert_mutation_changes_fingerprint!(covered, base, "ssrc.force", |settings| {
         settings.ssrc.force = false;
-    });
-    assert_mutation_changes_fingerprint!(covered, base, "ssrc.two_pass", |settings| {
-        settings.ssrc.two_pass = true;
     });
     assert_mutation_changes_fingerprint!(covered, base, "ssrc.insane_mode", |settings| {
         settings.ssrc.insane_mode = false;
