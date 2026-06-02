@@ -1831,8 +1831,8 @@ pub enum ActiveOverlay {
     FormatSettings {
         kind: FormatSettingsKind,
         focus: FormatSettingsFocus,
-        /// When true, overlay shows help text instead of controls.
-        show_help: bool,
+        /// `None` = controls mode. `Some(scroll)` = help mode with scroll offset.
+        help_scroll: Option<usize>,
     },
 }
 

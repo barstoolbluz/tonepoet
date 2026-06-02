@@ -179,10 +179,10 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::FormatSettings {
             ref kind,
             focus,
-            show_help,
+            help_scroll,
         } => {
             let kind = kind.clone();
-            draw_format_settings(f, &kind, focus, show_help, &mut app.button_map);
+            draw_format_settings(f, &kind, focus, help_scroll, &mut app.button_map);
         }
     }
 
@@ -840,11 +840,11 @@ fn draw_format_settings(
     f: &mut Frame,
     kind: &FormatSettingsKind,
     focus: FormatSettingsFocus,
-    show_help: bool,
+    help_scroll: Option<usize>,
     buttons: &mut super::button_map::ButtonRenderMap,
 ) {
-    if show_help {
-        draw_format_settings_help(f, kind);
+    if let Some(scroll) = help_scroll {
+        draw_format_settings_help(f, kind, scroll);
         return;
     }
     let area = f.size();
@@ -1626,74 +1626,487 @@ fn draw_ssrc_fields(
     buttons.record_button(TuiButton::FormatSettingsSsrcInsane(1), Rect::new(ix + 6, chunks[2].y, 4, 1));
 }
 
-/// Render context-specific help text for the format/resampler settings overlay.
-fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind) {
-    let area = f.size();
-    let help_lines: Vec<(&str, &str)> = match kind {
+/// Build the enriched help content for a given format settings kind.
+/// Each entry is (label, &[description_lines]).
+fn format_settings_help_content(kind: &FormatSettingsKind) -> Vec<(&'static str, &'static [&'static str])> {
+    match kind {
         FormatSettingsKind::Flac { .. } => vec![
-            ("compression", "Encode effort 0-8. Higher = smaller file, slower."),
-            ("verify", "Decode-verify after encoding to catch errors."),
-            ("md5 checksum", "Store audio MD5 in FLAC streaminfo header."),
+            ("compression", &[
+                "Encoding effort level from 0 to 8. This controls how hard the",
+                "encoder works to find optimal predictions — higher levels try",
+                "more partition orders and LPC models, producing slightly smaller",
+                "files at the cost of slower encoding.",
+                "",
+                "All levels produce bit-identical lossless output; only encode",
+                "time and file size differ. Level 5 (the default) is a good",
+                "balance. Levels 6-8 yield diminishing returns — typically 1-2%",
+                "smaller files for 2-4x longer encode times. Level 0 is useful",
+                "for fast intermediates that will be re-encoded later.",
+            ] as &[&str]),
+            ("verify", &[
+                "When enabled, the encoder decodes each frame immediately after",
+                "encoding and compares the result against the original PCM input.",
+                "This catches rare encoder bugs, memory corruption, or disk write",
+                "errors during the encode process.",
+                "",
+                "Roughly doubles encode time. Recommended for archival rips and",
+                "any conversion where data integrity is critical. Can be left off",
+                "for quick intermediate files or batch previews.",
+            ]),
+            ("md5 checksum", &[
+                "Stores an MD5 hash of the uncompressed audio data in the FLAC",
+                "streaminfo header. Any decoder can later recompute this hash to",
+                "verify that the audio content has not been corrupted (bit-rot,",
+                "truncation, bad sector, incomplete transfer).",
+                "",
+                "Nearly zero encoding overhead. Strongly recommended to keep on.",
+                "Some tools (dbpoweramp, foobar2000, flac -t) use this checksum",
+                "for integrity verification. Without it, you can only verify by",
+                "fully decoding and re-encoding, which is much slower.",
+            ]),
         ],
         FormatSettingsKind::Aac { .. } => vec![
-            ("profile", "LC = standard, HE = low bitrate (SBR), HEv2 = very low (SBR+PS)."),
-            ("quality", "Bitrate presets. Profile-aware: HE/HEv2 use lower rates."),
-            ("bitrate", "Target bitrate in kbps. Overrides preset when edited."),
+            ("profile", &[
+                "The AAC encoding profile determines the codec features used:",
+                "",
+                "  LC-AAC    Standard low-complexity profile. Best quality at",
+                "            moderate to high bitrates (96-256+ kbps). Use this",
+                "            for general music encoding.",
+                "",
+                "  HE-AAC   High Efficiency. Adds Spectral Band Replication (SBR)",
+                "            to reconstruct high frequencies from a compact low-",
+                "            frequency core. Best at 48-80 kbps — outperforms LC",
+                "            at low bitrates but wastes bits above ~96 kbps.",
+                "",
+                "  HE-AACv2 Adds Parametric Stereo on top of SBR. Encodes stereo",
+                "            image as parameters rather than discrete channels.",
+                "            Best at very low bitrates (24-48 kbps) for speech or",
+                "            streaming. Not suitable for critical music listening.",
+                "",
+                "Quality presets adjust automatically when you change profile.",
+                "Encoded via libfdk_aac (Fraunhofer reference implementation).",
+            ]),
+            ("quality", &[
+                "Bitrate presets tuned per profile. Selecting a preset fills the",
+                "bitrate field with the corresponding value. The presets represent",
+                "common quality tiers:",
+                "",
+                "  LC-AAC:   low=96, medium=128, good=192, high=256 kbps",
+                "  HE-AAC:   low=32, medium=48, good=64, high=80 kbps",
+                "  HE-AACv2: low=24, medium=32, good=40, high=48 kbps",
+                "",
+                "Editing the bitrate field directly overrides the preset. The",
+                "preset indicator clears when the bitrate no longer matches any",
+                "preset value.",
+            ]),
+            ("bitrate", &[
+                "Target bitrate in kilobits per second. For LC-AAC, the usable",
+                "range is roughly 64-320 kbps; for HE profiles, lower ranges",
+                "apply (see quality presets above). Values outside the codec's",
+                "supported range will be clamped by the encoder.",
+                "",
+                "AAC uses a VBR-like encoding internally — the bitrate is a",
+                "target, not a hard ceiling. Actual file sizes may vary slightly.",
+            ]),
         ],
         FormatSettingsKind::Opus { .. } => vec![
-            ("content type", "Auto detects; Music optimizes for music; Speech for voice."),
-            ("quality", "Bitrate presets. Selecting one fills the bitrate field."),
-            ("bitrate", "Target bitrate in kbps (6-510). Overrides preset when edited."),
-            ("complexity", "Encoder effort 0-10. Higher = better quality, slower encode."),
+            ("content type", &[
+                "Tells the Opus encoder what kind of audio to expect:",
+                "",
+                "  Auto     Encoder auto-detects content type per frame. Good",
+                "           default for mixed content or when unsure.",
+                "",
+                "  Music    Optimizes for tonal, complex audio (instruments,",
+                "           vocals, orchestral). Uses MDCT mode with longer",
+                "           windows for better frequency resolution.",
+                "",
+                "  Speech   Optimizes for voice (SILK mode at low bitrates,",
+                "           CELT at higher). Better for podcasts, audiobooks,",
+                "           and voice recordings. Not recommended for music.",
+            ]),
+            ("quality", &[
+                "Bitrate presets for common quality tiers. Selecting a preset",
+                "fills the bitrate field:",
+                "",
+                "  low=64, medium=96, good=128, high=160, ultra=256 kbps",
+                "",
+                "Opus is remarkably efficient — 128 kbps Opus generally matches",
+                "or exceeds 256 kbps MP3 and 192 kbps AAC in listening tests.",
+                "For archival-quality transparent encoding, 160-192 kbps is",
+                "typically sufficient. 256+ kbps is overkill for most material.",
+            ]),
+            ("bitrate", &[
+                "Target bitrate in kilobits per second (6-510 kbps). Opus uses",
+                "variable bitrate internally — this is a target, not a ceiling.",
+                "",
+                "Practical range: 64-256 kbps for music, 24-64 kbps for speech.",
+                "Below 64 kbps, audible artifacts may appear on complex music.",
+                "Above 256 kbps, returns are negligible for most listeners.",
+                "",
+                "Editing this field directly overrides any selected preset.",
+            ]),
+            ("complexity", &[
+                "Encoder computational effort from 0 to 10. Higher values allow",
+                "the encoder to use more CPU time searching for optimal encoding",
+                "decisions, potentially yielding better quality at the same",
+                "bitrate.",
+                "",
+                "Default: 10 (maximum). There is rarely a reason to lower this",
+                "unless encoding speed is critical (e.g., real-time streaming).",
+                "The quality difference between 9 and 10 is minimal, but between",
+                "0 and 10 it can be significant at low bitrates.",
+            ]),
         ],
         FormatSettingsKind::Mp3 { .. } => vec![
-            ("mode", "VBR = variable (quality-based), CBR = constant, ABR = average."),
-            ("vbr quality", "VBR quality 0-9. 0 = best (~245kbps), 2 = good (~190kbps)."),
-            ("preset", "CBR/ABR bitrate presets. Selecting one fills the bitrate field."),
-            ("bitrate", "Target bitrate in kbps for CBR/ABR modes."),
+            ("mode", &[
+                "The encoding mode controls how bitrate is allocated:",
+                "",
+                "  VBR  Variable Bit Rate. The encoder allocates more bits to",
+                "       complex passages and fewer to silence/simple sections.",
+                "       Controlled by the VBR quality setting (not bitrate).",
+                "       Best quality-per-byte for music. Recommended default.",
+                "",
+                "  CBR  Constant Bit Rate. Every frame uses the same number of",
+                "       bits regardless of content. Predictable file size but",
+                "       wastes bits on simple passages. Required by some older",
+                "       hardware players and streaming protocols.",
+                "",
+                "  ABR  Average Bit Rate. A compromise: targets an average",
+                "       bitrate over time but allows frame-level variation.",
+                "       Less efficient than VBR, more flexible than CBR.",
+                "",
+                "Switching mode greys out the irrelevant quality controls.",
+            ]),
+            ("vbr quality", &[
+                "VBR quality level from 0 (highest) to 9 (lowest). Only active",
+                "in VBR mode. This controls the encoder's quality target — the",
+                "actual bitrate varies based on content complexity:",
+                "",
+                "  0 = ~245 kbps  (transparent for most material)",
+                "  2 = ~190 kbps  (recommended — excellent quality)",
+                "  4 = ~165 kbps  (good for casual listening)",
+                "  6 = ~130 kbps  (noticeable artifacts on complex material)",
+                "  9 = ~65 kbps   (low quality, small files)",
+                "",
+                "Uses LAME's VBR algorithm. Quality 2 is widely considered the",
+                "best balance of quality and file size for music.",
+            ]),
+            ("preset", &[
+                "Bitrate presets for CBR and ABR modes. Selecting a preset fills",
+                "the bitrate field. Greyed out in VBR mode (use VBR quality",
+                "instead). Common choices:",
+                "",
+                "  128 kbps — acceptable for casual listening",
+                "  192 kbps — good quality for most music",
+                "  256 kbps — high quality, near-transparent",
+                "  320 kbps — maximum MP3 bitrate, transparent",
+            ]),
+            ("bitrate", &[
+                "Target bitrate in kilobits per second for CBR and ABR modes.",
+                "Greyed out in VBR mode. Valid range: 32-320 kbps.",
+                "",
+                "For CBR, every frame uses exactly this bitrate. For ABR, this",
+                "is the target average. Editing this field directly overrides",
+                "any selected preset.",
+            ]),
         ],
         FormatSettingsKind::WavPack { .. } => vec![
-            ("mode", "Compression effort. Higher = smaller file, slower encode."),
-            ("hybrid", "Lossy mode at target bitrate. With correction = lossless."),
-            ("bitrate", "Target kbps per channel for hybrid mode (24-9600)."),
-            ("correction", "Write .wvc lossless correction sidecar alongside .wv."),
+            ("mode", &[
+                "Compression effort level. All modes produce lossless output",
+                "(unless hybrid mode is enabled). Higher modes try harder to",
+                "find optimal predictions:",
+                "",
+                "  Fast      Fastest encoding, largest files. Useful for quick",
+                "            intermediates or when disk space is not a concern.",
+                "",
+                "  Normal    Default balance of speed and compression. Good for",
+                "            most use cases.",
+                "",
+                "  High      Better compression at the cost of slower encoding.",
+                "            Typical improvement: 1-3% smaller than Normal.",
+                "",
+                "  Very High Maximum compression effort. Diminishing returns",
+                "            over High — marginally smaller files, noticeably",
+                "            slower encoding.",
+            ]),
+            ("hybrid", &[
+                "Enables WavPack's unique hybrid mode, which produces a lossy",
+                ".wv file at the target bitrate. The lossy file is independently",
+                "playable and typically much smaller than lossless.",
+                "",
+                "When combined with the correction file option, a .wvc sidecar",
+                "is written alongside the .wv. Together, the .wv + .wvc pair",
+                "reconstruct the original lossless audio — giving you the best",
+                "of both worlds: a compact lossy file for playback and a small",
+                "correction file for lossless recovery.",
+                "",
+                "Without the correction file, hybrid mode is purely lossy.",
+            ]),
+            ("bitrate", &[
+                "Target bitrate per channel in kilobits per second for hybrid",
+                "mode (24-9600 kbps). Only active when hybrid is enabled.",
+                "",
+                "Typical values: 256-512 kbps/channel for high-quality lossy,",
+                "128-256 kbps/channel for moderate. Higher values produce larger",
+                "lossy files but smaller correction files (and vice versa).",
+            ]),
+            ("correction", &[
+                "When enabled, writes a .wvc lossless correction sidecar file",
+                "alongside the .wv hybrid file. The correction file contains",
+                "the difference between the lossy and lossless representations.",
+                "",
+                "Only active when hybrid mode is enabled. With correction on,",
+                "the total size (.wv + .wvc) is similar to a normal lossless",
+                "WavPack file, but you gain the option to distribute or play",
+                "just the smaller .wv file when full lossless isn't needed.",
+            ]),
         ],
         FormatSettingsKind::Ssrc { .. } => vec![
-            ("profile", "Filter length. Longer = steeper rolloff, more processing."),
-            ("insane", "Force maximum quality profile regardless of preset."),
+            ("profile", &[
+                "Controls the FIR filter length used during sample rate",
+                "conversion. Longer filters provide steeper rolloff and better",
+                "stopband rejection at the cost of more processing time:",
+                "",
+                "  Fast       Shortest filter. Quick but may allow some",
+                "             aliasing. Suitable for previews.",
+                "",
+                "  Standard   Good balance for most conversions.",
+                "",
+                "  High       Recommended for quality-critical work.",
+                "",
+                "  Insane     Maximum filter length. Extremely clean conversion",
+                "             with deep stopband rejection. Slowest.",
+                "",
+                "SSRC uses brick-wall sinc interpolation, which produces",
+                "exceptionally clean results for integer-ratio conversions",
+                "(e.g., 96 kHz → 48 kHz, 88.2 kHz → 44.1 kHz).",
+            ]),
+            ("insane", &[
+                "Forces the maximum quality profile regardless of the profile",
+                "setting above. This is a legacy toggle from the original SSRC",
+                "command-line tool — effectively equivalent to selecting the",
+                "Insane profile, but as a separate override.",
+                "",
+                "When both this toggle and a profile are set, the insane flag",
+                "takes precedence.",
+            ]),
         ],
         FormatSettingsKind::Sox { .. } => vec![
-            ("chebyshev", "Steep equiripple filter. Forces 99% bandwidth. Needs quality >= High."),
-            ("nyquist cutoff", "Anti-aliasing rolloff as % of Nyquist. Higher = more content preserved."),
-            ("phase", "0 = linear (preserves shape), 50 = intermediate, 100 = minimum phase."),
-            ("aliasing", "Allow content above Nyquist. Creative use only; avoid for archival."),
-            ("taps", "FIR filter length (power of 2). More taps = sharper filter, slower."),
-            ("attenuation", "Stopband rejection in dB (80-200). Higher = less aliasing leakage."),
-            ("passband", "Lowpass cutoff frequency in Hz. Typically half of target sample rate."),
-            ("transition", "Rolloff width in Hz (1-5000). Narrower = steeper filter."),
-            ("kaiser beta", "Window shape (0-32). Higher = more sidelobe suppression."),
-            ("sinc phase", "Linear preserves waveform; minimum reduces pre-ringing."),
+            ("chebyshev", &[
+                "Enables a Chebyshev (equiripple) anti-aliasing filter instead",
+                "of the default windowed-sinc design. Chebyshev filters have a",
+                "sharper transition band — they cut off more steeply at the",
+                "Nyquist frequency — at the cost of slight passband ripple.",
+                "",
+                "When enabled, bandwidth is forced to 99% of Nyquist and the",
+                "nyquist cutoff field is greyed out. Requires resample quality",
+                "of High or above to be effective.",
+                "",
+                "Use for critical sample rate conversions where you want maximum",
+                "content preservation with minimal aliasing leakage.",
+            ]),
+            ("nyquist cutoff", &[
+                "Anti-aliasing filter rolloff as a percentage of the Nyquist",
+                "frequency (half the target sample rate). Controls how much of",
+                "the audio bandwidth is preserved during resampling.",
+                "",
+                "  95%   Gentle rolloff. Slight high-frequency loss but very",
+                "        clean transition. Good for general use.",
+                "  97%   Moderate. Preserves more content, slightly less clean.",
+                "  99%+  Steep. Preserves nearly all content up to Nyquist but",
+                "        may produce ringing artifacts if filter quality is low.",
+                "",
+                "Greyed out when chebyshev is enabled (forced to 99%).",
+                "Valid range: 74-99.7%.",
+            ]),
+            ("phase", &[
+                "Controls the phase response of the resampling filter, as an",
+                "integer from 0 to 100:",
+                "",
+                "  0    Linear phase. Preserves waveform shape perfectly but",
+                "       introduces symmetric pre-ringing and post-ringing around",
+                "       transients. Best for measurement or scientific use.",
+                "",
+                "  50   Intermediate phase. A blend of linear and minimum phase",
+                "       characteristics. Moderate pre-ring, good transient",
+                "       preservation. Good general-purpose choice.",
+                "",
+                "  100  Minimum phase. Eliminates pre-ringing entirely at the",
+                "       cost of asymmetric post-ringing and slight phase shift.",
+                "       Many listeners prefer this for music — transient attacks",
+                "       sound cleaner and more natural.",
+            ]),
+            ("aliasing", &[
+                "Allows frequency content above the Nyquist limit to fold back",
+                "into the audible range (aliasing) rather than being filtered.",
+                "",
+                "Off (default): The resampling filter removes content above",
+                "Nyquist before downsampling, preventing aliasing artifacts.",
+                "",
+                "On: Content above Nyquist is preserved, which creates aliasing",
+                "products (new frequencies not in the original). This is almost",
+                "never desirable for music — it introduces inharmonic distortion.",
+                "Only useful for experimental/creative sound design.",
+            ]),
+            ("taps", &[
+                "FIR filter length for the sinc pre-filter, specified as a power",
+                "of 2. More taps produce a sharper, more precise filter at the",
+                "cost of increased CPU time and latency.",
+                "",
+                "Valid values: 1024 to 67108864 (powers of 2 only).",
+                "",
+                "Leave empty to use the default derived from resample quality.",
+                "Typical values: 4096-32768 for moderate quality, 65536-262144",
+                "for high precision. Values above 1M are extreme and rarely",
+                "needed outside of measurement contexts.",
+            ]),
+            ("attenuation", &[
+                "Stopband rejection depth in decibels for the sinc pre-filter.",
+                "Controls how thoroughly the filter suppresses content above the",
+                "cutoff frequency.",
+                "",
+                "Higher values push the stopband noise floor lower, reducing",
+                "aliasing leakage into the passband. Valid range: 80-200 dB.",
+                "",
+                "Leave empty for the default. 120 dB is a good starting point",
+                "for high-quality work. Values above 160 dB are extreme and may",
+                "require very long filters (high tap count) to be achievable.",
+            ]),
+            ("passband", &[
+                "Lowpass cutoff frequency in Hz for the sinc pre-filter. Content",
+                "above this frequency will be attenuated by the filter.",
+                "",
+                "Typically set to half the target sample rate (e.g., 22050 Hz",
+                "when downsampling to 44.1 kHz). Leave empty to use the default",
+                "derived from the target rate and nyquist cutoff percentage.",
+                "",
+                "Valid range: 1-220000 Hz.",
+            ]),
+            ("transition", &[
+                "Transition band width in Hz for the sinc pre-filter. This is",
+                "the frequency range over which the filter rolls off from full",
+                "passband to full stopband attenuation.",
+                "",
+                "Narrower values produce a steeper, more precise filter but",
+                "require more taps to avoid ringing. Wider values produce a",
+                "gentler rolloff that is easier on the filter design.",
+                "",
+                "Leave empty for the default. Valid range: 1-5000 Hz.",
+                "Typical values: 100-1000 Hz for music.",
+            ]),
+            ("kaiser beta", &[
+                "Shape parameter for the Kaiser window function applied to the",
+                "sinc filter. Controls the trade-off between main-lobe width",
+                "(frequency selectivity) and side-lobe level (aliasing).",
+                "",
+                "  Low (2-4)   Wide main lobe, low side lobes. Less selective",
+                "              but cleaner stopband.",
+                "  Medium (6-10) Good balance for most audio work.",
+                "  High (14-20)  Narrow main lobe, higher side lobes. More",
+                "                selective but more spectral leakage.",
+                "",
+                "Leave empty for the default. Valid range: 0-32.",
+            ]),
+            ("sinc phase", &[
+                "Phase response of the sinc pre-filter (separate from the main",
+                "resampling phase control above):",
+                "",
+                "  Linear        Symmetric impulse response. Preserves waveform",
+                "                shape but introduces pre-ringing before transients.",
+                "",
+                "  Minimum       No pre-ringing. All ringing occurs after the",
+                "                transient. Often preferred for percussive music.",
+                "",
+                "  Intermediate  A compromise between linear and minimum phase.",
+                "",
+                "Leave unselected (no pill highlighted) to inherit the default",
+                "from the main phase setting.",
+            ]),
         ],
         FormatSettingsKind::Soxr { .. } => vec![
-            ("chebyshev", "Equiripple passband filter. Sharper cutoff with slight ripple."),
-            ("nyquist cutoff", "Anti-aliasing rolloff as % of Nyquist. 95 = gentle, 99.7 = steep."),
-            ("phase", "0 = linear (preserves shape), 50 = intermediate, 100 = minimum phase."),
+            ("chebyshev", &[
+                "Enables a Chebyshev (equiripple) passband filter instead of",
+                "the default design. The Chebyshev filter distributes error",
+                "evenly across the passband as small ripples, achieving a",
+                "sharper cutoff for a given filter order.",
+                "",
+                "The ripple is typically inaudible (< 0.01 dB). This provides",
+                "a steeper transition from passband to stopband, preserving",
+                "more high-frequency content at the cost of minor passband",
+                "ripple. Recommended for quality-critical downsampling.",
+            ]),
+            ("nyquist cutoff", &[
+                "Anti-aliasing filter rolloff as a percentage of the Nyquist",
+                "frequency. Controls how aggressively the filter protects",
+                "against aliasing versus how much bandwidth is preserved.",
+                "",
+                "  74-90%  Conservative. Removes more content but ensures very",
+                "          clean results with no aliasing artifacts.",
+                "  91-96%  Balanced. Good default range for most work.",
+                "  97-99%+ Aggressive. Preserves nearly all content but relies",
+                "          on filter quality to suppress aliasing.",
+                "",
+                "Valid range: 74-99.7%. Leave empty for the default derived",
+                "from resample quality preset.",
+            ]),
+            ("phase", &[
+                "Controls the phase response of the soxr resampling filter, as",
+                "an integer from 0 to 100. Same semantics as the sox phase",
+                "control:",
+                "",
+                "  0    Linear phase — preserves waveform shape, symmetric",
+                "       pre/post-ringing around transients.",
+                "",
+                "  50   Intermediate — blended characteristics.",
+                "",
+                "  100  Minimum phase — no pre-ringing, preferred by many",
+                "       listeners for music playback.",
+                "",
+                "Leave empty for the default (typically 50, intermediate).",
+            ]),
         ],
-    };
+    }
+}
 
-    let popup_width = area.width.saturating_sub(4).min(72);
-    let popup_height = (help_lines.len() as u16 + 5).min(area.height.saturating_sub(4));
-    let popup = centered_rect(popup_width, popup_height, area);
+/// Count the total flattened lines for help content of a given kind.
+/// Used by key/mouse handlers to compute max scroll offset.
+pub fn format_settings_help_line_count(kind: &FormatSettingsKind) -> usize {
+    let content = format_settings_help_content(kind);
+    let mut count = 0;
+    for (i, (_, desc)) in content.iter().enumerate() {
+        if i > 0 {
+            count += 1; // blank separator between entries
+        }
+        count += 1; // label line
+        count += desc.len(); // description lines
+    }
+    count
+}
+
+/// Compute the popup rect for the format settings help overlay.
+/// Shared between renderer and mouse handler to keep geometry in sync.
+pub fn format_settings_help_popup_rect(area_w: u16, area_h: u16) -> Rect {
+    let w = (area_w * 80 / 100).max(50).min(area_w.saturating_sub(2));
+    let h = (area_h * 85 / 100).max(15).min(area_h.saturating_sub(2));
+    let x = (area_w.saturating_sub(w)) / 2;
+    let y = (area_h.saturating_sub(h)) / 2;
+    Rect::new(x, y, w, h)
+}
+
+/// Render context-specific help text for the format/resampler settings overlay.
+fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind, scroll: usize) {
+    let area = f.size();
+    let popup = format_settings_help_popup_rect(area.width, area.height);
 
     let title = match kind {
-        FormatSettingsKind::Flac { .. } => " FLAC Help ",
-        FormatSettingsKind::Aac { .. } => " AAC Help ",
-        FormatSettingsKind::Opus { .. } => " Opus Help ",
-        FormatSettingsKind::Mp3 { .. } => " MP3 Help ",
-        FormatSettingsKind::WavPack { .. } => " WavPack Help ",
-        FormatSettingsKind::Ssrc { .. } => " SSRC Help ",
-        FormatSettingsKind::Sox { .. } => " Sox Help ",
-        FormatSettingsKind::Soxr { .. } => " Soxr Help ",
+        FormatSettingsKind::Flac { .. } => " FLAC Settings Help ",
+        FormatSettingsKind::Aac { .. } => " AAC Settings Help ",
+        FormatSettingsKind::Opus { .. } => " Opus Settings Help ",
+        FormatSettingsKind::Mp3 { .. } => " MP3 Settings Help ",
+        FormatSettingsKind::WavPack { .. } => " WavPack Settings Help ",
+        FormatSettingsKind::Ssrc { .. } => " SSRC Settings Help ",
+        FormatSettingsKind::Sox { .. } => " Sox Resampler Help ",
+        FormatSettingsKind::Soxr { .. } => " Soxr Resampler Help ",
     };
 
     f.render_widget(Clear, popup);
@@ -1709,33 +2122,54 @@ fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // blank
-    for _ in &help_lines {
-        constraints.push(Constraint::Length(1));
+    if inner.height < 3 {
+        return;
     }
-    constraints.push(Constraint::Length(1)); // blank
-    constraints.push(Constraint::Length(1)); // footer
-    constraints.push(Constraint::Min(0));
 
+    // Layout: scrollable content + footer.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    for (i, (field, desc)) in help_lines.iter().enumerate() {
-        let line = Line::from(vec![
-            Span::styled(format!("  {:14}", field), Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(*desc, theme::muted()),
-        ]);
-        f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), chunks[i + 1]);
+    // Flatten content to lines.
+    let content = format_settings_help_content(kind);
+    let mut all_lines: Vec<Line> = Vec::new();
+    for (i, (label, desc)) in content.iter().enumerate() {
+        if i > 0 {
+            all_lines.push(Line::from("")); // blank separator
+        }
+        all_lines.push(Line::from(Span::styled(
+            format!("  {}", label),
+            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+        )));
+        for d in *desc {
+            if d.is_empty() {
+                all_lines.push(Line::from(""));
+            } else {
+                all_lines.push(Line::from(Span::styled(
+                    format!("      {}", d),
+                    Style::default().fg(theme::TEXT),
+                )));
+            }
+        }
     }
 
-    let footer_idx = help_lines.len() + 2;
-    let footer = Paragraph::new(Line::from(vec![
-        footer_pill("Esc close", theme::PURPLE),
-    ]))
-    .alignment(Alignment::Center);
-    f.render_widget(footer, chunks[footer_idx]);
+    let total = all_lines.len();
+    let visible = chunks[0].height as usize;
+    let scroll = scroll.min(total.saturating_sub(visible));
+
+    let visible_lines: Vec<Line> = all_lines.into_iter().skip(scroll).take(visible).collect();
+    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+
+    // Footer: Esc close + scroll indicator if content overflows.
+    let mut footer_spans = vec![footer_pill("Esc close", theme::PURPLE)];
+    if total > visible {
+        footer_spans.push(pill_gap());
+        footer_spans.push(footer_pill("↑↓ scroll", theme::BLUE));
+    }
+    let footer = Paragraph::new(Line::from(footer_spans)).alignment(Alignment::Center);
+    f.render_widget(footer, chunks[1]);
 }
 
 fn draw_sox_fields(

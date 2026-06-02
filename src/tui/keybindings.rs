@@ -1564,37 +1564,70 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
-        ActiveOverlay::FormatSettings { mut kind, mut focus, show_help } => {
-            match key.code {
-                KeyCode::Enter => {
-                    if show_help {
-                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
-                    } else {
+        ActiveOverlay::FormatSettings { mut kind, mut focus, help_scroll } => {
+            if let Some(mut scroll) = help_scroll {
+                // Help mode: scroll keys, Esc/Enter/? close help.
+                let max_scroll = {
+                    let total = super::draw_overlays::format_settings_help_line_count(&kind);
+                    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 30));
+                    let popup = super::draw_overlays::format_settings_help_popup_rect(tw, th);
+                    let visible = popup.height.saturating_sub(3) as usize; // borders(2) + footer(1)
+                    total.saturating_sub(visible)
+                };
+                let page = 10usize;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: None };
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        scroll = scroll.saturating_sub(1);
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: Some(scroll) };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        scroll = (scroll + 1).min(max_scroll);
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: Some(scroll) };
+                    }
+                    KeyCode::PageUp => {
+                        scroll = scroll.saturating_sub(page);
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: Some(scroll) };
+                    }
+                    KeyCode::PageDown => {
+                        scroll = (scroll + page).min(max_scroll);
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: Some(scroll) };
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: Some(0) };
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: Some(max_scroll) };
+                    }
+                    _ => {} // ignore other keys in help mode
+                }
+            } else {
+                // Controls mode.
+                match key.code {
+                    KeyCode::Enter => {
                         commit_format_settings(app, &kind);
                         app.active_overlay = ActiveOverlay::None;
                     }
-                }
-                KeyCode::Esc => {
-                    if show_help {
-                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
-                    } else {
+                    KeyCode::Esc => {
                         app.active_overlay = ActiveOverlay::None;
                     }
-                }
-                KeyCode::Up => {
-                    focus = format_settings_focus_prev(&kind, focus);
-                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
-                }
-                KeyCode::Down | KeyCode::Tab => {
-                    focus = format_settings_focus_next(&kind, focus);
-                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
-                }
-                KeyCode::Char('?') => {
-                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: !show_help };
-                }
-                _ => {
-                    handle_format_settings_field_key(&mut kind, focus, &key);
-                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
+                    KeyCode::Up => {
+                        focus = format_settings_focus_prev(&kind, focus);
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: None };
+                    }
+                    KeyCode::Down | KeyCode::Tab => {
+                        focus = format_settings_focus_next(&kind, focus);
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: None };
+                    }
+                    KeyCode::Char('?') => {
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: Some(0) };
+                    }
+                    _ => {
+                        handle_format_settings_field_key(&mut kind, focus, &key);
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: None };
+                    }
                 }
             }
         }
@@ -6919,6 +6952,24 @@ fn handle_format_settings_mouse(
     mouse: MouseEvent,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    let term = crossterm::terminal::size().unwrap_or((80, 24));
+
+    // Scroll wheel in help mode.
+    if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        if let ActiveOverlay::FormatSettings { help_scroll: Some(ref mut scroll), ref kind, .. } = app.active_overlay {
+            let total = super::draw_overlays::format_settings_help_line_count(kind);
+            let popup = super::draw_overlays::format_settings_help_popup_rect(term.0, term.1);
+            let visible = popup.height.saturating_sub(3) as usize; // borders(2) + footer(1)
+            let max_scroll = total.saturating_sub(visible);
+            match mouse.kind {
+                MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => *scroll = (*scroll + 3).min(max_scroll),
+                _ => {}
+            }
+        }
+        return;
+    }
+
     if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
         return; // only left clicks matter
     }
@@ -6927,7 +6978,6 @@ fn handle_format_settings_mouse(
     let my = mouse.row;
 
     // Compute popup geometry (must match draw_format_settings + hint/rect).
-    let term = crossterm::terminal::size().unwrap_or((80, 24));
     let (min_w, field_count) = if let ActiveOverlay::FormatSettings { ref kind, .. } = app.active_overlay {
         (
             super::draw_overlays::format_settings_min_width(kind),
@@ -6942,23 +6992,19 @@ fn handle_format_settings_mouse(
     );
     let is_help = matches!(
         app.active_overlay,
-        ActiveOverlay::FormatSettings { show_help: true, .. }
+        ActiveOverlay::FormatSettings { help_scroll: Some(_), .. }
     );
-    // Help popup uses its own width/height based on help line count.
-    let popup_w = if is_help {
-        term.0.saturating_sub(4).min(72) // matches draw_format_settings_help
+    // Help popup uses shared geometry helper; controls popup uses per-kind sizing.
+    let (popup_x, popup_y, popup_w, popup_h) = if is_help {
+        let r = super::draw_overlays::format_settings_help_popup_rect(term.0, term.1);
+        (r.x, r.y, r.width, r.height)
     } else {
-        term.0.saturating_sub(4).min(min_w)
+        let w = term.0.saturating_sub(4).min(min_w);
+        let h = if is_sox { 17 } else { field_count + 6 };
+        let x = (term.0.saturating_sub(w)) / 2;
+        let y = (term.1.saturating_sub(h)) / 2;
+        (x, y, w, h)
     };
-    let popup_h = if is_help {
-        (field_count + 5).min(term.1.saturating_sub(4)) // matches draw_format_settings_help
-    } else if is_sox {
-        17
-    } else {
-        field_count + 6
-    };
-    let popup_x = (term.0.saturating_sub(popup_w)) / 2;
-    let popup_y = (term.1.saturating_sub(popup_h)) / 2;
 
     let in_popup = mx >= popup_x
         && mx < popup_x + popup_w
@@ -7188,13 +7234,10 @@ fn handle_format_settings_mouse(
     } // end of !is_help click-to-focus block
 
     // Footer row Y. Must match the rendered footer position for each overlay mode.
-    // Layout: border(1) + content + footer + absorb(if any) + border(1).
-    // For help: border + blank + N lines + blank + footer + absorb + border.
-    // For normal: border + blank + fields + blank + footer + absorb + border.
-    // For Sox normal: border + blank + 4rate + blank + header + 6sinc + blank + footer + absorb + border.
+    // Help: footer is last inner row = popup_y + popup_h - 2 (2 = bottom border + footer itself).
+    // Normal/Sox: explicit layout positions.
     let footer_y = if is_help {
-        // Help: footer at inner row field_count + 2 (blank + N lines + blank + footer)
-        popup_y + 1 + field_count + 2
+        popup_y + popup_h - 2
     } else if is_sox {
         // Sox: footer at inner row 14 (blank + 4 + blank + header + 6 + blank + footer)
         popup_y + 1 + 14
@@ -11163,7 +11206,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     ),
                     _ => return,
                 };
-                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
+                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: None };
             }
             TuiButton::ResampleQualityPill(i) => {
                 use tonepoet_pipeline::enums::ResampleQuality;
@@ -11235,7 +11278,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     ),
                     _ => return,
                 };
-                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
+                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: None };
             }
             TuiButton::MergePill(i) => {
                 app.convert.focus = ConvertFocus::OutputOptions;
