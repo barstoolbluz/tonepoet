@@ -6,8 +6,8 @@
 use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     DsdNoiseShaper, GainCompensation, ModulatorOrder, Mp3Mode, NyquistTransition, OpusContentType,
-    PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SsrcProfile,
-    WavPackMode,
+    PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
+    SsrcProfile, WavPackMode,
 };
 use crate::error::{PlanningError, Result};
 
@@ -292,6 +292,46 @@ fn validate_encoder_settings(settings: &PipelineSettings) -> Result<()> {
             ));
         }
     }
+    if let Some(taps) = settings.sox_resampler.sinc_taps {
+        if !taps.is_power_of_two() || !(1024..=67_108_864).contains(&taps) {
+            return Err(PlanningError::invalid_settings(
+                "sox_resampler.sinc_taps",
+                "must be a power of 2 between 1024 and 67108864",
+            ));
+        }
+    }
+    if let Some(att) = settings.sox_resampler.sinc_attenuation_db {
+        if !(80..=200).contains(&att) {
+            return Err(PlanningError::invalid_settings(
+                "sox_resampler.sinc_attenuation_db",
+                "expected 80 through 200 dB",
+            ));
+        }
+    }
+    if let Some(pb) = settings.sox_resampler.sinc_passband_hz {
+        if !(1.0..=220_000.0).contains(&pb) {
+            return Err(PlanningError::invalid_settings(
+                "sox_resampler.sinc_passband_hz",
+                "expected 1 through 220000 Hz",
+            ));
+        }
+    }
+    if let Some(tr) = settings.sox_resampler.sinc_transition_hz {
+        if !(1.0..=5000.0).contains(&tr) {
+            return Err(PlanningError::invalid_settings(
+                "sox_resampler.sinc_transition_hz",
+                "expected 1 through 5000 Hz",
+            ));
+        }
+    }
+    if let Some(beta) = settings.sox_resampler.sinc_kaiser_beta {
+        if !(0.0..=32.0).contains(&beta) {
+            return Err(PlanningError::invalid_settings(
+                "sox_resampler.sinc_kaiser_beta",
+                "expected 0 through 32",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -547,10 +587,23 @@ pub struct SoxResamplerSettings {
     pub chebyshev: bool,
     /// Override bandwidth percentage (74.0–99.7). Mutually exclusive with chebyshev.
     pub bandwidth_pct: Option<f32>,
-    /// Phase shift (0–100).
+    /// Phase shift (0–100) for rate effect.
     pub phase: Option<u8>,
-    /// Allow aliasing (`-a` flag).
+    /// Allow aliasing (`-a` flag) on rate effect.
     pub allow_aliasing: bool,
+    // ── Sinc FIR pre-filter parameters (added before `rate` in effects chain) ──
+    /// FIR tap count (power of 2, 1024–67108864).
+    pub sinc_taps: Option<u32>,
+    /// Stopband attenuation in dB (80–200).
+    pub sinc_attenuation_db: Option<u16>,
+    /// Lowpass passband corner frequency in Hz (1–220000).
+    pub sinc_passband_hz: Option<f32>,
+    /// Transition bandwidth in Hz (1–5000).
+    pub sinc_transition_hz: Option<f32>,
+    /// Kaiser window beta parameter (0–32).
+    pub sinc_kaiser_beta: Option<f32>,
+    /// Sinc filter phase mode (-L/-M/-I).
+    pub sinc_phase: Option<SoxSincPhase>,
 }
 
 impl Default for SoxResamplerSettings {
@@ -560,6 +613,12 @@ impl Default for SoxResamplerSettings {
             bandwidth_pct: None,
             phase: None,
             allow_aliasing: false,
+            sinc_taps: None,
+            sinc_attenuation_db: None,
+            sinc_passband_hz: None,
+            sinc_transition_hz: None,
+            sinc_kaiser_beta: None,
+            sinc_phase: None,
         }
     }
 }

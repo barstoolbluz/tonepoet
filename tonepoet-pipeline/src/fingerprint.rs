@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     DsdNoiseShaper, GainCompensation, ModulatorOrder, Mp3Mode, NyquistTransition, OpusContentType,
-    PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SsrcProfile,
-    WavPackMode,
+    PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
+    SsrcProfile, WavPackMode,
 };
 use crate::settings::{
     AacSettings, DsdSettings, FlacSettings, MetadataSettings, Mp3Settings, OpusSettings,
@@ -86,6 +86,12 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "sox_resampler.bandwidth_pct",
     "sox_resampler.phase",
     "sox_resampler.allow_aliasing",
+    "sox_resampler.sinc_taps",
+    "sox_resampler.sinc_attenuation_db",
+    "sox_resampler.sinc_passband_hz",
+    "sox_resampler.sinc_transition_hz",
+    "sox_resampler.sinc_kaiser_beta",
+    "sox_resampler.sinc_phase",
     "soxr_resampler.chebyshev",
     "soxr_resampler.cutoff",
     "soxr_resampler.phase",
@@ -238,6 +244,26 @@ fn push_sox_resampler(writer: &mut FingerprintWriter, settings: &SoxResamplerSet
     writer.field_static(
         "sox_resampler.allow_aliasing",
         bool_value(settings.allow_aliasing),
+    );
+    writer.field_string(
+        "sox_resampler.sinc_taps",
+        settings.sinc_taps.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()),
+    );
+    writer.field_string(
+        "sox_resampler.sinc_attenuation_db",
+        settings.sinc_attenuation_db.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()),
+    );
+    writer.field_string("sox_resampler.sinc_passband_hz", option_f32(settings.sinc_passband_hz));
+    writer.field_string("sox_resampler.sinc_transition_hz", option_f32(settings.sinc_transition_hz));
+    writer.field_string("sox_resampler.sinc_kaiser_beta", option_f32(settings.sinc_kaiser_beta));
+    writer.field_static(
+        "sox_resampler.sinc_phase",
+        match settings.sinc_phase {
+            Some(SoxSincPhase::Linear) => "Linear",
+            Some(SoxSincPhase::Minimum) => "Minimum",
+            Some(SoxSincPhase::Intermediate) => "Intermediate",
+            None => "None",
+        },
     );
 }
 

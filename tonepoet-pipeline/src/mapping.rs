@@ -4,7 +4,8 @@
 
 use crate::enums::{
     AacProfile, AudioFormat, DitherType, DsdLowpassMethod, DsdNoiseShaper, ModulatorOrder, Mp3Mode,
-    NyquistTransition, OpusContentType, PcmBitDepth, ResampleQuality, SsrcProfile, WavPackMode,
+    NyquistTransition, OpusContentType, PcmBitDepth, ResampleQuality, SoxSincPhase, SsrcProfile,
+    WavPackMode,
 };
 use crate::error::{PlanningError, Result};
 use crate::settings::SsrcSettings;
@@ -273,6 +274,16 @@ pub const fn wavpack_mode_flag(mode: WavPackMode) -> &'static str {
         WavPackMode::Normal => "",
         WavPackMode::High => "-h",
         WavPackMode::VeryHigh => "-hh",
+    }
+}
+
+/// Sox sinc phase flag.
+#[must_use]
+pub const fn sox_sinc_phase_flag(phase: SoxSincPhase) -> &'static str {
+    match phase {
+        SoxSincPhase::Linear => "-L",
+        SoxSincPhase::Minimum => "-M",
+        SoxSincPhase::Intermediate => "-I",
     }
 }
 

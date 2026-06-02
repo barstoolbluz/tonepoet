@@ -5,7 +5,8 @@ use tonepoet_pipeline::{
     NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
     SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
-    SoxResamplerSettings, SoxrResamplerSettings, SsrcProfile, SsrcSettings, TrellisSettings,
+    SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcProfile, SsrcSettings,
+    TrellisSettings,
     VerificationSettings, WavPackMode, WavPackSettings,
 };
 
@@ -44,6 +45,12 @@ use tonepoet_pipeline::{
 /// - soxr_resampler.chebyshev: true
 /// - soxr_resampler.cutoff: Some(0.97)
 /// - soxr_resampler.phase: Some(25)
+/// - sox_resampler.sinc_taps: Some(262144)
+/// - sox_resampler.sinc_attenuation_db: Some(120)
+/// - sox_resampler.sinc_passband_hz: Some(22050.0)
+/// - sox_resampler.sinc_transition_hz: Some(500.0)
+/// - sox_resampler.sinc_kaiser_beta: Some(16.0)
+/// - sox_resampler.sinc_phase: Some(Minimum)
 /// - dsd.noise_shaper: Crfb
 /// - dsd.modulator_order: Order7
 /// - dsd.trellis.lookahead: 17
@@ -112,6 +119,12 @@ fn flac_md5_sentinel() -> PipelineSettings {
             bandwidth_pct: Some(97.0),
             phase: Some(25),
             allow_aliasing: true,
+            sinc_taps: Some(262144),
+            sinc_attenuation_db: Some(120),
+            sinc_passband_hz: Some(22050.0),
+            sinc_transition_hz: Some(500.0),
+            sinc_kaiser_beta: Some(16.0),
+            sinc_phase: Some(SoxSincPhase::Minimum),
         },
         soxr_resampler: SoxrResamplerSettings {
             chebyshev: true,
@@ -158,7 +171,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 57);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 63);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();
@@ -318,6 +331,49 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
         "sox_resampler.allow_aliasing",
         |settings| {
             settings.sox_resampler.allow_aliasing = false;
+        }
+    );
+    assert_mutation_changes_fingerprint!(covered, base, "sox_resampler.sinc_taps", |settings| {
+        settings.sox_resampler.sinc_taps = Some(65536);
+    });
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "sox_resampler.sinc_attenuation_db",
+        |settings| {
+            settings.sox_resampler.sinc_attenuation_db = Some(140);
+        }
+    );
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "sox_resampler.sinc_passband_hz",
+        |settings| {
+            settings.sox_resampler.sinc_passband_hz = Some(20000.0);
+        }
+    );
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "sox_resampler.sinc_transition_hz",
+        |settings| {
+            settings.sox_resampler.sinc_transition_hz = Some(250.0);
+        }
+    );
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "sox_resampler.sinc_kaiser_beta",
+        |settings| {
+            settings.sox_resampler.sinc_kaiser_beta = Some(20.0);
+        }
+    );
+    assert_mutation_changes_fingerprint!(
+        covered,
+        base,
+        "sox_resampler.sinc_phase",
+        |settings| {
+            settings.sox_resampler.sinc_phase = Some(SoxSincPhase::Linear);
         }
     );
     assert_mutation_changes_fingerprint!(

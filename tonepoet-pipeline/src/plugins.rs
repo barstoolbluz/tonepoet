@@ -5,7 +5,7 @@
 
 use crate::enums::{
     AacProfile, AudioFormat, DitherType, DsdFilterPreset, DsdLowpassMethod, GainCompensation,
-    Mp3Mode, PcmBitDepth, ReplayGainMode,
+    Mp3Mode, PcmBitDepth, ReplayGainMode, SoxSincPhase,
 };
 use crate::error::{PlanningError, Result};
 use crate::mapping;
@@ -1227,6 +1227,43 @@ fn add_sox_pcm_effects(
 ) {
     if let Some(rate) = target_rate_hz {
         let sox_rs = &context.request.settings.sox_resampler;
+
+        // Sinc FIR pre-filter (before rate effect). Active when any numeric sinc
+        // field is set — phase alone is not enough to trigger the effect.
+        let sinc_active = sox_rs.sinc_taps.is_some()
+            || sox_rs.sinc_attenuation_db.is_some()
+            || sox_rs.sinc_passband_hz.is_some()
+            || sox_rs.sinc_transition_hz.is_some()
+            || sox_rs.sinc_kaiser_beta.is_some();
+        if sinc_active {
+            args.push("sinc".into());
+            if let Some(pb) = sox_rs.sinc_passband_hz {
+                args.push(format!("-{:.0}", pb)); // negative = lowpass
+            }
+            if let Some(taps) = sox_rs.sinc_taps {
+                args.push("-n".into());
+                args.push(taps.to_string());
+            }
+            if let Some(att) = sox_rs.sinc_attenuation_db {
+                args.push("-a".into());
+                args.push(att.to_string());
+            }
+            if let Some(tr) = sox_rs.sinc_transition_hz {
+                args.push("-t".into());
+                args.push(format!("{}", tr));
+            }
+            if let Some(beta) = sox_rs.sinc_kaiser_beta {
+                args.push("-b".into());
+                args.push(format!("{}", beta));
+            }
+            match sox_rs.sinc_phase {
+                Some(SoxSincPhase::Linear) => args.push("-L".into()),
+                Some(SoxSincPhase::Minimum) => args.push("-M".into()),
+                Some(SoxSincPhase::Intermediate) => args.push("-I".into()),
+                None => {} // sox defaults to linear
+            }
+        }
+
         args.push("rate".into());
         args.push(mapping::sox_rate_quality_flag(context.request.settings.resample_quality).into());
         // Chebyshev (-s) and bandwidth (-b) are mutually exclusive.

@@ -845,6 +845,18 @@ pub struct FormatState {
     pub sox_phase: Option<u8>,
     /// Sox allow aliasing (-a). Default: false.
     pub sox_allow_aliasing: bool,
+    /// Sox sinc FIR taps (power of 2, 1024-67108864). None = no sinc pre-filter.
+    pub sox_sinc_taps: Option<u32>,
+    /// Sox sinc attenuation in dB (80-200). None = sox default.
+    pub sox_sinc_attenuation: Option<u16>,
+    /// Sox sinc passband corner in Hz (1-220000). None = sox default.
+    pub sox_sinc_passband: Option<f32>,
+    /// Sox sinc transition bandwidth in Hz (1-5000). None = sox default.
+    pub sox_sinc_transition: Option<f32>,
+    /// Sox sinc Kaiser beta (0-32). None = sox default.
+    pub sox_sinc_kaiser_beta: Option<f32>,
+    /// Sox sinc phase mode. None = linear (sox default).
+    pub sox_sinc_phase: Option<tonepoet_pipeline::enums::SoxSincPhase>,
     /// Soxr chebyshev filter (cheby=1). Default: false.
     pub soxr_chebyshev: bool,
     /// Soxr cutoff override (0.0-1.0). None = derived from NyquistTransition.
@@ -1024,6 +1036,12 @@ impl FormatState {
             sox_bandwidth: None,
             sox_phase: None,
             sox_allow_aliasing: false,
+            sox_sinc_taps: None,
+            sox_sinc_attenuation: None,
+            sox_sinc_passband: None,
+            sox_sinc_transition: None,
+            sox_sinc_kaiser_beta: None,
+            sox_sinc_phase: None,
             soxr_chebyshev: false,
             soxr_cutoff: None,
             soxr_phase: None,

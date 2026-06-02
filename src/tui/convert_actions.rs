@@ -374,6 +374,12 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             bandwidth_pct: format.sox_bandwidth,
             phase: format.sox_phase,
             allow_aliasing: format.sox_allow_aliasing,
+            sinc_taps: format.sox_sinc_taps,
+            sinc_attenuation_db: format.sox_sinc_attenuation,
+            sinc_passband_hz: format.sox_sinc_passband,
+            sinc_transition_hz: format.sox_sinc_transition,
+            sinc_kaiser_beta: format.sox_sinc_kaiser_beta,
+            sinc_phase: format.sox_sinc_phase,
         },
         soxr_resampler: tonepoet_pipeline::SoxrResamplerSettings {
             chebyshev: format.soxr_chebyshev,

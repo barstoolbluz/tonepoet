@@ -540,6 +540,18 @@ pub enum WavPackMode {
     VeryHigh,
 }
 
+/// Sox sinc FIR filter phase mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SoxSincPhase {
+    /// Linear phase — preserves waveform shape (`-L`).
+    Linear,
+    /// Minimum phase — reduces pre-ringing, lower latency (`-M`).
+    Minimum,
+    /// Intermediate phase — compromise between linear and minimum (`-I`).
+    Intermediate,
+}
+
 /// SSRC resampling profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

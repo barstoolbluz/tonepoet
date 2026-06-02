@@ -18,7 +18,8 @@ use tonepoet_pipeline::{
     NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
     SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
-    SoxResamplerSettings, SoxrResamplerSettings, SsrcProfile, SsrcSettings, TrellisSettings,
+    SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcProfile, SsrcSettings,
+    TrellisSettings,
     VerificationSettings, WavPackMode,
     WavPackSettings,
 };
@@ -64,6 +65,12 @@ use tonepoet_pipeline::{
 /// - sox_resampler.bandwidth_pct: Some(97.0)
 /// - sox_resampler.phase: Some(25)
 /// - sox_resampler.allow_aliasing: true
+/// - sox_resampler.sinc_taps: Some(262144)
+/// - sox_resampler.sinc_attenuation_db: Some(120)
+/// - sox_resampler.sinc_passband_hz: Some(22050.0)
+/// - sox_resampler.sinc_transition_hz: Some(500.0)
+/// - sox_resampler.sinc_kaiser_beta: Some(16.0)
+/// - sox_resampler.sinc_phase: Some(Minimum)
 /// - soxr_resampler.chebyshev: true
 /// - soxr_resampler.cutoff: Some(0.97)
 /// - soxr_resampler.phase: Some(25)
@@ -138,6 +145,12 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             bandwidth_pct: Some(97.0),
             phase: Some(25),
             allow_aliasing: true,
+            sinc_taps: Some(262144),
+            sinc_attenuation_db: Some(120),
+            sinc_passband_hz: Some(22050.0),
+            sinc_transition_hz: Some(500.0),
+            sinc_kaiser_beta: Some(16.0),
+            sinc_phase: Some(SoxSincPhase::Minimum),
         },
         soxr_resampler: SoxrResamplerSettings {
             chebyshev: true,
@@ -260,6 +273,12 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.sox_resampler.bandwidth_pct, &expected.sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
     assert_eq!(&actual.sox_resampler.phase, &expected.sox_resampler.phase, "sox_resampler.phase");
     assert_eq!(&actual.sox_resampler.allow_aliasing, &expected.sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
+    assert_eq!(&actual.sox_resampler.sinc_taps, &expected.sox_resampler.sinc_taps, "sox_resampler.sinc_taps");
+    assert_eq!(&actual.sox_resampler.sinc_attenuation_db, &expected.sox_resampler.sinc_attenuation_db, "sox_resampler.sinc_attenuation_db");
+    assert_eq!(&actual.sox_resampler.sinc_passband_hz, &expected.sox_resampler.sinc_passband_hz, "sox_resampler.sinc_passband_hz");
+    assert_eq!(&actual.sox_resampler.sinc_transition_hz, &expected.sox_resampler.sinc_transition_hz, "sox_resampler.sinc_transition_hz");
+    assert_eq!(&actual.sox_resampler.sinc_kaiser_beta, &expected.sox_resampler.sinc_kaiser_beta, "sox_resampler.sinc_kaiser_beta");
+    assert_eq!(&actual.sox_resampler.sinc_phase, &expected.sox_resampler.sinc_phase, "sox_resampler.sinc_phase");
     assert_eq!(&actual.soxr_resampler.chebyshev, &expected.soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
     assert_eq!(&actual.soxr_resampler.cutoff, &expected.soxr_resampler.cutoff, "soxr_resampler.cutoff");
     assert_eq!(&actual.soxr_resampler.phase, &expected.soxr_resampler.phase, "soxr_resampler.phase");
@@ -344,6 +363,12 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "sox_resampler.bandwidth_pct", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "sox_resampler.phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "sox_resampler.allow_aliasing", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.sinc_taps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.sinc_attenuation_db", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.sinc_passband_hz", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.sinc_transition_hz", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.sinc_kaiser_beta", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "sox_resampler.sinc_phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "soxr_resampler.chebyshev", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "soxr_resampler.cutoff", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "soxr_resampler.phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
@@ -409,6 +434,12 @@ fn field_differs_from_default(
         "sox_resampler.bandwidth_pct" => settings.sox_resampler.bandwidth_pct != default.sox_resampler.bandwidth_pct,
         "sox_resampler.phase" => settings.sox_resampler.phase != default.sox_resampler.phase,
         "sox_resampler.allow_aliasing" => settings.sox_resampler.allow_aliasing != default.sox_resampler.allow_aliasing,
+        "sox_resampler.sinc_taps" => settings.sox_resampler.sinc_taps != default.sox_resampler.sinc_taps,
+        "sox_resampler.sinc_attenuation_db" => settings.sox_resampler.sinc_attenuation_db != default.sox_resampler.sinc_attenuation_db,
+        "sox_resampler.sinc_passband_hz" => settings.sox_resampler.sinc_passband_hz != default.sox_resampler.sinc_passband_hz,
+        "sox_resampler.sinc_transition_hz" => settings.sox_resampler.sinc_transition_hz != default.sox_resampler.sinc_transition_hz,
+        "sox_resampler.sinc_kaiser_beta" => settings.sox_resampler.sinc_kaiser_beta != default.sox_resampler.sinc_kaiser_beta,
+        "sox_resampler.sinc_phase" => settings.sox_resampler.sinc_phase != default.sox_resampler.sinc_phase,
         "soxr_resampler.chebyshev" => settings.soxr_resampler.chebyshev != default.soxr_resampler.chebyshev,
         "soxr_resampler.cutoff" => settings.soxr_resampler.cutoff != default.soxr_resampler.cutoff,
         "soxr_resampler.phase" => settings.soxr_resampler.phase != default.soxr_resampler.phase,
@@ -536,6 +567,12 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
     assert_covered_by_non_default!(default, raw, raw, sox_resampler.phase, "sox_resampler.phase");
     assert_covered_by_non_default!(default, raw, raw, sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_taps, "sox_resampler.sinc_taps");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_attenuation_db, "sox_resampler.sinc_attenuation_db");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_passband_hz, "sox_resampler.sinc_passband_hz");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_transition_hz, "sox_resampler.sinc_transition_hz");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_kaiser_beta, "sox_resampler.sinc_kaiser_beta");
+    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_phase, "sox_resampler.sinc_phase");
     assert_covered_by_non_default!(default, raw, raw, soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
     assert_covered_by_non_default!(default, raw, raw, soxr_resampler.cutoff, "soxr_resampler.cutoff");
     assert_covered_by_non_default!(default, raw, raw, soxr_resampler.phase, "soxr_resampler.phase");
@@ -603,6 +640,12 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
     assert_covered_by_non_default!(default, flac, custom, sox_resampler.phase, "sox_resampler.phase");
     assert_covered_by_non_default!(default, flac, custom, sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_taps, "sox_resampler.sinc_taps");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_attenuation_db, "sox_resampler.sinc_attenuation_db");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_passband_hz, "sox_resampler.sinc_passband_hz");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_transition_hz, "sox_resampler.sinc_transition_hz");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_kaiser_beta, "sox_resampler.sinc_kaiser_beta");
+    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_phase, "sox_resampler.sinc_phase");
     assert_covered_by_non_default!(default, flac, custom, soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
     assert_covered_by_non_default!(default, flac, custom, soxr_resampler.cutoff, "soxr_resampler.cutoff");
     assert_covered_by_non_default!(default, flac, custom, soxr_resampler.phase, "soxr_resampler.phase");
@@ -743,6 +786,12 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("sox_resampler.bandwidth_pct", LegacyProjectionStatus::Defaulted),
     ("sox_resampler.phase", LegacyProjectionStatus::Defaulted),
     ("sox_resampler.allow_aliasing", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.sinc_taps", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.sinc_attenuation_db", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.sinc_passband_hz", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.sinc_transition_hz", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.sinc_kaiser_beta", LegacyProjectionStatus::Defaulted),
+    ("sox_resampler.sinc_phase", LegacyProjectionStatus::Defaulted),
     ("soxr_resampler.chebyshev", LegacyProjectionStatus::Defaulted),
     ("soxr_resampler.cutoff", LegacyProjectionStatus::Defaulted),
     ("soxr_resampler.phase", LegacyProjectionStatus::Defaulted),
@@ -918,6 +967,12 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_unrepresentable!(covered, "sox_resampler.bandwidth_pct", flac.sox_resampler.bandwidth_pct, default.sox_resampler.bandwidth_pct, sentinel.sox_resampler.bandwidth_pct);
     assert_legacy_unrepresentable!(covered, "sox_resampler.phase", flac.sox_resampler.phase, default.sox_resampler.phase, sentinel.sox_resampler.phase);
     assert_legacy_unrepresentable!(covered, "sox_resampler.allow_aliasing", flac.sox_resampler.allow_aliasing, default.sox_resampler.allow_aliasing, sentinel.sox_resampler.allow_aliasing);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_taps", flac.sox_resampler.sinc_taps, default.sox_resampler.sinc_taps, sentinel.sox_resampler.sinc_taps);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_attenuation_db", flac.sox_resampler.sinc_attenuation_db, default.sox_resampler.sinc_attenuation_db, sentinel.sox_resampler.sinc_attenuation_db);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_passband_hz", flac.sox_resampler.sinc_passband_hz, default.sox_resampler.sinc_passband_hz, sentinel.sox_resampler.sinc_passband_hz);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_transition_hz", flac.sox_resampler.sinc_transition_hz, default.sox_resampler.sinc_transition_hz, sentinel.sox_resampler.sinc_transition_hz);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_kaiser_beta", flac.sox_resampler.sinc_kaiser_beta, default.sox_resampler.sinc_kaiser_beta, sentinel.sox_resampler.sinc_kaiser_beta);
+    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_phase", flac.sox_resampler.sinc_phase, default.sox_resampler.sinc_phase, sentinel.sox_resampler.sinc_phase);
     assert_legacy_unrepresentable!(covered, "soxr_resampler.chebyshev", flac.soxr_resampler.chebyshev, default.soxr_resampler.chebyshev, sentinel.soxr_resampler.chebyshev);
     assert_legacy_unrepresentable!(covered, "soxr_resampler.cutoff", flac.soxr_resampler.cutoff, default.soxr_resampler.cutoff, sentinel.soxr_resampler.cutoff);
     assert_legacy_unrepresentable!(covered, "soxr_resampler.phase", flac.soxr_resampler.phase, default.soxr_resampler.phase, sentinel.soxr_resampler.phase);
