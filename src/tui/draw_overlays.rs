@@ -760,7 +760,7 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
         display_input,
         Style::default().fg(Color::White),
     )]))
-    .style(Style::default().bg(Color::Rgb(40, 40, 40)));
+    .style(Style::default().bg(Color::Rgb(55, 60, 80)));
     f.render_widget(input_widget, chunks[1]);
 
     f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
@@ -821,7 +821,7 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
         display_input,
         Style::default().fg(Color::White),
     )]))
-    .style(Style::default().bg(Color::Rgb(40, 40, 40)));
+    .style(Style::default().bg(Color::Rgb(55, 60, 80)));
     f.render_widget(input_widget, chunks[1]);
 
     f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
@@ -1009,9 +1009,9 @@ fn draw_flac_fields(
     let (view, cursor_col) = compression_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
     let input_bg = if comp_focused {
-        Color::Rgb(40, 40, 40)
+        Color::Rgb(55, 60, 80)
     } else {
-        Color::Rgb(30, 30, 30)
+        Color::Rgb(40, 45, 65)
     };
     let comp_line = Line::from(vec![
         Span::styled("  compression  ", comp_label_style),
@@ -1150,9 +1150,9 @@ fn draw_aac_fields(
     let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
     let input_bg = if br_focused {
-        Color::Rgb(40, 40, 40)
+        Color::Rgb(55, 60, 80)
     } else {
-        Color::Rgb(30, 30, 30)
+        Color::Rgb(40, 45, 65)
     };
     let br_line = Line::from(vec![
         Span::styled("  bitrate      ", br_label_style),
@@ -1259,9 +1259,9 @@ fn draw_opus_fields(
     let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
     let input_bg = if br_focused {
-        Color::Rgb(40, 40, 40)
+        Color::Rgb(55, 60, 80)
     } else {
-        Color::Rgb(30, 30, 30)
+        Color::Rgb(40, 45, 65)
     };
     let br_line = Line::from(vec![
         Span::styled("  bitrate      ", br_label_style),
@@ -1283,9 +1283,9 @@ fn draw_opus_fields(
     let (view_c, cursor_col_c) = complexity_input.view(visible_width_c.max(1));
     let display_val_c = if view_c.is_empty() { " ".to_string() } else { view_c };
     let comp_bg = if comp_focused {
-        Color::Rgb(40, 40, 40)
+        Color::Rgb(55, 60, 80)
     } else {
-        Color::Rgb(30, 30, 30)
+        Color::Rgb(40, 45, 65)
     };
     let comp_line = Line::from(vec![
         Span::styled("  complexity   ", comp_label_style),
@@ -1314,7 +1314,7 @@ fn draw_mp3_fields(
 
     let is_vbr = mode == Mp3Mode::Vbr;
     let greyed = Style::default().fg(Color::DarkGray);
-    let greyed_bg = Color::Rgb(20, 20, 20);
+    let greyed_bg = Color::Rgb(30, 33, 45);
 
     // Row 1: Mode pills (VBR/CBR/ABR) — always active
     let mode_focused = focus == FormatSettingsFocus::Mp3Mode;
@@ -1362,9 +1362,9 @@ fn draw_mp3_fields(
     let input_bg = if !is_vbr {
         greyed_bg
     } else if vbr_focused {
-        Color::Rgb(40, 40, 40)
+        Color::Rgb(55, 60, 80)
     } else {
-        Color::Rgb(30, 30, 30)
+        Color::Rgb(40, 45, 65)
     };
     let fg = if !is_vbr { Color::DarkGray } else { Color::White };
     let vbr_line = Line::from(vec![
@@ -1426,9 +1426,9 @@ fn draw_mp3_fields(
     let br_bg = if is_vbr {
         greyed_bg
     } else if br_focused {
-        Color::Rgb(40, 40, 40)
+        Color::Rgb(55, 60, 80)
     } else {
-        Color::Rgb(30, 30, 30)
+        Color::Rgb(40, 45, 65)
     };
     let br_fg = if is_vbr { Color::DarkGray } else { Color::White };
     let br_line = Line::from(vec![
@@ -1458,7 +1458,7 @@ fn draw_wavpack_fields(
     use tonepoet_pipeline::enums::WavPackMode;
 
     let greyed = Style::default().fg(Color::DarkGray);
-    let greyed_bg = Color::Rgb(20, 20, 20);
+    let greyed_bg = Color::Rgb(30, 33, 45);
 
     // Row 1: Mode pills (fast/normal/high/very high) — always active
     let mode_focused = focus == FormatSettingsFocus::WavPackMode;
@@ -1519,7 +1519,7 @@ fn draw_wavpack_fields(
     let visible_width = chunks[3].width.saturating_sub(24) as usize;
     let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
-    let br_bg = if !hybrid { greyed_bg } else if br_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let br_bg = if !hybrid { greyed_bg } else if br_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
     let br_fg = if !hybrid { Color::DarkGray } else { Color::White };
     let br_line = Line::from(vec![
         Span::styled("  bitrate      ", br_label_style),
@@ -2191,7 +2191,7 @@ fn draw_sox_fields(
     use tonepoet_pipeline::enums::SoxSincPhase;
 
     let greyed = Style::default().fg(Color::DarkGray);
-    let greyed_bg = Color::Rgb(20, 20, 20);
+    let greyed_bg = Color::Rgb(30, 33, 45);
 
     // ── Rate section (chunks[1..4]) ──
 
@@ -2212,9 +2212,9 @@ fn draw_sox_fields(
     let bw_ls = if chebyshev { greyed } else if bw_focused { theme::bright() } else { theme::muted() };
     let bw_vw = chunks[2].width.saturating_sub(22) as usize;
     let (bw_v, bw_cc) = bandwidth_input.view(bw_vw.max(1));
-    let bw_d = if bw_v.is_empty() { " ".to_string() } else { bw_v };
-    let bw_bg = if chebyshev { greyed_bg } else if bw_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
-    let bw_fg = if chebyshev { Color::DarkGray } else { Color::White };
+    let (bw_d, bw_is_placeholder) = if bw_v.is_empty() { ("95".to_string(), true) } else { (bw_v, false) };
+    let bw_bg = if chebyshev { greyed_bg } else if bw_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
+    let bw_fg = if chebyshev { Color::DarkGray } else if bw_is_placeholder { theme::TEXT_DIM } else { Color::White };
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  nyquist cutoff  ", bw_ls),
         Span::styled(format!(" {} ", bw_d), Style::default().fg(bw_fg).bg(bw_bg)),
@@ -2227,11 +2227,12 @@ fn draw_sox_fields(
     let ph_ls = if ph_focused { theme::bright() } else { theme::muted() };
     let ph_vw = chunks[3].width.saturating_sub(19) as usize;
     let (ph_v, ph_cc) = phase_input.view(ph_vw.max(1));
-    let ph_d = if ph_v.is_empty() { " ".to_string() } else { ph_v };
-    let ph_bg = if ph_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let (ph_d, ph_is_placeholder) = if ph_v.is_empty() { ("50".to_string(), true) } else { (ph_v, false) };
+    let ph_bg = if ph_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
+    let ph_fg = if ph_is_placeholder { theme::TEXT_DIM } else { Color::White };
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  phase           ", ph_ls),
-        Span::styled(format!(" {} ", ph_d), Style::default().fg(Color::White).bg(ph_bg)),
+        Span::styled(format!(" {} ", ph_d), Style::default().fg(ph_fg).bg(ph_bg)),
     ])), chunks[3]);
     if ph_focused { f.set_cursor(chunks[3].x + 19 + ph_cc, chunks[3].y); }
 
@@ -2263,7 +2264,7 @@ fn draw_sox_fields(
         let vw = chunk.width.saturating_sub(22) as usize;
         let (v, cc) = input.view(vw.max(1));
         let d = if v.is_empty() { " ".to_string() } else { v };
-        let bg = if focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+        let bg = if focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
         let mut spans = vec![
             Span::styled(label, ls),
             Span::styled(format!(" {} ", d), Style::default().fg(Color::White).bg(bg)),
@@ -2356,11 +2357,12 @@ fn draw_soxr_fields(
     let co_label_style = if co_focused { theme::bright() } else { theme::muted() };
     let visible_width = chunks[2].width.saturating_sub(20) as usize;
     let (view, cursor_col) = cutoff_input.view(visible_width.max(1));
-    let display_val = if view.is_empty() { " ".to_string() } else { view };
-    let co_bg = if co_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let (display_val, co_is_placeholder) = if view.is_empty() { ("95".to_string(), true) } else { (view, false) };
+    let co_bg = if co_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
+    let co_fg = if co_is_placeholder { theme::TEXT_DIM } else { Color::White };
     let co_line = Line::from(vec![
         Span::styled("  nyquist cutoff  ", co_label_style),
-        Span::styled(format!(" {} ", display_val), Style::default().fg(Color::White).bg(co_bg)),
+        Span::styled(format!(" {} ", display_val), Style::default().fg(co_fg).bg(co_bg)),
         Span::styled(" %", theme::muted()),
     ]);
     f.render_widget(Paragraph::new(co_line), chunks[2]);
@@ -2373,11 +2375,12 @@ fn draw_soxr_fields(
     let ph_label_style = if ph_focused { theme::bright() } else { theme::muted() };
     let visible_width_ph = chunks[3].width.saturating_sub(16) as usize;
     let (view_ph, cursor_col_ph) = phase_input.view(visible_width_ph.max(1));
-    let display_val_ph = if view_ph.is_empty() { " ".to_string() } else { view_ph };
-    let ph_bg = if ph_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+    let (display_val_ph, ph_is_placeholder) = if view_ph.is_empty() { ("50".to_string(), true) } else { (view_ph, false) };
+    let ph_bg = if ph_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
+    let ph_fg = if ph_is_placeholder { theme::TEXT_DIM } else { Color::White };
     let ph_line = Line::from(vec![
         Span::styled("  phase           ", ph_label_style),
-        Span::styled(format!(" {} ", display_val_ph), Style::default().fg(Color::White).bg(ph_bg)),
+        Span::styled(format!(" {} ", display_val_ph), Style::default().fg(ph_fg).bg(ph_bg)),
     ]);
     f.render_widget(Paragraph::new(ph_line), chunks[3]);
     if ph_focused {
