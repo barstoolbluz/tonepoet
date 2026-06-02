@@ -1800,6 +1800,8 @@ pub enum ActiveOverlay {
     FormatSettings {
         kind: FormatSettingsKind,
         focus: FormatSettingsFocus,
+        /// When true, overlay shows help text instead of controls.
+        show_help: bool,
     },
 }
 

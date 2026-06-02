@@ -1564,26 +1564,37 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
-        ActiveOverlay::FormatSettings { mut kind, mut focus } => {
+        ActiveOverlay::FormatSettings { mut kind, mut focus, show_help } => {
             match key.code {
                 KeyCode::Enter => {
-                    commit_format_settings(app, &kind);
-                    app.active_overlay = ActiveOverlay::None;
+                    if show_help {
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
+                    } else {
+                        commit_format_settings(app, &kind);
+                        app.active_overlay = ActiveOverlay::None;
+                    }
                 }
                 KeyCode::Esc => {
-                    app.active_overlay = ActiveOverlay::None;
+                    if show_help {
+                        app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
+                    } else {
+                        app.active_overlay = ActiveOverlay::None;
+                    }
                 }
                 KeyCode::Up => {
                     focus = format_settings_focus_prev(&kind, focus);
-                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
+                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
                 }
                 KeyCode::Down | KeyCode::Tab => {
                     focus = format_settings_focus_next(&kind, focus);
-                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
+                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
+                }
+                KeyCode::Char('?') => {
+                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: !show_help };
                 }
                 _ => {
                     handle_format_settings_field_key(&mut kind, focus, &key);
-                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
+                    app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
                 }
             }
         }
@@ -6404,7 +6415,7 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .trim()
                 .parse::<f32>()
                 .ok()
-                .filter(|v| (0.0..=1.0).contains(v));
+                .filter(|v| (74.0..=99.7).contains(v));
             app.convert.format.soxr_phase = phase_input
                 .text
                 .trim()
@@ -7078,21 +7089,40 @@ fn handle_format_settings_mouse(
         }
     }
 
-    // Footer row.
+    // Footer row. When in help mode, the footer has 2 pills (? back, Esc close);
+    // in normal mode it has 3 pills (Enter save, Esc cancel, ? help).
+    let is_help = matches!(
+        app.active_overlay,
+        ActiveOverlay::FormatSettings { show_help: true, .. }
+    );
+    // Footer Y: border(1) + blank(1) + fields/help_lines(N) + blank(1) + footer
+    // = popup_y + field_count + 3 (both normal and help have same content row count)
     let footer_y = popup_y + 1 + field_count + 2;
     if my == footer_y {
-        // Hit-test the two footer pills: "Enter save" and "Esc cancel".
-        // They are center-aligned. Approximate: if click is in the left
-        // half of the inner area, treat as save; right half as cancel.
-        let inner_center = popup_x + popup_w / 2;
-        if mx < inner_center {
-            // Save: synthesize Enter.
-            let fake = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        if is_help {
+            // Help footer: left half = "? back", right half = "Esc close"
+            let half = popup_w / 2;
+            let rel_x = mx.saturating_sub(popup_x);
+            let fake = if rel_x < half {
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)
+            } else {
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            };
             handle_overlay_key(app, fake, tx);
         } else {
-            // Cancel: synthesize Esc.
-            let fake = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-            handle_overlay_key(app, fake, tx);
+            // Normal footer: thirds for Enter / Esc / ?
+            let third = popup_w / 3;
+            let rel_x = mx.saturating_sub(popup_x);
+            if rel_x < third {
+                let fake = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                handle_overlay_key(app, fake, tx);
+            } else if rel_x < third * 2 {
+                let fake = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+                handle_overlay_key(app, fake, tx);
+            } else {
+                let fake = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+                handle_overlay_key(app, fake, tx);
+            }
         }
     }
     // Any other in-popup click is silently consumed.
@@ -11035,7 +11065,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     ),
                     _ => return,
                 };
-                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
+                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
             }
             TuiButton::ResampleQualityPill(i) => {
                 use tonepoet_pipeline::enums::ResampleQuality;
@@ -11091,7 +11121,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     ),
                     _ => return,
                 };
-                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus };
+                app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, show_help: false };
             }
             TuiButton::MergePill(i) => {
                 app.convert.focus = ConvertFocus::OutputOptions;

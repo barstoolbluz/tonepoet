@@ -377,7 +377,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         },
         soxr_resampler: tonepoet_pipeline::SoxrResamplerSettings {
             chebyshev: format.soxr_chebyshev,
-            cutoff: format.soxr_cutoff,
+            cutoff: format.soxr_cutoff.map(|pct| pct / 100.0), // TUI stores %, pipeline needs 0.0-1.0
             phase: format.soxr_phase,
         },
         dsd,
