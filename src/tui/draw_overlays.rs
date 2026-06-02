@@ -851,7 +851,10 @@ fn draw_format_settings(
     let min_width = format_settings_min_width(kind);
     let popup_width = area.width.saturating_sub(4).min(min_width);
     let field_count: u16 = format_settings_field_count(kind);
-    let popup_height = field_count + 6;
+    let popup_height = match kind {
+        FormatSettingsKind::Sox { .. } => 17, // 15 content + 2 borders (includes sinc header)
+        _ => field_count + 6,
+    };
     let popup = centered_rect(popup_width, popup_height, area);
 
     let title = match kind {
@@ -878,22 +881,48 @@ fn draw_format_settings(
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    // Dynamic layout: blank, N fields, blank, footer, absorb.
-    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // blank
-    for _ in 0..field_count {
-        constraints.push(Constraint::Length(1));
-    }
-    constraints.push(Constraint::Length(1)); // blank
-    constraints.push(Constraint::Length(1)); // footer
-    constraints.push(Constraint::Min(0));    // absorb
+    // Dynamic layout. Sox has a section header between rate and sinc fields.
+    let constraints: Vec<Constraint> = if matches!(kind, FormatSettingsKind::Sox { .. }) {
+        // blank, 4 rate, blank, header, 6 sinc, blank, footer, absorb = 16
+        vec![
+            Constraint::Length(1), // [0] blank
+            Constraint::Length(1), // [1] chebyshev
+            Constraint::Length(1), // [2] cutoff
+            Constraint::Length(1), // [3] phase
+            Constraint::Length(1), // [4] aliasing
+            Constraint::Length(1), // [5] blank
+            Constraint::Length(1), // [6] "sinc filter" header
+            Constraint::Length(1), // [7] taps
+            Constraint::Length(1), // [8] attenuation
+            Constraint::Length(1), // [9] passband
+            Constraint::Length(1), // [10] transition
+            Constraint::Length(1), // [11] kaiser_beta
+            Constraint::Length(1), // [12] sinc_phase
+            Constraint::Length(1), // [13] blank
+            Constraint::Length(1), // [14] footer
+            Constraint::Min(0),   // [15] absorb
+        ]
+    } else {
+        let mut c = vec![Constraint::Length(1)]; // blank
+        for _ in 0..field_count {
+            c.push(Constraint::Length(1));
+        }
+        c.push(Constraint::Length(1)); // blank
+        c.push(Constraint::Length(1)); // footer
+        c.push(Constraint::Min(0));    // absorb
+        c
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(inner);
 
-    // Footer is at chunks[field_count + 2] (blank + fields + blank + footer).
-    let footer_idx = (field_count + 2) as usize;
+    let footer_idx = if matches!(kind, FormatSettingsKind::Sox { .. }) {
+        14 // Sox: blank + 4 rate + blank + header + 6 sinc + blank + footer
+    } else {
+        (field_count + 2) as usize
+    };
 
     match kind {
         FormatSettingsKind::Flac {
@@ -933,7 +962,18 @@ fn draw_format_settings(
             bandwidth_input,
             phase_input,
             allow_aliasing,
-        } => draw_sox_fields(f, *chebyshev, bandwidth_input, phase_input, *allow_aliasing, focus, &chunks, buttons),
+            sinc_taps_input,
+            sinc_attenuation_input,
+            sinc_passband_input,
+            sinc_transition_input,
+            sinc_kaiser_beta_input,
+            sinc_phase,
+        } => draw_sox_fields(
+            f, *chebyshev, bandwidth_input, phase_input, *allow_aliasing,
+            sinc_taps_input, sinc_attenuation_input, sinc_passband_input,
+            sinc_transition_input, sinc_kaiser_beta_input, *sinc_phase,
+            focus, &chunks, buttons,
+        ),
         FormatSettingsKind::Soxr {
             chebyshev,
             cutoff_input,
@@ -1627,6 +1667,12 @@ fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind) {
             ("nyquist cutoff", "Anti-aliasing rolloff as % of Nyquist. Higher = more content preserved."),
             ("phase", "0 = linear (preserves shape), 50 = intermediate, 100 = minimum phase."),
             ("aliasing", "Allow content above Nyquist. Creative use only; avoid for archival."),
+            ("taps", "FIR filter length (power of 2). More taps = sharper filter, slower."),
+            ("attenuation", "Stopband rejection in dB (80-200). Higher = less aliasing leakage."),
+            ("passband", "Lowpass cutoff frequency in Hz. Typically half of target sample rate."),
+            ("transition", "Rolloff width in Hz (1-5000). Narrower = steeper filter."),
+            ("kaiser beta", "Window shape (0-32). Higher = more sidelobe suppression."),
+            ("sinc phase", "Linear preserves waveform; minimum reduces pre-ringing."),
         ],
         FormatSettingsKind::Soxr { .. } => vec![
             ("chebyshev", "Equiripple passband filter. Sharper cutoff with slight ripple."),
@@ -1686,8 +1732,6 @@ fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind) {
 
     let footer_idx = help_lines.len() + 2;
     let footer = Paragraph::new(Line::from(vec![
-        footer_pill("? back", theme::BLUE),
-        pill_gap(),
         footer_pill("Esc close", theme::PURPLE),
     ]))
     .alignment(Alignment::Center);
@@ -1700,77 +1744,153 @@ fn draw_sox_fields(
     bandwidth_input: &super::text_input::TextInputState,
     phase_input: &super::text_input::TextInputState,
     allow_aliasing: bool,
+    sinc_taps_input: &super::text_input::TextInputState,
+    sinc_attenuation_input: &super::text_input::TextInputState,
+    sinc_passband_input: &super::text_input::TextInputState,
+    sinc_transition_input: &super::text_input::TextInputState,
+    sinc_kaiser_beta_input: &super::text_input::TextInputState,
+    sinc_phase: Option<tonepoet_pipeline::enums::SoxSincPhase>,
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
 ) {
+    use tonepoet_pipeline::enums::SoxSincPhase;
+
     let greyed = Style::default().fg(Color::DarkGray);
     let greyed_bg = Color::Rgb(20, 20, 20);
 
-    // Row 1: Chebyshev toggle (off/on)
-    // TODO: grey when quality < High (need quality passed in or read from app state)
+    // ── Rate section (chunks[1..4]) ──
+
+    // Row 1: Chebyshev toggle
     let cheb_focused = focus == FormatSettingsFocus::SoxChebyshev;
     let cheb_label_style = if cheb_focused { theme::bright() } else { theme::muted() };
-    let (off_style, on_style) = toggle_pill_styles(chebyshev, cheb_focused);
-    let cheb_line = Line::from(vec![
+    let (off_s, on_s) = toggle_pill_styles(chebyshev, cheb_focused);
+    f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  chebyshev       ", cheb_label_style),
-        Span::styled(" off ", off_style),
-        Span::raw(" "),
-        Span::styled(" on ", on_style),
-    ]);
-    f.render_widget(Paragraph::new(cheb_line), chunks[1]);
+        Span::styled(" off ", off_s), Span::raw(" "), Span::styled(" on ", on_s),
+    ])), chunks[1]);
     let cx = chunks[1].x + 18;
     buttons.record_button(TuiButton::FormatSettingsSoxChebyshev(0), Rect::new(cx, chunks[1].y, 5, 1));
     buttons.record_button(TuiButton::FormatSettingsSoxChebyshev(1), Rect::new(cx + 6, chunks[1].y, 4, 1));
 
-    // Row 2: Bandwidth text entry — greyed when chebyshev on
+    // Row 2: Nyquist cutoff — greyed when chebyshev on
     let bw_focused = focus == FormatSettingsFocus::SoxBandwidth;
-    let bw_label_style = if chebyshev { greyed } else if bw_focused { theme::bright() } else { theme::muted() };
-    let visible_width = chunks[2].width.saturating_sub(20) as usize;
-    let (view, cursor_col) = bandwidth_input.view(visible_width.max(1));
-    let display_val = if view.is_empty() { " ".to_string() } else { view };
+    let bw_ls = if chebyshev { greyed } else if bw_focused { theme::bright() } else { theme::muted() };
+    let bw_vw = chunks[2].width.saturating_sub(22) as usize;
+    let (bw_v, bw_cc) = bandwidth_input.view(bw_vw.max(1));
+    let bw_d = if bw_v.is_empty() { " ".to_string() } else { bw_v };
     let bw_bg = if chebyshev { greyed_bg } else if bw_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
     let bw_fg = if chebyshev { Color::DarkGray } else { Color::White };
-    let bw_line = Line::from(vec![
-        Span::styled("  nyquist cutoff  ", bw_label_style),
-        Span::styled(format!(" {} ", display_val), Style::default().fg(bw_fg).bg(bw_bg)),
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("  nyquist cutoff  ", bw_ls),
+        Span::styled(format!(" {} ", bw_d), Style::default().fg(bw_fg).bg(bw_bg)),
         Span::styled(" %", if chebyshev { greyed } else { theme::muted() }),
-    ]);
-    f.render_widget(Paragraph::new(bw_line), chunks[2]);
-    if bw_focused && !chebyshev {
-        f.set_cursor(chunks[2].x + 19 + cursor_col, chunks[2].y);
-    }
+    ])), chunks[2]);
+    if bw_focused && !chebyshev { f.set_cursor(chunks[2].x + 19 + bw_cc, chunks[2].y); }
 
-    // Row 3: Phase text entry
+    // Row 3: Phase
     let ph_focused = focus == FormatSettingsFocus::SoxPhase;
-    let ph_label_style = if ph_focused { theme::bright() } else { theme::muted() };
-    let visible_width_ph = chunks[3].width.saturating_sub(16) as usize;
-    let (view_ph, cursor_col_ph) = phase_input.view(visible_width_ph.max(1));
-    let display_val_ph = if view_ph.is_empty() { " ".to_string() } else { view_ph };
+    let ph_ls = if ph_focused { theme::bright() } else { theme::muted() };
+    let ph_vw = chunks[3].width.saturating_sub(19) as usize;
+    let (ph_v, ph_cc) = phase_input.view(ph_vw.max(1));
+    let ph_d = if ph_v.is_empty() { " ".to_string() } else { ph_v };
     let ph_bg = if ph_focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
-    let ph_line = Line::from(vec![
-        Span::styled("  phase           ", ph_label_style),
-        Span::styled(format!(" {} ", display_val_ph), Style::default().fg(Color::White).bg(ph_bg)),
-    ]);
-    f.render_widget(Paragraph::new(ph_line), chunks[3]);
-    if ph_focused {
-        f.set_cursor(chunks[3].x + 19 + cursor_col_ph, chunks[3].y);
-    }
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("  phase           ", ph_ls),
+        Span::styled(format!(" {} ", ph_d), Style::default().fg(Color::White).bg(ph_bg)),
+    ])), chunks[3]);
+    if ph_focused { f.set_cursor(chunks[3].x + 19 + ph_cc, chunks[3].y); }
 
-    // Row 4: Allow aliasing toggle (off/on)
+    // Row 4: Aliasing toggle
     let al_focused = focus == FormatSettingsFocus::SoxAliasing;
-    let al_label_style = if al_focused { theme::bright() } else { theme::muted() };
+    let al_ls = if al_focused { theme::bright() } else { theme::muted() };
     let (al_off, al_on) = toggle_pill_styles(allow_aliasing, al_focused);
-    let al_line = Line::from(vec![
-        Span::styled("  aliasing        ", al_label_style),
-        Span::styled(" off ", al_off),
-        Span::raw(" "),
-        Span::styled(" on ", al_on),
-    ]);
-    f.render_widget(Paragraph::new(al_line), chunks[4]);
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("  aliasing        ", al_ls),
+        Span::styled(" off ", al_off), Span::raw(" "), Span::styled(" on ", al_on),
+    ])), chunks[4]);
     let ax = chunks[4].x + 18;
     buttons.record_button(TuiButton::FormatSettingsSoxAliasing(0), Rect::new(ax, chunks[4].y, 5, 1));
     buttons.record_button(TuiButton::FormatSettingsSoxAliasing(1), Rect::new(ax + 6, chunks[4].y, 4, 1));
+
+    // ── Sinc section header (chunks[6]) + fields (chunks[7..12]) ──
+
+    let sinc_label_style = if focused_in_sinc(focus) { theme::bright() } else { theme::muted() };
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("  sinc filter", sinc_label_style),
+    ])), chunks[6]);
+
+    // Helper: render a text entry row for sinc fields
+    fn sinc_text_row<'a>(
+        label: &'a str, input: &super::text_input::TextInputState, suffix: &'a str,
+        focused: bool, chunk: Rect, f: &mut Frame,
+    ) -> u16 {
+        let ls = if focused { theme::bright() } else { theme::muted() };
+        let vw = chunk.width.saturating_sub(22) as usize;
+        let (v, cc) = input.view(vw.max(1));
+        let d = if v.is_empty() { " ".to_string() } else { v };
+        let bg = if focused { Color::Rgb(40, 40, 40) } else { Color::Rgb(30, 30, 30) };
+        let mut spans = vec![
+            Span::styled(label, ls),
+            Span::styled(format!(" {} ", d), Style::default().fg(Color::White).bg(bg)),
+        ];
+        if !suffix.is_empty() {
+            spans.push(Span::styled(suffix, theme::muted()));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), chunk);
+        if focused { f.set_cursor(chunk.x + 19 + cc, chunk.y); }
+        cc
+    }
+
+    sinc_text_row("  taps            ", sinc_taps_input, "",
+        focus == FormatSettingsFocus::SoxSincTaps, chunks[7], f);
+    sinc_text_row("  attenuation     ", sinc_attenuation_input, " dB",
+        focus == FormatSettingsFocus::SoxSincAttenuation, chunks[8], f);
+    sinc_text_row("  passband        ", sinc_passband_input, " Hz",
+        focus == FormatSettingsFocus::SoxSincPassband, chunks[9], f);
+    sinc_text_row("  transition      ", sinc_transition_input, " Hz",
+        focus == FormatSettingsFocus::SoxSincTransition, chunks[10], f);
+    sinc_text_row("  kaiser beta     ", sinc_kaiser_beta_input, "",
+        focus == FormatSettingsFocus::SoxSincKaiserBeta, chunks[11], f);
+
+    // Row 12: Sinc phase pills (linear/minimum/intermediate)
+    let sp_focused = focus == FormatSettingsFocus::SoxSincPhase;
+    let sp_ls = if sp_focused { theme::bright() } else { theme::muted() };
+    let phases = [
+        (Some(SoxSincPhase::Linear), "linear"),
+        (Some(SoxSincPhase::Minimum), "minimum"),
+        (Some(SoxSincPhase::Intermediate), "intermediate"),
+    ];
+    let mut sp_spans = vec![Span::styled("  sinc phase      ", sp_ls)];
+    let mut spx = chunks[12].x + 18;
+    for (i, (p, label)) in phases.iter().enumerate() {
+        let selected = *p == sinc_phase;
+        let style = if selected {
+            Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::GREEN).add_modifier(Modifier::BOLD)
+        } else if sp_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        sp_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(TuiButton::FormatSettingsSoxSincPhase(i), Rect::new(spx, chunks[12].y, pill_w, 1));
+        spx += pill_w;
+        if i + 1 < phases.len() { sp_spans.push(Span::raw(" ")); spx += 1; }
+    }
+    f.render_widget(Paragraph::new(Line::from(sp_spans)), chunks[12]);
+}
+
+fn focused_in_sinc(focus: FormatSettingsFocus) -> bool {
+    matches!(focus,
+        FormatSettingsFocus::SoxSincTaps
+        | FormatSettingsFocus::SoxSincAttenuation
+        | FormatSettingsFocus::SoxSincPassband
+        | FormatSettingsFocus::SoxSincTransition
+        | FormatSettingsFocus::SoxSincKaiserBeta
+        | FormatSettingsFocus::SoxSincPhase
+    )
 }
 
 fn draw_soxr_fields(
@@ -1857,7 +1977,7 @@ pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
         FormatSettingsKind::Mp3 { .. } => 4,
         FormatSettingsKind::WavPack { .. } => 4,
         FormatSettingsKind::Ssrc { .. } => 2,
-        FormatSettingsKind::Sox { .. } => 4,
+        FormatSettingsKind::Sox { .. } => 10,
         FormatSettingsKind::Soxr { .. } => 3,
     }
 }
@@ -1910,9 +2030,11 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
                 + labels.len().saturating_sub(1);
             label_width + pills_width
         }
-        FormatSettingsKind::Sox { .. } | FormatSettingsKind::Soxr { .. } => {
-            // Labels are 18 chars (wider than standard 15 due to "nyquist cutoff")
-            // Plus text entry width for editing
+        FormatSettingsKind::Sox { .. } => {
+            // Widest: sinc phase pills: 18 + " linear " + " minimum " + " intermediate " = 52
+            52 + 6
+        }
+        FormatSettingsKind::Soxr { .. } => {
             18 + 20
         }
     };

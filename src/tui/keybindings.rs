@@ -5494,7 +5494,7 @@ fn handle_generic_overlay_mouse(
                 let min_w = super::draw_overlays::format_settings_min_width(kind);
                 let w: u16 = area.0.saturating_sub(4).min(min_w);
                 let field_count = super::draw_overlays::format_settings_field_count(kind);
-                let h: u16 = field_count + 6;
+                let h: u16 = if matches!(kind, FormatSettingsKind::Sox { .. }) { 17 } else { field_count + 6 };
                 let x = (area.0.saturating_sub(w)) / 2;
                 let y = (area.1.saturating_sub(h)) / 2;
                 (
@@ -6388,21 +6388,37 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
             bandwidth_input,
             phase_input,
             allow_aliasing,
+            sinc_taps_input,
+            sinc_attenuation_input,
+            sinc_passband_input,
+            sinc_transition_input,
+            sinc_kaiser_beta_input,
+            sinc_phase,
         } => {
             app.convert.format.sox_chebyshev = *chebyshev;
             app.convert.format.sox_bandwidth = bandwidth_input
-                .text
-                .trim()
-                .parse::<f32>()
-                .ok()
+                .text.trim().parse::<f32>().ok()
                 .filter(|v| (74.0..=99.7).contains(v));
             app.convert.format.sox_phase = phase_input
-                .text
-                .trim()
-                .parse::<u8>()
-                .ok()
+                .text.trim().parse::<u8>().ok()
                 .filter(|v| *v <= 100);
             app.convert.format.sox_allow_aliasing = *allow_aliasing;
+            app.convert.format.sox_sinc_taps = sinc_taps_input
+                .text.trim().parse::<u32>().ok()
+                .filter(|v| v.is_power_of_two() && (1024..=67_108_864).contains(v));
+            app.convert.format.sox_sinc_attenuation = sinc_attenuation_input
+                .text.trim().parse::<u16>().ok()
+                .filter(|v| (80..=200).contains(v));
+            app.convert.format.sox_sinc_passband = sinc_passband_input
+                .text.trim().parse::<f32>().ok()
+                .filter(|v| (1.0..=220_000.0).contains(v));
+            app.convert.format.sox_sinc_transition = sinc_transition_input
+                .text.trim().parse::<f32>().ok()
+                .filter(|v| (1.0..=5000.0).contains(v));
+            app.convert.format.sox_sinc_kaiser_beta = sinc_kaiser_beta_input
+                .text.trim().parse::<f32>().ok()
+                .filter(|v| (0.0..=32.0).contains(v));
+            app.convert.format.sox_sinc_phase = *sinc_phase;
         }
         FormatSettingsKind::Soxr {
             chebyshev,
@@ -6485,20 +6501,19 @@ fn format_settings_focus_next(kind: &FormatSettingsKind, focus: FormatSettingsFo
             _ => FormatSettingsFocus::SsrcProfile,
         },
         FormatSettingsKind::Sox { chebyshev, .. } => {
-            if *chebyshev {
-                // Chebyshev on: skip bandwidth
-                match focus {
-                    FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxPhase,
-                    FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxAliasing,
-                    _ => FormatSettingsFocus::SoxChebyshev,
+            match focus {
+                FormatSettingsFocus::SoxChebyshev => {
+                    if *chebyshev { FormatSettingsFocus::SoxPhase } else { FormatSettingsFocus::SoxBandwidth }
                 }
-            } else {
-                match focus {
-                    FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxBandwidth,
-                    FormatSettingsFocus::SoxBandwidth => FormatSettingsFocus::SoxPhase,
-                    FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxAliasing,
-                    _ => FormatSettingsFocus::SoxChebyshev,
-                }
+                FormatSettingsFocus::SoxBandwidth => FormatSettingsFocus::SoxPhase,
+                FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxAliasing,
+                FormatSettingsFocus::SoxAliasing => FormatSettingsFocus::SoxSincTaps,
+                FormatSettingsFocus::SoxSincTaps => FormatSettingsFocus::SoxSincAttenuation,
+                FormatSettingsFocus::SoxSincAttenuation => FormatSettingsFocus::SoxSincPassband,
+                FormatSettingsFocus::SoxSincPassband => FormatSettingsFocus::SoxSincTransition,
+                FormatSettingsFocus::SoxSincTransition => FormatSettingsFocus::SoxSincKaiserBeta,
+                FormatSettingsFocus::SoxSincKaiserBeta => FormatSettingsFocus::SoxSincPhase,
+                _ => FormatSettingsFocus::SoxChebyshev,
             }
         }
         FormatSettingsKind::Soxr { .. } => match focus {
@@ -6562,19 +6577,19 @@ fn format_settings_focus_prev(kind: &FormatSettingsKind, focus: FormatSettingsFo
             _ => FormatSettingsFocus::SsrcProfile,
         },
         FormatSettingsKind::Sox { chebyshev, .. } => {
-            if *chebyshev {
-                match focus {
-                    FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxAliasing,
-                    FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxChebyshev,
-                    _ => FormatSettingsFocus::SoxPhase,
+            match focus {
+                FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxSincPhase,
+                FormatSettingsFocus::SoxBandwidth => FormatSettingsFocus::SoxChebyshev,
+                FormatSettingsFocus::SoxPhase => {
+                    if *chebyshev { FormatSettingsFocus::SoxChebyshev } else { FormatSettingsFocus::SoxBandwidth }
                 }
-            } else {
-                match focus {
-                    FormatSettingsFocus::SoxChebyshev => FormatSettingsFocus::SoxAliasing,
-                    FormatSettingsFocus::SoxBandwidth => FormatSettingsFocus::SoxChebyshev,
-                    FormatSettingsFocus::SoxPhase => FormatSettingsFocus::SoxBandwidth,
-                    _ => FormatSettingsFocus::SoxPhase,
-                }
+                FormatSettingsFocus::SoxAliasing => FormatSettingsFocus::SoxPhase,
+                FormatSettingsFocus::SoxSincTaps => FormatSettingsFocus::SoxAliasing,
+                FormatSettingsFocus::SoxSincAttenuation => FormatSettingsFocus::SoxSincTaps,
+                FormatSettingsFocus::SoxSincPassband => FormatSettingsFocus::SoxSincAttenuation,
+                FormatSettingsFocus::SoxSincTransition => FormatSettingsFocus::SoxSincPassband,
+                FormatSettingsFocus::SoxSincKaiserBeta => FormatSettingsFocus::SoxSincTransition,
+                _ => FormatSettingsFocus::SoxSincKaiserBeta,
             }
         }
         FormatSettingsKind::Soxr { .. } => match focus {
@@ -6820,25 +6835,61 @@ fn handle_format_settings_field_key(
             bandwidth_input,
             phase_input,
             allow_aliasing,
-        } => match focus {
-            FormatSettingsFocus::SoxChebyshev => {
-                if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
-                    *chebyshev = !*chebyshev;
+            sinc_taps_input,
+            sinc_attenuation_input,
+            sinc_passband_input,
+            sinc_transition_input,
+            sinc_kaiser_beta_input,
+            sinc_phase,
+        } => {
+            use tonepoet_pipeline::enums::SoxSincPhase;
+            match focus {
+                FormatSettingsFocus::SoxChebyshev => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        *chebyshev = !*chebyshev;
+                    }
                 }
-            }
-            FormatSettingsFocus::SoxBandwidth => {
-                super::text_input::handle_text_input_key(bandwidth_input, key);
-            }
-            FormatSettingsFocus::SoxPhase => {
-                super::text_input::handle_text_input_key(phase_input, key);
-            }
-            FormatSettingsFocus::SoxAliasing => {
-                if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
-                    *allow_aliasing = !*allow_aliasing;
+                FormatSettingsFocus::SoxBandwidth => {
+                    super::text_input::handle_text_input_key(bandwidth_input, key);
                 }
+                FormatSettingsFocus::SoxPhase => {
+                    super::text_input::handle_text_input_key(phase_input, key);
+                }
+                FormatSettingsFocus::SoxAliasing => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        *allow_aliasing = !*allow_aliasing;
+                    }
+                }
+                FormatSettingsFocus::SoxSincTaps => {
+                    super::text_input::handle_text_input_key(sinc_taps_input, key);
+                }
+                FormatSettingsFocus::SoxSincAttenuation => {
+                    super::text_input::handle_text_input_key(sinc_attenuation_input, key);
+                }
+                FormatSettingsFocus::SoxSincPassband => {
+                    super::text_input::handle_text_input_key(sinc_passband_input, key);
+                }
+                FormatSettingsFocus::SoxSincTransition => {
+                    super::text_input::handle_text_input_key(sinc_transition_input, key);
+                }
+                FormatSettingsFocus::SoxSincKaiserBeta => {
+                    super::text_input::handle_text_input_key(sinc_kaiser_beta_input, key);
+                }
+                FormatSettingsFocus::SoxSincPhase => {
+                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        let phases = [None, Some(SoxSincPhase::Linear), Some(SoxSincPhase::Minimum), Some(SoxSincPhase::Intermediate)];
+                        let cur = phases.iter().position(|p| p == sinc_phase).unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            if cur == 0 { phases.len() - 1 } else { cur - 1 }
+                        } else {
+                            (cur + 1) % phases.len()
+                        };
+                        *sinc_phase = phases[next];
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
         FormatSettingsKind::Soxr {
             chebyshev,
             cutoff_input,
@@ -6885,8 +6936,27 @@ fn handle_format_settings_mouse(
     } else {
         (50, 3)
     };
-    let popup_w = term.0.saturating_sub(4).min(min_w);
-    let popup_h = field_count + 6;
+    let is_sox = matches!(
+        app.active_overlay,
+        ActiveOverlay::FormatSettings { kind: FormatSettingsKind::Sox { .. }, .. }
+    );
+    let is_help = matches!(
+        app.active_overlay,
+        ActiveOverlay::FormatSettings { show_help: true, .. }
+    );
+    // Help popup uses its own width/height based on help line count.
+    let popup_w = if is_help {
+        term.0.saturating_sub(4).min(72) // matches draw_format_settings_help
+    } else {
+        term.0.saturating_sub(4).min(min_w)
+    };
+    let popup_h = if is_help {
+        (field_count + 5).min(term.1.saturating_sub(4)) // matches draw_format_settings_help
+    } else if is_sox {
+        17
+    } else {
+        field_count + 6
+    };
     let popup_x = (term.0.saturating_sub(popup_w)) / 2;
     let popup_y = (term.1.saturating_sub(popup_h)) / 2;
 
@@ -7009,6 +7079,14 @@ fn handle_format_settings_mouse(
                     *allow_aliasing = i == 1;
                     return;
                 }
+                (FormatSettingsKind::Sox { ref mut sinc_phase, .. }, TuiButton::FormatSettingsSoxSincPhase(i)) => {
+                    use tonepoet_pipeline::enums::SoxSincPhase;
+                    let phases = [Some(SoxSincPhase::Linear), Some(SoxSincPhase::Minimum), Some(SoxSincPhase::Intermediate)];
+                    if let Some(p) = phases.get(i) {
+                        *sinc_phase = *p;
+                    }
+                    return;
+                }
                 (FormatSettingsKind::Soxr { ref mut chebyshev, .. }, TuiButton::FormatSettingsSoxrChebyshev(i)) => {
                     *chebyshev = i == 1;
                     return;
@@ -7019,6 +7097,10 @@ fn handle_format_settings_mouse(
     }
 
     // Click-to-focus: clicking on a field row sets focus to that field.
+    // Skip in help mode — help overlay has no interactive fields.
+    if is_help {
+        // Fall through to footer check below.
+    } else {
     let field1_y = popup_y + 2;
     let field2_y = popup_y + 3;
     let field3_y = popup_y + 4;
@@ -7069,13 +7151,28 @@ fn handle_format_settings_mouse(
                 y if y == field2_y => Some(FormatSettingsFocus::SsrcInsane),
                 _ => None,
             },
-            FormatSettingsKind::Sox { chebyshev, .. } => match my {
-                y if y == field1_y => Some(FormatSettingsFocus::SoxChebyshev),
-                y if y == field2_y && !*chebyshev => Some(FormatSettingsFocus::SoxBandwidth),
-                y if y == field3_y => Some(FormatSettingsFocus::SoxPhase),
-                y if y == field4_y => Some(FormatSettingsFocus::SoxAliasing),
-                _ => None,
-            },
+            FormatSettingsKind::Sox { chebyshev, .. } => {
+                // Rate fields at popup_y+2..+5, sinc fields at popup_y+8..+13 (offset by blank+header)
+                let sinc1_y = popup_y + 8;
+                let sinc2_y = popup_y + 9;
+                let sinc3_y = popup_y + 10;
+                let sinc4_y = popup_y + 11;
+                let sinc5_y = popup_y + 12;
+                let sinc6_y = popup_y + 13;
+                match my {
+                    y if y == field1_y => Some(FormatSettingsFocus::SoxChebyshev),
+                    y if y == field2_y && !*chebyshev => Some(FormatSettingsFocus::SoxBandwidth),
+                    y if y == field3_y => Some(FormatSettingsFocus::SoxPhase),
+                    y if y == field4_y => Some(FormatSettingsFocus::SoxAliasing),
+                    y if y == sinc1_y => Some(FormatSettingsFocus::SoxSincTaps),
+                    y if y == sinc2_y => Some(FormatSettingsFocus::SoxSincAttenuation),
+                    y if y == sinc3_y => Some(FormatSettingsFocus::SoxSincPassband),
+                    y if y == sinc4_y => Some(FormatSettingsFocus::SoxSincTransition),
+                    y if y == sinc5_y => Some(FormatSettingsFocus::SoxSincKaiserBeta),
+                    y if y == sinc6_y => Some(FormatSettingsFocus::SoxSincPhase),
+                    _ => None,
+                }
+            }
             FormatSettingsKind::Soxr { .. } => match my {
                 y if y == field1_y => Some(FormatSettingsFocus::SoxrChebyshev),
                 y if y == field2_y => Some(FormatSettingsFocus::SoxrCutoff),
@@ -7088,26 +7185,27 @@ fn handle_format_settings_mouse(
             return;
         }
     }
+    } // end of !is_help click-to-focus block
 
-    // Footer row. When in help mode, the footer has 2 pills (? back, Esc close);
-    // in normal mode it has 3 pills (Enter save, Esc cancel, ? help).
-    let is_help = matches!(
-        app.active_overlay,
-        ActiveOverlay::FormatSettings { show_help: true, .. }
-    );
-    // Footer Y: border(1) + blank(1) + fields/help_lines(N) + blank(1) + footer
-    // = popup_y + field_count + 3 (both normal and help have same content row count)
-    let footer_y = popup_y + 1 + field_count + 2;
+    // Footer row Y. Must match the rendered footer position for each overlay mode.
+    // Layout: border(1) + content + footer + absorb(if any) + border(1).
+    // For help: border + blank + N lines + blank + footer + absorb + border.
+    // For normal: border + blank + fields + blank + footer + absorb + border.
+    // For Sox normal: border + blank + 4rate + blank + header + 6sinc + blank + footer + absorb + border.
+    let footer_y = if is_help {
+        // Help: footer at inner row field_count + 2 (blank + N lines + blank + footer)
+        popup_y + 1 + field_count + 2
+    } else if is_sox {
+        // Sox: footer at inner row 14 (blank + 4 + blank + header + 6 + blank + footer)
+        popup_y + 1 + 14
+    } else {
+        // Generic: footer at inner row field_count + 2
+        popup_y + 1 + field_count + 2
+    };
     if my == footer_y {
         if is_help {
-            // Help footer: left half = "? back", right half = "Esc close"
-            let half = popup_w / 2;
-            let rel_x = mx.saturating_sub(popup_x);
-            let fake = if rel_x < half {
-                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)
-            } else {
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
-            };
+            // Help footer: single "Esc close" pill — any click returns to controls
+            let fake = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
             handle_overlay_key(app, fake, tx);
         } else {
             // Normal footer: thirds for Enter / Esc / ?
@@ -11104,6 +11202,22 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                                 fmt.sox_phase.map(|v| v.to_string()).unwrap_or_default(),
                             ),
                             allow_aliasing: fmt.sox_allow_aliasing,
+                            sinc_taps_input: super::text_input::TextInputState::new(
+                                fmt.sox_sinc_taps.map(|v| v.to_string()).unwrap_or_default(),
+                            ),
+                            sinc_attenuation_input: super::text_input::TextInputState::new(
+                                fmt.sox_sinc_attenuation.map(|v| v.to_string()).unwrap_or_default(),
+                            ),
+                            sinc_passband_input: super::text_input::TextInputState::new(
+                                fmt.sox_sinc_passband.map(|v| format!("{}", v)).unwrap_or_default(),
+                            ),
+                            sinc_transition_input: super::text_input::TextInputState::new(
+                                fmt.sox_sinc_transition.map(|v| format!("{}", v)).unwrap_or_default(),
+                            ),
+                            sinc_kaiser_beta_input: super::text_input::TextInputState::new(
+                                fmt.sox_sinc_kaiser_beta.map(|v| format!("{}", v)).unwrap_or_default(),
+                            ),
+                            sinc_phase: fmt.sox_sinc_phase,
                         },
                         FormatSettingsFocus::SoxChebyshev,
                     ),
@@ -11486,6 +11600,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsSsrcInsane(_)
             | TuiButton::FormatSettingsSoxChebyshev(_)
             | TuiButton::FormatSettingsSoxAliasing(_)
+            | TuiButton::FormatSettingsSoxSincPhase(_)
             | TuiButton::FormatSettingsSoxrChebyshev(_) => {
                 // Handled in dedicated mouse handlers; no-op here.
             }

@@ -137,11 +137,18 @@ pub enum FormatSettingsFocus {
     // SSRC
     SsrcProfile,
     SsrcInsane,
-    // Sox
+    // Sox (rate effect)
     SoxChebyshev,
     SoxBandwidth,
     SoxPhase,
     SoxAliasing,
+    // Sox (sinc FIR pre-filter)
+    SoxSincTaps,
+    SoxSincAttenuation,
+    SoxSincPassband,
+    SoxSincTransition,
+    SoxSincKaiserBeta,
+    SoxSincPhase,
     // Soxr
     SoxrChebyshev,
     SoxrCutoff,
@@ -188,6 +195,12 @@ pub enum FormatSettingsKind {
         bandwidth_input: crate::tui::text_input::TextInputState,
         phase_input: crate::tui::text_input::TextInputState,
         allow_aliasing: bool,
+        sinc_taps_input: crate::tui::text_input::TextInputState,
+        sinc_attenuation_input: crate::tui::text_input::TextInputState,
+        sinc_passband_input: crate::tui::text_input::TextInputState,
+        sinc_transition_input: crate::tui::text_input::TextInputState,
+        sinc_kaiser_beta_input: crate::tui::text_input::TextInputState,
+        sinc_phase: Option<tonepoet_pipeline::enums::SoxSincPhase>,
     },
     Soxr {
         chebyshev: bool,

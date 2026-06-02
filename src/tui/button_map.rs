@@ -79,6 +79,8 @@ pub enum TuiButton {
     FormatSettingsSoxChebyshev(usize),
     /// Sox aliasing toggle pills inside the FormatSettings overlay.
     FormatSettingsSoxAliasing(usize),
+    /// Sox sinc phase pills inside the FormatSettings overlay.
+    FormatSettingsSoxSincPhase(usize),
     /// Soxr chebyshev toggle pills inside the FormatSettings overlay.
     FormatSettingsSoxrChebyshev(usize),
 
@@ -250,6 +252,7 @@ impl TuiButton {
             | Self::FormatSettingsSsrcInsane(_)
             | Self::FormatSettingsSoxChebyshev(_)
             | Self::FormatSettingsSoxAliasing(_)
+            | Self::FormatSettingsSoxSincPhase(_)
             | Self::FormatSettingsSoxrChebyshev(_) => None,
             Self::Pane(_)
             | Self::FormatPill(_)
