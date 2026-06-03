@@ -18,7 +18,7 @@ use tonepoet_pipeline::{
     NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
     SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
-    SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcProfile, SsrcSettings,
+    SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcPdfType, SsrcProfile, SsrcSettings,
     TrellisSettings,
     VerificationSettings, WavPackMode,
     WavPackSettings,
@@ -75,6 +75,9 @@ use tonepoet_pipeline::{
 /// - soxr_resampler.cutoff: Some(0.97)
 /// - soxr_resampler.phase: Some(25)
 /// - ssrc.profile: Some(Long)
+/// - ssrc.attenuation_db: Some(3.0)
+/// - ssrc.min_phase: true
+/// - ssrc.pdf_type: Some(Triangular)
 /// - dsd.noise_shaper: Crfb
 /// - dsd.modulator_order: Order7
 /// - dsd.trellis.lookahead: 17
@@ -139,6 +142,9 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             force: true,
             insane_mode: true,
             profile: Some(SsrcProfile::Long),
+            attenuation_db: Some(3.0),
+            min_phase: true,
+            pdf_type: Some(SsrcPdfType::Triangular),
         },
         sox_resampler: SoxResamplerSettings {
             chebyshev: true,
@@ -283,6 +289,9 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.soxr_resampler.cutoff, &expected.soxr_resampler.cutoff, "soxr_resampler.cutoff");
     assert_eq!(&actual.soxr_resampler.phase, &expected.soxr_resampler.phase, "soxr_resampler.phase");
     assert_eq!(&actual.ssrc.profile, &expected.ssrc.profile, "ssrc.profile");
+    assert_eq!(&actual.ssrc.attenuation_db, &expected.ssrc.attenuation_db, "ssrc.attenuation_db");
+    assert_eq!(&actual.ssrc.min_phase, &expected.ssrc.min_phase, "ssrc.min_phase");
+    assert_eq!(&actual.ssrc.pdf_type, &expected.ssrc.pdf_type, "ssrc.pdf_type");
     assert_eq!(&actual.dsd.noise_shaper, &expected.dsd.noise_shaper, "dsd.noise_shaper");
     assert_eq!(&actual.dsd.modulator_order, &expected.dsd.modulator_order, "dsd.modulator_order");
     assert_eq!(&actual.dsd.trellis, &expected.dsd.trellis, "dsd.trellis");
@@ -373,6 +382,9 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "soxr_resampler.cutoff", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "soxr_resampler.phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "ssrc.profile", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "ssrc.attenuation_db", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "ssrc.min_phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "ssrc.pdf_type", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.noise_shaper", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.modulator_order", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.trellis", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
@@ -444,6 +456,9 @@ fn field_differs_from_default(
         "soxr_resampler.cutoff" => settings.soxr_resampler.cutoff != default.soxr_resampler.cutoff,
         "soxr_resampler.phase" => settings.soxr_resampler.phase != default.soxr_resampler.phase,
         "ssrc.profile" => settings.ssrc.profile != default.ssrc.profile,
+        "ssrc.attenuation_db" => settings.ssrc.attenuation_db != default.ssrc.attenuation_db,
+        "ssrc.min_phase" => settings.ssrc.min_phase != default.ssrc.min_phase,
+        "ssrc.pdf_type" => settings.ssrc.pdf_type != default.ssrc.pdf_type,
         "dsd.noise_shaper" => settings.dsd.noise_shaper != default.dsd.noise_shaper,
         "dsd.modulator_order" => settings.dsd.modulator_order != default.dsd.modulator_order,
         "dsd.trellis" => settings.dsd.trellis != default.dsd.trellis,
@@ -577,6 +592,9 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, soxr_resampler.cutoff, "soxr_resampler.cutoff");
     assert_covered_by_non_default!(default, raw, raw, soxr_resampler.phase, "soxr_resampler.phase");
     assert_covered_by_non_default!(default, raw, raw, ssrc.profile, "ssrc.profile");
+    assert_covered_by_non_default!(default, raw, raw, ssrc.attenuation_db, "ssrc.attenuation_db");
+    assert_covered_by_non_default!(default, raw, raw, ssrc.min_phase, "ssrc.min_phase");
+    assert_covered_by_non_default!(default, raw, raw, ssrc.pdf_type, "ssrc.pdf_type");
     assert_covered_by_non_default!(default, raw, raw, dsd.noise_shaper, "dsd.noise_shaper");
     assert_covered_by_non_default!(default, raw, raw, dsd.modulator_order, "dsd.modulator_order");
     assert_covered_by_non_default!(default, raw, raw, dsd.trellis, "dsd.trellis");
@@ -650,6 +668,9 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, soxr_resampler.cutoff, "soxr_resampler.cutoff");
     assert_covered_by_non_default!(default, flac, custom, soxr_resampler.phase, "soxr_resampler.phase");
     assert_covered_by_non_default!(default, flac, custom, ssrc.profile, "ssrc.profile");
+    assert_covered_by_non_default!(default, flac, custom, ssrc.attenuation_db, "ssrc.attenuation_db");
+    assert_covered_by_non_default!(default, flac, custom, ssrc.min_phase, "ssrc.min_phase");
+    assert_covered_by_non_default!(default, flac, custom, ssrc.pdf_type, "ssrc.pdf_type");
     assert_covered_by_non_default!(default, flac, custom, dsd.noise_shaper, "dsd.noise_shaper");
     assert_covered_by_non_default!(default, flac, custom, dsd.modulator_order, "dsd.modulator_order");
     assert_covered_by_non_default!(default, flac, custom, dsd.trellis, "dsd.trellis");
@@ -796,6 +817,9 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("soxr_resampler.cutoff", LegacyProjectionStatus::Defaulted),
     ("soxr_resampler.phase", LegacyProjectionStatus::Defaulted),
     ("ssrc.profile", LegacyProjectionStatus::Derived),
+    ("ssrc.attenuation_db", LegacyProjectionStatus::Derived),
+    ("ssrc.min_phase", LegacyProjectionStatus::Derived),
+    ("ssrc.pdf_type", LegacyProjectionStatus::Derived),
     ("dsd.noise_shaper", LegacyProjectionStatus::Unrepresentable),
     ("dsd.modulator_order", LegacyProjectionStatus::Unrepresentable),
     ("dsd.trellis", LegacyProjectionStatus::Unrepresentable),
@@ -977,6 +1001,9 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_unrepresentable!(covered, "soxr_resampler.cutoff", flac.soxr_resampler.cutoff, default.soxr_resampler.cutoff, sentinel.soxr_resampler.cutoff);
     assert_legacy_unrepresentable!(covered, "soxr_resampler.phase", flac.soxr_resampler.phase, default.soxr_resampler.phase, sentinel.soxr_resampler.phase);
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.profile", flac.ssrc.profile, Some(SsrcProfile::Insane));
+    assert_legacy_unrepresentable!(covered, "ssrc.attenuation_db", flac.ssrc.attenuation_db, default.ssrc.attenuation_db, sentinel.ssrc.attenuation_db);
+    assert_legacy_unrepresentable!(covered, "ssrc.min_phase", flac.ssrc.min_phase, default.ssrc.min_phase, sentinel.ssrc.min_phase);
+    assert_legacy_unrepresentable!(covered, "ssrc.pdf_type", flac.ssrc.pdf_type, default.ssrc.pdf_type, sentinel.ssrc.pdf_type);
     assert_legacy_unrepresentable!(covered, "dsd.noise_shaper", flac.dsd.noise_shaper, default.dsd.noise_shaper, sentinel.dsd.noise_shaper);
     assert_legacy_unrepresentable!(covered, "dsd.modulator_order", flac.dsd.modulator_order, default.dsd.modulator_order, sentinel.dsd.modulator_order);
     assert_legacy_unrepresentable!(covered, "dsd.trellis", flac.dsd.trellis, default.dsd.trellis, sentinel.dsd.trellis);

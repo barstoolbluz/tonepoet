@@ -75,6 +75,10 @@ pub enum TuiButton {
     FormatSettingsSsrcProfile(usize),
     /// SSRC insane toggle pills inside the FormatSettings overlay.
     FormatSettingsSsrcInsane(usize),
+    /// SSRC min phase toggle pills inside the FormatSettings overlay.
+    FormatSettingsSsrcMinPhase(usize),
+    /// SSRC PDF type pills inside the FormatSettings overlay.
+    FormatSettingsSsrcPdf(usize),
     /// Sox chebyshev toggle pills inside the FormatSettings overlay.
     FormatSettingsSoxChebyshev(usize),
     /// Sox aliasing toggle pills inside the FormatSettings overlay.
@@ -250,6 +254,8 @@ impl TuiButton {
             | Self::FormatSettingsWavPackCorrection(_)
             | Self::FormatSettingsSsrcProfile(_)
             | Self::FormatSettingsSsrcInsane(_)
+            | Self::FormatSettingsSsrcMinPhase(_)
+            | Self::FormatSettingsSsrcPdf(_)
             | Self::FormatSettingsSoxChebyshev(_)
             | Self::FormatSettingsSoxAliasing(_)
             | Self::FormatSettingsSoxSincPhase(_)

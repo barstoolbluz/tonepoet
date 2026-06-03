@@ -368,6 +368,9 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             force: false,
             insane_mode: format.ssrc_insane_mode,
             profile: format.ssrc_profile,
+            attenuation_db: format.ssrc_attenuation_db,
+            min_phase: format.ssrc_min_phase,
+            pdf_type: format.ssrc_pdf_type,
         },
         sox_resampler: tonepoet_pipeline::SoxResamplerSettings {
             chebyshev: format.sox_chebyshev,

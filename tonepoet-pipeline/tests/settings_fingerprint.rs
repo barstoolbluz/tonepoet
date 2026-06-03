@@ -5,7 +5,7 @@ use tonepoet_pipeline::{
     NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
     SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
-    SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcProfile, SsrcSettings,
+    SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcPdfType, SsrcProfile, SsrcSettings,
     TrellisSettings,
     VerificationSettings, WavPackMode, WavPackSettings,
 };
@@ -38,6 +38,9 @@ use tonepoet_pipeline::{
 /// - ssrc.force: true
 /// - ssrc.insane_mode: true
 /// - ssrc.profile: Some(Long)
+/// - ssrc.attenuation_db: Some(3.0)
+/// - ssrc.min_phase: true
+/// - ssrc.pdf_type: Some(Triangular)
 /// - sox_resampler.chebyshev: true
 /// - sox_resampler.bandwidth_pct: Some(97.0)
 /// - sox_resampler.phase: Some(25)
@@ -113,6 +116,9 @@ fn flac_md5_sentinel() -> PipelineSettings {
             force: true,
             insane_mode: true,
             profile: Some(SsrcProfile::Long),
+            attenuation_db: Some(3.0),
+            min_phase: true,
+            pdf_type: Some(SsrcPdfType::Triangular),
         },
         sox_resampler: SoxResamplerSettings {
             chebyshev: true,
@@ -171,7 +177,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 63);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 66);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();
@@ -305,6 +311,15 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     });
     assert_mutation_changes_fingerprint!(covered, base, "ssrc.profile", |settings| {
         settings.ssrc.profile = Some(SsrcProfile::High);
+    });
+    assert_mutation_changes_fingerprint!(covered, base, "ssrc.attenuation_db", |settings| {
+        settings.ssrc.attenuation_db = Some(6.0);
+    });
+    assert_mutation_changes_fingerprint!(covered, base, "ssrc.min_phase", |settings| {
+        settings.ssrc.min_phase = false;
+    });
+    assert_mutation_changes_fingerprint!(covered, base, "ssrc.pdf_type", |settings| {
+        settings.ssrc.pdf_type = Some(SsrcPdfType::Rectangular);
     });
     assert_mutation_changes_fingerprint!(
         covered,

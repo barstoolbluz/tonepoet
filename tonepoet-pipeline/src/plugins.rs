@@ -315,6 +315,21 @@ impl ToolPlugin for SsrcPlugin {
                 args.push("--bits".into());
                 args.push(depth.bits().to_string());
             }
+            if let Some(att) = context.request.settings.ssrc.attenuation_db {
+                args.push("--att".into());
+                args.push(format!("{:.1}", att));
+            }
+            if context.request.settings.ssrc.min_phase {
+                args.push("--minPhase".into());
+            }
+            if let Some(pdf) = context.request.settings.ssrc.pdf_type {
+                use crate::enums::SsrcPdfType;
+                args.push("--pdf".into());
+                args.push(match pdf {
+                    SsrcPdfType::Rectangular => "0".into(),
+                    SsrcPdfType::Triangular => "1".into(),
+                });
+            }
             args.push(input);
             args.push(output);
             Ok(PlannedCommand::new(

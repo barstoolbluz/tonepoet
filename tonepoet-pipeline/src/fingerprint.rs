@@ -82,6 +82,9 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "ssrc.force",
     "ssrc.insane_mode",
     "ssrc.profile",
+    "ssrc.attenuation_db",
+    "ssrc.min_phase",
+    "ssrc.pdf_type",
     "sox_resampler.chebyshev",
     "sox_resampler.bandwidth_pct",
     "sox_resampler.phase",
@@ -232,6 +235,19 @@ fn push_ssrc(writer: &mut FingerprintWriter, settings: &SsrcSettings) {
     writer.field_static("ssrc.force", bool_value(settings.force));
     writer.field_static("ssrc.insane_mode", bool_value(settings.insane_mode));
     writer.field_string("ssrc.profile", option_static(settings.profile.map(ssrc_profile)));
+    writer.field_string("ssrc.attenuation_db", option_f32(settings.attenuation_db));
+    writer.field_static("ssrc.min_phase", bool_value(settings.min_phase));
+    writer.field_string(
+        "ssrc.pdf_type",
+        option_static(settings.pdf_type.map(ssrc_pdf_type)),
+    );
+}
+
+fn ssrc_pdf_type(pdf: crate::enums::SsrcPdfType) -> &'static str {
+    match pdf {
+        crate::enums::SsrcPdfType::Rectangular => "Rectangular",
+        crate::enums::SsrcPdfType::Triangular => "Triangular",
+    }
 }
 
 fn push_sox_resampler(writer: &mut FingerprintWriter, settings: &SoxResamplerSettings) {

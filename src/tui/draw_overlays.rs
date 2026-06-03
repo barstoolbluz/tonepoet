@@ -956,7 +956,10 @@ fn draw_format_settings(
         FormatSettingsKind::Ssrc {
             profile,
             insane,
-        } => draw_ssrc_fields(f, *profile, *insane, focus, &chunks, buttons),
+            attenuation_input,
+            min_phase,
+            pdf_type,
+        } => draw_ssrc_fields(f, *profile, *insane, attenuation_input, *min_phase, *pdf_type, focus, &chunks, buttons),
         FormatSettingsKind::Sox {
             chebyshev,
             bandwidth_input,
@@ -1565,11 +1568,14 @@ fn draw_ssrc_fields(
     f: &mut Frame,
     profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
     insane: bool,
+    attenuation_input: &super::text_input::TextInputState,
+    min_phase: bool,
+    pdf_type: Option<tonepoet_pipeline::enums::SsrcPdfType>,
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
 ) {
-    use tonepoet_pipeline::enums::SsrcProfile;
+    use tonepoet_pipeline::enums::{SsrcPdfType, SsrcProfile};
 
     // Row 1: Profile pills (fast/short/std/long/high)
     let prof_focused = focus == FormatSettingsFocus::SsrcProfile;
@@ -1581,8 +1587,8 @@ fn draw_ssrc_fields(
         (SsrcProfile::Long, "long"),
         (SsrcProfile::High, "high"),
     ];
-    let mut prof_spans = vec![Span::styled("  profile      ", prof_label_style)];
-    let mut px = chunks[1].x + 15;
+    let mut prof_spans = vec![Span::styled("  profile        ", prof_label_style)];
+    let mut px = chunks[1].x + 17;
     for (i, (p, label)) in profiles.iter().enumerate() {
         let selected = profile == Some(*p);
         let style = if selected {
@@ -1615,15 +1621,70 @@ fn draw_ssrc_fields(
     let ins_label_style = if ins_focused { theme::bright() } else { theme::muted() };
     let (off_style, on_style) = toggle_pill_styles(insane, ins_focused);
     let ins_line = Line::from(vec![
-        Span::styled("  insane       ", ins_label_style),
+        Span::styled("  insane         ", ins_label_style),
         Span::styled(" off ", off_style),
         Span::raw(" "),
         Span::styled(" on ", on_style),
     ]);
     f.render_widget(Paragraph::new(ins_line), chunks[2]);
-    let ix = chunks[2].x + 15;
+    let ix = chunks[2].x + 17;
     buttons.record_button(TuiButton::FormatSettingsSsrcInsane(0), Rect::new(ix, chunks[2].y, 5, 1));
     buttons.record_button(TuiButton::FormatSettingsSsrcInsane(1), Rect::new(ix + 6, chunks[2].y, 4, 1));
+
+    // Row 3: Attenuation text entry
+    let att_focused = focus == FormatSettingsFocus::SsrcAttenuation;
+    let att_ls = if att_focused { theme::bright() } else { theme::muted() };
+    let att_vw = chunks[3].width.saturating_sub(22) as usize;
+    let (att_v, att_cc) = attenuation_input.view(att_vw.max(1));
+    let (att_d, att_is_placeholder) = if att_v.is_empty() { ("0".to_string(), true) } else { (att_v, false) };
+    let att_bg = if att_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
+    let att_fg = if att_is_placeholder { theme::TEXT_DIM } else { Color::White };
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("  attenuation    ", att_ls),
+        Span::styled(format!(" {} ", att_d), Style::default().fg(att_fg).bg(att_bg)),
+        Span::styled(" dB", theme::muted()),
+    ])), chunks[3]);
+    if att_focused { f.set_cursor(chunks[3].x + 18 + att_cc, chunks[3].y); }
+
+    // Row 4: Min phase toggle (off/on)
+    let mp_focused = focus == FormatSettingsFocus::SsrcMinPhase;
+    let mp_ls = if mp_focused { theme::bright() } else { theme::muted() };
+    let (mp_off, mp_on) = toggle_pill_styles(min_phase, mp_focused);
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("  min phase      ", mp_ls),
+        Span::styled(" off ", mp_off), Span::raw(" "), Span::styled(" on ", mp_on),
+    ])), chunks[4]);
+    let mx = chunks[4].x + 17;
+    buttons.record_button(TuiButton::FormatSettingsSsrcMinPhase(0), Rect::new(mx, chunks[4].y, 5, 1));
+    buttons.record_button(TuiButton::FormatSettingsSsrcMinPhase(1), Rect::new(mx + 6, chunks[4].y, 4, 1));
+
+    // Row 5: PDF type pills (none/rect/tri)
+    let pdf_focused = focus == FormatSettingsFocus::SsrcPdf;
+    let pdf_ls = if pdf_focused { theme::bright() } else { theme::muted() };
+    let pdfs = [
+        (None, "none"),
+        (Some(SsrcPdfType::Rectangular), "rect"),
+        (Some(SsrcPdfType::Triangular), "tri"),
+    ];
+    let mut pdf_spans = vec![Span::styled("  dither pdf     ", pdf_ls)];
+    let mut pdx = chunks[5].x + 17;
+    for (i, (p, label)) in pdfs.iter().enumerate() {
+        let selected = *p == pdf_type;
+        let style = if selected {
+            Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::GREEN).add_modifier(Modifier::BOLD)
+        } else if pdf_focused {
+            Style::default().fg(theme::TEXT_DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let pill_text = format!(" {} ", label);
+        let pill_w = pill_text.len() as u16;
+        pdf_spans.push(Span::styled(pill_text, style));
+        buttons.record_button(TuiButton::FormatSettingsSsrcPdf(i), Rect::new(pdx, chunks[5].y, pill_w, 1));
+        pdx += pill_w;
+        if i + 1 < pdfs.len() { pdf_spans.push(Span::raw(" ")); pdx += 1; }
+    }
+    f.render_widget(Paragraph::new(Line::from(pdf_spans)), chunks[5]);
 }
 
 /// Build the enriched help content for a given format settings kind.
@@ -1889,6 +1950,47 @@ fn format_settings_help_content(kind: &FormatSettingsKind) -> Vec<(&'static str,
                 "",
                 "When both this toggle and a profile are set, the insane flag",
                 "takes precedence.",
+            ]),
+            ("attenuation", &[
+                "Output attenuation in decibels (0.0–99.9 dB). Reduces the",
+                "output signal level to prevent intersample clipping, which can",
+                "occur when sample rate conversion produces peaks that exceed",
+                "0 dBFS.",
+                "",
+                "Particularly useful when downsampling high-resolution content",
+                "(e.g., 192 kHz → 44.1 kHz) where the anti-aliasing filter may",
+                "cause overshoot. A value of 1-3 dB is typical for safety.",
+                "",
+                "Leave empty for no attenuation (0 dB, full scale).",
+            ]),
+            ("min phase", &[
+                "When enabled, SSRC uses minimum phase FIR filters instead of",
+                "the default linear phase filters.",
+                "",
+                "Linear phase (default): Preserves the waveform shape with",
+                "symmetric pre/post-ringing around transients. No phase",
+                "distortion. Preferred for measurement and mastering.",
+                "",
+                "Minimum phase: Eliminates pre-ringing entirely. All ringing",
+                "occurs after the transient. Many listeners prefer this for",
+                "music playback as transient attacks sound cleaner. Introduces",
+                "slight phase shift that varies with frequency.",
+            ]),
+            ("dither pdf", &[
+                "Selects the probability distribution function used for",
+                "generating dither noise, separate from the noise shaper",
+                "selection on the main dither pill.",
+                "",
+                "  None         Use SSRC's default (determined by dither type).",
+                "",
+                "  Rectangular  Flat uniform distribution. Simplest form of",
+                "               dithering. Removes all distortion from",
+                "               quantization but adds slightly more noise.",
+                "",
+                "  Triangular   Shaped distribution that minimizes perceived",
+                "               noise modulation. Standard choice for audio",
+                "               work — slightly less total noise than",
+                "               rectangular, with no noise modulation.",
             ]),
         ],
         FormatSettingsKind::Sox { .. } => vec![
@@ -2413,7 +2515,7 @@ pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
         FormatSettingsKind::Opus { .. } => 4,
         FormatSettingsKind::Mp3 { .. } => 4,
         FormatSettingsKind::WavPack { .. } => 4,
-        FormatSettingsKind::Ssrc { .. } => 2,
+        FormatSettingsKind::Ssrc { .. } => 5,
         FormatSettingsKind::Sox { .. } => 10,
         FormatSettingsKind::Soxr { .. } => 3,
     }

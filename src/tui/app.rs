@@ -137,6 +137,9 @@ pub enum FormatSettingsFocus {
     // SSRC
     SsrcProfile,
     SsrcInsane,
+    SsrcAttenuation,
+    SsrcMinPhase,
+    SsrcPdf,
     // Sox (rate effect)
     SoxChebyshev,
     SoxBandwidth,
@@ -189,6 +192,9 @@ pub enum FormatSettingsKind {
     Ssrc {
         profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
         insane: bool,
+        attenuation_input: crate::tui::text_input::TextInputState,
+        min_phase: bool,
+        pdf_type: Option<tonepoet_pipeline::enums::SsrcPdfType>,
     },
     Sox {
         chebyshev: bool,
@@ -850,6 +856,12 @@ pub struct FormatState {
     pub ssrc_profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
     /// SSRC insane mode (force insane profile). Default: false.
     pub ssrc_insane_mode: bool,
+    /// SSRC output attenuation in dB (0.0-99.9). None = no attenuation.
+    pub ssrc_attenuation_db: Option<f32>,
+    /// SSRC minimum phase filters. Default: false (linear phase).
+    pub ssrc_min_phase: bool,
+    /// SSRC probability distribution function for dithering. None = ssrc default.
+    pub ssrc_pdf_type: Option<tonepoet_pipeline::enums::SsrcPdfType>,
     /// Sox chebyshev/steep filter (-s). Default: false.
     pub sox_chebyshev: bool,
     /// Sox bandwidth override (74.0-99.7%). None = derived from NyquistTransition.
@@ -1045,6 +1057,9 @@ impl FormatState {
             resample_quality: tonepoet_pipeline::enums::ResampleQuality::Ultra,
             ssrc_profile: None,
             ssrc_insane_mode: false,
+            ssrc_attenuation_db: None,
+            ssrc_min_phase: false,
+            ssrc_pdf_type: None,
             sox_chebyshev: false,
             sox_bandwidth: None,
             sox_phase: None,

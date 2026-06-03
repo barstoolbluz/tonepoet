@@ -588,6 +588,16 @@ impl SsrcProfile {
     }
 }
 
+/// SSRC probability distribution function for dithering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SsrcPdfType {
+    /// Rectangular distribution (`--pdf 0`).
+    Rectangular,
+    /// Triangular distribution (`--pdf 1`).
+    Triangular,
+}
+
 /// SoX-DSD noise-shaper family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

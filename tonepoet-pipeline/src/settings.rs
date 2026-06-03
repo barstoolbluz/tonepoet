@@ -7,7 +7,7 @@ use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     DsdNoiseShaper, GainCompensation, ModulatorOrder, Mp3Mode, NyquistTransition, OpusContentType,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
-    SsrcProfile, WavPackMode,
+    SsrcPdfType, SsrcProfile, WavPackMode,
 };
 use crate::error::{PlanningError, Result};
 
@@ -292,6 +292,14 @@ fn validate_encoder_settings(settings: &PipelineSettings) -> Result<()> {
             ));
         }
     }
+    if let Some(att) = settings.ssrc.attenuation_db {
+        if !(0.0..=99.9).contains(&att) {
+            return Err(PlanningError::invalid_settings(
+                "ssrc.attenuation_db",
+                "expected 0.0 through 99.9 dB",
+            ));
+        }
+    }
     if let Some(taps) = settings.sox_resampler.sinc_taps {
         if !taps.is_power_of_two() || !(1024..=67_108_864).contains(&taps) {
             return Err(PlanningError::invalid_settings(
@@ -557,7 +565,7 @@ impl Default for WavPackSettings {
 }
 
 /// SSRC brick-wall resampler settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SsrcSettings {
     /// Force SSRC when `nyquist_transition` is `BrickWall`.
@@ -566,6 +574,12 @@ pub struct SsrcSettings {
     pub insane_mode: bool,
     /// Optional explicit profile. `insane_mode` wins.
     pub profile: Option<SsrcProfile>,
+    /// Output attenuation in dB (0.0–99.9). None = no attenuation.
+    pub attenuation_db: Option<f32>,
+    /// Use minimum phase filters instead of linear phase.
+    pub min_phase: bool,
+    /// Probability distribution function for dithering. None = ssrc default.
+    pub pdf_type: Option<SsrcPdfType>,
 }
 
 impl Default for SsrcSettings {
@@ -574,6 +588,9 @@ impl Default for SsrcSettings {
             force: false,
             insane_mode: false,
             profile: None,
+            attenuation_db: None,
+            min_phase: false,
+            pdf_type: None,
         }
     }
 }
