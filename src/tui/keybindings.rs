@@ -11264,14 +11264,16 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::ResampleQualityPill(i) => {
                 use tonepoet_pipeline::enums::ResampleQuality;
                 app.convert.focus = ConvertFocus::Format;
-                let qualities = [
+                let mut qualities = vec![
                     ResampleQuality::Low,
                     ResampleQuality::Medium,
                     ResampleQuality::High,
                     ResampleQuality::VeryHigh,
                     ResampleQuality::Ultra,
-                    ResampleQuality::Insane,
                 ];
+                if *app.convert.format.resampler.selected_value() == ResamplerChoice::Sox {
+                    qualities.push(ResampleQuality::Insane);
+                }
                 if let Some(&q) = qualities.get(i) {
                     app.convert.format.resample_quality = q;
                     app.preset.mark_modified();

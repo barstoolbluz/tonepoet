@@ -246,33 +246,37 @@ pub fn draw_format_pane(
             vec![Span::styled("   resampling", resample_label_style)],
         ));
         use tonepoet_pipeline::enums::ResampleQuality;
-        let quality_pills: Vec<Span> = [
+        let mut quality_list: Vec<(ResampleQuality, &str)> = vec![
             (ResampleQuality::Low, "low"),
             (ResampleQuality::Medium, "med"),
             (ResampleQuality::High, "high"),
             (ResampleQuality::VeryHigh, "vhigh"),
             (ResampleQuality::Ultra, "ultra"),
-            (ResampleQuality::Insane, "insane"),
-        ]
-        .iter()
-        .enumerate()
-        .flat_map(|(i, (q, label))| {
-            let selected = *q == format_state.resample_quality;
-            let style = if selected {
-                Style::default()
-                    .fg(theme::PILL_ACTIVE_FG)
-                    .bg(theme::GREEN)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::TEXT_DIM)
-            };
-            let mut spans = vec![Span::styled(format!(" {} ", label), style)];
-            if i < 5 {
-                spans.push(Span::styled(" ", Style::default()));
-            }
-            spans
-        })
-        .collect();
+        ];
+        if *format_state.resampler.selected_value() == ResamplerChoice::Sox {
+            quality_list.push((ResampleQuality::Insane, "insane"));
+        }
+        let quality_count = quality_list.len();
+        let quality_pills: Vec<Span> = quality_list
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (q, label))| {
+                let selected = *q == format_state.resample_quality;
+                let style = if selected {
+                    Style::default()
+                        .fg(theme::PILL_ACTIVE_FG)
+                        .bg(theme::GREEN)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::TEXT_DIM)
+                };
+                let mut spans = vec![Span::styled(format!(" {} ", label), style)];
+                if i < quality_count - 1 {
+                    spans.push(Span::styled(" ", Style::default()));
+                }
+                spans
+            })
+            .collect();
 
         let resampler_name = match *format_state.resampler.selected_value() {
             ResamplerChoice::Ssrc => Some("ssrc"),

@@ -1659,7 +1659,7 @@ mod tests {
                 "8",
                 "output.flac",
                 "rate",
-                "-v",
+                "-u",
                 "88200",
                 "sinc",
                 "-a",

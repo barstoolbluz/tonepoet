@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{AppState, ConvertFocus, ConvertLayout, SourceMode};
+use super::app::{AppState, ConvertFocus, ConvertLayout, ResamplerChoice, SourceMode};
 use super::button_map::{ButtonRenderMap, MetadataFieldKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
@@ -300,7 +300,10 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
         };
         // Register quality pills
         let mut qx = label_col;
-        let quality_labels = ["low", "med", "high", "vhigh", "ultra", "insane"];
+        let mut quality_labels: Vec<&str> = vec!["low", "med", "high", "vhigh", "ultra"];
+        if *state.resampler.selected_value() == ResamplerChoice::Sox {
+            quality_labels.push("insane");
+        }
         for (i, label) in quality_labels.iter().enumerate() {
             let w = label.len() as u16 + 2; // " label "
             buttons.record_button(

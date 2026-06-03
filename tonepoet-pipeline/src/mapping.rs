@@ -27,7 +27,8 @@ pub const fn soxr_precision(quality: ResampleQuality) -> u8 {
 #[must_use]
 pub const fn sox_rate_quality_flag(quality: ResampleQuality) -> &'static str {
     match quality {
-        ResampleQuality::Insane | ResampleQuality::Ultra => "-v",
+        ResampleQuality::Insane => "-u",
+        ResampleQuality::Ultra => "-v",
         ResampleQuality::VeryHigh => "-h",
         ResampleQuality::High => "-m",
         ResampleQuality::Medium => "-l",
@@ -38,19 +39,19 @@ pub const fn sox_rate_quality_flag(quality: ResampleQuality) -> &'static str {
 /// Map DSD auto presets to SoX's very-high-quality rate flag.
 #[must_use]
 pub const fn sox_dsd_auto_rate_flag() -> &'static str {
-    "-v"
+    "-u"
 }
 
 /// Map a DSD low-pass policy to the SoX `rate` quality flag.
-/// DSD paths use `-v` (very high quality) matching the original implementation.
+/// DSD paths use `-u` (undocumented ultra: 701 taps, 210 dB rejection).
 #[must_use]
 pub const fn sox_dsd_lowpass_rate_flag(
     lowpass: DsdLowpassMethod,
     _quality: ResampleQuality,
 ) -> &'static str {
     match lowpass {
-        DsdLowpassMethod::Auto | DsdLowpassMethod::SoxUltra => "-v",
-        DsdLowpassMethod::Sinc => "-v",
+        DsdLowpassMethod::Auto | DsdLowpassMethod::SoxUltra => "-u",
+        DsdLowpassMethod::Sinc => "-u",
     }
 }
 

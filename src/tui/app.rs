@@ -1501,6 +1501,11 @@ impl FormatState {
             }
         }
 
+        // DSD sources always use sox for decode — resampler pill is irrelevant.
+        if self.source_is_dsd {
+            self.resampler.set_all_enabled(false);
+        }
+
         self.clamp_disabled_selections();
         if !FormatField::visible_rows(self.is_dsd_selected(), self.dsd_to_pcm_gain_available())
             .contains(&self.field_focus)
