@@ -1,11 +1,13 @@
 //! Application state for the standalone TUI
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::TonepoetConfig;
 use crate::convert::formats::AudioFormat;
 use crate::convert::simple_wizard::DitherType;
-use tonepoet_pipeline::enums::{DsdFilterPreset, DsdNoiseShaper, ModulatorOrder};
+use tonepoet_pipeline::enums::{
+    DsdFilterPreset, DsdNoiseShaper, DsdToPcmGainMode, ModulatorOrder,
+};
 use crate::convert::{ConversionConfig, ConversionItem, ConversionManager};
 use crate::tui::button_map::ButtonRenderMap;
 use crate::tui::pill::PillState;
@@ -283,6 +285,17 @@ pub enum ResamplerChoice {
 /// Kept as a local UI enum so labels can stay stable even if pipeline names evolve.
 pub type DsdConversionPreset = DsdFilterPreset;
 
+/// DSD-to-PCM gain mode exposed in the format pane.
+pub type DsdGainMode = DsdToPcmGainMode;
+
+/// User-editable manual gain range for DSD-to-PCM conversions.
+/// Matches `DsdSettings::validate()` so the TUI cannot stage an invalid value.
+pub const DSD_TO_PCM_GAIN_DB_MIN: f32 = -24.0;
+pub const DSD_TO_PCM_GAIN_DB_MAX: f32 = 24.0;
+/// Keyboard step for the manual gain row. Fine enough for mastering-level
+/// adjustments while still making large changes practical with repeats.
+pub const DSD_TO_PCM_GAIN_DB_STEP: f32 = 0.25;
+
 impl ResamplerChoice {
     pub const fn label(self) -> &'static str {
         match self {
@@ -296,6 +309,19 @@ impl ResamplerChoice {
 
 fn is_dsd_format(fmt: AudioFormat) -> bool {
     matches!(fmt, AudioFormat::Dsf | AudioFormat::Dff)
+}
+
+fn source_info_is_dsd(info: &SourceInfo) -> bool {
+    info.bit_depth == Some(1)
+        || tonepoet_pipeline::DsdRate::from_hz(info.sample_rate).is_some()
+        || info.codec.to_ascii_lowercase().contains("dsd")
+}
+
+fn source_path_is_dsd(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "dsf" | "dff"))
+        .unwrap_or(false)
 }
 
 
@@ -724,11 +750,17 @@ pub enum FormatField {
     NoiseShaper,
     ModulatorOrder,
     ConversionPreset,
+    DsdGain,
+    /// Manual DSD-to-PCM fixed gain value, edited with left/right controls.
+    DsdGainDb,
 }
 
 impl FormatField {
-    pub fn visible_rows(is_dsd: bool) -> &'static [Self] {
-        if is_dsd {
+    /// Rows visible in the format pane. DSD-to-PCM gain controls are visible
+    /// only for DSD sources targeting PCM outputs; they are hidden for PCM->PCM
+    /// and PCM->DSD so the UI cannot imply that SoX normalization applies there.
+    pub fn visible_rows(is_dsd_target: bool, show_dsd_to_pcm_gain: bool) -> &'static [Self] {
+        if is_dsd_target {
             &[
                 Self::Format,
                 Self::DsdRate,
@@ -736,6 +768,17 @@ impl FormatField {
                 Self::NoiseShaper,
                 Self::ModulatorOrder,
                 Self::ConversionPreset,
+            ]
+        } else if show_dsd_to_pcm_gain {
+            &[
+                Self::Format,
+                Self::SampleRate,
+                Self::BitDepth,
+                Self::Resampler,
+                Self::Dither,
+                Self::ReplayGain,
+                Self::DsdGain,
+                Self::DsdGainDb,
             ]
         } else {
             &[
@@ -749,14 +792,14 @@ impl FormatField {
         }
     }
 
-    pub fn next_for(self, is_dsd: bool) -> Self {
-        let rows = Self::visible_rows(is_dsd);
+    pub fn next_for(self, is_dsd_target: bool, show_dsd_to_pcm_gain: bool) -> Self {
+        let rows = Self::visible_rows(is_dsd_target, show_dsd_to_pcm_gain);
         let idx = rows.iter().position(|row| *row == self).unwrap_or(0);
         rows[(idx + 1) % rows.len()]
     }
 
-    pub fn prev_for(self, is_dsd: bool) -> Self {
-        let rows = Self::visible_rows(is_dsd);
+    pub fn prev_for(self, is_dsd_target: bool, show_dsd_to_pcm_gain: bool) -> Self {
+        let rows = Self::visible_rows(is_dsd_target, show_dsd_to_pcm_gain);
         let idx = rows.iter().position(|row| *row == self).unwrap_or(0);
         rows[(idx + rows.len() - 1) % rows.len()]
     }
@@ -804,6 +847,14 @@ pub struct FormatState {
     pub noise_shaper: PillState<DsdNoiseShaper>,
     pub modulator_order: PillState<ModulatorOrder>,
     pub conversion_preset: PillState<DsdConversionPreset>,
+    pub dsd_gain_mode: PillState<DsdGainMode>,
+    /// Fixed DSD-to-PCM gain in dB used when `dsd_gain_mode` is Manual.
+    pub dsd_gain_db: f32,
+    /// Auto DSD-to-PCM peak-normalization safety margin in dB.
+    pub dsd_auto_gain_margin_db: f32,
+    /// Whether the currently previewed source is DSD. Drives visibility and
+    /// activation of DSD-to-PCM gain controls so they never appear for PCM sources.
+    pub source_is_dsd: bool,
     pub field_focus: FormatField,
     pub advanced_open: bool,
     /// False until the user explicitly picks a dither algorithm. Bit-depth changes may update it.
@@ -1017,6 +1068,12 @@ impl FormatState {
             (DsdConversionPreset::Sinc, "Sinc"),
         ]);
 
+        let dsd_gain_mode = PillState::new(vec![
+            (DsdGainMode::Disabled, "off"),
+            (DsdGainMode::Auto, "auto"),
+            (DsdGainMode::Manual, "manual"),
+        ]);
+
         let mut state = Self {
             format,
             sample_rate,
@@ -1027,6 +1084,10 @@ impl FormatState {
             noise_shaper,
             modulator_order,
             conversion_preset,
+            dsd_gain_mode,
+            dsd_gain_db: 0.0,
+            dsd_auto_gain_margin_db: 0.15,
+            source_is_dsd: false,
             field_focus: FormatField::Format,
             advanced_open: false,
             dither_overridden: false,
@@ -1093,12 +1154,27 @@ impl FormatState {
         is_dsd_format(*self.format.selected_value())
     }
 
+    /// True only for the conversion direction where this control has meaning:
+    /// DSD source material rendered to a PCM target format.
+    pub fn dsd_to_pcm_gain_available(&self) -> bool {
+        self.source_is_dsd && !self.is_dsd_selected()
+    }
+
+    pub fn set_source_is_dsd(&mut self, source_is_dsd: bool) {
+        self.source_is_dsd = source_is_dsd;
+        self.apply_format_constraints();
+    }
+
     pub fn focus_next(&mut self) {
-        self.field_focus = self.field_focus.next_for(self.is_dsd_selected());
+        self.field_focus = self
+            .field_focus
+            .next_for(self.is_dsd_selected(), self.dsd_to_pcm_gain_available());
     }
 
     pub fn focus_prev(&mut self) {
-        self.field_focus = self.field_focus.prev_for(self.is_dsd_selected());
+        self.field_focus = self
+            .field_focus
+            .prev_for(self.is_dsd_selected(), self.dsd_to_pcm_gain_available());
     }
 
     pub fn mark_dither_overridden(&mut self) {
@@ -1145,6 +1221,13 @@ impl FormatState {
             FormatField::NoiseShaper => select_enabled_index(&mut self.noise_shaper, index),
             FormatField::ModulatorOrder => select_enabled_index(&mut self.modulator_order, index),
             FormatField::ConversionPreset => select_enabled_index(&mut self.conversion_preset, index),
+            FormatField::DsdGain => select_enabled_index(&mut self.dsd_gain_mode, index),
+            FormatField::DsdGainDb => {
+                // Clicking/focusing the value row makes Manual explicit;
+                // keyboard left/right then adjusts the staged dB value.
+                self.dsd_gain_mode.select_value(&DsdGainMode::Manual);
+                self.dsd_gain_db = clamp_dsd_to_pcm_gain_db(self.dsd_gain_db);
+            }
         }
         self.after_user_selection(row, before_format, before_depth, source_bits, source_rate);
     }
@@ -1325,6 +1408,7 @@ impl FormatState {
         self.noise_shaper.set_all_enabled(true);
         self.modulator_order.set_all_enabled(true);
         self.conversion_preset.set_all_enabled(true);
+        self.dsd_gain_mode.set_all_enabled(self.dsd_to_pcm_gain_available());
 
         // DSD rate threshold: rates at or above this are DSD, below are PCM.
         const DSD_RATE_MIN: u32 = 2_822_400;
@@ -1343,6 +1427,7 @@ impl FormatState {
             self.resampler.set_all_enabled(false);
             self.dither.set_all_enabled(false);
             self.replaygain.set_all_enabled(false);
+            self.dsd_gain_mode.set_all_enabled(false);
         } else {
             self.noise_shaper.set_all_enabled(false);
             self.modulator_order.set_all_enabled(false);
@@ -1417,7 +1502,9 @@ impl FormatState {
         }
 
         self.clamp_disabled_selections();
-        if !FormatField::visible_rows(self.is_dsd_selected()).contains(&self.field_focus) {
+        if !FormatField::visible_rows(self.is_dsd_selected(), self.dsd_to_pcm_gain_available())
+            .contains(&self.field_focus)
+        {
             self.field_focus = FormatField::Format;
         }
     }
@@ -1431,6 +1518,8 @@ impl FormatState {
         clamp_pill(&mut self.noise_shaper);
         clamp_pill(&mut self.modulator_order);
         clamp_pill(&mut self.conversion_preset);
+        clamp_pill(&mut self.dsd_gain_mode);
+        self.dsd_gain_db = clamp_dsd_to_pcm_gain_db(self.dsd_gain_db);
     }
 
     pub fn focused_pill_mut(&mut self) -> FocusedPill<'_> {
@@ -1444,8 +1533,28 @@ impl FormatState {
             FormatField::NoiseShaper => FocusedPill::NoiseShaper(&mut self.noise_shaper),
             FormatField::ModulatorOrder => FocusedPill::ModulatorOrder(&mut self.modulator_order),
             FormatField::ConversionPreset => FocusedPill::ConversionPreset(&mut self.conversion_preset),
+            FormatField::DsdGain => FocusedPill::DsdGain(&mut self.dsd_gain_mode),
+            FormatField::DsdGainDb => FocusedPill::DsdGainDb {
+                gain_db: &mut self.dsd_gain_db,
+                gain_mode: &mut self.dsd_gain_mode,
+            },
         }
     }
+}
+
+fn clamp_dsd_to_pcm_gain_db(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(DSD_TO_PCM_GAIN_DB_MIN, DSD_TO_PCM_GAIN_DB_MAX)
+    } else {
+        0.0
+    }
+}
+
+fn step_dsd_to_pcm_gain_db(value: &mut f32, delta: f32) {
+    let next = clamp_dsd_to_pcm_gain_db(*value + delta);
+    // Keep repeated key presses idempotent with respect to display precision and
+    // avoid accumulating binary float noise in staged settings.
+    *value = (next * 100.0).round() / 100.0;
 }
 
 fn clamp_pill<T: Clone + PartialEq>(pill: &mut PillState<T>) {
@@ -1480,6 +1589,11 @@ pub enum FocusedPill<'a> {
     NoiseShaper(&'a mut PillState<DsdNoiseShaper>),
     ModulatorOrder(&'a mut PillState<ModulatorOrder>),
     ConversionPreset(&'a mut PillState<DsdConversionPreset>),
+    DsdGain(&'a mut PillState<DsdGainMode>),
+    DsdGainDb {
+        gain_db: &'a mut f32,
+        gain_mode: &'a mut PillState<DsdGainMode>,
+    },
 }
 
 impl FocusedPill<'_> {
@@ -1494,6 +1608,11 @@ impl FocusedPill<'_> {
             Self::NoiseShaper(p) => p.select_next(),
             Self::ModulatorOrder(p) => p.select_next(),
             Self::ConversionPreset(p) => p.select_next(),
+            Self::DsdGain(p) => p.select_next(),
+            Self::DsdGainDb { gain_db, gain_mode } => {
+                (*gain_mode).select_value(&DsdGainMode::Manual);
+                step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP);
+            }
         }
     }
 
@@ -1508,6 +1627,11 @@ impl FocusedPill<'_> {
             Self::NoiseShaper(p) => p.select_prev(),
             Self::ModulatorOrder(p) => p.select_prev(),
             Self::ConversionPreset(p) => p.select_prev(),
+            Self::DsdGain(p) => p.select_prev(),
+            Self::DsdGainDb { gain_db, gain_mode } => {
+                (*gain_mode).select_value(&DsdGainMode::Manual);
+                step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP);
+            }
         }
     }
 }
@@ -1618,6 +1742,14 @@ impl ConvertState {
     pub fn set_source_mode(&mut self, mode: SourceMode) {
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
+        let source_is_dsd = self
+            .source
+            .mode
+            .current_info()
+            .map(source_info_is_dsd)
+            .or_else(|| self.source.mode.current_path().map(|path| source_path_is_dsd(path)))
+            .unwrap_or(false);
+        self.format.set_source_is_dsd(source_is_dsd);
     }
 
     /// Source bit depth for format-pane side effects such as auto-dither.
@@ -1639,7 +1771,8 @@ impl ConvertState {
         let source_rate = info.sample_rate;
         let source_bits = info.bit_depth;
         let source_is_float = info.codec.contains("Float");
-        let is_dsd_source = tonepoet_pipeline::DsdRate::from_hz(source_rate).is_some();
+        let is_dsd_source = source_info_is_dsd(info);
+        self.format.set_source_is_dsd(is_dsd_source);
 
         if is_dsd_source {
             if !self.format.is_dsd_selected() {
@@ -3071,6 +3204,100 @@ impl AppState {
             )
         };
         self.set_status(status);
+    }
+}
+
+
+#[cfg(test)]
+mod dsd_gain_format_state_tests {
+    use super::*;
+
+    #[test]
+    fn dsd_gain_rows_are_visible_only_for_dsd_sources_targeting_pcm() {
+        assert!(!FormatField::visible_rows(false, false).contains(&FormatField::DsdGain));
+        assert!(!FormatField::visible_rows(false, false).contains(&FormatField::DsdGainDb));
+        assert!(FormatField::visible_rows(false, true).contains(&FormatField::DsdGain));
+        assert!(FormatField::visible_rows(false, true).contains(&FormatField::DsdGainDb));
+        assert!(!FormatField::visible_rows(true, false).contains(&FormatField::DsdGain));
+        assert!(!FormatField::visible_rows(true, true).contains(&FormatField::DsdGain));
+    }
+
+    #[test]
+    fn format_state_hides_dsd_gain_until_source_is_dsd() {
+        let mut s = FormatState::new();
+        assert!(!s.dsd_to_pcm_gain_available());
+        assert!(!FormatField::visible_rows(s.is_dsd_selected(), s.dsd_to_pcm_gain_available())
+            .contains(&FormatField::DsdGain));
+
+        s.set_source_is_dsd(true);
+        assert!(s.dsd_to_pcm_gain_available());
+        assert!(FormatField::visible_rows(s.is_dsd_selected(), s.dsd_to_pcm_gain_available())
+            .contains(&FormatField::DsdGain));
+    }
+
+    #[test]
+    fn dsd_target_hides_dsd_gain_even_for_dsd_source() {
+        let mut s = FormatState::new();
+        s.set_source_is_dsd(true);
+        s.format.select_value(&AudioFormat::Dsf);
+        s.apply_format_constraints();
+
+        assert!(!s.dsd_to_pcm_gain_available());
+        assert!(!FormatField::visible_rows(s.is_dsd_selected(), s.dsd_to_pcm_gain_available())
+            .contains(&FormatField::DsdGain));
+    }
+
+
+    #[test]
+    fn focus_navigation_skips_dsd_gain_for_pcm_sources() {
+        let mut s = FormatState::new();
+        s.field_focus = FormatField::ReplayGain;
+        s.focus_next();
+        assert_eq!(s.field_focus, FormatField::Format);
+
+        s.set_source_is_dsd(true);
+        s.field_focus = FormatField::ReplayGain;
+        s.focus_next();
+        assert_eq!(s.field_focus, FormatField::DsdGain);
+        s.focus_next();
+        assert_eq!(s.field_focus, FormatField::DsdGainDb);
+    }
+
+    #[test]
+    fn dsd_gain_defaults_to_disabled_with_015_db_auto_margin() {
+        let s = FormatState::new();
+        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Disabled);
+        assert!((s.dsd_auto_gain_margin_db - 0.15).abs() < f32::EPSILON);
+        assert_eq!(s.dsd_gain_db, 0.0);
+        assert!(!s.source_is_dsd);
+    }
+
+    #[test]
+    fn manual_dsd_gain_row_adjusts_value_and_selects_manual_mode() {
+        let mut s = FormatState::new();
+        s.set_source_is_dsd(true);
+        s.field_focus = FormatField::DsdGainDb;
+
+        s.select_focused_next(None, None);
+        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Manual);
+        assert_eq!(s.dsd_gain_db, DSD_TO_PCM_GAIN_DB_STEP);
+
+        s.select_focused_prev(None, None);
+        assert_eq!(s.dsd_gain_db, 0.0);
+    }
+
+    #[test]
+    fn manual_dsd_gain_row_clamps_to_valid_settings_range() {
+        let mut s = FormatState::new();
+        s.set_source_is_dsd(true);
+        s.field_focus = FormatField::DsdGainDb;
+        s.dsd_gain_db = DSD_TO_PCM_GAIN_DB_MAX;
+        s.select_focused_next(None, None);
+        assert_eq!(s.dsd_gain_db, DSD_TO_PCM_GAIN_DB_MAX);
+
+        s.dsd_gain_db = DSD_TO_PCM_GAIN_DB_MIN;
+        s.select_focused_prev(None, None);
+        assert_eq!(s.dsd_gain_db, DSD_TO_PCM_GAIN_DB_MIN);
     }
 }
 

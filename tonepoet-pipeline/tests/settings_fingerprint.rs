@@ -2,7 +2,7 @@ use tonepoet_pipeline::{
     settings_fingerprint, AacProfile, AacSettings, AudioFormat, BitDepthTarget, DitherType,
     DsdFilterPreset, DsdLowpassMethod, DsdNoiseShaper, DsdSettings, FlacSettings,
     GainCompensation, MetadataSettings, ModulatorOrder, Mp3Mode, Mp3Settings,
-    NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
+    DsdToPcmGainMode, NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
     SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
     SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcPdfType, SsrcProfile, SsrcSettings,
@@ -61,6 +61,8 @@ use tonepoet_pipeline::{
 /// - dsd.trellis.latency: Some(321)
 /// - dsd.pcm_to_dsd_filter: Sinc
 /// - dsd.dsd_to_pcm_lowpass: Sinc
+/// - dsd.dsd_to_pcm_gain_mode: Manual
+/// - dsd.dsd_to_pcm_auto_gain_margin_db: 0.50
 /// - dsd.dsd_to_pcm_gain_db: Some(-3.25)
 /// - dsd.sinc.oversample_factor: 16
 /// - dsd.sinc.taps: 131_072
@@ -147,6 +149,8 @@ fn flac_md5_sentinel() -> PipelineSettings {
             }),
             pcm_to_dsd_filter: DsdFilterPreset::Sinc,
             dsd_to_pcm_lowpass: DsdLowpassMethod::Sinc,
+            dsd_to_pcm_gain_mode: DsdToPcmGainMode::Manual,
+            dsd_to_pcm_auto_gain_margin_db: 0.50,
             dsd_to_pcm_gain_db: Some(-3.25),
             sinc: SincFilterSettings {
                 oversample_factor: 16,
@@ -177,7 +181,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 66);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 68);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();
@@ -428,6 +432,14 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.dsd_to_pcm_lowpass", |settings| {
         settings.dsd.dsd_to_pcm_lowpass = DsdLowpassMethod::SoxUltra;
+    });
+    assert_mutation_changes_fingerprint!(covered, base, "dsd.dsd_to_pcm_gain_mode", |settings| {
+        settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+    });
+    assert_mutation_changes_fingerprint!(covered, base, "dsd.dsd_to_pcm_auto_gain_margin_db", |settings| {
+        // Switch to Auto mode so margin is fingerprinted, then change it.
+        settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+        settings.dsd.dsd_to_pcm_auto_gain_margin_db = 1.0;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.dsd_to_pcm_gain_db", |settings| {
         settings.dsd.dsd_to_pcm_gain_db = Some(-2.75);

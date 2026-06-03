@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
-    DsdNoiseShaper, GainCompensation, ModulatorOrder, Mp3Mode, NyquistTransition, OpusContentType,
+    DsdNoiseShaper, DsdToPcmGainMode, GainCompensation, ModulatorOrder, Mp3Mode,
+    NyquistTransition, OpusContentType,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcProfile, WavPackMode,
 };
@@ -54,7 +55,9 @@ impl std::fmt::Display for SettingsFingerprint {
 /// Canonical field-path inventory covered by [`settings_fingerprint`].
 ///
 /// The list is public so integration tests can compare handoff, legacy, and
-/// mutation coverage against the same conversion-affecting field set.
+/// mutation coverage against the same conversion-affecting field set. Some
+/// paths are mode-scoped: they are emitted only when the selected mode makes
+/// them output-affecting.
 pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "target_format",
     "target_sample_rate",
@@ -106,6 +109,8 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "dsd.trellis.latency",
     "dsd.pcm_to_dsd_filter",
     "dsd.dsd_to_pcm_lowpass",
+    "dsd.dsd_to_pcm_gain_mode",
+    "dsd.dsd_to_pcm_auto_gain_margin_db",
     "dsd.dsd_to_pcm_gain_db",
     "dsd.sinc.oversample_factor",
     "dsd.sinc.taps",
@@ -314,15 +319,44 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
         "dsd.dsd_to_pcm_lowpass",
         dsd_lowpass_method(settings.dsd_to_pcm_lowpass),
     );
-    writer.field_string(
-        "dsd.dsd_to_pcm_gain_db",
-        option_f32(settings.dsd_to_pcm_gain_db),
-    );
+    push_dsd_to_pcm_gain(writer, settings);
     push_sinc(writer, &settings.sinc);
     writer.field_string(
         "dsd.gain_compensation",
         gain_compensation(settings.gain_compensation),
     );
+}
+
+fn push_dsd_to_pcm_gain(writer: &mut FingerprintWriter, settings: &DsdSettings) {
+    writer.field_static(
+        "dsd.dsd_to_pcm_gain_mode",
+        dsd_to_pcm_gain_mode(settings.dsd_to_pcm_gain_mode),
+    );
+
+    match settings.dsd_to_pcm_gain_mode {
+        DsdToPcmGainMode::Disabled => {
+            // Compatibility: a legacy caller that sets only `dsd_to_pcm_gain_db`
+            // still changes DSD-to-PCM output, so include it only when present.
+            if let Some(gain_db) = settings.dsd_to_pcm_gain_db {
+                writer.field_string(
+                    "dsd.dsd_to_pcm_gain_db",
+                    option_f32(Some(gain_db)),
+                );
+            }
+        }
+        DsdToPcmGainMode::Auto => {
+            writer.field_string(
+                "dsd.dsd_to_pcm_auto_gain_margin_db",
+                f32_value(settings.dsd_to_pcm_auto_gain_margin_db),
+            );
+        }
+        DsdToPcmGainMode::Manual => {
+            writer.field_string(
+                "dsd.dsd_to_pcm_gain_db",
+                option_f32(settings.dsd_to_pcm_gain_db),
+            );
+        }
+    }
 }
 
 fn push_sinc(writer: &mut FingerprintWriter, settings: &SincFilterSettings) {
@@ -586,6 +620,14 @@ fn dsd_lowpass_method(value: DsdLowpassMethod) -> &'static str {
     }
 }
 
+fn dsd_to_pcm_gain_mode(value: DsdToPcmGainMode) -> &'static str {
+    match value {
+        DsdToPcmGainMode::Disabled => "Disabled",
+        DsdToPcmGainMode::Auto => "Auto",
+        DsdToPcmGainMode::Manual => "Manual",
+    }
+}
+
 fn gain_compensation(value: GainCompensation) -> String {
     match value {
         GainCompensation::Auto => "Auto".to_string(),
@@ -613,5 +655,101 @@ fn pcm_bit_depth(value: PcmBitDepth) -> &'static str {
         PcmBitDepth::Int32 => "Int32",
         PcmBitDepth::Float32 => "Float32",
         PcmBitDepth::Float64 => "Float64",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fingerprint_with(mut update: impl FnMut(&mut PipelineSettings)) -> SettingsFingerprint {
+        let mut settings = PipelineSettings::default();
+        update(&mut settings);
+        settings_fingerprint(&settings)
+    }
+
+    #[test]
+    fn disabled_dsd_to_pcm_fingerprint_ignores_auto_margin_without_legacy_gain() {
+        let base = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
+            settings.dsd.dsd_to_pcm_gain_db = None;
+        });
+        let changed_stale_margin = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 1.0;
+            settings.dsd.dsd_to_pcm_gain_db = None;
+        });
+
+        assert_eq!(base, changed_stale_margin);
+    }
+
+    #[test]
+    fn disabled_dsd_to_pcm_fingerprint_honors_legacy_gain_only_when_present() {
+        let no_legacy_gain = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
+            settings.dsd.dsd_to_pcm_gain_db = None;
+        });
+        let legacy_gain = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
+            settings.dsd.dsd_to_pcm_gain_db = Some(2.0);
+        });
+        let same_legacy_gain_stale_margin = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 1.0;
+            settings.dsd.dsd_to_pcm_gain_db = Some(2.0);
+        });
+        let different_legacy_gain = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
+            settings.dsd.dsd_to_pcm_gain_db = Some(3.0);
+        });
+
+        assert_ne!(no_legacy_gain, legacy_gain);
+        assert_eq!(legacy_gain, same_legacy_gain_stale_margin);
+        assert_ne!(legacy_gain, different_legacy_gain);
+    }
+
+    #[test]
+    fn auto_dsd_to_pcm_fingerprint_includes_margin_and_ignores_manual_gain() {
+        let base = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
+            settings.dsd.dsd_to_pcm_gain_db = None;
+        });
+        let stale_manual_gain = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
+            settings.dsd.dsd_to_pcm_gain_db = Some(6.0);
+        });
+        let changed_margin = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.50;
+            settings.dsd.dsd_to_pcm_gain_db = None;
+        });
+
+        assert_eq!(base, stale_manual_gain);
+        assert_ne!(base, changed_margin);
+    }
+
+    #[test]
+    fn manual_dsd_to_pcm_fingerprint_includes_manual_gain_and_ignores_auto_margin() {
+        let base = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
+            settings.dsd.dsd_to_pcm_gain_db = Some(2.0);
+        });
+        let stale_auto_margin = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 1.0;
+            settings.dsd.dsd_to_pcm_gain_db = Some(2.0);
+        });
+        let changed_manual_gain = fingerprint_with(|settings| {
+            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
+            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
+            settings.dsd.dsd_to_pcm_gain_db = Some(2.25);
+        });
+
+        assert_eq!(base, stale_auto_margin);
+        assert_ne!(base, changed_manual_gain);
     }
 }

@@ -675,3 +675,25 @@ pub enum GainCompensation {
     /// Do not apply compensation.
     Disabled,
 }
+
+/// DSD-to-PCM output gain strategy.
+///
+/// This is intentionally separate from [`GainCompensation`], which is used by
+/// PCM-to-DSD sinc upsampling and defaults to `Auto` for that path. Reusing it
+/// here would make DSD-to-PCM auto-normalization opt-out instead of opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DsdToPcmGainMode {
+    /// Leave decoded PCM at SoX's natural DSD reconstruction level.
+    Disabled,
+    /// Peak-normalize after DSD decoding and low-pass filtering.
+    Auto,
+    /// Apply the fixed dB value in `DsdSettings::dsd_to_pcm_gain_db`.
+    Manual,
+}
+
+impl Default for DsdToPcmGainMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}

@@ -13,7 +13,7 @@ use tonepoet::convert::{
 };
 use tonepoet_pipeline::{
     AacProfile, AacSettings, AudioFormat, BitDepthTarget, DitherType,
-    DsdFilterPreset, DsdLowpassMethod, DsdNoiseShaper, DsdSettings, FlacSettings,
+    DsdFilterPreset, DsdLowpassMethod, DsdNoiseShaper, DsdSettings, DsdToPcmGainMode, FlacSettings,
     GainCompensation, MetadataSettings, ModulatorOrder, Mp3Mode, Mp3Settings,
     NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
@@ -78,6 +78,8 @@ use tonepoet_pipeline::{
 /// - ssrc.attenuation_db: Some(3.0)
 /// - ssrc.min_phase: true
 /// - ssrc.pdf_type: Some(Triangular)
+/// - dsd.dsd_to_pcm_gain_mode: Manual
+/// - dsd.dsd_to_pcm_auto_gain_margin_db: 0.50
 /// - dsd.noise_shaper: Crfb
 /// - dsd.modulator_order: Order7
 /// - dsd.trellis.lookahead: 17
@@ -173,6 +175,8 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             }),
             pcm_to_dsd_filter: DsdFilterPreset::Sinc,
             dsd_to_pcm_lowpass: DsdLowpassMethod::Sinc,
+            dsd_to_pcm_gain_mode: DsdToPcmGainMode::Manual,
+            dsd_to_pcm_auto_gain_margin_db: 0.50,
             dsd_to_pcm_gain_db: Some(-3.25),
             sinc: SincFilterSettings {
                 oversample_factor: 16,
@@ -300,6 +304,8 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.dsd.trellis.and_then(|trellis| trellis.latency), &expected.dsd.trellis.and_then(|trellis| trellis.latency), "dsd.trellis.latency");
     assert_eq!(&actual.dsd.pcm_to_dsd_filter, &expected.dsd.pcm_to_dsd_filter, "dsd.pcm_to_dsd_filter");
     assert_eq!(&actual.dsd.dsd_to_pcm_lowpass, &expected.dsd.dsd_to_pcm_lowpass, "dsd.dsd_to_pcm_lowpass");
+    assert_eq!(&actual.dsd.dsd_to_pcm_gain_mode, &expected.dsd.dsd_to_pcm_gain_mode, "dsd.dsd_to_pcm_gain_mode");
+    assert_eq!(&actual.dsd.dsd_to_pcm_auto_gain_margin_db, &expected.dsd.dsd_to_pcm_auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
     assert_eq!(&actual.dsd.dsd_to_pcm_gain_db, &expected.dsd.dsd_to_pcm_gain_db, "dsd.dsd_to_pcm_gain_db");
     assert_eq!(&actual.dsd.sinc.oversample_factor, &expected.dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
     assert_eq!(&actual.dsd.sinc.taps, &expected.dsd.sinc.taps, "dsd.sinc.taps");
@@ -393,6 +399,8 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "dsd.trellis.latency", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.pcm_to_dsd_filter", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.dsd_to_pcm_lowpass", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "dsd.dsd_to_pcm_gain_mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "dsd.dsd_to_pcm_auto_gain_margin_db", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.dsd_to_pcm_gain_db", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.sinc.oversample_factor", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dsd.sinc.taps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
@@ -467,6 +475,8 @@ fn field_differs_from_default(
         "dsd.trellis.latency" => settings.dsd.trellis.and_then(|trellis| trellis.latency) != default.dsd.trellis.and_then(|trellis| trellis.latency),
         "dsd.pcm_to_dsd_filter" => settings.dsd.pcm_to_dsd_filter != default.dsd.pcm_to_dsd_filter,
         "dsd.dsd_to_pcm_lowpass" => settings.dsd.dsd_to_pcm_lowpass != default.dsd.dsd_to_pcm_lowpass,
+        "dsd.dsd_to_pcm_gain_mode" => settings.dsd.dsd_to_pcm_gain_mode != default.dsd.dsd_to_pcm_gain_mode,
+        "dsd.dsd_to_pcm_auto_gain_margin_db" => (settings.dsd.dsd_to_pcm_auto_gain_margin_db - default.dsd.dsd_to_pcm_auto_gain_margin_db).abs() > f32::EPSILON,
         "dsd.dsd_to_pcm_gain_db" => settings.dsd.dsd_to_pcm_gain_db != default.dsd.dsd_to_pcm_gain_db,
         "dsd.sinc.oversample_factor" => settings.dsd.sinc.oversample_factor != default.dsd.sinc.oversample_factor,
         "dsd.sinc.taps" => settings.dsd.sinc.taps != default.dsd.sinc.taps,
@@ -600,6 +610,8 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, dsd.trellis, "dsd.trellis");
     assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd_filter, "dsd.pcm_to_dsd_filter");
     assert_covered_by_non_default!(default, raw, raw, dsd.dsd_to_pcm_lowpass, "dsd.dsd_to_pcm_lowpass");
+    assert_covered_by_non_default!(default, raw, raw, dsd.dsd_to_pcm_gain_mode, "dsd.dsd_to_pcm_gain_mode");
+    assert_covered_by_non_default!(default, raw, raw, dsd.dsd_to_pcm_auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
     assert_covered_by_non_default!(default, raw, raw, dsd.dsd_to_pcm_gain_db, "dsd.dsd_to_pcm_gain_db");
     assert_covered_by_non_default!(default, raw, raw, dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
     assert_covered_by_non_default!(default, raw, raw, dsd.sinc.taps, "dsd.sinc.taps");
@@ -676,6 +688,8 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, dsd.trellis, "dsd.trellis");
     assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd_filter, "dsd.pcm_to_dsd_filter");
     assert_covered_by_non_default!(default, flac, custom, dsd.dsd_to_pcm_lowpass, "dsd.dsd_to_pcm_lowpass");
+    assert_covered_by_non_default!(default, flac, custom, dsd.dsd_to_pcm_gain_mode, "dsd.dsd_to_pcm_gain_mode");
+    assert_covered_by_non_default!(default, flac, custom, dsd.dsd_to_pcm_auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
     assert_covered_by_non_default!(default, flac, custom, dsd.dsd_to_pcm_gain_db, "dsd.dsd_to_pcm_gain_db");
     assert_covered_by_non_default!(default, flac, custom, dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
     assert_covered_by_non_default!(default, flac, custom, dsd.sinc.taps, "dsd.sinc.taps");
@@ -828,6 +842,8 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("dsd.trellis.latency", LegacyProjectionStatus::Unrepresentable),
     ("dsd.pcm_to_dsd_filter", LegacyProjectionStatus::Unrepresentable),
     ("dsd.dsd_to_pcm_lowpass", LegacyProjectionStatus::Unrepresentable),
+    ("dsd.dsd_to_pcm_gain_mode", LegacyProjectionStatus::Derived),
+    ("dsd.dsd_to_pcm_auto_gain_margin_db", LegacyProjectionStatus::Derived),
     ("dsd.dsd_to_pcm_gain_db", LegacyProjectionStatus::Unrepresentable),
     ("dsd.sinc.oversample_factor", LegacyProjectionStatus::Unrepresentable),
     ("dsd.sinc.taps", LegacyProjectionStatus::Unrepresentable),
@@ -1012,6 +1028,8 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_unrepresentable!(covered, "dsd.trellis.latency", flac.dsd.trellis.and_then(|trellis| trellis.latency), default.dsd.trellis.and_then(|trellis| trellis.latency), sentinel.dsd.trellis.and_then(|trellis| trellis.latency));
     assert_legacy_unrepresentable!(covered, "dsd.pcm_to_dsd_filter", flac.dsd.pcm_to_dsd_filter, default.dsd.pcm_to_dsd_filter, sentinel.dsd.pcm_to_dsd_filter);
     assert_legacy_unrepresentable!(covered, "dsd.dsd_to_pcm_lowpass", flac.dsd.dsd_to_pcm_lowpass, default.dsd.dsd_to_pcm_lowpass, sentinel.dsd.dsd_to_pcm_lowpass);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "dsd.dsd_to_pcm_gain_mode", flac.dsd.dsd_to_pcm_gain_mode, DsdToPcmGainMode::Disabled);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "dsd.dsd_to_pcm_auto_gain_margin_db", flac.dsd.dsd_to_pcm_auto_gain_margin_db, 0.15_f32);
     assert_legacy_unrepresentable!(covered, "dsd.dsd_to_pcm_gain_db", flac.dsd.dsd_to_pcm_gain_db, default.dsd.dsd_to_pcm_gain_db, sentinel.dsd.dsd_to_pcm_gain_db);
     assert_legacy_unrepresentable!(covered, "dsd.sinc.oversample_factor", flac.dsd.sinc.oversample_factor, default.dsd.sinc.oversample_factor, sentinel.dsd.sinc.oversample_factor);
     assert_legacy_unrepresentable!(covered, "dsd.sinc.taps", flac.dsd.sinc.taps, default.dsd.sinc.taps, sentinel.dsd.sinc.taps);

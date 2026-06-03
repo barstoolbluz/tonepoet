@@ -5,7 +5,8 @@
 
 use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
-    DsdNoiseShaper, GainCompensation, ModulatorOrder, Mp3Mode, NyquistTransition, OpusContentType,
+    DsdNoiseShaper, DsdToPcmGainMode, GainCompensation, ModulatorOrder, Mp3Mode,
+    NyquistTransition, OpusContentType,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcPdfType, SsrcProfile, WavPackMode,
 };
@@ -359,6 +360,16 @@ fn validate_metadata(settings: &PipelineSettings) -> Result<()> {
 }
 
 fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
+    validate_finite_f32(
+        "dsd.dsd_to_pcm_auto_gain_margin_db",
+        settings.dsd_to_pcm_auto_gain_margin_db,
+    )?;
+    if !(0.0..=6.0).contains(&settings.dsd_to_pcm_auto_gain_margin_db) {
+        return Err(PlanningError::invalid_settings(
+            "dsd.dsd_to_pcm_auto_gain_margin_db",
+            "auto gain safety margin must be between 0 and 6 dB",
+        ));
+    }
     if let Some(gain_db) = settings.dsd_to_pcm_gain_db {
         validate_finite_f32("dsd.dsd_to_pcm_gain_db", gain_db)?;
         if !(-24.0..=24.0).contains(&gain_db) {
@@ -367,6 +378,14 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                 "gain must be between -24 and +24 dB",
             ));
         }
+    }
+    if settings.dsd_to_pcm_gain_mode == DsdToPcmGainMode::Manual
+        && settings.dsd_to_pcm_gain_db.is_none()
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.dsd_to_pcm_gain_db",
+            "manual DSD-to-PCM gain requires a dB value",
+        ));
     }
     match settings.gain_compensation {
         GainCompensation::Linear(value) => {
@@ -678,12 +697,25 @@ pub struct DsdSettings {
     pub pcm_to_dsd_filter: DsdFilterPreset,
     /// DSD-to-PCM low-pass method.
     pub dsd_to_pcm_lowpass: DsdLowpassMethod,
-    /// Optional DSD-to-PCM gain in dB.
+    /// DSD-to-PCM gain strategy.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dsd_to_pcm_gain_mode: DsdToPcmGainMode,
+    /// Auto-gain peak safety margin in dB. `0.15` means normalize to -0.15 dBFS.
+    #[cfg_attr(feature = "serde", serde(default = "default_dsd_to_pcm_auto_gain_margin_db"))]
+    pub dsd_to_pcm_auto_gain_margin_db: f32,
+    /// Optional fixed DSD-to-PCM gain in dB for manual mode.
+    ///
+    /// When `dsd_to_pcm_gain_mode` is `Disabled`, a `Some` value is still honored
+    /// as a compatibility path for older callers that set only this field.
     pub dsd_to_pcm_gain_db: Option<f32>,
     /// Sinc-filter parameters used when a sinc preset is selected.
     pub sinc: SincFilterSettings,
     /// Gain compensation for PCM-to-DSD sinc upsampling.
     pub gain_compensation: GainCompensation,
+}
+
+fn default_dsd_to_pcm_auto_gain_margin_db() -> f32 {
+    0.15
 }
 
 impl Default for DsdSettings {
@@ -694,6 +726,8 @@ impl Default for DsdSettings {
             trellis: None,
             pcm_to_dsd_filter: DsdFilterPreset::Auto,
             dsd_to_pcm_lowpass: DsdLowpassMethod::Auto,
+            dsd_to_pcm_gain_mode: DsdToPcmGainMode::Disabled,
+            dsd_to_pcm_auto_gain_margin_db: default_dsd_to_pcm_auto_gain_margin_db(),
             dsd_to_pcm_gain_db: None,
             sinc: SincFilterSettings::default(),
             gain_compensation: GainCompensation::Auto,

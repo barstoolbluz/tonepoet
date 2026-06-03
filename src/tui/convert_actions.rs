@@ -323,6 +323,26 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
     // codec-specific sub-structs (flac, mp3, aac, etc.) use defaults until the TUI
     // exposes those settings.
     let mut dsd: tonepoet_pipeline::DsdSettings = Default::default();
+    if format.dsd_to_pcm_gain_available() {
+        dsd.dsd_to_pcm_gain_mode = *format.dsd_gain_mode.selected_value();
+        dsd.dsd_to_pcm_auto_gain_margin_db = format.dsd_auto_gain_margin_db;
+        dsd.dsd_to_pcm_gain_db = if *format.dsd_gain_mode.selected_value()
+            == pipeline_enums::DsdToPcmGainMode::Manual
+        {
+            Some(if format.dsd_gain_db.is_finite() {
+                format
+                    .dsd_gain_db
+                    .clamp(DSD_TO_PCM_GAIN_DB_MIN, DSD_TO_PCM_GAIN_DB_MAX)
+            } else {
+                0.0
+            })
+        } else {
+            None
+        };
+    } else {
+        dsd.dsd_to_pcm_gain_mode = pipeline_enums::DsdToPcmGainMode::Disabled;
+        dsd.dsd_to_pcm_gain_db = None;
+    }
     if is_dsd {
         dsd.noise_shaper = *format.noise_shaper.selected_value();
         dsd.modulator_order = *format.modulator_order.selected_value();
@@ -739,4 +759,66 @@ mod lifecycle_forwarder_tests {
             other => panic!("expected item progress message, got {other:?}"),
         }
     }
+
+    #[test]
+    fn format_state_to_pipeline_settings_maps_dsd_to_pcm_gain() {
+        let mut format = FormatState::new();
+        format.set_source_is_dsd(true);
+        format.dsd_gain_mode.select_value(&DsdGainMode::Auto);
+        format.dsd_auto_gain_margin_db = 0.5;
+
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+
+        assert_eq!(
+            settings.dsd.dsd_to_pcm_gain_mode,
+            pipeline_enums::DsdToPcmGainMode::Auto
+        );
+        assert!((settings.dsd.dsd_to_pcm_auto_gain_margin_db - 0.5).abs() < f32::EPSILON);
+        assert_eq!(settings.dsd.dsd_to_pcm_gain_db, None);
+    }
+
+    #[test]
+    fn format_state_to_pipeline_settings_maps_manual_dsd_to_pcm_gain() {
+        let mut format = FormatState::new();
+        format.set_source_is_dsd(true);
+        format.dsd_gain_mode.select_value(&DsdGainMode::Manual);
+        format.dsd_gain_db = 2.25;
+
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+
+        assert_eq!(
+            settings.dsd.dsd_to_pcm_gain_mode,
+            pipeline_enums::DsdToPcmGainMode::Manual
+        );
+        assert_eq!(settings.dsd.dsd_to_pcm_gain_db, Some(2.25));
+    }
+
+
+    #[test]
+    fn format_state_to_pipeline_settings_disables_hidden_dsd_gain_for_pcm_source() {
+        let mut format = FormatState::new();
+        format.dsd_gain_mode.select_value(&DsdGainMode::Manual);
+        format.dsd_gain_db = 2.25;
+
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+
+        assert_eq!(
+            settings.dsd.dsd_to_pcm_gain_mode,
+            pipeline_enums::DsdToPcmGainMode::Disabled
+        );
+        assert_eq!(settings.dsd.dsd_to_pcm_gain_db, None);
+    }
+
+    #[test]
+    fn format_state_to_pipeline_settings_clamps_manual_dsd_to_pcm_gain() {
+        let mut format = FormatState::new();
+        format.set_source_is_dsd(true);
+        format.dsd_gain_mode.select_value(&DsdGainMode::Manual);
+        format.dsd_gain_db = DSD_TO_PCM_GAIN_DB_MAX + 99.0;
+
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+
+        assert_eq!(settings.dsd.dsd_to_pcm_gain_db, Some(DSD_TO_PCM_GAIN_DB_MAX));
+    }
+
 }

@@ -8,23 +8,15 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{FormatField, FormatState, ResamplerChoice};
+use super::app::{FormatField, FormatState, ResamplerChoice, DsdGainMode};
 use super::pill::render_pill_spans;
 use super::theme;
 
 /// Draw the format pane with green border.
 ///
-/// Height stays at 10 rows:
-///   0 top border
-///   1 blank
-///   2 format
-///   3 rate
-///   4 bit depth / static 1-bit
-///   5 resampler / noise shaper
-///   6 dither / modulator order
-///   7 replaygain / conversion preset
-///   8 blank
-///   9 bottom border
+/// Height is 10 rows for DSD targets, 9 rows for ordinary PCM targets, and 11
+/// rows for DSD-to-PCM targets. DSD-to-PCM targets include both the gain mode
+/// row and its manual dB value row so Manual mode is directly user-editable.
 pub fn draw_format_pane(
     f: &mut Frame,
     area: Rect,
@@ -169,6 +161,26 @@ pub fn draw_format_pane(
             ),
             focused && format_state.field_focus == FormatField::ReplayGain,
         ));
+        if format_state.dsd_to_pcm_gain_available() {
+            lines.push(pill_row(
+                border_color,
+                w,
+                "DSD gain  ",
+                "",
+                &render_pill_spans(
+                    &format_state.dsd_gain_mode,
+                    focused && format_state.field_focus == FormatField::DsdGain,
+                ),
+                focused && format_state.field_focus == FormatField::DsdGain,
+            ));
+            lines.push(dsd_gain_db_row(
+                border_color,
+                w,
+                format_state.dsd_gain_db,
+                *format_state.dsd_gain_mode.selected_value() == DsdGainMode::Manual,
+                focused && format_state.field_focus == FormatField::DsdGainDb,
+            ));
+        }
     }
 
     // Below-the-fold: container selector when maximized and codec has alternatives.
@@ -355,6 +367,48 @@ fn static_row<'a>(
     let padding = width.saturating_sub(content_width + 1);
     spans.push(Span::raw(" ".repeat(padding)));
     spans.push(Span::styled("│", theme::border(border_color)));
+    Line::from(spans)
+}
+
+fn dsd_gain_db_row(
+    border_color: ratatui::style::Color,
+    width: usize,
+    gain_db: f32,
+    manual_enabled: bool,
+    focused: bool,
+) -> Line<'static> {
+    let label_style = if focused { theme::bright() } else { theme::muted() };
+    let control_style = if focused {
+        theme::bright().add_modifier(Modifier::BOLD)
+    } else if manual_enabled {
+        theme::muted()
+    } else {
+        Style::default().fg(ratatui::style::Color::DarkGray)
+    };
+    let hint_style = if manual_enabled {
+        theme::muted()
+    } else {
+        Style::default().fg(ratatui::style::Color::DarkGray)
+    };
+
+    let mut spans = vec![
+        Span::styled("│", theme::border(border_color)),
+        Span::styled("   gain dB    ", label_style),
+        Span::styled("< ", control_style),
+        Span::styled(format!("{gain_db:+.2} dB"), control_style),
+        Span::styled(" >", control_style),
+    ];
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        if manual_enabled { "left/right adjust" } else { "select manual to apply" },
+        hint_style,
+    ));
+
+    let content_width: usize = spans.iter().map(|s| s.width()).sum();
+    let padding = width.saturating_sub(content_width + 1);
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled("│", theme::border(border_color)));
+
     Line::from(spans)
 }
 

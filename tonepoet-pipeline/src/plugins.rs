@@ -4,7 +4,8 @@
 //! types. They use the reference files only for argument-shape semantics.
 
 use crate::enums::{
-    AacProfile, AudioFormat, DitherType, DsdFilterPreset, DsdLowpassMethod, GainCompensation,
+    AacProfile, AudioFormat, DitherType, DsdFilterPreset, DsdLowpassMethod,
+    DsdToPcmGainMode, GainCompensation,
     Mp3Mode, PcmBitDepth, ReplayGainMode, SoxSincPhase,
 };
 use crate::error::{PlanningError, Result};
@@ -971,7 +972,7 @@ fn build_sox_dsd_to_pcm(
     let mut args = vec!["-S".into(), input];
     add_sox_output_format_args(context, &mut args, target_format, target_depth);
     args.push(output);
-    add_sox_dsd_to_pcm_effects(context, &mut args, target_rate_hz, target_depth, lowpass);
+    add_sox_dsd_to_pcm_effects(context, &mut args, target_rate_hz, target_depth, lowpass)?;
     Ok(PlannedCommand::new(
         ToolIdentifier::Sox,
         args,
@@ -1374,7 +1375,7 @@ fn add_sox_dsd_to_pcm_effects(
     target_rate_hz: u32,
     target_depth: PcmBitDepth,
     lowpass: DsdLowpassMethod,
-) {
+) -> Result<()> {
     match lowpass {
         DsdLowpassMethod::Sinc => {
             let sinc = context.request.settings.dsd.sinc;
@@ -1421,10 +1422,7 @@ fn add_sox_dsd_to_pcm_effects(
             }
         }
     }
-    if let Some(gain_db) = context.request.settings.dsd.dsd_to_pcm_gain_db {
-        args.push("gain".into());
-        args.push(format!("{gain_db:+.2}"));
-    }
+    add_sox_dsd_to_pcm_gain(&context.request.settings.dsd, args)?;
     if target_depth == PcmBitDepth::Int16
         && context.request.settings.dither_type != DitherType::None
     {
@@ -1432,6 +1430,38 @@ fn add_sox_dsd_to_pcm_effects(
             context.request.settings.dither_type,
         ));
     }
+    Ok(())
+}
+
+fn add_sox_dsd_to_pcm_gain(
+    dsd: &crate::settings::DsdSettings,
+    args: &mut Vec<String>,
+) -> Result<()> {
+    match dsd.dsd_to_pcm_gain_mode {
+        DsdToPcmGainMode::Auto => {
+            args.push("norm".into());
+            args.push(format!("-{:.2}", dsd.dsd_to_pcm_auto_gain_margin_db));
+        }
+        DsdToPcmGainMode::Manual => {
+            let gain_db = dsd.dsd_to_pcm_gain_db.ok_or_else(|| {
+                PlanningError::invalid_settings(
+                    "dsd.dsd_to_pcm_gain_db",
+                    "Manual DSD-to-PCM gain requires a finite dB value",
+                )
+            })?;
+            args.push("gain".into());
+            args.push(format!("{gain_db:+.2}"));
+        }
+        DsdToPcmGainMode::Disabled => {
+            // Backward compatibility: older callers only had this optional
+            // field. Keep honoring it without making auto gain the default.
+            if let Some(gain_db) = dsd.dsd_to_pcm_gain_db {
+                args.push("gain".into());
+                args.push(format!("{gain_db:+.2}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn add_sox_dsd_rate_change_effects(
@@ -1513,4 +1543,133 @@ fn format_float(value: f32) -> String {
         rendered.pop();
     }
     rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::{InputSource, OutputSink, PlanOperation, PlanRequest, PlanStep};
+    use crate::settings::{DsdSettings, PipelineSettings};
+    use crate::source::SourceInfo;
+    use std::path::PathBuf;
+
+    #[test]
+    fn dsd_to_pcm_manual_gain_without_value_fails_loudly() {
+        let mut dsd = DsdSettings::default();
+        dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
+        dsd.dsd_to_pcm_gain_db = None;
+        let mut args = Vec::new();
+
+        let result = add_sox_dsd_to_pcm_gain(&dsd, &mut args);
+
+        assert!(result.is_err());
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn dsd_to_pcm_manual_gain_with_value_emits_gain() {
+        let mut dsd = DsdSettings::default();
+        dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
+        dsd.dsd_to_pcm_gain_db = Some(2.25);
+        let mut args = Vec::new();
+
+        add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
+
+        assert_eq!(args, vec!["gain", "+2.25"]);
+    }
+
+    #[test]
+    fn dsd_to_pcm_auto_gain_emits_norm_margin() {
+        let mut dsd = DsdSettings::default();
+        dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+        dsd.dsd_to_pcm_auto_gain_margin_db = 0.50;
+        dsd.dsd_to_pcm_gain_db = None;
+        let mut args = Vec::new();
+
+        add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
+
+        assert_eq!(args, vec!["norm", "-0.50"]);
+    }
+
+    #[test]
+    fn dsd_to_pcm_disabled_gain_preserves_legacy_fixed_db() {
+        let mut dsd = DsdSettings::default();
+        dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
+        dsd.dsd_to_pcm_gain_db = Some(-1.5);
+        let mut args = Vec::new();
+
+        add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
+
+        assert_eq!(args, vec!["gain", "-1.50"]);
+    }
+
+    #[test]
+    fn dsd_to_pcm_auto_gain_golden_sox_command_chain() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.dither_type = DitherType::Shibata;
+        settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+        settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
+        settings.dsd.dsd_to_pcm_gain_db = None;
+
+        let source = SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: crate::enums::AudioCodec::Dsd,
+            sample_rate_hz: Some(2_822_400),
+            bit_depth: None,
+            sample_kind: Some(crate::enums::SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+
+        let request = PlanRequest {
+            input_path: PathBuf::from("input.dsf"),
+            output_path: PathBuf::from("output.flac"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let context = request.context();
+        let step = PlanStep::new(
+            0,
+            PlanOperation::DsdToPcm {
+                target_format: AudioFormat::Flac,
+                target_rate_hz: 88_200,
+                target_bit_depth: PcmBitDepth::Int16,
+                lowpass: DsdLowpassMethod::SoxUltra,
+            },
+            InputSource::Path(PathBuf::from("input.dsf")),
+            OutputSink::Path(PathBuf::from("output.flac")),
+            "Create PCM output",
+        );
+
+        let command = SoxPlugin.build_command(&context, &step).unwrap();
+
+        assert_eq!(command.tool, ToolIdentifier::Sox);
+        assert_eq!(
+            command.args,
+            vec![
+                "-S",
+                "input.dsf",
+                "-b",
+                "16",
+                "-C",
+                "8",
+                "output.flac",
+                "rate",
+                "-v",
+                "88200",
+                "sinc",
+                "-a",
+                "180",
+                "-25000",
+                "norm",
+                "-0.15",
+                "dither",
+                "-s",
+            ]
+        );
+    }
 }
