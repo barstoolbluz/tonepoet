@@ -41,6 +41,7 @@ pub enum TuiButton {
     NoiseShaperPill(usize),
     ModulatorOrderPill(usize),
     ConversionPresetPill(usize),
+    DsdGainPill(usize),
     MergePill(usize),
     ContainerPill(usize),
     /// ⚙ pill on the container row (below-the-fold) to open format-specific settings overlay.
@@ -270,6 +271,7 @@ impl TuiButton {
             | Self::NoiseShaperPill(_)
             | Self::ModulatorOrderPill(_)
             | Self::ConversionPresetPill(_)
+            | Self::DsdGainPill(_)
             | Self::MergePill(_)
             | Self::ContainerPill(_)
             | Self::FormatSettingsButton

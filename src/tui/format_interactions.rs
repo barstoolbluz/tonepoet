@@ -49,6 +49,7 @@ pub fn handle_format_button(
         TuiButton::NoiseShaperPill(index) => format.select_row_index(FormatField::NoiseShaper, index, source_bits, source_rate),
         TuiButton::ModulatorOrderPill(index) => format.select_row_index(FormatField::ModulatorOrder, index, source_bits, source_rate),
         TuiButton::ConversionPresetPill(index) => format.select_row_index(FormatField::ConversionPreset, index, source_bits, source_rate),
+        TuiButton::DsdGainPill(index) => format.select_row_index(FormatField::DsdGain, index, source_bits, source_rate),
         _ => return false,
     }
     true

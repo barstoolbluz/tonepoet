@@ -11180,7 +11180,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::ReplayGainPill(_)
             | TuiButton::NoiseShaperPill(_)
             | TuiButton::ModulatorOrderPill(_)
-            | TuiButton::ConversionPresetPill(_) => {
+            | TuiButton::ConversionPresetPill(_)
+            | TuiButton::DsdGainPill(_) => {
                 app.convert.focus = ConvertFocus::Format;
                 if super::format_interactions::handle_convert_format_button(&mut app.convert, button) {
                     app.preset.mark_modified();

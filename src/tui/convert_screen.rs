@@ -230,7 +230,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
     let label_col = area.x + 17;
     register_pill_row(buttons, &state.format, area.y + 2, label_col, |i| TuiButton::FormatPill(i));
 
-    let last_standard_row;
+    let mut last_standard_row;
     if state.is_dsd_selected() {
         register_pill_row(buttons, &state.sample_rate, area.y + 3, label_col, |i| TuiButton::RatePill(i));
         register_pill_row(buttons, &state.noise_shaper, area.y + 5, label_col, |i| TuiButton::NoiseShaperPill(i));
@@ -244,6 +244,10 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
         register_pill_row(buttons, &state.dither, area.y + 6, label_col, |i| TuiButton::DitherPill(i));
         register_pill_row(buttons, &state.replaygain, area.y + 7, label_col, |i| TuiButton::ReplayGainPill(i));
         last_standard_row = 7;
+        if state.dsd_to_pcm_gain_available() {
+            register_pill_row(buttons, &state.dsd_gain_mode, area.y + 8, label_col, |i| TuiButton::DsdGainPill(i));
+            last_standard_row = 9;
+        }
     }
 
     // Below-the-fold: container pill buttons when maximized.
