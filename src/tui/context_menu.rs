@@ -329,12 +329,12 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
     }
 }
 
-/// "Disk Tools" submenu — AccurateRip and CUETools DB lookups, both
+/// "Disc Tools" submenu — AccurateRip and CUETools DB lookups, both
 /// of which only return useful results for redbook CD rips (16-bit /
 /// 44.1 kHz with a known TOC).
 fn build_disk_tools_submenu() -> ContextMenuEntry {
     ContextMenuEntry::Submenu {
-        label: "Disk Tools".to_string(),
+        label: "Disc Tools".to_string(),
         children: vec![
             ContextMenuEntry::Submenu {
                 label: "AccurateRip".to_string(),
@@ -528,6 +528,17 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Deselect", ContextAction::Deselect));
         }
         EntryKind::OtherFile => {
+            // CUE files are convertible (they reference an image file).
+            let is_cue = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("cue"))
+                .unwrap_or(false);
+            if is_cue {
+                items.push(build_convert_submenu(app));
+                items.push(separator());
+            }
             if super::browse::is_viewable_text_file(&entry.path) {
                 items.push(item("View", ContextAction::ViewFile(entry.path.clone())));
                 if super::browse::is_editable_text_file(&entry.path) {
