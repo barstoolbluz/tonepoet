@@ -657,6 +657,56 @@ mod tests {
     }
 
     #[test]
+    fn cue_image_segment_keeps_source_tag_artwork_policy_enabled() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("realized-segment.flac");
+        write_minimal_flac_with_md5(&input);
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::ImageSegment {
+            image: temp.path().join("album.flac"),
+            start_sample: 0,
+            samples: 44_100,
+        });
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("CUE image-segment plan request builds");
+
+        assert!(planned.settings.metadata.transfer_tags);
+        assert!(planned.settings.metadata.preserve_artwork);
+        assert!(planned.settings.metadata.store_source_audio_md5);
+    }
+
+    #[test]
+    fn cue_metadata_obligations_require_both_source_transfer_and_authoritative_tags() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        let src = source(
+            SourceKind::CueImage,
+            track(TrackSourceRef::ImageSegment {
+                image: temp.path().join("album.flac"),
+                start_sample: 0,
+                samples: 44_100,
+            }),
+            temp.path(),
+        );
+
+        let obligations = metadata_obligations_for_request(&req, &src);
+
+        assert!(obligations.source_tags_transferred);
+        assert!(obligations.artwork_transferred);
+        assert!(obligations.authoritative_tags_applied);
+        assert!(!obligations.source_audio_md5_written);
+    }
+
+    #[test]
     fn staged_dsf_plan_request_preserves_source_tag_artwork_but_disables_unavailable_source_md5() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("source.dsf");

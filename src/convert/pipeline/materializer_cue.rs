@@ -1,9 +1,11 @@
 //! PR 8 - CUE image materializer.
 //!
-//! Parses a single-image CUE layout into `ImageSegment` track refs. Cutting
-//! is left to `realize_track`.
+//! Parses CUE image layouts into `ImageSegment` track refs. Cutting
+//! is left to `realize_track`. Sidecar CUE sheets may reference one image
+//! or multiple image files; embedded CUE sheets are constrained to their
+//! owning image.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,9 +26,11 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 struct CueInput {
-    image_path: PathBuf,
     sheet: CueSheet,
     raw_cue: String,
+    origin: CueOrigin,
+    cue_parent: Option<PathBuf>,
+    fallback_image: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -63,14 +67,32 @@ impl Materializer for CueImageMaterializer {
         }
 
         let cue_input = resolve_cue_input(req)?;
-        let probe = probe_audio_image(&cue_input.image_path, runner, cancel).await?;
-        let boundaries = compute_track_boundaries(
+        let track_images = resolve_track_image_paths(&cue_input)?;
+        let unique_images = unique_existing_paths(&track_images);
+
+        let mut probes = HashMap::new();
+        let mut image_metadata = HashMap::new();
+        for image_path in &unique_images {
+            if cancel.is_cancelled() {
+                return Err(MaterializeError::Cancelled);
+            }
+            probes.insert(
+                path_identity(image_path),
+                probe_audio_image(image_path, runner, cancel).await?,
+            );
+            image_metadata.insert(path_identity(image_path), read_image_album_metadata(image_path));
+        }
+
+        let boundaries = compute_track_boundaries_for_layout(
             &cue_input.sheet,
-            probe.total_samples,
-            probe.sample_rate,
-            probe.exact_samples,
+            &track_images,
+            &probes,
         )?;
         let cue_annotations = CueAnnotations::parse(&cue_input.raw_cue);
+        let track_number_plan = cue_track_number_plan(&cue_input.sheet);
+        warn_if_cue_track_numbering_normalized(&track_number_plan);
+        let album_image_metadata = merge_image_album_metadata(&track_images, &image_metadata);
+        let total_tracks = cue_input.sheet.tracks.len() as u32;
 
         let mut tracks = Vec::with_capacity(cue_input.sheet.tracks.len());
         for (idx, cue_track) in cue_input.sheet.tracks.iter().enumerate() {
@@ -79,11 +101,27 @@ impl Materializer for CueImageMaterializer {
             }
 
             let ordinal = (idx + 1) as u32;
+            let image_path = &track_images[idx];
+            let image_key = path_identity(image_path);
+            let probe = probes.get(&image_key).ok_or_else(|| {
+                MaterializeError::Parse(format!(
+                    "missing audio probe for CUE image {}",
+                    image_path.display()
+                ))
+            })?;
+            let image_metadata_for_track = image_metadata.get(&image_key).ok_or_else(|| {
+                MaterializeError::Parse(format!(
+                    "missing image metadata slot for CUE image {}",
+                    image_path.display()
+                ))
+            })?;
             let (start_sample, samples) = boundaries[idx];
             let mut metadata = cue_track_metadata(
                 cue_track,
                 &cue_input.sheet,
+                image_metadata_for_track,
                 cue_annotations.track_pre_emphasis(cue_track.number),
+                track_number_plan[idx],
             );
             cue_annotations.add_track_extras(cue_track.number, &mut metadata.extra);
 
@@ -91,10 +129,10 @@ impl Materializer for CueImageMaterializer {
                 id: TrackId {
                     source_ordinal: ordinal,
                     disc_number: None,
-                    track_number: cue_track.number,
+                    track_number: track_number_plan[idx].output_number,
                 },
                 source_ref: TrackSourceRef::ImageSegment {
-                    image: cue_input.image_path.clone(),
+                    image: image_path.clone(),
                     start_sample,
                     samples,
                 },
@@ -106,7 +144,7 @@ impl Materializer for CueImageMaterializer {
         }
 
         let tracks = apply_track_selection(tracks, &req.source.track_selection)?;
-        let mut album_metadata = cue_album_metadata(&cue_input.sheet, tracks.len() as u32);
+        let mut album_metadata = cue_album_metadata(&cue_input.sheet, &album_image_metadata, total_tracks);
         cue_annotations.add_album_extras(&mut album_metadata.extra);
 
         let provenance = ExtractionProvenance {
@@ -145,7 +183,7 @@ fn resolve_cue_input(req: &PipelineRequest) -> Result<CueInput, MaterializeError
 fn resolve_sidecar_cue(req: &PipelineRequest) -> Result<CueInput, MaterializeError> {
     let cue_path = find_valid_sidecar_cue_for_image(&req.container)?.ok_or_else(|| {
         MaterializeError::Parse(
-            "SidecarOnly requested but no matching single-image CUE was found".to_string(),
+            "SidecarOnly requested but no matching CUE was found".to_string(),
         )
     })?;
     read_sidecar_cue(req, cue_path)
@@ -157,26 +195,33 @@ fn read_sidecar_cue(
 ) -> Result<CueInput, MaterializeError> {
     let raw_cue = read_text_lossy(&cue_path)?;
     let sheet = parse_cue_file(&cue_path).map_err(MaterializeError::Parse)?;
-    let image_path = resolve_single_image_path(
-        &sheet,
-        CueOrigin::Sidecar,
-        cue_path.parent(),
-        Some(&req.container),
-    )?;
+    validate_sidecar_layout(&sheet)?;
 
-    if !same_existing_path(&image_path, &req.container) && !has_extension(&req.container, "cue") {
-        return Err(MaterializeError::Parse(format!(
-            "CUE file {} does not reference input image {}",
-            cue_path.display(),
-            req.container.display()
-        )));
-    }
-
-    Ok(CueInput {
-        image_path,
+    let cue_parent = cue_path.parent().map(Path::to_path_buf);
+    let fallback_image = (!has_extension(&req.container, "cue")).then(|| req.container.clone());
+    let cue_input = CueInput {
         sheet,
         raw_cue,
-    })
+        origin: CueOrigin::Sidecar,
+        cue_parent,
+        fallback_image,
+    };
+
+    if !has_extension(&req.container, "cue") {
+        let track_images = resolve_track_image_paths(&cue_input)?;
+        if !track_images
+            .iter()
+            .any(|image_path| same_existing_path(image_path, &req.container))
+        {
+            return Err(MaterializeError::Parse(format!(
+                "CUE file {} does not reference input image {}",
+                cue_path.display(),
+                req.container.display()
+            )));
+        }
+    }
+
+    Ok(cue_input)
 }
 
 fn resolve_embedded_cue(req: &PipelineRequest) -> Result<CueInput, MaterializeError> {
@@ -186,12 +231,14 @@ fn resolve_embedded_cue(req: &PipelineRequest) -> Result<CueInput, MaterializeEr
         )
     })?;
     let sheet = parse_cue(&raw_cue);
-    validate_single_image_layout(&sheet)?;
+    validate_embedded_single_image_layout(&sheet)?;
 
     Ok(CueInput {
-        image_path: req.container.clone(),
         sheet,
         raw_cue,
+        origin: CueOrigin::Embedded,
+        cue_parent: None,
+        fallback_image: Some(req.container.clone()),
     })
 }
 
@@ -248,18 +295,23 @@ fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDe
     let mut matching = Vec::new();
     for cue_path in candidates {
         let raw = std::fs::read(&cue_path)?;
-        let content = String::from_utf8_lossy(&raw);
+        let content = String::from_utf8_lossy(&raw).into_owned();
         let sheet = parse_cue(&content);
-        if validate_single_image_layout_detect(&sheet).is_err() {
+        if validate_sidecar_layout_detect(&sheet).is_err() {
             continue;
         }
-        if let Some(resolved) = resolve_single_image_path_detect(
-            &sheet,
-            CueOrigin::Sidecar,
-            cue_path.parent(),
-            Some(image),
-        ) {
-            if same_existing_path(&resolved, image) {
+        let cue_input = CueInput {
+            sheet,
+            raw_cue: content,
+            origin: CueOrigin::Sidecar,
+            cue_parent: cue_path.parent().map(Path::to_path_buf),
+            fallback_image: Some(image.to_path_buf()),
+        };
+        if let Ok(track_images) = resolve_track_image_paths(&cue_input) {
+            if track_images
+                .iter()
+                .any(|resolved| same_existing_path(resolved, image))
+            {
                 matching.push(cue_path);
             }
         }
@@ -280,7 +332,7 @@ fn embedded_cuesheet_is_single_image(path: &Path) -> bool {
         return false;
     };
     let sheet = parse_cue(&raw);
-    validate_single_image_layout_detect(&sheet).is_ok()
+    validate_embedded_single_image_layout_detect(&sheet).is_ok()
 }
 
 fn find_valid_sidecar_cue_for_image(image: &Path) -> Result<Option<PathBuf>, MaterializeError> {
@@ -345,10 +397,18 @@ fn validate_sidecar_cue_matches_image(
 fn sidecar_cue_matches_image(cue_path: &Path, image: &Path) -> Result<bool, MaterializeError> {
     let raw_cue = read_text_lossy(cue_path)?;
     let sheet = parse_cue(&raw_cue);
-    validate_single_image_layout(&sheet)?;
-    let resolved =
-        resolve_single_image_path(&sheet, CueOrigin::Sidecar, cue_path.parent(), Some(image))?;
-    Ok(same_existing_path(&resolved, image))
+    validate_sidecar_layout(&sheet)?;
+    let cue_input = CueInput {
+        sheet,
+        raw_cue,
+        origin: CueOrigin::Sidecar,
+        cue_parent: cue_path.parent().map(Path::to_path_buf),
+        fallback_image: Some(image.to_path_buf()),
+    };
+    let track_images = resolve_track_image_paths(&cue_input)?;
+    Ok(track_images
+        .iter()
+        .any(|resolved| same_existing_path(resolved, image)))
 }
 
 fn source_detect_to_materialize(err: SourceDetectError) -> MaterializeError {
@@ -430,82 +490,136 @@ fn read_embedded_cuesheet(path: &Path) -> Result<Option<String>, MaterializeErro
         .map(|value| value.to_string()))
 }
 
-fn validate_single_image_layout(sheet: &CueSheet) -> Result<(), MaterializeError> {
-    validate_single_image_layout_detect(sheet).map_err(MaterializeError::Parse)
+fn validate_sidecar_layout(sheet: &CueSheet) -> Result<(), MaterializeError> {
+    validate_sidecar_layout_detect(sheet).map_err(MaterializeError::Parse)
 }
 
-fn validate_single_image_layout_detect(sheet: &CueSheet) -> Result<(), String> {
-    if sheet.tracks.is_empty() {
-        return Err("CUE sheet has no tracks".to_string());
+fn validate_sidecar_layout_detect(sheet: &CueSheet) -> Result<(), String> {
+    validate_common_cue_layout(sheet)?;
+    if !sheet.tracks.iter().all(|track| track.file.is_some()) {
+        return Err("sidecar CUE requires a FILE reference for every track".to_string());
     }
-    if !sheet
-        .tracks
-        .iter()
-        .all(|track| track.index01_frames.is_some())
-    {
-        return Err("single-image CUE requires INDEX 01 for every track".to_string());
-    }
+    validate_index_order_per_file(sheet)
+}
+
+fn validate_embedded_single_image_layout(sheet: &CueSheet) -> Result<(), MaterializeError> {
+    validate_embedded_single_image_layout_detect(sheet).map_err(MaterializeError::Parse)
+}
+
+fn validate_embedded_single_image_layout_detect(sheet: &CueSheet) -> Result<(), String> {
+    validate_common_cue_layout(sheet)?;
 
     let first_file = sheet.tracks.iter().find_map(|track| track.file.as_ref());
     if let Some(file_ref) = first_file {
         let all_same = sheet
             .tracks
             .iter()
-            .all(|track| track.file.as_ref() == Some(file_ref));
+            .all(|track| track.file.as_ref().is_none() || track.file.as_ref() == Some(file_ref));
         if !all_same {
-            return Err(
-                "track-per-file CUE layouts are not handled by CueImageMaterializer".to_string(),
-            );
+            return Err("embedded CUE cannot reference multiple audio files".to_string());
         }
     }
 
-    let mut previous = None;
-    for track in &sheet.tracks {
-        let current = track.index01_frames.expect("checked above");
-        if previous.is_some_and(|prev| current <= prev) {
-            return Err(format!("non-increasing INDEX 01 at track {}", track.number));
-        }
-        previous = Some(current);
-    }
+    validate_index_order_per_file(sheet)
+}
 
+fn validate_common_cue_layout(sheet: &CueSheet) -> Result<(), String> {
+    if sheet.tracks.is_empty() {
+        return Err("CUE sheet has no tracks".to_string());
+    }
+    validate_track_number_identity(sheet)?;
+    if !sheet
+        .tracks
+        .iter()
+        .all(|track| track.index01_frames.is_some())
+    {
+        return Err("CUE requires INDEX 01 for every track".to_string());
+    }
     Ok(())
 }
 
-fn resolve_single_image_path(
-    sheet: &CueSheet,
-    origin: CueOrigin,
-    cue_parent: Option<&Path>,
-    fallback_image: Option<&Path>,
-) -> Result<PathBuf, MaterializeError> {
-    validate_single_image_layout(sheet)?;
-    if origin == CueOrigin::Embedded {
-        return fallback_image.map(Path::to_path_buf).ok_or_else(|| {
-            MaterializeError::Parse("embedded CUE has no owning image".to_string())
-        });
+fn validate_track_number_identity(sheet: &CueSheet) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for track in &sheet.tracks {
+        if track.number == 0 {
+            return Err("CUE track numbers must be positive".to_string());
+        }
+        if !seen.insert(track.number) {
+            return Err(format!("duplicate CUE track number {}", track.number));
+        }
     }
-
-    let file_ref = sheet
-        .tracks
-        .iter()
-        .find_map(|track| track.file.as_ref())
-        .ok_or_else(|| {
-            MaterializeError::Parse("sidecar CUE sheet has no FILE reference".to_string())
-        })?;
-    resolve_audio_reference(cue_parent, file_ref, fallback_image)
+    Ok(())
 }
 
-fn resolve_single_image_path_detect(
-    sheet: &CueSheet,
-    origin: CueOrigin,
-    cue_parent: Option<&Path>,
-    fallback_image: Option<&Path>,
-) -> Option<PathBuf> {
-    validate_single_image_layout_detect(sheet).ok()?;
-    if origin == CueOrigin::Embedded {
-        return fallback_image.map(Path::to_path_buf);
+fn validate_index_order_per_file(sheet: &CueSheet) -> Result<(), String> {
+    let mut previous_by_file: HashMap<String, u32> = HashMap::new();
+    for track in &sheet.tracks {
+        let current = track.index01_frames.expect("checked above");
+        let file_key = track
+            .file
+            .as_deref()
+            .map(normalize_cue_file_key)
+            .unwrap_or_else(|| "<embedded>".to_string());
+        if previous_by_file
+            .get(&file_key)
+            .is_some_and(|previous| current <= *previous)
+        {
+            return Err(format!(
+                "non-increasing INDEX 01 at track {} in FILE {}",
+                track.number,
+                track.file.as_deref().unwrap_or("<embedded>")
+            ));
+        }
+        previous_by_file.insert(file_key, current);
     }
-    let file_ref = sheet.tracks.iter().find_map(|track| track.file.as_ref())?;
-    resolve_audio_reference(cue_parent, file_ref, fallback_image).ok()
+    Ok(())
+}
+
+fn normalize_cue_file_key(value: &str) -> String {
+    value.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn resolve_track_image_paths(input: &CueInput) -> Result<Vec<PathBuf>, MaterializeError> {
+    match input.origin {
+        CueOrigin::Embedded => {
+            let image = input.fallback_image.as_ref().ok_or_else(|| {
+                MaterializeError::Parse("embedded CUE has no owning image".to_string())
+            })?;
+            Ok(vec![image.clone(); input.sheet.tracks.len()])
+        }
+        CueOrigin::Sidecar => input
+            .sheet
+            .tracks
+            .iter()
+            .map(|track| {
+                let file_ref = track.file.as_ref().ok_or_else(|| {
+                    MaterializeError::Parse(format!(
+                        "track {} has no CUE FILE reference",
+                        track.number
+                    ))
+                })?;
+                resolve_audio_reference(
+                    input.cue_parent.as_deref(),
+                    file_ref,
+                    input.fallback_image.as_deref(),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn unique_existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !unique.iter().any(|existing| same_existing_path(existing, path)) {
+            unique.push(path.clone());
+        }
+    }
+    unique
+}
+
+fn path_identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn resolve_audio_reference(
@@ -709,6 +823,78 @@ fn json_u32_from_value(value: &serde_json::Value) -> Option<u32> {
         .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
 }
 
+fn compute_track_boundaries_for_layout(
+    sheet: &CueSheet,
+    track_images: &[PathBuf],
+    probes: &HashMap<PathBuf, AudioProbe>,
+) -> Result<Vec<(u64, u64)>, MaterializeError> {
+    if sheet.tracks.len() != track_images.len() {
+        return Err(MaterializeError::Parse(format!(
+            "CUE track/image cardinality mismatch: {} tracks, {} images",
+            sheet.tracks.len(),
+            track_images.len()
+        )));
+    }
+
+    let image_keys: Vec<PathBuf> = track_images
+        .iter()
+        .map(|image_path| path_identity(image_path))
+        .collect();
+    let mut boundaries = Vec::with_capacity(sheet.tracks.len());
+
+    for (idx, track) in sheet.tracks.iter().enumerate() {
+        let image_path = &track_images[idx];
+        let image_key = &image_keys[idx];
+        let probe = probes.get(image_key).ok_or_else(|| {
+            MaterializeError::Parse(format!(
+                "missing audio probe for CUE image {}",
+                image_path.display()
+            ))
+        })?;
+        let index01 = track.index01_frames.ok_or_else(|| {
+            MaterializeError::Parse(format!("track {} has no INDEX 01", track.number))
+        })?;
+        let start = cue_frames_to_samples(index01 as u64, probe.sample_rate);
+
+        let next_start = ((idx + 1)..sheet.tracks.len())
+            .find(|next_idx| image_keys[*next_idx] == *image_key)
+            .map(|next_idx| {
+                let next_frames = sheet.tracks[next_idx]
+                    .index01_frames
+                    .expect("validated INDEX 01");
+                cue_frames_to_samples(next_frames as u64, probe.sample_rate)
+            });
+        let end = next_start.unwrap_or(probe.total_samples);
+
+        if end <= start {
+            return Err(MaterializeError::Parse(format!(
+                "invalid CUE boundary for track {} in image {}",
+                track.number,
+                image_path.display()
+            )));
+        }
+        if end > probe.total_samples {
+            return Err(MaterializeError::Parse(format!(
+                "track {} starts beyond image duration for {}",
+                track.number,
+                image_path.display()
+            )));
+        }
+        if !probe.exact_samples
+            && next_start.is_none()
+            && probe.total_samples.saturating_sub(start) < probe.sample_rate as u64 / 20
+        {
+            return Err(MaterializeError::Parse(format!(
+                "image sample count probe is too coarse for final CUE segment in {}",
+                image_path.display()
+            )));
+        }
+        boundaries.push((start, end - start));
+    }
+
+    Ok(boundaries)
+}
+
 fn compute_track_boundaries(
     sheet: &CueSheet,
     total_samples: u64,
@@ -758,10 +944,224 @@ fn cue_frames_to_samples(frames: u64, sample_rate: u32) -> u64 {
     ((frames as u128 * sample_rate as u128) / 75_u128) as u64
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ImageAlbumMetadata {
+    album: Option<String>,
+    album_artist: Option<String>,
+    artist: Option<String>,
+    genre: Option<String>,
+    date: Option<String>,
+    total_discs: Option<u32>,
+    disc_number: Option<u32>,
+    source: Option<String>,
+}
+
+fn merge_image_album_metadata(
+    track_images: &[PathBuf],
+    metadata_by_image: &HashMap<PathBuf, ImageAlbumMetadata>,
+) -> ImageAlbumMetadata {
+    let mut merged = ImageAlbumMetadata::default();
+    let mut sources = Vec::new();
+
+    for image_path in unique_existing_paths(track_images) {
+        let Some(metadata) = metadata_by_image.get(&path_identity(&image_path)) else {
+            continue;
+        };
+
+        if let Some(source) = &metadata.source {
+            if !sources.iter().any(|seen| seen == source) {
+                sources.push(source.clone());
+            }
+        }
+        if merged.album.is_none() {
+            merged.album = metadata.album.clone();
+        }
+        if merged.album_artist.is_none() {
+            merged.album_artist = metadata.album_artist.clone();
+        }
+        if merged.artist.is_none() {
+            merged.artist = metadata.artist.clone();
+        }
+        if merged.genre.is_none() {
+            merged.genre = metadata.genre.clone();
+        }
+        if merged.date.is_none() {
+            merged.date = metadata.date.clone();
+        }
+        if merged.total_discs.is_none() {
+            merged.total_discs = metadata.total_discs;
+        }
+        if merged.disc_number.is_none() {
+            merged.disc_number = metadata.disc_number;
+        }
+    }
+
+    if !sources.is_empty() {
+        merged.source = Some(sources.join("; "));
+    }
+
+    merged
+}
+
+fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
+    use lofty::prelude::*;
+
+    let tagged = match lofty::read_from_path(path) {
+        Ok(tagged) => tagged,
+        Err(err) => {
+            log::warn!(
+                "unable to read album-level tags from CUE image '{}'; using CUE metadata without image tag fallback: {err}",
+                path.display()
+            );
+            return ImageAlbumMetadata::default();
+        }
+    };
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return ImageAlbumMetadata::default();
+    };
+
+    let mut metadata = ImageAlbumMetadata::default();
+    for item in tag.items() {
+        let key = normalized_lofty_item_key(item.key());
+        let Some(value) = item.value().text().map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        match cue_image_tag_field(&key) {
+            Some(ImageTagField::Album) => set_if_empty(&mut metadata.album, value),
+            Some(ImageTagField::AlbumArtist) => set_if_empty(&mut metadata.album_artist, value),
+            Some(ImageTagField::Artist) => set_if_empty(&mut metadata.artist, value),
+            Some(ImageTagField::Genre) => set_if_empty(&mut metadata.genre, value),
+            Some(ImageTagField::Date) => set_if_empty(&mut metadata.date, value),
+            Some(ImageTagField::DiscNumber) => {
+                if metadata.disc_number.is_none() {
+                    metadata.disc_number = parse_tag_number(value);
+                }
+            }
+            Some(ImageTagField::TotalDiscs) => {
+                if metadata.total_discs.is_none() {
+                    metadata.total_discs = parse_tag_number(value);
+                }
+            }
+            None => {}
+        }
+    }
+
+    if metadata.album.is_some()
+        || metadata.album_artist.is_some()
+        || metadata.artist.is_some()
+        || metadata.genre.is_some()
+        || metadata.date.is_some()
+        || metadata.total_discs.is_some()
+        || metadata.disc_number.is_some()
+    {
+        metadata.source = Some(path.display().to_string());
+    }
+    metadata
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageTagField {
+    Album,
+    AlbumArtist,
+    Artist,
+    Genre,
+    Date,
+    DiscNumber,
+    TotalDiscs,
+}
+
+fn cue_image_tag_field(key: &str) -> Option<ImageTagField> {
+    match key {
+        "album" | "albumtitle" | "talb" => Some(ImageTagField::Album),
+        "albumartist" | "albumartistsort" | "albumartistsortorder" | "tpe2" => {
+            Some(ImageTagField::AlbumArtist)
+        }
+        "artist" | "trackartist" | "performer" | "tpe1" => Some(ImageTagField::Artist),
+        "genre" | "tcon" => Some(ImageTagField::Genre),
+        "date" | "year" | "recordingdate" | "originaldate" | "tdrc" | "tyer" => {
+            Some(ImageTagField::Date)
+        }
+        "discnumber" | "disc" | "partofset" | "tpos" => Some(ImageTagField::DiscNumber),
+        "totaldiscs" | "disctotal" => Some(ImageTagField::TotalDiscs),
+        _ => None,
+    }
+}
+
+fn normalized_lofty_item_key(key: &lofty::tag::ItemKey) -> String {
+    let raw = match key {
+        lofty::tag::ItemKey::Unknown(value) => value.as_str().to_string(),
+        _ => format!("{key:?}"),
+    };
+    normalize_tag_key(&raw)
+}
+
+fn normalize_tag_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn set_if_empty(slot: &mut Option<String>, value: &str) {
+    if slot.is_none() {
+        *slot = Some(value.to_string());
+    }
+}
+
+fn parse_tag_number(value: &str) -> Option<u32> {
+    value
+        .split('/')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CueTrackNumberPlan {
+    output_number: u32,
+    cue_number: u32,
+}
+
+fn cue_track_number_plan(sheet: &CueSheet) -> Vec<CueTrackNumberPlan> {
+    sheet
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(idx, track)| CueTrackNumberPlan {
+            output_number: (idx + 1) as u32,
+            cue_number: track.number,
+        })
+        .collect()
+}
+
+fn warn_if_cue_track_numbering_normalized(plan: &[CueTrackNumberPlan]) {
+    if plan
+        .iter()
+        .all(|entry| entry.output_number == entry.cue_number)
+    {
+        return;
+    }
+
+    let mapping = plan
+        .iter()
+        .map(|entry| format!("{}->{}", entry.cue_number, entry.output_number))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log::warn!(
+        "CUE track numbers are not sequential from 1 in playback order; writing normalized TRACKNUMBER values and preserving CUE numbers in TRACK_CUE_TRACK_NUMBER tags: {mapping}"
+    );
+}
+
 fn cue_track_metadata(
     cue_track: &crate::tui::cue_parser::CueTrack,
     sheet: &CueSheet,
+    image: &ImageAlbumMetadata,
     pre_emphasis: bool,
+    numbering: CueTrackNumberPlan,
 ) -> TrackMetadata {
     let mut extra = BTreeMap::new();
     if let Some(album) = &sheet.title {
@@ -776,22 +1176,34 @@ fn cue_track_metadata(
     if let Some(index01) = cue_track.index01_frames {
         extra.insert("index01_frames".to_string(), index01.to_string());
     }
+    if numbering.cue_number != numbering.output_number {
+        extra.insert(
+            "cue_track_number".to_string(),
+            numbering.cue_number.to_string(),
+        );
+    }
+
+    let performer = cue_track
+        .performer
+        .clone()
+        .or_else(|| sheet.performer.clone())
+        .or_else(|| image.artist.clone())
+        .or_else(|| image.album_artist.clone());
+    let album_artist = sheet
+        .performer
+        .clone()
+        .or_else(|| image.album_artist.clone())
+        .or_else(|| image.artist.clone());
 
     TrackMetadata {
         title: cue_track.title.clone(),
-        artist: cue_track
-            .performer
-            .clone()
-            .or_else(|| sheet.performer.clone()),
-        album_artist: sheet.performer.clone(),
+        artist: performer.clone(),
+        album_artist,
         composer: None,
-        performer: cue_track
-            .performer
-            .clone()
-            .or_else(|| sheet.performer.clone()),
-        genre: sheet.genre.clone(),
-        date: sheet.date.clone(),
-        track_number: Some(cue_track.number),
+        performer,
+        genre: sheet.genre.clone().or_else(|| image.genre.clone()),
+        date: sheet.date.clone().or_else(|| image.date.clone()),
+        track_number: Some(numbering.output_number),
         disc_number: None,
         isrc: cue_track.isrc.clone(),
         publisher: None,
@@ -802,20 +1214,31 @@ fn cue_track_metadata(
     }
 }
 
-fn cue_album_metadata(sheet: &CueSheet, total_tracks: u32) -> AlbumMetadata {
+fn cue_album_metadata(
+    sheet: &CueSheet,
+    image: &ImageAlbumMetadata,
+    total_tracks: u32,
+) -> AlbumMetadata {
     let mut extra = BTreeMap::new();
     if let Some(catalog) = &sheet.catalog {
         extra.insert("catalog".to_string(), catalog.clone());
     }
+    if let Some(source) = &image.source {
+        extra.insert("image_metadata_source".to_string(), source.clone());
+    }
 
     AlbumMetadata {
-        album: sheet.title.clone(),
-        album_artist: sheet.performer.clone(),
-        genre: sheet.genre.clone(),
-        date: sheet.date.clone(),
+        album: sheet.title.clone().or_else(|| image.album.clone()),
+        album_artist: sheet
+            .performer
+            .clone()
+            .or_else(|| image.album_artist.clone())
+            .or_else(|| image.artist.clone()),
+        genre: sheet.genre.clone().or_else(|| image.genre.clone()),
+        date: sheet.date.clone().or_else(|| image.date.clone()),
         total_tracks,
-        total_discs: None,
-        disc_number: None,
+        total_discs: image.total_discs,
+        disc_number: image.disc_number,
         extra,
     }
 }
@@ -1042,23 +1465,29 @@ mod materializer_cue_tests {
     }
 
     fn stub_runner_with_probe(json: &str) -> StubToolRunner {
+        stub_runner_with_probes(&[json])
+    }
+
+    fn stub_runner_with_probes(json_outputs: &[&str]) -> StubToolRunner {
         let runner = StubToolRunner::new();
-        runner.push_output(ToolOutput {
-            exit: crate::convert::pipeline::tool::ProcessExit::Code(0),
-            stdout_tail: json.to_string(),
-            stderr_tail: String::new(),
-            elapsed: Duration::from_millis(10),
-            command: crate::convert::pipeline::tool::CommandRecord {
-                binary: ToolBinary::Ffprobe,
-                sanitized_args: vec![],
-                cwd: None,
-                env_keys: vec![],
-                exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(0)),
-                stdout_tail: String::new(),
+        for json in json_outputs {
+            runner.push_output(ToolOutput {
+                exit: crate::convert::pipeline::tool::ProcessExit::Code(0),
+                stdout_tail: (*json).to_string(),
                 stderr_tail: String::new(),
                 elapsed: Duration::from_millis(10),
-            },
-        });
+                command: crate::convert::pipeline::tool::CommandRecord {
+                    binary: ToolBinary::Ffprobe,
+                    sanitized_args: vec![],
+                    cwd: None,
+                    env_keys: vec![],
+                    exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(0)),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    elapsed: Duration::from_millis(10),
+                },
+            });
+        }
         runner
     }
 
@@ -1153,12 +1582,22 @@ FILE "album.flac" WAVE
         probe_json: &str,
         temp: &tempfile::TempDir,
     ) -> Result<PreparedSource, MaterializeError> {
-        let cue_path = temp.path().join("album.cue");
-        let audio_path = temp.path().join("album.flac");
-        write_file(&cue_path, cue_content.as_bytes());
-        write_file(&audio_path, b"fake-audio-data");
+        materialize_cue_with_audio_files(cue_content, &[probe_json], &["album.flac"], temp).await
+    }
 
-        let runner = stub_runner_with_probe(probe_json);
+    async fn materialize_cue_with_audio_files(
+        cue_content: &str,
+        probe_jsons: &[&str],
+        audio_files: &[&str],
+        temp: &tempfile::TempDir,
+    ) -> Result<PreparedSource, MaterializeError> {
+        let cue_path = temp.path().join("album.cue");
+        write_file(&cue_path, cue_content.as_bytes());
+        for audio_file in audio_files {
+            write_file(&temp.path().join(audio_file), b"fake-audio-data");
+        }
+
+        let runner = stub_runner_with_probes(probe_jsons);
         let mut staging = test_staging(temp);
         let cancel = CancellationToken::new();
         let req = test_request(&cue_path);
@@ -1300,18 +1739,127 @@ FILE "album.flac" WAVE
     }
 
     #[tokio::test]
-    async fn track_per_file_cue_rejected_as_not_single_image() {
+    async fn track_per_file_cue_materializes_each_referenced_file() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cue = r#"FILE "track1.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "One"
+    INDEX 01 00:00:00
+FILE "track2.flac" WAVE
+  TRACK 02 AUDIO
+    TITLE "Two"
+    INDEX 01 00:00:00
+"#;
+        let probe1 = ffprobe_json_exact(44100, 441_000, 16);
+        let probe2 = ffprobe_json_exact(44100, 882_000, 16);
+        let source = materialize_cue_with_audio_files(
+            cue,
+            &[&probe1, &probe2],
+            &["track1.flac", "track2.flac"],
+            &temp,
+        )
+        .await
+        .expect("track-per-file CUE materializes");
+
+        assert_eq!(source.tracks.len(), 2);
+        assert_eq!(source.album_metadata.total_tracks, 2);
+
+        let TrackSourceRef::ImageSegment { image, start_sample, samples } = &source.tracks[0].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(image.file_name().and_then(|value| value.to_str()), Some("track1.flac"));
+        assert_eq!(*start_sample, 0);
+        assert_eq!(*samples, 441_000);
+        assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("One"));
+
+        let TrackSourceRef::ImageSegment { image, start_sample, samples } = &source.tracks[1].source_ref else {
+            panic!("expected ImageSegment");
+        };
+        assert_eq!(image.file_name().and_then(|value| value.to_str()), Some("track2.flac"));
+        assert_eq!(*start_sample, 0);
+        assert_eq!(*samples, 882_000);
+        assert_eq!(source.tracks[1].metadata.title.as_deref(), Some("Two"));
+    }
+
+    #[test]
+    fn sidecar_discovery_matches_audio_inside_multiple_file_cue() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_path = temp.path().join("album.cue");
+        let track1 = temp.path().join("track1.flac");
+        let track2 = temp.path().join("track2.flac");
+        write_file(
+            &cue_path,
+            br#"FILE "track1.flac" WAVE
   TRACK 01 AUDIO
     INDEX 01 00:00:00
 FILE "track2.flac" WAVE
   TRACK 02 AUDIO
     INDEX 01 00:00:00
+"#,
+        );
+        write_file(&track1, b"fake-audio-data");
+        write_file(&track2, b"fake-audio-data");
+
+        let discovered = find_valid_sidecar_cue_for_image(&track2)
+            .expect("sidecar search succeeds")
+            .expect("multi-file CUE matches referenced audio");
+        assert_eq!(discovered, cue_path);
+    }
+
+    #[tokio::test]
+    async fn non_sequential_cue_track_numbers_are_normalized_and_preserved() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 05 AUDIO
+    TITLE "Hidden Lead-In"
+    INDEX 01 00:00:00
+  TRACK 07 AUDIO
+    TITLE "Second Audible Track"
+    INDEX 01 01:00:00
+"#;
+        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
+        let source = materialize_cue(cue, &probe, &temp)
+            .await
+            .expect("non-sequential CUE numbering materializes");
+
+        assert_eq!(source.tracks.len(), 2);
+        assert_eq!(source.album_metadata.total_tracks, 2);
+
+        assert_eq!(source.tracks[0].id.track_number, 1);
+        assert_eq!(source.tracks[0].metadata.track_number, Some(1));
+        assert_eq!(
+            source.tracks[0].metadata.extra.get("cue_track_number").map(String::as_str),
+            Some("5")
+        );
+
+        assert_eq!(source.tracks[1].id.track_number, 2);
+        assert_eq!(source.tracks[1].metadata.track_number, Some(2));
+        assert_eq!(
+            source.tracks[1].metadata.extra.get("cue_track_number").map(String::as_str),
+            Some("7")
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_cue_track_numbers_fail_before_metadata_mapping() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "First"
+    INDEX 01 00:00:00
+  TRACK 01 AUDIO
+    TITLE "Duplicate"
+    INDEX 01 01:00:00
 "#;
         let probe = ffprobe_json_exact(44100, 10_000_000, 16);
         let result = materialize_cue(cue, &probe, &temp).await;
+
         assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate CUE track number 1"),
+            "error should identify duplicate CUE track number: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1504,6 +2052,123 @@ FILE "track2.flac" WAVE
             panic!("expected ImageSegment");
         };
         assert_eq!(*samples, 500);
+    }
+
+    #[test]
+    fn cue_metadata_uses_image_tags_only_for_cue_gaps() {
+        let mut image = ImageAlbumMetadata::default();
+        image.album = Some("Image Album".to_string());
+        image.album_artist = Some("Image Album Artist".to_string());
+        image.artist = Some("Image Artist".to_string());
+        image.genre = Some("Image Genre".to_string());
+        image.date = Some("1984".to_string());
+        image.disc_number = Some(1);
+        image.total_discs = Some(2);
+
+        let sheet = parse_cue(
+            "PERFORMER \"Cue Artist\"\nTITLE \"Cue Album\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Track\"\n    INDEX 01 00:00:00\n",
+        );
+
+        let numbering = cue_track_number_plan(&sheet);
+        let track = cue_track_metadata(&sheet.tracks[0], &sheet, &image, false, numbering[0]);
+        let album = cue_album_metadata(&sheet, &image, sheet.tracks.len() as u32);
+
+        assert_eq!(track.artist.as_deref(), Some("Cue Artist"));
+        assert_eq!(track.album_artist.as_deref(), Some("Cue Artist"));
+        assert_eq!(track.genre.as_deref(), Some("Image Genre"));
+        assert_eq!(track.date.as_deref(), Some("1984"));
+        assert_eq!(album.album.as_deref(), Some("Cue Album"));
+        assert_eq!(album.album_artist.as_deref(), Some("Cue Artist"));
+        assert_eq!(album.total_tracks, 1);
+        assert_eq!(album.disc_number, Some(1));
+        assert_eq!(album.total_discs, Some(2));
+    }
+
+
+    fn fixture_tool_available(tool: &str) -> bool {
+        std::process::Command::new(tool)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_fixture_command(command: &mut std::process::Command) {
+        let output = command.output().expect("spawn fixture command");
+        assert!(
+            output.status.success(),
+            "fixture command failed: status={:?}\nstdout={}\nstderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn lofty_reads_real_flac_tags_and_embedded_cuesheet_fixture() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
+            eprintln!("skipping real FLAC/lofty fixture: ffmpeg or metaflac is unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("lofty-image.flac");
+        let cue_path = temp.path().join("embedded.cue");
+        let cue = r#"PERFORMER "Embedded Cue Artist"
+TITLE "Embedded Cue Album"
+FILE "lofty-image.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Embedded Cue Track One"
+    INDEX 01 00:00:00
+"#;
+        std::fs::write(&cue_path, cue).expect("write cue text");
+
+        run_fixture_command(
+            std::process::Command::new("ffmpeg")
+                .arg("-y")
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg("sine=frequency=440:sample_rate=44100:duration=1")
+                .arg("-c:a")
+                .arg("flac")
+                .arg(&image),
+        );
+        run_fixture_command(
+            std::process::Command::new("metaflac")
+                .arg("--set-tag=ALBUM=Lofty Image Album")
+                .arg("--set-tag=ARTIST=Lofty Image Artist")
+                .arg("--set-tag=ALBUMARTIST=Lofty Image Album Artist")
+                .arg("--set-tag=DATE=2026")
+                .arg("--set-tag=GENRE=Lofty Fixture")
+                .arg("--set-tag=DISCNUMBER=1")
+                .arg("--set-tag=TOTALDISCS=2")
+                .arg(format!("--set-tag-from-file=CUESHEET={}", cue_path.display()))
+                .arg(&image),
+        );
+
+        let image_metadata = read_image_album_metadata(&image);
+        assert_eq!(image_metadata.album.as_deref(), Some("Lofty Image Album"));
+        assert_eq!(image_metadata.artist.as_deref(), Some("Lofty Image Artist"));
+        assert_eq!(
+            image_metadata.album_artist.as_deref(),
+            Some("Lofty Image Album Artist")
+        );
+        assert_eq!(image_metadata.date.as_deref(), Some("2026"));
+        assert_eq!(image_metadata.genre.as_deref(), Some("Lofty Fixture"));
+        assert_eq!(image_metadata.disc_number, Some(1));
+        assert_eq!(image_metadata.total_discs, Some(2));
+
+        let embedded = read_embedded_cuesheet(&image)
+            .expect("lofty read should succeed")
+            .expect("embedded CUESHEET should exist");
+        assert!(embedded.contains("Embedded Cue Album"));
+        assert!(embedded.contains("Embedded Cue Track One"));
     }
 
     // ── Category G: probe failure ──

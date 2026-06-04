@@ -309,7 +309,7 @@ async fn realize_image_segment(
     image: &Path,
     start_sample: u64,
     samples: u64,
-    _req: &PipelineRequest,
+    req: &PipelineRequest,
     staging: &StagingDir,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
@@ -366,7 +366,20 @@ async fn realize_image_segment(
                 cancel,
                 tool_concurrency_limits,
             )
-            .await
+            .await?;
+
+            if req.settings.metadata.transfer_tags || req.settings.metadata.preserve_artwork {
+                reattach_image_metadata_with_ffmpeg(
+                    image,
+                    &out_path,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits,
+                )
+                .await?;
+            }
+
+            Ok(())
         }
         .await;
 
@@ -392,6 +405,99 @@ async fn realize_image_segment(
     Ok(out_path)
 }
 
+fn cut_segment_ffmpeg_args(input: &Path, filter: &str, out_path: &Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        input.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-map".into(),
+        "0:v?".into(),
+        "-map_metadata".into(),
+        "0".into(),
+        "-af".into(),
+        filter.to_string(),
+        "-c:a".into(),
+        "flac".into(),
+        "-c:v".into(),
+        "copy".into(),
+        "-compression_level".into(),
+        "0".into(),
+        out_path.to_string_lossy().into_owned(),
+    ]
+}
+
+fn reattach_image_metadata_ffmpeg_args(segment: &Path, image: &Path, out_path: &Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        segment.to_string_lossy().into_owned(),
+        "-i".into(),
+        image.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-map".into(),
+        "1:v?".into(),
+        "-map_metadata".into(),
+        "1".into(),
+        "-c:a".into(),
+        "copy".into(),
+        "-c:v".into(),
+        "copy".into(),
+        out_path.to_string_lossy().into_owned(),
+    ]
+}
+
+#[cfg(test)]
+mod cue_image_segment_command_tests {
+    use super::*;
+
+    #[test]
+    fn cut_segment_command_copies_image_metadata_and_artwork() {
+        let args = cut_segment_ffmpeg_args(
+            Path::new("album.flac"),
+            "atrim=start_sample=0:end_sample=44100,asetpts=PTS-STARTPTS",
+            Path::new("segment.flac"),
+        );
+
+        assert!(has_adjacent_arg(&args, "-map", "0:a:0"));
+        assert!(has_adjacent_arg(&args, "-map", "0:v?"));
+        assert!(has_adjacent_arg(&args, "-map_metadata", "0"));
+        assert!(has_adjacent_arg(&args, "-c:a", "flac"));
+        assert!(has_adjacent_arg(&args, "-c:v", "copy"));
+        assert!(!has_adjacent_arg(&args, "-map_metadata", "-1"));
+        assert!(!args.iter().any(|arg| arg == "-vn"));
+    }
+
+    #[test]
+    fn wavpack_fallback_reattach_command_maps_original_image_artwork_and_tags() {
+        let args = reattach_image_metadata_ffmpeg_args(
+            Path::new("realized.flac"),
+            Path::new("album.wv"),
+            Path::new("reattached.flac"),
+        );
+
+        assert_eq!(args.iter().filter(|arg| *arg == "-i").count(), 2);
+        assert!(has_adjacent_arg(&args, "-map", "0:a:0"));
+        assert!(has_adjacent_arg(&args, "-map", "1:v?"));
+        assert!(has_adjacent_arg(&args, "-map_metadata", "1"));
+        assert!(has_adjacent_arg(&args, "-c:a", "copy"));
+        assert!(has_adjacent_arg(&args, "-c:v", "copy"));
+        assert!(!args.iter().any(|arg| arg == "-vn"));
+    }
+
+    fn has_adjacent_arg(args: &[String], left: &str, right: &str) -> bool {
+        args.windows(2).any(|window| window[0] == left && window[1] == right)
+    }
+}
+
 async fn cut_segment_with_ffmpeg(
     input: &Path,
     start_sample: u64,
@@ -415,24 +521,7 @@ async fn cut_segment_with_ffmpeg(
         format!("atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS");
     let cmd = ToolCommand {
         binary: ToolBinary::Ffmpeg,
-        args: vec![
-            "-y".into(),
-            "-hide_banner".into(),
-            "-loglevel".into(),
-            "error".into(),
-            "-i".into(),
-            input.to_string_lossy().into_owned(),
-            "-map".into(),
-            "0:a:0".into(),
-            "-vn".into(),
-            "-af".into(),
-            filter,
-            "-c:a".into(),
-            "flac".into(),
-            "-compression_level".into(),
-            "0".into(),
-            out_path.to_string_lossy().into_owned(),
-        ],
+        args: cut_segment_ffmpeg_args(input, &filter, out_path),
         secret_args: vec![],
         cwd: None,
         env: vec![],
@@ -446,6 +535,50 @@ async fn cut_segment_with_ffmpeg(
         }
         Err(err) => Err(ConvertError::Tool(err)),
     }
+}
+
+async fn reattach_image_metadata_with_ffmpeg(
+    image: &Path,
+    out_path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), ConvertError> {
+    let tmp_path = out_path.with_file_name(format!(
+        ".{}.reattach.{}.flac",
+        out_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("segment.flac"),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&tmp_path);
+
+    let cmd = ToolCommand {
+        binary: ToolBinary::Ffmpeg,
+        args: reattach_image_metadata_ffmpeg_args(out_path, image, &tmp_path),
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: DEFAULT_CONVERT_TIMEOUT,
+    };
+
+    let result = match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await {
+        Ok(_) => {
+            fs::rename(&tmp_path, out_path)?;
+            Ok(())
+        }
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            Err(ConvertError::Realize("cancelled".to_string()))
+        }
+        Err(err) => Err(ConvertError::Tool(err)),
+    };
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    result
 }
 
 async fn ensure_decoded_wavpack_image(
