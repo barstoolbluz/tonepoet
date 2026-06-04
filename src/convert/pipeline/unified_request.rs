@@ -89,7 +89,7 @@ pub fn build_pipeline_request_from_settings(
         });
 
     let cue_policy = if is_cue_capable_path(&item.input_path) {
-        CueSidecarPolicy::PreferSidecar
+        CueSidecarPolicy::PreferEmbedded
     } else {
         CueSidecarPolicy::IgnoreCue
     };

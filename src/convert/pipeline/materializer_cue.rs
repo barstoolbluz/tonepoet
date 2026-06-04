@@ -170,6 +170,19 @@ fn resolve_cue_input(req: &PipelineRequest) -> Result<CueInput, MaterializeError
             "IgnoreCue must stay on the legacy single-file path".to_string(),
         )),
         CueSidecarPolicy::SidecarOnly => resolve_sidecar_cue(req),
+        CueSidecarPolicy::PreferEmbedded => {
+            match resolve_embedded_cue(req) {
+                Ok(cue) => Ok(cue),
+                Err(_) => {
+                    match find_valid_sidecar_cue_for_image(&req.container)? {
+                        Some(cue_path) => read_sidecar_cue(req, cue_path),
+                        None => Err(MaterializeError::Parse(
+                            "no embedded CUESHEET and no sidecar CUE found".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
         CueSidecarPolicy::PreferSidecar => {
             match find_valid_sidecar_cue_for_image(&req.container)? {
                 Some(cue_path) => read_sidecar_cue(req, cue_path),
@@ -268,6 +281,12 @@ pub(crate) fn is_cue_image_candidate(req: &PipelineRequest) -> Result<bool, Sour
                 return Ok(embedded_cuesheet_is_single_image(&req.container));
             }
             Ok(false)
+        }
+        CueSidecarPolicy::PreferEmbedded => {
+            if embedded_cuesheet_is_single_image(&req.container) {
+                return Ok(true);
+            }
+            Ok(sidecar_cue_route_candidate(&req.container)?.is_some())
         }
         CueSidecarPolicy::EmbeddedOnly => Ok(embedded_cuesheet_is_single_image(&req.container)),
         CueSidecarPolicy::IgnoreCue => Ok(false),

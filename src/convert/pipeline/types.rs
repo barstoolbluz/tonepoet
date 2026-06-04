@@ -77,6 +77,7 @@ pub struct SourceOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CueSidecarPolicy {
+    PreferEmbedded,
     PreferSidecar,
     SidecarOnly,
     EmbeddedOnly,
