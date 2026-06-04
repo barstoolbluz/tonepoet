@@ -145,6 +145,73 @@ impl OutputSink {
     }
 }
 
+
+/// Typed metadata effects produced by a planned command.
+///
+/// These facts describe only planner-owned metadata writes without requiring
+/// executors or orchestrators to infer policy satisfaction from command-line
+/// argument spelling. The distinction between original-source transfer and
+/// immediate-input preservation is intentional: only effects that explicitly
+/// read metadata from the original request input may satisfy the source-tag or
+/// artwork obligations used by the orchestrator. An encoder that maps metadata
+/// from its current input records the preservation fact separately, because the
+/// current input may be an intermediate created by an earlier audio-only step.
+///
+/// Authoritative Tonepoet/materializer album and track tags are currently
+/// orchestrator-owned and are intentionally not representable as a planner
+/// command effect. If a future planner operation writes those tags, add an
+/// explicit typed effect for that operation rather than reusing source tag,
+/// artwork, or MD5 effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MetadataPlanEffect {
+    /// Original source-container text tags were transferred into the output.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_tags_transferred_from_original_source: bool,
+    /// Original source artwork/video metadata was transferred into the output.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub artwork_transferred_from_original_source: bool,
+    /// Text tags from the command's immediate input were preserved.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tags_preserved_from_command_input: bool,
+    /// Artwork/video metadata from the command's immediate input was preserved.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub artwork_preserved_from_command_input: bool,
+    /// Source-audio MD5 metadata was written.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_audio_md5_written: bool,
+}
+
+impl MetadataPlanEffect {
+    /// No metadata effect.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            source_tags_transferred_from_original_source: false,
+            artwork_transferred_from_original_source: false,
+            tags_preserved_from_command_input: false,
+            artwork_preserved_from_command_input: false,
+            source_audio_md5_written: false,
+        }
+    }
+
+    /// Merge two effect records.
+    #[must_use]
+    pub const fn merge(self, other: Self) -> Self {
+        Self {
+            source_tags_transferred_from_original_source: self.source_tags_transferred_from_original_source
+                || other.source_tags_transferred_from_original_source,
+            artwork_transferred_from_original_source: self.artwork_transferred_from_original_source
+                || other.artwork_transferred_from_original_source,
+            tags_preserved_from_command_input: self.tags_preserved_from_command_input
+                || other.tags_preserved_from_command_input,
+            artwork_preserved_from_command_input: self.artwork_preserved_from_command_input
+                || other.artwork_preserved_from_command_input,
+            source_audio_md5_written: self.source_audio_md5_written || other.source_audio_md5_written,
+        }
+    }
+}
+
 /// One command ready for an executor to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -163,6 +230,9 @@ pub struct PlannedCommand {
     pub expected_duration: Option<Duration>,
     /// User-facing description.
     pub description: String,
+    /// Typed metadata effects produced by this command.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub metadata_effect: MetadataPlanEffect,
 }
 
 impl PlannedCommand {
@@ -184,7 +254,15 @@ impl PlannedCommand {
             environment: BTreeMap::new(),
             expected_duration,
             description: description.into(),
+            metadata_effect: MetadataPlanEffect::none(),
         }
+    }
+
+    /// Return this command annotated with a typed metadata effect.
+    #[must_use]
+    pub fn with_metadata_effect(mut self, metadata_effect: MetadataPlanEffect) -> Self {
+        self.metadata_effect = metadata_effect;
+        self
     }
 }
 
@@ -600,62 +678,133 @@ fn prune_redundant_metadata_steps(
 ) -> Result<(Vec<PlanStep>, Option<Finalization>)> {
     let mut pruned = steps.to_vec();
     let mut adjusted_finalization = finalization;
+    let mut original_source_metadata_by_path: BTreeMap<PathBuf, MetadataPlanEffect> = BTreeMap::new();
     let mut index = 0;
 
     while index < pruned.len() {
-        if !matches!(
-            pruned[index].operation,
-            PlanOperation::MetadataTransfer { .. }
-        ) {
-            index += 1;
-            continue;
-        }
+        if let Some(required) = metadata_transfer_required_effect(&pruned[index].operation) {
+            let Some(input_path) = pruned[index]
+                .input
+                .as_path()
+                .map(std::path::Path::to_path_buf)
+            else {
+                index += 1;
+                continue;
+            };
+            let available = original_source_metadata_by_path
+                .get(&input_path)
+                .copied()
+                .unwrap_or_else(MetadataPlanEffect::none);
 
-        let Some(previous_index) = pruned[..index]
-            .iter()
-            .rposition(|candidate| operation_can_write_metadata(&candidate.operation))
-        else {
-            index += 1;
-            continue;
-        };
-
-        let previous_step = &pruned[previous_index];
-        let disposition = registry.metadata_disposition_for_step(context, previous_step)?;
-        if !disposition.writes_requested_policy() {
-            index += 1;
-            continue;
-        }
-
-        let Some(from_path) = pruned[index]
-            .output
-            .as_path()
-            .map(std::path::Path::to_path_buf)
-        else {
-            index += 1;
-            continue;
-        };
-        let Some(to_path) = previous_step
-            .output
-            .as_path()
-            .map(std::path::Path::to_path_buf)
-        else {
-            index += 1;
-            continue;
-        };
-
-        pruned.remove(index);
-        for later in &mut pruned[index..] {
-            replace_input_path(&mut later.input, &from_path, &to_path);
-            replace_output_path(&mut later.output, &from_path, &to_path);
-        }
-        if let Some(Finalization::AtomicRename { from, .. }) = &mut adjusted_finalization {
-            if from == &from_path {
-                *from = to_path;
+            if !metadata_effect_satisfies_original_source_transfer(available, required) {
+                let effect = registry.metadata_effect_for_step(context, &pruned[index])?;
+                record_original_source_metadata_effect(
+                    &mut original_source_metadata_by_path,
+                    &pruned[index],
+                    effect,
+                );
+                index += 1;
+                continue;
             }
+
+            let Some(from_path) = pruned[index]
+                .output
+                .as_path()
+                .map(std::path::Path::to_path_buf)
+            else {
+                index += 1;
+                continue;
+            };
+            let to_path = input_path;
+
+            pruned.remove(index);
+            for later in &mut pruned[index..] {
+                replace_input_path(&mut later.input, &from_path, &to_path);
+                replace_output_path(&mut later.output, &from_path, &to_path);
+            }
+            if let Some(Finalization::AtomicRename { from, .. }) = &mut adjusted_finalization {
+                if from == &from_path {
+                    *from = to_path;
+                }
+            }
+            continue;
         }
+
+        let effect = registry.metadata_effect_for_step(context, &pruned[index])?;
+        record_original_source_metadata_effect(
+            &mut original_source_metadata_by_path,
+            &pruned[index],
+            effect,
+        );
+        index += 1;
     }
 
     Ok((pruned, adjusted_finalization))
+}
+
+fn metadata_transfer_required_effect(operation: &PlanOperation) -> Option<MetadataPlanEffect> {
+    match operation {
+        PlanOperation::MetadataTransfer {
+            transfer_tags,
+            preserve_artwork,
+            ..
+        } => Some(MetadataPlanEffect {
+            source_tags_transferred_from_original_source: *transfer_tags,
+            artwork_transferred_from_original_source: *preserve_artwork,
+            ..MetadataPlanEffect::none()
+        }),
+        _ => None,
+    }
+}
+
+fn metadata_effect_satisfies_original_source_transfer(
+    available: MetadataPlanEffect,
+    required: MetadataPlanEffect,
+) -> bool {
+    (!required.source_tags_transferred_from_original_source
+        || available.source_tags_transferred_from_original_source)
+        && (!required.artwork_transferred_from_original_source
+            || available.artwork_transferred_from_original_source)
+}
+
+fn record_original_source_metadata_effect(
+    by_path: &mut BTreeMap<PathBuf, MetadataPlanEffect>,
+    step: &PlanStep,
+    effect: MetadataPlanEffect,
+) {
+    let Some(output_path) = step.output.as_path().map(std::path::Path::to_path_buf) else {
+        return;
+    };
+
+    let input_state = step
+        .input
+        .as_path()
+        .and_then(|path| by_path.get(path).copied())
+        .unwrap_or_else(MetadataPlanEffect::none);
+
+    let mut output_state = MetadataPlanEffect::none();
+    if effect.source_tags_transferred_from_original_source {
+        output_state.source_tags_transferred_from_original_source = true;
+    }
+    if effect.artwork_transferred_from_original_source {
+        output_state.artwork_transferred_from_original_source = true;
+    }
+    if effect.tags_preserved_from_command_input {
+        output_state.source_tags_transferred_from_original_source |=
+            input_state.source_tags_transferred_from_original_source;
+    }
+    if effect.artwork_preserved_from_command_input {
+        output_state.artwork_transferred_from_original_source |=
+            input_state.artwork_transferred_from_original_source;
+    }
+
+    if step.input.as_path() == Some(output_path.as_path())
+        || matches!(step.output, OutputSink::InPlace(_))
+    {
+        output_state = output_state.merge(input_state);
+    }
+
+    by_path.insert(output_path, output_state);
 }
 
 fn replace_input_path(input: &mut InputSource, from: &std::path::Path, to: &std::path::Path) {
@@ -675,18 +824,6 @@ fn replace_output_path(output: &mut OutputSink, from: &std::path::Path, to: &std
         }
         OutputSink::Stdout => {}
     }
-}
-
-fn operation_can_write_metadata(operation: &PlanOperation) -> bool {
-    matches!(
-        operation,
-        PlanOperation::EncodePcm { .. }
-            | PlanOperation::EncodeLossy { .. }
-            | PlanOperation::PcmToDsd { .. }
-            | PlanOperation::DsdToPcm { .. }
-            | PlanOperation::DsdRateChange { .. }
-            | PlanOperation::MetadataTransfer { .. }
-    )
 }
 
 fn collect_cleanup_paths(
@@ -1319,5 +1456,161 @@ fn resolve_target_dsd_rate(request: &PlanRequest) -> Result<DsdRate> {
             "target_sample_rate",
             "DSD targets cannot use a PCM rate",
         )),
+    }
+}
+
+#[cfg(test)]
+mod metadata_pruning_tests {
+    use super::*;
+    use crate::enums::{AudioCodec, AudioFormat, PcmBitDepth, SampleKind};
+    use crate::settings::PipelineSettings;
+    use crate::source::SourceInfo;
+    use crate::tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolSupport};
+    use std::path::PathBuf;
+
+    #[derive(Debug, Clone, Copy)]
+    struct MetadataPruningPlugin {
+        encode_effect: MetadataPlanEffect,
+        disposition: MetadataDisposition,
+    }
+
+    impl ToolPlugin for MetadataPruningPlugin {
+        fn id(&self) -> ToolIdentifier {
+            ToolIdentifier::Custom("metadata-pruning-test".into())
+        }
+
+        fn supports(&self, _context: &PlanContext<'_>, step: &PlanStep) -> ToolSupport {
+            match &step.operation {
+                PlanOperation::EncodePcm { .. } | PlanOperation::MetadataTransfer { .. } => {
+                    ToolSupport::CANONICAL
+                }
+                _ => ToolSupport::UNSUPPORTED,
+            }
+        }
+
+        fn metadata_effect(&self, _context: &PlanContext<'_>, step: &PlanStep) -> MetadataPlanEffect {
+            match &step.operation {
+                PlanOperation::EncodePcm { .. } => self.encode_effect,
+                PlanOperation::MetadataTransfer {
+                    transfer_tags,
+                    preserve_artwork,
+                    ..
+                } => MetadataPlanEffect {
+                    source_tags_transferred_from_original_source: *transfer_tags,
+                    artwork_transferred_from_original_source: *preserve_artwork,
+                    ..MetadataPlanEffect::none()
+                },
+                _ => MetadataPlanEffect::none(),
+            }
+        }
+
+        fn metadata_disposition(
+            &self,
+            _context: &PlanContext<'_>,
+            _step: &PlanStep,
+        ) -> MetadataDisposition {
+            self.disposition
+        }
+
+        fn build_command(
+            &self,
+            _context: &PlanContext<'_>,
+            step: &PlanStep,
+        ) -> Result<PlannedCommand> {
+            Ok(PlannedCommand::new(
+                self.id(),
+                Vec::new(),
+                step.input.clone(),
+                step.output.clone(),
+                None,
+                step.description.clone(),
+            )
+            .with_metadata_effect(self.metadata_effect(_context, step)))
+        }
+    }
+
+    fn metadata_pruning_request() -> PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.metadata.transfer_tags = true;
+        settings.metadata.preserve_artwork = false;
+        PlanRequest {
+            input_path: PathBuf::from("source.wav"),
+            output_path: PathBuf::from("output.flac"),
+            source: SourceInfo {
+                format: AudioFormat::Wav,
+                codec: AudioCodec::PcmSigned,
+                sample_rate_hz: Some(44_100),
+                bit_depth: Some(PcmBitDepth::Int16),
+                sample_kind: Some(SampleKind::SignedInteger),
+                channels: Some(2),
+                duration: None,
+                audio_md5: None,
+            },
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pruning_ignores_legacy_metadata_disposition_without_typed_effect() {
+        let mut registry = ToolRegistry::empty();
+        registry
+            .register(Box::new(MetadataPruningPlugin {
+                encode_effect: MetadataPlanEffect::none(),
+                disposition: MetadataDisposition::WritesRequestedPolicy,
+            }))
+            .unwrap();
+
+        let plan = plan_conversion_with_registry(&metadata_pruning_request(), &registry).unwrap();
+
+        match plan.action {
+            PlanAction::Execute { commands, .. } => {
+                assert_eq!(
+                    commands.len(),
+                    2,
+                    "a coarse plugin disposition must not prune MetadataTransfer without a typed original-source metadata effect"
+                );
+                assert!(matches!(
+                    commands[1].metadata_effect,
+                    MetadataPlanEffect {
+                        source_tags_transferred_from_original_source: true,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected executable plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pruning_uses_typed_original_source_effects() {
+        let mut registry = ToolRegistry::empty();
+        registry
+            .register(Box::new(MetadataPruningPlugin {
+                encode_effect: MetadataPlanEffect {
+                    source_tags_transferred_from_original_source: true,
+                    ..MetadataPlanEffect::none()
+                },
+                disposition: MetadataDisposition::DoesNotWrite,
+            }))
+            .unwrap();
+
+        let plan = plan_conversion_with_registry(&metadata_pruning_request(), &registry).unwrap();
+
+        match plan.action {
+            PlanAction::Execute { commands, .. } => {
+                assert_eq!(
+                    commands.len(),
+                    1,
+                    "typed original-source metadata effects are sufficient to remove the redundant transfer step"
+                );
+                assert!(commands[0]
+                    .metadata_effect
+                    .source_tags_transferred_from_original_source);
+            }
+            other => panic!("expected executable plan, got {other:?}"),
+        }
     }
 }

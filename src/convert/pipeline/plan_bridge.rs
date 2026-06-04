@@ -4,12 +4,15 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use tonepoet_pipeline::{
-    AudioCodec as PlannerCodec, AudioFormat as PlannerFormat, BitDepthTarget, MetadataDisposition,
+    AudioCodec as PlannerCodec, AudioFormat as PlannerFormat, BitDepthTarget,
     PcmBitDepth, PipelineSettings, PlanRequest, SampleKind, SourceInfo,
 };
 
 use super::errors::ConvertError;
-use super::types::{PipelineRequest, PreparedTrack, StageRequirement, TrackSourceRef};
+use super::types::{
+    AlbumMetadata, PlannedMetadataSatisfaction, PipelineRequest, PreparedSource, PreparedTrack,
+    SourceKind, StageRequirement, TrackMetadata, TrackSourceRef,
+};
 
 pub fn plan_request_for_track(
     request: &PipelineRequest,
@@ -23,14 +26,44 @@ pub fn plan_request_for_track(
         .validate()
         .map_err(|err| ConvertError::Backend(format!("invalid source facts for planner: {err}")))?;
 
+    if let Some(message) =
+        source_audio_md5_policy_downgrade_message(request, track, realized_input, &source)
+    {
+        log::warn!("{message}");
+    }
+
     let mut settings = request.settings.clone();
-    // Metadata stays in the per-track planner request. The pipeline planner already
-    // consults ToolRegistry::metadata_disposition_for_step() and prunes redundant
-    // metadata-transfer steps when the selected encoder writes the requested policy.
-    // Track execution records the resulting effective MetadataDisposition so the
-    // album post-processing gate can skip the legacy metadata stage only when every
-    // successful track was already handled by the planner. ReplayGain remains
-    // orchestrator-owned because album mode requires all completed tracks.
+    for message in apply_unsupported_target_metadata_policy_downgrades(&mut settings) {
+        log::warn!("{message}");
+    }
+    // Metadata stays in the per-track planner request for ordinary sources. The
+    // planner can preserve source-container tags/artwork and store source MD5, but
+    // it cannot write authoritative materializer metadata from PreparedSource/
+    // PreparedTrack. SACD ISO materialization is a special case: its realized DSF
+    // files are generated audio carriers, not the metadata authority. The current
+    // SACD materializer extracts audio plus sidecar/TOC text metadata only; it has
+    // no source-container tag/artwork extraction path and no FLAC STREAMINFO audio
+    // MD5 on the materialized DSF/DFF carrier. Therefore source tag/artwork copy
+    // and source-audio MD5 storage from the materialized DSD carrier must be
+    // disabled here, and those original SACD policies are treated as unsupported
+    // rather than satisfied in metadata_obligations_for_request().
+    if matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. }) {
+        settings.metadata.transfer_tags = false;
+        settings.metadata.preserve_artwork = false;
+    }
+    // Source-audio MD5 can only be planned when the realized input actually
+    // exposed a value. Today this bridge obtains that value from FLAC
+    // STREAMINFO, so DSF/DFF/WAV/AIFF/MP3 and other non-FLAC realized inputs
+    // must not carry a still-enabled store_source_audio_md5 request into the
+    // planner, where validation would otherwise fail before the orchestrator
+    // can write authoritative metadata. This is capability-based rather than
+    // source-kind-based: standalone FLAC can keep the policy; standalone DSD
+    // cannot.
+    if source.audio_md5.is_none() {
+        settings.metadata.store_source_audio_md5 = false;
+    }
+    // ReplayGain remains orchestrator-owned because album mode requires all
+    // completed tracks.
     settings.replay_gain.mode = None;
     if matches!(settings.target_bit_depth, BitDepthTarget::Source) {
         if let Some(depth) = source.bit_depth {
@@ -53,7 +86,80 @@ pub fn plan_request_for_track(
 }
 
 
-/// Return whether the planner request asks for any metadata effect.
+/// Return a user-visible warning when a requested source-audio MD5 policy must
+/// be disabled for a concrete realized track.
+///
+/// `metadata.store_source_audio_md5` is only implementable when the realized
+/// input exposes an actual nonzero FLAC STREAMINFO MD5 in `SourceInfo`. When the
+/// user requested that policy but the source lacks the required fact, the bridge
+/// disables the per-track planner flag to avoid a late planner validation error.
+/// This helper keeps that downgrade explicit and testable rather than silent.
+#[must_use]
+pub fn source_audio_md5_policy_downgrade_message(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    source: &SourceInfo,
+) -> Option<String> {
+    if !request.settings.metadata.store_source_audio_md5 || source.audio_md5.is_some() {
+        return None;
+    }
+
+    Some(format!(
+        "metadata.store_source_audio_md5 requested for track {} ({}) but the realized source {} does not expose a nonzero FLAC STREAMINFO audio MD5; SOURCE_AUDIO_MD5 metadata is unsupported for this track and will be skipped",
+        track.id.source_ordinal,
+        track_label_for_policy_message(track),
+        realized_input.display()
+    ))
+}
+
+fn track_label_for_policy_message(track: &PreparedTrack) -> String {
+    track
+        .metadata
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("untitled")
+        .to_string()
+}
+
+/// Disable requested source metadata policies that the selected target format
+/// cannot represent through the planner/plugin metadata path, returning
+/// user-visible warnings for each downgrade.
+///
+/// This keeps per-track planner validation aligned with the obligation model:
+/// unsupported target metadata policies are not treated as required work, and
+/// they are not left enabled for the planner to reject later.
+#[must_use]
+pub fn apply_unsupported_target_metadata_policy_downgrades(
+    settings: &mut PipelineSettings,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+
+    if settings.metadata.transfer_tags
+        && !settings.target_format.supports_planner_source_tag_transfer()
+    {
+        messages.push(format!(
+            "metadata.transfer_tags requested for target format {:?}, but the planner/plugin metadata path cannot represent source tags for that target; source tag transfer is unsupported for this track and will be skipped",
+            settings.target_format
+        ));
+        settings.metadata.transfer_tags = false;
+    }
+
+    if settings.metadata.preserve_artwork
+        && !settings.target_format.supports_planner_embedded_artwork_transfer()
+    {
+        messages.push(format!(
+            "metadata.preserve_artwork requested for target format {:?}, but the planner/plugin metadata path cannot preserve embedded artwork for that target; artwork preservation is unsupported for this track and will be skipped",
+            settings.target_format
+        ));
+        settings.metadata.preserve_artwork = false;
+    }
+
+    messages
+}
+
+/// Return whether the planner request asks for any planner-owned metadata effect.
 #[must_use]
 pub fn settings_request_metadata(settings: &PipelineSettings) -> bool {
     settings.metadata.transfer_tags
@@ -61,20 +167,150 @@ pub fn settings_request_metadata(settings: &PipelineSettings) -> bool {
         || settings.metadata.store_source_audio_md5
 }
 
-/// Decide whether the legacy album metadata stage is still necessary after the planner ran.
+/// Return the metadata obligations that can be decided from the album request
+/// and source/materializer facts plus planner-owned target-format capabilities.
 ///
-/// This consumes the post-planner effective [`MetadataDisposition`], not a pre-plan guess.
-/// The orchestrator may skip its legacy metadata pass only for non-merged track artifacts
-/// when metadata was requested and every successful track reports `WritesRequestedPolicy`.
+/// Source-audio MD5 is intentionally **not** computed here: the planner can
+/// write `SOURCE_AUDIO_MD5` only when the realized per-track `SourceInfo`
+/// contains an actual parsed FLAC STREAMINFO MD5. A path extension is not a
+/// capability proof. Use `planner_metadata_obligations_for_track()` after
+/// `plan_request_for_track()` has parsed the realized input.
+#[must_use]
+pub fn metadata_obligations_for_request(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+) -> PlannedMetadataSatisfaction {
+    PlannedMetadataSatisfaction {
+        source_tags_transferred: req.settings.metadata.transfer_tags
+            && source_supports_source_tag_transfer(req, source),
+        artwork_transferred: req.settings.metadata.preserve_artwork
+            && source_supports_source_artwork_preservation(req, source),
+        source_audio_md5_written: false,
+        authoritative_tags_applied: matches!(req.stages.metadata, StageRequirement::Enabled)
+            && source_needs_authoritative_metadata(source),
+    }
+}
+
+/// Return planner-owned metadata obligations for a concrete realized track.
+///
+/// This function uses the already-built `PlanRequest`, so source-MD5 support
+/// comes from the same parsed `SourceInfo::audio_md5` fact that the planner will
+/// validate and use. This avoids mismatches where an extension such as `.flac`
+/// is treated as proof that a usable STREAMINFO MD5 exists.
+#[must_use]
+pub fn planner_metadata_obligations_for_track(
+    req: &PipelineRequest,
+    plan_request: &PlanRequest,
+) -> PlannedMetadataSatisfaction {
+    PlannedMetadataSatisfaction {
+        source_tags_transferred: req.settings.metadata.transfer_tags
+            && plan_request.settings.metadata.transfer_tags
+            && plan_request.settings.target_format.supports_planner_source_tag_transfer(),
+        artwork_transferred: req.settings.metadata.preserve_artwork
+            && plan_request.settings.metadata.preserve_artwork
+            && plan_request.settings.target_format.supports_planner_embedded_artwork_transfer(),
+        source_audio_md5_written: req.settings.metadata.store_source_audio_md5
+            && plan_request.settings.metadata.store_source_audio_md5
+            && plan_request.source.audio_md5.is_some(),
+        authoritative_tags_applied: false,
+    }
+}
+
+/// Return whether the original source is a meaningful source-container tag
+/// authority for the per-track planner and the selected target has planner/plugin
+/// support for source tag transfer.
+///
+/// SACD ISO tracks are realized as generated DSF/DFF audio carriers; the useful
+/// text metadata comes from the SACD TOC or sidecar XML and is handled by the
+/// orchestrator metadata stage instead. Other source kinds still require a
+/// target format whose planner-owned metadata-transfer capability can carry text tags. This keeps
+/// the obligation model aligned with the planner's typed command effects rather
+/// than assuming every non-SACD target can receive source tags.
+#[must_use]
+pub fn source_supports_source_tag_transfer(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+) -> bool {
+    !matches!(source.kind, SourceKind::SacdIso)
+        && req.settings.target_format.supports_planner_source_tag_transfer()
+}
+
+/// Return whether the current source/materializer plus target-format path can
+/// preserve source artwork through the per-track planner. This is intentionally
+/// narrower than "non-SACD": FFmpeg can only preserve embedded artwork for
+/// target formats whose planner-owned capability supports artwork, and SACD ISO
+/// materialization currently extracts audio plus text metadata but no artwork.
+///
+/// Concrete command-level satisfaction is carried by typed planner metadata
+/// effects and aggregated from the final `ConversionPlan`; this function only
+/// defines which original artwork requests are meaningful obligations for the
+/// orchestrator skip gate.
+#[must_use]
+pub fn source_supports_source_artwork_preservation(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+) -> bool {
+    !matches!(source.kind, SourceKind::SacdIso)
+        && req.settings.target_format.supports_planner_embedded_artwork_transfer()
+}
+
+/// Decide whether the legacy album metadata stage is still necessary after the
+/// planner ran. The orchestrator may skip its metadata pass only when every
+/// originally requested dimension has been satisfied; satisfying one metadata
+/// sub-policy must never stand in for another.
 #[must_use]
 pub fn orchestrator_metadata_stage_required(
-    disposition: MetadataDisposition,
+    satisfaction: PlannedMetadataSatisfaction,
     stage: StageRequirement,
-    requested_metadata: bool,
+    required: PlannedMetadataSatisfaction,
 ) -> bool {
     matches!(stage, StageRequirement::Enabled)
-        && requested_metadata
-        && !disposition.writes_requested_policy()
+        && required.any()
+        && !satisfaction.satisfies(required)
+}
+
+#[must_use]
+pub fn source_needs_authoritative_metadata(source: &PreparedSource) -> bool {
+    matches!(source.kind, SourceKind::CueImage | SourceKind::SacdIso)
+        && prepared_source_has_metadata(source)
+}
+
+fn prepared_source_has_metadata(source: &PreparedSource) -> bool {
+    album_metadata_has_tags(&source.album_metadata)
+        || source.tracks.iter().any(|track| track_metadata_has_tags(&track.metadata))
+}
+
+fn has_non_empty_text(value: &Option<String>) -> bool {
+    value.as_deref().map_or(false, |value| !value.trim().is_empty())
+}
+
+fn album_metadata_has_tags(album: &AlbumMetadata) -> bool {
+    has_non_empty_text(&album.album)
+        || has_non_empty_text(&album.album_artist)
+        || has_non_empty_text(&album.genre)
+        || has_non_empty_text(&album.date)
+        || album.total_tracks > 0
+        || album.total_discs.is_some()
+        || album.disc_number.is_some()
+        || !album.extra.is_empty()
+}
+
+fn track_metadata_has_tags(track: &TrackMetadata) -> bool {
+    has_non_empty_text(&track.title)
+        || has_non_empty_text(&track.artist)
+        || has_non_empty_text(&track.album_artist)
+        || has_non_empty_text(&track.composer)
+        || has_non_empty_text(&track.performer)
+        || has_non_empty_text(&track.genre)
+        || has_non_empty_text(&track.date)
+        || track.track_number.is_some()
+        || track.disc_number.is_some()
+        || has_non_empty_text(&track.isrc)
+        || has_non_empty_text(&track.publisher)
+        || has_non_empty_text(&track.copyright)
+        || has_non_empty_text(&track.comment)
+        || track.pre_emphasis
+        || !track.extra.is_empty()
 }
 
 pub fn source_info_for_realized_track(
@@ -207,5 +443,659 @@ fn flac_streaminfo_audio_md5(path: &Path) -> Option<String> {
         if is_last {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use tempfile::TempDir;
+    use tonepoet_pipeline::{AudioFormat as PlannerFormat, PipelineSettings, PlanAction, PlanRequest};
+
+    use super::{
+        apply_unsupported_target_metadata_policy_downgrades, flac_streaminfo_audio_md5,
+        metadata_obligations_for_request, orchestrator_metadata_stage_required,
+        plan_request_for_track, planner_metadata_obligations_for_track,
+        source_audio_md5_policy_downgrade_message, source_info_for_realized_track,
+        source_needs_authoritative_metadata,
+    };
+    use crate::convert::pipeline::types::{
+        AlbumMetadata, CueSidecarPolicy, ExtractionProvenance, FailurePolicy, LogPolicy,
+        PlannedMetadataSatisfaction, NamingCollisionPolicy, NamingPolicy, OverwritePolicy,
+        PipelineRequest, PreparedSource, PreparedTrack, PublishPolicy, SacdArea, SourceKind,
+        SourceOptions, StagePolicy, StageRequirement, TrackId, TrackMetadata, TrackSelection,
+        TrackSourceRef,
+    };
+
+    fn request(root: &Path) -> PipelineRequest {
+        PipelineRequest {
+            job_id: "job".to_string(),
+            item_id: "item".to_string(),
+            container: root.join("album.iso"),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: Some(SacdArea::Stereo),
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            settings: PipelineSettings::default(),
+            worker_count: Some(1),
+            merge: false,
+            output_root: root.join("out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+                write_manifest: false,
+            },
+            log: LogPolicy {
+                root: root.join("logs"),
+                write_for_blocked: false,
+                write_json_log: false,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Disabled,
+                generate_cue: false,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    fn track(source_ref: TrackSourceRef) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref,
+            metadata: TrackMetadata {
+                title: Some("Track One".to_string()),
+                track_number: Some(1),
+                ..TrackMetadata::default()
+            },
+            expected_samples: Some(1_000),
+            sample_rate: 2_822_400,
+            bit_depth: None,
+        }
+    }
+
+    fn source(kind: SourceKind, track: PreparedTrack, root: &Path) -> PreparedSource {
+        PreparedSource {
+            container: root.join("album.iso"),
+            kind,
+            tracks: vec![track],
+            album_metadata: AlbumMetadata {
+                album: Some("Album".to_string()),
+                album_artist: Some("Artist".to_string()),
+                total_tracks: 1,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: kind,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        }
+    }
+
+    fn planned_command_args(plan_request: &PlanRequest) -> Vec<Vec<String>> {
+        let plan = tonepoet_pipeline::plan_conversion(plan_request).expect("planner builds command plan");
+        match plan.action {
+            PlanAction::Execute { commands, .. } => commands.into_iter().map(|cmd| cmd.args).collect(),
+            PlanAction::PassthroughCopy { .. } => Vec::new(),
+        }
+    }
+
+    fn has_adjacent_args(args: &[String], left: &str, right: &str) -> bool {
+        args.windows(2).any(|window| window[0] == left && window[1] == right)
+    }
+
+    fn has_input_arg(args: &[String], expected_suffix: &str) -> bool {
+        args.windows(2).any(|window| {
+            window[0] == "-i" && window[1].replace('\\', "/").ends_with(expected_suffix)
+        })
+    }
+
+    fn write_minimal_flac_with_md5(path: &Path) {
+        let mut streaminfo = vec![0_u8; 34];
+        streaminfo[18..34].copy_from_slice(&[
+            0x00, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff,
+        ]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"fLaC");
+        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 34]);
+        bytes.extend_from_slice(&streaminfo);
+        std::fs::write(path, bytes).expect("write minimal FLAC STREAMINFO");
+    }
+
+    fn write_minimal_flac_with_zero_md5(path: &Path) {
+        let streaminfo = vec![0_u8; 34];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"fLaC");
+        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 34]);
+        bytes.extend_from_slice(&streaminfo);
+        std::fs::write(path, bytes).expect("write minimal FLAC STREAMINFO with zero MD5");
+    }
+
+
+    #[test]
+    fn flac_streaminfo_audio_md5_reads_nonzero_streaminfo_md5() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.flac");
+        write_minimal_flac_with_md5(&input);
+
+        assert_eq!(
+            flac_streaminfo_audio_md5(&input).as_deref(),
+            Some("00112233445566778899aabbccddeeff"),
+            "source-MD5 capability must come from the parsed FLAC STREAMINFO MD5 bytes"
+        );
+    }
+
+    #[test]
+    fn flac_streaminfo_audio_md5_rejects_zero_streaminfo_md5() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.flac");
+        write_minimal_flac_with_zero_md5(&input);
+
+        assert!(
+            flac_streaminfo_audio_md5(&input).is_none(),
+            "an all-zero FLAC STREAMINFO MD5 is not a usable source-audio MD5 obligation"
+        );
+    }
+
+    #[test]
+    fn flac_streaminfo_audio_md5_rejects_non_flac_input() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        std::fs::write(&input, b"DSD \x00\x00not flac").expect("write non-FLAC source");
+
+        assert!(
+            flac_streaminfo_audio_md5(&input).is_none(),
+            "non-FLAC realized inputs must not create a source-MD5 capability"
+        );
+    }
+
+    #[test]
+    fn sacd_plan_request_suppresses_unsupported_source_tag_artwork_md5_policy() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("realized.dsf");
+        std::fs::write(&input, b"DSD ").expect("realized dsf placeholder");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::SacdTrack {
+            iso: temp.path().join("album.iso"),
+            track_index: 1,
+            area: SacdArea::Stereo,
+        });
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("SACD plan request builds");
+
+        assert!(!planned.settings.metadata.transfer_tags);
+        assert!(!planned.settings.metadata.preserve_artwork);
+        assert!(!planned.settings.metadata.store_source_audio_md5);
+    }
+
+    #[test]
+    fn staged_dsf_plan_request_preserves_source_tag_artwork_but_disables_unavailable_source_md5() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        std::fs::write(&input, b"DSD ").expect("source dsf placeholder");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("staged DSF plan request builds");
+
+        assert!(planned.settings.metadata.transfer_tags);
+        assert!(planned.settings.metadata.preserve_artwork);
+        assert!(
+            !planned.settings.metadata.store_source_audio_md5,
+            "standalone DSF has no FLAC STREAMINFO MD5 and must not fail planner validation"
+        );
+    }
+
+    #[test]
+    fn missing_source_audio_md5_policy_downgrade_is_reportable() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        std::fs::write(&input, b"DSD ").expect("source dsf placeholder");
+        let mut req = request(temp.path());
+        req.settings.metadata.store_source_audio_md5 = true;
+        let mut track = track(TrackSourceRef::StagedFile(input.clone()));
+        track.metadata.title = Some("Track With No Source MD5".to_string());
+        let source = source_info_for_realized_track(&track, &input).expect("source facts");
+
+        let message = source_audio_md5_policy_downgrade_message(&req, &track, &input, &source)
+            .expect("requested-but-unavailable source MD5 should be reported");
+
+        assert!(message.contains("metadata.store_source_audio_md5 requested"));
+        assert!(message.contains("Track With No Source MD5"));
+        assert!(message.contains("source.dsf"));
+        assert!(message.contains("unsupported for this track"));
+    }
+
+    #[test]
+    fn available_source_audio_md5_policy_does_not_report_downgrade() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.flac");
+        write_minimal_flac_with_md5(&input);
+        let mut req = request(temp.path());
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+        let source = source_info_for_realized_track(&track, &input).expect("source facts");
+
+        assert!(source_audio_md5_policy_downgrade_message(&req, &track, &input, &source).is_none());
+    }
+
+
+    #[test]
+    fn unsupported_target_metadata_policy_downgrade_is_reportable_and_disables_flags() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = PlannerFormat::Dsf;
+        settings.metadata.transfer_tags = true;
+        settings.metadata.preserve_artwork = true;
+
+        let messages = apply_unsupported_target_metadata_policy_downgrades(&mut settings);
+
+        assert!(!settings.metadata.transfer_tags);
+        assert!(!settings.metadata.preserve_artwork);
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| message.contains("metadata.transfer_tags requested")));
+        assert!(messages.iter().any(|message| message.contains("metadata.preserve_artwork requested")));
+        assert!(messages.iter().all(|message| message.contains("unsupported for this track")));
+    }
+
+    #[test]
+    fn unsupported_target_metadata_policy_is_disabled_before_planning() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        std::fs::write(&input, b"DSD ").expect("source dsf placeholder");
+        let output = temp.path().join("out.dsf");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Dsf;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("plan request downgrades unsupported target metadata policies before validation");
+
+        assert!(!planned.settings.metadata.transfer_tags);
+        assert!(!planned.settings.metadata.preserve_artwork);
+    }
+
+    #[test]
+    fn staged_flac_plan_preserves_available_source_md5_policy() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.flac");
+        write_minimal_flac_with_md5(&input);
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("staged FLAC plan request builds");
+
+        assert!(
+            planned.settings.metadata.store_source_audio_md5,
+            "standalone FLAC with STREAMINFO MD5 keeps source-audio MD5 policy"
+        );
+        assert_eq!(
+            planned.source.audio_md5.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+    }
+
+    #[test]
+    fn sacd_flac_plan_has_no_ffmpeg_map_metadata_or_source_md5_from_materialized_dsf() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("realized.dsf");
+        std::fs::write(&input, b"DSD ").expect("realized dsf placeholder");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::SacdTrack {
+            iso: temp.path().join("album.iso"),
+            track_index: 1,
+            area: SacdArea::Stereo,
+        });
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("SACD plan request builds");
+        let commands = planned_command_args(&planned);
+
+        assert!(
+            !commands.iter().any(|args| has_adjacent_args(args, "-map_metadata", "1")),
+            "SACD materialized DSF must not be used as an FFmpeg metadata source: {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|args| has_input_arg(args, "realized.dsf") && has_adjacent_args(args, "-map_metadata", "1")),
+            "no command may copy metadata from the materialized SACD carrier: {commands:?}"
+        );
+        assert!(
+            !commands.iter().flatten().any(|arg| arg.contains("SOURCE_AUDIO_MD5")),
+            "SACD source-audio MD5 is unsupported for materialized DSF/DFF carriers and must not be planned: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn staged_dsf_and_dff_flac_plans_still_use_ffmpeg_source_metadata_transfer() {
+        for ext in ["dsf", "dff"] {
+            let temp = TempDir::new().expect("temp dir");
+            let input = temp.path().join(format!("source.{ext}"));
+            std::fs::write(&input, b"DSD ").expect("source DSD placeholder");
+            let output = temp.path().join(format!("out-{ext}.flac"));
+            let mut req = request(temp.path());
+            req.settings.target_format = PlannerFormat::Flac;
+            req.settings.metadata.transfer_tags = true;
+            req.settings.metadata.preserve_artwork = true;
+            let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+            let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+                .expect("staged DSD plan request builds");
+            let commands = planned_command_args(&planned);
+            let expected_source = format!("source.{ext}");
+
+            assert!(
+                commands.iter().any(|args| {
+                    has_adjacent_args(args, "-map_metadata", "1") && has_input_arg(args, &expected_source)
+                }),
+                "standalone/staged {ext} keeps its source metadata transfer path: {commands:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sacd_metadata_obligations_exclude_unsupported_source_tag_artwork_md5_copy() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let src = source(
+            SourceKind::SacdIso,
+            track(TrackSourceRef::SacdTrack {
+                iso: temp.path().join("album.iso"),
+                track_index: 1,
+                area: SacdArea::Stereo,
+            }),
+            temp.path(),
+        );
+
+        let obligations = metadata_obligations_for_request(&req, &src);
+
+        assert!(source_needs_authoritative_metadata(&src));
+        assert!(obligations.authoritative_tags_applied);
+        assert!(
+            !obligations.source_audio_md5_written,
+            "SACD source-audio MD5 is unsupported because the materialized DSF/DFF source has no FLAC STREAMINFO MD5"
+        );
+        assert!(
+            !obligations.source_tags_transferred,
+            "SACD sidecar/TOC metadata is authoritative; generated DSF source tags are not"
+        );
+        assert!(
+            !obligations.artwork_transferred,
+            "SACD artwork_transferred preservation is unsupported by the current materializer and must not be counted as satisfied"
+        );
+    }
+
+    #[test]
+    fn single_file_dsf_metadata_obligations_keep_source_tag_artwork_for_artwork_capable_target_but_not_md5_policy() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let src = source(
+            SourceKind::SingleFile,
+            track(TrackSourceRef::StagedFile(temp.path().join("source.dsf"))),
+            temp.path(),
+        );
+
+        let obligations = metadata_obligations_for_request(&req, &src);
+
+        assert!(obligations.source_tags_transferred);
+        assert!(obligations.artwork_transferred);
+        assert!(
+            !obligations.source_audio_md5_written,
+            "DSF source-audio MD5 is unsupported unless the realized input exposes FLAC STREAMINFO MD5"
+        );
+        assert!(!obligations.authoritative_tags_applied);
+    }
+
+
+
+
+    #[test]
+    fn single_file_dsf_metadata_obligations_do_not_require_artwork_for_artwork_incapable_target() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Wav;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        let src = source(
+            SourceKind::SingleFile,
+            track(TrackSourceRef::StagedFile(temp.path().join("source.dsf"))),
+            temp.path(),
+        );
+
+        let obligations = metadata_obligations_for_request(&req, &src);
+
+        assert!(
+            obligations.source_tags_transferred,
+            "WAV can still carry text tags through the planner policy"
+        );
+        assert!(
+            !obligations.artwork_transferred,
+            "artwork preservation must not be required for targets whose metadata transfer plugin cannot preserve artwork"
+        );
+    }
+
+    #[test]
+    fn source_tag_obligations_do_not_require_transfer_for_tag_incapable_target() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Dsf;
+        req.settings.metadata.transfer_tags = true;
+        let src = source(
+            SourceKind::SingleFile,
+            track(TrackSourceRef::StagedFile(temp.path().join("source.dsf"))),
+            temp.path(),
+        );
+
+        let obligations = metadata_obligations_for_request(&req, &src);
+
+        assert!(
+            !obligations.source_tags_transferred,
+            "source-tag obligations must be limited to targets whose planner/plugin metadata path can carry tags"
+        );
+    }
+
+    #[test]
+    fn planner_track_obligations_do_not_require_source_tags_for_tag_incapable_target() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        std::fs::write(&input, b"DSD ").expect("source dsf placeholder");
+        let output = temp.path().join("out.dsf");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Dsf;
+        req.settings.metadata.transfer_tags = true;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+        let planned = PlanRequest {
+            input_path: input.clone(),
+            output_path: output,
+            source: source_info_for_realized_track(&track, &input).expect("source facts"),
+            settings: req.settings.clone(),
+            intermediate_dir: Some(temp.path().join("work")),
+            container_ffmpeg_flags: Vec::new(),
+        };
+
+        let obligations = planner_metadata_obligations_for_track(&req, &planned);
+
+        assert!(planned.settings.metadata.transfer_tags);
+        assert!(
+            !obligations.source_tags_transferred,
+            "a requested transfer_tags flag is not an obligation when the target/plugin cannot represent source tags"
+        );
+    }
+
+    #[test]
+    fn source_level_metadata_obligations_do_not_infer_md5_from_flac_extension() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.metadata.store_source_audio_md5 = true;
+        let src = source(
+            SourceKind::SingleFile,
+            track(TrackSourceRef::StagedFile(temp.path().join("source.flac"))),
+            temp.path(),
+        );
+
+        let obligations = metadata_obligations_for_request(&req, &src);
+
+        assert!(
+            !obligations.source_audio_md5_written,
+            "source-level obligations must not treat a .flac extension as proof of a usable STREAMINFO MD5"
+        );
+        assert!(!obligations.authoritative_tags_applied);
+    }
+
+    #[test]
+    fn planner_track_obligations_keep_source_md5_only_when_streaminfo_md5_is_present() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.flac");
+        write_minimal_flac_with_md5(&input);
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("staged FLAC plan request builds");
+        let obligations = planner_metadata_obligations_for_track(&req, &planned);
+
+        assert!(obligations.source_audio_md5_written);
+        assert_eq!(planned.source.audio_md5.as_deref(), Some("00112233445566778899aabbccddeeff"));
+    }
+
+    #[test]
+    fn planner_track_obligations_drop_source_md5_for_flac_with_missing_streaminfo_md5() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.flac");
+        write_minimal_flac_with_zero_md5(&input);
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("staged FLAC plan request builds without source MD5");
+        let obligations = planner_metadata_obligations_for_track(&req, &planned);
+
+        assert!(!planned.settings.metadata.store_source_audio_md5);
+        assert!(planned.source.audio_md5.is_none());
+        assert!(
+            !obligations.source_audio_md5_written,
+            "a .flac path with absent/zero STREAMINFO MD5 must not create an unsatisfiable source-MD5 obligation"
+        );
+    }
+
+
+    #[test]
+    fn planner_track_obligations_drop_source_md5_for_non_flac_input() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        std::fs::write(&input, b"DSD ").expect("write placeholder DSF");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.store_source_audio_md5 = true;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("non-FLAC plan request builds without source MD5");
+        let obligations = planner_metadata_obligations_for_track(&req, &planned);
+
+        assert!(!planned.settings.metadata.store_source_audio_md5);
+        assert!(planned.source.audio_md5.is_none());
+        assert!(
+            !obligations.source_audio_md5_written,
+            "non-FLAC inputs do not expose FLAC STREAMINFO MD5 and must not create source-MD5 obligations"
+        );
+    }
+
+    #[test]
+    fn md5_satisfaction_cannot_stand_in_for_authoritative_tags() {
+        let required = PlannedMetadataSatisfaction {
+            source_tags_transferred: true,
+            artwork_transferred: false,
+            source_audio_md5_written: true,
+            authoritative_tags_applied: true,
+        };
+        let actual = PlannedMetadataSatisfaction {
+            source_audio_md5_written: true,
+            ..PlannedMetadataSatisfaction::none()
+        };
+
+        assert!(orchestrator_metadata_stage_required(
+            actual,
+            StageRequirement::Enabled,
+            required,
+        ));
+    }
+
+    #[test]
+    fn exact_dimensional_satisfaction_allows_skip() {
+        let required = PlannedMetadataSatisfaction {
+            source_tags_transferred: true,
+            artwork_transferred: true,
+            source_audio_md5_written: true,
+            authoritative_tags_applied: false,
+        };
+        let actual = PlannedMetadataSatisfaction {
+            source_tags_transferred: true,
+            artwork_transferred: true,
+            source_audio_md5_written: true,
+            authoritative_tags_applied: false,
+        };
+
+        assert!(!orchestrator_metadata_stage_required(
+            actual,
+            StageRequirement::Enabled,
+            required,
+        ));
     }
 }

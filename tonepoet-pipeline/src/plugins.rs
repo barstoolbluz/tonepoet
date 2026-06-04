@@ -10,7 +10,7 @@ use crate::enums::{
 };
 use crate::error::{PlanningError, Result};
 use crate::mapping;
-use crate::plan::{PlanContext, PlanOperation, PlanStep, PlannedCommand};
+use crate::plan::{MetadataPlanEffect, PlanContext, PlanOperation, PlanStep, PlannedCommand};
 use crate::tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolSupport};
 
 /// FFmpeg plugin.
@@ -90,17 +90,11 @@ impl ToolPlugin for FfmpegPlugin {
         }
     }
 
-    fn metadata_disposition(
-        &self,
-        context: &PlanContext<'_>,
-        step: &PlanStep,
-    ) -> MetadataDisposition {
+    fn metadata_effect(&self, context: &PlanContext<'_>, step: &PlanStep) -> MetadataPlanEffect {
         match &step.operation {
             PlanOperation::EncodePcm { target_format, .. }
-            | PlanOperation::EncodeLossy { target_format, .. }
-                if ffmpeg_encoder_writes_requested_metadata_policy(context, target_format) =>
-            {
-                MetadataDisposition::WritesRequestedPolicy
+            | PlanOperation::EncodeLossy { target_format, .. } => {
+                ffmpeg_encode_metadata_effect(context, step, target_format)
             }
             PlanOperation::MetadataTransfer {
                 target_format,
@@ -110,7 +104,31 @@ impl ToolPlugin for FfmpegPlugin {
                 target_format,
                 *transfer_tags,
                 *preserve_artwork,
-            ) =>
+            ) => MetadataPlanEffect {
+                source_tags_transferred_from_original_source: *transfer_tags,
+                artwork_transferred_from_original_source: *preserve_artwork,
+                ..MetadataPlanEffect::none()
+            },
+            _ => MetadataPlanEffect::none(),
+        }
+    }
+
+    fn metadata_disposition(
+        &self,
+        context: &PlanContext<'_>,
+        step: &PlanStep,
+    ) -> MetadataDisposition {
+        let effect = self.metadata_effect(context, step);
+        match &step.operation {
+            PlanOperation::EncodePcm { target_format, .. }
+            | PlanOperation::EncodeLossy { target_format, .. }
+                if ffmpeg_encoder_transfers_original_source_metadata(context, step, target_format) =>
+            {
+                MetadataDisposition::WritesRequestedPolicy
+            }
+            PlanOperation::MetadataTransfer { .. }
+                if effect.source_tags_transferred_from_original_source
+                    || effect.artwork_transferred_from_original_source =>
             {
                 MetadataDisposition::WritesRequestedPolicy
             }
@@ -417,6 +435,20 @@ impl ToolPlugin for MetaflacPlugin {
         }
     }
 
+    fn metadata_effect(&self, _context: &PlanContext<'_>, step: &PlanStep) -> MetadataPlanEffect {
+        match &step.operation {
+            PlanOperation::StoreSourceAudioMd5 { target_format }
+                if target_format == &AudioFormat::Flac =>
+            {
+                MetadataPlanEffect {
+                    source_audio_md5_written: true,
+                    ..MetadataPlanEffect::none()
+                }
+            }
+            _ => MetadataPlanEffect::none(),
+        }
+    }
+
     fn build_command(&self, context: &PlanContext<'_>, step: &PlanStep) -> Result<PlannedCommand> {
         match &step.operation {
             PlanOperation::StoreSourceAudioMd5 { target_format }
@@ -436,7 +468,8 @@ impl ToolPlugin for MetaflacPlugin {
                     step.output.clone(),
                     context.request.source.duration,
                     "Store source audio MD5 as a FLAC Vorbis comment",
-                ))
+                )
+                .with_metadata_effect(self.metadata_effect(context, step)))
             }
             _ => Err(PlanningError::plugin_rejected(
                 self.id(),
@@ -602,7 +635,8 @@ fn build_ffmpeg_encode_pcm(
         step.output.clone(),
         context.request.source.duration,
         step.description.clone(),
-    ))
+    )
+    .with_metadata_effect(ffmpeg_encode_metadata_effect(context, step, target_format)))
 }
 
 fn build_ffmpeg_encode_lossy(
@@ -691,7 +725,40 @@ fn build_ffmpeg_encode_lossy(
         step.output.clone(),
         context.request.source.duration,
         step.description.clone(),
-    ))
+    )
+    .with_metadata_effect(ffmpeg_encode_metadata_effect(context, step, target_format)))
+}
+
+fn ffmpeg_encode_metadata_effect(
+    context: &PlanContext<'_>,
+    step: &PlanStep,
+    target_format: &AudioFormat,
+) -> MetadataPlanEffect {
+    let transfers_tags = context.request.settings.metadata.transfer_tags
+        && format_supports_tags(target_format);
+    let transfers_artwork = context.request.settings.metadata.preserve_artwork
+        && format_supports_artwork(target_format);
+
+    if ffmpeg_step_reads_original_request_input(context, step) {
+        MetadataPlanEffect {
+            source_tags_transferred_from_original_source: transfers_tags,
+            artwork_transferred_from_original_source: transfers_artwork,
+            ..MetadataPlanEffect::none()
+        }
+    } else {
+        MetadataPlanEffect {
+            tags_preserved_from_command_input: transfers_tags,
+            artwork_preserved_from_command_input: transfers_artwork,
+            ..MetadataPlanEffect::none()
+        }
+    }
+}
+
+fn ffmpeg_step_reads_original_request_input(context: &PlanContext<'_>, step: &PlanStep) -> bool {
+    matches!(
+        &step.input,
+        crate::plan::InputSource::Path(path) if path == &context.request.input_path
+    )
 }
 
 fn metadata_rewritable_by_ffmpeg(format: &AudioFormat) -> bool {
@@ -717,29 +784,63 @@ fn ffmpeg_encoder_writes_requested_metadata_policy(
         && (!context.request.settings.metadata.preserve_artwork || format_supports_artwork(format))
 }
 
+fn ffmpeg_encoder_transfers_original_source_metadata(
+    context: &PlanContext<'_>,
+    step: &PlanStep,
+    format: &AudioFormat,
+) -> bool {
+    ffmpeg_step_reads_original_request_input(context, step)
+        && ffmpeg_encoder_writes_requested_metadata_policy(context, format)
+}
+
+impl AudioFormat {
+    /// True when the built-in planner/plugin metadata path can carry
+    /// source-container text tags into this target format.
+    ///
+    /// This is the single capability definition used by both the planner
+    /// plugins and the conversion bridge obligation model. Keeping it on the
+    /// planner-owned format type prevents the bridge from mirroring FFmpeg
+    /// support tables by hand.
+    #[must_use]
+    pub fn supports_planner_source_tag_transfer(&self) -> bool {
+        matches!(
+            self,
+            AudioFormat::Flac
+                | AudioFormat::Wav
+                | AudioFormat::Aiff
+                | AudioFormat::WavPack
+                | AudioFormat::Mp3
+                | AudioFormat::Aac
+                | AudioFormat::Opus
+                | AudioFormat::Alac
+        )
+    }
+
+    /// True when the built-in planner/plugin metadata path can preserve
+    /// embedded artwork/video streams for this target format.
+    ///
+    /// This is intentionally narrower than text-tag support. The conversion
+    /// bridge must use this same planner-owned capability when deciding whether
+    /// artwork preservation is a real obligation.
+    #[must_use]
+    pub fn supports_planner_embedded_artwork_transfer(&self) -> bool {
+        matches!(
+            self,
+            AudioFormat::Flac
+                | AudioFormat::Mp3
+                | AudioFormat::Aac
+                | AudioFormat::Opus
+                | AudioFormat::Alac
+        )
+    }
+}
+
 fn format_supports_tags(format: &AudioFormat) -> bool {
-    matches!(
-        format,
-        AudioFormat::Flac
-            | AudioFormat::Wav
-            | AudioFormat::Aiff
-            | AudioFormat::WavPack
-            | AudioFormat::Mp3
-            | AudioFormat::Aac
-            | AudioFormat::Opus
-            | AudioFormat::Alac
-    )
+    format.supports_planner_source_tag_transfer()
 }
 
 fn format_supports_artwork(format: &AudioFormat) -> bool {
-    matches!(
-        format,
-        AudioFormat::Flac
-            | AudioFormat::Mp3
-            | AudioFormat::Aac
-            | AudioFormat::Opus
-            | AudioFormat::Alac
-    )
+    format.supports_planner_embedded_artwork_transfer()
 }
 
 fn loudgain_supports_format(format: &AudioFormat) -> bool {
@@ -808,7 +909,8 @@ fn build_ffmpeg_metadata_transfer(
         step.output.clone(),
         context.request.source.duration,
         step.description.clone(),
-    ))
+    )
+    .with_metadata_effect(FfmpegPlugin.metadata_effect(context, step)))
 }
 
 fn build_ffmpeg_verify(context: &PlanContext<'_>, step: &PlanStep) -> Result<PlannedCommand> {
@@ -1548,10 +1650,227 @@ fn format_float(value: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{InputSource, OutputSink, PlanOperation, PlanRequest, PlanStep};
+    use crate::plan::{InputSource, MetadataPlanEffect, OutputSink, PlanOperation, PlanRequest, PlanStep};
     use crate::settings::{DsdSettings, PipelineSettings};
     use crate::source::SourceInfo;
     use std::path::PathBuf;
+
+    #[test]
+    fn planner_format_metadata_capabilities_are_centralized_on_audio_format() {
+        assert!(AudioFormat::Flac.supports_planner_source_tag_transfer());
+        assert!(AudioFormat::Wav.supports_planner_source_tag_transfer());
+        assert!(!AudioFormat::Dsf.supports_planner_source_tag_transfer());
+        assert!(!AudioFormat::Dff.supports_planner_source_tag_transfer());
+
+        assert!(AudioFormat::Flac.supports_planner_embedded_artwork_transfer());
+        assert!(AudioFormat::Mp3.supports_planner_embedded_artwork_transfer());
+        assert!(!AudioFormat::Wav.supports_planner_embedded_artwork_transfer());
+        assert!(!AudioFormat::Dsf.supports_planner_embedded_artwork_transfer());
+    }
+
+    #[test]
+    fn ffmpeg_metadata_transfer_carries_typed_metadata_effects() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.metadata.transfer_tags = true;
+        settings.metadata.preserve_artwork = true;
+        let source = SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: crate::enums::AudioCodec::Dsd,
+            sample_rate_hz: Some(2_822_400),
+            bit_depth: None,
+            sample_kind: Some(crate::enums::SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let request = PlanRequest {
+            input_path: PathBuf::from("source.dsf"),
+            output_path: PathBuf::from("output.flac"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let context = request.context();
+        let step = PlanStep::new(
+            0,
+            PlanOperation::MetadataTransfer {
+                target_format: AudioFormat::Flac,
+                transfer_tags: true,
+                preserve_artwork: true,
+            },
+            InputSource::Path(PathBuf::from("encoded.flac")),
+            OutputSink::Path(PathBuf::from("tagged.flac")),
+            "Apply metadata and artwork policy",
+        );
+
+        let command = FfmpegPlugin.build_command(&context, &step).unwrap();
+
+        assert_eq!(
+            command.metadata_effect,
+            MetadataPlanEffect {
+                source_tags_transferred_from_original_source: true,
+                artwork_transferred_from_original_source: true,
+                ..MetadataPlanEffect::none()
+            }
+        );
+    }
+
+    #[test]
+    fn ffmpeg_encode_from_original_source_carries_original_source_effects() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.metadata.transfer_tags = true;
+        settings.metadata.preserve_artwork = true;
+        let source = SourceInfo {
+            format: AudioFormat::Wav,
+            codec: crate::enums::AudioCodec::PcmSigned,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(PcmBitDepth::Int16),
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let request = PlanRequest {
+            input_path: PathBuf::from("source.wav"),
+            output_path: PathBuf::from("output.flac"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let context = request.context();
+        let step = PlanStep::new(
+            0,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Flac,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int16,
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("source.wav")),
+            OutputSink::Path(PathBuf::from("output.flac")),
+            "Encode PCM output",
+        );
+
+        let command = FfmpegPlugin.build_command(&context, &step).unwrap();
+
+        assert_eq!(
+            command.metadata_effect,
+            MetadataPlanEffect {
+                source_tags_transferred_from_original_source: true,
+                artwork_transferred_from_original_source: true,
+                ..MetadataPlanEffect::none()
+            }
+        );
+        assert_eq!(
+            FfmpegPlugin.metadata_disposition(&context, &step),
+            MetadataDisposition::WritesRequestedPolicy,
+            "an FFmpeg encode can make a later MetadataTransfer redundant only when it reads the original request input"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_encode_from_intermediate_preserves_current_input_without_claiming_original_source_transfer() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.metadata.transfer_tags = true;
+        settings.metadata.preserve_artwork = true;
+        let source = SourceInfo {
+            format: AudioFormat::Wav,
+            codec: crate::enums::AudioCodec::PcmSigned,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(PcmBitDepth::Int16),
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let request = PlanRequest {
+            input_path: PathBuf::from("source.wav"),
+            output_path: PathBuf::from("output.flac"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let context = request.context();
+        let step = PlanStep::new(
+            1,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Flac,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int16,
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("intermediate.wav")),
+            OutputSink::Path(PathBuf::from("output.flac")),
+            "Encode PCM output",
+        );
+
+        let command = FfmpegPlugin.build_command(&context, &step).unwrap();
+
+        assert_eq!(
+            command.metadata_effect,
+            MetadataPlanEffect {
+                tags_preserved_from_command_input: true,
+                artwork_preserved_from_command_input: true,
+                ..MetadataPlanEffect::none()
+            }
+        );
+        assert_eq!(
+            FfmpegPlugin.metadata_disposition(&context, &step),
+            MetadataDisposition::DoesNotWrite,
+            "preserving metadata from an intermediate input must not prune an explicit original-source MetadataTransfer step"
+        );
+    }
+
+    #[test]
+    fn metaflac_source_audio_md5_carries_typed_metadata_effect() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.metadata.store_source_audio_md5 = true;
+        let source = SourceInfo {
+            format: AudioFormat::Flac,
+            codec: crate::enums::AudioCodec::PcmSigned,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(PcmBitDepth::Int16),
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: Some("0123456789abcdef0123456789abcdef".into()),
+        };
+        let request = PlanRequest {
+            input_path: PathBuf::from("source.flac"),
+            output_path: PathBuf::from("output.flac"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let context = request.context();
+        let step = PlanStep::new(
+            0,
+            PlanOperation::StoreSourceAudioMd5 {
+                target_format: AudioFormat::Flac,
+            },
+            InputSource::Path(PathBuf::from("output.flac")),
+            OutputSink::InPlace(PathBuf::from("output.flac")),
+            "Store source audio MD5 metadata",
+        );
+
+        let command = MetaflacPlugin.build_command(&context, &step).unwrap();
+
+        assert_eq!(
+            command.metadata_effect,
+            MetadataPlanEffect {
+                source_audio_md5_written: true,
+                ..MetadataPlanEffect::none()
+            }
+        );
+    }
 
     #[test]
     fn dsd_to_pcm_manual_gain_without_value_fails_loudly() {

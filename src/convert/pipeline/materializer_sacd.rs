@@ -258,13 +258,8 @@ fn album_metadata(
     // can resolve %CATALOGNUMBER%, %RELEASECOUNTRY%, MusicBrainz IDs, etc.
     if let Some(sidecar) = sidecar_first_track {
         for (key, value) in &sidecar.meta {
-            match key.as_str() {
-                // Already mapped to top-level AlbumMetadata fields.
-                "TITLE" | "ALBUM" | "ARTIST" | "GENRE" | "DATE" | "ISRC" | "TRACKNUMBER"
-                | "TOTALTRACKS" => {}
-                _ => {
-                    insert_nonempty(&mut extra, &key.to_lowercase(), value.clone());
-                }
+            if !is_standard_sidecar_album_key(key) {
+                insert_nonempty(&mut extra, &key.to_lowercase(), value.clone());
             }
         }
     }
@@ -358,7 +353,7 @@ fn track_metadata(
             .or_else(|| metadata.album_artist().map(str::to_string)),
         album_artist: sc("ARTIST").or_else(|| metadata.album_artist().map(str::to_string)),
         composer: entry.text.composer.clone(),
-        performer: sc("ARTIST").or_else(|| entry.text.performer.clone()),
+        performer: track_performer_from_sidecar_or_toc(sidecar, entry.text.performer.clone()),
         genre: sc("GENRE")
             .or_else(|| entry.genre.map(genre_to_string))
             .or_else(|| first_genre(metadata)),
@@ -380,20 +375,53 @@ fn track_metadata(
             // Carry sidecar-only fields into extra.
             if let Some(sidecar_track) = sidecar {
                 for (key, value) in &sidecar_track.meta {
-                    match key.as_str() {
-                        // Already mapped to top-level fields.
-                        "TITLE" | "ARTIST" | "GENRE" | "DATE" | "ISRC" | "TRACKNUMBER"
-                        | "TOTALTRACKS" => {}
+                    if !is_standard_sidecar_track_key(key) {
                         // Preserve everything else (MusicBrainz IDs, etc.).
-                        _ => {
-                            insert_nonempty(&mut extra, &key.to_lowercase(), value.clone());
-                        }
+                        insert_nonempty(&mut extra, &key.to_lowercase(), value.clone());
                     }
                 }
             }
             extra
         },
     }
+}
+
+fn sidecar_nonempty_meta_value(sidecar: Option<&SidecarTrack>, key: &str) -> Option<String> {
+    sidecar
+        .and_then(|track| track.meta.get(key))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+}
+
+fn track_performer_from_sidecar_or_toc(
+    sidecar: Option<&SidecarTrack>,
+    toc_performer: Option<String>,
+) -> Option<String> {
+    sidecar_nonempty_meta_value(sidecar, "PERFORMER")
+        .or_else(|| sidecar_nonempty_meta_value(sidecar, "ARTIST"))
+        .or(toc_performer)
+}
+
+fn is_standard_sidecar_album_key(key: &str) -> bool {
+    matches!(
+        key,
+        "TITLE"
+            | "ALBUM"
+            | "ARTIST"
+            | "PERFORMER"
+            | "GENRE"
+            | "DATE"
+            | "ISRC"
+            | "TRACKNUMBER"
+            | "TOTALTRACKS"
+    )
+}
+
+fn is_standard_sidecar_track_key(key: &str) -> bool {
+    matches!(
+        key,
+        "TITLE" | "ARTIST" | "PERFORMER" | "GENRE" | "DATE" | "ISRC" | "TRACKNUMBER" | "TOTALTRACKS"
+    )
 }
 
 fn first_genre(metadata: &SacdMetadata) -> Option<String> {
@@ -557,6 +585,69 @@ pub(crate) mod test_support {
                 .map(|track| track.id.source_ordinal)
                 .collect()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sidecar_track(entries: &[(&str, &str)]) -> SidecarTrack {
+        let mut track = SidecarTrack::default();
+        for (key, value) in entries {
+            track.meta.insert((*key).to_string(), (*value).to_string());
+        }
+        track
+    }
+
+    #[test]
+    fn sidecar_performer_overrides_artist_and_toc_performer() {
+        let sidecar = sidecar_track(&[
+            ("ARTIST", "Sidecar Artist"),
+            ("PERFORMER", "Sidecar Performer"),
+        ]);
+
+        assert_eq!(
+            track_performer_from_sidecar_or_toc(Some(&sidecar), Some("TOC Performer".to_string()))
+                .as_deref(),
+            Some("Sidecar Performer"),
+        );
+    }
+
+    #[test]
+    fn blank_sidecar_performer_does_not_block_fallback() {
+        let sidecar = sidecar_track(&[("ARTIST", "Sidecar Artist"), ("PERFORMER", "   ")]);
+
+        assert_eq!(
+            track_performer_from_sidecar_or_toc(Some(&sidecar), Some("TOC Performer".to_string()))
+                .as_deref(),
+            Some("Sidecar Artist"),
+        );
+    }
+
+    #[test]
+    fn track_performer_falls_back_to_sidecar_artist_then_toc_performer() {
+        let sidecar_artist_only = sidecar_track(&[("ARTIST", "Sidecar Artist")]);
+        assert_eq!(
+            track_performer_from_sidecar_or_toc(
+                Some(&sidecar_artist_only),
+                Some("TOC Performer".to_string()),
+            )
+            .as_deref(),
+            Some("Sidecar Artist"),
+        );
+
+        assert_eq!(
+            track_performer_from_sidecar_or_toc(None, Some("TOC Performer".to_string()))
+                .as_deref(),
+            Some("TOC Performer"),
+        );
+    }
+
+    #[test]
+    fn performer_is_standard_sidecar_metadata_not_tonepoet_extra() {
+        assert!(is_standard_sidecar_track_key("PERFORMER"));
+        assert!(is_standard_sidecar_album_key("PERFORMER"));
     }
 }
 

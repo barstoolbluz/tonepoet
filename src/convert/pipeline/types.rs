@@ -313,17 +313,115 @@ pub struct PlannedTrackOutput {
     pub final_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedMetadataSatisfaction {
+    /// Original source-container text tags were transferred by the per-track planner.
+    #[serde(default)]
+    pub source_tags_transferred: bool,
+    /// Original source artwork/video metadata was transferred by the per-track planner.
+    #[serde(default)]
+    pub artwork_transferred: bool,
+    /// Source-audio MD5 metadata was written by the per-track planner.
+    #[serde(default)]
+    pub source_audio_md5_written: bool,
+    /// Authoritative Tonepoet/materializer album and track tags have already
+    /// been applied by an explicit owner. Current per-track planner commands do
+    /// not set this; the orchestrator normally owns `apply_metadata()`.
+    ///
+    /// Backward-compatible alias: earlier dimensional metadata-state snapshots
+    /// used `authoritative_tags_written`. Preserve that spelling on deserialize
+    /// so persisted manifests/logs do not silently lose this bit.
+    #[serde(default, alias = "authoritative_tags_written")]
+    pub authoritative_tags_applied: bool,
+}
+
+impl PlannedMetadataSatisfaction {
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            source_tags_transferred: false,
+            artwork_transferred: false,
+            source_audio_md5_written: false,
+            authoritative_tags_applied: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn satisfies(self, required: Self) -> bool {
+        (!required.source_tags_transferred || self.source_tags_transferred)
+            && (!required.artwork_transferred || self.artwork_transferred)
+            && (!required.source_audio_md5_written || self.source_audio_md5_written)
+            && (!required.authoritative_tags_applied || self.authoritative_tags_applied)
+    }
+
+    #[must_use]
+    pub const fn merge(self, other: Self) -> Self {
+        Self {
+            source_tags_transferred: self.source_tags_transferred || other.source_tags_transferred,
+            artwork_transferred: self.artwork_transferred || other.artwork_transferred,
+            source_audio_md5_written: self.source_audio_md5_written || other.source_audio_md5_written,
+            authoritative_tags_applied: self.authoritative_tags_applied || other.authoritative_tags_applied,
+        }
+    }
+
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.source_tags_transferred || self.artwork_transferred || self.source_audio_md5_written || self.authoritative_tags_applied
+    }
+}
+
+#[cfg(test)]
+mod metadata_satisfaction_serde_tests {
+    use super::PlannedMetadataSatisfaction;
+
+    #[test]
+    fn accepts_legacy_authoritative_tags_written_field() {
+        let value: PlannedMetadataSatisfaction = serde_json::from_str(
+            r#"{
+                "source_tags_transferred": false,
+                "artwork_transferred": false,
+                "source_audio_md5_written": false,
+                "authoritative_tags_written": true
+            }"#,
+        )
+        .expect("legacy metadata satisfaction JSON should deserialize");
+
+        assert!(value.authoritative_tags_applied);
+    }
+
+    #[test]
+    fn serializes_canonical_authoritative_tags_applied_field() {
+        let value = PlannedMetadataSatisfaction {
+            authoritative_tags_applied: true,
+            ..PlannedMetadataSatisfaction::none()
+        };
+
+        let json = serde_json::to_value(value).expect("serialize metadata satisfaction");
+
+        assert_eq!(json["authoritative_tags_applied"], serde_json::Value::Bool(true));
+        assert!(json.get("authoritative_tags_written").is_none());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackArtifact {
     pub track_id: TrackId,
     pub staged_path: PathBuf,
     pub final_path: PathBuf,
     pub samples: Option<u64>,
-    /// True when the planner-owned per-track plan applied the requested
-    /// metadata/artwork/source-MD5 policy. Album post-processing uses this
-    /// to skip the legacy metadata stage only when doing so is safe.
+    /// Dimension-by-dimension record of the metadata obligations satisfied by
+    /// the planner-owned per-track plan. The album post-processing gate must
+    /// compare this against the original request; it must not collapse distinct
+    /// obligations into a single boolean.
     #[serde(default)]
-    pub metadata_written_by_plan: bool,
+    pub metadata_satisfaction: PlannedMetadataSatisfaction,
+    /// Dimension-by-dimension metadata obligations that were meaningful for
+    /// this realized track after source facts were parsed. In particular,
+    /// `source_audio_md5_written` is required only when the realized source
+    /// actually exposed a parsed `SourceInfo::audio_md5`, not merely because a
+    /// path ended in `.flac`.
+    #[serde(default)]
+    pub metadata_required: PlannedMetadataSatisfaction,
     /// SHA-256 of the planned command sequence, computed during encoding.
     /// Used by the manifest for rerun identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]

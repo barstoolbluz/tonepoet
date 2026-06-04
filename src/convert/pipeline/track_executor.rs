@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::{
-    plan_conversion, plan_topology, Finalization, MetadataDisposition,
-    PlanAction, PlanOperation, PlanRequest, PlanStep, PlannedCommand,
-    ToolRegistry, TopologyPlan,
+    plan_conversion, ConversionPlan, Finalization, PlanAction, PlanRequest, PlannedCommand,
 };
 
 use super::errors::{ConvertError, ToolRunnerError};
-use super::plan_bridge::{plan_request_for_track, settings_request_metadata};
+use super::plan_bridge::{
+    plan_request_for_track, planner_metadata_obligations_for_track, settings_request_metadata,
+};
 use super::planned_adapter::{planned_command_to_tool_command, DEFAULT_PLANNED_COMMAND_TIMEOUT};
 use super::progress::{
     probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker,
@@ -28,18 +28,21 @@ use super::progress::{
 use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
 #[cfg(test)]
 use super::tool::ProcessExit;
-use super::types::{PipelineRequest, PreparedTrack};
+use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack};
 
 #[derive(Debug, Clone)]
 pub struct ExecutedTrackPlan {
     pub commands: Vec<CommandRecord>,
     pub elapsed: Duration,
-    /// Effective post-planner metadata disposition for this track. This is
-    /// `WritesRequestedPolicy` only when the planner request asked for metadata
-    /// and the resulting plan will satisfy that policy by passthrough, metadata
-    /// commands, or disposition-pruned encoder behavior.
-    pub metadata_disposition: MetadataDisposition,
-    pub metadata_written_by_plan: bool,
+    /// Metadata obligations satisfied by the planner-owned per-track plan.
+    /// This is tracked dimensionally so source tag transfer, artwork_transferred, source
+    /// MD5, and materializer-authored tags cannot be collapsed into one flag.
+    pub metadata_satisfaction: PlannedMetadataSatisfaction,
+    /// Metadata obligations that were meaningful for this realized track after
+    /// source facts such as `SourceInfo::audio_md5` were parsed. The stage gate
+    /// compares planner satisfaction against this per-track requirement instead
+    /// of inferring source-MD5 support from file names.
+    pub metadata_required: PlannedMetadataSatisfaction,
     /// SHA-256 of the planned command sequence, for manifest rerun identity.
     pub command_hash: Option<String>,
 }
@@ -171,8 +174,8 @@ pub async fn execute_planned_track_conversion(
     let plan = plan_conversion(&plan_request)
         .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
     let command_hash = super::manifest::planned_command_hash(&plan).ok();
-    let metadata_disposition = effective_metadata_disposition(&plan_request)?;
-    let metadata_written_by_plan = metadata_disposition.writes_requested_policy();
+    let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
+    let metadata_required = planner_metadata_obligations_for_track(request, &plan_request);
 
     cleanup_paths(plan.cleanup_paths());
     let started = Instant::now();
@@ -203,8 +206,8 @@ pub async fn execute_planned_track_conversion(
             Ok(ExecutedTrackPlan {
                 commands: Vec::new(),
                 elapsed: started.elapsed(),
-                metadata_disposition,
-                metadata_written_by_plan,
+                metadata_satisfaction,
+                metadata_required,
                 command_hash: command_hash.clone(),
             })
         }
@@ -238,8 +241,8 @@ pub async fn execute_planned_track_conversion(
             Ok(ExecutedTrackPlan {
                 commands,
                 elapsed: started.elapsed(),
-                metadata_disposition,
-                metadata_written_by_plan,
+                metadata_satisfaction,
+                metadata_required,
                 command_hash,
             })
         }
@@ -259,113 +262,37 @@ pub async fn execute_planned_track_conversion(
     }
 }
 
-fn effective_metadata_disposition(
+fn effective_metadata_satisfaction(
     plan_request: &PlanRequest,
-) -> Result<MetadataDisposition, ConvertError> {
+    plan: &ConversionPlan,
+) -> PlannedMetadataSatisfaction {
     if !settings_request_metadata(&plan_request.settings) {
-        return Ok(MetadataDisposition::DoesNotWrite);
+        return PlannedMetadataSatisfaction::none();
     }
 
-    let topology = plan_topology(plan_request)
-        .map_err(|err| ConvertError::Backend(format!("metadata topology inspection failed: {err}")))?;
-    let registry = ToolRegistry::with_builtin_tools();
-    let context = plan_request.context();
-
-    match topology {
-        TopologyPlan::Passthrough { .. } => Ok(MetadataDisposition::WritesRequestedPolicy),
-        TopologyPlan::Execute { steps, .. } => {
-            let needs_tag_or_artwork = plan_request.settings.metadata.transfer_tags
-                || plan_request.settings.metadata.preserve_artwork;
-            let needs_source_md5 = plan_request.settings.metadata.store_source_audio_md5;
-
-            let mut tag_or_artwork_satisfied = !needs_tag_or_artwork;
-            let mut source_md5_satisfied = !needs_source_md5;
-
-            for (index, step) in steps.iter().enumerate() {
-                if needs_tag_or_artwork && operation_can_write_metadata(&step.operation) {
-                    let disposition = registry
-                        .metadata_disposition_for_step(&context, step)
-                        .map_err(|err| ConvertError::Backend(format!(
-                            "metadata disposition lookup failed: {err}"
-                        )))?;
-                    if disposition.writes_requested_policy() {
-                        tag_or_artwork_satisfied = true;
-                    }
-                }
-
-                match &step.operation {
-                    PlanOperation::MetadataTransfer { .. } => {
-                        let explicit_transfer = registry
-                            .metadata_disposition_for_step(&context, step)
-                            .map_err(|err| ConvertError::Backend(format!(
-                                "metadata disposition lookup failed: {err}"
-                            )))?;
-                        let previous_writer = previous_metadata_writer(&steps[..index], &registry, &context)?;
-                        let transfer_satisfies_policy = explicit_transfer.writes_requested_policy()
-                            || matches!(
-                                previous_writer.as_ref(),
-                                Some(disposition) if disposition.writes_requested_policy()
-                            );
-                        if transfer_satisfies_policy {
-                            tag_or_artwork_satisfied = true;
-                            log::debug!(
-                                "metadata transfer for step {} is satisfied by explicit {:?} or prior {:?} disposition",
-                                step.index,
-                                explicit_transfer,
-                                previous_writer
-                            );
-                        } else {
-                            log::debug!(
-                                "metadata transfer for step {} does not satisfy requested metadata policy; legacy metadata stage remains required",
-                                step.index
-                            );
-                        }
-                    }
-                    PlanOperation::StoreSourceAudioMd5 { .. } => {
-                        source_md5_satisfied = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            if tag_or_artwork_satisfied && source_md5_satisfied {
-                Ok(MetadataDisposition::WritesRequestedPolicy)
-            } else {
-                Ok(MetadataDisposition::DoesNotWrite)
+    match &plan.action {
+        PlanAction::PassthroughCopy { .. } => {
+            // A passthrough copy preserves source-container tags/artwork, but it
+            // does not add new source-MD5 metadata and it does not write
+            // materializer-authored album/track tags.
+            PlannedMetadataSatisfaction {
+                source_tags_transferred: plan_request.settings.metadata.transfer_tags,
+                artwork_transferred: plan_request.settings.metadata.preserve_artwork,
+                ..PlannedMetadataSatisfaction::none()
             }
         }
+        PlanAction::Execute { commands, .. } => commands
+            .iter()
+            .map(|command| command.metadata_effect)
+            .fold(PlannedMetadataSatisfaction::none(), |satisfaction, effect| {
+                satisfaction.merge(PlannedMetadataSatisfaction {
+                    source_tags_transferred: effect.source_tags_transferred_from_original_source,
+                    artwork_transferred: effect.artwork_transferred_from_original_source,
+                    source_audio_md5_written: effect.source_audio_md5_written,
+                    ..PlannedMetadataSatisfaction::none()
+                })
+            }),
     }
-}
-
-fn previous_metadata_writer(
-    previous_steps: &[PlanStep],
-    registry: &ToolRegistry,
-    context: &tonepoet_pipeline::PlanContext<'_>,
-) -> Result<Option<MetadataDisposition>, ConvertError> {
-    for step in previous_steps.iter().rev() {
-        if !operation_can_write_metadata(&step.operation) {
-            continue;
-        }
-        let disposition = registry
-            .metadata_disposition_for_step(context, step)
-            .map_err(|err| ConvertError::Backend(format!("metadata disposition lookup failed: {err}")))?;
-        if disposition.writes_requested_policy() {
-            return Ok(Some(disposition));
-        }
-    }
-    Ok(None)
-}
-
-fn operation_can_write_metadata(operation: &PlanOperation) -> bool {
-    matches!(
-        operation,
-        PlanOperation::EncodePcm { .. }
-            | PlanOperation::EncodeLossy { .. }
-            | PlanOperation::PcmToDsd { .. }
-            | PlanOperation::DsdToPcm { .. }
-            | PlanOperation::DsdRateChange { .. }
-            | PlanOperation::MetadataTransfer { .. }
-    )
 }
 
 async fn execute_commands(
@@ -762,9 +689,13 @@ mod tests {
     use crate::convert::pipeline::tool::blocking_test_runner::{
         tool_gate, BlockingToolRunner, ToolBehavior,
     };
-    use crate::convert::pipeline::types::PipelineStage;
+    use crate::convert::pipeline::types::{
+        CueSidecarPolicy, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
+        OverwritePolicy, PipelineStage, PublishPolicy, SacdArea, SourceOptions, StagePolicy,
+        StageRequirement, TrackId, TrackMetadata, TrackSelection, TrackSourceRef,
+    };
     use tempfile::TempDir;
-    use tonepoet_pipeline::{InputSource, OutputSink, ToolIdentifier};
+    use tonepoet_pipeline::{AudioFormat, InputSource, OutputSink, PipelineSettings, ToolIdentifier};
 
     use super::*;
 
@@ -801,6 +732,68 @@ mod tests {
         )
     }
 
+    fn metadata_test_request(root: &Path) -> PipelineRequest {
+        PipelineRequest {
+            job_id: "metadata-job".to_string(),
+            item_id: "metadata-item".to_string(),
+            container: root.join("album.iso"),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: Some(SacdArea::Stereo),
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            settings: PipelineSettings::default(),
+            worker_count: Some(1),
+            merge: false,
+            output_root: root.join("out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+                write_manifest: false,
+            },
+            log: LogPolicy {
+                root: root.join("logs"),
+                write_for_blocked: false,
+                write_json_log: false,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Disabled,
+                generate_cue: false,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    fn metadata_test_track(source_ref: TrackSourceRef) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref,
+            metadata: TrackMetadata {
+                title: Some("Track One".to_string()),
+                track_number: Some(1),
+                ..TrackMetadata::default()
+            },
+            expected_samples: Some(1_000),
+            sample_rate: 2_822_400,
+            bit_depth: None,
+        }
+    }
+
     async fn execute_commands_for_test(
         commands: Vec<PlannedCommand>,
         runner: &dyn ToolRunner,
@@ -824,6 +817,154 @@ mod tests {
             "test track".to_string(),
         )
         .await
+    }
+
+
+    #[test]
+    fn metadata_satisfaction_uses_typed_effects_not_argv_spelling() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut request = metadata_test_request(temp.path());
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.metadata.transfer_tags = true;
+        request.settings.metadata.preserve_artwork = true;
+        let track = metadata_test_track(TrackSourceRef::StagedFile(temp.path().join("source.flac")));
+        let plan_request = plan_request_for_track(
+            &request,
+            &track,
+            &temp.path().join("source.flac"),
+            &temp.path().join("out.flac"),
+            temp.path().join("work"),
+        )
+        .expect("per-track plan request builds");
+        let mut command = PlannedCommand::new(
+            ToolIdentifier::Ffmpeg,
+            vec!["arguments".into(), "intentionally".into(), "irrelevant".into()],
+            InputSource::Path(temp.path().join("encoded.flac")),
+            OutputSink::Path(temp.path().join("out.flac")),
+            None,
+            "synthetic metadata transfer",
+        );
+        command.metadata_effect.source_tags_transferred_from_original_source = true;
+        command.metadata_effect.artwork_transferred_from_original_source = true;
+        let plan = ConversionPlan::execute_with_cleanup(vec![command], Vec::new(), None);
+
+        let satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
+
+        assert!(satisfaction.source_tags_transferred);
+        assert!(satisfaction.artwork_transferred);
+        assert!(!satisfaction.source_audio_md5_written);
+        assert!(!satisfaction.authoritative_tags_applied);
+    }
+
+    #[test]
+    fn current_input_preservation_does_not_satisfy_original_source_metadata_obligations() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut request = metadata_test_request(temp.path());
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.metadata.transfer_tags = true;
+        request.settings.metadata.preserve_artwork = true;
+        let track = metadata_test_track(TrackSourceRef::StagedFile(temp.path().join("source.flac")));
+        let plan_request = plan_request_for_track(
+            &request,
+            &track,
+            &temp.path().join("source.flac"),
+            &temp.path().join("out.flac"),
+            temp.path().join("work"),
+        )
+        .expect("per-track plan request builds");
+        let mut command = PlannedCommand::new(
+            ToolIdentifier::Ffmpeg,
+            vec!["arguments".into(), "remain".into(), "irrelevant".into()],
+            InputSource::Path(temp.path().join("intermediate.wav")),
+            OutputSink::Path(temp.path().join("out.flac")),
+            None,
+            "synthetic current-input metadata preservation",
+        );
+        command.metadata_effect.tags_preserved_from_command_input = true;
+        command.metadata_effect.artwork_preserved_from_command_input = true;
+        let plan = ConversionPlan::execute_with_cleanup(vec![command], Vec::new(), None);
+
+        let satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
+
+        assert!(!satisfaction.source_tags_transferred);
+        assert!(!satisfaction.artwork_transferred);
+        assert!(!satisfaction.source_audio_md5_written);
+        assert!(!satisfaction.authoritative_tags_applied);
+    }
+
+    #[test]
+    fn planner_owned_metadata_effects_do_not_apply_authoritative_tags() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut request = metadata_test_request(temp.path());
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.metadata.transfer_tags = true;
+        request.settings.metadata.preserve_artwork = true;
+        request.settings.metadata.store_source_audio_md5 = true;
+        let track = metadata_test_track(TrackSourceRef::StagedFile(temp.path().join("source.flac")));
+        let plan_request = plan_request_for_track(
+            &request,
+            &track,
+            &temp.path().join("source.flac"),
+            &temp.path().join("out.flac"),
+            temp.path().join("work"),
+        )
+        .expect("per-track plan request builds");
+        let mut command = PlannedCommand::new(
+            ToolIdentifier::Ffmpeg,
+            vec!["arguments".into(), "remain".into(), "irrelevant".into()],
+            InputSource::Path(temp.path().join("encoded.flac")),
+            OutputSink::Path(temp.path().join("out.flac")),
+            None,
+            "synthetic planner-owned metadata effects",
+        );
+        command.metadata_effect.source_tags_transferred_from_original_source = true;
+        command.metadata_effect.artwork_transferred_from_original_source = true;
+        command.metadata_effect.source_audio_md5_written = true;
+        let plan = ConversionPlan::execute_with_cleanup(vec![command], Vec::new(), None);
+
+        let satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
+
+        assert!(satisfaction.source_tags_transferred);
+        assert!(satisfaction.artwork_transferred);
+        assert!(satisfaction.source_audio_md5_written);
+        assert!(
+            !satisfaction.authoritative_tags_applied,
+            "planner-owned source tag, artwork, and MD5 effects must not stand in for orchestrator-owned authoritative tags"
+        );
+    }
+
+    #[test]
+    fn sacd_track_plan_reports_no_planner_metadata_satisfaction_for_source_tag_policy() {
+        let temp = TempDir::new().expect("temp dir");
+        let realized_input = temp.path().join("realized.dsf");
+        std::fs::write(&realized_input, b"DSD ").expect("realized dsf placeholder");
+        let staged_output = temp.path().join("out.flac");
+        let mut request = metadata_test_request(temp.path());
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.metadata.transfer_tags = true;
+        request.settings.metadata.preserve_artwork = true;
+        let track = metadata_test_track(TrackSourceRef::SacdTrack {
+            iso: temp.path().join("album.iso"),
+            track_index: 1,
+            area: SacdArea::Stereo,
+        });
+        let plan_request = plan_request_for_track(
+            &request,
+            &track,
+            &realized_input,
+            &staged_output,
+            temp.path().join("work"),
+        )
+        .expect("SACD per-track plan request builds");
+
+        let plan = plan_conversion(&plan_request).expect("SACD per-track plan builds");
+        let satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
+
+        assert_eq!(
+            satisfaction,
+            PlannedMetadataSatisfaction::none(),
+            "suppressed original-source tag/artwork transfer must not report planner metadata satisfaction"
+        );
     }
 
     #[test]
@@ -1516,7 +1657,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
             },
             artifact: None,
             ok: false,
-            metadata_written_by_plan: false,
+            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
         }
     }
 

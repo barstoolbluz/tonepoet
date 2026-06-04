@@ -2,7 +2,7 @@
 
 use crate::enums::PreferredTool;
 use crate::error::{PlanningError, Result};
-use crate::plan::{PlanContext, PlanStep, PlannedCommand};
+use crate::plan::{MetadataPlanEffect, PlanContext, PlanStep, PlannedCommand};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -132,10 +132,25 @@ pub trait ToolPlugin: Send + Sync {
     /// Capability score for a planned logical step.
     fn supports(&self, context: &PlanContext<'_>, step: &PlanStep) -> ToolSupport;
 
+    /// Return the typed planner-owned metadata effect for this logical step.
+    ///
+    /// This is the authoritative planner signal used for metadata-step pruning
+    /// and orchestration satisfaction. Implementations must report only effects
+    /// they actually produce for the selected step; callers must not infer these
+    /// facts by parsing command-line arguments.
+    fn metadata_effect(
+        &self,
+        _context: &PlanContext<'_>,
+        _step: &PlanStep,
+    ) -> MetadataPlanEffect {
+        MetadataPlanEffect::none()
+    }
+
     /// Report whether this plugin writes the requested metadata/artwork policy for this step.
     ///
-    /// The default is conservative: encoders do not get credit for metadata
-    /// preservation unless they explicitly say so.
+    /// Deprecated compatibility hook. New planner/orchestrator code should use
+    /// [`ToolPlugin::metadata_effect`] so distinct metadata obligations cannot
+    /// collapse into a coarse yes/no disposition.
     fn metadata_disposition(
         &self,
         _context: &PlanContext<'_>,
@@ -219,6 +234,16 @@ impl ToolRegistry {
         step: &PlanStep,
     ) -> Result<ToolIdentifier> {
         Ok(self.select_plugin(context, step)?.id())
+    }
+
+    /// Return the selected plugin's typed metadata effect for a logical step.
+    pub fn metadata_effect_for_step(
+        &self,
+        context: &PlanContext<'_>,
+        step: &PlanStep,
+    ) -> Result<MetadataPlanEffect> {
+        let plugin = self.select_plugin(context, step)?;
+        Ok(plugin.metadata_effect(context, step))
     }
 
     /// Return the selected plugin's metadata behavior for a logical step.
