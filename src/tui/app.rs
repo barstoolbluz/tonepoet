@@ -324,6 +324,21 @@ fn source_path_is_dsd(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Read an embedded CUESHEET tag from a FLAC file for Convert-screen preview.
+/// Returns None if the file has no embedded cue or lofty can't read it.
+fn read_embedded_cuesheet_for_preview(path: &Path) -> Option<crate::tui::cue_parser::CueSheet> {
+    use lofty::prelude::*;
+    let tagged = lofty::read_from_path(path).ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    let cue_text = tag.items()
+        .find(|item| {
+            matches!(item.key(), lofty::tag::ItemKey::Unknown(key) if key.eq_ignore_ascii_case("CUESHEET"))
+        })
+        .and_then(|item| item.value().text().map(|s| s.to_string()))?;
+    let sheet = crate::tui::cue_parser::parse_cue(&cue_text);
+    if sheet.tracks.len() >= 2 { Some(sheet) } else { None }
+}
+
 
 
 /// Merge mode for the output options pane
@@ -611,43 +626,46 @@ impl SourceMode {
             }
         }
 
-        // CUE sidecar detection
-        if let Some(cue_path) = crate::tui::cue_parser::find_sidecar_cue(&path) {
-            if let Ok(sheet) = crate::tui::cue_parser::parse_cue_file(&cue_path) {
-                if sheet.tracks.len() >= 2 {
-                    let tracks: Vec<MultiTrackEntry> = sheet
-                        .tracks
-                        .iter()
-                        .map(|t| MultiTrackEntry {
-                            number: t.number,
-                            title: t.title.clone(),
-                            performer: t.performer.clone().or_else(|| sheet.performer.clone()),
-                            duration_display: None,
-                        })
-                        .collect();
+        // CUE detection: prefer embedded CUESHEET, fall back to sidecar.
+        let cue_sheet = read_embedded_cuesheet_for_preview(&path)
+            .or_else(|| {
+                crate::tui::cue_parser::find_sidecar_cue(&path)
+                    .and_then(|p| crate::tui::cue_parser::parse_cue_file(&p).ok())
+            });
+        if let Some(sheet) = cue_sheet {
+            if sheet.tracks.len() >= 2 {
+                let tracks: Vec<MultiTrackEntry> = sheet
+                    .tracks
+                    .iter()
+                    .map(|t| MultiTrackEntry {
+                        number: t.number,
+                        title: t.title.clone(),
+                        performer: t.performer.clone().or_else(|| sheet.performer.clone()),
+                        duration_display: None,
+                    })
+                    .collect();
 
-                    let mut meta = metadata;
-                    if meta.album.is_none() {
-                        meta.album = sheet.title.clone();
-                    }
-                    if meta.artist.is_none() {
-                        meta.artist = sheet.performer.clone();
-                    }
-
-                    let track_count = tracks.len();
-                    return Self::MultiTrack {
-                        path,
-                        info,
-                        metadata: meta,
-                        tracks,
-                        area_label: None,
-                        album_title: sheet.title,
-                        album_artist: sheet.performer,
-                        scroll: 0,
-                        cursor: 0,
-                        selected: vec![true; track_count],
-                    };
+                let mut meta = metadata;
+                if meta.album.is_none() {
+                    meta.album = sheet.title.clone();
                 }
+                if meta.artist.is_none() {
+                    meta.artist = sheet.performer.clone();
+                }
+
+                let track_count = tracks.len();
+                return Self::MultiTrack {
+                    path,
+                    info,
+                    metadata: meta,
+                    tracks,
+                    area_label: None,
+                    album_title: sheet.title,
+                    album_artist: sheet.performer,
+                    scroll: 0,
+                    cursor: 0,
+                    selected: vec![true; track_count],
+                };
             }
         }
 
