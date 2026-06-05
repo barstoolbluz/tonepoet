@@ -301,7 +301,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
         // Register quality pills
         let mut qx = label_col;
         let mut quality_labels: Vec<&str> = vec!["low", "med", "high", "vhigh", "ultra"];
-        if *state.resampler.selected_value() == ResamplerChoice::Sox {
+        if matches!(*state.resampler.selected_value(), ResamplerChoice::Sox | ResamplerChoice::Ssrc) {
             quality_labels.push("insane");
         }
         for (i, label) in quality_labels.iter().enumerate() {

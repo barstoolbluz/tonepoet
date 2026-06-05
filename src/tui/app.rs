@@ -137,8 +137,6 @@ pub enum FormatSettingsFocus {
     WavPackBitrate,
     WavPackCorrection,
     // SSRC
-    SsrcProfile,
-    SsrcInsane,
     SsrcAttenuation,
     SsrcMinPhase,
     SsrcPdf,
@@ -192,8 +190,6 @@ pub enum FormatSettingsKind {
         correction: bool,
     },
     Ssrc {
-        profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
-        insane: bool,
         attenuation_input: crate::tui::text_input::TextInputState,
         min_phase: bool,
         pdf_type: Option<tonepoet_pipeline::enums::SsrcPdfType>,
@@ -922,9 +918,6 @@ pub struct FormatState {
     /// Resampling quality preset. Default: Ultra.
     pub resample_quality: tonepoet_pipeline::enums::ResampleQuality,
     /// SSRC explicit profile override. None = derive from resample_quality.
-    pub ssrc_profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
-    /// SSRC insane mode (force insane profile). Default: false.
-    pub ssrc_insane_mode: bool,
     /// SSRC output attenuation in dB (0.0-99.9). None = no attenuation.
     pub ssrc_attenuation_db: Option<f32>,
     /// SSRC minimum phase filters. Default: false (linear phase).
@@ -1134,8 +1127,6 @@ impl FormatState {
             wavpack_bitrate_kbps: 320,
             wavpack_correction: true,
             resample_quality: tonepoet_pipeline::enums::ResampleQuality::Ultra,
-            ssrc_profile: None,
-            ssrc_insane_mode: false,
             ssrc_attenuation_db: None,
             ssrc_min_phase: false,
             ssrc_pdf_type: None,

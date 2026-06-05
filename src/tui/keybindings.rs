@@ -6412,9 +6412,7 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
             app.convert.format.wavpack_bitrate_kbps = bitrate;
             app.convert.format.wavpack_correction = *correction;
         }
-        FormatSettingsKind::Ssrc { profile, insane, ref attenuation_input, min_phase, pdf_type } => {
-            app.convert.format.ssrc_profile = *profile;
-            app.convert.format.ssrc_insane_mode = *insane;
+        FormatSettingsKind::Ssrc { ref attenuation_input, min_phase, pdf_type } => {
             app.convert.format.ssrc_attenuation_db = attenuation_input
                 .text.trim().parse::<f32>().ok()
                 .filter(|v| (0.0..=99.9).contains(v));
@@ -6535,11 +6533,9 @@ fn format_settings_focus_next(kind: &FormatSettingsKind, focus: FormatSettingsFo
             }
         }
         FormatSettingsKind::Ssrc { .. } => match focus {
-            FormatSettingsFocus::SsrcProfile => FormatSettingsFocus::SsrcInsane,
-            FormatSettingsFocus::SsrcInsane => FormatSettingsFocus::SsrcAttenuation,
             FormatSettingsFocus::SsrcAttenuation => FormatSettingsFocus::SsrcMinPhase,
             FormatSettingsFocus::SsrcMinPhase => FormatSettingsFocus::SsrcPdf,
-            _ => FormatSettingsFocus::SsrcProfile,
+            _ => FormatSettingsFocus::SsrcAttenuation,
         },
         FormatSettingsKind::Sox { chebyshev, .. } => {
             match focus {
@@ -6614,9 +6610,7 @@ fn format_settings_focus_prev(kind: &FormatSettingsKind, focus: FormatSettingsFo
             }
         }
         FormatSettingsKind::Ssrc { .. } => match focus {
-            FormatSettingsFocus::SsrcProfile => FormatSettingsFocus::SsrcPdf,
-            FormatSettingsFocus::SsrcInsane => FormatSettingsFocus::SsrcProfile,
-            FormatSettingsFocus::SsrcAttenuation => FormatSettingsFocus::SsrcInsane,
+            FormatSettingsFocus::SsrcAttenuation => FormatSettingsFocus::SsrcPdf,
             FormatSettingsFocus::SsrcMinPhase => FormatSettingsFocus::SsrcAttenuation,
             _ => FormatSettingsFocus::SsrcMinPhase,
         },
@@ -6842,38 +6836,12 @@ fn handle_format_settings_field_key(
             }
         }
         FormatSettingsKind::Ssrc {
-            profile,
-            insane,
             attenuation_input,
             min_phase,
             pdf_type,
         } => {
-            use tonepoet_pipeline::enums::{SsrcPdfType, SsrcProfile};
+            use tonepoet_pipeline::enums::SsrcPdfType;
             match focus {
-                FormatSettingsFocus::SsrcProfile => {
-                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
-                        let profiles = [
-                            None,
-                            Some(SsrcProfile::Fast),
-                            Some(SsrcProfile::Short),
-                            Some(SsrcProfile::Standard),
-                            Some(SsrcProfile::Long),
-                            Some(SsrcProfile::High),
-                        ];
-                        let cur = profiles.iter().position(|p| p == profile).unwrap_or(0);
-                        let next = if key.code == KeyCode::Left {
-                            if cur == 0 { profiles.len() - 1 } else { cur - 1 }
-                        } else {
-                            (cur + 1) % profiles.len()
-                        };
-                        *profile = profiles[next];
-                    }
-                }
-                FormatSettingsFocus::SsrcInsane => {
-                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
-                        *insane = !*insane;
-                    }
-                }
                 FormatSettingsFocus::SsrcAttenuation => {
                     super::text_input::handle_text_input_key(attenuation_input, key);
                 }
@@ -7132,25 +7100,6 @@ fn handle_format_settings_mouse(
                     *correction = i == 1;
                     return;
                 }
-                (FormatSettingsKind::Ssrc { ref mut profile, .. }, TuiButton::FormatSettingsSsrcProfile(i)) => {
-                    use tonepoet_pipeline::enums::SsrcProfile;
-                    let profiles = [
-                        None,
-                        Some(SsrcProfile::Fast),
-                        Some(SsrcProfile::Short),
-                        Some(SsrcProfile::Standard),
-                        Some(SsrcProfile::Long),
-                        Some(SsrcProfile::High),
-                    ];
-                    if let Some(p) = profiles.get(i) {
-                        *profile = *p;
-                    }
-                    return;
-                }
-                (FormatSettingsKind::Ssrc { ref mut insane, .. }, TuiButton::FormatSettingsSsrcInsane(i)) => {
-                    *insane = i == 1;
-                    return;
-                }
                 (FormatSettingsKind::Ssrc { ref mut min_phase, .. }, TuiButton::FormatSettingsSsrcMinPhase(i)) => {
                     *min_phase = i == 1;
                     return;
@@ -7241,11 +7190,9 @@ fn handle_format_settings_mouse(
             FormatSettingsKind::Ssrc { .. } => {
                 let field5_y = popup_y + 6;
                 match my {
-                    y if y == field1_y => Some(FormatSettingsFocus::SsrcProfile),
-                    y if y == field2_y => Some(FormatSettingsFocus::SsrcInsane),
-                    y if y == field3_y => Some(FormatSettingsFocus::SsrcAttenuation),
-                    y if y == field4_y => Some(FormatSettingsFocus::SsrcMinPhase),
-                    y if y == field5_y => Some(FormatSettingsFocus::SsrcPdf),
+                    y if y == field1_y => Some(FormatSettingsFocus::SsrcAttenuation),
+                    y if y == field2_y => Some(FormatSettingsFocus::SsrcMinPhase),
+                    y if y == field3_y => Some(FormatSettingsFocus::SsrcPdf),
                     _ => None,
                 }
             }
@@ -11271,7 +11218,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     ResampleQuality::VeryHigh,
                     ResampleQuality::Ultra,
                 ];
-                if *app.convert.format.resampler.selected_value() == ResamplerChoice::Sox {
+                if matches!(*app.convert.format.resampler.selected_value(), ResamplerChoice::Sox | ResamplerChoice::Ssrc) {
                     qualities.push(ResampleQuality::Insane);
                 }
                 if let Some(&q) = qualities.get(i) {
@@ -11285,15 +11232,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 let (kind, focus) = match *fmt.resampler.selected_value() {
                     ResamplerChoice::Ssrc => (
                         FormatSettingsKind::Ssrc {
-                            profile: fmt.ssrc_profile,
-                            insane: fmt.ssrc_insane_mode,
                             attenuation_input: super::text_input::TextInputState::new(
                                 fmt.ssrc_attenuation_db.map(|v| format!("{:.1}", v)).unwrap_or_default(),
                             ),
                             min_phase: fmt.ssrc_min_phase,
                             pdf_type: fmt.ssrc_pdf_type,
                         },
-                        FormatSettingsFocus::SsrcProfile,
+                        FormatSettingsFocus::SsrcAttenuation,
                     ),
                     ResamplerChoice::Sox => (
                         FormatSettingsKind::Sox {
@@ -11699,8 +11644,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsWavPackMode(_)
             | TuiButton::FormatSettingsWavPackHybrid(_)
             | TuiButton::FormatSettingsWavPackCorrection(_)
-            | TuiButton::FormatSettingsSsrcProfile(_)
-            | TuiButton::FormatSettingsSsrcInsane(_)
             | TuiButton::FormatSettingsSsrcMinPhase(_)
             | TuiButton::FormatSettingsSsrcPdf(_)
             | TuiButton::FormatSettingsSoxChebyshev(_)

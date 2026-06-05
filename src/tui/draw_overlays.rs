@@ -954,12 +954,10 @@ fn draw_format_settings(
             correction,
         } => draw_wavpack_fields(f, *mode, *hybrid, bitrate_input, *correction, focus, &chunks, buttons),
         FormatSettingsKind::Ssrc {
-            profile,
-            insane,
             attenuation_input,
             min_phase,
             pdf_type,
-        } => draw_ssrc_fields(f, *profile, *insane, attenuation_input, *min_phase, *pdf_type, focus, &chunks, buttons),
+        } => draw_ssrc_fields(f, attenuation_input, *min_phase, *pdf_type, focus, &chunks, buttons),
         FormatSettingsKind::Sox {
             chebyshev,
             bandwidth_input,
@@ -1566,8 +1564,6 @@ fn draw_wavpack_fields(
 
 fn draw_ssrc_fields(
     f: &mut Frame,
-    profile: Option<tonepoet_pipeline::enums::SsrcProfile>,
-    insane: bool,
     attenuation_input: &super::text_input::TextInputState,
     min_phase: bool,
     pdf_type: Option<tonepoet_pipeline::enums::SsrcPdfType>,
@@ -1575,66 +1571,12 @@ fn draw_ssrc_fields(
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
 ) {
-    use tonepoet_pipeline::enums::{SsrcPdfType, SsrcProfile};
+    use tonepoet_pipeline::enums::SsrcPdfType;
 
-    // Row 1: Profile pills (fast/short/std/long/high)
-    let prof_focused = focus == FormatSettingsFocus::SsrcProfile;
-    let prof_label_style = if prof_focused { theme::bright() } else { theme::muted() };
-    let profiles = [
-        (SsrcProfile::Fast, "fast"),
-        (SsrcProfile::Short, "short"),
-        (SsrcProfile::Standard, "std"),
-        (SsrcProfile::Long, "long"),
-        (SsrcProfile::High, "high"),
-    ];
-    let mut prof_spans = vec![Span::styled("  profile        ", prof_label_style)];
-    let mut px = chunks[1].x + 17;
-    for (i, (p, label)) in profiles.iter().enumerate() {
-        let selected = profile == Some(*p);
-        let style = if selected {
-            Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::GREEN)
-                .add_modifier(Modifier::BOLD)
-        } else if prof_focused {
-            Style::default().fg(theme::TEXT_DIM)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
-        prof_spans.push(Span::styled(pill_text, style));
-        buttons.record_button(
-            TuiButton::FormatSettingsSsrcProfile(i),
-            Rect::new(px, chunks[1].y, pill_w, 1),
-        );
-        px += pill_w;
-        if i + 1 < profiles.len() {
-            prof_spans.push(Span::raw(" "));
-            px += 1;
-        }
-    }
-    f.render_widget(Paragraph::new(Line::from(prof_spans)), chunks[1]);
-
-    // Row 2: Insane toggle (off/on)
-    let ins_focused = focus == FormatSettingsFocus::SsrcInsane;
-    let ins_label_style = if ins_focused { theme::bright() } else { theme::muted() };
-    let (off_style, on_style) = toggle_pill_styles(insane, ins_focused);
-    let ins_line = Line::from(vec![
-        Span::styled("  insane         ", ins_label_style),
-        Span::styled(" off ", off_style),
-        Span::raw(" "),
-        Span::styled(" on ", on_style),
-    ]);
-    f.render_widget(Paragraph::new(ins_line), chunks[2]);
-    let ix = chunks[2].x + 17;
-    buttons.record_button(TuiButton::FormatSettingsSsrcInsane(0), Rect::new(ix, chunks[2].y, 5, 1));
-    buttons.record_button(TuiButton::FormatSettingsSsrcInsane(1), Rect::new(ix + 6, chunks[2].y, 4, 1));
-
-    // Row 3: Attenuation text entry
+    // Row 1: Attenuation text entry
     let att_focused = focus == FormatSettingsFocus::SsrcAttenuation;
     let att_ls = if att_focused { theme::bright() } else { theme::muted() };
-    let att_vw = chunks[3].width.saturating_sub(22) as usize;
+    let att_vw = chunks[1].width.saturating_sub(22) as usize;
     let (att_v, att_cc) = attenuation_input.view(att_vw.max(1));
     let (att_d, att_is_placeholder) = if att_v.is_empty() { ("0".to_string(), true) } else { (att_v, false) };
     let att_bg = if att_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
@@ -1643,22 +1585,22 @@ fn draw_ssrc_fields(
         Span::styled("  attenuation    ", att_ls),
         Span::styled(format!(" {} ", att_d), Style::default().fg(att_fg).bg(att_bg)),
         Span::styled(" dB", theme::muted()),
-    ])), chunks[3]);
-    if att_focused { f.set_cursor(chunks[3].x + 18 + att_cc, chunks[3].y); }
+    ])), chunks[1]);
+    if att_focused { f.set_cursor(chunks[1].x + 18 + att_cc, chunks[1].y); }
 
-    // Row 4: Min phase toggle (off/on)
+    // Row 2: Min phase toggle (off/on)
     let mp_focused = focus == FormatSettingsFocus::SsrcMinPhase;
     let mp_ls = if mp_focused { theme::bright() } else { theme::muted() };
     let (mp_off, mp_on) = toggle_pill_styles(min_phase, mp_focused);
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  min phase      ", mp_ls),
         Span::styled(" off ", mp_off), Span::raw(" "), Span::styled(" on ", mp_on),
-    ])), chunks[4]);
-    let mx = chunks[4].x + 17;
-    buttons.record_button(TuiButton::FormatSettingsSsrcMinPhase(0), Rect::new(mx, chunks[4].y, 5, 1));
-    buttons.record_button(TuiButton::FormatSettingsSsrcMinPhase(1), Rect::new(mx + 6, chunks[4].y, 4, 1));
+    ])), chunks[2]);
+    let mx = chunks[2].x + 17;
+    buttons.record_button(TuiButton::FormatSettingsSsrcMinPhase(0), Rect::new(mx, chunks[2].y, 5, 1));
+    buttons.record_button(TuiButton::FormatSettingsSsrcMinPhase(1), Rect::new(mx + 6, chunks[2].y, 4, 1));
 
-    // Row 5: PDF type pills (none/rect/tri)
+    // Row 3: PDF type pills (none/rect/tri)
     let pdf_focused = focus == FormatSettingsFocus::SsrcPdf;
     let pdf_ls = if pdf_focused { theme::bright() } else { theme::muted() };
     let pdfs = [
@@ -1667,7 +1609,7 @@ fn draw_ssrc_fields(
         (Some(SsrcPdfType::Triangular), "tri"),
     ];
     let mut pdf_spans = vec![Span::styled("  dither pdf     ", pdf_ls)];
-    let mut pdx = chunks[5].x + 17;
+    let mut pdx = chunks[3].x + 17;
     for (i, (p, label)) in pdfs.iter().enumerate() {
         let selected = *p == pdf_type;
         let style = if selected {
@@ -1680,11 +1622,11 @@ fn draw_ssrc_fields(
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
         pdf_spans.push(Span::styled(pill_text, style));
-        buttons.record_button(TuiButton::FormatSettingsSsrcPdf(i), Rect::new(pdx, chunks[5].y, pill_w, 1));
+        buttons.record_button(TuiButton::FormatSettingsSsrcPdf(i), Rect::new(pdx, chunks[3].y, pill_w, 1));
         pdx += pill_w;
         if i + 1 < pdfs.len() { pdf_spans.push(Span::raw(" ")); pdx += 1; }
     }
-    f.render_widget(Paragraph::new(Line::from(pdf_spans)), chunks[5]);
+    f.render_widget(Paragraph::new(Line::from(pdf_spans)), chunks[3]);
 }
 
 /// Build the enriched help content for a given format settings kind.
@@ -1923,34 +1865,6 @@ fn format_settings_help_content(kind: &FormatSettingsKind) -> Vec<(&'static str,
             ]),
         ],
         FormatSettingsKind::Ssrc { .. } => vec![
-            ("profile", &[
-                "Controls the FIR filter length used during sample rate",
-                "conversion. Longer filters provide steeper rolloff and better",
-                "stopband rejection at the cost of more processing time:",
-                "",
-                "  Fast       Shortest filter. Quick but may allow some",
-                "             aliasing. Suitable for previews.",
-                "",
-                "  Standard   Good balance for most conversions.",
-                "",
-                "  High       Recommended for quality-critical work.",
-                "",
-                "  Insane     Maximum filter length. Extremely clean conversion",
-                "             with deep stopband rejection. Slowest.",
-                "",
-                "SSRC uses brick-wall sinc interpolation, which produces",
-                "exceptionally clean results for integer-ratio conversions",
-                "(e.g., 96 kHz → 48 kHz, 88.2 kHz → 44.1 kHz).",
-            ]),
-            ("insane", &[
-                "Forces the maximum quality profile regardless of the profile",
-                "setting above. This is a legacy toggle from the original SSRC",
-                "command-line tool — effectively equivalent to selecting the",
-                "Insane profile, but as a separate override.",
-                "",
-                "When both this toggle and a profile are set, the insane flag",
-                "takes precedence.",
-            ]),
             ("attenuation", &[
                 "Output attenuation in decibels (0.0–99.9 dB). Reduces the",
                 "output signal level to prevent intersample clipping, which can",
@@ -2515,7 +2429,7 @@ pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
         FormatSettingsKind::Opus { .. } => 4,
         FormatSettingsKind::Mp3 { .. } => 4,
         FormatSettingsKind::WavPack { .. } => 4,
-        FormatSettingsKind::Ssrc { .. } => 5,
+        FormatSettingsKind::Ssrc { .. } => 3,
         FormatSettingsKind::Sox { .. } => 10,
         FormatSettingsKind::Soxr { .. } => 3,
     }

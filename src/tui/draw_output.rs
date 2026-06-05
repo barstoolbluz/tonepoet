@@ -253,7 +253,7 @@ pub fn draw_format_pane(
             (ResampleQuality::VeryHigh, "vhigh"),
             (ResampleQuality::Ultra, "ultra"),
         ];
-        if *format_state.resampler.selected_value() == ResamplerChoice::Sox {
+        if matches!(*format_state.resampler.selected_value(), ResamplerChoice::Sox | ResamplerChoice::Ssrc) {
             quality_list.push((ResampleQuality::Insane, "insane"));
         }
         let quality_count = quality_list.len();

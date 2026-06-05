@@ -386,8 +386,8 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         },
         ssrc: tonepoet_pipeline::SsrcSettings {
             force: false,
-            insane_mode: format.ssrc_insane_mode,
-            profile: format.ssrc_profile,
+            insane_mode: false,
+            profile: None,
             attenuation_db: format.ssrc_attenuation_db,
             min_phase: format.ssrc_min_phase,
             pdf_type: format.ssrc_pdf_type,

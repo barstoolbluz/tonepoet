@@ -72,10 +72,6 @@ pub enum TuiButton {
     ResampleQualityPill(usize),
     /// Resampler-specific settings pill (e.g. "ssrc settings").
     ResamplerSettingsButton,
-    /// SSRC profile pills inside the FormatSettings overlay.
-    FormatSettingsSsrcProfile(usize),
-    /// SSRC insane toggle pills inside the FormatSettings overlay.
-    FormatSettingsSsrcInsane(usize),
     /// SSRC min phase toggle pills inside the FormatSettings overlay.
     FormatSettingsSsrcMinPhase(usize),
     /// SSRC PDF type pills inside the FormatSettings overlay.
@@ -253,8 +249,6 @@ impl TuiButton {
             | Self::FormatSettingsWavPackMode(_)
             | Self::FormatSettingsWavPackHybrid(_)
             | Self::FormatSettingsWavPackCorrection(_)
-            | Self::FormatSettingsSsrcProfile(_)
-            | Self::FormatSettingsSsrcInsane(_)
             | Self::FormatSettingsSsrcMinPhase(_)
             | Self::FormatSettingsSsrcPdf(_)
             | Self::FormatSettingsSoxChebyshev(_)
