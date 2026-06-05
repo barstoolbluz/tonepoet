@@ -30,7 +30,9 @@ use crate::dff_footer::{render_dff_footer, DffMetadata};
 use crate::dff_writer::DffWriter;
 use crate::dsf_writer::{DsfWriter, SACD_SAMPLING_FREQUENCY};
 use crate::dst::{decode_frame, DstError};
-use crate::frame::{FrameError, FrameReader};
+use crate::frame::{
+    DroppedFrameEvent, FrameError, FrameFormat, FrameReader, FrameReaderStats, RecoveryEvent,
+};
 use crate::id3::{render_id3v24, Id3Metadata};
 use crate::iso_reader::IsoReader;
 use std::borrow::Cow;
@@ -88,10 +90,13 @@ impl TimeFilter {
     }
 }
 
-/// Options bundle for [`extract_track`]. Forward-compatible with
-/// future Series-3 parity items (ID3 mode, edit-master, concatenate,
-/// etc.) — new knobs land here without changing the function
-/// signature.
+/// Options bundle for [`extract_track`].
+///
+/// This struct intentionally remains source-compatible with the original
+/// public API: callers may still construct it with a struct literal using
+/// exactly these public fields. New high-integrity controls live in
+/// [`ExtractIntegrityOptions`] and are supplied through
+/// [`extract_track_with_integrity_options`].
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
     pub start_lsn: u64,
@@ -156,6 +161,88 @@ impl ExtractOptions {
     }
 }
 
+/// Additive controls for integrity-sensitive extraction.
+///
+/// These controls were deliberately not added to [`ExtractOptions`], because
+/// `ExtractOptions` is public and existing downstream callers may construct it
+/// with a struct literal. Use [`extract_track_with_integrity_options`] when the
+/// caller can supply area-TOC state or wants damaged-disc recovery.
+#[derive(Debug, Clone)]
+/// SB-AUDIT: SB-AUDIO-012..SB-AUDIO-015
+pub struct ExtractIntegrityOptions {
+    /// Authoritative area-TOC frame format. When set, extraction validates
+    /// every audio sector header against it and uses it to choose DST versus
+    /// plain-DSD frame-info layout.
+    pub frame_format: Option<FrameFormat>,
+    /// If true, the frame reader records and skips malformed/unreadable
+    /// sectors instead of failing immediately. The in-progress frame is
+    /// discarded whenever a sector is skipped so unrelated payloads are never
+    /// joined.
+    pub recover_sector_errors: bool,
+    /// If true, a DST frame whose channel hint disagrees with the area TOC
+    /// aborts extraction. The default is true: validation workflows are
+    /// fail-fast unless the caller deliberately opts into salvage mode.
+    pub strict_channel_count: bool,
+}
+
+impl Default for ExtractIntegrityOptions {
+    fn default() -> Self {
+        Self {
+            frame_format: None,
+            recover_sector_errors: false,
+            strict_channel_count: true,
+        }
+    }
+}
+
+impl ExtractIntegrityOptions {
+    /// Strict validation profile. Malformed sectors, read errors, invalid
+    /// timecodes, incomplete frames, frame-format mismatches, and strict
+    /// channel-count mismatches fail the extraction. This is the default and
+    /// should be used for regression validation and byte-exact comparisons.
+    pub fn strict() -> Self {
+        Self::default()
+    }
+
+    pub fn new() -> Self {
+        Self::strict()
+    }
+
+    /// Deliberate damaged-disc salvage profile. The frame reader skips
+    /// unreadable/malformed sectors, discards any in-progress frame at each
+    /// skip boundary, records every skipped-sector and dropped-frame detail
+    /// in [`ExtractReport::integrity`], and returns success only with an
+    /// explicit non-clean integrity report.
+    pub fn salvage() -> Self {
+        Self {
+            recover_sector_errors: true,
+            strict_channel_count: false,
+            ..Self::default()
+        }
+    }
+
+    /// Attach the area-TOC frame format. This is the preferred constructor
+    /// path for high-integrity extraction because it makes the area TOC the
+    /// source of truth and rejects sectors whose compression bit disagrees.
+    pub fn with_frame_format(mut self, frame_format: FrameFormat) -> Self {
+        self.frame_format = Some(frame_format);
+        self
+    }
+
+    /// Continue extraction after malformed or unreadable sectors. Use when
+    /// salvaging damaged ISOs; leave disabled for validation runs.
+    pub fn with_sector_recovery(mut self, recover: bool) -> Self {
+        self.recover_sector_errors = recover;
+        self
+    }
+
+    /// Treat DST channel-count hint mismatches as fatal parser errors.
+    pub fn with_strict_channel_count(mut self, strict: bool) -> Self {
+        self.strict_channel_count = strict;
+        self
+    }
+}
+
 /// Errors from `extract_track`.
 #[derive(Debug)]
 pub enum ExtractError {
@@ -197,17 +284,155 @@ impl From<DstError> for ExtractError {
     }
 }
 
-/// Summary returned on successful extraction.
+/// Summary returned by the source-compatible [`extract_track`] API.
+///
+/// This struct intentionally keeps the original two public fields so existing
+/// downstream struct literals and field accesses continue to compile. Use
+/// [`extract_track_with_integrity_options`] to obtain the full
+/// [`ExtractReport`] with sector recovery and parser-integrity diagnostics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExtractStats {
     /// Number of frames **written to output**. Frames dropped by
-    /// the time filter are not counted, matching sacd_extract's
+    /// the parser time filter are not counted, matching sacd_extract's
     /// `count_frames` semantics (incremented only inside the
     /// keep-range branch of `frame_read_callback`).
     pub frames_read: u64,
     /// Total audio bytes pushed to the writer (pre-pad,
     /// post-filter).
     pub audio_bytes: u64,
+}
+
+/// Detailed parser and recovery state returned by
+/// [`extract_track_with_integrity_options`].
+#[derive(Debug, Clone, Default)]
+/// SB-AUDIT: SB-AUDIO-014..SB-AUDIO-015
+pub struct ExtractIntegrityReport {
+    /// Number of sectors successfully read from the ISO frame range.
+    pub sectors_read: u64,
+    /// Number of sectors skipped by damaged-disc recovery. A non-zero
+    /// value means the extraction succeeded only by omitting source data.
+    pub sectors_skipped: u64,
+    /// Number of syntactically malformed audio sectors encountered.
+    pub malformed_sectors: u64,
+    /// Number of sector I/O errors observed while recovery was enabled.
+    pub io_errors: u64,
+    /// Number of complete parser frames emitted before container writes.
+    pub parser_frames_emitted: u64,
+    /// Number of parser frames rejected by the timecode filter.
+    pub frames_filtered: u64,
+    /// Number of partial frames discarded at a frame boundary, sector skip,
+    /// or end-of-range flush.
+    pub frames_dropped_incomplete: u64,
+    /// Number of DST frame channel hints that disagreed with the area TOC.
+    pub channel_mismatches: u64,
+    /// Number of sector header compression bits that disagreed with the
+    /// authoritative area-TOC frame format.
+    pub frame_format_mismatches: u64,
+    /// Number of frame-info timecodes outside the normalized SACD ranges
+    /// (`seconds >= 60` or `frames >= 75`).
+    pub invalid_timecodes: u64,
+    /// Bytes emitted by the frame parser before DST decoding. For DST this
+    /// is encoded bytes; `ExtractStats::audio_bytes` is bytes actually written.
+    pub parser_bytes_emitted: u64,
+    /// Exact sector-level recovery log. A non-empty list means the
+    /// extraction result was salvaged, not clean. Each entry includes the
+    /// LSN, failure phase, and error text from the reader/parser.
+    pub recovery_events: Vec<RecoveryEvent>,
+    /// Exact partial-frame loss log. In normal mode these conditions are
+    /// fatal; in recovery mode they are reported here so callers can decide
+    /// whether a salvaged output is acceptable.
+    pub dropped_frame_events: Vec<DroppedFrameEvent>,
+}
+
+impl ExtractIntegrityReport {
+    fn from_reader_stats(reader: FrameReaderStats) -> Self {
+        let report = Self {
+            sectors_read: reader.sectors_read,
+            sectors_skipped: reader.sectors_skipped,
+            malformed_sectors: reader.malformed_sectors,
+            io_errors: reader.io_errors,
+            parser_frames_emitted: reader.frames_emitted,
+            frames_filtered: reader.frames_filtered,
+            frames_dropped_incomplete: reader.frames_dropped_incomplete,
+            channel_mismatches: reader.channel_mismatches,
+            frame_format_mismatches: reader.frame_format_mismatches,
+            invalid_timecodes: reader.invalid_timecodes,
+            parser_bytes_emitted: reader.bytes_emitted,
+            recovery_events: reader.recovery_events,
+            dropped_frame_events: reader.dropped_frame_events,
+        };
+        debug_assert_eq!(report.sectors_skipped as usize, report.recovery_events.len());
+        debug_assert!(
+            report.dropped_frame_events.len() <= report.frames_dropped_incomplete as usize
+        );
+        report
+    }
+
+    /// Per-sector recovery details, suitable for logging in the caller/UI.
+    pub fn recovery_events(&self) -> &[RecoveryEvent] {
+        &self.recovery_events
+    }
+
+    /// Partial-frame loss details, suitable for logging in the caller/UI.
+    pub fn dropped_frame_events(&self) -> &[DroppedFrameEvent] {
+        &self.dropped_frame_events
+    }
+
+    /// True when no parser/recovery anomaly was observed.
+    pub fn is_clean(&self) -> bool {
+        !self.integrity_loss_detected()
+    }
+
+    /// True when the extraction succeeded only under the damaged-disc
+    /// salvage contract.
+    pub fn is_salvaged(&self) -> bool {
+        self.integrity_loss_detected()
+    }
+
+    /// True when a nominally successful extraction still lost integrity
+    /// because damaged-sector recovery, incomplete-frame dropping, area
+    /// frame-format disagreement, channel disagreement, or invalid timecode
+    /// handling was required.
+    pub fn integrity_loss_detected(&self) -> bool {
+        self.sectors_skipped != 0
+            || self.malformed_sectors != 0
+            || self.io_errors != 0
+            || self.frames_dropped_incomplete != 0
+            || self.channel_mismatches != 0
+            || self.frame_format_mismatches != 0
+            || self.invalid_timecodes != 0
+    }
+}
+
+/// Full extraction result returned by the additive high-integrity API.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractReport {
+    /// Source-compatible frame/byte counters.
+    pub stats: ExtractStats,
+    /// Parser, sector-recovery, and integrity diagnostics.
+    pub integrity: ExtractIntegrityReport,
+}
+
+impl ExtractReport {
+    pub fn integrity_loss_detected(&self) -> bool {
+        self.integrity.integrity_loss_detected()
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.integrity.is_clean()
+    }
+
+    pub fn is_salvaged(&self) -> bool {
+        self.integrity.is_salvaged()
+    }
+
+    pub fn recovery_events(&self) -> &[RecoveryEvent] {
+        self.integrity.recovery_events()
+    }
+
+    pub fn dropped_frame_events(&self) -> &[DroppedFrameEvent] {
+        self.integrity.dropped_frame_events()
+    }
 }
 
 /// Extract a single track's DSD audio from `iso` into `output`,
@@ -246,7 +471,53 @@ pub fn extract_track<W: Write + Seek>(
     output: &mut W,
     opts: ExtractOptions,
 ) -> Result<ExtractStats, ExtractError> {
+    let report = extract_track_impl(
+        iso,
+        output,
+        opts,
+        ExtractIntegrityOptions::strict(),
+    )?;
+    debug_assert!(!report.integrity_loss_detected());
+    Ok(report.stats)
+}
+
+/// High-integrity extraction entry point.
+///
+/// This additive API preserves [`extract_track`] and [`ExtractOptions`] source
+/// compatibility while returning all recovery and parser-integrity state.
+/// In strict/default mode (`recover_sector_errors == false`), malformed
+/// sectors, read errors, invalid timecodes, frame-format mismatches, strict
+/// channel-count mismatches, and incomplete pending frames fail the operation.
+/// In salvage mode ([`ExtractIntegrityOptions::salvage`]), the operation may
+/// succeed after damaged sectors are skipped, but every skipped sector and
+/// dropped partial frame is retained in [`ExtractReport::integrity`]. A caller
+/// must treat `report.integrity_loss_detected() == true` as a salvaged,
+/// non-verification-grade extraction.
+pub fn extract_track_with_integrity_options<W: Write + Seek>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    integrity_options: ExtractIntegrityOptions,
+) -> Result<ExtractReport, ExtractError> {
+    extract_track_impl(iso, output, opts, integrity_options)
+}
+
+fn extract_track_impl<W: Write + Seek>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    integrity_options: ExtractIntegrityOptions,
+) -> Result<ExtractReport, ExtractError> {
     let mut reader = FrameReader::new(iso, opts.start_lsn, opts.end_lsn);
+    reader.set_expected_channel_count(opts.channel_count);
+    if let Some(frame_format) = integrity_options.frame_format {
+        reader.set_expected_frame_format(frame_format);
+    }
+    reader.set_strict_channel_count(integrity_options.strict_channel_count);
+    reader.set_recover_sector_errors(integrity_options.recover_sector_errors);
+    if let Some(filter) = opts.time_filter {
+        reader.set_timecode_filter(filter.start_frame, filter.duration_frames);
+    }
 
     match opts.format {
         OutputFormat::Dsf => {
@@ -254,22 +525,22 @@ pub fn extract_track<W: Write + Seek>(
             if let Some(ref meta) = opts.id3_metadata {
                 writer.set_id3_footer(render_id3v24(meta));
             }
-            let stats = drain_frames(&mut reader, opts.time_filter, |data| {
+            let report = drain_frames(&mut reader, None, |data| {
                 writer.write_interleaved(data).map_err(ExtractError::Io)
             })?;
             writer.finish()?;
-            Ok(stats)
+            Ok(report)
         }
         OutputFormat::Dff => {
             let mut writer = DffWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
             if let Some(ref meta) = opts.dff_metadata {
                 writer.set_footer_bytes(render_dff_footer(meta));
             }
-            let stats = drain_frames(&mut reader, opts.time_filter, |data| {
+            let report = drain_frames(&mut reader, None, |data| {
                 writer.write_frame(data).map_err(ExtractError::Io)
             })?;
             writer.finish()?;
-            Ok(stats)
+            Ok(report)
         }
     }
 }
@@ -285,7 +556,7 @@ fn drain_frames<F>(
     reader: &mut FrameReader<'_>,
     time_filter: Option<TimeFilter>,
     mut write_data: F,
-) -> Result<ExtractStats, ExtractError>
+) -> Result<ExtractReport, ExtractError>
 where
     F: FnMut(&[u8]) -> Result<(), ExtractError>,
 {
@@ -311,14 +582,16 @@ where
         stats.frames_read += 1;
         stats.audio_bytes += payload.len() as u64;
     }
-    Ok(stats)
+    let integrity = ExtractIntegrityReport::from_reader_stats(reader.stats());
+    Ok(ExtractReport { stats, integrity })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dsf_writer::BLOCK_SIZE_PER_CHANNEL;
-    use crate::frame::{Timecode, FRAME_SIZE_UNCOMPRESSED};
+    use crate::frame::{FrameFormat, Timecode, FRAME_SIZE_UNCOMPRESSED};
+    use crate::iso_reader::SECTOR_SIZE;
     use crate::test_util::{
         sha256_hex, synth_audio_sector, synth_continuation_sector, synth_dst_sector, tc_at,
         write_iso,
@@ -344,6 +617,15 @@ mod tests {
     /// Test pattern: byte i = (i & 0xFF). Easy to spot demux/bit-flip bugs.
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i & 0xFF) as u8).collect()
+    }
+
+
+    fn malformed_audio_sector_packet_too_large() -> Vec<u8> {
+        let mut sector = vec![0u8; SECTOR_SIZE as usize];
+        sector[0] = 1 << 5; // one packet, no frame info, uncompressed
+        sector[1] = (2 << 3) | 0x07; // DATA_TYPE_AUDIO, length high bits = 7
+        sector[2] = 0xff; // length = 2047 > MAX_PACKET_SIZE
+        sector
     }
 
     fn read_u16_be(b: &[u8], off: usize) -> u16 {
@@ -1289,4 +1571,190 @@ mod tests {
         assert_eq!(&out[144..144 + 9408], &frame_a[..]);
         assert_eq!(&out[144 + 9408..144 + 9408 * 2], &frame_b[..]);
     }
+
+    #[test]
+    fn extract_stats_exposes_recovered_malformed_sector() {
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let mut sectors = vec![malformed_audio_sector_packet_too_large()];
+        sectors.extend(synth_uncompressed_frame_sectors(&frame, tc_at(1)));
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
+        let report = extract_track_with_integrity_options(
+            &mut iso,
+            &mut output,
+            opts,
+            ExtractIntegrityOptions::new().with_sector_recovery(true),
+        )
+        .unwrap();
+        let stats = report.stats;
+        let integrity = &report.integrity;
+
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, 9408);
+        assert_eq!(integrity.sectors_read, sectors.len() as u64);
+        assert_eq!(integrity.sectors_skipped, 1);
+        assert_eq!(integrity.malformed_sectors, 1);
+        assert_eq!(integrity.io_errors, 0);
+        assert_eq!(integrity.frames_dropped_incomplete, 0);
+        assert_eq!(integrity.recovery_events.len(), 1);
+        assert_eq!(integrity.recovery_events[0].lsn, 0);
+        assert_eq!(integrity.recovery_events[0].kind.to_string(), "malformed-sector");
+        assert!(integrity.recovery_events[0].error.contains("LSN 0"));
+        assert!(integrity.recovery_events[0].error.contains("packet length"));
+        assert!(integrity.recovery_events[0].to_string().contains("LSN 0 malformed-sector"));
+        assert!(report.integrity_loss_detected());
+    }
+
+    #[test]
+    fn extract_stats_exposes_incomplete_frame_dropped_by_recovery() {
+        let dropped = pattern(PART_SIZE);
+        let kept = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let mut sectors = vec![synth_audio_sector(true, &dropped, tc_at(1))];
+        sectors.push(malformed_audio_sector_packet_too_large());
+        sectors.extend(synth_uncompressed_frame_sectors(&kept, tc_at(2)));
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
+        let report = extract_track_with_integrity_options(
+            &mut iso,
+            &mut output,
+            opts,
+            ExtractIntegrityOptions::new().with_sector_recovery(true),
+        )
+        .unwrap();
+        let stats = report.stats;
+        let integrity = &report.integrity;
+
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, 9408);
+        assert_eq!(integrity.sectors_skipped, 1);
+        assert_eq!(integrity.malformed_sectors, 1);
+        assert_eq!(integrity.frames_dropped_incomplete, 1);
+        assert_eq!(integrity.dropped_frame_events.len(), 1);
+        assert_eq!(integrity.dropped_frame_events()[0].lsn, 1);
+        assert_eq!(integrity.dropped_frame_events()[0].bytes, PART_SIZE);
+        assert!(integrity.dropped_frame_events()[0].to_string().contains("dropped incomplete DSD frame"));
+        assert_eq!(integrity.recovery_events.len(), 1);
+        assert_eq!(integrity.recovery_events[0].lsn, 1);
+        assert!(integrity.recovery_events[0].error.contains("LSN 1"));
+        assert!(report.integrity_loss_detected());
+    }
+
+    #[test]
+    fn incomplete_frame_fails_normal_extraction() {
+        let partial = pattern(PART_SIZE);
+        let sectors = vec![synth_audio_sector(true, &partial, tc_at(1))];
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
+        let err = extract_track(&mut iso, &mut output, opts)
+            .expect_err("normal mode must fail on incomplete trailing frame");
+        assert!(matches!(err, ExtractError::Frame(FrameError::IncompleteFrame { .. })), "got {:?}", err);
+    }
+
+    #[test]
+    fn incomplete_frame_is_reported_in_recovery_extraction() {
+        let partial = pattern(PART_SIZE);
+        let sectors = vec![synth_audio_sector(true, &partial, tc_at(1))];
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
+        let report = extract_track_with_integrity_options(
+            &mut iso,
+            &mut output,
+            opts,
+            ExtractIntegrityOptions::new().with_sector_recovery(true),
+        )
+        .unwrap();
+        let stats = report.stats;
+        let integrity = &report.integrity;
+
+        assert_eq!(stats.frames_read, 0);
+        assert_eq!(integrity.frames_dropped_incomplete, 1);
+        assert_eq!(integrity.dropped_frame_events().len(), 1);
+        assert_eq!(integrity.dropped_frame_events()[0].lsn, sectors.len() as u64);
+        assert_eq!(integrity.dropped_frame_events()[0].bytes, PART_SIZE);
+        assert!(report.integrity_loss_detected());
+    }
+
+    #[test]
+    fn area_frame_format_is_authoritative_for_extraction() {
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let sectors = synth_uncompressed_frame_sectors(&frame, tc_at(1));
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
+        let report = extract_track_with_integrity_options(
+            &mut iso,
+            &mut output,
+            opts,
+            ExtractIntegrityOptions::new().with_frame_format(FrameFormat::Dsd3In14),
+        )
+        .unwrap();
+        let stats = report.stats;
+        let integrity = &report.integrity;
+
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(integrity.frame_format_mismatches, 0);
+        assert!(!report.integrity_loss_detected());
+    }
+
+    #[test]
+    fn area_frame_format_mismatch_fails_normal_extraction() {
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let sectors = synth_uncompressed_frame_sectors(&frame, tc_at(1));
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
+        let err = extract_track_with_integrity_options(
+            &mut iso,
+            &mut output,
+            opts,
+            ExtractIntegrityOptions::new().with_frame_format(FrameFormat::Dst),
+        )
+        .expect_err("area TOC says DST but sector header says DSD");
+        assert!(matches!(err, ExtractError::Frame(FrameError::FrameFormatMismatch { .. })), "got {:?}", err);
+    }
+
+    #[test]
+    fn area_frame_format_mismatch_is_reported_in_recovery_extraction() {
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let sectors = synth_uncompressed_frame_sectors(&frame, tc_at(1));
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
+        let report = extract_track_with_integrity_options(
+            &mut iso,
+            &mut output,
+            opts,
+            ExtractIntegrityOptions::new()
+                .with_frame_format(FrameFormat::Dst)
+                .with_sector_recovery(true),
+        )
+        .unwrap();
+        let stats = report.stats;
+        let integrity = &report.integrity;
+
+        assert_eq!(stats.frames_read, 0);
+        assert_eq!(integrity.sectors_skipped, sectors.len() as u64);
+        assert_eq!(integrity.frame_format_mismatches, sectors.len() as u64);
+        assert!(integrity.recovery_events().iter().all(|e| e.error.contains("frame-format mismatch")));
+        assert!(report.integrity_loss_detected());
+    }
+
 }

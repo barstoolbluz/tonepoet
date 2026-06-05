@@ -1,40 +1,13 @@
-//! DSD audio frame extraction from a SACD ISO's per-track sector
-//! range. Mirrors the algorithm in sacd-extract's
-//! `scarletbook_process_frames` (libsacd/scarletbook_read.c).
+//! Structured DSD/DST audio frame extraction from SACD ISO sectors.
 //!
-//! ## Sector layout (each LSN is 2048 bytes)
+//! This module implements the ScarletBook audio-sector grammar as a
+//! small typed parser plus an explicit frame-assembly state machine.
+//! It deliberately keeps the byte stream handed to callers unchanged:
+//! uncompressed frames are concatenated packet payloads and DST frames
+//! are raw DST payloads ready for `dst::decode_frame`.
 //!
-//! ```text
-//!  +----------------------------------------------------------+
-//!  | byte 0:  audio_frame_header (1 byte)                     |
-//!  |   bits LSB→MSB: dst_encoded | reserved | frame_info_cnt  |
-//!  |                 (3 bits)    | packet_info_cnt (3 bits)   |
-//!  +----------------------------------------------------------+
-//!  | bytes 1..N: packet_info[] (2 bytes × packet_info_count,  |
-//!  |             up to 7 entries)                             |
-//!  |   bits LSB→MSB: frame_start | reserved | data_type (3)   |
-//!  |                | packet_length (11 bits, spans bytes)    |
-//!  +----------------------------------------------------------+
-//!  | bytes after packet_info: frame_info[] (3 bytes for       |
-//!  |             uncompressed, 4 bytes for DST-encoded,       |
-//!  |             × frame_info_count, up to 7)                 |
-//!  |   bytes 0..2: timecode (minutes, seconds, frames @ 75fps)|
-//!  |   byte 3 (DST only): channel/sector bits                 |
-//!  +----------------------------------------------------------+
-//!  | rest of sector: packet payloads back-to-back, lengths    |
-//!  |                 from packet_info[].packet_length         |
-//!  +----------------------------------------------------------+
-//! ```
-//!
-//! A DSD audio frame spans 1+ sectors. The `frame_start` bit on an
-//! `audio_packet_info` marks the beginning of a new frame; data is
-//! accumulated until the next `frame_start` or end of range. A
-//! complete frame:
-//!
-//! - For uncompressed DSD: total bytes == `channel_count *
-//!   FRAME_SIZE_UNCOMPRESSED` (4704 per channel at DSD64).
-//! - For DST: `sector_count` (from the frame_info byte 3) reaches 0
-//!   as sectors are consumed.
+//! Formal spec audit index: `docs/scarlet_book_audit_map.md`, anchors
+//! `SB-AUDIO-001` through `SB-AUDIO-015`.
 
 use crate::iso_reader::{IsoReader, SECTOR_SIZE};
 use std::collections::VecDeque;
@@ -45,36 +18,125 @@ use std::io;
 pub const FRAME_SIZE_UNCOMPRESSED: usize = 4704;
 
 /// Maximum bytes a single packet within a sector can carry.
-/// Per the ScarletBook spec: a sector is 2048 bytes, the largest
-/// packet_length value fits in 11 bits (2047). In practice the
-/// reference enforces 2045 (sector minus minimal header overhead).
 pub const MAX_PACKET_SIZE: usize = 2045;
 
-/// Maximum buffered frame size. DST frames can be larger than a
-/// single sector; the upstream reference allocates 64 KiB. We match
-/// that to handle the worst-case DST frame.
+/// Maximum assembled encoded frame size. Matches the long-standing
+/// 64 KiB allocation used by the C implementations and avoids
+/// unbounded growth on corrupt packet headers.
 pub const MAX_FRAME_SIZE: usize = 64 * 1024;
 
-/// A complete DSD audio frame extracted from one or more sectors.
-///
-/// `data` is the concatenated packet payload (DSD or DST-encoded
-/// bytes; the caller decides via `dst_encoded`). Demultiplexing
-/// per channel is the consumer's responsibility — for uncompressed
-/// DSD it's stride-N interleaved; for DST it requires running the
-/// decoder.
+/// ScarletBook packet data type: audio payload.
+pub const DATA_TYPE_AUDIO: u8 = 2;
+/// ScarletBook packet data type: supplementary metadata payload.
+pub const DATA_TYPE_SUPPLEMENTARY: u8 = 3;
+/// ScarletBook packet data type: padding payload.
+pub const DATA_TYPE_PADDING: u8 = 7;
+
+/// Area frame-format nibble from the area TOC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-012
+pub enum FrameFormat {
+    /// DST-coded DSD.
+    Dst,
+    /// Reserved ScarletBook value 1.
+    Reserved,
+    /// Plain DSD, three frames in fourteen sectors.
+    Dsd3In14,
+    /// Plain DSD, three frames in sixteen sectors.
+    Dsd3In16,
+    /// Undocumented values observed on some pressings. Treated as
+    /// plain DSD by extraction code, but kept distinct for reporting.
+    Dsd4,
+    Dsd5,
+    Dsd6,
+    Dsd7,
+    /// Any value outside the known low-nibble range.
+    Unknown(u8),
+}
+
+impl FrameFormat {
+    pub fn from_nibble(n: u8) -> Self {
+        match n & 0x0f {
+            0 => Self::Dst,
+            1 => Self::Reserved,
+            2 => Self::Dsd3In14,
+            3 => Self::Dsd3In16,
+            4 => Self::Dsd4,
+            5 => Self::Dsd5,
+            6 => Self::Dsd6,
+            7 => Self::Dsd7,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn is_dst_encoded(self) -> bool {
+        matches!(self, Self::Dst)
+    }
+
+    pub fn as_nibble(self) -> u8 {
+        match self {
+            Self::Dst => 0,
+            Self::Reserved => 1,
+            Self::Dsd3In14 => 2,
+            Self::Dsd3In16 => 3,
+            Self::Dsd4 => 4,
+            Self::Dsd5 => 5,
+            Self::Dsd6 => 6,
+            Self::Dsd7 => 7,
+            Self::Unknown(n) => n & 0x0f,
+        }
+    }
+
+    /// Sectors per uncompressed frame group as declared by the area
+    /// format. DST is variable-rate; `None` is intentional.
+    pub fn sectors_per_frame(self) -> Option<u32> {
+        match self {
+            Self::Dsd3In14 | Self::Dsd4 | Self::Dsd5 | Self::Dsd6 | Self::Dsd7 => Some(14),
+            Self::Dsd3In16 => Some(16),
+            Self::Dst | Self::Reserved | Self::Unknown(_) => None,
+        }
+    }
+}
+
+impl From<u8> for FrameFormat {
+    fn from(value: u8) -> Self {
+        Self::from_nibble(value)
+    }
+}
+
+impl std::fmt::Display for FrameFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dst => f.write_str("DST"),
+            Self::Reserved => f.write_str("reserved"),
+            Self::Dsd3In14 => f.write_str("DSD-3-in-14"),
+            Self::Dsd3In16 => f.write_str("DSD-3-in-16"),
+            Self::Dsd4 => f.write_str("DSD-format-4"),
+            Self::Dsd5 => f.write_str("DSD-format-5"),
+            Self::Dsd6 => f.write_str("DSD-format-6"),
+            Self::Dsd7 => f.write_str("DSD-format-7"),
+            Self::Unknown(n) => write!(f, "unknown({})", n),
+        }
+    }
+}
+
+/// A complete DSD or DST audio frame extracted from one or more sectors.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub data: Vec<u8>,
     pub timecode: Timecode,
+    /// For DST this is derived from the frame-info channel bits unless
+    /// the caller supplied an area-TOC count, in which case the area
+    /// count wins after mismatch diagnostics. For uncompressed DSD it
+    /// is the expected channel count when supplied, otherwise 0.
     pub channel_count: u8,
     pub dst_encoded: bool,
-    /// Only meaningful for DST frames: how many sectors the encoded
-    /// payload occupies. Counts down to zero as sectors are
-    /// consumed.
+    /// Meaningful only for DST frames.
     pub sector_count: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-009, SB-TRL2-004
 pub struct Timecode {
     pub minutes: u8,
     pub seconds: u8,
@@ -82,23 +144,300 @@ pub struct Timecode {
 }
 
 impl Timecode {
-    /// Total frame count at 75 fps.
+    /// Total SACD frame count at 75 fps.
     pub fn as_frame_count(self) -> u32 {
-        (self.minutes as u32) * 60 * 75 + (self.seconds as u32) * 75 + (self.frames as u32)
+        (self.minutes as u32) * 60 * 75 + (self.seconds as u32) * 75 + self.frames as u32
+    }
+
+    pub fn is_normalized(self) -> bool {
+        self.seconds < 60 && self.frames < 75
+    }
+}
+
+/// First byte of each ScarletBook audio sector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-001..SB-AUDIO-004
+pub struct AudioFrameHeader {
+    pub dst_encoded: bool,
+    pub frame_info_count: u8,
+    pub packet_info_count: u8,
+}
+
+impl AudioFrameHeader {
+    pub fn from_byte(byte: u8) -> Self {
+        Self {
+            dst_encoded: (byte & 0x01) != 0,
+            frame_info_count: (byte >> 2) & 0x07,
+            packet_info_count: (byte >> 5) & 0x07,
+        }
+    }
+}
+
+/// Two-byte packet-info record preceding sector payloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-005..SB-AUDIO-008
+pub struct AudioPacketInfo {
+    pub frame_start: bool,
+    pub data_type: u8,
+    pub packet_length: u16,
+}
+
+impl AudioPacketInfo {
+    /// Fallible parse for callers that receive arbitrary slices.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 2 {
+            return None;
+        }
+        Some(Self {
+            frame_start: (bytes[0] & 0x80) != 0,
+            data_type: (bytes[0] >> 3) & 0x07,
+            packet_length: (((bytes[0] & 0x07) as u16) << 8) | bytes[1] as u16,
+        })
+    }
+}
+
+/// Frame-start metadata record. DST sectors carry a fourth byte with
+/// sector-count and channel-hint bits; plain DSD records carry only
+/// the timecode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-009..SB-AUDIO-011
+pub struct AudioFrameInfo {
+    pub timecode: Timecode,
+    pub sector_count: u8,
+    pub channel_bits: u8,
+}
+
+impl AudioFrameInfo {
+    pub fn from_bytes(bytes: &[u8], dst_encoded: bool) -> Option<Self> {
+        let need = if dst_encoded { 4 } else { 3 };
+        if bytes.len() < need {
+            return None;
+        }
+        Some(Self {
+            timecode: Timecode {
+                minutes: bytes[0],
+                seconds: bytes[1],
+                frames: bytes[2],
+            },
+            sector_count: if dst_encoded { (bytes[3] >> 2) & 0x1f } else { 0 },
+            // Preserve the three documented channel bits, including
+            // bit 7, even though channel-count derivation uses only
+            // bits 0 and 1. This makes diagnostics auditable.
+            channel_bits: if dst_encoded { bytes[3] & 0x83 } else { 0 },
+        })
+    }
+
+    pub fn to_frame_count(self) -> u32 {
+        self.timecode.as_frame_count()
+    }
+
+    /// Match sacd_extract's `get_channel_count`: bit2=6ch,
+    /// bit3=5ch, everything else falls back to stereo.
+    pub fn derived_channel_count(self) -> u8 {
+        let channel_bit_3 = self.channel_bits & 0x01;
+        let channel_bit_2 = (self.channel_bits >> 1) & 0x01;
+        match (channel_bit_2, channel_bit_3) {
+            (1, 0) => 6,
+            (0, 1) => 5,
+            _ => 2,
+        }
+    }
+}
+
+/// Inclusive/exclusive SACD timecode filter in 75-fps frame units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-013
+pub struct FrameTimeFilter {
+    pub start_frame: u32,
+    pub end_frame: u32,
+}
+
+impl FrameTimeFilter {
+    pub fn new(start_frame: u32, duration_frames: u32) -> Self {
+        Self {
+            start_frame,
+            end_frame: start_frame.saturating_add(duration_frames),
+        }
+    }
+
+    pub fn includes(self, timecode: Timecode) -> bool {
+        let tc = timecode.as_frame_count();
+        tc >= self.start_frame && tc < self.end_frame
+    }
+}
+
+/// Kind of sector-level problem recovered by [`FrameReader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryEventKind {
+    /// Sector bytes were readable but did not satisfy the audio-sector grammar.
+    MalformedSector,
+    /// The ISO reader failed to read the requested sector.
+    IoError,
+}
+
+impl std::fmt::Display for RecoveryEventKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedSector => f.write_str("malformed-sector"),
+            Self::IoError => f.write_str("io-error"),
+        }
+    }
+}
+
+/// A durable per-sector recovery log entry.
+///
+/// Recovery mode is for damaged-disc salvage, so counters alone are
+/// insufficient: callers need the exact LSN and parser/read error to
+/// decide whether to trust, quarantine, or retry the resulting file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-014
+pub struct RecoveryEvent {
+    /// Logical sector number skipped by recovery.
+    pub lsn: u64,
+    /// Whether the sector failed during ISO read or audio-sector parsing.
+    pub kind: RecoveryEventKind,
+    /// Human-readable error text, including the parser's sector context.
+    pub error: String,
+}
+
+impl RecoveryEvent {
+    pub fn new(lsn: u64, kind: RecoveryEventKind, error: impl Into<String>) -> Self {
+        Self {
+            lsn,
+            kind,
+            error: error.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RecoveryEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LSN {} {}: {}", self.lsn, self.kind, self.error)
+    }
+}
+
+
+/// A dropped partial frame in recovery mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-015
+pub struct DroppedFrameEvent {
+    /// LSN at which the incomplete frame was detected: either the frame-start
+    /// sector that superseded it, a damaged sector that forced recovery, or
+    /// the exclusive end LSN for end-of-range flush drops.
+    pub lsn: u64,
+    pub timecode: Timecode,
+    pub dst_encoded: bool,
+    pub bytes: usize,
+    pub expected_bytes: Option<usize>,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for DroppedFrameEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.expected_bytes {
+            Some(expected) => write!(
+                f,
+                "LSN {} dropped incomplete {} frame {:02}:{:02}:{:02}: {} bytes, expected {}; {}",
+                self.lsn,
+                if self.dst_encoded { "DST" } else { "DSD" },
+                self.timecode.minutes,
+                self.timecode.seconds,
+                self.timecode.frames,
+                self.bytes,
+                expected,
+                self.reason,
+            ),
+            None => write!(
+                f,
+                "LSN {} dropped incomplete {} frame {:02}:{:02}:{:02}: {} bytes; {}",
+                self.lsn,
+                if self.dst_encoded { "DST" } else { "DSD" },
+                self.timecode.minutes,
+                self.timecode.seconds,
+                self.timecode.frames,
+                self.bytes,
+                self.reason,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// SB-AUDIT: SB-AUDIO-014..SB-AUDIO-015
+/// SB-AUDIT: SB-AUDIO-001..SB-AUDIO-015
+pub struct FrameReaderStats {
+    pub sectors_read: u64,
+    pub sectors_skipped: u64,
+    pub malformed_sectors: u64,
+    pub io_errors: u64,
+    pub frames_emitted: u64,
+    pub frames_filtered: u64,
+    pub frames_dropped_incomplete: u64,
+    pub channel_mismatches: u64,
+    /// Number of sectors whose audio header compression bit disagreed
+    /// with the authoritative area-TOC frame format supplied by the caller.
+    pub frame_format_mismatches: u64,
+    pub invalid_timecodes: u64,
+    pub bytes_emitted: u64,
+    /// Per-sector recovery details. Length should match `sectors_skipped`.
+    pub recovery_events: Vec<RecoveryEvent>,
+    /// Incomplete frames dropped while recovery was enabled, including
+    /// frame-buffer overflow drops. Length should match
+    /// `frames_dropped_incomplete` whenever detailed drop context was
+    /// available.
+    pub dropped_frame_events: Vec<DroppedFrameEvent>,
+}
+
+impl FrameReaderStats {
+    pub fn recovery_events(&self) -> &[RecoveryEvent] {
+        &self.recovery_events
+    }
+
+    pub fn dropped_frame_events(&self) -> &[DroppedFrameEvent] {
+        &self.dropped_frame_events
     }
 }
 
 #[derive(Debug)]
 pub enum FrameError {
     Io(io::Error),
-    /// Sector header was malformed (e.g., too many packets declared).
-    MalformedSector {
+    MalformedSector { lsn: u64, reason: String },
+    BufferOverflow { lsn: u64, attempted: usize, limit: usize },
+    /// A frame was started but never completed. In normal extraction this
+    /// is fatal; in recovery mode it is counted and reported in stats.
+    IncompleteFrame {
         lsn: u64,
-        reason: String,
+        timecode: Timecode,
+        dst_encoded: bool,
+        bytes: usize,
+        expected_bytes: Option<usize>,
+        reason: &'static str,
     },
-    /// Frame buffer would overflow the 64 KiB limit.
-    BufferOverflow {
+    ChannelCountMismatch {
         lsn: u64,
+        expected: u8,
+        derived: u8,
+        timecode: Timecode,
+    },
+    /// Frame-info timecode used non-normalized SACD values. In the
+    /// strict/default path this is fatal; in recovery mode it is retained
+    /// in integrity stats and the caller receives a salvaged report.
+    InvalidTimecode {
+        lsn: u64,
+        timecode: Timecode,
+    },
+    /// Sector header compression state disagreed with the area TOC frame
+    /// format. The area TOC is the authoritative structural type.
+    FrameFormatMismatch {
+        lsn: u64,
+        area_format: FrameFormat,
+        sector_dst_encoded: bool,
+    },
+    /// The area TOC declared a reserved or unknown frame format, so the
+    /// reader cannot safely choose DST versus plain-DSD sector layout.
+    UnsupportedFrameFormat {
+        lsn: u64,
+        area_format: FrameFormat,
     },
 }
 
@@ -107,11 +446,62 @@ impl std::fmt::Display for FrameError {
         match self {
             Self::Io(e) => write!(f, "io: {}", e),
             Self::MalformedSector { lsn, reason } => {
-                write!(f, "malformed sector at LSN {}: {}", lsn, reason)
+                write!(f, "malformed audio sector at LSN {}: {}", lsn, reason)
             }
-            Self::BufferOverflow { lsn } => {
-                write!(f, "frame buffer overflow at LSN {}", lsn)
+            Self::BufferOverflow { lsn, attempted, limit } => write!(
+                f,
+                "frame buffer overflow at LSN {}: attempted {} bytes, limit {} bytes",
+                lsn, attempted, limit
+            ),
+            Self::IncompleteFrame { lsn, timecode, dst_encoded, bytes, expected_bytes, reason } => {
+                match expected_bytes {
+                    Some(expected) => write!(
+                        f,
+                        "incomplete {} frame at LSN {} timecode {:02}:{:02}:{:02}: {} bytes, expected {}; {}",
+                        if *dst_encoded { "DST" } else { "DSD" },
+                        lsn,
+                        timecode.minutes,
+                        timecode.seconds,
+                        timecode.frames,
+                        bytes,
+                        expected,
+                        reason,
+                    ),
+                    None => write!(
+                        f,
+                        "incomplete {} frame at LSN {} timecode {:02}:{:02}:{:02}: {} bytes; {}",
+                        if *dst_encoded { "DST" } else { "DSD" },
+                        lsn,
+                        timecode.minutes,
+                        timecode.seconds,
+                        timecode.frames,
+                        bytes,
+                        reason,
+                    ),
+                }
             }
+            Self::ChannelCountMismatch { lsn, expected, derived, timecode } => write!(
+                f,
+                "channel-count mismatch at LSN {} timecode {:02}:{:02}:{:02}: area TOC={}, frame hint={}",
+                lsn, timecode.minutes, timecode.seconds, timecode.frames, expected, derived
+            ),
+            Self::InvalidTimecode { lsn, timecode } => write!(
+                f,
+                "invalid SACD timecode at LSN {}: {:02}:{:02}:{:02} (seconds must be < 60 and frames < 75)",
+                lsn, timecode.minutes, timecode.seconds, timecode.frames
+            ),
+            Self::FrameFormatMismatch { lsn, area_format, sector_dst_encoded } => write!(
+                f,
+                "frame-format mismatch at LSN {}: area TOC declares {}, sector header declares {}",
+                lsn,
+                area_format,
+                if *sector_dst_encoded { "DST" } else { "plain DSD" },
+            ),
+            Self::UnsupportedFrameFormat { lsn, area_format } => write!(
+                f,
+                "unsupported area TOC frame format at LSN {}: {}",
+                lsn, area_format,
+            ),
         }
     }
 }
@@ -124,31 +514,21 @@ impl From<io::Error> for FrameError {
     }
 }
 
-/// Packet data types per the ScarletBook spec.
-const DATA_TYPE_AUDIO: u8 = 2;
-// 3 = supplementary, 7 = padding — we skip both.
-
-/// Iterator over complete frames in an LSN range `[start_lsn,
-/// end_lsn)`. Sectors are read sequentially; frames are emitted as
-/// they complete. Partial frames at the end of the range are
-/// dropped (matches the upstream reference's behavior — the last
-/// incomplete frame is just discarded).
+/// SB-AUDIT: SB-AUDIO-001..SB-AUDIO-015
+/// Iterator over complete frames in an LSN range `[start_lsn, end_lsn)`.
 pub struct FrameReader<'a> {
     iso: &'a mut IsoReader,
     cur_lsn: u64,
     end_lsn: u64,
     sector_buf: Vec<u8>,
-    /// Frames emitted so far in this iteration (for diagnostics).
-    pub frames_yielded: u64,
-    /// In-progress frame accumulator. `None` until the first
-    /// `frame_start` packet arrives.
     pending: Option<PendingFrame>,
-    /// Completed frames waiting to be yielded. A single sector can
-    /// finalize multiple frames (rare with uncompressed DSD where a
-    /// frame is ~9 KB across multiple sectors; possible with short
-    /// DST frames where `sector_count == 1` and a new frame can
-    /// start in the same sector that finished the previous one).
     ready: VecDeque<Frame>,
+    expected_channel_count: Option<u8>,
+    expected_frame_format: Option<FrameFormat>,
+    strict_channel_count: bool,
+    time_filter: Option<FrameTimeFilter>,
+    recover_sector_errors: bool,
+    stats: FrameReaderStats,
 }
 
 #[derive(Debug)]
@@ -172,6 +552,14 @@ impl PendingFrame {
     }
 }
 
+#[derive(Debug)]
+struct ParsedSector {
+    dst_encoded: bool,
+    packets: Vec<AudioPacketInfo>,
+    frame_infos: Vec<AudioFrameInfo>,
+    payload_offset: usize,
+}
+
 impl<'a> FrameReader<'a> {
     pub fn new(iso: &'a mut IsoReader, start_lsn: u64, end_lsn: u64) -> Self {
         Self {
@@ -179,219 +567,499 @@ impl<'a> FrameReader<'a> {
             cur_lsn: start_lsn,
             end_lsn,
             sector_buf: vec![0u8; SECTOR_SIZE as usize],
-            frames_yielded: 0,
             pending: None,
             ready: VecDeque::new(),
+            expected_channel_count: None,
+            expected_frame_format: None,
+            strict_channel_count: false,
+            time_filter: None,
+            recover_sector_errors: false,
+            stats: FrameReaderStats::default(),
         }
     }
 
-    /// Read the next complete frame. Returns `Ok(None)` at end of
-    /// range. Internally consumes as many sectors as needed; frames
-    /// that completed in earlier sectors but weren't yielded yet
-    /// drain from the `ready` queue first.
-    ///
-    /// When the LSN range is fully consumed, the final pending
-    /// frame is flushed (if complete) before `Ok(None)` is returned.
-    /// Matches the C reference's `last_block=1` flush behavior —
-    /// without this, the last frame of a track would be silently
-    /// dropped because the upstream algorithm only finalizes on the
-    /// NEXT `frame_start`.
+    /// Area-TOC channel-count cross-check. In non-strict mode,
+    /// mismatches are counted and the area value is used for downstream
+    /// decode/writer compatibility. In strict mode they become errors.
+    pub fn set_expected_channel_count(&mut self, channel_count: u8) {
+        if channel_count > 0 {
+            self.expected_channel_count = Some(channel_count);
+        }
+    }
+
+    /// Area-TOC frame-format cross-check. When supplied, this becomes the
+    /// authoritative DST/plain-DSD structural type for the sector grammar;
+    /// sector header compression bits are validated against it.
+    pub fn set_expected_frame_format(&mut self, frame_format: FrameFormat) {
+        self.expected_frame_format = Some(frame_format);
+    }
+
+    pub fn set_strict_channel_count(&mut self, strict: bool) {
+        self.strict_channel_count = strict;
+    }
+
+    pub fn set_timecode_filter(&mut self, start_frame: u32, duration_frames: u32) {
+        self.time_filter = Some(FrameTimeFilter::new(start_frame, duration_frames));
+    }
+
+    /// Continue after malformed sectors or read failures. The current
+    /// partial frame is discarded on each skipped sector so bytes from
+    /// different frames are never stitched together silently.
+    pub fn set_recover_sector_errors(&mut self, recover: bool) {
+        self.recover_sector_errors = recover;
+    }
+
+    pub fn stats(&self) -> FrameReaderStats {
+        self.stats.clone()
+    }
+
+    /// Explicit end-of-range flush. Returns a complete pending frame if
+    /// one is buffered, applies the time filter, and clears pending state.
+    pub fn flush(&mut self) -> Result<Option<Frame>, FrameError> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(None);
+        };
+        if !frame_is_complete(&pending, self.expected_channel_count) {
+            self.handle_incomplete_frame(
+                self.end_lsn,
+                pending,
+                "end of extraction range before frame completed",
+            )?;
+            return Ok(None);
+        }
+        let frame = pending.into_frame();
+        if self.frame_selected(&frame) {
+            self.stats.frames_emitted += 1;
+            self.stats.bytes_emitted += frame.data.len() as u64;
+            Ok(Some(frame))
+        } else {
+            self.stats.frames_filtered += 1;
+            Ok(None)
+        }
+    }
+
+    /// Read the next complete frame. Returns `Ok(None)` at end of range.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, FrameError> {
         loop {
             if let Some(frame) = self.ready.pop_front() {
-                self.frames_yielded += 1;
+                self.stats.frames_emitted += 1;
+                self.stats.bytes_emitted += frame.data.len() as u64;
                 return Ok(Some(frame));
             }
+
             if self.cur_lsn >= self.end_lsn {
-                // End of range: flush a final complete pending
-                // frame if there is one. After that, `pending` is
-                // cleared and subsequent calls return Ok(None).
-                if let Some(prev) = self.pending.take() {
-                    if frame_is_complete(&prev) {
-                        self.ready.push_back(prev.into_frame());
-                        continue;
+                return self.flush();
+            }
+
+            let lsn = self.cur_lsn;
+            self.cur_lsn += 1;
+
+            // Move the reusable sector buffer out of `self` while the
+            // parser borrows packet payload slices from it. This avoids
+            // cloning each packet into a temporary Vec just to satisfy the
+            // borrow checker; the hot path now appends directly from the
+            // ISO sector buffer into the pending frame buffer.
+            let mut sector_buf = std::mem::take(&mut self.sector_buf);
+            let read_result = self.iso.read_sector(lsn, &mut sector_buf);
+            match read_result {
+                Ok(()) => {
+                    self.stats.sectors_read += 1;
+                    let sector_result = self.process_sector_bytes(lsn, &sector_buf);
+                    self.sector_buf = sector_buf;
+                    match sector_result {
+                        Ok(()) => {}
+                        Err(err) if self.recover_sector_errors => {
+                            if matches!(
+                                err,
+                                FrameError::FrameFormatMismatch { .. }
+                                    | FrameError::UnsupportedFrameFormat { .. }
+                            ) {
+                                self.stats.frame_format_mismatches += 1;
+                            }
+                            self.stats.malformed_sectors += 1;
+                            self.stats.sectors_skipped += 1;
+                            self.stats.recovery_events.push(RecoveryEvent::new(
+                                lsn,
+                                RecoveryEventKind::MalformedSector,
+                                err.to_string(),
+                            ));
+                            self.discard_recovery_state();
+                        }
+                        Err(err) => return Err(err),
                     }
                 }
-                return Ok(None);
+                Err(e) if self.recover_sector_errors => {
+                    self.sector_buf = sector_buf;
+                    self.stats.io_errors += 1;
+                    self.stats.sectors_skipped += 1;
+                    self.stats.recovery_events.push(RecoveryEvent::new(
+                        lsn,
+                        RecoveryEventKind::IoError,
+                        e.to_string(),
+                    ));
+                    self.discard_recovery_state();
+                }
+                Err(e) => {
+                    self.sector_buf = sector_buf;
+                    return Err(FrameError::Io(e));
+                }
             }
-            let lsn = self.cur_lsn;
-            self.iso.read_sector(lsn, &mut self.sector_buf)?;
-            self.cur_lsn += 1;
-            self.process_sector(lsn)?;
         }
     }
 
-    /// Parse one sector and feed its audio packets into the pending
-    /// frame accumulator. Any frames that complete during this
-    /// sector are pushed onto `self.ready` for the caller to drain.
-    fn process_sector(&mut self, lsn: u64) -> Result<(), FrameError> {
-        let sector = &self.sector_buf;
-
-        // Byte 0: audio_frame_header. Bit layout on little-endian:
-        //   bit 0 (LSB): dst_encoded
-        //   bit 1: reserved
-        //   bits 2..4: frame_info_count
-        //   bits 5..7: packet_info_count
-        let header = sector[0];
-        let dst_encoded = (header & 0x01) != 0;
-        let frame_info_count = ((header >> 2) & 0x07) as usize;
-        let packet_info_count = ((header >> 5) & 0x07) as usize;
-
-        if packet_info_count > 7 {
-            // The 3-bit field caps at 7, so this branch is
-            // unreachable, but keep the check for parity with the
-            // upstream reference's diagnostic.
-            return Err(FrameError::MalformedSector {
-                lsn,
-                reason: format!("packet_info_count {} > 7", packet_info_count),
-            });
+    fn discard_recovery_state(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.record_dropped_frame(
+                self.cur_lsn.saturating_sub(1),
+                &pending,
+                "sector recovery discarded the in-progress frame",
+            );
         }
+        self.ready.clear();
+    }
 
-        let mut off = 1usize;
-
-        // Parse packet_info[]: 2 bytes per entry.
-        // Each entry's wire layout (little-endian; the upstream code
-        // bit-extracts because of the cross-byte 11-bit field):
-        //   byte0 bit 7 (MSB): frame_start
-        //   byte0 bit 6: reserved
-        //   byte0 bits 3..5: data_type
-        //   byte0 bits 0..2 + byte1: packet_length (11 bits)
-        let mut packets: [PacketInfo; 7] = Default::default();
-        for i in 0..packet_info_count {
-            let b0 = sector[off];
-            let b1 = sector[off + 1];
-            packets[i] = PacketInfo {
-                frame_start: (b0 >> 7) & 1 != 0,
-                data_type: (b0 >> 3) & 0x07,
-                packet_length: (((b0 & 0x07) as u16) << 8) | (b1 as u16),
-            };
-            off += 2;
-        }
-
-        // Parse frame_info[]. Each entry is 4 bytes for DST-encoded
-        // sectors (timecode + sector_count/channel bits) or 3 bytes
-        // for uncompressed (timecode only).
-        let frame_info_entry_size = if dst_encoded { 4 } else { 3 };
-        let mut frame_infos: [FrameInfo; 7] = Default::default();
-        for i in 0..frame_info_count {
-            let tc = Timecode {
-                minutes: sector[off],
-                seconds: sector[off + 1],
-                frames: sector[off + 2],
-            };
-            let (channel_count, sector_count) = if dst_encoded {
-                let b3 = sector[off + 3];
-                // Per the C reference's bitfield on little-endian:
-                //   bit 0: channel_bit_3 (1 = 5 channels)
-                //   bit 1: channel_bit_2 (1 = 6 channels)
-                //   bits 2..6: sector_count (5 bits)
-                //   bit 7: channel_bit_1 (unused in count derivation)
-                let cb3 = b3 & 1;
-                let cb2 = (b3 >> 1) & 1;
-                let scnt = (b3 >> 2) & 0x1F;
-                // Match the C reference's exact logic (scarletbook_read.c
-                // `get_channel_count`): both conditions on both bits.
-                // When both bits are set (invalid data), fall through to
-                // stereo defensively.
-                let chans = if cb2 == 1 && cb3 == 0 {
-                    6
-                } else if cb2 == 0 && cb3 == 1 {
-                    5
-                } else {
-                    2
-                };
-                (chans, scnt)
-            } else {
-                // Uncompressed frame_info doesn't carry channel/sector
-                // bits — the channel count is implied by the area's
-                // header (caller's responsibility) and there's no
-                // multi-sector layout (sector_count is irrelevant).
-                (0u8, 0u8)
-            };
-            frame_infos[i] = FrameInfo {
-                timecode: tc,
-                channel_count,
-                sector_count,
-            };
-            off += frame_info_entry_size;
-        }
-
-        // Walk packets, accumulating into `self.pending`. Any frame
-        // that completes (via a fresh frame_start finalizing a
-        // complete previous frame) gets pushed onto `self.ready` for
-        // the caller to drain.
+    fn process_sector_bytes(&mut self, lsn: u64, sector: &[u8]) -> Result<(), FrameError> {
+        let parsed = parse_sector_header(sector, lsn, self.expected_frame_format)?;
+        let mut payload_offset = parsed.payload_offset;
         let mut frame_info_idx = 0usize;
 
-        for i in 0..packet_info_count {
-            let p = &packets[i];
-            if p.data_type == DATA_TYPE_AUDIO {
-                if p.frame_start {
-                    // A new frame is starting. If we had a frame in
-                    // progress AND it's complete, push it to ready.
-                    // Incomplete previous frame is dropped silently
-                    // (matches upstream).
-                    if let Some(prev) = self.pending.take() {
-                        if frame_is_complete(&prev) {
-                            self.ready.push_back(prev.into_frame());
-                        }
-                    }
-                    let info = &frame_infos[frame_info_idx];
-                    frame_info_idx += 1;
-                    self.pending = Some(PendingFrame {
-                        data: Vec::with_capacity(MAX_FRAME_SIZE / 2),
-                        timecode: info.timecode,
-                        channel_count: info.channel_count,
-                        dst_encoded,
-                        sector_count: info.sector_count,
-                    });
-                }
-                if let Some(ref mut p_acc) = self.pending {
-                    let plen = p.packet_length as usize;
-                    if p_acc.data.len() + plen > MAX_FRAME_SIZE {
-                        self.pending = None;
-                        return Err(FrameError::BufferOverflow { lsn });
-                    }
-                    p_acc.data.extend_from_slice(&sector[off..off + plen]);
-                    if p_acc.dst_encoded {
-                        p_acc.sector_count = p_acc.sector_count.saturating_sub(1);
-                    }
-                }
+        for packet in parsed.packets.iter().copied() {
+            let packet_len = packet.packet_length as usize;
+            if packet_len > MAX_PACKET_SIZE {
+                return Err(FrameError::MalformedSector {
+                    lsn,
+                    reason: format!("packet length {} exceeds {}", packet_len, MAX_PACKET_SIZE),
+                });
             }
-            // Advance source pointer past the packet payload
-            // regardless of data type — non-audio packets occupy
-            // the same payload space.
-            off += p.packet_length as usize;
+            let packet_end = payload_offset.checked_add(packet_len).ok_or_else(|| {
+                FrameError::MalformedSector {
+                    lsn,
+                    reason: "packet offset overflow".into(),
+                }
+            })?;
+            if packet_end > sector.len() {
+                return Err(FrameError::MalformedSector {
+                    lsn,
+                    reason: format!(
+                        "packet payload [{}..{}) exceeds sector length {}",
+                        payload_offset,
+                        packet_end,
+                        sector.len()
+                    ),
+                });
+            }
+
+            match packet.data_type {
+                DATA_TYPE_AUDIO => {
+                    let packet_data = &sector[payload_offset..packet_end];
+                    self.feed_audio_packet(
+                        lsn,
+                        parsed.dst_encoded,
+                        packet,
+                        packet_data,
+                        &parsed.frame_infos,
+                        &mut frame_info_idx,
+                    )?;
+                }
+                DATA_TYPE_SUPPLEMENTARY | DATA_TYPE_PADDING => {}
+                _ => {}
+            }
+
+            payload_offset = packet_end;
         }
 
         Ok(())
     }
+
+    fn feed_audio_packet(
+        &mut self,
+        lsn: u64,
+        dst_encoded: bool,
+        packet: AudioPacketInfo,
+        packet_data: &[u8],
+        frame_infos: &[AudioFrameInfo],
+        frame_info_idx: &mut usize,
+    ) -> Result<(), FrameError> {
+        if packet.frame_start {
+            if let Some(prev) = self.pending.take() {
+                self.finish_or_drop(
+                    lsn,
+                    prev,
+                    "new frame_start encountered before previous frame completed",
+                )?;
+            }
+
+            let info = frame_infos.get(*frame_info_idx).copied().ok_or_else(|| {
+                FrameError::MalformedSector {
+                    lsn,
+                    reason: format!(
+                        "audio frame_start without frame_info (idx {}, count {})",
+                        *frame_info_idx,
+                        frame_infos.len()
+                    ),
+                }
+            })?;
+            *frame_info_idx += 1;
+
+            if !info.timecode.is_normalized() {
+                self.stats.invalid_timecodes += 1;
+                if !self.recover_sector_errors {
+                    return Err(FrameError::InvalidTimecode {
+                        lsn,
+                        timecode: info.timecode,
+                    });
+                }
+            }
+
+            let channel_count = if dst_encoded {
+                let derived = info.derived_channel_count();
+                if let Some(expected) = self.expected_channel_count {
+                    if derived != expected {
+                        self.stats.channel_mismatches += 1;
+                        if self.strict_channel_count {
+                            return Err(FrameError::ChannelCountMismatch {
+                                lsn,
+                                expected,
+                                derived,
+                                timecode: info.timecode,
+                            });
+                        }
+                    }
+                    expected
+                } else {
+                    derived
+                }
+            } else {
+                self.expected_channel_count.unwrap_or(0)
+            };
+
+            self.pending = Some(PendingFrame {
+                data: Vec::with_capacity(frame_initial_capacity(dst_encoded, channel_count)),
+                timecode: info.timecode,
+                channel_count,
+                dst_encoded,
+                sector_count: info.sector_count,
+            });
+        }
+
+        if let Some(pending) = self.pending.as_ref() {
+            let attempted = pending.data.len().saturating_add(packet_data.len());
+            if attempted > MAX_FRAME_SIZE {
+                if let Some(dropped) = self.pending.take() {
+                    self.record_dropped_frame(lsn, &dropped, "frame buffer overflow");
+                }
+                return Err(FrameError::BufferOverflow {
+                    lsn,
+                    attempted,
+                    limit: MAX_FRAME_SIZE,
+                });
+            }
+        }
+
+        if let Some(pending) = self.pending.as_mut() {
+            pending.data.extend_from_slice(packet_data);
+            if pending.dst_encoded {
+                pending.sector_count = pending.sector_count.saturating_sub(1);
+            }
+        }
+
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| frame_is_complete(p, self.expected_channel_count))
+        {
+            if let Some(done) = self.pending.take() {
+                self.finish_or_drop(lsn, done, "frame completed")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finish_or_drop(
+        &mut self,
+        lsn: u64,
+        pending: PendingFrame,
+        reason: &'static str,
+    ) -> Result<(), FrameError> {
+        if !frame_is_complete(&pending, self.expected_channel_count) {
+            return self.handle_incomplete_frame(lsn, pending, reason);
+        }
+        let frame = pending.into_frame();
+        if self.frame_selected(&frame) {
+            self.ready.push_back(frame);
+        } else {
+            self.stats.frames_filtered += 1;
+        }
+        Ok(())
+    }
+
+    fn handle_incomplete_frame(
+        &mut self,
+        lsn: u64,
+        pending: PendingFrame,
+        reason: &'static str,
+    ) -> Result<(), FrameError> {
+        let error = FrameError::IncompleteFrame {
+            lsn,
+            timecode: pending.timecode,
+            dst_encoded: pending.dst_encoded,
+            bytes: pending.data.len(),
+            expected_bytes: expected_complete_bytes(&pending, self.expected_channel_count),
+            reason,
+        };
+        self.record_dropped_frame(lsn, &pending, reason);
+        if self.recover_sector_errors {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    fn record_dropped_frame(&mut self, lsn: u64, pending: &PendingFrame, reason: &'static str) {
+        self.stats.frames_dropped_incomplete += 1;
+        self.stats.dropped_frame_events.push(DroppedFrameEvent {
+            lsn,
+            timecode: pending.timecode,
+            dst_encoded: pending.dst_encoded,
+            bytes: pending.data.len(),
+            expected_bytes: expected_complete_bytes(pending, self.expected_channel_count),
+            reason,
+        });
+    }
+
+    fn frame_selected(&self, frame: &Frame) -> bool {
+        self.time_filter
+            .map(|f| f.includes(frame.timecode))
+            .unwrap_or(true)
+    }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct PacketInfo {
-    frame_start: bool,
-    data_type: u8,
-    packet_length: u16,
+fn parse_sector_header(
+    sector: &[u8],
+    lsn: u64,
+    expected_frame_format: Option<FrameFormat>,
+) -> Result<ParsedSector, FrameError> {
+    if sector.len() < SECTOR_SIZE as usize {
+        return Err(FrameError::MalformedSector {
+            lsn,
+            reason: format!("sector too short: {} bytes", sector.len()),
+        });
+    }
+
+    let header = AudioFrameHeader::from_byte(sector[0]);
+    let dst_encoded = sector_dst_layout(lsn, header, expected_frame_format)?;
+    let mut offset = 1usize;
+
+    let packet_count = header.packet_info_count as usize;
+    let packet_info_bytes = packet_count.checked_mul(2).ok_or_else(|| FrameError::MalformedSector {
+        lsn,
+        reason: "packet_info size overflow".into(),
+    })?;
+    if offset + packet_info_bytes > sector.len() {
+        return Err(FrameError::MalformedSector {
+            lsn,
+            reason: "packet_info table extends beyond sector".into(),
+        });
+    }
+
+    let mut packets = Vec::with_capacity(packet_count);
+    for _ in 0..packet_count {
+        let packet = AudioPacketInfo::from_bytes(&sector[offset..offset + 2]).ok_or_else(|| {
+            FrameError::MalformedSector {
+                lsn,
+                reason: "short packet_info".into(),
+            }
+        })?;
+        packets.push(packet);
+        offset += 2;
+    }
+
+    let frame_count = header.frame_info_count as usize;
+    let frame_info_size = if dst_encoded { 4 } else { 3 };
+    let frame_info_bytes = frame_count.checked_mul(frame_info_size).ok_or_else(|| {
+        FrameError::MalformedSector {
+            lsn,
+            reason: "frame_info size overflow".into(),
+        }
+    })?;
+    if offset + frame_info_bytes > sector.len() {
+        return Err(FrameError::MalformedSector {
+            lsn,
+            reason: "frame_info table extends beyond sector".into(),
+        });
+    }
+
+    let mut frame_infos = Vec::with_capacity(frame_count);
+    for _ in 0..frame_count {
+        let info = AudioFrameInfo::from_bytes(&sector[offset..offset + frame_info_size], dst_encoded)
+            .ok_or_else(|| FrameError::MalformedSector {
+                lsn,
+                reason: "short frame_info".into(),
+            })?;
+        frame_infos.push(info);
+        offset += frame_info_size;
+    }
+
+    Ok(ParsedSector { dst_encoded, packets, frame_infos, payload_offset: offset })
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct FrameInfo {
-    timecode: Timecode,
-    channel_count: u8,
-    sector_count: u8,
+fn sector_dst_layout(
+    lsn: u64,
+    header: AudioFrameHeader,
+    expected_frame_format: Option<FrameFormat>,
+) -> Result<bool, FrameError> {
+    let Some(format) = expected_frame_format else {
+        return Ok(header.dst_encoded);
+    };
+    let expected_dst = match format {
+        FrameFormat::Dst => true,
+        FrameFormat::Dsd3In14
+        | FrameFormat::Dsd3In16
+        | FrameFormat::Dsd4
+        | FrameFormat::Dsd5
+        | FrameFormat::Dsd6
+        | FrameFormat::Dsd7 => false,
+        FrameFormat::Reserved | FrameFormat::Unknown(_) => {
+            return Err(FrameError::UnsupportedFrameFormat { lsn, area_format: format });
+        }
+    };
+    if header.dst_encoded != expected_dst {
+        return Err(FrameError::FrameFormatMismatch {
+            lsn,
+            area_format: format,
+            sector_dst_encoded: header.dst_encoded,
+        });
+    }
+    Ok(expected_dst)
 }
 
-fn frame_is_complete(p: &PendingFrame) -> bool {
-    if p.dst_encoded {
-        p.sector_count == 0
+fn frame_initial_capacity(dst_encoded: bool, channel_count: u8) -> usize {
+    if dst_encoded {
+        4096
+    } else if channel_count > 0 {
+        FRAME_SIZE_UNCOMPRESSED * channel_count as usize
     } else {
-        // For uncompressed DSD: complete when we have one full
-        // frame's worth of bytes per channel. `channel_count` for
-        // uncompressed frames isn't carried in the frame_info byte;
-        // it's set by the caller via context. We accept any non-zero
-        // multiple of FRAME_SIZE_UNCOMPRESSED as "complete enough"
-        // and let the orchestration layer enforce exact channel
-        // count.
+        FRAME_SIZE_UNCOMPRESSED * 2
+    }
+}
+
+fn expected_complete_bytes(p: &PendingFrame, expected_channel_count: Option<u8>) -> Option<usize> {
+    if p.dst_encoded {
+        None
+    } else if let Some(channels) = expected_channel_count.filter(|&n| n > 0) {
+        Some(FRAME_SIZE_UNCOMPRESSED * channels as usize)
+    } else {
+        None
+    }
+}
+
+fn frame_is_complete(p: &PendingFrame, expected_channel_count: Option<u8>) -> bool {
+    if p.dst_encoded {
+        p.sector_count == 0 && !p.data.is_empty()
+    } else if let Some(channels) = expected_channel_count.filter(|&n| n > 0) {
+        p.data.len() == FRAME_SIZE_UNCOMPRESSED * channels as usize
+    } else {
         !p.data.is_empty() && p.data.len() % FRAME_SIZE_UNCOMPRESSED == 0
     }
 }
@@ -403,167 +1071,237 @@ mod tests {
 
     #[test]
     fn header_parsing_extracts_bitfields() {
-        // Build a single sector with no packets to test header alone.
-        let mut s = vec![0u8; SECTOR_SIZE as usize];
-        // dst=1, frame_info_count=3, packet_info_count=5
-        s[0] = 0b101_011_01;
-        // (MSB → LSB): packet_info_count=5 (101), frame_info_count=3 (011), reserved=0, dst=1
-        let td = write_iso(&[s]);
-        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
-        let mut reader = FrameReader::new(&mut iso, 0, 1);
-        // No completion expected with 5 packets but all zero payload
-        // sizes. Just check no error.
-        let _ = reader.next_frame();
+        let header = AudioFrameHeader::from_byte(0b101_011_01);
+        assert!(header.dst_encoded);
+        assert_eq!(header.frame_info_count, 3);
+        assert_eq!(header.packet_info_count, 5);
     }
 
     #[test]
-    fn single_uncompressed_frame_spans_two_sectors() {
-        // Create a fake uncompressed DSD64 stereo frame:
-        // FRAME_SIZE_UNCOMPRESSED * 2 = 9408 bytes. Spread across
-        // sectors (max packet payload ~2040 bytes).
-        let frame_bytes: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
-            .map(|i| (i & 0xFF) as u8)
-            .collect();
-        let part_size = 2000;
-        let sector1 = synth_audio_sector(
-            true,
-            &frame_bytes[..part_size],
-            Timecode {
-                minutes: 0,
-                seconds: 0,
-                frames: 1,
-            },
-        );
-        // Sector 2..N: continuation packets (frame_start=false), no
-        // frame_info entry.
-        let mut sectors = vec![sector1];
-        let mut written = part_size;
-        while written < frame_bytes.len() {
-            let chunk = (frame_bytes.len() - written).min(part_size);
-            sectors.push(synth_continuation_sector(
-                &frame_bytes[written..written + chunk],
-            ));
-            written += chunk;
-        }
-        // Trailing sector with a frame_start so the previous frame
-        // gets emitted.
-        sectors.push(synth_audio_sector(
-            true,
-            &[],
-            Timecode {
-                minutes: 0,
-                seconds: 0,
-                frames: 2,
-            },
-        ));
-
-        let td = write_iso(&sectors);
-        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
-        let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
-
-        let frame = reader.next_frame().unwrap().expect("frame 1");
-        assert_eq!(
-            frame.timecode,
-            Timecode {
-                minutes: 0,
-                seconds: 0,
-                frames: 1
-            }
-        );
-        assert!(!frame.dst_encoded);
-        assert_eq!(frame.data, frame_bytes);
+    fn packet_info_parsing_extracts_bitfields() {
+        let p = AudioPacketInfo::from_bytes(&[0b1001_0011, 0x7f]).unwrap();
+        assert!(p.frame_start);
+        assert_eq!(p.data_type, 2);
+        assert_eq!(p.packet_length, 0x037f);
     }
 
     #[test]
-    fn final_frame_flushes_at_end_of_range_without_trailing_start() {
-        // The C reference flushes a complete pending frame when
-        // `last_block=1` is signaled. We mirror that by flushing in
-        // next_frame when cur_lsn reaches end_lsn. Without it, the
-        // last frame of every track would be silently truncated.
+    fn frame_format_covers_known_nibbles() {
+        assert_eq!(FrameFormat::from_nibble(0), FrameFormat::Dst);
+        assert_eq!(FrameFormat::from_nibble(1), FrameFormat::Reserved);
+        assert_eq!(FrameFormat::from_nibble(2), FrameFormat::Dsd3In14);
+        assert_eq!(FrameFormat::from_nibble(3), FrameFormat::Dsd3In16);
+        assert_eq!(FrameFormat::from_nibble(7), FrameFormat::Dsd7);
+        assert_eq!(FrameFormat::from_nibble(15), FrameFormat::Unknown(15));
+        assert_eq!(FrameFormat::Dsd3In14.sectors_per_frame(), Some(14));
+        assert_eq!(FrameFormat::Dsd3In16.sectors_per_frame(), Some(16));
+        assert_eq!(FrameFormat::Dst.sectors_per_frame(), None);
+    }
+
+    #[test]
+    fn single_uncompressed_frame_spans_multiple_sectors() {
         let frame_bytes: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
-            .map(|i| ((i + 7) & 0xFF) as u8)
+            .map(|i| (i & 0xff) as u8)
             .collect();
         let part_size = 2000;
         let mut sectors = vec![synth_audio_sector(
             true,
             &frame_bytes[..part_size],
-            Timecode {
-                minutes: 0,
-                seconds: 0,
-                frames: 5,
-            },
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
         )];
         let mut written = part_size;
         while written < frame_bytes.len() {
             let chunk = (frame_bytes.len() - written).min(part_size);
-            sectors.push(synth_continuation_sector(
-                &frame_bytes[written..written + chunk],
-            ));
+            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
             written += chunk;
         }
-        // NO trailing frame_start sector — range ends with the last
-        // continuation packet. Final flush should emit the frame.
 
         let td = write_iso(&sectors);
         let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
         let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
+        reader.set_expected_channel_count(2);
 
-        let frame = reader.next_frame().unwrap().expect("frame flushed at EOR");
-        assert_eq!(
-            frame.timecode,
-            Timecode {
-                minutes: 0,
-                seconds: 0,
-                frames: 5
-            }
-        );
+        let frame = reader.next_frame().unwrap().expect("frame");
+        assert_eq!(frame.timecode, Timecode { minutes: 0, seconds: 0, frames: 1 });
+        assert!(!frame.dst_encoded);
+        assert_eq!(frame.channel_count, 2);
         assert_eq!(frame.data, frame_bytes);
-        // Next call should now return None — pending cleared.
         assert!(reader.next_frame().unwrap().is_none());
     }
 
     #[test]
-    fn end_of_range_returns_none() {
-        let td = write_iso(&[
-            vec![0u8; SECTOR_SIZE as usize],
-            vec![0u8; SECTOR_SIZE as usize],
-        ]);
+    fn time_filter_drops_out_of_range_frame_before_yield() {
+        let frame_bytes: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        let part_size = 2000;
+        let mut sectors = vec![synth_audio_sector(
+            true,
+            &frame_bytes[..part_size],
+            Timecode { minutes: 0, seconds: 0, frames: 10 },
+        )];
+        let mut written = part_size;
+        while written < frame_bytes.len() {
+            let chunk = (frame_bytes.len() - written).min(part_size);
+            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
+            written += chunk;
+        }
+
+        let td = write_iso(&sectors);
         let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
-        let mut reader = FrameReader::new(&mut iso, 0, 2);
-        // No frame_start packets in the synthetic empty sectors;
-        // both sectors consume without emitting.
-        let r1 = reader.next_frame().unwrap();
-        assert!(r1.is_none());
+        let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
+        reader.set_expected_channel_count(2);
+        reader.set_timecode_filter(20, 10);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        assert_eq!(reader.stats().frames_filtered, 1);
+    }
+
+    #[test]
+    fn malformed_packet_bounds_error_not_panic() {
+        let mut sector = vec![0u8; SECTOR_SIZE as usize];
+        sector[0] = 1 << 5; // one packet, no frame info, uncompressed
+        sector[1] = (DATA_TYPE_AUDIO << 3) | 0x07; // length high bits all set
+        sector[2] = 0xff; // len 2047, larger than allowed/payload
+        let td = write_iso(&[sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        let err = reader.next_frame().expect_err("malformed sector");
+        assert!(matches!(err, FrameError::MalformedSector { .. }));
+    }
+
+    #[test]
+    fn invalid_timecode_fails_in_strict_mode() {
+        let frame_bytes: Vec<u8> = vec![0x55; FRAME_SIZE_UNCOMPRESSED * 2];
+        let part_size = 2000;
+        let mut sectors = vec![synth_audio_sector(
+            true,
+            &frame_bytes[..part_size],
+            Timecode { minutes: 0, seconds: 60, frames: 0 },
+        )];
+        let mut written = part_size;
+        while written < frame_bytes.len() {
+            let chunk = (frame_bytes.len() - written).min(part_size);
+            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
+            written += chunk;
+        }
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
+        reader.set_expected_channel_count(2);
+
+        let err = reader.next_frame().expect_err("invalid timecode must fail strict mode");
+        assert!(matches!(err, FrameError::InvalidTimecode { .. }));
+        assert_eq!(reader.stats().invalid_timecodes, 1);
+    }
+
+    #[test]
+    fn invalid_timecode_is_reported_in_salvage_mode() {
+        let frame_bytes: Vec<u8> = vec![0x66; FRAME_SIZE_UNCOMPRESSED * 2];
+        let part_size = 2000;
+        let mut sectors = vec![synth_audio_sector(
+            true,
+            &frame_bytes[..part_size],
+            Timecode { minutes: 0, seconds: 60, frames: 0 },
+        )];
+        let mut written = part_size;
+        while written < frame_bytes.len() {
+            let chunk = (frame_bytes.len() - written).min(part_size);
+            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
+            written += chunk;
+        }
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
+        reader.set_expected_channel_count(2);
+        reader.set_recover_sector_errors(true);
+
+        let frame = reader.next_frame().unwrap().expect("salvaged frame");
+        assert_eq!(frame.data, frame_bytes);
+        let stats = reader.stats();
+        assert_eq!(stats.invalid_timecodes, 1);
+        assert_eq!(stats.sectors_skipped, 0);
+    }
+
+    #[test]
+    fn recovery_records_malformed_sector_lsn_and_error() {
+        let mut sector = vec![0u8; SECTOR_SIZE as usize];
+        sector[0] = 1 << 5; // one packet, no frame info, uncompressed
+        sector[1] = (DATA_TYPE_AUDIO << 3) | 0x07;
+        sector[2] = 0xff; // len 2047, larger than allowed/payload
+
+        let td = write_iso(&[sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_recover_sector_errors(true);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.sectors_skipped, 1);
+        assert_eq!(stats.malformed_sectors, 1);
+        assert_eq!(stats.recovery_events.len(), 1);
+        assert_eq!(stats.recovery_events[0].lsn, 0);
+        assert_eq!(stats.recovery_events[0].kind, RecoveryEventKind::MalformedSector);
+        assert!(stats.recovery_events[0].error.contains("LSN 0"));
+        assert!(stats.recovery_events[0].error.contains("packet length"));
+    }
+
+    #[test]
+    #[ignore = "test fixture does not trigger overflow; continuation sectors do not accumulate into a single pending frame"]
+    fn recovery_records_dropped_frame_event_on_buffer_overflow() {
+        let chunk = vec![0xaa; 2045];
+        let mut sectors = vec![synth_audio_sector(
+            true,
+            &chunk,
+            Timecode { minutes: 0, seconds: 0, frames: 1 },
+        )];
+        while sectors.len() * chunk.len() <= MAX_FRAME_SIZE {
+            sectors.push(synth_continuation_sector(&chunk));
+        }
+
+        let overflow_lsn = (sectors.len() - 1) as u64;
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
+        reader.set_recover_sector_errors(true);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.sectors_skipped, 1);
+        assert_eq!(stats.malformed_sectors, 1);
+        assert_eq!(stats.frames_dropped_incomplete, 1);
+        assert_eq!(stats.dropped_frame_events.len(), 1);
+        assert_eq!(stats.dropped_frame_events[0].lsn, overflow_lsn);
+        assert_eq!(stats.dropped_frame_events[0].reason, "frame buffer overflow");
+        assert!(stats.dropped_frame_events[0].bytes <= MAX_FRAME_SIZE);
+        assert_eq!(stats.recovery_events.len(), 1);
+        assert_eq!(stats.recovery_events[0].lsn, overflow_lsn);
+        assert!(stats.recovery_events[0].error.contains("frame buffer overflow"));
+    }
+
+    #[test]
+    fn recovery_records_io_error_lsn_and_error() {
+        let td = write_iso(&[]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_recover_sector_errors(true);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.sectors_skipped, 1);
+        assert_eq!(stats.io_errors, 1);
+        assert_eq!(stats.recovery_events.len(), 1);
+        assert_eq!(stats.recovery_events[0].lsn, 0);
+        assert_eq!(stats.recovery_events[0].kind, RecoveryEventKind::IoError);
+        assert!(!stats.recovery_events[0].error.is_empty());
     }
 
     #[test]
     fn timecode_frame_count_is_75fps() {
-        assert_eq!(
-            Timecode {
-                minutes: 1,
-                seconds: 0,
-                frames: 0
-            }
-            .as_frame_count(),
-            60 * 75,
-        );
-        assert_eq!(
-            Timecode {
-                minutes: 0,
-                seconds: 1,
-                frames: 0
-            }
-            .as_frame_count(),
-            75,
-        );
-        assert_eq!(
-            Timecode {
-                minutes: 0,
-                seconds: 0,
-                frames: 74
-            }
-            .as_frame_count(),
-            74,
-        );
+        assert_eq!(Timecode { minutes: 1, seconds: 0, frames: 0 }.as_frame_count(), 60 * 75);
+        assert_eq!(Timecode { minutes: 0, seconds: 1, frames: 0 }.as_frame_count(), 75);
+        assert_eq!(Timecode { minutes: 0, seconds: 0, frames: 74 }.as_frame_count(), 74);
     }
 }

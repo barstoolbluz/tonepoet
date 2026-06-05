@@ -2,7 +2,15 @@
 //
 // Copyright (C) 2026 the tonepoet authors.
 //
-// SACD ISO support: detection, TOC parsing, metadata surfacing.
+// SACD ISO support: detection, Master/Area TOC parsing, metadata
+// surfacing, TOC consistency reporting, and metadata-to-extraction
+// bridging. Audio extraction itself is delegated to crates/sacd-rs,
+// with the parsed area frame-format nibble passed into the high-integrity
+// extraction API.
+//
+// Formal spec audit index: docs/scarlet_book_audit_map.md. Grep
+// SB-AUDIT anchors from that file to review implementation sites against
+// the licensed Scarlet Book specification.
 //
 // SACD ISOs are NOT UDF — they're a flat sequence of 2048-byte sectors
 // per the ScarletBook specification (Philips/Sony, 1999). The Master
@@ -26,15 +34,30 @@ use std::path::Path;
 
 /// Sector size (bytes) per the ScarletBook spec. All SACD-ISO offsets
 /// are in units of these sectors.
+// SB-AUDIT: SB-DISC-001
 pub const SECTOR_SIZE: u64 = 2048;
 
 /// Master TOC start sectors (LSNs). Three redundant copies; if the
 /// first is corrupted, fall back to the next.
+// SB-AUDIT: SB-DISC-002
 pub const MASTER_TOC_LSNS: [u64; 3] = [510, 520, 530];
+
+
+/// Canonical ScarletBook structure signatures. The older *_MAGIC names
+/// remain below for compatibility with existing call sites.
+// SB-AUDIT: SB-SIG-001..SB-SIG-008
+pub const MASTER_TOC_SIGNATURE: &[u8; 8] = b"SACDMTOC";
+pub const MASTER_TEXT_SIGNATURE: &[u8; 8] = b"SACDText";
+pub const AREA_TOC_SIGNATURE_STEREO: &[u8; 8] = b"TWOCHTOC";
+pub const AREA_TOC_SIGNATURE_MCH: &[u8; 8] = b"MULCHTOC";
+pub const AREA_TRACK_TEXT_SIGNATURE: &[u8; 8] = b"SACDTTxt";
+pub const AREA_TRACK_LIST_1_SIGNATURE: &[u8; 8] = b"SACDTRL1";
+pub const AREA_TRACK_LIST_2_SIGNATURE: &[u8; 8] = b"SACDTRL2";
+pub const AREA_ISRC_GENRE_SIGNATURE: &[u8; 8] = b"SACD_IGL";
 
 /// Magic identifier at the start of each Master TOC sector. ASCII,
 /// 8 bytes, big-endian per spec.
-pub const MASTER_TOC_MAGIC: &[u8; 8] = b"SACDMTOC";
+pub const MASTER_TOC_MAGIC: &[u8; 8] = MASTER_TOC_SIGNATURE;
 
 /// Number of contiguous sectors occupied by each Master TOC copy
 /// (Master TOC sector 0 = `master_toc_t`, sector 1 = `SACDText`,
@@ -48,31 +71,31 @@ const MASTER_TOC_T_SIZE: usize = 0xa8;
 
 /// Magic identifier for the multilingual text sector that follows the
 /// Master TOC (sector at LSN 511 / 521 / 531 — i.e. master_toc_lsn+1).
-pub const SACD_TEXT_MAGIC: &[u8; 8] = b"SACDText";
+pub const SACD_TEXT_MAGIC: &[u8; 8] = MASTER_TEXT_SIGNATURE;
 
 /// Magic identifier for a 2-channel area's TOC sector (first sector
 /// at the LSN pointed at by master_toc.area_1_toc_1_start).
-pub const TWOCH_TOC_MAGIC: &[u8; 8] = b"TWOCHTOC";
+pub const TWOCH_TOC_MAGIC: &[u8; 8] = AREA_TOC_SIGNATURE_STEREO;
 
 /// Magic identifier for a multi-channel area's TOC sector.
-pub const MULCH_TOC_MAGIC: &[u8; 8] = b"MULCHTOC";
+pub const MULCH_TOC_MAGIC: &[u8; 8] = AREA_TOC_SIGNATURE_MCH;
 
 /// Magic identifier for the per-area track-LSN list (SACDTRL1).
 /// Lives at one of the sectors following the area TOC header.
-pub const SACD_TRL1_MAGIC: &[u8; 8] = b"SACDTRL1";
+pub const SACD_TRL1_MAGIC: &[u8; 8] = AREA_TRACK_LIST_1_SIGNATURE;
 
 /// Magic identifier for the per-area track-time list (SACDTRL2).
-pub const SACD_TRL2_MAGIC: &[u8; 8] = b"SACDTRL2";
+pub const SACD_TRL2_MAGIC: &[u8; 8] = AREA_TRACK_LIST_2_SIGNATURE;
 
 /// Magic identifier for the per-area, per-track text sector
 /// (track titles, performers, composers, ISRC-adjacent metadata).
 /// One sector per locale; tonepoet only parses the primary one
 /// (locale 0).
-pub const SACD_T_TXT_MAGIC: &[u8; 8] = b"SACDTTxt";
+pub const SACD_T_TXT_MAGIC: &[u8; 8] = AREA_TRACK_TEXT_SIGNATURE;
 
 /// Magic identifier for the per-area ISRC + per-track genre list.
 /// Spans **two** consecutive sectors (4096 bytes total, 4092 used).
-pub const SACD_IGL_MAGIC: &[u8; 8] = b"SACD_IGL";
+pub const SACD_IGL_MAGIC: &[u8; 8] = AREA_ISRC_GENRE_SIGNATURE;
 
 /// Magic identifier for the access list. Spans 32 consecutive
 /// sectors (64 KB) and contains data we don't currently surface;
@@ -313,6 +336,16 @@ pub struct Genre {
 }
 
 impl Genre {
+    /// ScarletBook genre-table category label.
+    pub fn category_name(&self) -> &'static str {
+        match self.category {
+            0 => "Not used",
+            1 => "General",
+            2 => "Japanese",
+            _ => "unknown",
+        }
+    }
+
     /// English label for the genre code, or `"unknown"` if outside
     /// the spec range.
     pub fn name(&self) -> &'static str {
@@ -387,6 +420,7 @@ pub struct DiscDate {
 /// title, performer, etc.) lives in the `SACDText` sector and is
 /// parsed separately in C2b.
 #[derive(Debug, Clone)]
+// SB-AUDIT: SB-MTOC-001..SB-MTOC-009
 pub struct MasterToc {
     /// (major, minor) — e.g. (1, 20) on a 1.20 disc.
     pub spec_version: (u8, u8),
@@ -536,6 +570,51 @@ pub fn parse_master_toc(buf: &[u8]) -> Result<MasterToc, SacdError> {
     })
 }
 
+/// Reusable 2048-byte sector reader for TOC scans.
+///
+/// The previous helper opened, sought, read, and closed the ISO for every
+/// sector. That is acceptable for one-off probes, but area TOC scans can touch
+/// dozens of adjacent sectors. Keeping a single file descriptor and reusable
+/// caller-provided buffers removes repeated open/close churn while preserving
+/// the simple path-level public API.
+struct SectorReader {
+    file: std::fs::File,
+}
+
+impl SectorReader {
+    fn open(path: &Path) -> Result<Self, SacdError> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| SacdError::Io(format!("open: {}", e)))?;
+        Ok(Self { file })
+    }
+
+    fn read_sector_into(&mut self, lsn: u64, buf: &mut [u8]) -> Result<(), SacdError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        if buf.len() < SECTOR_SIZE as usize {
+            return Err(SacdError::Malformed(format!(
+                "sector read buffer too small: {} < {}",
+                buf.len(), SECTOR_SIZE
+            )));
+        }
+        let offset = lsn.checked_mul(SECTOR_SIZE).ok_or_else(|| {
+            SacdError::Malformed(format!("sector offset overflow for LSN {}", lsn))
+        })?;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| SacdError::Io(format!("seek to LSN {}: {}", lsn, e)))?;
+        self.file
+            .read_exact(&mut buf[..SECTOR_SIZE as usize])
+            .map_err(|e| SacdError::Io(format!("read LSN {}: {}", lsn, e)))
+    }
+
+    fn read_sector(&mut self, lsn: u64) -> Result<Vec<u8>, SacdError> {
+        let mut buf = vec![0u8; SECTOR_SIZE as usize];
+        self.read_sector_into(lsn, &mut buf)?;
+        Ok(buf)
+    }
+}
+
 /// Open `path`, try each redundant Master TOC LSN in order, and
 /// return the first one that parses cleanly. If every copy is either
 /// missing magic or malformed, returns `NotSacdIso` for the
@@ -677,6 +756,7 @@ fn read_genre_table(slice: &[u8]) -> Vec<Genre> {
 /// either a 0 position pointer in the spec or a string that decoded
 /// to empty.
 #[derive(Debug, Clone, Default)]
+// SB-AUDIT: SB-MTXT-001..SB-MTXT-006
 pub struct SacdText {
     pub album_title: Option<String>,
     pub album_title_phonetic: Option<String>,
@@ -813,7 +893,8 @@ pub fn read_master_text(
         .map(|l| l.character_set)
         .unwrap_or(0);
     let sector_lsn = master_toc_lsn + 1;
-    let buf = read_sector(path, sector_lsn)?;
+    let mut reader = SectorReader::open(path)?;
+    let buf = reader.read_sector(sector_lsn)?;
     match parse_sacd_text(&buf, charset) {
         Ok(t) => Ok(Some(t)),
         Err(SacdError::Malformed(_)) => Ok(None), // missing-magic = no text, not fatal
@@ -875,20 +956,20 @@ pub fn read_master_text(
 //
 // Total = 0x98 + 1896 = 2048 bytes ✓
 
-/// Frame format used by an SACD area. DSD-3-in-N variants are uncompressed;
-/// DST is lossless-compressed (~2.5:1) and requires DST decoding to
-/// reconstruct DSD samples for playback or transcoding.
+/// Frame format used by an SACD area. DSD variants are uncompressed;
+/// DST is lossless-compressed and requires DST decoding to reconstruct
+/// DSD samples for playback or transcoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// SB-AUDIT: SB-ATOC-006, SB-AUDIO-012
 pub enum FrameFormat {
-    /// DST-compressed DSD (lossless). Audio extraction needs a DST
-    /// decoder (deferred — out of scope for v1 metadata-only).
     Dst,
-    /// Uncompressed DSD packed 3 frames in 14 bytes.
+    Reserved,
     Dsd3In14,
-    /// Uncompressed DSD packed 3 frames in 16 bytes.
     Dsd3In16,
-    /// Spec value not in {0, 2, 3}. Surfaced rather than rejected so
-    /// detection still succeeds for unusual presses.
+    Dsd4,
+    Dsd5,
+    Dsd6,
+    Dsd7,
     Unknown(u8),
 }
 
@@ -896,19 +977,55 @@ impl FrameFormat {
     fn from_nibble(n: u8) -> Self {
         match n & 0x0f {
             0 => FrameFormat::Dst,
+            1 => FrameFormat::Reserved,
             2 => FrameFormat::Dsd3In14,
             3 => FrameFormat::Dsd3In16,
+            4 => FrameFormat::Dsd4,
+            5 => FrameFormat::Dsd5,
+            6 => FrameFormat::Dsd6,
+            7 => FrameFormat::Dsd7,
             other => FrameFormat::Unknown(other),
         }
     }
+
     pub fn is_dst_encoded(&self) -> bool {
         matches!(self, FrameFormat::Dst)
+    }
+
+    /// Low-nibble value as stored in the area TOC. Use this when plumbing
+    /// the parsed TUI metadata into `sacd-rs` extraction options:
+    /// `sacd_rs::FrameFormat::from_nibble(area.header.frame_format.as_nibble())`.
+    pub fn as_nibble(&self) -> u8 {
+        match self {
+            FrameFormat::Dst => 0,
+            FrameFormat::Reserved => 1,
+            FrameFormat::Dsd3In14 => 2,
+            FrameFormat::Dsd3In16 => 3,
+            FrameFormat::Dsd4 => 4,
+            FrameFormat::Dsd5 => 5,
+            FrameFormat::Dsd6 => 6,
+            FrameFormat::Dsd7 => 7,
+            FrameFormat::Unknown(n) => n & 0x0f,
+        }
+    }
+
+    pub fn sectors_per_frame(&self) -> Option<u32> {
+        match self {
+            FrameFormat::Dsd3In14
+            | FrameFormat::Dsd4
+            | FrameFormat::Dsd5
+            | FrameFormat::Dsd6
+            | FrameFormat::Dsd7 => Some(14),
+            FrameFormat::Dsd3In16 => Some(16),
+            FrameFormat::Dst | FrameFormat::Reserved | FrameFormat::Unknown(_) => None,
+        }
     }
 }
 
 /// Total playtime for an area as a (minutes, seconds, frames@75)
 /// triple. Use `total_seconds()` for a flat duration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// SB-AUDIT: SB-TRL2-002..SB-TRL2-006
 pub struct PlayTime {
     pub minutes: u8,
     pub seconds: u8,
@@ -922,6 +1039,22 @@ impl PlayTime {
             + self.seconds as f64
             + self.frames as f64 / SACD_FRAME_RATE as f64
     }
+
+    /// Total SACD frame count at 75 fps.
+    pub fn as_frame_count(&self) -> u32 {
+        (self.minutes as u32) * 60 * SACD_FRAME_RATE
+            + (self.seconds as u32) * SACD_FRAME_RATE
+            + self.frames as u32
+    }
+
+    /// True for normalized ScarletBook timecodes.
+    pub fn is_normalized(&self) -> bool {
+        self.seconds < 60 && self.frames < SACD_FRAME_RATE as u8
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.minutes == 0 && self.seconds == 0 && self.frames == 0
+    }
 }
 
 /// One area's per-track entry: timing from SACDTRL1+SACDTRL2, text
@@ -930,6 +1063,7 @@ impl PlayTime {
 /// the full set, or any subset in between. (Copy is intentionally
 /// not derived because TrackText holds owned Strings.)
 #[derive(Debug, Clone, Default)]
+// SB-AUDIT: SB-TRL1-002..SB-TRL1-006, SB-TRL2-002..SB-TRL2-006, SB-TTXT-001..SB-TTXT-016, SB-IGL-002..SB-IGL-007
 pub struct TrackEntry {
     /// Absolute LSN where this track's audio begins.
     pub start_lsn: u32,
@@ -945,6 +1079,8 @@ pub struct TrackEntry {
     /// 12-character ISRC if the disc has SACD_IGL with a non-empty
     /// ISRC for this track.
     pub isrc: Option<String>,
+    /// Structured ISRC parsed from SACD_IGL, when present.
+    pub structured_isrc: Option<Isrc>,
     /// Per-track genre from SACD_IGL.
     pub genre: Option<Genre>,
 }
@@ -953,6 +1089,7 @@ pub struct TrackEntry {
 /// Strings (description, copyright) are pulled from the trailing
 /// data region using the area's primary locale's character_set.
 #[derive(Debug, Clone)]
+// SB-AUDIT: SB-ATOC-001..SB-ATOC-014
 pub struct AreaTocHeader {
     /// `Stereo` for TWOCHTOC, `MultiChannel` for MULCHTOC.
     pub kind: AreaKind,
@@ -1007,6 +1144,191 @@ pub struct AreaTocHeader {
 pub enum AreaKind {
     Stereo,
     MultiChannel,
+}
+
+/// Severity of a TOC consistency finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TocConsistencySeverity {
+    Warning,
+    Error,
+}
+
+/// Named consistency checks performed after the TOC structures are parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// SB-AUDIT: SB-CHECK-001..SB-CHECK-012
+pub enum TocConsistencyCheck {
+    MasterAreaPointer,
+    AreaPointerKind,
+    AreaSizeBounds,
+    TrackCount,
+    TrackSectorRange,
+    TrackList1Length,
+    TrackList2Duration,
+    AreaDuration,
+    /// Exact-sector read/seek failure observed while scanning TOC sectors.
+    /// This prevents damaged-disc reports from collapsing I/O loss into
+    /// later "missing list" consistency errors.
+    TocSectorRead,
+}
+
+/// One auditable consistency finding. `track_index` is one-based when set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocConsistencyIssue {
+    pub severity: TocConsistencySeverity,
+    pub check: TocConsistencyCheck,
+    pub area: Option<AreaKind>,
+    pub track_index: Option<u8>,
+    pub message: String,
+}
+
+/// A precise TOC-sector I/O diagnostic captured during metadata scanning.
+///
+/// Audio-sector extraction uses `RecoveryEvent`; TOC scanning gets a parallel
+/// report path so a forensic caller can see the exact LSN and operation that
+/// failed instead of inferring damage from a later missing-list error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocReadEvent {
+    pub severity: TocConsistencySeverity,
+    pub area: Option<AreaKind>,
+    pub lsn: u64,
+    pub context: String,
+    pub error: String,
+}
+
+impl std::fmt::Display for TocReadEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} TOC read event at LSN {}",
+            self.severity, self.lsn
+        )?;
+        if let Some(area) = self.area {
+            write!(f, " ({:?})", area)?;
+        }
+        write!(f, ": {}: {}", self.context, self.error)
+    }
+}
+
+/// Result of the explicit TOC consistency pass. Non-strict parsing keeps
+/// metadata and exposes this report; strict parsing treats any `Error`
+/// finding as malformed input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TocConsistencyReport {
+    pub issues: Vec<TocConsistencyIssue>,
+    pub read_events: Vec<TocReadEvent>,
+}
+
+impl TocConsistencyReport {
+    pub fn is_clean(&self) -> bool {
+        self.issues.is_empty() && self.read_events.is_empty()
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == TocConsistencySeverity::Error)
+            || self
+                .read_events
+                .iter()
+                .any(|event| event.severity == TocConsistencySeverity::Error)
+    }
+
+    pub fn extend(&mut self, mut other: TocConsistencyReport) {
+        self.issues.append(&mut other.issues);
+        self.read_events.append(&mut other.read_events);
+    }
+
+    pub fn push_error(
+        &mut self,
+        check: TocConsistencyCheck,
+        area: Option<AreaKind>,
+        track_index: Option<u8>,
+        message: impl Into<String>,
+    ) {
+        self.push(TocConsistencySeverity::Error, check, area, track_index, message);
+    }
+
+    pub fn push_warning(
+        &mut self,
+        check: TocConsistencyCheck,
+        area: Option<AreaKind>,
+        track_index: Option<u8>,
+        message: impl Into<String>,
+    ) {
+        self.push(TocConsistencySeverity::Warning, check, area, track_index, message);
+    }
+
+    fn push(
+        &mut self,
+        severity: TocConsistencySeverity,
+        check: TocConsistencyCheck,
+        area: Option<AreaKind>,
+        track_index: Option<u8>,
+        message: impl Into<String>,
+    ) {
+        self.issues.push(TocConsistencyIssue {
+            severity,
+            check,
+            area,
+            track_index,
+            message: message.into(),
+        });
+    }
+
+    pub fn push_read_error(
+        &mut self,
+        area: Option<AreaKind>,
+        lsn: u64,
+        context: impl Into<String>,
+        error: impl Into<String>,
+    ) {
+        self.push_read_event(TocConsistencySeverity::Error, area, lsn, context, error);
+    }
+
+    pub fn push_read_warning(
+        &mut self,
+        area: Option<AreaKind>,
+        lsn: u64,
+        context: impl Into<String>,
+        error: impl Into<String>,
+    ) {
+        self.push_read_event(TocConsistencySeverity::Warning, area, lsn, context, error);
+    }
+
+    fn push_read_event(
+        &mut self,
+        severity: TocConsistencySeverity,
+        area: Option<AreaKind>,
+        lsn: u64,
+        context: impl Into<String>,
+        error: impl Into<String>,
+    ) {
+        let context = context.into();
+        let error = error.into();
+        self.read_events.push(TocReadEvent {
+            severity,
+            area,
+            lsn,
+            context: context.clone(),
+            error: error.clone(),
+        });
+        self.push(
+            severity,
+            TocConsistencyCheck::TocSectorRead,
+            area,
+            None,
+            format!("TOC sector read failed at LSN {} while {}: {}", lsn, context, error),
+        );
+    }
+
+    pub fn error_summary(&self) -> String {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == TocConsistencySeverity::Error)
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 /// Parse an area TOC header from a single 2048-byte sector. The
@@ -1221,6 +1543,53 @@ pub fn parse_trl2(buf: &[u8], track_count: u8) -> Result<Vec<(PlayTime, PlayTime
 // The 0x20 byte after each type byte is documented in sacd-extract
 // only as "unknown 0x20" — it appears to be a separator.
 
+/// ScarletBook per-track text type identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// SB-AUDIT: SB-TTXT-001..SB-TTXT-016
+pub enum TrackTextType {
+    Title,
+    Performer,
+    Songwriter,
+    Composer,
+    Arranger,
+    Message,
+    ExtraMessage,
+    Copyright,
+    TitlePhonetic,
+    PerformerPhonetic,
+    SongwriterPhonetic,
+    ComposerPhonetic,
+    ArrangerPhonetic,
+    MessagePhonetic,
+    ExtraMessagePhonetic,
+    CopyrightPhonetic,
+    Unknown(u8),
+}
+
+impl From<u8> for TrackTextType {
+    fn from(value: u8) -> Self {
+        match value {
+            0x01 => TrackTextType::Title,
+            0x02 => TrackTextType::Performer,
+            0x03 => TrackTextType::Songwriter,
+            0x04 => TrackTextType::Composer,
+            0x05 => TrackTextType::Arranger,
+            0x06 => TrackTextType::Message,
+            0x07 => TrackTextType::ExtraMessage,
+            0x08 => TrackTextType::Copyright,
+            0x81 => TrackTextType::TitlePhonetic,
+            0x82 => TrackTextType::PerformerPhonetic,
+            0x83 => TrackTextType::SongwriterPhonetic,
+            0x84 => TrackTextType::ComposerPhonetic,
+            0x85 => TrackTextType::ArrangerPhonetic,
+            0x86 => TrackTextType::MessagePhonetic,
+            0x87 => TrackTextType::ExtraMessagePhonetic,
+            0x88 => TrackTextType::CopyrightPhonetic,
+            other => TrackTextType::Unknown(other),
+        }
+    }
+}
+
 /// Per-track text fields for a single track in a single area, all
 /// optional (a track may carry just title, or title+performer, or
 /// every field). Phonetic variants are stored separately for discs
@@ -1234,6 +1603,7 @@ pub struct TrackText {
     pub arranger: Option<String>,
     pub message: Option<String>,
     pub extra_message: Option<String>,
+    pub copyright: Option<String>,
     pub title_phonetic: Option<String>,
     pub performer_phonetic: Option<String>,
     pub songwriter_phonetic: Option<String>,
@@ -1241,6 +1611,7 @@ pub struct TrackText {
     pub arranger_phonetic: Option<String>,
     pub message_phonetic: Option<String>,
     pub extra_message_phonetic: Option<String>,
+    pub copyright_phonetic: Option<String>,
 }
 
 /// Parse one SACDTTxt sector for the *primary* locale into a vector
@@ -1319,24 +1690,24 @@ pub fn parse_sacd_t_txt(
 }
 
 fn set_track_text_field(tt: &mut TrackText, ttype: u8, s: String) {
-    match ttype {
-        0x01 => tt.title = Some(s),
-        0x02 => tt.performer = Some(s),
-        0x03 => tt.songwriter = Some(s),
-        0x04 => tt.composer = Some(s),
-        0x05 => tt.arranger = Some(s),
-        0x06 => tt.message = Some(s),
-        0x07 => tt.extra_message = Some(s),
-        0x81 => tt.title_phonetic = Some(s),
-        0x82 => tt.performer_phonetic = Some(s),
-        0x83 => tt.songwriter_phonetic = Some(s),
-        0x84 => tt.composer_phonetic = Some(s),
-        0x85 => tt.arranger_phonetic = Some(s),
-        0x86 => tt.message_phonetic = Some(s),
-        0x87 => tt.extra_message_phonetic = Some(s),
-        // Unknown / future track types: silently skip rather than
-        // refuse to parse (matches sacd-extract behaviour).
-        _ => {}
+    match TrackTextType::from(ttype) {
+        TrackTextType::Title => tt.title = Some(s),
+        TrackTextType::Performer => tt.performer = Some(s),
+        TrackTextType::Songwriter => tt.songwriter = Some(s),
+        TrackTextType::Composer => tt.composer = Some(s),
+        TrackTextType::Arranger => tt.arranger = Some(s),
+        TrackTextType::Message => tt.message = Some(s),
+        TrackTextType::ExtraMessage => tt.extra_message = Some(s),
+        TrackTextType::Copyright => tt.copyright = Some(s),
+        TrackTextType::TitlePhonetic => tt.title_phonetic = Some(s),
+        TrackTextType::PerformerPhonetic => tt.performer_phonetic = Some(s),
+        TrackTextType::SongwriterPhonetic => tt.songwriter_phonetic = Some(s),
+        TrackTextType::ComposerPhonetic => tt.composer_phonetic = Some(s),
+        TrackTextType::ArrangerPhonetic => tt.arranger_phonetic = Some(s),
+        TrackTextType::MessagePhonetic => tt.message_phonetic = Some(s),
+        TrackTextType::ExtraMessagePhonetic => tt.extra_message_phonetic = Some(s),
+        TrackTextType::CopyrightPhonetic => tt.copyright_phonetic = Some(s),
+        TrackTextType::Unknown(_) => {}
     }
 }
 
@@ -1357,11 +1728,63 @@ fn set_track_text_field(tt: &mut TrackText, ttype: u8, s: String) {
 // year[2] + designation[5] = 12 ASCII characters. All 0x00 means
 // "no ISRC". Some discs pad with spaces instead.
 
+/// Structured International Standard Recording Code from SACD_IGL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// SB-AUDIT: SB-IGL-002..SB-IGL-005
+pub struct Isrc {
+    pub country_code: [u8; 2],
+    pub owner_code: [u8; 3],
+    pub recording_year: [u8; 2],
+    pub designation_code: [u8; 5],
+}
+
+impl Isrc {
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 12 {
+            return None;
+        }
+        let raw = &bytes[..12];
+        if raw.iter().all(|&b| b == 0 || b == b' ') {
+            return None;
+        }
+        let mut country_code = [0u8; 2];
+        let mut owner_code = [0u8; 3];
+        let mut recording_year = [0u8; 2];
+        let mut designation_code = [0u8; 5];
+        country_code.copy_from_slice(&raw[0..2]);
+        owner_code.copy_from_slice(&raw[2..5]);
+        recording_year.copy_from_slice(&raw[5..7]);
+        designation_code.copy_from_slice(&raw[7..12]);
+        Some(Self { country_code, owner_code, recording_year, designation_code })
+    }
+
+    /// Structural ISRC validation: CC is A-Z, owner is alphanumeric,
+    /// year and designation are decimal digits.
+    pub fn is_valid(&self) -> bool {
+        self.country_code.iter().all(|b| b.is_ascii_uppercase())
+            && self.owner_code.iter().all(|b| b.is_ascii_alphanumeric())
+            && self.recording_year.iter().all(|b| b.is_ascii_digit())
+            && self.designation_code.iter().all(|b| b.is_ascii_digit())
+    }
+}
+
+impl std::fmt::Display for Isrc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&String::from_utf8_lossy(&self.country_code))?;
+        f.write_str(&String::from_utf8_lossy(&self.owner_code))?;
+        f.write_str(&String::from_utf8_lossy(&self.recording_year))?;
+        f.write_str(&String::from_utf8_lossy(&self.designation_code))
+    }
+}
+
 /// One row of SACD_IGL data for a single track.
 #[derive(Debug, Clone, Default)]
 pub struct TrackIsrcGenre {
-    /// 12-character ISRC if non-empty, else None.
+    /// 12-character ISRC if non-empty, else None. Kept for compatibility
+    /// with existing metadata callers.
     pub isrc: Option<String>,
+    /// Structured ISRC with validation helpers.
+    pub structured_isrc: Option<Isrc>,
     /// Per-track genre if `category != 0`, else None.
     pub genre: Option<Genre>,
 }
@@ -1392,12 +1815,10 @@ pub fn parse_sacd_igl(buf: &[u8], track_count: u8) -> Result<Vec<TrackIsrcGenre>
     for i in 0..track_count as usize {
         // ISRC: 12 ASCII bytes. Some discs use NUL pad, some space.
         let isrc_off = isrc_base + i * 12;
-        let isrc_str = read_fixed_ascii(&buf[isrc_off..isrc_off + 12]);
-        let isrc = if isrc_str.is_empty() {
-            None
-        } else {
-            Some(isrc_str)
-        };
+        let isrc_bytes = &buf[isrc_off..isrc_off + 12];
+        let structured_isrc = Isrc::parse(isrc_bytes);
+        let isrc_str = structured_isrc.as_ref().map(|isrc| isrc.to_string()).unwrap_or_default();
+        let isrc = if isrc_str.is_empty() { None } else { Some(isrc_str) };
 
         // Genre: 4 bytes (category, reserved u16, genre_code).
         let g_off = genre_base + i * 4;
@@ -1412,7 +1833,7 @@ pub fn parse_sacd_igl(buf: &[u8], track_count: u8) -> Result<Vec<TrackIsrcGenre>
             None
         };
 
-        out.push(TrackIsrcGenre { isrc, genre });
+        out.push(TrackIsrcGenre { isrc, structured_isrc, genre });
     }
     Ok(out)
 }
@@ -1429,6 +1850,9 @@ pub struct AreaInfo {
     /// `header.track_count`. Empty if neither SACDTRL1 nor SACDTRL2
     /// was found in the area's TOC sectors (rare but tolerated).
     pub tracks: Vec<TrackEntry>,
+    /// Per-area TOC consistency diagnostics. A parsed area can be usable
+    /// while still carrying warnings or recovery-relevant errors.
+    pub consistency: TocConsistencyReport,
 }
 
 /// Top-level SACD metadata for an ISO. Either or both areas may be
@@ -1440,9 +1864,254 @@ pub struct SacdMetadata {
     pub master_text: Option<SacdText>,
     pub stereo: Option<AreaInfo>,
     pub multi_channel: Option<AreaInfo>,
+    /// Master + area TOC consistency diagnostics accumulated during parse.
+    pub consistency: TocConsistencyReport,
+}
+
+
+/// Production extraction mode for SACD audio materialization.
+///
+/// The strict mode is intended for validation and normal high-integrity
+/// conversion. Salvage mode is explicit and returns a non-clean
+/// `sacd_rs::extract::ExtractReport` whenever damaged sectors or partial
+/// frames had to be skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SacdExtractionMode {
+    Strict,
+    Salvage,
+}
+
+impl SacdExtractionMode {
+    fn integrity_options(self, area: &AreaInfo) -> sacd_rs::extract::ExtractIntegrityOptions {
+        let frame_format = sacd_rs::FrameFormat::from_nibble(area.header.frame_format.as_nibble());
+        match self {
+            SacdExtractionMode::Strict => {
+                sacd_rs::extract::ExtractIntegrityOptions::strict()
+                    .with_frame_format(frame_format)
+            }
+            SacdExtractionMode::Salvage => {
+                sacd_rs::extract::ExtractIntegrityOptions::salvage()
+                    .with_frame_format(frame_format)
+            }
+        }
+    }
+}
+
+/// Errors from the SACD metadata-to-extraction bridge.
+#[derive(Debug)]
+pub enum SacdExtractionError {
+    /// Caller requested a track index outside the parsed area track list.
+    TrackIndexOutOfRange { requested: usize, track_count: usize },
+    /// The parsed track does not have a usable sector range. This usually
+    /// means SACDTRL1 was missing or internally inconsistent.
+    MissingTrackSectorRange { track_index: usize },
+    /// Caller requested an area that was not present or failed TOC parsing.
+    AreaMissing { area: AreaKind },
+    /// Failed to open the ISO for sector-aligned extraction.
+    IsoOpen(String),
+    /// High-integrity extractor failure.
+    Extract(sacd_rs::extract::ExtractError),
+}
+
+impl std::fmt::Display for SacdExtractionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrackIndexOutOfRange { requested, track_count } => write!(
+                f,
+                "SACD extraction: track index {} out of range for {} tracks",
+                requested, track_count
+            ),
+            Self::MissingTrackSectorRange { track_index } => write!(
+                f,
+                "SACD extraction: track {} has no usable sector range",
+                track_index + 1
+            ),
+            Self::AreaMissing { area } => write!(
+                f,
+                "SACD extraction: requested {:?} area is not available",
+                area
+            ),
+            Self::IsoOpen(msg) => write!(f, "SACD extraction: open ISO: {}", msg),
+            Self::Extract(err) => write!(f, "SACD extraction: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for SacdExtractionError {}
+
+impl From<sacd_rs::extract::ExtractError> for SacdExtractionError {
+    fn from(err: sacd_rs::extract::ExtractError) -> Self {
+        Self::Extract(err)
+    }
+}
+
+impl AreaInfo {
+    /// Convert the parsed area TOC frame-format nibble into the extraction
+    /// crate's authoritative `FrameFormat` type.
+    ///
+    /// This is the production handoff point requested by the refactor brief:
+    /// extraction must not rediscover DST/plain-DSD solely from per-sector
+    /// bits. The area TOC is authoritative and the frame reader validates
+    /// sector headers against this value.
+    pub fn extraction_frame_format(&self) -> sacd_rs::FrameFormat {
+        sacd_rs::FrameFormat::from_nibble(self.header.frame_format.as_nibble())
+    }
+
+    /// Build source-compatible extraction options from this area's parsed TOC
+    /// and one track entry.
+    ///
+    /// The normal path uses SACDTRL1's pre-trimmed `(start_lsn, length_lsn)`
+    /// range. If SACDTRL1 length is absent but a plausible start LSN exists,
+    /// this falls back to the next track start or the area end LSN and attaches
+    /// the SACDTRL2 time filter so pause/pre-gap frames are not emitted.
+    pub fn track_extract_options(
+        &self,
+        track_index: usize,
+        output_format: sacd_rs::extract::OutputFormat,
+    ) -> Result<sacd_rs::extract::ExtractOptions, SacdExtractionError> {
+        let track = self.tracks.get(track_index).ok_or(
+            SacdExtractionError::TrackIndexOutOfRange {
+                requested: track_index,
+                track_count: self.tracks.len(),
+            },
+        )?;
+
+        let start_lsn = track.start_lsn as u64;
+        if start_lsn == 0 {
+            return Err(SacdExtractionError::MissingTrackSectorRange { track_index });
+        }
+
+        let mut used_wide_range_fallback = false;
+        let end_lsn = if track.length_lsn != 0 {
+            start_lsn.saturating_add(track.length_lsn as u64)
+        } else {
+            used_wide_range_fallback = true;
+            self.tracks
+                .get(track_index + 1)
+                .map(|next| next.start_lsn as u64)
+                .filter(|&next_start| next_start > start_lsn)
+                .unwrap_or(self.header.track_end_lsn as u64)
+        };
+
+        if end_lsn <= start_lsn {
+            return Err(SacdExtractionError::MissingTrackSectorRange { track_index });
+        }
+
+        let mut opts = sacd_rs::extract::ExtractOptions::new(
+            start_lsn,
+            end_lsn,
+            self.header.channel_count,
+            output_format,
+        );
+
+        if used_wide_range_fallback
+            && track.start_time.is_normalized()
+            && track.duration.is_normalized()
+            && !track.duration.is_zero()
+        {
+            opts = opts.with_time_filter(sacd_rs::extract::TimeFilter::new(
+                track.start_time.as_frame_count(),
+                track.duration.as_frame_count(),
+            ));
+        }
+
+        Ok(opts)
+    }
+
+    /// Build the high-integrity extraction controls for this area.
+    ///
+    /// This always passes
+    /// `sacd_rs::FrameFormat::from_nibble(area.header.frame_format.as_nibble())`
+    /// into `ExtractIntegrityOptions`, so production extraction validates the
+    /// sector stream against the area TOC's frame format end to end.
+    pub fn track_integrity_options(
+        &self,
+        mode: SacdExtractionMode,
+    ) -> sacd_rs::extract::ExtractIntegrityOptions {
+        mode.integrity_options(self)
+    }
+
+    /// Extract one parsed area track into a caller-owned output writer using
+    /// the high-integrity API.
+    ///
+    /// Call sites should use this instead of the legacy `extract_track()` path
+    /// whenever they are starting from parsed `AreaInfo`; it carries the area
+    /// TOC's frame format into the frame reader and returns the surfaced
+    /// integrity report.
+    pub fn extract_track_to_writer<W: std::io::Write + std::io::Seek>(
+        &self,
+        iso: &mut sacd_rs::iso_reader::IsoReader,
+        output: &mut W,
+        track_index: usize,
+        output_format: sacd_rs::extract::OutputFormat,
+        mode: SacdExtractionMode,
+    ) -> Result<sacd_rs::extract::ExtractReport, SacdExtractionError> {
+        let opts = self.track_extract_options(track_index, output_format)?;
+        let integrity_options = self.track_integrity_options(mode);
+        sacd_rs::extract::extract_track_with_integrity_options(
+            iso,
+            output,
+            opts,
+            integrity_options,
+        )
+        .map_err(SacdExtractionError::from)
+    }
+
+    /// Convenience wrapper that opens the ISO and then delegates to
+    /// [`AreaInfo::extract_track_to_writer`]. This is suitable for production
+    /// materializers that already have parsed `SacdMetadata` and an output
+    /// file/temporary writer.
+    pub fn extract_track_from_path<W: std::io::Write + std::io::Seek>(
+        &self,
+        iso_path: &Path,
+        output: &mut W,
+        track_index: usize,
+        output_format: sacd_rs::extract::OutputFormat,
+        mode: SacdExtractionMode,
+    ) -> Result<sacd_rs::extract::ExtractReport, SacdExtractionError> {
+        let mut iso = sacd_rs::iso_reader::IsoReader::open(iso_path)
+            .map_err(|e| SacdExtractionError::IsoOpen(e.to_string()))?;
+        self.extract_track_to_writer(&mut iso, output, track_index, output_format, mode)
+    }
 }
 
 impl SacdMetadata {
+    /// Return the parsed area metadata for a stereo or multi-channel request.
+    pub fn area(&self, area: AreaKind) -> Option<&AreaInfo> {
+        match area {
+            AreaKind::Stereo => self.stereo.as_ref(),
+            AreaKind::MultiChannel => self.multi_channel.as_ref(),
+        }
+    }
+
+    /// Production SACD extraction entry point from parsed metadata.
+    ///
+    /// This deliberately delegates through [`AreaInfo::extract_track_from_path`]
+    /// rather than the legacy `sacd_rs::extract::extract_track()` function, so
+    /// every production extraction carries the area TOC frame format into
+    /// `extract_track_with_integrity_options()` and returns the full integrity
+    /// report.
+    pub fn extract_track_from_path<W: std::io::Write + std::io::Seek>(
+        &self,
+        iso_path: &Path,
+        area: AreaKind,
+        track_index: usize,
+        output: &mut W,
+        output_format: sacd_rs::extract::OutputFormat,
+        mode: SacdExtractionMode,
+    ) -> Result<sacd_rs::extract::ExtractReport, SacdExtractionError> {
+        let area_info = self
+            .area(area)
+            .ok_or(SacdExtractionError::AreaMissing { area })?;
+        area_info.extract_track_from_path(
+            iso_path,
+            output,
+            track_index,
+            output_format,
+            mode,
+        )
+    }
+
     /// Best-effort album title: prefer `master_text.album_title`,
     /// fall back to the stereo area's description, then None.
     pub fn album_title(&self) -> Option<&str> {
@@ -1491,17 +2160,48 @@ pub fn parse_sacd_iso_with_strictness(
     // Walk LSNs to find a parsing master TOC; remember which LSN it
     // came from so we can locate the SACDText sector immediately
     // after it.
+    let total_sectors = file_complete_sector_count(path)?;
     let (master_toc_lsn, master_toc) = read_master_toc_with_lsn(path)?;
     let master_text = read_master_text(path, master_toc_lsn, &master_toc)?;
 
-    let stereo = parse_area_with_strictness(path, master_toc.two_channel, strict)?;
-    let multi_channel = parse_area_with_strictness(path, master_toc.multi_channel, strict)?;
+    let mut consistency = validate_master_area_pointers(&master_toc, total_sectors);
+    if strict && consistency.has_errors() {
+        return Err(SacdError::Malformed(format!(
+            "master TOC consistency failure: {}",
+            consistency.error_summary()
+        )));
+    }
+
+    let stereo = parse_area_with_strictness(
+        path,
+        master_toc.two_channel,
+        AreaKind::Stereo,
+        total_sectors,
+        strict,
+        &mut consistency,
+    )?;
+    let multi_channel = parse_area_with_strictness(
+        path,
+        master_toc.multi_channel,
+        AreaKind::MultiChannel,
+        total_sectors,
+        strict,
+        &mut consistency,
+    )?;
+
+    if strict && consistency.has_errors() {
+        return Err(SacdError::Malformed(format!(
+            "SACD TOC consistency failure: {}",
+            consistency.error_summary()
+        )));
+    }
 
     Ok(SacdMetadata {
         master_toc,
         master_text,
         stereo,
         multi_channel,
+        consistency,
     })
 }
 
@@ -1565,16 +2265,52 @@ pub fn read_master_toc_with_lsn(path: &Path) -> Result<(u64, MasterToc), SacdErr
 fn parse_area_with_strictness(
     path: &Path,
     ptr: AreaPointer,
+    expected_kind: AreaKind,
+    total_sectors: u64,
     strict: bool,
+    global_consistency: &mut TocConsistencyReport,
 ) -> Result<Option<AreaInfo>, SacdError> {
     if !ptr.is_present() {
         return Ok(None);
     }
-    match parse_area(path, ptr) {
-        Ok(a) => Ok(Some(a)),
-        Err(e) if strict => Err(e),
-        Err(_) => Ok(None),
+    match parse_area_checked_impl(path, ptr, Some(expected_kind), total_sectors) {
+        Ok(area) => {
+            global_consistency.extend(area.consistency.clone());
+            if strict && area.consistency.has_errors() {
+                return Err(SacdError::Malformed(format!(
+                    "{:?} area TOC consistency failure: {}",
+                    expected_kind,
+                    area.consistency.error_summary()
+                )));
+            }
+            Ok(Some(area))
+        }
+        Err(failure) if strict => Err(failure.error),
+        Err(failure) => {
+            let AreaParseFailure {
+                error,
+                consistency,
+            } = failure;
+            global_consistency.extend(consistency);
+            global_consistency.push_error(
+                TocConsistencyCheck::MasterAreaPointer,
+                Some(expected_kind),
+                None,
+                format!("{:?} area failed to parse: {}", expected_kind, error),
+            );
+            Ok(None)
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+struct AreaParseFailure {
+    error: SacdError,
+    consistency: TocConsistencyReport,
+}
+
+fn area_parse_failure(error: SacdError, consistency: TocConsistencyReport) -> AreaParseFailure {
+    AreaParseFailure { error, consistency }
 }
 
 /// Parse one area: load its TOC sector(s), decode the header, then
@@ -1590,21 +2326,101 @@ fn parse_area_with_strictness(
 /// sacd-extract does in `scarletbook_read.c` and is what real
 /// players do when reading scratched discs.
 pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> {
+    let total_sectors = file_complete_sector_count(path)?;
+    parse_area_checked_impl(path, ptr, None, total_sectors).map_err(|failure| failure.error)
+}
+
+fn parse_area_checked_impl(
+    path: &Path,
+    ptr: AreaPointer,
+    expected_kind: Option<AreaKind>,
+    total_sectors: u64,
+) -> Result<AreaInfo, AreaParseFailure> {
+    let mut consistency = TocConsistencyReport::default();
+    let mut sector_reader = SectorReader::open(path)
+        .map_err(|error| area_parse_failure(error, TocConsistencyReport::default()))?;
+
     // Try toc_1 first; on failure, fall back to toc_2 when set.
-    let (header, header_start_lsn) = match try_area_header_at(path, ptr.toc_1_start as u64) {
+    let (header, header_start_lsn) = match try_area_header_at(&mut sector_reader, ptr.toc_1_start as u64) {
         Ok(h) => (h, ptr.toc_1_start as u64),
         Err(primary_err) => {
+            let primary_msg = primary_err.to_string();
+            let primary_was_io = matches!(&primary_err, SacdError::Io(_));
             if ptr.toc_2_start == 0 {
-                return Err(primary_err);
+                if primary_was_io {
+                    consistency.push_read_error(
+                        expected_kind,
+                        ptr.toc_1_start as u64,
+                        "reading primary area TOC header",
+                        primary_msg.clone(),
+                    );
+                }
+                return Err(area_parse_failure(primary_err, consistency));
             }
-            match try_area_header_at(path, ptr.toc_2_start as u64) {
-                Ok(h) => (h, ptr.toc_2_start as u64),
-                // Both copies failed — surface the *primary* error
-                // since it's the one the user expected to work.
-                Err(_) => return Err(primary_err),
+            match try_area_header_at(&mut sector_reader, ptr.toc_2_start as u64) {
+                Ok(h) => {
+                    if primary_was_io {
+                        consistency.push_read_warning(
+                            expected_kind,
+                            ptr.toc_1_start as u64,
+                            "reading primary area TOC header",
+                            primary_msg.clone(),
+                        );
+                    }
+                    consistency.push_warning(
+                        TocConsistencyCheck::MasterAreaPointer,
+                        expected_kind,
+                        None,
+                        format!(
+                            "primary area TOC at LSN {} failed; using redundant copy at LSN {}: {}",
+                            ptr.toc_1_start, ptr.toc_2_start, primary_msg
+                        ),
+                    );
+                    (h, ptr.toc_2_start as u64)
+                }
+                Err(backup_err) => {
+                    let backup_msg = backup_err.to_string();
+                    let backup_was_io = matches!(&backup_err, SacdError::Io(_));
+                    if primary_was_io {
+                        consistency.push_read_error(
+                            expected_kind,
+                            ptr.toc_1_start as u64,
+                            "reading primary area TOC header",
+                            primary_msg.clone(),
+                        );
+                    }
+                    if backup_was_io {
+                        consistency.push_read_error(
+                            expected_kind,
+                            ptr.toc_2_start as u64,
+                            "reading redundant area TOC header",
+                            backup_msg.clone(),
+                        );
+                    }
+                    let msg = format!(
+                        "both area TOC copies failed: primary LSN {}: {}; redundant LSN {}: {}",
+                        ptr.toc_1_start, primary_msg, ptr.toc_2_start, backup_msg
+                    );
+                    let error = if primary_was_io && backup_was_io {
+                        SacdError::Io(msg)
+                    } else {
+                        SacdError::Malformed(msg)
+                    };
+                    return Err(area_parse_failure(error, consistency));
+                }
             }
         }
     };
+    let area_kind = expected_kind.unwrap_or(header.kind);
+    validate_area_header_consistency(
+        ptr,
+        expected_kind,
+        header_start_lsn,
+        total_sectors,
+        &header,
+        &mut consistency,
+    );
+
     let area_charset = header.locales.first().map(|l| l.character_set).unwrap_or(0);
 
     let mut starts: Option<Vec<(u32, u32)>> = None;
@@ -1619,29 +2435,47 @@ pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> 
     // per spec). `i` advances by 1, 2, or 32 depending on the magic
     // we just consumed (SACD_IGL spans 2 sectors; SACD_ACC spans 32).
     let max_scan = (header.size_sectors as u64).min(96);
+    let mut scan_buf = vec![0u8; SECTOR_SIZE as usize];
     let mut i: u64 = 1;
     while i < max_scan {
         let lsn = header_start_lsn + i;
-        let buf = match read_sector(path, lsn) {
-            Ok(b) => b,
-            Err(_) => break,
-        };
-        match &buf[0..8] {
+        if let Err(e) = sector_reader.read_sector_into(lsn, &mut scan_buf) {
+            consistency.push_read_error(
+                Some(area_kind),
+                lsn,
+                format!("scanning area TOC sector {} of {}", i, max_scan),
+                e.to_string(),
+            );
+            break;
+        }
+        match &scan_buf[0..8] {
             m if m == SACD_TRL1_MAGIC => {
-                if let Ok(v) = parse_trl1(&buf, header.track_count) {
-                    starts = Some(v);
+                match parse_trl1(&scan_buf, header.track_count) {
+                    Ok(v) => starts = Some(v),
+                    Err(e) => consistency.push_error(
+                        TocConsistencyCheck::TrackList1Length,
+                        Some(area_kind),
+                        None,
+                        format!("SACDTRL1 parse failed at LSN {}: {}", lsn, e),
+                    ),
                 }
                 i += 1;
             }
             m if m == SACD_TRL2_MAGIC => {
-                if let Ok(v) = parse_trl2(&buf, header.track_count) {
-                    times = Some(v);
+                match parse_trl2(&scan_buf, header.track_count) {
+                    Ok(v) => times = Some(v),
+                    Err(e) => consistency.push_error(
+                        TocConsistencyCheck::TrackList2Duration,
+                        Some(area_kind),
+                        None,
+                        format!("SACDTRL2 parse failed at LSN {}: {}", lsn, e),
+                    ),
                 }
                 i += 1;
             }
             m if m == SACD_T_TXT_MAGIC => {
                 if !got_text {
-                    if let Ok(v) = parse_sacd_t_txt(&buf, header.track_count, area_charset) {
+                    if let Ok(v) = parse_sacd_t_txt(&scan_buf, header.track_count, area_charset) {
                         text_per_track = v;
                         got_text = true;
                     }
@@ -1651,12 +2485,23 @@ pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> 
             m if m == SACD_IGL_MAGIC => {
                 // SACD_IGL spans 2 sectors. Concatenate before parse.
                 let next_lsn = lsn + 1;
-                if let Ok(buf2) = read_sector(path, next_lsn) {
-                    let mut full = Vec::with_capacity(2 * SECTOR_SIZE as usize);
-                    full.extend_from_slice(&buf);
-                    full.extend_from_slice(&buf2);
-                    if let Ok(v) = parse_sacd_igl(&full, header.track_count) {
-                        isrc_genre = v;
+                let mut buf2 = vec![0u8; SECTOR_SIZE as usize];
+                match sector_reader.read_sector_into(next_lsn, &mut buf2) {
+                    Ok(()) => {
+                        let mut full = Vec::with_capacity(2 * SECTOR_SIZE as usize);
+                        full.extend_from_slice(&scan_buf);
+                        full.extend_from_slice(&buf2);
+                        if let Ok(v) = parse_sacd_igl(&full, header.track_count) {
+                            isrc_genre = v;
+                        }
+                    }
+                    Err(e) => {
+                        consistency.push_read_warning(
+                            Some(area_kind),
+                            next_lsn,
+                            "reading SACD_IGL continuation sector",
+                            e.to_string(),
+                        );
                     }
                 }
                 i += SACD_IGL_SECTOR_SPAN;
@@ -1691,35 +2536,499 @@ pub fn parse_area(path: &Path, ptr: AreaPointer) -> Result<AreaInfo, SacdError> 
             duration,
             text,
             isrc: ig.isrc,
+            structured_isrc: ig.structured_isrc,
             genre: ig.genre,
         });
     }
 
-    Ok(AreaInfo { header, tracks })
+    validate_track_list_consistency(area_kind, &header, starts.as_deref(), times.as_deref(), &mut consistency);
+
+    Ok(AreaInfo { header, tracks, consistency })
 }
 
-/// Read a single 2048-byte sector at `lsn` from `path` into a fresh
-/// Vec.
+// SB-AUDIT: SB-CHECK-001
+fn validate_master_area_pointers(master_toc: &MasterToc, total_sectors: u64) -> TocConsistencyReport {
+    let mut report = TocConsistencyReport::default();
+    validate_area_pointer(AreaKind::Stereo, master_toc.two_channel, total_sectors, &mut report);
+    validate_area_pointer(
+        AreaKind::MultiChannel,
+        master_toc.multi_channel,
+        total_sectors,
+        &mut report,
+    );
+    report
+}
+
+fn validate_area_pointer(
+    kind: AreaKind,
+    ptr: AreaPointer,
+    total_sectors: u64,
+    report: &mut TocConsistencyReport,
+) {
+    let partially_present = ptr.toc_1_start != 0 || ptr.toc_2_start != 0 || ptr.toc_size_sectors != 0;
+    if !ptr.is_present() {
+        if partially_present {
+            report.push_error(
+                TocConsistencyCheck::MasterAreaPointer,
+                Some(kind),
+                None,
+                format!(
+                    "{:?} area pointer is partial: toc_1_start={}, toc_2_start={}, toc_size_sectors={}",
+                    kind, ptr.toc_1_start, ptr.toc_2_start, ptr.toc_size_sectors
+                ),
+            );
+        }
+        return;
+    }
+
+    if ptr.toc_size_sectors > 96 {
+        report.push_error(
+            TocConsistencyCheck::AreaSizeBounds,
+            Some(kind),
+            None,
+            format!(
+                "{:?} area pointer declares {} TOC sectors; spec maximum is 96",
+                kind, ptr.toc_size_sectors
+            ),
+        );
+    }
+
+    validate_lsn_span(
+        TocConsistencyCheck::MasterAreaPointer,
+        Some(kind),
+        None,
+        ptr.toc_1_start as u64,
+        ptr.toc_size_sectors as u64,
+        total_sectors,
+        "primary area TOC pointer",
+        report,
+    );
+    if ptr.toc_2_start != 0 {
+        validate_lsn_span(
+            TocConsistencyCheck::MasterAreaPointer,
+            Some(kind),
+            None,
+            ptr.toc_2_start as u64,
+            ptr.toc_size_sectors as u64,
+            total_sectors,
+            "redundant area TOC pointer",
+            report,
+        );
+    }
+}
+
+// SB-AUDIT: SB-CHECK-002..SB-CHECK-004
+fn validate_area_header_consistency(
+    ptr: AreaPointer,
+    expected_kind: Option<AreaKind>,
+    header_start_lsn: u64,
+    total_sectors: u64,
+    header: &AreaTocHeader,
+    report: &mut TocConsistencyReport,
+) {
+    let area = Some(expected_kind.unwrap_or(header.kind));
+
+    if let Some(expected) = expected_kind {
+        if header.kind != expected {
+            report.push_error(
+                TocConsistencyCheck::AreaPointerKind,
+                area,
+                None,
+                format!(
+                    "area pointer expected {:?} TOC but header at LSN {} is {:?}",
+                    expected, header_start_lsn, header.kind
+                ),
+            );
+        }
+    }
+
+    if header.size_sectors == 0 || header.size_sectors > 96 {
+        report.push_error(
+            TocConsistencyCheck::AreaSizeBounds,
+            area,
+            None,
+            format!(
+                "area TOC header declares {} sectors; valid range is 1..=96",
+                header.size_sectors
+            ),
+        );
+    }
+    if ptr.toc_size_sectors != 0 && header.size_sectors != ptr.toc_size_sectors {
+        report.push_error(
+            TocConsistencyCheck::AreaSizeBounds,
+            area,
+            None,
+            format!(
+                "master pointer TOC size {} disagrees with area header TOC size {}",
+                ptr.toc_size_sectors, header.size_sectors
+            ),
+        );
+    }
+    validate_lsn_span(
+        TocConsistencyCheck::AreaSizeBounds,
+        area,
+        None,
+        header_start_lsn,
+        header.size_sectors as u64,
+        total_sectors,
+        "area TOC header span",
+        report,
+    );
+
+    if header.track_count == 0 {
+        report.push_error(
+            TocConsistencyCheck::TrackCount,
+            area,
+            None,
+            "area TOC declares zero tracks",
+        );
+    }
+
+    if header.track_start_lsn == 0 || header.track_end_lsn == 0 || header.track_start_lsn >= header.track_end_lsn {
+        report.push_error(
+            TocConsistencyCheck::TrackSectorRange,
+            area,
+            None,
+            format!(
+                "invalid area audio bounds: track_start_lsn={}, track_end_lsn={}",
+                header.track_start_lsn, header.track_end_lsn
+            ),
+        );
+    } else {
+        validate_lsn_span(
+            TocConsistencyCheck::TrackSectorRange,
+            area,
+            None,
+            header.track_start_lsn as u64,
+            (header.track_end_lsn - header.track_start_lsn) as u64,
+            total_sectors,
+            "area audio span",
+            report,
+        );
+    }
+}
+
+fn validate_track_list_consistency(
+    area_kind: AreaKind,
+    header: &AreaTocHeader,
+    starts: Option<&[(u32, u32)]>,
+    times: Option<&[(PlayTime, PlayTime)]>,
+    report: &mut TocConsistencyReport,
+) {
+    let area = Some(area_kind);
+    let track_count = header.track_count as usize;
+
+    match starts {
+        Some(v) if v.len() == track_count => {
+            let mut previous_start: Option<u32> = None;
+            let mut previous_end: Option<u64> = None;
+            for (idx, &(start, len)) in v.iter().enumerate() {
+                let track_index = Some((idx + 1) as u8);
+                if start == 0 {
+                    report.push_error(
+                        TocConsistencyCheck::TrackList1Length,
+                        area,
+                        track_index,
+                        "SACDTRL1 track start LSN is zero",
+                    );
+                }
+                if len == 0 {
+                    report.push_error(
+                        TocConsistencyCheck::TrackList1Length,
+                        area,
+                        track_index,
+                        "SACDTRL1 track length is zero sectors",
+                    );
+                }
+                let end = match (start as u64).checked_add(len as u64) {
+                    Some(end) => end,
+                    None => {
+                        report.push_error(
+                            TocConsistencyCheck::TrackList1Length,
+                            area,
+                            track_index,
+                            format!("SACDTRL1 track range overflows: start={}, length={}", start, len),
+                        );
+                        continue;
+                    }
+                };
+                if start < header.track_start_lsn || end > header.track_end_lsn as u64 {
+                    report.push_error(
+                        TocConsistencyCheck::TrackSectorRange,
+                        area,
+                        track_index,
+                        format!(
+                            "track LSN range [{}..{}) falls outside area audio bounds [{}..{})",
+                            start, end, header.track_start_lsn, header.track_end_lsn
+                        ),
+                    );
+                }
+                if let Some(prev_start) = previous_start {
+                    if start < prev_start {
+                        report.push_error(
+                            TocConsistencyCheck::TrackSectorRange,
+                            area,
+                            track_index,
+                            format!(
+                                "track start LSN {} is before previous track start LSN {}",
+                                start, prev_start
+                            ),
+                        );
+                    }
+                }
+                if let Some(prev_end) = previous_end {
+                    if (start as u64) < prev_end {
+                        report.push_error(
+                            TocConsistencyCheck::TrackSectorRange,
+                            area,
+                            track_index,
+                            format!(
+                                "track starts at LSN {} before previous track ends at LSN {}",
+                                start, prev_end
+                            ),
+                        );
+                    } else if (start as u64) > prev_end {
+                        report.push_warning(
+                            TocConsistencyCheck::TrackSectorRange,
+                            area,
+                            track_index,
+                            format!(
+                                "gap of {} sectors before track {}",
+                                (start as u64) - prev_end,
+                                idx + 1
+                            ),
+                        );
+                    }
+                }
+                previous_start = Some(start);
+                previous_end = Some(end);
+            }
+            if let Some(&(first, _)) = v.first() {
+                if first != header.track_start_lsn {
+                    report.push_warning(
+                        TocConsistencyCheck::TrackSectorRange,
+                        area,
+                        Some(1),
+                        format!(
+                            "first SACDTRL1 start LSN {} differs from area track_start_lsn {}",
+                            first, header.track_start_lsn
+                        ),
+                    );
+                }
+            }
+            if let Some(last_end) = previous_end {
+                if last_end != header.track_end_lsn as u64 {
+                    report.push_warning(
+                        TocConsistencyCheck::TrackSectorRange,
+                        area,
+                        Some(header.track_count),
+                        format!(
+                            "last SACDTRL1 end LSN {} differs from area track_end_lsn {}",
+                            last_end, header.track_end_lsn
+                        ),
+                    );
+                }
+            }
+        }
+        Some(v) => report.push_error(
+            TocConsistencyCheck::TrackCount,
+            area,
+            None,
+            format!(
+                "SACDTRL1 decoded {} tracks but area header declares {}",
+                v.len(), track_count
+            ),
+        ),
+        None if header.track_count != 0 => report.push_error(
+            TocConsistencyCheck::TrackList1Length,
+            area,
+            None,
+            "SACDTRL1 track LSN/length list is missing",
+        ),
+        None => {}
+    }
+
+    match times {
+        Some(v) if v.len() == track_count => {
+            let mut previous_end: Option<u32> = None;
+            let mut last_end: Option<u32> = None;
+            let mut duration_sum: u32 = 0;
+            for (idx, &(start, duration)) in v.iter().enumerate() {
+                let track_index = Some((idx + 1) as u8);
+                if !start.is_normalized() {
+                    report.push_error(
+                        TocConsistencyCheck::TrackList2Duration,
+                        area,
+                        track_index,
+                        format!(
+                            "SACDTRL2 start time is not normalized: {:02}:{:02}:{:02}",
+                            start.minutes, start.seconds, start.frames
+                        ),
+                    );
+                }
+                if !duration.is_normalized() {
+                    report.push_error(
+                        TocConsistencyCheck::TrackList2Duration,
+                        area,
+                        track_index,
+                        format!(
+                            "SACDTRL2 duration is not normalized: {:02}:{:02}:{:02}",
+                            duration.minutes, duration.seconds, duration.frames
+                        ),
+                    );
+                }
+                if duration.is_zero() {
+                    report.push_error(
+                        TocConsistencyCheck::TrackList2Duration,
+                        area,
+                        track_index,
+                        "SACDTRL2 duration is zero",
+                    );
+                }
+                let start_frames = start.as_frame_count();
+                let duration_frames = duration.as_frame_count();
+                duration_sum = duration_sum.saturating_add(duration_frames);
+                let end_frames = start_frames.saturating_add(duration_frames);
+                if let Some(prev_end) = previous_end {
+                    if start_frames < prev_end {
+                        report.push_error(
+                            TocConsistencyCheck::TrackList2Duration,
+                            area,
+                            track_index,
+                            format!(
+                                "track starts at frame {} before previous track ends at frame {}",
+                                start_frames, prev_end
+                            ),
+                        );
+                    } else if start_frames > prev_end {
+                        report.push_warning(
+                            TocConsistencyCheck::TrackList2Duration,
+                            area,
+                            track_index,
+                            format!(
+                                "timecode gap of {} frames before track {}",
+                                start_frames - prev_end,
+                                idx + 1
+                            ),
+                        );
+                    }
+                }
+                previous_end = Some(end_frames);
+                last_end = Some(end_frames);
+            }
+
+            let area_total = header.total_playtime.as_frame_count();
+            if area_total != 0 {
+                if let Some(last_end) = last_end {
+                    let delta = frame_delta(last_end, area_total);
+                    if delta > SACD_FRAME_RATE {
+                        report.push_warning(
+                            TocConsistencyCheck::AreaDuration,
+                            area,
+                            None,
+                            format!(
+                                "last SACDTRL2 end frame {} differs from area total_playtime {} by {} frames",
+                                last_end, area_total, delta
+                            ),
+                        );
+                    }
+                }
+                let sum_delta = frame_delta(duration_sum, area_total);
+                if sum_delta > SACD_FRAME_RATE {
+                    report.push_warning(
+                        TocConsistencyCheck::AreaDuration,
+                        area,
+                        None,
+                        format!(
+                            "sum of SACDTRL2 durations {} differs from area total_playtime {} by {} frames",
+                            duration_sum, area_total, sum_delta
+                        ),
+                    );
+                }
+            }
+        }
+        Some(v) => report.push_error(
+            TocConsistencyCheck::TrackCount,
+            area,
+            None,
+            format!(
+                "SACDTRL2 decoded {} tracks but area header declares {}",
+                v.len(), track_count
+            ),
+        ),
+        None if header.track_count != 0 => report.push_error(
+            TocConsistencyCheck::TrackList2Duration,
+            area,
+            None,
+            "SACDTRL2 track time/duration list is missing",
+        ),
+        None => {}
+    }
+}
+
+fn validate_lsn_span(
+    check: TocConsistencyCheck,
+    area: Option<AreaKind>,
+    track_index: Option<u8>,
+    start_lsn: u64,
+    sectors: u64,
+    total_sectors: u64,
+    label: &str,
+    report: &mut TocConsistencyReport,
+) {
+    if sectors == 0 {
+        report.push_error(
+            check,
+            area,
+            track_index,
+            format!("{} has zero length at LSN {}", label, start_lsn),
+        );
+        return;
+    }
+    let Some(end_lsn) = start_lsn.checked_add(sectors) else {
+        report.push_error(
+            check,
+            area,
+            track_index,
+            format!("{} overflows: start={}, sectors={}", label, start_lsn, sectors),
+        );
+        return;
+    };
+    if end_lsn > total_sectors {
+        report.push_error(
+            check,
+            area,
+            track_index,
+            format!(
+                "{} [{}..{}) exceeds ISO complete-sector count {}",
+                label, start_lsn, end_lsn, total_sectors
+            ),
+        );
+    }
+}
+
+fn frame_delta(a: u32, b: u32) -> u32 {
+    if a >= b { a - b } else { b - a }
+}
+
 /// Read and parse an area TOC header from the given LSN. Returns
 /// Err if the read fails or the magic / structure is malformed.
 /// Used by `parse_area` with toc_1 then (on failure) toc_2.
-fn try_area_header_at(path: &Path, lsn: u64) -> Result<AreaTocHeader, SacdError> {
-    let buf = read_sector(path, lsn)?;
+fn try_area_header_at(reader: &mut SectorReader, lsn: u64) -> Result<AreaTocHeader, SacdError> {
+    let buf = reader.read_sector(lsn)?;
     parse_area_toc_header(&buf)
 }
 
-fn read_sector(path: &Path, lsn: u64) -> Result<Vec<u8>, SacdError> {
-    use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
+fn file_complete_sector_count(path: &Path) -> Result<u64, SacdError> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| SacdError::Io(format!("metadata: {}", e)))?
+        .len();
+    Ok(size / SECTOR_SIZE)
+}
 
-    let mut f = File::open(path).map_err(|e| SacdError::Io(format!("open: {}", e)))?;
-    let offset = lsn * SECTOR_SIZE;
-    f.seek(SeekFrom::Start(offset))
-        .map_err(|e| SacdError::Io(format!("seek to LSN {}: {}", lsn, e)))?;
-    let mut buf = vec![0u8; SECTOR_SIZE as usize];
-    f.read_exact(&mut buf)
-        .map_err(|e| SacdError::Io(format!("read LSN {}: {}", lsn, e)))?;
-    Ok(buf)
+fn read_sector(path: &Path, lsn: u64) -> Result<Vec<u8>, SacdError> {
+    let mut reader = SectorReader::open(path)?;
+    reader.read_sector(lsn)
 }
 
 #[cfg(test)]
@@ -2171,9 +3480,9 @@ mod tests {
 
     #[test]
     fn parse_area_toc_header_unknown_frame_format() {
-        let b = build_area_toc_sector(TWOCH_TOC_MAGIC, 1, 7 /* not in spec */);
+        let b = build_area_toc_sector(TWOCH_TOC_MAGIC, 1, 7 /* undocumented but known */);
         let h = parse_area_toc_header(&b).expect("parse");
-        assert_eq!(h.frame_format, FrameFormat::Unknown(7));
+        assert_eq!(h.frame_format, FrameFormat::Dsd7);
     }
 
     #[test]
@@ -2561,6 +3870,8 @@ mod tests {
         let v = parse_sacd_igl(&buf, 3).expect("parse");
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].isrc.as_deref(), Some("USAA10800001"));
+        assert_eq!(v[0].structured_isrc.unwrap().to_string(), "USAA10800001");
+        assert!(v[0].structured_isrc.unwrap().is_valid());
         assert_eq!(v[0].genre.unwrap().name(), "Jazz");
         assert!(v[1].isrc.is_none());
         assert_eq!(v[1].genre.unwrap().name(), "Rock");
@@ -2711,6 +4022,175 @@ mod tests {
         assert_eq!(stereo.tracks[1].duration.total_seconds(), 3.0 * 60.0 + 30.0);
     }
 
+
+
+    #[test]
+    fn parse_sacd_iso_reports_clean_toc_consistency_for_matching_lists() {
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("toc_clean.iso");
+        let total_sectors = 900u64;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total_sectors * SECTOR_SIZE).unwrap();
+        drop(f);
+
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
+        mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        let mut area = build_area_toc_sector(TWOCH_TOC_MAGIC, 2, 2);
+        area[0x40] = 3;
+        area[0x41] = 0;
+        area[0x42] = 0;
+        area[0x48..0x4c].copy_from_slice(&600u32.to_be_bytes());
+        area[0x4c..0x50].copy_from_slice(&850u32.to_be_bytes());
+        f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        f.write_all(&area).unwrap();
+
+        let trl1 = build_trl1_sector(&[(600, 100), (700, 150)]);
+        f.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
+        f.write_all(&trl1).unwrap();
+
+        let trl2 = build_trl2_sector(&[
+            (
+                PlayTime { minutes: 0, seconds: 0, frames: 0 },
+                PlayTime { minutes: 1, seconds: 0, frames: 0 },
+            ),
+            (
+                PlayTime { minutes: 1, seconds: 0, frames: 0 },
+                PlayTime { minutes: 2, seconds: 0, frames: 0 },
+            ),
+        ]);
+        f.seek(SeekFrom::Start(542 * SECTOR_SIZE)).unwrap();
+        f.write_all(&trl2).unwrap();
+        drop(f);
+
+        let md = parse_sacd_iso_with_strictness(&path, true).expect("strict clean TOC");
+        assert!(md.consistency.is_clean(), "{:?}", md.consistency.issues);
+        assert!(md.stereo.as_ref().unwrap().consistency.is_clean());
+    }
+
+    #[test]
+    fn parse_sacd_iso_records_precise_toc_read_event_for_truncated_area_scan() {
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("toc_truncated_scan.iso");
+
+        // File contains sectors 0..541. The area header declares a 3-sector
+        // TOC at 540, so the scan of LSN 542 must produce an exact read event
+        // rather than only a later "missing SACDTRL2" consistency error.
+        let total_sectors = 542u64;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total_sectors * SECTOR_SIZE).unwrap();
+        drop(f);
+
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
+        mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+        mtoc[0x54..0x56].copy_from_slice(&3u16.to_be_bytes());
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        let mut area = build_area_toc_sector(TWOCH_TOC_MAGIC, 1, 2);
+        area[0x0a..0x0c].copy_from_slice(&3u16.to_be_bytes());
+        area[0x48..0x4c].copy_from_slice(&600u32.to_be_bytes());
+        area[0x4c..0x50].copy_from_slice(&700u32.to_be_bytes());
+        f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        f.write_all(&area).unwrap();
+
+        f.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
+        f.write_all(&build_trl1_sector(&[(600, 100)])).unwrap();
+        drop(f);
+
+        let md = parse_sacd_iso(&path).expect("non-strict parse keeps report");
+        let stereo = md.stereo.as_ref().expect("stereo area present");
+        assert!(stereo.consistency.read_events.iter().any(|event| {
+            event.lsn == 542
+                && event.area == Some(AreaKind::Stereo)
+                && event.context.contains("scanning area TOC sector")
+                && event.error.contains("read LSN 542")
+        }));
+        assert!(md.consistency.read_events.iter().any(|event| event.lsn == 542));
+        assert!(md
+            .consistency
+            .issues
+            .iter()
+            .any(|issue| issue.check == TocConsistencyCheck::TocSectorRead
+                && issue.message.contains("LSN 542")));
+        assert!(parse_sacd_iso_with_strictness(&path, true).is_err());
+    }
+
+    #[test]
+    fn parse_sacd_iso_reports_toc_consistency_failures_non_strict() {
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("toc_bad.iso");
+        let total_sectors = 700u64;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total_sectors * SECTOR_SIZE).unwrap();
+        drop(f);
+
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
+        mtoc[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x12..0x14].copy_from_slice(&1u16.to_be_bytes());
+        mtoc[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+        mtoc[0x54..0x56].copy_from_slice(&120u16.to_be_bytes()); // invalid: >96 and mismatches header
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+
+        let mut area = build_area_toc_sector(TWOCH_TOC_MAGIC, 2, 2);
+        area[0x40] = 1;
+        area[0x41] = 0;
+        area[0x42] = 0;
+        area[0x48..0x4c].copy_from_slice(&600u32.to_be_bytes());
+        area[0x4c..0x50].copy_from_slice(&650u32.to_be_bytes());
+        f.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        f.write_all(&area).unwrap();
+
+        let trl1 = build_trl1_sector(&[(600, 100), (650, 0)]);
+        f.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
+        f.write_all(&trl1).unwrap();
+
+        let trl2 = build_trl2_sector(&[
+            (
+                PlayTime { minutes: 0, seconds: 0, frames: 0 },
+                PlayTime { minutes: 1, seconds: 0, frames: 0 },
+            ),
+            (
+                PlayTime { minutes: 0, seconds: 30, frames: 0 },
+                PlayTime { minutes: 0, seconds: 60, frames: 0 },
+            ),
+        ]);
+        f.seek(SeekFrom::Start(542 * SECTOR_SIZE)).unwrap();
+        f.write_all(&trl2).unwrap();
+        drop(f);
+
+        let md = parse_sacd_iso(&path).expect("non-strict keeps metadata and report");
+        assert!(md.consistency.has_errors());
+        assert!(md.consistency.issues.iter().any(|issue| issue.check == TocConsistencyCheck::AreaSizeBounds));
+        assert!(md.consistency.issues.iter().any(|issue| issue.check == TocConsistencyCheck::TrackSectorRange));
+        assert!(md.consistency.issues.iter().any(|issue| issue.check == TocConsistencyCheck::TrackList1Length));
+        assert!(md.consistency.issues.iter().any(|issue| issue.check == TocConsistencyCheck::TrackList2Duration));
+        assert!(parse_sacd_iso_with_strictness(&path, true).is_err());
+    }
+
     // ---------- C7 tests: redundancy fallback, malformed paths, real-ISO ----------
 
     #[test]
@@ -2791,6 +4271,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_sacd_iso_preserves_both_unreadable_area_toc_events() {
+        use std::io::{Seek, SeekFrom, Write};
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("both_unreadable_area_tocs.iso");
+        let total = 700u64;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total * SECTOR_SIZE).unwrap();
+        drop(f);
+
+        let mut mtoc = vec![0u8; MASTER_TOC_T_SIZE];
+        mtoc[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+        mtoc[0x08] = 1;
+        mtoc[0x09] = 20;
+        mtoc[0x40..0x44].copy_from_slice(&700u32.to_be_bytes());
+        mtoc[0x44..0x48].copy_from_slice(&701u32.to_be_bytes());
+        mtoc[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        f.write_all(&mtoc).unwrap();
+        drop(f);
+
+        let md = parse_sacd_iso(&path).expect("non-strict keeps forensic report");
+        assert!(md.stereo.is_none());
+
+        let primary = md.consistency.read_events.iter().find(|event| {
+            event.area == Some(AreaKind::Stereo)
+                && event.lsn == 700
+                && event.context.contains("primary area TOC header")
+        });
+        let redundant = md.consistency.read_events.iter().find(|event| {
+            event.area == Some(AreaKind::Stereo)
+                && event.lsn == 701
+                && event.context.contains("redundant area TOC header")
+        });
+
+        assert!(primary.is_some(), "missing primary event: {:?}", md.consistency.read_events);
+        assert!(redundant.is_some(), "missing redundant event: {:?}", md.consistency.read_events);
+        assert_eq!(primary.unwrap().severity, TocConsistencySeverity::Error);
+        assert_eq!(redundant.unwrap().severity, TocConsistencySeverity::Error);
+        assert!(parse_sacd_iso_with_strictness(&path, true).is_err());
+    }
+
+    #[test]
     fn parse_area_no_toc_2_returns_primary_error() {
         // When ptr.toc_2_start is 0 we mustn't try sector 0 (which
         // contains the file system area).
@@ -2820,6 +4343,89 @@ mod tests {
             strict.is_err(),
             "should error when toc_1 fails and no toc_2"
         );
+    }
+
+
+    fn build_extraction_test_area(frame_format_nibble: u8) -> AreaInfo {
+        let header = parse_area_toc_header(&build_area_toc_sector(
+            TWOCH_TOC_MAGIC,
+            1,
+            frame_format_nibble,
+        ))
+        .expect("area header");
+        AreaInfo {
+            header,
+            tracks: vec![TrackEntry {
+                start_lsn: 600,
+                length_lsn: 14,
+                start_time: PlayTime::default(),
+                duration: PlayTime {
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 1,
+                },
+                ..TrackEntry::default()
+            }],
+            consistency: TocConsistencyReport::default(),
+        }
+    }
+
+    #[test]
+    fn area_integrity_options_plumb_area_frame_format() {
+        let area = build_extraction_test_area(0); // DST
+        let strict = area.track_integrity_options(SacdExtractionMode::Strict);
+        assert_eq!(strict.frame_format, Some(sacd_rs::FrameFormat::Dst));
+        assert!(!strict.recover_sector_errors);
+        assert!(strict.strict_channel_count);
+
+        let salvage = area.track_integrity_options(SacdExtractionMode::Salvage);
+        assert_eq!(salvage.frame_format, Some(sacd_rs::FrameFormat::Dst));
+        assert!(salvage.recover_sector_errors);
+        assert!(!salvage.strict_channel_count);
+    }
+
+    #[test]
+    fn area_track_extract_options_use_toc_channel_count_and_trl1_range() {
+        let area = build_extraction_test_area(2); // DSD3-in-14
+        let opts = area
+            .track_extract_options(0, sacd_rs::extract::OutputFormat::Dff)
+            .expect("track options");
+        assert_eq!(opts.start_lsn, 600);
+        assert_eq!(opts.end_lsn, 614);
+        assert_eq!(opts.channel_count, area.header.channel_count);
+        assert_eq!(opts.time_filter, None);
+    }
+
+    #[test]
+    fn metadata_extraction_entry_reports_missing_area_before_opening_iso() {
+        let md = SacdMetadata {
+            master_toc: parse_master_toc(&{
+                let mut b = vec![0u8; MASTER_TOC_T_SIZE];
+                b[0..8].copy_from_slice(MASTER_TOC_MAGIC);
+                b[0x08] = 1;
+                b[0x09] = 20;
+                b[0x40..0x44].copy_from_slice(&540u32.to_be_bytes());
+                b[0x54..0x56].copy_from_slice(&1u16.to_be_bytes());
+                b
+            })
+            .expect("master toc"),
+            master_text: None,
+            stereo: Some(build_extraction_test_area(2)),
+            multi_channel: None,
+            consistency: TocConsistencyReport::default(),
+        };
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let err = md
+            .extract_track_from_path(
+                std::path::Path::new("/definitely/not/present.iso"),
+                AreaKind::MultiChannel,
+                0,
+                &mut output,
+                sacd_rs::extract::OutputFormat::Dff,
+                SacdExtractionMode::Strict,
+            )
+            .expect_err("missing area should fail before ISO open");
+        assert!(matches!(err, SacdExtractionError::AreaMissing { area: AreaKind::MultiChannel }));
     }
 
     /// Real-world ISO fixture: only runs when

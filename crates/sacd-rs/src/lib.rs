@@ -23,16 +23,16 @@
 //!
 //! [upstream]: https://github.com/Sound-Linux-More/sacd-extract
 //!
-//! ## Roadmap
+//! ## Status
 //!
-//! - **PR 1 (this crate set)**: uncompressed-DSD extraction —
-//!   frame reader, DSF/DFF writers, orchestration, byte-exact test
-//!   against the C reference on a known uncompressed SACD.
-//! - **PR 2**: DST decoder port (handed off to a reasoning model
-//!   for the dense math, integrated here).
-//! - **PR 3**: tonepoet pipeline integration (Convert UI for SACD,
-//!   Analyze + DR via sox decimation).
+//! This crate implements local SACD ISO audio extraction for both
+//! uncompressed DSD and DST-encoded frames, with DSF/DFF output,
+//! structured frame parsing, strict integrity validation, and explicit
+//! damaged-ISO salvage reporting. Scarlet Book metadata parsing lives
+//! in tonepoet's `tui::sacd` module, which passes parsed area state into
+//! this crate's high-integrity extraction API.
 
+pub mod consts;
 pub mod dff_footer;
 pub mod dff_writer;
 pub mod dsf_writer;
@@ -41,6 +41,8 @@ pub mod extract;
 pub mod frame;
 pub mod id3;
 pub mod iso_reader;
+
+pub use frame::FrameFormat;
 
 #[cfg(test)]
 mod test_util;

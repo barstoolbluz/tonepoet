@@ -1051,6 +1051,7 @@ mod tests {
                 ..Default::default()
             },
             isrc: isrc.map(String::from),
+            structured_isrc: None,
             genre: None,
         }
     }
@@ -1103,6 +1104,7 @@ mod tests {
                 copyright_phonetic: None,
             },
             tracks,
+            consistency: Default::default(),
         }
     }
 
@@ -1162,6 +1164,7 @@ mod tests {
             }),
             stereo: stereo_n.map(|n| make_area(AreaKind::Stereo, n)),
             multi_channel: mch_n.map(|n| make_area(AreaKind::MultiChannel, n)),
+            consistency: Default::default(),
         }
     }
 
@@ -1276,6 +1279,7 @@ mod tests {
             master_text: None,
             stereo: Some(make_area(super::super::sacd::AreaKind::Stereo, 1)),
             multi_channel: None,
+            consistency: Default::default(),
         };
         let s = seed_sidecar_from_scarletbook(&md);
         assert_eq!(s.tracks.len(), 1);

@@ -12697,6 +12697,7 @@ mod phase4_tests {
                     ..Default::default()
                 },
                 isrc: track_isrcs.get(i).and_then(|o| o.map(|s| s.to_string())),
+                structured_isrc: None,
                 genre: None,
             });
         }
@@ -12739,8 +12740,10 @@ mod phase4_tests {
             stereo: Some(AreaInfo {
                 header: stereo_header,
                 tracks,
+                consistency: Default::default(),
             }),
             multi_channel: None,
+            consistency: Default::default(),
         }
     }
 
@@ -13970,6 +13973,7 @@ mod phase4_tests {
                     ..Default::default()
                 },
                 isrc: None,
+                structured_isrc: None,
                 genre: None,
             });
         }
@@ -13980,6 +13984,7 @@ mod phase4_tests {
         md.multi_channel = Some(AreaInfo {
             header: mch_header,
             tracks: mch_tracks,
+            consistency: Default::default(),
         });
         md
     }
