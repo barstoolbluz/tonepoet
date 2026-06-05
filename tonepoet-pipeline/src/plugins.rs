@@ -4,7 +4,7 @@
 //! types. They use the reference files only for argument-shape semantics.
 
 use crate::enums::{
-    AacProfile, AudioFormat, DitherType, DsdFilterPreset, DsdLowpassMethod,
+    AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     DsdToPcmGainMode, GainCompensation,
     Mp3Mode, PcmBitDepth, ReplayGainMode, SoxSincPhase,
 };
@@ -332,12 +332,17 @@ impl ToolPlugin for SsrcPlugin {
                 *target_bit_depth,
                 Some(PcmBitDepth::Float32 | PcmBitDepth::Float64)
             );
+            let needs_dither = match *target_bit_depth {
+                Some(depth) => pcm_conversion_reduces_depth(context.request.source.bit_depth, depth),
+                None => true,
+            };
             // SSRC treats `--dither` and `--pdf` as parameters of the terminal
             // integer dither/quantization stage, not as two independently
             // ordered shell pipeline stages. Keep the effective pair together
             // here, validate it against the destination sample rate, and omit
-            // both flags for float output where no integer quantizer runs.
-            let pdf_type = if integer_output {
+            // both flags when dither is not needed (float output, same/higher
+            // bit depth, or Int32 target).
+            let pdf_type = if needs_dither {
                 let mapped_dither = mapping::ssrc_dither_selection_for_rate(
                     context.request.settings.dither_type,
                     *target_rate_hz,
@@ -371,7 +376,7 @@ impl ToolPlugin for SsrcPlugin {
             if context.request.settings.ssrc.min_phase {
                 args.push("--minPhase".into());
             }
-            if integer_output {
+            if needs_dither {
                 if let Some(pdf) = pdf_type {
                     use crate::enums::SsrcPdfType;
                     args.push("--pdf".into());
@@ -1232,7 +1237,15 @@ fn ffmpeg_audio_filter(
     if let Some(phase) = settings.soxr_resampler.phase {
         opts.push(format!("phase_shift={}", phase));
     }
-    if settings.dither_type != DitherType::None {
+    let ffmpeg_needs_dither = match target_depth {
+        Some(depth) => pcm_conversion_reduces_depth(context.request.source.bit_depth, depth),
+        None => match context.request.settings.target_bit_depth {
+            BitDepthTarget::Source => false,
+            BitDepthTarget::Pcm(depth) => pcm_conversion_reduces_depth(
+                context.request.source.bit_depth, depth),
+        },
+    };
+    if settings.dither_type != DitherType::None && ffmpeg_needs_dither {
         let method = mapping::soxr_dither_method(settings.dither_type).ok_or_else(|| {
             PlanningError::invalid_settings(
                 "dither_type",
@@ -1444,7 +1457,7 @@ fn add_sox_pcm_effects(
         args.push(rate.to_string());
     }
     let depth_allows_dither = match target_depth {
-        Some(depth) => !depth.is_float(),
+        Some(depth) => pcm_conversion_reduces_depth(context.request.source.bit_depth, depth),
         None => true,
     };
     let should_dither =
@@ -1565,7 +1578,7 @@ fn add_sox_dsd_to_pcm_effects(
         }
     }
     add_sox_dsd_to_pcm_gain(&context.request.settings.dsd, args)?;
-    if target_depth == PcmBitDepth::Int16
+    if target_depth_needs_dither(target_depth)
         && context.request.settings.dither_type != DitherType::None
     {
         args.extend(mapping::sox_dither_args(
@@ -1573,6 +1586,27 @@ fn add_sox_dsd_to_pcm_effects(
         ));
     }
     Ok(())
+}
+
+/// True when the target depth is low enough to benefit from dither.
+/// Int32, Float32, Float64 never need dither.
+fn target_depth_needs_dither(depth: PcmBitDepth) -> bool {
+    matches!(depth, PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24)
+}
+
+/// True when a PCM→PCM conversion reduces bit depth (needs dither).
+/// Returns true conservatively when source depth is unknown.
+fn pcm_conversion_reduces_depth(
+    source_depth: Option<PcmBitDepth>,
+    target_depth: PcmBitDepth,
+) -> bool {
+    if !target_depth_needs_dither(target_depth) {
+        return false;
+    }
+    match source_depth {
+        Some(source) => target_depth.bits() < source.bits(),
+        None => true,
+    }
 }
 
 fn add_sox_dsd_to_pcm_gain(
