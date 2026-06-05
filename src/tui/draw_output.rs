@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -139,16 +139,23 @@ pub fn draw_format_pane(
             ),
             focused && format_state.field_focus == FormatField::Resampler,
         ));
+        let ssrc_dither_override = format_state.ssrc_dither_override_active();
+        let dither_focused = focused
+            && format_state.field_focus == FormatField::Dither
+            && !ssrc_dither_override;
+        let rendered_dither = render_pill_spans(&format_state.dither, dither_focused);
+        let dither_spans = if ssrc_dither_override {
+            dim_pill_spans(&rendered_dither)
+        } else {
+            rendered_dither
+        };
         lines.push(pill_row(
             border_color,
             w,
             "dither     ",
-            "",
-            &render_pill_spans(
-                &format_state.dither,
-                focused && format_state.field_focus == FormatField::Dither,
-            ),
-            focused && format_state.field_focus == FormatField::Dither,
+            format_state.ssrc_dither_status_label().unwrap_or(""),
+            &dither_spans,
+            dither_focused,
         ));
         lines.push(pill_row(
             border_color,
@@ -414,6 +421,13 @@ fn dsd_gain_db_row(
     spans.push(Span::styled("│", theme::border(border_color)));
 
     Line::from(spans)
+}
+
+fn dim_pill_spans<'a>(spans: &[Span<'a>]) -> Vec<Span<'a>> {
+    spans
+        .iter()
+        .map(|span| Span::styled(span.content.clone(), Style::default().fg(Color::DarkGray)))
+        .collect()
 }
 
 fn pill_row<'a>(

@@ -120,6 +120,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
             profile: Some(SsrcProfile::Long),
             attenuation_db: Some(3.0),
             min_phase: true,
+            dither_id: Some(2),
             pdf_type: Some(SsrcPdfType::Triangular),
         },
         sox_resampler: SoxResamplerSettings {
@@ -181,7 +182,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 68);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 69);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();
@@ -321,6 +322,9 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     });
     assert_mutation_changes_fingerprint!(covered, base, "ssrc.min_phase", |settings| {
         settings.ssrc.min_phase = false;
+    });
+    assert_mutation_changes_fingerprint!(covered, base, "ssrc.dither_id", |settings| {
+        settings.ssrc.dither_id = Some(99);
     });
     assert_mutation_changes_fingerprint!(covered, base, "ssrc.pdf_type", |settings| {
         settings.ssrc.pdf_type = Some(SsrcPdfType::Rectangular);

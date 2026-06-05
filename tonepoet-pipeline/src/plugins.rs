@@ -328,11 +328,41 @@ impl ToolPlugin for SsrcPlugin {
                 "--profile".into(),
                 profile.as_arg().into(),
             ];
-            args.push("--dither".into());
-            args.push(mapping::ssrc_dither_id(context.request.settings.dither_type).to_string());
+            let integer_output = !matches!(
+                *target_bit_depth,
+                Some(PcmBitDepth::Float32 | PcmBitDepth::Float64)
+            );
+            // SSRC treats `--dither` and `--pdf` as parameters of the terminal
+            // integer dither/quantization stage, not as two independently
+            // ordered shell pipeline stages. Keep the effective pair together
+            // here, validate it against the destination sample rate, and omit
+            // both flags for float output where no integer quantizer runs.
+            let pdf_type = if integer_output {
+                let mapped_dither = mapping::ssrc_dither_selection_for_rate(
+                    context.request.settings.dither_type,
+                    *target_rate_hz,
+                )?;
+                let dither_id = context
+                    .request
+                    .settings
+                    .ssrc
+                    .dither_id
+                    .unwrap_or(mapped_dither.dither_id);
+                mapping::validate_ssrc_dither_id_for_rate(dither_id, *target_rate_hz)?;
+                args.push("--dither".into());
+                args.push(dither_id.to_string());
+                context
+                    .request
+                    .settings
+                    .ssrc
+                    .pdf_type
+                    .or(mapped_dither.pdf_type)
+            } else {
+                None
+            };
             if let Some(depth) = *target_bit_depth {
                 args.push("--bits".into());
-                args.push(depth.bits().to_string());
+                args.push(ssrc_bits_arg(depth));
             }
             if let Some(att) = context.request.settings.ssrc.attenuation_db {
                 args.push("--att".into());
@@ -341,13 +371,15 @@ impl ToolPlugin for SsrcPlugin {
             if context.request.settings.ssrc.min_phase {
                 args.push("--minPhase".into());
             }
-            if let Some(pdf) = context.request.settings.ssrc.pdf_type {
-                use crate::enums::SsrcPdfType;
-                args.push("--pdf".into());
-                args.push(match pdf {
-                    SsrcPdfType::Rectangular => "0".into(),
-                    SsrcPdfType::Triangular => "1".into(),
-                });
+            if integer_output {
+                if let Some(pdf) = pdf_type {
+                    use crate::enums::SsrcPdfType;
+                    args.push("--pdf".into());
+                    args.push(match pdf {
+                        SsrcPdfType::Rectangular => "0".into(),
+                        SsrcPdfType::Triangular => "1".into(),
+                    });
+                }
             }
             args.push(input);
             args.push(output);
@@ -365,6 +397,14 @@ impl ToolPlugin for SsrcPlugin {
                 format!("unsupported operation {}", step.operation.label()),
             ))
         }
+    }
+}
+
+fn ssrc_bits_arg(depth: PcmBitDepth) -> String {
+    match depth {
+        PcmBitDepth::Float32 => "-32".into(),
+        PcmBitDepth::Float64 => "-64".into(),
+        _ => depth.bits().to_string(),
     }
 }
 
@@ -1652,8 +1692,201 @@ mod tests {
     use super::*;
     use crate::plan::{InputSource, MetadataPlanEffect, OutputSink, PlanOperation, PlanRequest, PlanStep};
     use crate::settings::{DsdSettings, PipelineSettings};
+    use crate::enums::SsrcPdfType;
     use crate::source::SourceInfo;
     use std::path::PathBuf;
+
+    fn ssrc_resample_command_with(
+        settings: PipelineSettings,
+        target_rate_hz: u32,
+        target_bit_depth: Option<PcmBitDepth>,
+    ) -> Result<PlannedCommand> {
+        let source = SourceInfo {
+            format: AudioFormat::Wav,
+            codec: crate::enums::AudioCodec::PcmSigned,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(PcmBitDepth::Int24),
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let request = PlanRequest {
+            input_path: PathBuf::from("source.wav"),
+            output_path: PathBuf::from("output.wav"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let context = request.context();
+        let step = PlanStep::new(
+            0,
+            PlanOperation::ResamplePcm {
+                target_rate_hz,
+                target_bit_depth,
+                profile: None,
+                brick_wall: true,
+            },
+            InputSource::Path(PathBuf::from("source.wav")),
+            OutputSink::Path(PathBuf::from("output.wav")),
+            "SSRC command-builder regression test",
+        );
+
+        SsrcPlugin.build_command(&context, &step)
+    }
+
+    fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+    }
+
+    fn assert_arg(args: &[String], flag: &str, expected: &str) {
+        assert_eq!(arg_value(args, flag), Some(expected), "missing or wrong {flag} in {args:?}");
+    }
+
+    fn assert_no_arg(args: &[String], flag: &str) {
+        assert!(arg_value(args, flag).is_none(), "unexpected {flag} in {args:?}");
+    }
+
+    #[test]
+    fn ssrc_command_emits_global_tpdf_as_no_shaper_with_triangular_pdf() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::Tpdf;
+
+        let command = ssrc_resample_command_with(settings, 44_100, Some(PcmBitDepth::Int16)).unwrap();
+
+        assert_arg(&command.args, "--dither", "99");
+        assert_arg(&command.args, "--pdf", "1");
+        assert_arg(&command.args, "--bits", "16");
+    }
+
+    #[test]
+    fn ssrc_command_emits_global_none_as_no_shaper_without_pdf_override() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::None;
+
+        let command = ssrc_resample_command_with(settings, 44_100, Some(PcmBitDepth::Int16)).unwrap();
+
+        assert_arg(&command.args, "--dither", "99");
+        assert_no_arg(&command.args, "--pdf");
+    }
+
+    #[test]
+    fn ssrc_command_emits_shibata_family_as_rate_valid_ath_curve_a_with_triangular_pdf() {
+        let cases = [
+            (DitherType::LowShibata, 44_100, "0"),
+            (DitherType::Shibata, 44_100, "2"),
+            (DitherType::HighShibata, 44_100, "6"),
+            (DitherType::HighShibata, 96_000, "2"),
+            (DitherType::HighShibata, 22_050, "1"),
+        ];
+
+        for (dither_type, target_rate_hz, expected_dither_id) in cases {
+            let mut settings = PipelineSettings::default();
+            settings.dither_type = dither_type;
+
+            let command = ssrc_resample_command_with(
+                settings,
+                target_rate_hz,
+                Some(PcmBitDepth::Int16),
+            )
+            .unwrap();
+
+            assert_arg(&command.args, "--dither", expected_dither_id);
+            assert_arg(&command.args, "--pdf", "1");
+        }
+    }
+
+    #[test]
+    fn ssrc_command_honors_explicit_dither_id_only() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::Tpdf;
+        settings.ssrc.dither_id = Some(0);
+        settings.ssrc.pdf_type = None;
+
+        let command = ssrc_resample_command_with(settings, 44_100, Some(PcmBitDepth::Int16)).unwrap();
+
+        assert_arg(&command.args, "--dither", "0");
+        assert_arg(&command.args, "--pdf", "1");
+    }
+
+    #[test]
+    fn ssrc_command_honors_explicit_pdf_type_only() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::Shibata;
+        settings.ssrc.dither_id = None;
+        settings.ssrc.pdf_type = Some(SsrcPdfType::Rectangular);
+
+        let command = ssrc_resample_command_with(settings, 44_100, Some(PcmBitDepth::Int16)).unwrap();
+
+        assert_arg(&command.args, "--dither", "2");
+        assert_arg(&command.args, "--pdf", "0");
+    }
+
+    #[test]
+    fn ssrc_command_honors_both_explicit_overrides() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::None;
+        settings.ssrc.dither_id = Some(1);
+        settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
+
+        let command = ssrc_resample_command_with(settings, 22_050, Some(PcmBitDepth::Int16)).unwrap();
+
+        assert_arg(&command.args, "--dither", "1");
+        assert_arg(&command.args, "--pdf", "1");
+    }
+
+    #[test]
+    fn ssrc_command_suppresses_dither_and_pdf_for_float_output() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::Shibata;
+        settings.ssrc.dither_id = Some(2);
+        settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
+
+        let command = ssrc_resample_command_with(settings, 44_100, Some(PcmBitDepth::Float32)).unwrap();
+
+        assert_arg(&command.args, "--bits", "-32");
+        assert_no_arg(&command.args, "--dither");
+        assert_no_arg(&command.args, "--pdf");
+    }
+
+    #[test]
+    fn ssrc_command_rejects_explicit_high_rate_unavailable_dither_id() {
+        let mut settings = PipelineSettings::default();
+        settings.ssrc.dither_id = Some(16);
+
+        let err = ssrc_resample_command_with(settings, 96_000, Some(PcmBitDepth::Int16)).unwrap_err();
+
+        let message = format!("{err:?}");
+        assert!(message.contains("96"));
+        assert!(message.contains("16"));
+    }
+
+    #[test]
+    fn ssrc_command_rejects_explicit_low_rate_unavailable_dither_id() {
+        let mut settings = PipelineSettings::default();
+        settings.ssrc.dither_id = Some(6);
+
+        let err = ssrc_resample_command_with(settings, 22_050, Some(PcmBitDepth::Int16)).unwrap_err();
+
+        let message = format!("{err:?}");
+        assert!(message.contains("22050") || message.contains("22_050"));
+        assert!(message.contains("6"));
+    }
+
+
+    #[test]
+    fn ssrc_command_rejects_derived_global_shaper_at_unlisted_rate() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::HighShibata;
+
+        let err = ssrc_resample_command_with(settings, 176_400, Some(PcmBitDepth::Int16)).unwrap_err();
+
+        let message = format!("{err:?}");
+        assert!(message.contains("176400") || message.contains("176_400"));
+    }
 
     #[test]
     fn planner_format_metadata_capabilities_are_centralized_on_audio_format() {

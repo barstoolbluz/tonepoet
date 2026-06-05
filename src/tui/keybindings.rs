@@ -6412,12 +6412,20 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
             app.convert.format.wavpack_bitrate_kbps = bitrate;
             app.convert.format.wavpack_correction = *correction;
         }
-        FormatSettingsKind::Ssrc { ref attenuation_input, min_phase, pdf_type } => {
+        FormatSettingsKind::Ssrc { ref attenuation_input, min_phase, ref dither_id_input, ref pdf_type_input } => {
             app.convert.format.ssrc_attenuation_db = attenuation_input
                 .text.trim().parse::<f32>().ok()
                 .filter(|v| (0.0..=99.9).contains(v));
             app.convert.format.ssrc_min_phase = *min_phase;
-            app.convert.format.ssrc_pdf_type = *pdf_type;
+            app.convert.format.ssrc_dither_id = dither_id_input
+                .text.trim().parse::<u8>().ok()
+                .filter(|v| *v <= 99);
+            app.convert.format.ssrc_pdf_type = match pdf_type_input.text.trim() {
+                "0" => Some(tonepoet_pipeline::enums::SsrcPdfType::Rectangular),
+                "1" => Some(tonepoet_pipeline::enums::SsrcPdfType::Triangular),
+                "" => None,
+                _ => None,
+            };
         }
         FormatSettingsKind::Sox {
             chebyshev,
@@ -6838,9 +6846,9 @@ fn handle_format_settings_field_key(
         FormatSettingsKind::Ssrc {
             attenuation_input,
             min_phase,
-            pdf_type,
+            dither_id_input,
+            pdf_type_input,
         } => {
-            use tonepoet_pipeline::enums::SsrcPdfType;
             match focus {
                 FormatSettingsFocus::SsrcAttenuation => {
                     super::text_input::handle_text_input_key(attenuation_input, key);
@@ -6850,17 +6858,11 @@ fn handle_format_settings_field_key(
                         *min_phase = !*min_phase;
                     }
                 }
+                FormatSettingsFocus::SsrcDitherId => {
+                    super::text_input::handle_text_input_key(dither_id_input, key);
+                }
                 FormatSettingsFocus::SsrcPdf => {
-                    if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
-                        let pdfs = [None, Some(SsrcPdfType::Rectangular), Some(SsrcPdfType::Triangular)];
-                        let cur = pdfs.iter().position(|p| p == pdf_type).unwrap_or(0);
-                        let next = if key.code == KeyCode::Left {
-                            if cur == 0 { pdfs.len() - 1 } else { cur - 1 }
-                        } else {
-                            (cur + 1) % pdfs.len()
-                        };
-                        *pdf_type = pdfs[next];
-                    }
+                    super::text_input::handle_text_input_key(pdf_type_input, key);
                 }
                 _ => {}
             }
@@ -7102,14 +7104,6 @@ fn handle_format_settings_mouse(
                 }
                 (FormatSettingsKind::Ssrc { ref mut min_phase, .. }, TuiButton::FormatSettingsSsrcMinPhase(i)) => {
                     *min_phase = i == 1;
-                    return;
-                }
-                (FormatSettingsKind::Ssrc { ref mut pdf_type, .. }, TuiButton::FormatSettingsSsrcPdf(i)) => {
-                    use tonepoet_pipeline::enums::SsrcPdfType;
-                    let pdfs = [None, Some(SsrcPdfType::Rectangular), Some(SsrcPdfType::Triangular)];
-                    if let Some(p) = pdfs.get(i) {
-                        *pdf_type = *p;
-                    }
                     return;
                 }
                 (FormatSettingsKind::Sox { ref mut chebyshev, .. }, TuiButton::FormatSettingsSoxChebyshev(i)) => {
@@ -11236,7 +11230,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                                 fmt.ssrc_attenuation_db.map(|v| format!("{:.1}", v)).unwrap_or_default(),
                             ),
                             min_phase: fmt.ssrc_min_phase,
-                            pdf_type: fmt.ssrc_pdf_type,
+                            dither_id_input: super::text_input::TextInputState::new(
+                                fmt.ssrc_dither_id.map(|v| v.to_string()).unwrap_or_default(),
+                            ),
+                            pdf_type_input: super::text_input::TextInputState::new(
+                                fmt.ssrc_pdf_type.map(|v| match v {
+                                    tonepoet_pipeline::enums::SsrcPdfType::Rectangular => "0".to_string(),
+                                    tonepoet_pipeline::enums::SsrcPdfType::Triangular => "1".to_string(),
+                                }).unwrap_or_default(),
+                            ),
                         },
                         FormatSettingsFocus::SsrcAttenuation,
                     ),

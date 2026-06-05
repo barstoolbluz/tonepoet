@@ -956,8 +956,18 @@ fn draw_format_settings(
         FormatSettingsKind::Ssrc {
             attenuation_input,
             min_phase,
-            pdf_type,
-        } => draw_ssrc_fields(f, attenuation_input, *min_phase, *pdf_type, focus, &chunks, buttons),
+            dither_id_input,
+            pdf_type_input,
+        } => draw_ssrc_fields(
+            f,
+            attenuation_input,
+            *min_phase,
+            dither_id_input,
+            pdf_type_input,
+            focus,
+            &chunks,
+            buttons,
+        ),
         FormatSettingsKind::Sox {
             chebyshev,
             bandwidth_input,
@@ -1566,67 +1576,127 @@ fn draw_ssrc_fields(
     f: &mut Frame,
     attenuation_input: &super::text_input::TextInputState,
     min_phase: bool,
-    pdf_type: Option<tonepoet_pipeline::enums::SsrcPdfType>,
+    dither_id_input: &super::text_input::TextInputState,
+    pdf_type_input: &super::text_input::TextInputState,
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
 ) {
-    use tonepoet_pipeline::enums::SsrcPdfType;
-
     // Row 1: Attenuation text entry
     let att_focused = focus == FormatSettingsFocus::SsrcAttenuation;
     let att_ls = if att_focused { theme::bright() } else { theme::muted() };
     let att_vw = chunks[1].width.saturating_sub(22) as usize;
     let (att_v, att_cc) = attenuation_input.view(att_vw.max(1));
-    let (att_d, att_is_placeholder) = if att_v.is_empty() { ("0".to_string(), true) } else { (att_v, false) };
-    let att_bg = if att_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
+    let (att_d, att_is_placeholder) = if att_v.is_empty() {
+        ("0".to_string(), true)
+    } else {
+        (att_v, false)
+    };
+    let att_bg = if att_focused {
+        Color::Rgb(55, 60, 80)
+    } else {
+        Color::Rgb(40, 45, 65)
+    };
     let att_fg = if att_is_placeholder { theme::TEXT_DIM } else { Color::White };
-    f.render_widget(Paragraph::new(Line::from(vec![
-        Span::styled("  attenuation    ", att_ls),
-        Span::styled(format!(" {} ", att_d), Style::default().fg(att_fg).bg(att_bg)),
-        Span::styled(" dB", theme::muted()),
-    ])), chunks[1]);
-    if att_focused { f.set_cursor(chunks[1].x + 18 + att_cc, chunks[1].y); }
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  attenuation    ", att_ls),
+            Span::styled(format!(" {} ", att_d), Style::default().fg(att_fg).bg(att_bg)),
+            Span::styled(" dB", theme::muted()),
+        ])),
+        chunks[1],
+    );
+    if att_focused {
+        f.set_cursor(chunks[1].x + 18 + att_cc, chunks[1].y);
+    }
 
     // Row 2: Min phase toggle (off/on)
     let mp_focused = focus == FormatSettingsFocus::SsrcMinPhase;
     let mp_ls = if mp_focused { theme::bright() } else { theme::muted() };
     let (mp_off, mp_on) = toggle_pill_styles(min_phase, mp_focused);
-    f.render_widget(Paragraph::new(Line::from(vec![
-        Span::styled("  min phase      ", mp_ls),
-        Span::styled(" off ", mp_off), Span::raw(" "), Span::styled(" on ", mp_on),
-    ])), chunks[2]);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  min phase      ", mp_ls),
+            Span::styled(" off ", mp_off),
+            Span::raw(" "),
+            Span::styled(" on ", mp_on),
+        ])),
+        chunks[2],
+    );
     let mx = chunks[2].x + 17;
-    buttons.record_button(TuiButton::FormatSettingsSsrcMinPhase(0), Rect::new(mx, chunks[2].y, 5, 1));
-    buttons.record_button(TuiButton::FormatSettingsSsrcMinPhase(1), Rect::new(mx + 6, chunks[2].y, 4, 1));
+    buttons.record_button(
+        TuiButton::FormatSettingsSsrcMinPhase(0),
+        Rect::new(mx, chunks[2].y, 5, 1),
+    );
+    buttons.record_button(
+        TuiButton::FormatSettingsSsrcMinPhase(1),
+        Rect::new(mx + 6, chunks[2].y, 4, 1),
+    );
 
-    // Row 3: PDF type pills (none/rect/tri)
+    // Row 3: Explicit SSRC --dither ID text entry
+    let dither_focused = focus == FormatSettingsFocus::SsrcDitherId;
+    let dither_ls = if dither_focused { theme::bright() } else { theme::muted() };
+    draw_ssrc_numeric_input(
+        f,
+        chunks[3],
+        "  dither id     ",
+        "auto",
+        dither_id_input,
+        dither_ls,
+        dither_focused,
+        "0-99",
+    );
+
+    // Row 4: Explicit SSRC --pdf type text entry
     let pdf_focused = focus == FormatSettingsFocus::SsrcPdf;
     let pdf_ls = if pdf_focused { theme::bright() } else { theme::muted() };
-    let pdfs = [
-        (None, "none"),
-        (Some(SsrcPdfType::Rectangular), "rect"),
-        (Some(SsrcPdfType::Triangular), "tri"),
-    ];
-    let mut pdf_spans = vec![Span::styled("  dither pdf     ", pdf_ls)];
-    let mut pdx = chunks[3].x + 17;
-    for (i, (p, label)) in pdfs.iter().enumerate() {
-        let selected = *p == pdf_type;
-        let style = if selected {
-            Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::GREEN).add_modifier(Modifier::BOLD)
-        } else if pdf_focused {
-            Style::default().fg(theme::TEXT_DIM)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
-        pdf_spans.push(Span::styled(pill_text, style));
-        buttons.record_button(TuiButton::FormatSettingsSsrcPdf(i), Rect::new(pdx, chunks[3].y, pill_w, 1));
-        pdx += pill_w;
-        if i + 1 < pdfs.len() { pdf_spans.push(Span::raw(" ")); pdx += 1; }
+    draw_ssrc_numeric_input(
+        f,
+        chunks[4],
+        "  pdf type      ",
+        "auto",
+        pdf_type_input,
+        pdf_ls,
+        pdf_focused,
+        "0=rect 1=tri",
+    );
+}
+
+fn draw_ssrc_numeric_input(
+    f: &mut Frame,
+    rect: Rect,
+    label: &'static str,
+    placeholder: &'static str,
+    input: &super::text_input::TextInputState,
+    label_style: Style,
+    focused: bool,
+    suffix: &'static str,
+) {
+    let visible_width = rect.width.saturating_sub(31) as usize;
+    let (view, cursor_col) = input.view(visible_width.max(1));
+    let (display, is_placeholder) = if view.is_empty() {
+        (placeholder.to_string(), true)
+    } else {
+        (view, false)
+    };
+    let input_bg = if focused {
+        Color::Rgb(55, 60, 80)
+    } else {
+        Color::Rgb(40, 45, 65)
+    };
+    let input_fg = if is_placeholder { theme::TEXT_DIM } else { Color::White };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(label, label_style),
+            Span::styled(format!(" {} ", display), Style::default().fg(input_fg).bg(input_bg)),
+            Span::raw("  "),
+            Span::styled(suffix, theme::muted()),
+        ])),
+        rect,
+    );
+    if focused {
+        f.set_cursor(rect.x + 17 + cursor_col, rect.y);
     }
-    f.render_widget(Paragraph::new(Line::from(pdf_spans)), chunks[3]);
 }
 
 /// Build the enriched help content for a given format settings kind.
@@ -1890,21 +1960,20 @@ fn format_settings_help_content(kind: &FormatSettingsKind) -> Vec<(&'static str,
                 "music playback as transient attacks sound cleaner. Introduces",
                 "slight phase shift that varies with frequency.",
             ]),
-            ("dither pdf", &[
-                "Selects the probability distribution function used for",
-                "generating dither noise, separate from the noise shaper",
-                "selection on the main dither pill.",
+            ("dither id", &[
+                "Optional explicit SSRC --dither ID, 0 through 99.",
+                "Leave empty to derive the SSRC-native pair from the main",
+                "dither pill. Setting this field overrides the shaper ID only.",
                 "",
-                "  None         Use SSRC's default (determined by dither type).",
+                "Common values: 0 = ATH Curve A intensity 0, 1/2 = stronger",
+                "ATH A settings, 98 = Simple triangular, 99 = No shaper.",
+            ]),
+            ("pdf type", &[
+                "Optional explicit SSRC --pdf value. Leave empty to use the",
+                "PDF derived from the main dither pill.",
                 "",
-                "  Rectangular  Flat uniform distribution. Simplest form of",
-                "               dithering. Removes all distortion from",
-                "               quantization but adds slightly more noise.",
-                "",
-                "  Triangular   Shaped distribution that minimizes perceived",
-                "               noise modulation. Standard choice for audio",
-                "               work — slightly less total noise than",
-                "               rectangular, with no noise modulation.",
+                "  0  Rectangular PDF",
+                "  1  Triangular PDF",
             ]),
         ],
         FormatSettingsKind::Sox { .. } => vec![
@@ -2429,7 +2498,7 @@ pub fn format_settings_field_count(kind: &FormatSettingsKind) -> u16 {
         FormatSettingsKind::Opus { .. } => 4,
         FormatSettingsKind::Mp3 { .. } => 4,
         FormatSettingsKind::WavPack { .. } => 4,
-        FormatSettingsKind::Ssrc { .. } => 3,
+        FormatSettingsKind::Ssrc { .. } => 4,
         FormatSettingsKind::Sox { .. } => 10,
         FormatSettingsKind::Soxr { .. } => 3,
     }
@@ -2478,10 +2547,8 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
             label_width + pills_width
         }
         FormatSettingsKind::Ssrc { .. } => {
-            let labels = ["fast", "short", "std", "long", "high"];
-            let pills_width: usize = labels.iter().map(|l| l.len() + 2).sum::<usize>()
-                + labels.len().saturating_sub(1);
-            label_width + pills_width
+            // Widest SSRC row: label + editable value + explanatory suffix.
+            label_width + 24
         }
         FormatSettingsKind::Sox { .. } => {
             // Widest: sinc phase pills: 18 + " linear " + " minimum " + " intermediate " = 52

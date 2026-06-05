@@ -87,6 +87,7 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "ssrc.profile",
     "ssrc.attenuation_db",
     "ssrc.min_phase",
+    "ssrc.dither_id",
     "ssrc.pdf_type",
     "sox_resampler.chebyshev",
     "sox_resampler.bandwidth_pct",
@@ -242,6 +243,7 @@ fn push_ssrc(writer: &mut FingerprintWriter, settings: &SsrcSettings) {
     writer.field_string("ssrc.profile", option_static(settings.profile.map(ssrc_profile)));
     writer.field_string("ssrc.attenuation_db", option_f32(settings.attenuation_db));
     writer.field_static("ssrc.min_phase", bool_value(settings.min_phase));
+    writer.field_string("ssrc.dither_id", option_u8(settings.dither_id));
     writer.field_string(
         "ssrc.pdf_type",
         option_static(settings.pdf_type.map(ssrc_pdf_type)),

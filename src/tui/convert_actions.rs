@@ -390,6 +390,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             profile: None,
             attenuation_db: format.ssrc_attenuation_db,
             min_phase: format.ssrc_min_phase,
+            dither_id: format.ssrc_dither_id,
             pdf_type: format.ssrc_pdf_type,
         },
         sox_resampler: tonepoet_pipeline::SoxResamplerSettings {
@@ -452,15 +453,24 @@ fn map_audio_format(format: AudioFormat, container_ext: Option<&str>) -> pipelin
 }
 
 fn map_dither(dither: crate::convert::simple_wizard::DitherType) -> pipeline_enums::DitherType {
+    use crate::convert::simple_wizard::DitherType as UiDitherType;
+
+    // Keep this match exhaustive: a newly-added TUI dither variant must choose
+    // an explicit pipeline mapping at compile time. Falling through to `None`
+    // can silently disable dither/noise shaping, which is the wrong failure
+    // mode for final integer audio output.
     match dither {
-        crate::convert::simple_wizard::DitherType::None => pipeline_enums::DitherType::None,
-        crate::convert::simple_wizard::DitherType::TPDF => pipeline_enums::DitherType::Tpdf,
-        crate::convert::simple_wizard::DitherType::Shibata => pipeline_enums::DitherType::Shibata,
-        crate::convert::simple_wizard::DitherType::Lipshitz => pipeline_enums::DitherType::Lipshitz,
-        crate::convert::simple_wizard::DitherType::Gesemann => pipeline_enums::DitherType::Gesemann,
-        crate::convert::simple_wizard::DitherType::LowShibata => pipeline_enums::DitherType::LowShibata,
-        crate::convert::simple_wizard::DitherType::HighShibata => pipeline_enums::DitherType::HighShibata,
-        _ => pipeline_enums::DitherType::None,
+        UiDitherType::None => pipeline_enums::DitherType::None,
+        UiDitherType::TPDF => pipeline_enums::DitherType::Tpdf,
+        UiDitherType::SloppedTPDF => pipeline_enums::DitherType::SlopedTpdf,
+        UiDitherType::Shibata => pipeline_enums::DitherType::Shibata,
+        UiDitherType::LowShibata => pipeline_enums::DitherType::LowShibata,
+        UiDitherType::HighShibata => pipeline_enums::DitherType::HighShibata,
+        UiDitherType::Lipshitz => pipeline_enums::DitherType::Lipshitz,
+        UiDitherType::FWeighted => pipeline_enums::DitherType::FWeighted,
+        UiDitherType::ModifiedEWeighted => pipeline_enums::DitherType::ModifiedEWeighted,
+        UiDitherType::ImprovedEWeighted => pipeline_enums::DitherType::ImprovedEWeighted,
+        UiDitherType::Gesemann => pipeline_enums::DitherType::Gesemann,
     }
 }
 
@@ -819,6 +829,45 @@ mod lifecycle_forwarder_tests {
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
         assert_eq!(settings.dsd.dsd_to_pcm_gain_db, Some(DSD_TO_PCM_GAIN_DB_MAX));
+    }
+
+    #[test]
+    fn map_dither_maps_every_known_tui_variant_explicitly() {
+        use crate::convert::simple_wizard::DitherType as UiDitherType;
+
+        let cases = [
+            (UiDitherType::None, pipeline_enums::DitherType::None),
+            (UiDitherType::TPDF, pipeline_enums::DitherType::Tpdf),
+            (UiDitherType::SloppedTPDF, pipeline_enums::DitherType::SlopedTpdf),
+            (UiDitherType::Shibata, pipeline_enums::DitherType::Shibata),
+            (UiDitherType::LowShibata, pipeline_enums::DitherType::LowShibata),
+            (UiDitherType::HighShibata, pipeline_enums::DitherType::HighShibata),
+            (UiDitherType::Lipshitz, pipeline_enums::DitherType::Lipshitz),
+            (UiDitherType::FWeighted, pipeline_enums::DitherType::FWeighted),
+            (
+                UiDitherType::ModifiedEWeighted,
+                pipeline_enums::DitherType::ModifiedEWeighted,
+            ),
+            (
+                UiDitherType::ImprovedEWeighted,
+                pipeline_enums::DitherType::ImprovedEWeighted,
+            ),
+            (UiDitherType::Gesemann, pipeline_enums::DitherType::Gesemann),
+        ];
+
+        for (ui, expected_pipeline) in cases {
+            assert_eq!(map_dither(ui), expected_pipeline);
+        }
+    }
+
+    #[test]
+    fn format_state_to_pipeline_settings_preserves_dither_choice() {
+        let mut format = FormatState::new();
+        format.dither.select_value(&crate::convert::simple_wizard::DitherType::Shibata);
+
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+
+        assert_eq!(settings.dither_type, pipeline_enums::DitherType::Shibata);
     }
 
 }

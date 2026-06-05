@@ -11,6 +11,7 @@ use crate::enums::{
     SsrcPdfType, SsrcProfile, WavPackMode,
 };
 use crate::error::{PlanningError, Result};
+use crate::mapping;
 
 /// Single source of truth for all conversion parameters.
 #[derive(Debug, Clone, PartialEq)]
@@ -301,6 +302,7 @@ fn validate_encoder_settings(settings: &PipelineSettings) -> Result<()> {
             ));
         }
     }
+    validate_ssrc_dither_settings(settings)?;
     if let Some(taps) = settings.sox_resampler.sinc_taps {
         if !taps.is_power_of_two() || !(1024..=67_108_864).contains(&taps) {
             return Err(PlanningError::invalid_settings(
@@ -597,7 +599,9 @@ pub struct SsrcSettings {
     pub attenuation_db: Option<f32>,
     /// Use minimum phase filters instead of linear phase.
     pub min_phase: bool,
-    /// Probability distribution function for dithering. None = ssrc default.
+    /// Explicit SSRC `--dither` ID. None derives a pair from the global dither choice.
+    pub dither_id: Option<u8>,
+    /// Probability distribution function for dithering. None derives from the dither choice.
     pub pdf_type: Option<SsrcPdfType>,
 }
 
@@ -609,6 +613,7 @@ impl Default for SsrcSettings {
             profile: None,
             attenuation_db: None,
             min_phase: false,
+            dither_id: None,
             pdf_type: None,
         }
     }
@@ -804,6 +809,44 @@ impl Default for MetadataSettings {
     }
 }
 
+
+fn validate_ssrc_dither_settings(settings: &PipelineSettings) -> Result<()> {
+    if let Some(dither_id) = settings.ssrc.dither_id {
+        if dither_id > 99 {
+            return Err(PlanningError::invalid_settings(
+                "ssrc.dither_id",
+                "expected 0 through 99",
+            ));
+        }
+    }
+
+    if !settings_may_emit_ssrc_integer_dither(settings) {
+        return Ok(());
+    }
+
+    let RateTarget::PcmHz(target_rate_hz) = settings.target_sample_rate else {
+        return Ok(());
+    };
+
+    if let Some(dither_id) = settings.ssrc.dither_id {
+        mapping::validate_ssrc_dither_id_for_rate(dither_id, target_rate_hz)
+    } else {
+        mapping::ssrc_dither_selection_for_rate(settings.dither_type, target_rate_hz).map(|_| ())
+    }
+}
+
+fn settings_may_emit_ssrc_integer_dither(settings: &PipelineSettings) -> bool {
+    let uses_ssrc = matches!(settings.preferred_tool, PreferredTool::Ssrc)
+        || settings.ssrc.force
+        || matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
+    let integer_or_unknown_output = !matches!(
+        settings.target_bit_depth,
+        BitDepthTarget::Pcm(PcmBitDepth::Float32) | BitDepthTarget::Pcm(PcmBitDepth::Float64)
+    );
+
+    uses_ssrc && integer_or_unknown_output
+}
+
 /// Verification settings consumed after encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -851,5 +894,102 @@ pub fn default_pcm_depth_for_format(format: &AudioFormat) -> PcmBitDepth {
         AudioFormat::Flac | AudioFormat::WavPack | AudioFormat::Alac => PcmBitDepth::Int24,
         AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus | AudioFormat::Dts | AudioFormat::Ac3 => PcmBitDepth::Int16,
         AudioFormat::Dsf | AudioFormat::Dff | AudioFormat::Custom { .. } => PcmBitDepth::Int24,
+    }
+}
+
+
+#[cfg(test)]
+mod ssrc_rate_dependent_dither_validation_tests {
+    use super::*;
+
+    #[test]
+    fn validates_explicit_ssrc_dither_id_against_explicit_pcm_rate() {
+        let mut settings = PipelineSettings::default();
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.nyquist_transition = NyquistTransition::BrickWall;
+        settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        settings.ssrc.dither_id = Some(16);
+        assert!(settings.validate().is_err());
+
+        settings.ssrc.dither_id = Some(2);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_low_rate_unavailable_ssrc_dither_id() {
+        let mut settings = PipelineSettings::default();
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.nyquist_transition = NyquistTransition::BrickWall;
+        settings.target_sample_rate = RateTarget::PcmHz(22_050);
+        settings.ssrc.dither_id = Some(6);
+        assert!(settings.validate().is_err());
+
+        settings.ssrc.dither_id = Some(1);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn defers_rate_dependent_ssrc_dither_validation_when_target_rate_is_source() {
+        let mut settings = PipelineSettings::default();
+        settings.target_sample_rate = RateTarget::Source;
+        settings.ssrc.dither_id = Some(16);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_derived_global_ssrc_dither_mapping_for_explicit_pcm_rate() {
+        let mut settings = PipelineSettings::default();
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        settings.dither_type = DitherType::HighShibata;
+        assert!(settings.validate().is_err());
+
+        settings.dither_type = DitherType::Tpdf;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_derived_ssrc_mapping_when_only_pdf_is_explicit() {
+        let mut settings = PipelineSettings::default();
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        settings.dither_type = DitherType::Shibata;
+        settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_sample_rate_independent_ssrc_dither_id_can_override_invalid_global_mapping() {
+        let mut settings = PipelineSettings::default();
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        settings.dither_type = DitherType::HighShibata;
+        settings.ssrc.dither_id = Some(99);
+        settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn skips_derived_ssrc_dither_validation_for_explicit_float_output() {
+        let mut settings = PipelineSettings::default();
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        settings.dither_type = DitherType::HighShibata;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_derived_ssrc_mapping_for_brickwall_auto_tool_settings() {
+        let mut settings = PipelineSettings::default();
+        settings.preferred_tool = PreferredTool::Auto;
+        settings.nyquist_transition = NyquistTransition::BrickWall;
+        settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        settings.dither_type = DitherType::HighShibata;
+        assert!(settings.validate().is_err());
     }
 }

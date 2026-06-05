@@ -139,6 +139,7 @@ pub enum FormatSettingsFocus {
     // SSRC
     SsrcAttenuation,
     SsrcMinPhase,
+    SsrcDitherId,
     SsrcPdf,
     // Sox (rate effect)
     SoxChebyshev,
@@ -156,6 +157,26 @@ pub enum FormatSettingsFocus {
     SoxrChebyshev,
     SoxrCutoff,
     SoxrPhase,
+}
+
+
+
+/// Which settings pill requested the format-settings overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatSettingsOpenTarget {
+    /// Codec/container settings such as FLAC compression or AAC bitrate.
+    Codec,
+    /// Resampler-specific settings such as SSRC dither/PDF or Sox phase.
+    Resampler,
+}
+
+impl FormatSettingsOpenTarget {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Codec => "codec",
+            Self::Resampler => "resampler",
+        }
+    }
 }
 
 /// Format-specific overlay state, keyed by codec.
@@ -192,7 +213,8 @@ pub enum FormatSettingsKind {
     Ssrc {
         attenuation_input: crate::tui::text_input::TextInputState,
         min_phase: bool,
-        pdf_type: Option<tonepoet_pipeline::enums::SsrcPdfType>,
+        dither_id_input: crate::tui::text_input::TextInputState,
+        pdf_type_input: crate::tui::text_input::TextInputState,
     },
     Sox {
         chebyshev: bool,
@@ -922,7 +944,9 @@ pub struct FormatState {
     pub ssrc_attenuation_db: Option<f32>,
     /// SSRC minimum phase filters. Default: false (linear phase).
     pub ssrc_min_phase: bool,
-    /// SSRC probability distribution function for dithering. None = ssrc default.
+    /// Explicit SSRC `--dither` ID. None derives from the global dither pill.
+    pub ssrc_dither_id: Option<u8>,
+    /// SSRC probability distribution function for dithering. None derives from the global dither pill.
     pub ssrc_pdf_type: Option<tonepoet_pipeline::enums::SsrcPdfType>,
     /// Sox chebyshev/steep filter (-s). Default: false.
     pub sox_chebyshev: bool,
@@ -1129,6 +1153,7 @@ impl FormatState {
             resample_quality: tonepoet_pipeline::enums::ResampleQuality::Ultra,
             ssrc_attenuation_db: None,
             ssrc_min_phase: false,
+            ssrc_dither_id: None,
             ssrc_pdf_type: None,
             sox_chebyshev: false,
             sox_bandwidth: None,
@@ -1167,6 +1192,52 @@ impl FormatState {
     /// DSD source material rendered to a PCM target format.
     pub fn dsd_to_pcm_gain_available(&self) -> bool {
         self.source_is_dsd && !self.is_dsd_selected()
+    }
+
+    /// True when the SSRC overlay is overriding any part of the dither pair
+    /// derived from the global dither pill.
+    pub fn ssrc_dither_override_active(&self) -> bool {
+        matches!(*self.resampler.selected_value(), ResamplerChoice::Ssrc)
+            && (self.ssrc_dither_id.is_some() || self.ssrc_pdf_type.is_some())
+    }
+
+    /// True when the selected global dither pill will be translated to an
+    /// SSRC-native approximation rather than emitted as the named shaper.
+    ///
+    /// Overlay overrides are not considered approximations here because the
+    /// user has explicitly selected SSRC-native `--dither`/`--pdf` values.
+    pub fn ssrc_dither_approximation_active(&self) -> bool {
+        matches!(*self.resampler.selected_value(), ResamplerChoice::Ssrc)
+            && !self.ssrc_dither_override_active()
+            && selected_global_dither_needs_ssrc_approximation(*self.dither.selected_value())
+    }
+
+    /// True when SSRC is selected and the global dither pill would derive an
+    /// SSRC shaper ID that is unavailable for the selected destination rate.
+    ///
+    /// Explicit SSRC overlay overrides take precedence, and float output skips
+    /// dither/noise-shaping emission entirely.
+    pub fn ssrc_dither_invalid_for_selected_rate(&self) -> bool {
+        matches!(*self.resampler.selected_value(), ResamplerChoice::Ssrc)
+            && !self.ssrc_dither_override_active()
+            && !self.bit_depth.selected_value().is_float()
+            && !selected_global_ssrc_dither_valid_for_rate(
+                *self.dither.selected_value(),
+                *self.sample_rate.selected_value(),
+            )
+    }
+
+    /// Short suffix for the dither row in the format pane.
+    pub fn ssrc_dither_status_label(&self) -> Option<&'static str> {
+        if self.ssrc_dither_override_active() {
+            Some("ssrc override")
+        } else if self.ssrc_dither_invalid_for_selected_rate() {
+            Some("ssrc invalid")
+        } else if self.ssrc_dither_approximation_active() {
+            Some("ssrc approx")
+        } else {
+            None
+        }
     }
 
     pub fn set_source_is_dsd(&mut self, source_is_dsd: bool) {
@@ -1589,6 +1660,34 @@ fn select_enabled_index<T: Clone + PartialEq>(pill: &mut PillState<T>, index: us
         if option.enabled {
             pill.selected = index;
         }
+    }
+}
+
+fn selected_global_dither_needs_ssrc_approximation(dither: DitherType) -> bool {
+    // SSRC can represent no dither and unshaped triangular PDF directly.
+    // Every other global pill names a SoX/SoXR-family shaper that SSRC does
+    // not expose by name and therefore maps to an SSRC-native approximation.
+    !matches!(dither, DitherType::None | DitherType::TPDF)
+}
+
+fn selected_global_ssrc_dither_valid_for_rate(dither: DitherType, target_rate_hz: u32) -> bool {
+    match dither {
+        // These map to sample-rate-independent SSRC IDs 98/99.
+        DitherType::None | DitherType::TPDF | DitherType::SloppedTPDF => true,
+        // These map to SSRC ATH Curve A intensities. SSRC only publishes ATH A
+        // tables for the rates below, and the pipeline clamps requested
+        // intensity to the strongest ATH A ID available at that rate.
+        DitherType::LowShibata
+        | DitherType::Shibata
+        | DitherType::HighShibata
+        | DitherType::Lipshitz
+        | DitherType::FWeighted
+        | DitherType::ModifiedEWeighted
+        | DitherType::ImprovedEWeighted
+        | DitherType::Gesemann => matches!(
+            target_rate_hz,
+            44_100 | 48_000 | 88_200 | 96_000 | 192_000 | 8_000 | 11_025 | 22_050
+        ),
     }
 }
 
@@ -3218,6 +3317,1097 @@ impl AppState {
             )
         };
         self.set_status(status);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Format-settings overlay lifecycle and text-entry handlers
+// -----------------------------------------------------------------------------
+// These handlers intentionally live next to `ActiveOverlay`/`FormatState` so
+// keyboard and mouse modules can share one path for overlay construction,
+// editing, validation, and commit. Renderers should not parse user input.
+
+impl AppState {
+    /// Open codec/container-specific settings for the current format.
+    pub fn open_codec_format_settings_overlay(&mut self) -> Result<(), String> {
+        self.open_format_settings_overlay_for(FormatSettingsOpenTarget::Codec)
+    }
+
+    /// Open resampler-specific settings for the current resampler.
+    pub fn open_resampler_format_settings_overlay(&mut self) -> Result<(), String> {
+        self.open_format_settings_overlay_for(FormatSettingsOpenTarget::Resampler)
+    }
+
+    /// Open the appropriate settings overlay for the current format-pane row.
+    ///
+    /// This convenience entry point preserves old call sites that had only one
+    /// "format settings" action. Dedicated settings-pill handlers should call
+    /// `open_codec_format_settings_overlay` or
+    /// `open_resampler_format_settings_overlay` so a codec settings pill and an
+    /// SSRC/Sox/Soxr settings pill cannot be confused.
+    pub fn open_format_settings_overlay(&mut self) -> Result<(), String> {
+        let target = match self.convert.format.field_focus {
+            FormatField::Resampler | FormatField::SampleRate | FormatField::BitDepth => {
+                FormatSettingsOpenTarget::Resampler
+            }
+            _ => FormatSettingsOpenTarget::Codec,
+        };
+        self.open_format_settings_overlay_for(target)
+    }
+
+    pub fn open_format_settings_overlay_for(
+        &mut self,
+        target: FormatSettingsOpenTarget,
+    ) -> Result<(), String> {
+        let Some(kind) = build_format_settings_kind(&self.convert.format, target) else {
+            return Err(format!(
+                "no {} settings available for current format/resampler",
+                target.label()
+            ));
+        };
+        let focus = first_format_settings_focus(&kind);
+        self.active_overlay = ActiveOverlay::FormatSettings {
+            kind,
+            focus,
+            help_scroll: None,
+        };
+        Ok(())
+    }
+
+    /// Move focus to the next editable field in the active format settings overlay.
+    pub fn format_settings_focus_next(&mut self) -> bool {
+        match &mut self.active_overlay {
+            ActiveOverlay::FormatSettings {
+                kind,
+                focus,
+                help_scroll: None,
+            } => {
+                *focus = next_format_settings_focus(kind, *focus, 1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Move focus to the previous editable field in the active format settings overlay.
+    pub fn format_settings_focus_prev(&mut self) -> bool {
+        match &mut self.active_overlay {
+            ActiveOverlay::FormatSettings {
+                kind,
+                focus,
+                help_scroll: None,
+            } => {
+                *focus = next_format_settings_focus(kind, *focus, -1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Insert a character into the active text field. Returns `Ok(false)` when
+    /// the focused field is not text-editable or the character is not accepted
+    /// by that field's grammar.
+    pub fn format_settings_insert_char(&mut self, ch: char) -> Result<bool, String> {
+        match &mut self.active_overlay {
+            ActiveOverlay::FormatSettings {
+                kind,
+                focus,
+                help_scroll: None,
+            } => {
+                let focus = *focus;
+                if !format_settings_focus_accepts_char(focus, ch) {
+                    return Ok(false);
+                }
+                let Some(input) = format_settings_focused_input_mut(kind, focus) else {
+                    return Ok(false);
+                };
+                text_input_insert_char(input, ch);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn format_settings_backspace(&mut self) -> bool {
+        self.format_settings_apply_text_edit(text_input_backspace)
+    }
+
+    pub fn format_settings_delete(&mut self) -> bool {
+        self.format_settings_apply_text_edit(text_input_delete)
+    }
+
+    pub fn format_settings_move_cursor_left(&mut self) -> bool {
+        self.format_settings_apply_text_edit(text_input_move_left)
+    }
+
+    pub fn format_settings_move_cursor_right(&mut self) -> bool {
+        self.format_settings_apply_text_edit(text_input_move_right)
+    }
+
+    pub fn format_settings_move_cursor_home(&mut self) -> bool {
+        self.format_settings_apply_text_edit(text_input_move_home)
+    }
+
+    pub fn format_settings_move_cursor_end(&mut self) -> bool {
+        self.format_settings_apply_text_edit(text_input_move_end)
+    }
+
+    fn format_settings_apply_text_edit(
+        &mut self,
+        edit: fn(&mut crate::tui::text_input::TextInputState) -> bool,
+    ) -> bool {
+        match &mut self.active_overlay {
+            ActiveOverlay::FormatSettings {
+                kind,
+                focus,
+                help_scroll: None,
+            } => {
+                let Some(input) = format_settings_focused_input_mut(kind, *focus) else {
+                    return false;
+                };
+                edit(input)
+            }
+            _ => false,
+        }
+    }
+
+    /// Commit the active format-settings overlay back into `FormatState`.
+    ///
+    /// Validation is all-or-nothing: invalid fields leave the overlay open and
+    /// do not mutate the live format state. This keeps retries idempotent and
+    /// prevents half-committed settings.
+    pub fn commit_format_settings_overlay(&mut self) -> Result<(), String> {
+        let kind = match &self.active_overlay {
+            ActiveOverlay::FormatSettings {
+                kind,
+                help_scroll: None,
+                ..
+            } => kind.clone(),
+            ActiveOverlay::FormatSettings { help_scroll: Some(_), .. } => {
+                return Err("close SSRC/settings help before committing".to_string());
+            }
+            _ => return Err("no format settings overlay is active".to_string()),
+        };
+
+        if let Err(err) = apply_format_settings_kind(&mut self.convert.format, kind) {
+            self.set_status(err.clone());
+            return Err(err);
+        }
+        self.active_overlay = ActiveOverlay::None;
+        self.set_status("format settings updated");
+        Ok(())
+    }
+
+    pub fn cancel_format_settings_overlay(&mut self) -> bool {
+        if matches!(self.active_overlay, ActiveOverlay::FormatSettings { .. }) {
+            self.active_overlay = ActiveOverlay::None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub fn build_format_settings_kind(
+    format: &FormatState,
+    target: FormatSettingsOpenTarget,
+) -> Option<FormatSettingsKind> {
+    match target {
+        FormatSettingsOpenTarget::Codec => build_codec_format_settings_kind(format),
+        FormatSettingsOpenTarget::Resampler => build_resampler_format_settings_kind(format),
+    }
+}
+
+fn build_codec_format_settings_kind(format: &FormatState) -> Option<FormatSettingsKind> {
+    match *format.format.selected_value() {
+        AudioFormat::Flac => Some(FormatSettingsKind::Flac {
+            compression_input: crate::tui::text_input::TextInputState::new(
+                format.flac_compression_level.to_string(),
+            ),
+            verify: *format.flac_verify.selected_value(),
+            md5: *format.flac_md5.selected_value(),
+        }),
+        AudioFormat::Aac => Some(FormatSettingsKind::Aac {
+            profile: format.aac_profile,
+            quality_preset: format.aac_quality_preset,
+            bitrate_input: crate::tui::text_input::TextInputState::new(
+                format.aac_bitrate_kbps.to_string(),
+            ),
+        }),
+        AudioFormat::Opus => Some(FormatSettingsKind::Opus {
+            content_type: format.opus_content_type,
+            quality_preset: format.opus_quality_preset,
+            bitrate_input: crate::tui::text_input::TextInputState::new(
+                format.opus_bitrate_kbps.to_string(),
+            ),
+            complexity_input: crate::tui::text_input::TextInputState::new(
+                format.opus_complexity.to_string(),
+            ),
+        }),
+        AudioFormat::Mp3 => Some(FormatSettingsKind::Mp3 {
+            mode: format.mp3_mode,
+            vbr_quality_input: crate::tui::text_input::TextInputState::new(
+                format.mp3_vbr_quality.to_string(),
+            ),
+            quality_preset: format.mp3_quality_preset,
+            bitrate_input: crate::tui::text_input::TextInputState::new(
+                format.mp3_bitrate_kbps.to_string(),
+            ),
+        }),
+        AudioFormat::WavPack => Some(FormatSettingsKind::WavPack {
+            mode: format.wavpack_mode,
+            hybrid: format.wavpack_hybrid,
+            bitrate_input: crate::tui::text_input::TextInputState::new(
+                format.wavpack_bitrate_kbps.to_string(),
+            ),
+            correction: format.wavpack_correction,
+        }),
+        _ => None,
+    }
+}
+
+fn build_resampler_format_settings_kind(format: &FormatState) -> Option<FormatSettingsKind> {
+    match *format.resampler.selected_value() {
+        ResamplerChoice::Ssrc => Some(FormatSettingsKind::Ssrc {
+            attenuation_input: crate::tui::text_input::TextInputState::new(
+                format
+                    .ssrc_attenuation_db
+                    .map(format_decimal)
+                    .unwrap_or_default(),
+            ),
+            min_phase: format.ssrc_min_phase,
+            dither_id_input: crate::tui::text_input::TextInputState::new(
+                format.ssrc_dither_id.map(|value| value.to_string()).unwrap_or_default(),
+            ),
+            pdf_type_input: crate::tui::text_input::TextInputState::new(
+                format
+                    .ssrc_pdf_type
+                    .map(|pdf| match pdf {
+                        tonepoet_pipeline::enums::SsrcPdfType::Rectangular => "0".to_string(),
+                        tonepoet_pipeline::enums::SsrcPdfType::Triangular => "1".to_string(),
+                    })
+                    .unwrap_or_default(),
+            ),
+        }),
+        ResamplerChoice::Sox => Some(FormatSettingsKind::Sox {
+            chebyshev: format.sox_chebyshev,
+            bandwidth_input: crate::tui::text_input::TextInputState::new(
+                format.sox_bandwidth.map(format_decimal).unwrap_or_default(),
+            ),
+            phase_input: crate::tui::text_input::TextInputState::new(
+                format.sox_phase.map(|value| value.to_string()).unwrap_or_default(),
+            ),
+            allow_aliasing: format.sox_allow_aliasing,
+            sinc_taps_input: crate::tui::text_input::TextInputState::new(
+                format.sox_sinc_taps.map(|value| value.to_string()).unwrap_or_default(),
+            ),
+            sinc_attenuation_input: crate::tui::text_input::TextInputState::new(
+                format
+                    .sox_sinc_attenuation
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            sinc_passband_input: crate::tui::text_input::TextInputState::new(
+                format.sox_sinc_passband.map(format_decimal).unwrap_or_default(),
+            ),
+            sinc_transition_input: crate::tui::text_input::TextInputState::new(
+                format.sox_sinc_transition.map(format_decimal).unwrap_or_default(),
+            ),
+            sinc_kaiser_beta_input: crate::tui::text_input::TextInputState::new(
+                format.sox_sinc_kaiser_beta.map(format_decimal).unwrap_or_default(),
+            ),
+            sinc_phase: format.sox_sinc_phase,
+        }),
+        ResamplerChoice::Soxr => Some(FormatSettingsKind::Soxr {
+            chebyshev: format.soxr_chebyshev,
+            cutoff_input: crate::tui::text_input::TextInputState::new(
+                format.soxr_cutoff.map(format_decimal).unwrap_or_default(),
+            ),
+            phase_input: crate::tui::text_input::TextInputState::new(
+                format.soxr_phase.map(|value| value.to_string()).unwrap_or_default(),
+            ),
+        }),
+        ResamplerChoice::None => None,
+    }
+}
+
+fn format_decimal(value: f32) -> String {
+    if value.fract().abs() < f32::EPSILON {
+        format!("{value:.0}")
+    } else {
+        let mut text = format!("{value:.3}");
+        while text.contains('.') && text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+        text
+    }
+}
+
+pub fn apply_format_settings_kind(
+    format: &mut FormatState,
+    kind: FormatSettingsKind,
+) -> Result<(), String> {
+    match kind {
+        FormatSettingsKind::Flac {
+            compression_input,
+            verify,
+            md5,
+        } => {
+            format.flac_compression_level = parse_required_u8(
+                "FLAC compression",
+                &compression_input.text,
+                0,
+                8,
+            )?;
+            format.flac_verify.select_value(&verify);
+            format.flac_md5.select_value(&md5);
+        }
+        FormatSettingsKind::Aac {
+            profile,
+            quality_preset,
+            bitrate_input,
+        } => {
+            format.aac_profile = profile;
+            format.aac_quality_preset = quality_preset;
+            format.aac_bitrate_kbps = parse_required_u32("AAC bitrate", &bitrate_input.text, 8, 1024)?;
+        }
+        FormatSettingsKind::Opus {
+            content_type,
+            quality_preset,
+            bitrate_input,
+            complexity_input,
+        } => {
+            format.opus_content_type = content_type;
+            format.opus_quality_preset = quality_preset;
+            format.opus_bitrate_kbps = parse_required_u32("Opus bitrate", &bitrate_input.text, 6, 510)?;
+            format.opus_complexity = parse_required_u8("Opus complexity", &complexity_input.text, 0, 10)?;
+        }
+        FormatSettingsKind::Mp3 {
+            mode,
+            vbr_quality_input,
+            quality_preset,
+            bitrate_input,
+        } => {
+            format.mp3_mode = mode;
+            format.mp3_quality_preset = quality_preset;
+            format.mp3_vbr_quality = parse_required_u8("MP3 VBR quality", &vbr_quality_input.text, 0, 9)?;
+            format.mp3_bitrate_kbps = parse_required_u32("MP3 bitrate", &bitrate_input.text, 8, 1000)?;
+        }
+        FormatSettingsKind::WavPack {
+            mode,
+            hybrid,
+            bitrate_input,
+            correction,
+        } => {
+            format.wavpack_mode = mode;
+            format.wavpack_hybrid = hybrid;
+            format.wavpack_bitrate_kbps = parse_required_u32("WavPack bitrate", &bitrate_input.text, 24, 9600)?;
+            format.wavpack_correction = correction;
+        }
+        FormatSettingsKind::Ssrc {
+            attenuation_input,
+            min_phase,
+            dither_id_input,
+            pdf_type_input,
+        } => {
+            let attenuation_db = parse_optional_f32(
+                "SSRC attenuation",
+                &attenuation_input.text,
+                0.0,
+                99.9,
+            )?;
+            let dither_id = parse_optional_u8("SSRC dither id", &dither_id_input.text, 0, 99)?;
+            let pdf_type = parse_optional_ssrc_pdf(&pdf_type_input.text)?;
+            if let Some(dither_id) = dither_id {
+                validate_ssrc_dither_id_for_target_rate(dither_id, *format.sample_rate.selected_value())?;
+            }
+
+            format.ssrc_attenuation_db = attenuation_db;
+            format.ssrc_min_phase = min_phase;
+            format.ssrc_dither_id = dither_id;
+            format.ssrc_pdf_type = pdf_type;
+        }
+        FormatSettingsKind::Sox {
+            chebyshev,
+            bandwidth_input,
+            phase_input,
+            allow_aliasing,
+            sinc_taps_input,
+            sinc_attenuation_input,
+            sinc_passband_input,
+            sinc_transition_input,
+            sinc_kaiser_beta_input,
+            sinc_phase,
+        } => {
+            format.sox_chebyshev = chebyshev;
+            format.sox_bandwidth = parse_optional_f32("Sox bandwidth", &bandwidth_input.text, 74.0, 99.7)?;
+            format.sox_phase = parse_optional_u8("Sox phase", &phase_input.text, 0, 100)?;
+            format.sox_allow_aliasing = allow_aliasing;
+            format.sox_sinc_taps = parse_optional_power_of_two_u32(
+                "Sox sinc taps",
+                &sinc_taps_input.text,
+                1024,
+                67_108_864,
+            )?;
+            format.sox_sinc_attenuation = parse_optional_u16(
+                "Sox sinc attenuation",
+                &sinc_attenuation_input.text,
+                80,
+                200,
+            )?;
+            format.sox_sinc_passband = parse_optional_f32(
+                "Sox sinc passband",
+                &sinc_passband_input.text,
+                1.0,
+                220_000.0,
+            )?;
+            format.sox_sinc_transition = parse_optional_f32(
+                "Sox sinc transition",
+                &sinc_transition_input.text,
+                1.0,
+                5000.0,
+            )?;
+            format.sox_sinc_kaiser_beta = parse_optional_f32(
+                "Sox sinc Kaiser beta",
+                &sinc_kaiser_beta_input.text,
+                0.0,
+                32.0,
+            )?;
+            format.sox_sinc_phase = sinc_phase;
+        }
+        FormatSettingsKind::Soxr {
+            chebyshev,
+            cutoff_input,
+            phase_input,
+        } => {
+            format.soxr_chebyshev = chebyshev;
+            format.soxr_cutoff = parse_optional_f32("Soxr cutoff", &cutoff_input.text, 74.0, 99.7)?;
+            format.soxr_phase = parse_optional_u8("Soxr phase", &phase_input.text, 0, 100)?;
+        }
+    }
+    format.apply_format_constraints();
+    Ok(())
+}
+
+fn first_format_settings_focus(kind: &FormatSettingsKind) -> FormatSettingsFocus {
+    format_settings_focuses(kind)[0]
+}
+
+fn next_format_settings_focus(
+    kind: &FormatSettingsKind,
+    current: FormatSettingsFocus,
+    direction: i8,
+) -> FormatSettingsFocus {
+    let focuses = format_settings_focuses(kind);
+    let Some(current_idx) = focuses.iter().position(|focus| *focus == current) else {
+        return focuses[0];
+    };
+    let len = focuses.len();
+    let next_idx = if direction < 0 {
+        (current_idx + len - 1) % len
+    } else {
+        (current_idx + 1) % len
+    };
+    focuses[next_idx]
+}
+
+fn format_settings_focuses(kind: &FormatSettingsKind) -> &'static [FormatSettingsFocus] {
+    match kind {
+        FormatSettingsKind::Flac { .. } => &[
+            FormatSettingsFocus::Compression,
+            FormatSettingsFocus::Verify,
+            FormatSettingsFocus::Md5,
+        ],
+        FormatSettingsKind::Aac { .. } => &[
+            FormatSettingsFocus::AacProfile,
+            FormatSettingsFocus::AacQuality,
+            FormatSettingsFocus::AacBitrate,
+        ],
+        FormatSettingsKind::Opus { .. } => &[
+            FormatSettingsFocus::OpusContentType,
+            FormatSettingsFocus::OpusQuality,
+            FormatSettingsFocus::OpusBitrate,
+            FormatSettingsFocus::OpusComplexity,
+        ],
+        FormatSettingsKind::Mp3 { .. } => &[
+            FormatSettingsFocus::Mp3Mode,
+            FormatSettingsFocus::Mp3VbrQuality,
+            FormatSettingsFocus::Mp3Preset,
+            FormatSettingsFocus::Mp3Bitrate,
+        ],
+        FormatSettingsKind::WavPack { .. } => &[
+            FormatSettingsFocus::WavPackMode,
+            FormatSettingsFocus::WavPackHybrid,
+            FormatSettingsFocus::WavPackBitrate,
+            FormatSettingsFocus::WavPackCorrection,
+        ],
+        FormatSettingsKind::Ssrc { .. } => &[
+            FormatSettingsFocus::SsrcAttenuation,
+            FormatSettingsFocus::SsrcMinPhase,
+            FormatSettingsFocus::SsrcDitherId,
+            FormatSettingsFocus::SsrcPdf,
+        ],
+        FormatSettingsKind::Sox { .. } => &[
+            FormatSettingsFocus::SoxChebyshev,
+            FormatSettingsFocus::SoxBandwidth,
+            FormatSettingsFocus::SoxPhase,
+            FormatSettingsFocus::SoxAliasing,
+            FormatSettingsFocus::SoxSincTaps,
+            FormatSettingsFocus::SoxSincAttenuation,
+            FormatSettingsFocus::SoxSincPassband,
+            FormatSettingsFocus::SoxSincTransition,
+            FormatSettingsFocus::SoxSincKaiserBeta,
+            FormatSettingsFocus::SoxSincPhase,
+        ],
+        FormatSettingsKind::Soxr { .. } => &[
+            FormatSettingsFocus::SoxrChebyshev,
+            FormatSettingsFocus::SoxrCutoff,
+            FormatSettingsFocus::SoxrPhase,
+        ],
+    }
+}
+
+fn format_settings_focused_input_mut(
+    kind: &mut FormatSettingsKind,
+    focus: FormatSettingsFocus,
+) -> Option<&mut crate::tui::text_input::TextInputState> {
+    match (kind, focus) {
+        (FormatSettingsKind::Flac { compression_input, .. }, FormatSettingsFocus::Compression) => {
+            Some(compression_input)
+        }
+        (FormatSettingsKind::Aac { bitrate_input, .. }, FormatSettingsFocus::AacBitrate) => {
+            Some(bitrate_input)
+        }
+        (FormatSettingsKind::Opus { bitrate_input, .. }, FormatSettingsFocus::OpusBitrate) => {
+            Some(bitrate_input)
+        }
+        (FormatSettingsKind::Opus { complexity_input, .. }, FormatSettingsFocus::OpusComplexity) => {
+            Some(complexity_input)
+        }
+        (FormatSettingsKind::Mp3 { vbr_quality_input, .. }, FormatSettingsFocus::Mp3VbrQuality) => {
+            Some(vbr_quality_input)
+        }
+        (FormatSettingsKind::Mp3 { bitrate_input, .. }, FormatSettingsFocus::Mp3Bitrate) => {
+            Some(bitrate_input)
+        }
+        (FormatSettingsKind::WavPack { bitrate_input, .. }, FormatSettingsFocus::WavPackBitrate) => {
+            Some(bitrate_input)
+        }
+        (FormatSettingsKind::Ssrc { attenuation_input, .. }, FormatSettingsFocus::SsrcAttenuation) => {
+            Some(attenuation_input)
+        }
+        (FormatSettingsKind::Ssrc { dither_id_input, .. }, FormatSettingsFocus::SsrcDitherId) => {
+            Some(dither_id_input)
+        }
+        (FormatSettingsKind::Ssrc { pdf_type_input, .. }, FormatSettingsFocus::SsrcPdf) => {
+            Some(pdf_type_input)
+        }
+        (FormatSettingsKind::Sox { bandwidth_input, .. }, FormatSettingsFocus::SoxBandwidth) => {
+            Some(bandwidth_input)
+        }
+        (FormatSettingsKind::Sox { phase_input, .. }, FormatSettingsFocus::SoxPhase) => {
+            Some(phase_input)
+        }
+        (FormatSettingsKind::Sox { sinc_taps_input, .. }, FormatSettingsFocus::SoxSincTaps) => {
+            Some(sinc_taps_input)
+        }
+        (FormatSettingsKind::Sox { sinc_attenuation_input, .. }, FormatSettingsFocus::SoxSincAttenuation) => {
+            Some(sinc_attenuation_input)
+        }
+        (FormatSettingsKind::Sox { sinc_passband_input, .. }, FormatSettingsFocus::SoxSincPassband) => {
+            Some(sinc_passband_input)
+        }
+        (FormatSettingsKind::Sox { sinc_transition_input, .. }, FormatSettingsFocus::SoxSincTransition) => {
+            Some(sinc_transition_input)
+        }
+        (FormatSettingsKind::Sox { sinc_kaiser_beta_input, .. }, FormatSettingsFocus::SoxSincKaiserBeta) => {
+            Some(sinc_kaiser_beta_input)
+        }
+        (FormatSettingsKind::Soxr { cutoff_input, .. }, FormatSettingsFocus::SoxrCutoff) => {
+            Some(cutoff_input)
+        }
+        (FormatSettingsKind::Soxr { phase_input, .. }, FormatSettingsFocus::SoxrPhase) => {
+            Some(phase_input)
+        }
+        _ => None,
+    }
+}
+
+fn format_settings_focus_accepts_char(focus: FormatSettingsFocus, ch: char) -> bool {
+    if ch == '.' {
+        return matches!(
+            focus,
+            FormatSettingsFocus::SsrcAttenuation
+                | FormatSettingsFocus::SoxBandwidth
+                | FormatSettingsFocus::SoxSincPassband
+                | FormatSettingsFocus::SoxSincTransition
+                | FormatSettingsFocus::SoxSincKaiserBeta
+                | FormatSettingsFocus::SoxrCutoff
+        );
+    }
+    ch.is_ascii_digit()
+        && matches!(
+            focus,
+            FormatSettingsFocus::Compression
+                | FormatSettingsFocus::AacBitrate
+                | FormatSettingsFocus::OpusBitrate
+                | FormatSettingsFocus::OpusComplexity
+                | FormatSettingsFocus::Mp3VbrQuality
+                | FormatSettingsFocus::Mp3Bitrate
+                | FormatSettingsFocus::WavPackBitrate
+                | FormatSettingsFocus::SsrcAttenuation
+                | FormatSettingsFocus::SsrcDitherId
+                | FormatSettingsFocus::SsrcPdf
+                | FormatSettingsFocus::SoxBandwidth
+                | FormatSettingsFocus::SoxPhase
+                | FormatSettingsFocus::SoxSincTaps
+                | FormatSettingsFocus::SoxSincAttenuation
+                | FormatSettingsFocus::SoxSincPassband
+                | FormatSettingsFocus::SoxSincTransition
+                | FormatSettingsFocus::SoxSincKaiserBeta
+                | FormatSettingsFocus::SoxrCutoff
+                | FormatSettingsFocus::SoxrPhase
+        )
+}
+
+fn parse_required_u8(label: &str, text: &str, min: u8, max: u8) -> Result<u8, String> {
+    let value = parse_required_u32(label, text, min as u32, max as u32)?;
+    Ok(value as u8)
+}
+
+fn parse_required_u32(label: &str, text: &str, min: u32, max: u32) -> Result<u32, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    let value = trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("{label} must be an integer from {min} through {max}"))?;
+    if !(min..=max).contains(&value) {
+        return Err(format!("{label} must be from {min} through {max}"));
+    }
+    Ok(value)
+}
+
+fn parse_optional_u8(label: &str, text: &str, min: u8, max: u8) -> Result<Option<u8>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    parse_required_u8(label, trimmed, min, max).map(Some)
+}
+
+fn parse_optional_u16(label: &str, text: &str, min: u16, max: u16) -> Result<Option<u16>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value = trimmed
+        .parse::<u16>()
+        .map_err(|_| format!("{label} must be an integer from {min} through {max}"))?;
+    if !(min..=max).contains(&value) {
+        return Err(format!("{label} must be from {min} through {max}"));
+    }
+    Ok(Some(value))
+}
+
+fn parse_optional_f32(label: &str, text: &str, min: f32, max: f32) -> Result<Option<f32>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value = trimmed
+        .parse::<f32>()
+        .map_err(|_| format!("{label} must be a number from {min} through {max}"))?;
+    if !value.is_finite() || value < min || value > max {
+        return Err(format!("{label} must be from {min} through {max}"));
+    }
+    Ok(Some(value))
+}
+
+fn parse_optional_power_of_two_u32(
+    label: &str,
+    text: &str,
+    min: u32,
+    max: u32,
+) -> Result<Option<u32>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value = parse_required_u32(label, trimmed, min, max)?;
+    if !value.is_power_of_two() {
+        return Err(format!("{label} must be a power of two from {min} through {max}"));
+    }
+    Ok(Some(value))
+}
+
+fn validate_ssrc_dither_id_for_target_rate(dither_id: u8, target_rate_hz: u32) -> Result<(), String> {
+    // Mirror SSRC's rate-dependent dither menu. IDs 98 and 99 are treated as
+    // sample-rate-independent simple/no-shaper choices; shaped ATH and legacy
+    // IDs must be available for the selected destination rate.
+    let valid = if matches!(dither_id, 98 | 99) {
+        true
+    } else {
+        match target_rate_hz {
+            44_100 => matches!(dither_id, 0..=6 | 10..=16 | 90..=92),
+            48_000 => matches!(dither_id, 0..=6 | 10..=16 | 90 | 91),
+            88_200 | 96_000 | 192_000 => matches!(dither_id, 0..=2),
+            8_000 | 11_025 | 22_050 => matches!(dither_id, 0 | 1 | 9),
+            _ => false,
+        }
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "SSRC dither id {dither_id} is not available for target sample rate {target_rate_hz} Hz"
+        ))
+    }
+}
+
+fn parse_optional_ssrc_pdf(
+    text: &str,
+) -> Result<Option<tonepoet_pipeline::enums::SsrcPdfType>, String> {
+    match text.trim() {
+        "" => Ok(None),
+        "0" => Ok(Some(tonepoet_pipeline::enums::SsrcPdfType::Rectangular)),
+        "1" => Ok(Some(tonepoet_pipeline::enums::SsrcPdfType::Triangular)),
+        _ => Err("SSRC pdf type must be 0 (rectangular) or 1 (triangular)".to_string()),
+    }
+}
+
+fn text_input_insert_char(input: &mut crate::tui::text_input::TextInputState, ch: char) {
+    let cursor = clamp_to_char_boundary(&input.text, input.cursor);
+    input.text.insert(cursor, ch);
+    input.cursor = cursor + ch.len_utf8();
+}
+
+fn text_input_backspace(input: &mut crate::tui::text_input::TextInputState) -> bool {
+    let cursor = clamp_to_char_boundary(&input.text, input.cursor);
+    if cursor == 0 {
+        input.cursor = 0;
+        return false;
+    }
+    let prev = previous_char_boundary(&input.text, cursor);
+    input.text.replace_range(prev..cursor, "");
+    input.cursor = prev;
+    true
+}
+
+fn text_input_delete(input: &mut crate::tui::text_input::TextInputState) -> bool {
+    let cursor = clamp_to_char_boundary(&input.text, input.cursor);
+    if cursor >= input.text.len() {
+        input.cursor = input.text.len();
+        return false;
+    }
+    let next = next_char_boundary(&input.text, cursor);
+    input.text.replace_range(cursor..next, "");
+    input.cursor = cursor;
+    true
+}
+
+fn text_input_move_left(input: &mut crate::tui::text_input::TextInputState) -> bool {
+    let cursor = clamp_to_char_boundary(&input.text, input.cursor);
+    let next = previous_char_boundary(&input.text, cursor);
+    let changed = next != input.cursor;
+    input.cursor = next;
+    changed
+}
+
+fn text_input_move_right(input: &mut crate::tui::text_input::TextInputState) -> bool {
+    let cursor = clamp_to_char_boundary(&input.text, input.cursor);
+    let next = next_char_boundary(&input.text, cursor);
+    let changed = next != input.cursor;
+    input.cursor = next;
+    changed
+}
+
+fn text_input_move_home(input: &mut crate::tui::text_input::TextInputState) -> bool {
+    let changed = input.cursor != 0;
+    input.cursor = 0;
+    changed
+}
+
+fn text_input_move_end(input: &mut crate::tui::text_input::TextInputState) -> bool {
+    let changed = input.cursor != input.text.len();
+    input.cursor = input.text.len();
+    changed
+}
+
+fn clamp_to_char_boundary(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> usize {
+    let mut prev = cursor.saturating_sub(1);
+    while prev > 0 && !text.is_char_boundary(prev) {
+        prev -= 1;
+    }
+    prev
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> usize {
+    if cursor >= text.len() {
+        return text.len();
+    }
+    let mut next = cursor + 1;
+    while next < text.len() && !text.is_char_boundary(next) {
+        next += 1;
+    }
+    next
+}
+
+#[cfg(test)]
+mod ssrc_format_settings_handler_tests {
+    use super::*;
+    use tonepoet_pipeline::enums::SsrcPdfType;
+
+    fn ssrc_kind(format: &FormatState) -> FormatSettingsKind {
+        build_format_settings_kind(format, FormatSettingsOpenTarget::Resampler)
+            .expect("SSRC settings should be available")
+    }
+
+    #[test]
+    fn ssrc_overlay_creation_seeds_empty_override_fields_as_empty_text() {
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+
+        let FormatSettingsKind::Ssrc {
+            attenuation_input,
+            dither_id_input,
+            pdf_type_input,
+            ..
+        } = ssrc_kind(&format)
+        else {
+            panic!("expected SSRC settings kind");
+        };
+
+        assert_eq!(attenuation_input.text, "");
+        assert_eq!(dither_id_input.text, "");
+        assert_eq!(pdf_type_input.text, "");
+    }
+
+    #[test]
+    fn ssrc_overlay_commit_parses_dither_id_and_pdf_type() {
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+        let mut kind = ssrc_kind(&format);
+
+        let FormatSettingsKind::Ssrc {
+            ref mut dither_id_input,
+            ref mut pdf_type_input,
+            ..
+        } = kind
+        else {
+            panic!("expected SSRC settings kind");
+        };
+        dither_id_input.text = "2".to_string();
+        dither_id_input.cursor = dither_id_input.text.len();
+        pdf_type_input.text = "1".to_string();
+        pdf_type_input.cursor = pdf_type_input.text.len();
+
+        apply_format_settings_kind(&mut format, kind).expect("valid SSRC settings should commit");
+        assert_eq!(format.ssrc_dither_id, Some(2));
+        assert_eq!(format.ssrc_pdf_type, Some(SsrcPdfType::Triangular));
+        assert!(format.ssrc_dither_override_active());
+    }
+
+    #[test]
+    fn ssrc_overlay_partial_override_activates_dither_override_indicator_state() {
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+
+        let mut dither_only = ssrc_kind(&format);
+        let FormatSettingsKind::Ssrc {
+            ref mut dither_id_input,
+            ref mut pdf_type_input,
+            ..
+        } = dither_only
+        else {
+            panic!("expected SSRC settings kind");
+        };
+        dither_id_input.text = "2".to_string();
+        pdf_type_input.text.clear();
+        apply_format_settings_kind(&mut format, dither_only)
+            .expect("valid dither-only override should commit");
+        assert_eq!(format.ssrc_dither_id, Some(2));
+        assert_eq!(format.ssrc_pdf_type, None);
+        assert!(format.ssrc_dither_override_active());
+
+        let mut pdf_only = ssrc_kind(&format);
+        let FormatSettingsKind::Ssrc {
+            ref mut dither_id_input,
+            ref mut pdf_type_input,
+            ..
+        } = pdf_only
+        else {
+            panic!("expected SSRC settings kind");
+        };
+        dither_id_input.text.clear();
+        pdf_type_input.text = "1".to_string();
+        apply_format_settings_kind(&mut format, pdf_only)
+            .expect("valid pdf-only override should commit");
+        assert_eq!(format.ssrc_dither_id, None);
+        assert_eq!(format.ssrc_pdf_type, Some(SsrcPdfType::Triangular));
+        assert!(format.ssrc_dither_override_active());
+    }
+
+    #[test]
+    fn ssrc_dither_override_indicator_requires_ssrc_resampler() {
+        let mut format = FormatState::new();
+        format.ssrc_dither_id = Some(2);
+        format.ssrc_pdf_type = Some(SsrcPdfType::Triangular);
+
+        assert!(!format.ssrc_dither_override_active());
+
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+        assert!(format.ssrc_dither_override_active());
+    }
+
+    #[test]
+    fn ssrc_overlay_commit_rejects_out_of_range_dither_id_without_mutation() {
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+        format.ssrc_dither_id = Some(6);
+        format.ssrc_pdf_type = Some(SsrcPdfType::Triangular);
+        let mut kind = ssrc_kind(&format);
+
+        let FormatSettingsKind::Ssrc {
+            ref mut dither_id_input,
+            ref mut pdf_type_input,
+            ..
+        } = kind
+        else {
+            panic!("expected SSRC settings kind");
+        };
+        dither_id_input.text = "100".to_string();
+        pdf_type_input.text = "1".to_string();
+
+        assert!(apply_format_settings_kind(&mut format, kind).is_err());
+        assert_eq!(format.ssrc_dither_id, Some(6));
+        assert_eq!(format.ssrc_pdf_type, Some(SsrcPdfType::Triangular));
+    }
+
+    #[test]
+    fn ssrc_overlay_commit_rejects_rate_unavailable_dither_id_without_mutation() {
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+        format.sample_rate.select_value(&96_000);
+        format.ssrc_dither_id = Some(2);
+        format.ssrc_pdf_type = Some(SsrcPdfType::Triangular);
+        let mut kind = ssrc_kind(&format);
+
+        let FormatSettingsKind::Ssrc {
+            ref mut dither_id_input,
+            ref mut pdf_type_input,
+            ..
+        } = kind
+        else {
+            panic!("expected SSRC settings kind");
+        };
+        dither_id_input.text = "16".to_string();
+        pdf_type_input.text = "1".to_string();
+
+        assert!(apply_format_settings_kind(&mut format, kind).is_err());
+        assert_eq!(format.ssrc_dither_id, Some(2));
+        assert_eq!(format.ssrc_pdf_type, Some(SsrcPdfType::Triangular));
+    }
+
+    #[test]
+    fn ssrc_overlay_empty_custom_fields_clear_overrides() {
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+        format.ssrc_dither_id = Some(2);
+        format.ssrc_pdf_type = Some(SsrcPdfType::Triangular);
+        let mut kind = ssrc_kind(&format);
+
+        let FormatSettingsKind::Ssrc {
+            ref mut dither_id_input,
+            ref mut pdf_type_input,
+            ..
+        } = kind
+        else {
+            panic!("expected SSRC settings kind");
+        };
+        dither_id_input.text.clear();
+        dither_id_input.cursor = 0;
+        pdf_type_input.text.clear();
+        pdf_type_input.cursor = 0;
+
+        assert!(format.ssrc_dither_override_active());
+
+        apply_format_settings_kind(&mut format, kind).expect("empty optional fields should commit");
+        assert_eq!(format.ssrc_dither_id, None);
+        assert_eq!(format.ssrc_pdf_type, None);
+        assert!(!format.ssrc_dither_override_active());
+    }
+
+    #[test]
+    fn ssrc_dither_approximation_indicator_is_user_visible_for_non_native_global_pills() {
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+
+        format.dither.select_value(&DitherType::TPDF);
+        assert!(!format.ssrc_dither_approximation_active());
+        assert_eq!(format.ssrc_dither_status_label(), None);
+
+        format.dither.select_value(&DitherType::Shibata);
+        assert!(format.ssrc_dither_approximation_active());
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc approx"));
+
+        format.dither.select_value(&DitherType::Lipshitz);
+        assert!(format.ssrc_dither_approximation_active());
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc approx"));
+
+        format.ssrc_dither_id = Some(0);
+        format.ssrc_pdf_type = Some(SsrcPdfType::Triangular);
+        assert!(!format.ssrc_dither_approximation_active());
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc override"));
+    }
+
+    #[test]
+    fn ssrc_dither_status_labels_invalid_global_mapping_for_selected_rate() {
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+        format.sample_rate.select_value(&176_400);
+        format.bit_depth.select_value(&BitDepthChoice::Int16);
+        format.dither.select_value(&DitherType::HighShibata);
+
+        assert!(format.ssrc_dither_invalid_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc invalid"));
+
+        format.dither.select_value(&DitherType::TPDF);
+        assert!(!format.ssrc_dither_invalid_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), None);
+    }
+
+    #[test]
+    fn ssrc_dither_invalid_status_is_suppressed_for_float_output_and_explicit_overrides() {
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Wav); // WAV supports float bit depths
+        format.apply_format_constraints(); // Enable Float32/Float64 for WAV
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+        format.sample_rate.select_value(&176_400);
+        format.bit_depth.select_value(&BitDepthChoice::Float32);
+        format.dither.select_value(&DitherType::HighShibata);
+
+        assert!(!format.ssrc_dither_invalid_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc approx"));
+
+        format.bit_depth.select_value(&BitDepthChoice::Int16);
+        format.ssrc_dither_id = Some(99);
+        format.ssrc_pdf_type = Some(SsrcPdfType::Triangular);
+        assert!(!format.ssrc_dither_invalid_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc override"));
     }
 }
 

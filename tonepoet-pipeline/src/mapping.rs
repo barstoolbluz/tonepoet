@@ -4,8 +4,8 @@
 
 use crate::enums::{
     AacProfile, AudioFormat, DitherType, DsdLowpassMethod, DsdNoiseShaper, ModulatorOrder, Mp3Mode,
-    NyquistTransition, OpusContentType, PcmBitDepth, ResampleQuality, SoxSincPhase, SsrcProfile,
-    WavPackMode,
+    NyquistTransition, OpusContentType, PcmBitDepth, ResampleQuality, SoxSincPhase, SsrcPdfType,
+    SsrcProfile, WavPackMode,
 };
 use crate::error::{PlanningError, Result};
 use crate::settings::SsrcSettings;
@@ -148,20 +148,286 @@ pub const fn soxr_dither_method(dither: DitherType) -> Option<&'static str> {
     }
 }
 
-/// Map dither to SSRC dither/noise-shaping numeric ID.
+/// SSRC-native dither/noise-shaping selection derived from a user-facing dither choice.
+///
+/// SSRC splits word-length reduction across two orthogonal controls:
+/// `--dither N` chooses the shaper/preset ID and `--pdf N` chooses the
+/// dither probability distribution. This struct keeps that pair together so
+/// call sites cannot accidentally map a TPDF request to a shaper ID alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsrcDitherSelection {
+    /// Value passed to SSRC's `--dither` option.
+    pub dither_id: u8,
+    /// Value passed to SSRC's `--pdf` option, when the mapping needs to
+    /// override SSRC's documented rectangular default.
+    pub pdf_type: Option<SsrcPdfType>,
+}
+
+impl SsrcDitherSelection {
+    #[must_use]
+    pub const fn new(dither_id: u8, pdf_type: Option<SsrcPdfType>) -> Self {
+        Self {
+            dither_id,
+            pdf_type,
+        }
+    }
+}
+
+/// Explain when a user-facing dither choice cannot be represented natively by
+/// SSRC and is therefore mapped to the closest SSRC-native approximation.
+///
+/// This is a product-facing API, not just an implementation detail: callers can
+/// surface the returned note in UI, logs, or plan summaries instead of silently
+/// changing the requested shaper family.
 #[must_use]
-pub const fn ssrc_dither_id(dither: DitherType) -> u8 {
+pub const fn ssrc_dither_approximation_note(dither: DitherType) -> Option<&'static str> {
     match dither {
-        DitherType::None => 99,
-        DitherType::Tpdf | DitherType::SlopedTpdf => 98,
-        DitherType::LowShibata => 0,
-        DitherType::Shibata => 2,
-        DitherType::HighShibata => 6,
+        DitherType::None | DitherType::Tpdf => None,
+        DitherType::SlopedTpdf => Some(
+            "SSRC does not expose sloped TPDF; using unshaped triangular PDF instead",
+        ),
+        DitherType::LowShibata | DitherType::Shibata | DitherType::HighShibata => Some(
+            "SSRC does not expose SoX Shibata filters; using ATH Curve A shaped dither instead",
+        ),
         DitherType::Lipshitz
         | DitherType::FWeighted
         | DitherType::ModifiedEWeighted
         | DitherType::ImprovedEWeighted
-        | DitherType::Gesemann => 99,
+        | DitherType::Gesemann => Some(
+            "SSRC does not expose this named shaper; using ATH Curve A, Intensity 0 with triangular PDF",
+        ),
+    }
+}
+
+/// True when [`ssrc_dither_selection`] necessarily approximates the requested
+/// user-facing dither family.
+#[must_use]
+pub const fn ssrc_dither_selection_is_approximation(dither: DitherType) -> bool {
+    match ssrc_dither_approximation_note(dither) {
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Map a user-facing dither choice to SSRC-native `--dither`/`--pdf` values.
+///
+/// Some user-facing dither families have no SSRC-native equivalent. Those
+/// choices intentionally map to documented SSRC approximations; callers should
+/// check [`ssrc_dither_approximation_note`] and surface that fact to users
+/// instead of presenting the result as the requested shaper family.
+#[must_use]
+pub const fn ssrc_dither_selection(dither: DitherType) -> SsrcDitherSelection {
+    match dither {
+        DitherType::None => SsrcDitherSelection::new(99, None),
+        DitherType::Tpdf | DitherType::SlopedTpdf => {
+            SsrcDitherSelection::new(99, Some(SsrcPdfType::Triangular))
+        }
+        DitherType::LowShibata => SsrcDitherSelection::new(0, Some(SsrcPdfType::Triangular)),
+        DitherType::Shibata => SsrcDitherSelection::new(2, Some(SsrcPdfType::Triangular)),
+        DitherType::HighShibata => SsrcDitherSelection::new(6, Some(SsrcPdfType::Triangular)),
+        DitherType::Lipshitz
+        | DitherType::FWeighted
+        | DitherType::ModifiedEWeighted
+        | DitherType::ImprovedEWeighted
+        | DitherType::Gesemann => SsrcDitherSelection::new(0, Some(SsrcPdfType::Triangular)),
+    }
+}
+
+/// Map dither to the SSRC dither/noise-shaping numeric ID.
+///
+/// Kept for compatibility with older call sites. Prefer
+/// [`ssrc_dither_selection_for_rate`] for command construction so the
+/// associated PDF choice is not lost and the chosen ID is valid for the
+/// destination sample rate.
+#[must_use]
+pub const fn ssrc_dither_id(dither: DitherType) -> u8 {
+    ssrc_dither_selection(dither).dither_id
+}
+
+/// Return true when an SSRC `--dither` ID is available for the destination
+/// sample rate.
+///
+/// The shaped ATH and legacy IDs are rate-specific. IDs `98` (Simple
+/// triangular) and `99` (No shaper) are treated as sample-rate independent
+/// because they do not depend on an ATH coefficient table. For unlisted rates,
+/// fail closed by accepting only those two sample-rate-independent choices.
+#[must_use]
+pub const fn ssrc_dither_id_available_for_rate(dither_id: u8, target_rate_hz: u32) -> bool {
+    if matches!(dither_id, 98 | 99) {
+        return true;
+    }
+
+    match target_rate_hz {
+        44_100 => matches!(dither_id, 0..=6 | 10..=16 | 90..=92),
+        48_000 => matches!(dither_id, 0..=6 | 10..=16 | 90 | 91),
+        88_200 | 96_000 | 192_000 => matches!(dither_id, 0..=2),
+        8_000 | 11_025 | 22_050 => matches!(dither_id, 0 | 1 | 9),
+        _ => false,
+    }
+}
+
+/// Validate an explicit SSRC dither ID against the destination sample rate.
+pub fn validate_ssrc_dither_id_for_rate(dither_id: u8, target_rate_hz: u32) -> Result<()> {
+    if ssrc_dither_id_available_for_rate(dither_id, target_rate_hz) {
+        Ok(())
+    } else {
+        Err(PlanningError::invalid_settings(
+            "ssrc.dither_id",
+            format!(
+                "SSRC dither ID {dither_id} is not available for destination sample rate {target_rate_hz} Hz"
+            ),
+        ))
+    }
+}
+
+/// Map a user-facing dither choice to a destination-rate-valid SSRC-native
+/// `--dither`/`--pdf` pair.
+///
+/// Named Shibata-style choices are approximated by ATH Curve A intensities.
+/// When the destination rate exposes fewer intensities, the requested intensity
+/// is clamped to the strongest available ATH Curve A ID at that rate instead of
+/// producing an invalid SSRC command.
+pub fn ssrc_dither_selection_for_rate(
+    dither: DitherType,
+    target_rate_hz: u32,
+) -> Result<SsrcDitherSelection> {
+    let selection = match dither {
+        DitherType::LowShibata => SsrcDitherSelection::new(
+            ath_curve_a_id_for_rate(0, target_rate_hz)?,
+            Some(SsrcPdfType::Triangular),
+        ),
+        DitherType::Shibata => SsrcDitherSelection::new(
+            ath_curve_a_id_for_rate(2, target_rate_hz)?,
+            Some(SsrcPdfType::Triangular),
+        ),
+        DitherType::HighShibata => SsrcDitherSelection::new(
+            ath_curve_a_id_for_rate(6, target_rate_hz)?,
+            Some(SsrcPdfType::Triangular),
+        ),
+        DitherType::Lipshitz
+        | DitherType::FWeighted
+        | DitherType::ModifiedEWeighted
+        | DitherType::ImprovedEWeighted
+        | DitherType::Gesemann => SsrcDitherSelection::new(
+            ath_curve_a_id_for_rate(0, target_rate_hz)?,
+            Some(SsrcPdfType::Triangular),
+        ),
+        DitherType::None | DitherType::Tpdf | DitherType::SlopedTpdf => ssrc_dither_selection(dither),
+    };
+
+    validate_ssrc_dither_id_for_rate(selection.dither_id, target_rate_hz)?;
+    Ok(selection)
+}
+
+fn ath_curve_a_id_for_rate(requested_intensity: u8, target_rate_hz: u32) -> Result<u8> {
+    let max_intensity = match target_rate_hz {
+        44_100 | 48_000 => 6,
+        88_200 | 96_000 | 192_000 => 2,
+        8_000 | 11_025 | 22_050 => 1,
+        _ => {
+            return Err(PlanningError::invalid_settings(
+                "ssrc.dither_id",
+                format!(
+                    "SSRC ATH noise shaping is not available for destination sample rate {target_rate_hz} Hz"
+                ),
+            ));
+        }
+    };
+
+    Ok(requested_intensity.min(max_intensity))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssrc_tpdf_maps_to_no_shaper_with_triangular_pdf() {
+        assert_eq!(
+            ssrc_dither_selection(DitherType::Tpdf),
+            SsrcDitherSelection::new(99, Some(SsrcPdfType::Triangular))
+        );
+    }
+
+    #[test]
+    fn ssrc_shibata_family_maps_to_ath_curve_a_with_triangular_pdf() {
+        assert_eq!(
+            ssrc_dither_selection(DitherType::LowShibata),
+            SsrcDitherSelection::new(0, Some(SsrcPdfType::Triangular))
+        );
+        assert_eq!(
+            ssrc_dither_selection(DitherType::Shibata),
+            SsrcDitherSelection::new(2, Some(SsrcPdfType::Triangular))
+        );
+        assert_eq!(
+            ssrc_dither_selection(DitherType::HighShibata),
+            SsrcDitherSelection::new(6, Some(SsrcPdfType::Triangular))
+        );
+    }
+
+    #[test]
+    fn unsupported_named_shapers_fall_back_to_conservative_ath_shape() {
+        assert_eq!(
+            ssrc_dither_selection(DitherType::Lipshitz),
+            SsrcDitherSelection::new(0, Some(SsrcPdfType::Triangular))
+        );
+        assert_eq!(
+            ssrc_dither_selection(DitherType::Gesemann),
+            SsrcDitherSelection::new(0, Some(SsrcPdfType::Triangular))
+        );
+    }
+
+    #[test]
+    fn ssrc_approximation_notes_are_explicit_for_non_native_mappings() {
+        assert!(ssrc_dither_approximation_note(DitherType::None).is_none());
+        assert!(ssrc_dither_approximation_note(DitherType::Tpdf).is_none());
+
+        assert!(ssrc_dither_selection_is_approximation(DitherType::SlopedTpdf));
+        assert!(ssrc_dither_selection_is_approximation(DitherType::Shibata));
+        assert!(ssrc_dither_selection_is_approximation(DitherType::HighShibata));
+        assert!(ssrc_dither_selection_is_approximation(DitherType::Lipshitz));
+        assert!(ssrc_dither_selection_is_approximation(DitherType::FWeighted));
+        assert!(ssrc_dither_selection_is_approximation(DitherType::ModifiedEWeighted));
+        assert!(ssrc_dither_selection_is_approximation(DitherType::ImprovedEWeighted));
+        assert!(ssrc_dither_selection_is_approximation(DitherType::Gesemann));
+
+        let note = ssrc_dither_approximation_note(DitherType::Lipshitz).unwrap();
+        assert!(note.contains("does not expose"));
+        assert!(note.contains("ATH Curve A"));
+    }
+
+    #[test]
+    fn ssrc_dither_id_availability_is_rate_dependent() {
+        assert!(ssrc_dither_id_available_for_rate(16, 44_100));
+        assert!(ssrc_dither_id_available_for_rate(16, 48_000));
+        assert!(!ssrc_dither_id_available_for_rate(16, 96_000));
+        assert!(!ssrc_dither_id_available_for_rate(6, 22_050));
+        assert!(ssrc_dither_id_available_for_rate(9, 22_050));
+        assert!(!ssrc_dither_id_available_for_rate(9, 44_100));
+        assert!(ssrc_dither_id_available_for_rate(98, 176_400));
+        assert!(ssrc_dither_id_available_for_rate(99, 176_400));
+    }
+
+    #[test]
+    fn rate_aware_ssrc_shibata_mapping_clamps_to_available_ath_intensity() {
+        assert_eq!(
+            ssrc_dither_selection_for_rate(DitherType::HighShibata, 44_100).unwrap(),
+            SsrcDitherSelection::new(6, Some(SsrcPdfType::Triangular))
+        );
+        assert_eq!(
+            ssrc_dither_selection_for_rate(DitherType::HighShibata, 96_000).unwrap(),
+            SsrcDitherSelection::new(2, Some(SsrcPdfType::Triangular))
+        );
+        assert_eq!(
+            ssrc_dither_selection_for_rate(DitherType::Shibata, 22_050).unwrap(),
+            SsrcDitherSelection::new(1, Some(SsrcPdfType::Triangular))
+        );
+    }
+
+    #[test]
+    fn rate_aware_ssrc_shaped_mapping_rejects_unlisted_rates() {
+        assert!(ssrc_dither_selection_for_rate(DitherType::Shibata, 176_400).is_err());
+        assert!(ssrc_dither_selection_for_rate(DitherType::Tpdf, 176_400).is_ok());
     }
 }
 
