@@ -5722,8 +5722,8 @@ fn sanitize_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
         .map(|ch| match ch {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            ch if ch.is_control() => '_',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            ch if ch.is_control() => ' ',
             ch => ch,
         })
         .collect();
@@ -6975,7 +6975,7 @@ mod naming_template_tests {
                 &source,
                 &tonepoet_pipeline::AudioFormat::Flac
             ),
-            PathBuf::from("Miles Davis/CK_1234/A Tribute to Jack Johnson")
+            PathBuf::from("Miles Davis/CK 1234/A Tribute to Jack Johnson")
         );
     }
 
@@ -6991,7 +6991,7 @@ mod naming_template_tests {
         .unwrap();
         assert_eq!(
             path,
-            PathBuf::from("01 - Right Off - 1971 - Jazz - CK-1234 - 44.1kHz - 24 - CAT_999 - ")
+            PathBuf::from("01 - Right Off - 1971 - Jazz - CK-1234 - 44.1kHz - 24 - CAT 999 - ")
         );
     }
 
@@ -7011,7 +7011,7 @@ mod naming_template_tests {
         source.album_metadata.album_artist = Some("Miles/Davis".to_string());
         assert_eq!(
             render_folder_template("%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
-            PathBuf::from("Miles_Davis/A Tribute to Jack Johnson")
+            PathBuf::from("Miles Davis/A Tribute to Jack Johnson")
         );
     }
 

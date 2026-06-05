@@ -1,13 +1,17 @@
 //! PR 8 - CUE image materializer.
 //!
-//! Parses CUE image layouts into `ImageSegment` track refs. Cutting
-//! is left to `realize_track`. Sidecar CUE sheets may reference one image
-//! or multiple image files; embedded CUE sheets are constrained to their
-//! owning image.
+//! Parses CUE image layouts and stages each CUE track as a bounded 32-bit
+//! signed PCM WAV file. Downstream planning receives ordinary `StagedFile`
+//! inputs, so SoX, SSRC, SOXR/FFmpeg, and plain FFmpeg all use the same
+//! existing file-input contract instead of depending on a separate
+//! `ImageSegment` realization path.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const STALE_CUE_SEGMENT_TMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +21,7 @@ use super::reporter::PipelineReporter;
 use super::stages::Materializer;
 use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
-use crate::tui::cue_parser::{parse_cue, parse_cue_file, CueSheet};
+use crate::tui::cue_parser::{decode_cue_bytes_for_path, parse_cue, CueSheet};
 
 const AUDIO_EXTENSIONS: &[&str] = &[
     "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4", "aac", "opus", "ogg",
@@ -33,12 +37,14 @@ struct CueInput {
     fallback_image: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AudioProbe {
     sample_rate: u32,
     total_samples: u64,
     exact_samples: bool,
     bit_depth: Option<u32>,
+    codec_name: Option<String>,
+    format_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,12 +100,17 @@ impl Materializer for CueImageMaterializer {
         let album_image_metadata = merge_image_album_metadata(&track_images, &image_metadata);
         let total_tracks = cue_input.sheet.tracks.len() as u32;
 
-        let mut tracks = Vec::with_capacity(cue_input.sheet.tracks.len());
-        for (idx, cue_track) in cue_input.sheet.tracks.iter().enumerate() {
+        let selected_track_indices = selected_track_indices(
+            cue_input.sheet.tracks.len(),
+            &req.source.track_selection,
+        )?;
+        let mut tracks = Vec::with_capacity(selected_track_indices.len());
+        for idx in selected_track_indices {
             if cancel.is_cancelled() {
                 return Err(MaterializeError::Cancelled);
             }
 
+            let cue_track = &cue_input.sheet.tracks[idx];
             let ordinal = (idx + 1) as u32;
             let image_path = &track_images[idx];
             let image_key = path_identity(image_path);
@@ -116,6 +127,25 @@ impl Materializer for CueImageMaterializer {
                 ))
             })?;
             let (start_sample, samples) = boundaries[idx];
+            let staged_path = staged_cue_segment_path(
+                staging,
+                ordinal,
+                cue_track.number,
+                track_number_plan[idx].output_number,
+                start_sample,
+                samples,
+            );
+            stage_cue_segment_as_s32_wav(
+                image_path,
+                start_sample,
+                samples,
+                probe.sample_rate,
+                &staged_path,
+                runner,
+                cancel,
+            )
+            .await?;
+
             let mut metadata = cue_track_metadata(
                 cue_track,
                 &cue_input.sheet,
@@ -131,11 +161,7 @@ impl Materializer for CueImageMaterializer {
                     disc_number: None,
                     track_number: track_number_plan[idx].output_number,
                 },
-                source_ref: TrackSourceRef::ImageSegment {
-                    image: image_path.clone(),
-                    start_sample,
-                    samples,
-                },
+                source_ref: TrackSourceRef::StagedFile(staged_path),
                 metadata,
                 expected_samples: Some(samples),
                 sample_rate: probe.sample_rate,
@@ -143,7 +169,6 @@ impl Materializer for CueImageMaterializer {
             });
         }
 
-        let tracks = apply_track_selection(tracks, &req.source.track_selection)?;
         let mut album_metadata = cue_album_metadata(&cue_input.sheet, &album_image_metadata, total_tracks);
         cue_annotations.add_album_extras(&mut album_metadata.extra);
 
@@ -171,16 +196,14 @@ fn resolve_cue_input(req: &PipelineRequest) -> Result<CueInput, MaterializeError
         )),
         CueSidecarPolicy::SidecarOnly => resolve_sidecar_cue(req),
         CueSidecarPolicy::PreferEmbedded => {
-            match resolve_embedded_cue(req) {
-                Ok(cue) => Ok(cue),
-                Err(_) => {
-                    match find_valid_sidecar_cue_for_image(&req.container)? {
-                        Some(cue_path) => read_sidecar_cue(req, cue_path),
-                        None => Err(MaterializeError::Parse(
-                            "no embedded CUESHEET and no sidecar CUE found".to_string(),
-                        )),
-                    }
-                }
+            if let Some(cue) = try_resolve_embedded_cue(req)? {
+                return Ok(cue);
+            }
+            match find_valid_sidecar_cue_for_image(&req.container)? {
+                Some(cue_path) => read_sidecar_cue(req, cue_path),
+                None => Err(MaterializeError::Parse(
+                    "no embedded CUESHEET and no sidecar CUE found".to_string(),
+                )),
             }
         }
         CueSidecarPolicy::PreferSidecar => {
@@ -206,8 +229,8 @@ fn read_sidecar_cue(
     req: &PipelineRequest,
     cue_path: PathBuf,
 ) -> Result<CueInput, MaterializeError> {
-    let raw_cue = read_text_lossy(&cue_path)?;
-    let sheet = parse_cue_file(&cue_path).map_err(MaterializeError::Parse)?;
+    let raw_cue = read_cue_text(&cue_path)?;
+    let sheet = parse_cue(&raw_cue);
     validate_sidecar_layout(&sheet)?;
 
     let cue_parent = cue_path.parent().map(Path::to_path_buf);
@@ -238,21 +261,27 @@ fn read_sidecar_cue(
 }
 
 fn resolve_embedded_cue(req: &PipelineRequest) -> Result<CueInput, MaterializeError> {
-    let raw_cue = read_embedded_cuesheet(&req.container)?.ok_or_else(|| {
+    try_resolve_embedded_cue(req)?.ok_or_else(|| {
         MaterializeError::Parse(
             "EmbeddedOnly requested but no embedded CUESHEET tag was found".to_string(),
         )
-    })?;
+    })
+}
+
+fn try_resolve_embedded_cue(req: &PipelineRequest) -> Result<Option<CueInput>, MaterializeError> {
+    let Some(raw_cue) = read_embedded_cuesheet(&req.container)? else {
+        return Ok(None);
+    };
     let sheet = parse_cue(&raw_cue);
     validate_embedded_single_image_layout(&sheet)?;
 
-    Ok(CueInput {
+    Ok(Some(CueInput {
         sheet,
         raw_cue,
         origin: CueOrigin::Embedded,
         cue_parent: None,
         fallback_image: Some(req.container.clone()),
-    })
+    }))
 }
 
 pub(crate) fn is_cue_image_candidate(req: &PipelineRequest) -> Result<bool, SourceDetectError> {
@@ -278,17 +307,17 @@ pub(crate) fn is_cue_image_candidate(req: &PipelineRequest) -> Result<bool, Sour
                 return Ok(true);
             }
             if req.source.cue_sidecar == CueSidecarPolicy::PreferSidecar {
-                return Ok(embedded_cuesheet_is_single_image(&req.container));
+                return Ok(embedded_cuesheet_is_present(&req.container));
             }
             Ok(false)
         }
         CueSidecarPolicy::PreferEmbedded => {
-            if embedded_cuesheet_is_single_image(&req.container) {
+            if embedded_cuesheet_is_present(&req.container) {
                 return Ok(true);
             }
             Ok(sidecar_cue_route_candidate(&req.container)?.is_some())
         }
-        CueSidecarPolicy::EmbeddedOnly => Ok(embedded_cuesheet_is_single_image(&req.container)),
+        CueSidecarPolicy::EmbeddedOnly => Ok(embedded_cuesheet_is_present(&req.container)),
         CueSidecarPolicy::IgnoreCue => Ok(false),
     }
 }
@@ -302,7 +331,11 @@ fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDe
     let same_stem = same_stem_sidecars(image, &candidates);
     match same_stem.len() {
         0 => {}
-        1 => return Ok(Some(same_stem[0].clone())),
+        1 => {
+            if sidecar_cue_is_usable_for_image(&same_stem[0], image)? {
+                return Ok(Some(same_stem[0].clone()));
+            }
+        }
         _ => {
             return Err(SourceDetectError::AmbiguousCue(format!(
                 "multiple same-stem CUE files found beside {}",
@@ -313,26 +346,8 @@ fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDe
 
     let mut matching = Vec::new();
     for cue_path in candidates {
-        let raw = std::fs::read(&cue_path)?;
-        let content = String::from_utf8_lossy(&raw).into_owned();
-        let sheet = parse_cue(&content);
-        if validate_sidecar_layout_detect(&sheet).is_err() {
-            continue;
-        }
-        let cue_input = CueInput {
-            sheet,
-            raw_cue: content,
-            origin: CueOrigin::Sidecar,
-            cue_parent: cue_path.parent().map(Path::to_path_buf),
-            fallback_image: Some(image.to_path_buf()),
-        };
-        if let Ok(track_images) = resolve_track_image_paths(&cue_input) {
-            if track_images
-                .iter()
-                .any(|resolved| same_existing_path(resolved, image))
-            {
-                matching.push(cue_path);
-            }
+        if sidecar_cue_is_usable_for_image(&cue_path, image)? {
+            matching.push(cue_path);
         }
     }
 
@@ -346,12 +361,39 @@ fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDe
     }
 }
 
-fn embedded_cuesheet_is_single_image(path: &Path) -> bool {
-    let Ok(Some(raw)) = read_embedded_cuesheet(path) else {
-        return false;
+fn sidecar_cue_is_usable_for_image(
+    cue_path: &Path,
+    image: &Path,
+) -> Result<bool, SourceDetectError> {
+    let raw = std::fs::read(cue_path)?;
+    let content = match decode_cue_bytes_for_path(&raw, cue_path) {
+        Ok(content) => content,
+        Err(_) => return Ok(false),
     };
-    let sheet = parse_cue(&raw);
-    validate_embedded_single_image_layout_detect(&sheet).is_ok()
+    let sheet = parse_cue(&content);
+    if validate_sidecar_layout_detect(&sheet).is_err() {
+        return Ok(false);
+    }
+
+    let cue_input = CueInput {
+        sheet,
+        raw_cue: content,
+        origin: CueOrigin::Sidecar,
+        cue_parent: cue_path.parent().map(Path::to_path_buf),
+        fallback_image: Some(image.to_path_buf()),
+    };
+
+    let Ok(track_images) = resolve_track_image_paths(&cue_input) else {
+        return Ok(false);
+    };
+
+    Ok(track_images
+        .iter()
+        .any(|resolved| same_existing_path(resolved, image)))
+}
+
+fn embedded_cuesheet_is_present(path: &Path) -> bool {
+    matches!(read_embedded_cuesheet(path), Ok(Some(_)))
 }
 
 fn find_valid_sidecar_cue_for_image(image: &Path) -> Result<Option<PathBuf>, MaterializeError> {
@@ -414,7 +456,7 @@ fn validate_sidecar_cue_matches_image(
 }
 
 fn sidecar_cue_matches_image(cue_path: &Path, image: &Path) -> Result<bool, MaterializeError> {
-    let raw_cue = read_text_lossy(cue_path)?;
+    let raw_cue = read_cue_text(cue_path)?;
     let sheet = parse_cue(&raw_cue);
     validate_sidecar_layout(&sheet)?;
     let cue_input = CueInput {
@@ -457,7 +499,7 @@ fn sidecar_cue_candidates(path: &Path) -> Result<Vec<PathBuf>, SourceDetectError
             cues.push(candidate);
         }
     }
-    cues.sort();
+    cues.sort_by_key(|path| deterministic_path_sort_key(path));
     Ok(cues)
 }
 
@@ -478,9 +520,15 @@ fn same_stem_sidecars(image: &Path, candidates: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn read_text_lossy(path: &Path) -> Result<String, MaterializeError> {
+fn read_cue_text(path: &Path) -> Result<String, MaterializeError> {
     let raw = std::fs::read(path)?;
-    Ok(String::from_utf8_lossy(&raw).into_owned())
+    decode_cue_bytes_for_path(&raw, path).map_err(|message| {
+        MaterializeError::Parse(format!(
+            "failed to decode CUE file {}: {}",
+            path.display(),
+            message
+        ))
+    })
 }
 
 fn read_embedded_cuesheet(path: &Path) -> Result<Option<String>, MaterializeError> {
@@ -659,6 +707,10 @@ fn resolve_audio_reference(
         return Ok(direct);
     }
 
+    // When materializing an audio image that already has an associated sidecar
+    // CUE, the image itself is an explicit policy choice. It is therefore safe
+    // to prefer it for extension-mismatch CUE references. A bare .cue input has
+    // no fallback and must resolve stem-only matches uniquely below.
     if let Some(fallback) = fallback_image {
         let ref_name = raw_path.file_name().and_then(|value| value.to_str());
         let ref_stem = raw_path.file_stem().and_then(|value| value.to_str());
@@ -675,35 +727,31 @@ fn resolve_audio_reference(
         }
     }
 
-    let wanted_name = raw_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
-    let wanted_stem = raw_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
+    let wanted_name = raw_path.file_name().and_then(|value| value.to_str());
+    let wanted_stem = raw_path.file_stem().and_then(|value| value.to_str());
+    let fallback_search_dir = audio_reference_fallback_search_dir(base, &raw_path);
 
-    for entry in std::fs::read_dir(base)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || !has_audio_extension(&path) {
-            continue;
-        }
-
-        let file_name_match = wanted_name.as_ref().is_some_and(|wanted| {
+    if let Some(wanted) = wanted_name {
+        let name_matches = collect_audio_reference_candidates(&fallback_search_dir, |path| {
             path.file_name()
                 .and_then(|value| value.to_str())
                 .map(|value| value.eq_ignore_ascii_case(wanted))
                 .unwrap_or(false)
-        });
-        let stem_match = wanted_stem.as_ref().is_some_and(|wanted| {
+        })?;
+        match unique_audio_reference_candidate(file_ref, name_matches)? {
+            Some(path) => return Ok(path),
+            None => {}
+        }
+    }
+
+    if let Some(wanted) = wanted_stem {
+        let stem_matches = collect_audio_reference_candidates(&fallback_search_dir, |path| {
             path.file_stem()
                 .and_then(|value| value.to_str())
                 .map(|value| value.eq_ignore_ascii_case(wanted))
                 .unwrap_or(false)
-        });
-        if file_name_match || stem_match {
+        })?;
+        if let Some(path) = unique_audio_reference_candidate(file_ref, stem_matches)? {
             return Ok(path);
         }
     }
@@ -711,6 +759,66 @@ fn resolve_audio_reference(
     Err(MaterializeError::Parse(format!(
         "CUE image file was not found: {file_ref}"
     )))
+}
+
+
+fn audio_reference_fallback_search_dir(base: &Path, raw_path: &Path) -> PathBuf {
+    raw_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| base.join(parent))
+        .unwrap_or_else(|| base.to_path_buf())
+}
+
+fn collect_audio_reference_candidates(
+    base: &Path,
+    matches_reference: impl Fn(&Path) -> bool,
+) -> Result<Vec<PathBuf>, MaterializeError> {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && has_audio_extension(&path) && matches_reference(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates.sort_by_key(|path| deterministic_path_sort_key(path));
+    candidates.dedup_by(|left, right| same_existing_path(left, right));
+    Ok(candidates)
+}
+
+fn unique_audio_reference_candidate(
+    file_ref: &str,
+    candidates: Vec<PathBuf>,
+) -> Result<Option<PathBuf>, MaterializeError> {
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.into_iter().next()),
+        _ => Err(MaterializeError::Parse(format!(
+            "ambiguous CUE image file reference {file_ref:?}; candidates: {}",
+            format_candidate_paths_for_error(&candidates)
+        ))),
+    }
+}
+
+fn deterministic_path_sort_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn format_candidate_paths_for_error(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn probe_audio_image(
@@ -727,10 +835,10 @@ async fn probe_audio_image(
             "a:0".into(),
             "-count_frames".into(),
             "-show_entries".into(),
-            "stream=sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
+            "stream=codec_name,sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
                 .into(),
             "-show_entries".into(),
-            "format=duration".into(),
+            "format=format_name,duration".into(),
             "-of".into(),
             "json".into(),
             path.display().to_string(),
@@ -771,6 +879,14 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
         .get("bits_per_raw_sample")
         .or_else(|| stream.get("bits_per_sample"))
         .and_then(json_u32_from_value);
+    let codec_name = stream
+        .get("codec_name")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let format_name = value
+        .pointer("/format/format_name")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
 
     if let Some(duration_ts_samples) = samples_from_duration_ts(stream, sample_rate) {
         if duration_ts_samples > 0 {
@@ -779,6 +895,8 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
                 total_samples: duration_ts_samples,
                 exact_samples: true,
                 bit_depth,
+                codec_name,
+                format_name,
             });
         }
     }
@@ -807,6 +925,8 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
         total_samples,
         exact_samples: false,
         bit_depth,
+        codec_name,
+        format_name,
     })
 }
 
@@ -961,6 +1081,523 @@ fn compute_track_boundaries(
 
 fn cue_frames_to_samples(frames: u64, sample_rate: u32) -> u64 {
     ((frames as u128 * sample_rate as u128) / 75_u128) as u64
+}
+
+fn staged_cue_segment_path(
+    staging: &StagingDir,
+    source_ordinal: u32,
+    cue_track_number: u32,
+    output_track_number: u32,
+    start_sample: u64,
+    samples: u64,
+) -> PathBuf {
+    staging.root.join("cue-segments").join(format!(
+        "{source_ordinal:03}-cue{cue_track_number:02}-track{output_track_number:02}-s{start_sample}-n{samples}.wav"
+    ))
+}
+
+async fn stage_cue_segment_as_s32_wav(
+    image: &Path,
+    start_sample: u64,
+    samples: u64,
+    sample_rate: u32,
+    destination: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    if destination.exists() {
+        match validate_staged_cue_segment(destination, sample_rate, samples, runner, cancel).await {
+            Ok(()) => return Ok(()),
+            Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
+            Err(_) => {
+                // Do not remove the published path yet. A stale or partial file from a
+                // previous interrupted run is not trusted, but keeping it in place until a
+                // fully validated replacement is ready avoids a publish gap for any
+                // accidental concurrent observer of the private staging directory.
+            }
+        }
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp_destination = temporary_segment_path(destination)?;
+    if let Some(parent) = tmp_destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    cleanup_old_temporary_segments(destination);
+    remove_path_if_exists(&tmp_destination)?;
+
+    let cmd = cue_segment_ffmpeg_command(image, start_sample, samples, &tmp_destination)?;
+
+    let run_result = runner.run(cmd, cancel).await;
+    match run_result {
+        Ok(_) => {
+            if let Err(err) = validate_staged_cue_segment(
+                &tmp_destination,
+                sample_rate,
+                samples,
+                runner,
+                cancel,
+            )
+            .await
+            {
+                let _ = remove_path_if_exists(&tmp_destination);
+                return Err(err);
+            }
+
+            sync_file_to_storage(&tmp_destination)?;
+
+            if destination.exists() {
+                match validate_staged_cue_segment(destination, sample_rate, samples, runner, cancel)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = remove_path_if_exists(&tmp_destination);
+                        return Ok(());
+                    }
+                    Err(MaterializeError::Cancelled) => {
+                        let _ = remove_path_if_exists(&tmp_destination);
+                        return Err(MaterializeError::Cancelled);
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if let Err(err) = publish_validated_staged_segment(
+                &tmp_destination,
+                destination,
+                sample_rate,
+                samples,
+                runner,
+                cancel,
+            )
+            .await
+            {
+                let _ = remove_path_if_exists(&tmp_destination);
+                return Err(err);
+            }
+            Ok(())
+        }
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            let _ = remove_path_if_exists(&tmp_destination);
+            Err(MaterializeError::Cancelled)
+        }
+        Err(err) => {
+            let _ = remove_path_if_exists(&tmp_destination);
+            Err(err.into())
+        }
+    }
+}
+
+async fn validate_staged_cue_segment(
+    path: &Path,
+    expected_sample_rate: u32,
+    expected_samples: u64,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    let metadata = path.metadata().map_err(|err| {
+        MaterializeError::Parse(format!(
+            "staged CUE segment {} is not readable: {err}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(MaterializeError::Parse(format!(
+            "staged CUE segment {} is missing or empty",
+            path.display()
+        )));
+    }
+
+    let probe = probe_staged_cue_segment(path, runner, cancel).await?;
+    if probe.sample_rate != expected_sample_rate {
+        return Err(MaterializeError::Parse(format!(
+            "staged CUE segment {} has sample_rate {}, expected {}",
+            path.display(),
+            probe.sample_rate,
+            expected_sample_rate
+        )));
+    }
+    if !probe.exact_samples {
+        return Err(MaterializeError::Parse(format!(
+            "staged CUE segment {} did not report an exact sample count",
+            path.display()
+        )));
+    }
+    if probe.total_samples != expected_samples {
+        return Err(MaterializeError::Parse(format!(
+            "staged CUE segment {} has {} samples, expected {}",
+            path.display(),
+            probe.total_samples,
+            expected_samples
+        )));
+    }
+    if probe.codec_name.as_deref() != Some("pcm_s32le") {
+        return Err(MaterializeError::Parse(format!(
+            "staged CUE segment {} has codec {:?}, expected pcm_s32le",
+            path.display(),
+            probe.codec_name
+        )));
+    }
+    if !probe
+        .format_name
+        .as_deref()
+        .map(format_name_contains_wav)
+        .unwrap_or(false)
+    {
+        return Err(MaterializeError::Parse(format!(
+            "staged CUE segment {} has container {:?}, expected wav",
+            path.display(),
+            probe.format_name
+        )));
+    }
+
+    Ok(())
+}
+
+async fn probe_staged_cue_segment(
+    path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<AudioProbe, MaterializeError> {
+    let cmd = ToolCommand {
+        binary: ToolBinary::Ffprobe,
+        args: vec![
+            "-v".into(),
+            "error".into(),
+            "-select_streams".into(),
+            "a:0".into(),
+            "-show_entries".into(),
+            "stream=codec_name,sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
+                .into(),
+            "-show_entries".into(),
+            "format=format_name,duration".into(),
+            "-of".into(),
+            "json".into(),
+            path.display().to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(30),
+    };
+
+    let output = match runner.run(cmd, cancel).await {
+        Ok(output) => output,
+        Err(ToolRunnerError::Cancelled { .. }) => return Err(MaterializeError::Cancelled),
+        Err(err) => return Err(err.into()),
+    };
+
+    parse_audio_probe_json(&output.stdout_tail)
+}
+
+fn format_name_contains_wav(format_name: &str) -> bool {
+    format_name
+        .split(',')
+        .any(|name| name.trim().eq_ignore_ascii_case("wav"))
+}
+
+fn temporary_segment_path(destination: &Path) -> Result<PathBuf, MaterializeError> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let random = random_temp_suffix()?;
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cue-segment.wav");
+    let tmp_dir = destination
+        .parent()
+        .map(|parent| parent.join(".tmp"))
+        .unwrap_or_else(|| PathBuf::from(".tmp"));
+    Ok(tmp_dir.join(format!("{file_name}.tmp.{pid}.{stamp}.{random}")))
+}
+
+fn random_temp_suffix() -> Result<String, MaterializeError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|err| {
+        MaterializeError::Parse(format!(
+            "failed to generate random temporary CUE segment suffix: {err}"
+        ))
+    })?;
+    Ok(hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn cleanup_old_temporary_segments(destination: &Path) {
+    let tmp_dir = destination
+        .parent()
+        .map(|parent| parent.join(".tmp"))
+        .unwrap_or_else(|| PathBuf::from(".tmp"));
+    cleanup_old_temporary_segments_in_dir(&tmp_dir, SystemTime::now(), STALE_CUE_SEGMENT_TMP_MAX_AGE);
+}
+
+fn cleanup_old_temporary_segments_in_dir(tmp_dir: &Path, now: SystemTime, max_age: Duration) {
+    let entries = match fs::read_dir(tmp_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|value| value.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(_) => continue,
+        };
+        if should_remove_old_temporary_segment(name, modified, now, max_age) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn should_remove_old_temporary_segment(
+    file_name: &str,
+    modified: SystemTime,
+    now: SystemTime,
+    max_age: Duration,
+) -> bool {
+    if !is_staged_segment_temporary_file_name(file_name) {
+        return false;
+    }
+    now.duration_since(modified)
+        .map(|age| age > max_age)
+        .unwrap_or(false)
+}
+
+fn is_staged_segment_temporary_file_name(file_name: &str) -> bool {
+    let Some((base_name, suffix)) = file_name.rsplit_once(".tmp.") else {
+        return false;
+    };
+    if base_name.is_empty() || !base_name.to_ascii_lowercase().ends_with(".wav") {
+        return false;
+    }
+
+    let mut parts = suffix.split('.');
+    let pid = parts.next();
+    let timestamp = parts.next();
+    let random = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+
+    let Some(pid) = pid else {
+        return false;
+    };
+    let Some(timestamp) = timestamp else {
+        return false;
+    };
+    let Some(random) = random else {
+        return false;
+    };
+
+    !pid.is_empty()
+        && pid.chars().all(|ch| ch.is_ascii_digit())
+        && !timestamp.is_empty()
+        && timestamp.chars().all(|ch| ch.is_ascii_digit())
+        && random.len() == 32
+        && random.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+async fn publish_validated_staged_segment(
+    tmp_destination: &Path,
+    destination: &Path,
+    expected_sample_rate: u32,
+    expected_samples: u64,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    match fs::rename(tmp_destination, destination) {
+        Ok(()) => {
+            sync_parent_dir_best_effort(destination);
+            validate_staged_cue_segment(
+                destination,
+                expected_sample_rate,
+                expected_samples,
+                runner,
+                cancel,
+            )
+            .await?;
+            Ok(())
+        }
+        Err(first_err) if destination.exists() => {
+            // POSIX rename replaces an existing path atomically. Some platforms, notably
+            // Windows through std::fs::rename, do not replace an existing destination. The
+            // std-only fallback has an unavoidable remove+rename window, so before deleting
+            // anything, re-check whether a concurrent worker has already published a valid
+            // segment. If so, discard our temp and reuse the published file.
+            match validate_staged_cue_segment(
+                destination,
+                expected_sample_rate,
+                expected_samples,
+                runner,
+                cancel,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let _ = remove_path_if_exists(tmp_destination);
+                    return Ok(());
+                }
+                Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
+                Err(_) => {}
+            }
+
+            // The destination is still missing or invalid after the last-moment validation.
+            // Remove only after our replacement has already been validated and fsynced.
+            remove_path_if_exists(destination)?;
+            match fs::rename(tmp_destination, destination) {
+                Ok(()) => {}
+                Err(second_err) if destination.exists() => {
+                    // Another concurrent worker may have published in the tiny interval
+                    // after our delete/rename attempt. Prefer a valid destination over
+                    // failing or overwriting it.
+                    match validate_staged_cue_segment(
+                        destination,
+                        expected_sample_rate,
+                        expected_samples,
+                        runner,
+                        cancel,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            let _ = remove_path_if_exists(tmp_destination);
+                            return Ok(());
+                        }
+                        Err(MaterializeError::Cancelled) => {
+                            return Err(MaterializeError::Cancelled);
+                        }
+                        Err(_) => {
+                            return Err(MaterializeError::Parse(format!(
+                                "failed to publish validated staged CUE segment {} over {}: first rename failed: {}; second rename failed: {}",
+                                tmp_destination.display(),
+                                destination.display(),
+                                first_err,
+                                second_err
+                            )));
+                        }
+                    }
+                }
+                Err(second_err) => {
+                    return Err(MaterializeError::Parse(format!(
+                        "failed to publish validated staged CUE segment {} over {}: first rename failed: {}; second rename failed: {}",
+                        tmp_destination.display(),
+                        destination.display(),
+                        first_err,
+                        second_err
+                    )));
+                }
+            }
+            sync_parent_dir_best_effort(destination);
+            validate_staged_cue_segment(
+                destination,
+                expected_sample_rate,
+                expected_samples,
+                runner,
+                cancel,
+            )
+            .await?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), MaterializeError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+
+fn sync_file_to_storage(path: &Path) -> Result<(), MaterializeError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn sync_parent_dir_best_effort(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+fn cue_segment_ffmpeg_command(
+    image: &Path,
+    start_sample: u64,
+    samples: u64,
+    destination: &Path,
+) -> Result<ToolCommand, MaterializeError> {
+    let filter = cue_segment_atrim_filter(start_sample, samples)?;
+    Ok(ToolCommand {
+        binary: ToolBinary::Ffmpeg,
+        args: vec![
+            "-v".into(),
+            "error".into(),
+            "-hide_banner".into(),
+            "-nostdin".into(),
+            "-y".into(),
+            "-i".into(),
+            image.display().to_string(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-vn".into(),
+            "-sn".into(),
+            "-dn".into(),
+            "-af".into(),
+            filter,
+            "-f".into(),
+            "wav".into(),
+            "-c:a".into(),
+            "pcm_s32le".into(),
+            destination.display().to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(15 * 60),
+    })
+}
+
+fn cue_segment_atrim_filter(start_sample: u64, samples: u64) -> Result<String, MaterializeError> {
+    let end_sample = start_sample.checked_add(samples).ok_or_else(|| {
+        MaterializeError::Parse("CUE segment sample range overflowed u64".to_string())
+    })?;
+    if samples == 0 {
+        return Err(MaterializeError::Parse(
+            "CUE segment has zero audio samples".to_string(),
+        ));
+    }
+    Ok(format!(
+        "atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=N/SR/TB"
+    ))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1262,29 +1899,29 @@ fn cue_album_metadata(
     }
 }
 
-fn apply_track_selection(
-    tracks: Vec<PreparedTrack>,
+fn selected_track_indices(
+    track_count: usize,
     selection: &TrackSelection,
-) -> Result<Vec<PreparedTrack>, MaterializeError> {
+) -> Result<Vec<usize>, MaterializeError> {
     match selection {
-        TrackSelection::All => Ok(tracks),
+        TrackSelection::All => Ok((0..track_count).collect()),
         TrackSelection::Range { start, end } => {
             if *start == 0 || *end == 0 || start > end {
                 return Err(MaterializeError::InvalidTrackSelection(format!(
                     "invalid range {start}-{end}"
                 )));
             }
-            let max_ordinal = tracks.len() as u32;
+
+            let max_ordinal = track_count as u32;
             if *start > max_ordinal {
                 return Err(MaterializeError::InvalidTrackSelection(format!(
                     "range start {start} exceeds track count {max_ordinal}"
                 )));
             }
-            Ok(tracks
-                .into_iter()
-                .filter(|track| {
-                    track.id.source_ordinal >= *start && track.id.source_ordinal <= *end
-                })
+
+            let end = (*end).min(max_ordinal);
+            Ok((*start..=end)
+                .map(|ordinal| (ordinal - 1) as usize)
                 .collect())
         }
         TrackSelection::Set(indices) => {
@@ -1293,7 +1930,8 @@ fn apply_track_selection(
                     "empty track set".to_string(),
                 ));
             }
-            let max_ordinal = tracks.len() as u32;
+
+            let max_ordinal = track_count as u32;
             for &idx in indices {
                 if idx == 0 || idx > max_ordinal {
                     return Err(MaterializeError::InvalidTrackSelection(format!(
@@ -1301,12 +1939,23 @@ fn apply_track_selection(
                     )));
                 }
             }
-            Ok(tracks
-                .into_iter()
-                .filter(|track| indices.contains(&track.id.source_ordinal))
-                .collect())
+
+            Ok(indices.iter().map(|idx| (*idx - 1) as usize).collect())
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CueAnnotationScope {
+    Album,
+    AudioTrack(u32),
+    IgnoredTrack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CueAnnotationTrackHeader {
+    Audio(u32),
+    NonAudioOrMalformed,
 }
 
 #[derive(Debug, Default)]
@@ -1319,7 +1968,7 @@ struct CueAnnotations {
 impl CueAnnotations {
     fn parse(raw: &str) -> Self {
         let mut annotations = Self::default();
-        let mut current_track: Option<u32> = None;
+        let mut scope = CueAnnotationScope::Album;
 
         for (idx, line) in raw.lines().enumerate() {
             let line = if idx == 0 {
@@ -1328,16 +1977,21 @@ impl CueAnnotations {
                 line
             };
             let trimmed = line.trim();
-            if let Some(track_no) = parse_track_number(trimmed) {
-                current_track = Some(track_no);
+            if let Some(header) = parse_annotation_track_header(trimmed) {
+                scope = match header {
+                    CueAnnotationTrackHeader::Audio(track_no) => {
+                        CueAnnotationScope::AudioTrack(track_no)
+                    }
+                    CueAnnotationTrackHeader::NonAudioOrMalformed => CueAnnotationScope::IgnoredTrack,
+                };
                 continue;
             }
-            if trimmed.starts_with("FLAGS")
+            if keyword_rest_ci(trimmed, "FLAGS").is_some()
                 && trimmed
                     .split_whitespace()
                     .any(|token| token.eq_ignore_ascii_case("PRE"))
             {
-                if let Some(track_no) = current_track {
+                if let CueAnnotationScope::AudioTrack(track_no) = scope {
                     annotations.pre_emphasis.push(track_no);
                 }
                 continue;
@@ -1347,14 +2001,18 @@ impl CueAnnotations {
                 if matches!(key.as_str(), "rem_date" | "rem_year" | "rem_genre") {
                     continue;
                 }
-                if let Some(track_no) = current_track {
-                    annotations
-                        .track_extra
-                        .entry(track_no)
-                        .or_default()
-                        .insert(key, value);
-                } else {
-                    annotations.album_extra.insert(key, value);
+                match scope {
+                    CueAnnotationScope::Album => {
+                        annotations.album_extra.insert(key, value);
+                    }
+                    CueAnnotationScope::AudioTrack(track_no) => {
+                        annotations
+                            .track_extra
+                            .entry(track_no)
+                            .or_default()
+                            .insert(key, value);
+                    }
+                    CueAnnotationScope::IgnoredTrack => {}
                 }
             }
         }
@@ -1377,20 +2035,50 @@ impl CueAnnotations {
     }
 }
 
-fn parse_track_number(line: &str) -> Option<u32> {
-    let rest = line.strip_prefix("TRACK")?.trim_start();
-    let end = rest.find(|ch: char| !ch.is_ascii_digit())?;
-    rest[..end].parse().ok()
+fn parse_annotation_track_header(line: &str) -> Option<CueAnnotationTrackHeader> {
+    let rest = keyword_rest_ci(line, "TRACK")?.trim_start();
+    let mut parts = rest.split_whitespace();
+    let number = match parts.next() {
+        Some(value) => value,
+        None => return Some(CueAnnotationTrackHeader::NonAudioOrMalformed),
+    };
+    let mode = match parts.next() {
+        Some(value) => value,
+        None => return Some(CueAnnotationTrackHeader::NonAudioOrMalformed),
+    };
+    if !mode.eq_ignore_ascii_case("AUDIO") {
+        return Some(CueAnnotationTrackHeader::NonAudioOrMalformed);
+    }
+    Some(match number.parse() {
+        Ok(track_no) => CueAnnotationTrackHeader::Audio(track_no),
+        Err(_) => CueAnnotationTrackHeader::NonAudioOrMalformed,
+    })
 }
 
 fn parse_rem_line(line: &str) -> Option<(String, String)> {
-    let rest = line.strip_prefix("REM")?.trim_start();
+    let rest = keyword_rest_ci(line, "REM")?.trim_start();
     let (key, value) = rest.split_once(char::is_whitespace)?;
     let value = value.trim();
     if key.is_empty() || value.is_empty() {
         return None;
     }
     Some((key.to_string(), unquote(value).to_string()))
+}
+
+fn keyword_rest_ci<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    if line.len() < keyword.len() {
+        return None;
+    }
+    let head = line.get(..keyword.len())?;
+    let rest = line.get(keyword.len()..)?;
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    if rest.is_empty() || rest.chars().next().map_or(false, char::is_whitespace) {
+        Some(rest)
+    } else {
+        None
+    }
 }
 
 fn unquote(value: &str) -> &str {
@@ -1449,8 +2137,11 @@ mod naming_template_bit_depth_tests {
 #[cfg(test)]
 mod materializer_cue_tests {
     use super::*;
+    use async_trait::async_trait;
     use crate::convert::pipeline::tool::StubToolRunner;
     use crate::convert::pipeline::tool::ToolOutput;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     // ── helpers ──
 
@@ -1483,21 +2174,166 @@ mod materializer_cue_tests {
         )
     }
 
-    fn stub_runner_with_probe(json: &str) -> StubToolRunner {
-        stub_runner_with_probes(&[json])
+    fn ffprobe_json_staged_segment(sample_rate: u32, total_samples: u64) -> String {
+        let time_base = format!("1/{sample_rate}");
+        format!(
+            r#"{{
+  "streams": [{{
+    "codec_name": "pcm_s32le",
+    "sample_rate": "{sample_rate}",
+    "duration_ts": {total_samples},
+    "time_base": "{time_base}",
+    "bits_per_raw_sample": "32"
+  }}],
+  "format": {{
+    "format_name": "wav"
+  }}
+}}"#
+        )
     }
 
-    fn stub_runner_with_probes(json_outputs: &[&str]) -> StubToolRunner {
-        let runner = StubToolRunner::new();
-        for json in json_outputs {
-            runner.push_output(ToolOutput {
+    fn expected_ffprobe(
+        path: impl Into<PathBuf>,
+        stdout: impl Into<String>,
+    ) -> ExpectedFfprobeOutput {
+        ExpectedFfprobeOutput {
+            target: ExpectedFfprobeTarget::Exact(path.into()),
+            stdout: stdout.into(),
+        }
+    }
+
+    fn expected_temp_ffprobe_for(
+        final_path: impl Into<PathBuf>,
+        stdout: impl Into<String>,
+    ) -> ExpectedFfprobeOutput {
+        ExpectedFfprobeOutput {
+            target: ExpectedFfprobeTarget::TemporarySegmentFor(final_path.into()),
+            stdout: stdout.into(),
+        }
+    }
+
+    fn stub_runner_with_expected_probes(
+        ffprobe_outputs: Vec<ExpectedFfprobeOutput>,
+    ) -> SegmentWritingRunner {
+        SegmentWritingRunner {
+            ffprobe_stdout: Mutex::new(VecDeque::from(ffprobe_outputs)),
+            ffmpeg_destinations: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExpectedFfprobeOutput {
+        target: ExpectedFfprobeTarget,
+        stdout: String,
+    }
+
+    impl ExpectedFfprobeOutput {
+        fn assert_matches_path(&self, actual: &Path) {
+            match &self.target {
+                ExpectedFfprobeTarget::Exact(expected) => {
+                    assert_eq!(
+                        actual, expected,
+                        "ffprobe path mismatch: expected {}, got {}",
+                        expected.display(),
+                        actual.display()
+                    );
+                }
+                ExpectedFfprobeTarget::TemporarySegmentFor(final_path) => {
+                    assert_temporary_probe_path_for_destination(actual, final_path);
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum ExpectedFfprobeTarget {
+        Exact(PathBuf),
+        TemporarySegmentFor(PathBuf),
+    }
+
+    fn assert_temporary_probe_path_for_destination(actual: &Path, final_path: &Path) {
+        let expected_tmp_dir = final_path
+            .parent()
+            .expect("staged destination has parent")
+            .join(".tmp");
+        assert_eq!(
+            actual.parent(),
+            Some(expected_tmp_dir.as_path()),
+            "ffprobe temporary path should be under {} for final destination {}; got {}",
+            expected_tmp_dir.display(),
+            final_path.display(),
+            actual.display()
+        );
+
+        let final_name = final_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("staged destination has UTF-8 file name");
+        let actual_name = actual
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("temporary staged path has UTF-8 file name");
+        let expected_prefix = format!("{final_name}.tmp.");
+        assert!(
+            actual_name.starts_with(&expected_prefix),
+            "temporary staged probe path {} should start with {} for final destination {}",
+            actual.display(),
+            expected_prefix,
+            final_path.display()
+        );
+        assert!(
+            is_staged_segment_temporary_file_name(actual_name),
+            "temporary staged probe path {} should match the staging temp naming pattern",
+            actual.display()
+        );
+    }
+
+    struct SegmentWritingRunner {
+        ffprobe_stdout: Mutex<VecDeque<ExpectedFfprobeOutput>>,
+        ffmpeg_destinations: Mutex<Vec<PathBuf>>,
+    }
+
+    #[async_trait]
+    impl ToolRunner for SegmentWritingRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            let is_ffmpeg = matches!(&cmd.binary, ToolBinary::Ffmpeg);
+            let stdout_tail = if is_ffmpeg {
+                let destination = cmd.args.last().expect("ffmpeg command has destination");
+                self.ffmpeg_destinations
+                    .lock()
+                    .expect("ffmpeg destination log lock")
+                    .push(PathBuf::from(destination));
+                std::fs::write(Path::new(destination), b"RIFF-staged-cue-segment");
+                String::new()
+            } else {
+                let probed_path = PathBuf::from(cmd.args.last().expect("ffprobe command has path"));
+                let expected = self
+                    .ffprobe_stdout
+                    .lock()
+                    .expect("ffprobe output queue lock")
+                    .pop_front()
+                    .expect("queued ffprobe output");
+                expected.assert_matches_path(&probed_path);
+                expected.stdout
+            };
+            let command_binary = if is_ffmpeg {
+                ToolBinary::Ffmpeg
+            } else {
+                ToolBinary::Ffprobe
+            };
+
+            Ok(ToolOutput {
                 exit: crate::convert::pipeline::tool::ProcessExit::Code(0),
-                stdout_tail: (*json).to_string(),
+                stdout_tail,
                 stderr_tail: String::new(),
                 elapsed: Duration::from_millis(10),
                 command: crate::convert::pipeline::tool::CommandRecord {
-                    binary: ToolBinary::Ffprobe,
-                    sanitized_args: vec![],
+                    binary: command_binary,
+                    sanitized_args: cmd.args.clone(),
                     cwd: None,
                     env_keys: vec![],
                     exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(0)),
@@ -1505,16 +2341,8 @@ mod materializer_cue_tests {
                     stderr_tail: String::new(),
                     elapsed: Duration::from_millis(10),
                 },
-            });
+            })
         }
-        runner
-    }
-
-    fn write_file(path: &std::path::Path, contents: &[u8]) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create parent dirs");
-        }
-        std::fs::write(path, contents).expect("write file");
     }
 
     fn cue_sheet_3_track() -> String {
@@ -1596,6 +2424,380 @@ FILE "album.flac" WAVE
         StagingDir::new(root, "test-staging".to_string())
     }
 
+
+    fn assert_staged_file_ref(track: &PreparedTrack) -> &Path {
+        let TrackSourceRef::StagedFile(path) = &track.source_ref else {
+            panic!("expected StagedFile so downstream resampler planning uses the existing file-input path");
+        };
+        assert_eq!(path.extension().and_then(|value| value.to_str()), Some("wav"));
+        path.as_path()
+    }
+
+    fn boundaries_for_cue(
+        cue_content: &str,
+        total_samples: u64,
+        sample_rate: u32,
+        exact_total: bool,
+    ) -> Vec<(u64, u64)> {
+        let sheet = parse_cue(cue_content);
+        compute_track_boundaries(&sheet, total_samples, sample_rate, exact_total)
+            .expect("boundary computation succeeds")
+    }
+
+
+    #[test]
+    fn cue_annotations_ignore_non_audio_track_scope() {
+        let annotations = CueAnnotations::parse(
+            r#"REM COMMENT "album note"
+TRACK 01 AUDIO
+  FLAGS PRE
+  REM COMMENT "audio note"
+TRACK 02 MODE1/2352
+  FLAGS PRE
+  REM COMMENT "data note"
+TRACK 03 AUDIO
+  REM COMMENT "third note"
+"#,
+        );
+
+        assert!(annotations.track_pre_emphasis(1));
+        assert!(!annotations.track_pre_emphasis(2));
+        assert!(!annotations.track_pre_emphasis(3));
+
+        let mut album_extra = BTreeMap::new();
+        annotations.add_album_extras(&mut album_extra);
+        assert_eq!(
+            album_extra.get("rem_comment"),
+            Some(&"album note".to_string())
+        );
+        assert!(!album_extra.values().any(|value| value == "data note"));
+
+        let mut track_one_extra = BTreeMap::new();
+        annotations.add_track_extras(1, &mut track_one_extra);
+        assert_eq!(
+            track_one_extra.get("rem_comment"),
+            Some(&"audio note".to_string())
+        );
+
+        let mut track_two_extra = BTreeMap::new();
+        annotations.add_track_extras(2, &mut track_two_extra);
+        assert!(track_two_extra.is_empty());
+
+        let mut track_three_extra = BTreeMap::new();
+        annotations.add_track_extras(3, &mut track_three_extra);
+        assert_eq!(
+            track_three_extra.get("rem_comment"),
+            Some(&"third note".to_string())
+        );
+    }
+
+    #[test]
+    fn cue_annotations_malformed_track_header_clears_audio_scope() {
+        let annotations = CueAnnotations::parse(
+            r#"TRACK 01 AUDIO
+  REM COMMENT "audio note"
+TRACK XX AUDIO
+  FLAGS PRE
+  REM COMMENT "malformed note"
+"#,
+        );
+
+        assert!(!annotations.track_pre_emphasis(1));
+
+        let mut track_one_extra = BTreeMap::new();
+        annotations.add_track_extras(1, &mut track_one_extra);
+        assert_eq!(
+            track_one_extra.get("rem_comment"),
+            Some(&"audio note".to_string())
+        );
+        assert!(!track_one_extra.values().any(|value| value == "malformed note"));
+
+        let mut album_extra = BTreeMap::new();
+        annotations.add_album_extras(&mut album_extra);
+        assert!(!album_extra.values().any(|value| value == "malformed note"));
+    }
+
+    struct ObservingSegmentRunner {
+        ffprobe_stdout: Mutex<VecDeque<ExpectedFfprobeOutput>>,
+        destination: PathBuf,
+        observed_during_ffmpeg: Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl ToolRunner for ObservingSegmentRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            let is_ffmpeg = matches!(&cmd.binary, ToolBinary::Ffmpeg);
+            let stdout_tail = if is_ffmpeg {
+                let observed = std::fs::read(&self.destination).ok();
+                *self
+                    .observed_during_ffmpeg
+                    .lock()
+                    .expect("observed lock") = observed;
+                let destination = cmd.args.last().expect("ffmpeg command has destination");
+                std::fs::write(Path::new(destination), b"RIFF-staged-cue-segment");
+                String::new()
+            } else {
+                let probed_path = PathBuf::from(cmd.args.last().expect("ffprobe command has path"));
+                let expected = self
+                    .ffprobe_stdout
+                    .lock()
+                    .expect("ffprobe output queue lock")
+                    .pop_front()
+                    .expect("queued ffprobe output");
+                expected.assert_matches_path(&probed_path);
+                expected.stdout
+            };
+            let command_binary = if is_ffmpeg {
+                ToolBinary::Ffmpeg
+            } else {
+                ToolBinary::Ffprobe
+            };
+
+            Ok(ToolOutput {
+                exit: crate::convert::pipeline::tool::ProcessExit::Code(0),
+                stdout_tail,
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(10),
+                command: crate::convert::pipeline::tool::CommandRecord {
+                    binary: command_binary,
+                    sanitized_args: cmd.args.clone(),
+                    cwd: None,
+                    env_keys: vec![],
+                    exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(0)),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    elapsed: Duration::from_millis(10),
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn cue_segment_command_uses_sample_exact_s32_pcm_staging() {
+        let image = Path::new("album.flac");
+        let destination = Path::new("staging/cue-segments/002-cue02-track02.wav");
+        let cmd = cue_segment_ffmpeg_command(image, 3_969_000, 7_188_300, destination)
+            .expect("build ffmpeg segment command");
+
+        assert!(matches!(cmd.binary, ToolBinary::Ffmpeg));
+        assert!(cmd.args.windows(2).any(|pair| {
+            pair[0] == "-af"
+                && pair[1]
+                    == "atrim=start_sample=3969000:end_sample=11157300,asetpts=N/SR/TB"
+        }));
+        assert!(cmd.args.windows(2).any(|pair| pair[0] == "-c:a" && pair[1] == "pcm_s32le"));
+        assert!(cmd.args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == "wav"));
+        assert!(!cmd.args.iter().any(|arg| arg == "-ss" || arg == "-t"));
+    }
+
+    #[test]
+    fn cue_segment_filter_rejects_zero_length_and_overflow() {
+        assert!(cue_segment_atrim_filter(100, 0).is_err());
+        assert!(cue_segment_atrim_filter(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn temporary_segment_path_uses_private_tmp_dir_and_random_suffix() {
+        let destination = Path::new("staging/cue-segments/001.wav");
+        let first = temporary_segment_path(destination).expect("first temp path");
+        let second = temporary_segment_path(destination).expect("second temp path");
+
+        assert_eq!(
+            first.parent().and_then(|path| path.file_name()).and_then(|name| name.to_str()),
+            Some(".tmp")
+        );
+        for path in [first, second] {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .expect("temp file name");
+            let random_suffix = name.rsplit('.').next().expect("random suffix");
+            assert_eq!(random_suffix.len(), 32, "expected 128-bit hex random suffix");
+            assert!(random_suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn old_tmp_cleanup_only_targets_staging_temp_pattern_and_age() {
+        let now = UNIX_EPOCH + Duration::from_secs(48 * 60 * 60);
+        let old = UNIX_EPOCH;
+        let recent = now - Duration::from_secs(60);
+        let matching = "001-cue01-track01-s0-n44100.wav.tmp.123.456.0123456789abcdef0123456789abcdef";
+
+        assert!(is_staged_segment_temporary_file_name(matching));
+        assert!(should_remove_old_temporary_segment(
+            matching,
+            old,
+            now,
+            STALE_CUE_SEGMENT_TMP_MAX_AGE
+        ));
+        assert!(!should_remove_old_temporary_segment(
+            matching,
+            recent,
+            now,
+            STALE_CUE_SEGMENT_TMP_MAX_AGE
+        ));
+        assert!(!should_remove_old_temporary_segment(
+            "001-cue01-track01.wav",
+            old,
+            now,
+            STALE_CUE_SEGMENT_TMP_MAX_AGE
+        ));
+        assert!(!should_remove_old_temporary_segment(
+            "001-cue01-track01-s0-n44100.wav.tmp.pid.456.0123456789abcdef0123456789abcdef",
+            old,
+            now,
+            STALE_CUE_SEGMENT_TMP_MAX_AGE
+        ));
+        assert!(!should_remove_old_temporary_segment(
+            "001-cue01-track01-s0-n44100.wav.tmp.123.456.not-random",
+            old,
+            now,
+            STALE_CUE_SEGMENT_TMP_MAX_AGE
+        ));
+    }
+
+    #[tokio::test]
+    async fn existing_staged_segment_is_reused_only_after_probe_validation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let destination = temp.path().join("staging/cue-segments/001.wav");
+        write_test_file(&destination, b"partial-wav");
+
+        let stale_probe = ffprobe_json_staged_segment(44_100, 1);
+        let valid_probe = ffprobe_json_staged_segment(44_100, 44_100);
+        let runner = stub_runner_with_expected_probes(vec![
+            expected_ffprobe(&destination, stale_probe.clone()),
+            expected_temp_ffprobe_for(&destination, valid_probe.clone()),
+            expected_ffprobe(&destination, stale_probe),
+            expected_ffprobe(&destination, valid_probe),
+        ]);
+        let cancel = CancellationToken::new();
+
+        stage_cue_segment_as_s32_wav(
+            Path::new("album.flac"),
+            0,
+            44_100,
+            44_100,
+            &destination,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("invalid existing segment is regenerated");
+
+        assert_eq!(
+            std::fs::read(&destination).expect("read regenerated segment"),
+            b"RIFF-staged-cue-segment"
+        );
+        let ffmpeg_destinations = runner
+            .ffmpeg_destinations
+            .lock()
+            .expect("ffmpeg destination log lock");
+        assert_eq!(ffmpeg_destinations.len(), 1);
+        assert_eq!(
+            ffmpeg_destinations[0]
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+            Some(".tmp")
+        );
+        assert!(
+            !ffmpeg_destinations[0].exists(),
+            "temporary staging file should be unpublished after materialization"
+        );
+        assert!(
+            runner
+                .ffprobe_stdout
+                .lock()
+                .expect("ffprobe output queue lock")
+                .is_empty(),
+            "post-publish validation should consume the final destination probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_published_segment_remains_until_replacement_is_ready() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let destination = temp.path().join("staging/cue-segments/001.wav");
+        write_test_file(&destination, b"old-partial-segment");
+
+        let stale_probe = ffprobe_json_staged_segment(44_100, 1);
+        let valid_probe = ffprobe_json_staged_segment(44_100, 44_100);
+        let runner = ObservingSegmentRunner {
+            ffprobe_stdout: Mutex::new(VecDeque::from(vec![
+                expected_ffprobe(&destination, stale_probe.clone()),
+                expected_temp_ffprobe_for(&destination, valid_probe.clone()),
+                expected_ffprobe(&destination, stale_probe),
+                expected_ffprobe(&destination, valid_probe),
+            ])),
+            destination: destination.clone(),
+            observed_during_ffmpeg: Mutex::new(None),
+        };
+        let cancel = CancellationToken::new();
+
+        stage_cue_segment_as_s32_wav(
+            Path::new("album.flac"),
+            0,
+            44_100,
+            44_100,
+            &destination,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("invalid existing segment is regenerated");
+
+        assert_eq!(
+            runner
+                .observed_during_ffmpeg
+                .lock()
+                .expect("observed lock")
+                .as_deref(),
+            Some(&b"old-partial-segment"[..]),
+            "the old destination should not be removed before the replacement is validated"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("read regenerated segment"),
+            b"RIFF-staged-cue-segment"
+        );
+        assert!(
+            runner
+                .ffprobe_stdout
+                .lock()
+                .expect("ffprobe output queue lock")
+                .is_empty(),
+            "post-publish validation should consume the final destination probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_segment_validation_rejects_wrong_codec() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let destination = temp.path().join("staging/cue-segments/001.wav");
+        write_test_file(&destination, b"RIFF-staged-cue-segment");
+
+        let wrong_codec = ffprobe_json_staged_segment(44_100, 44_100)
+            .replace("pcm_s32le", "pcm_s16le");
+        let runner = stub_runner_with_expected_probes(vec![expected_ffprobe(&destination, wrong_codec)]);
+        let cancel = CancellationToken::new();
+
+        let result = validate_staged_cue_segment(
+            &destination,
+            44_100,
+            44_100,
+            &runner,
+            &cancel,
+        )
+        .await;
+
+        let err = result.expect_err("wrong codec is rejected").to_string();
+        assert!(err.contains("pcm_s32le"), "error should mention codec: {err}");
+    }
+
     async fn materialize_cue(
         cue_content: &str,
         probe_json: &str,
@@ -1604,27 +2806,154 @@ FILE "album.flac" WAVE
         materialize_cue_with_audio_files(cue_content, &[probe_json], &["album.flac"], temp).await
     }
 
+    fn expected_probe_outputs_for_test(
+        req: &PipelineRequest,
+        staging: &StagingDir,
+        probe_jsons: &[&str],
+    ) -> Result<Vec<ExpectedFfprobeOutput>, String> {
+        let cue_input = resolve_cue_input(req).map_err(|err| {
+            format!(
+                "failed to resolve test CUE input for {}: {err}",
+                req.container.display()
+            )
+        })?;
+        let track_images = resolve_track_image_paths(&cue_input).map_err(|err| {
+            format!(
+                "failed to resolve test CUE track image paths for {}: {err}",
+                req.container.display()
+            )
+        })?;
+        let unique_images = unique_existing_paths(&track_images);
+        if unique_images.len() != probe_jsons.len() {
+            return Err(format!(
+                "test queued {} source ffprobe response(s), but resolved {} unique image path(s): {:?}",
+                probe_jsons.len(),
+                unique_images.len(),
+                unique_images
+            ));
+        }
+
+        let mut expected = Vec::new();
+        let mut probes = HashMap::new();
+        for (image_path, probe_json) in unique_images.iter().zip(probe_jsons.iter()) {
+            expected.push(expected_ffprobe(image_path, (*probe_json).to_string()));
+            let probe = parse_audio_probe_json(probe_json).map_err(|err| {
+                format!(
+                    "failed to parse queued source ffprobe JSON for {}: {err}",
+                    image_path.display()
+                )
+            })?;
+            probes.insert(path_identity(image_path), probe);
+        }
+
+        let boundaries = compute_track_boundaries_for_layout(
+            &cue_input.sheet,
+            &track_images,
+            &probes,
+        )
+        .map_err(|err| {
+            format!(
+                "failed to compute expected staged CUE boundaries for {}: {err}",
+                req.container.display()
+            )
+        })?;
+
+        let track_number_plan = cue_track_number_plan(&cue_input.sheet);
+        let selected_indices = selected_track_indices(
+            cue_input.sheet.tracks.len(),
+            &req.source.track_selection,
+        )
+        .map_err(|err| {
+            format!(
+                "failed to apply test track selection for {}: {err}",
+                req.container.display()
+            )
+        })?;
+
+        for idx in selected_indices {
+            let cue_track = &cue_input.sheet.tracks[idx];
+            let (start_sample, samples) = boundaries[idx];
+            let staged_path = staged_cue_segment_path(
+                staging,
+                (idx + 1) as u32,
+                cue_track.number,
+                track_number_plan[idx].output_number,
+                start_sample,
+                samples,
+            );
+            let probe = probes
+                .get(&path_identity(&track_images[idx]))
+                .expect("track image probe exists");
+            let staged_probe = ffprobe_json_staged_segment(probe.sample_rate, samples);
+            // Each newly staged segment is probed twice: once while it is still
+            // in cue-segments/.tmp/, then again after publish at the final path.
+            // Queue both the expected response and the expected target path so tests
+            // catch wrong-path probes as well as call-count mistakes.
+            expected.push(expected_temp_ffprobe_for(&staged_path, staged_probe.clone()));
+            expected.push(expected_ffprobe(&staged_path, staged_probe));
+        }
+
+        Ok(expected)
+    }
+
     async fn materialize_cue_with_audio_files(
         cue_content: &str,
         probe_jsons: &[&str],
         audio_files: &[&str],
         temp: &tempfile::TempDir,
     ) -> Result<PreparedSource, MaterializeError> {
-        let cue_path = temp.path().join("album.cue");
-        write_file(&cue_path, cue_content.as_bytes());
-        for audio_file in audio_files {
-            write_file(&temp.path().join(audio_file), b"fake-audio-data");
-        }
-
-        let runner = stub_runner_with_probes(probe_jsons);
-        let mut staging = test_staging(temp);
-        let cancel = CancellationToken::new();
+        let cue_path = write_cue_fixture(cue_content, audio_files, temp);
         let req = test_request(&cue_path);
+        let staging = test_staging(temp);
+        let expected_probes = expected_probe_outputs_for_test(&req, &staging, probe_jsons)
+            .expect("test should be able to derive expected ffprobe calls from its valid CUE fixture");
+        materialize_cue_with_expected_probes_for_request(req, staging, expected_probes).await
+    }
+
+    async fn materialize_cue_with_explicit_expected_probes(
+        cue_content: &str,
+        expected_probes: Vec<ExpectedFfprobeOutput>,
+        audio_files: &[&str],
+        temp: &tempfile::TempDir,
+    ) -> Result<PreparedSource, MaterializeError> {
+        let cue_path = write_cue_fixture(cue_content, audio_files, temp);
+        let req = test_request(&cue_path);
+        let staging = test_staging(temp);
+        materialize_cue_with_expected_probes_for_request(req, staging, expected_probes).await
+    }
+
+    async fn materialize_cue_with_expected_probes_for_request(
+        req: PipelineRequest,
+        mut staging: StagingDir,
+        expected_probes: Vec<ExpectedFfprobeOutput>,
+    ) -> Result<PreparedSource, MaterializeError> {
+        let runner = stub_runner_with_expected_probes(expected_probes);
+        let cancel = CancellationToken::new();
         let result = CueImageMaterializer
             .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
             .await;
         staging.disarm();
         result
+    }
+
+    fn write_cue_fixture(
+        cue_content: &str,
+        audio_files: &[&str],
+        temp: &tempfile::TempDir,
+    ) -> PathBuf {
+        let cue_path = temp.path().join("album.cue");
+        write_test_file(&cue_path, cue_content.as_bytes());
+        for audio_file in audio_files {
+            write_test_file(&temp.path().join(audio_file), b"fake-audio-data");
+        }
+        cue_path
+    }
+
+    fn write_test_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create test fixture parent directory");
+        }
+        std::fs::write(path, contents).expect("write test fixture file");
     }
 
     // ── Category A: happy path ──
@@ -1645,24 +2974,17 @@ FILE "album.flac" WAVE
         // Track 1: starts at 0:00:00 = frame 0 = sample 0
         assert_eq!(source.tracks[0].id.track_number, 1);
         assert_eq!(source.tracks[0].id.source_ordinal, 1);
-        let TrackSourceRef::ImageSegment { start_sample, samples, .. } = &source.tracks[0].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*start_sample, 0);
+        assert_staged_file_ref(&source.tracks[0]);
+        assert_staged_file_ref(&source.tracks[1]);
+        assert_staged_file_ref(&source.tracks[2]);
+        let boundaries = boundaries_for_cue(&cue_sheet_3_track(), total_samples, 44100, true);
+        assert_eq!(boundaries[0], (0, 3_969_000));
 
         // Track 2: starts at 1:30:00 = 6750 frames = 6750 * 44100 / 75 = 3,969,000 samples
-        let TrackSourceRef::ImageSegment { start_sample: s2, .. } = &source.tracks[1].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*s2, 3_969_000);
-        assert_eq!(*samples, 3_969_000); // track 1 length = track 2 start - track 1 start
+        assert_eq!(boundaries[1].0, 3_969_000);
 
         // Track 3: starts at 4:13:00 = 18975 frames = 18975 * 44100 / 75 = 11,157,300 samples
-        let TrackSourceRef::ImageSegment { start_sample: s3, samples: s3_len, .. } = &source.tracks[2].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*s3, 11_157_300);
-        assert_eq!(*s3_len, total_samples - 11_157_300);
+        assert_eq!(boundaries[2], (11_157_300, total_samples - 11_157_300));
 
         // Metadata
         assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("Speak to Me"));
@@ -1692,12 +3014,58 @@ FILE "album.flac" WAVE
             .expect("materialize succeeds");
 
         assert_eq!(source.tracks.len(), 1);
-        let TrackSourceRef::ImageSegment { start_sample, samples, .. } = &source.tracks[0].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*start_sample, 0);
-        assert_eq!(*samples, total_samples);
+        assert_staged_file_ref(&source.tracks[0]);
+        assert_eq!(source.tracks[0].expected_samples, Some(total_samples));
         assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("Only Track"));
+    }
+
+    #[tokio::test]
+    async fn track_selection_filters_before_staging_segments() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&cue_path, cue_sheet_3_track().as_bytes());
+        std::fs::write(&temp.path().join("album.flac"), b"fake-audio-data");
+
+        let mut req = test_request(&cue_path);
+        req.source.track_selection = TrackSelection::Set(std::collections::BTreeSet::from([2]));
+
+        let total_samples: u64 = 26_460_000;
+        let probe = ffprobe_json_exact(44100, total_samples, 16);
+        let mut staging = test_staging(&temp);
+        let expected_probes = expected_probe_outputs_for_test(&req, &staging, &[&probe])
+            .expect("test should be able to derive expected ffprobe calls from selected CUE fixture");
+        let runner = stub_runner_with_expected_probes(expected_probes);
+        let cancel = CancellationToken::new();
+
+        let source = CueImageMaterializer
+            .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+            .await
+            .expect("selected CUE track materializes");
+        staging.disarm();
+
+        assert_eq!(source.tracks.len(), 1);
+        assert_eq!(source.tracks[0].id.source_ordinal, 2);
+        assert_eq!(source.tracks[0].id.track_number, 2);
+        assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("Breathe"));
+
+        let ffmpeg_destinations = runner
+            .ffmpeg_destinations
+            .lock()
+            .expect("ffmpeg destination log lock");
+        assert_eq!(
+            ffmpeg_destinations.len(),
+            1,
+            "only the selected track should be staged"
+        );
+        assert!(
+            ffmpeg_destinations[0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("002-cue02-track02-"))
+                .unwrap_or(false),
+            "selected track 2 should be the only staged segment: {:?}",
+            ffmpeg_destinations[0]
+        );
     }
 
     #[tokio::test]
@@ -1720,14 +3088,14 @@ FILE "album.flac" WAVE
 
         assert_eq!(source.tracks.len(), 12);
 
-        // Verify contiguous, non-overlapping
+        // Verify contiguous, non-overlapping boundaries and staged file refs.
+        let boundaries = boundaries_for_cue(&cue, total_samples, 44100, true);
         let mut prev_end: u64 = 0;
-        for track in &source.tracks {
-            let TrackSourceRef::ImageSegment { start_sample, samples, .. } = &track.source_ref else {
-                panic!("expected ImageSegment");
-            };
+        for (track, (start_sample, samples)) in source.tracks.iter().zip(boundaries.iter()) {
+            assert_staged_file_ref(track);
             assert_eq!(*start_sample, prev_end, "track {} must start where previous ended", track.id.track_number);
             assert!(*samples > 0, "track {} must have positive length", track.id.track_number);
+            assert_eq!(track.expected_samples, Some(*samples));
             prev_end = start_sample + samples;
         }
         assert_eq!(prev_end, total_samples);
@@ -1738,8 +3106,13 @@ FILE "album.flac" WAVE
     #[tokio::test]
     async fn empty_cue_sheet_fails() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
-        let result = materialize_cue("", &probe, &temp).await;
+        let result = materialize_cue_with_explicit_expected_probes(
+            "",
+            Vec::new(),
+            &["album.flac"],
+            &temp,
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -1750,8 +3123,13 @@ FILE "album.flac" WAVE
   TRACK 01 AUDIO
     TITLE "No Index"
 "#;
-        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
-        let result = materialize_cue(cue, &probe, &temp).await;
+        let result = materialize_cue_with_explicit_expected_probes(
+            cue,
+            Vec::new(),
+            &["album.flac"],
+            &temp,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("INDEX 01"), "error should mention INDEX 01: {err}");
@@ -1783,21 +3161,86 @@ FILE "track2.flac" WAVE
         assert_eq!(source.tracks.len(), 2);
         assert_eq!(source.album_metadata.total_tracks, 2);
 
-        let TrackSourceRef::ImageSegment { image, start_sample, samples } = &source.tracks[0].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(image.file_name().and_then(|value| value.to_str()), Some("track1.flac"));
-        assert_eq!(*start_sample, 0);
-        assert_eq!(*samples, 441_000);
+        assert_staged_file_ref(&source.tracks[0]);
+        assert_eq!(source.tracks[0].expected_samples, Some(441_000));
         assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("One"));
 
-        let TrackSourceRef::ImageSegment { image, start_sample, samples } = &source.tracks[1].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(image.file_name().and_then(|value| value.to_str()), Some("track2.flac"));
-        assert_eq!(*start_sample, 0);
-        assert_eq!(*samples, 882_000);
+        assert_staged_file_ref(&source.tracks[1]);
+        assert_eq!(source.tracks[1].expected_samples, Some(882_000));
         assert_eq!(source.tracks[1].metadata.title.as_deref(), Some("Two"));
+    }
+
+    #[tokio::test]
+    async fn multifile_pregap_file_switch_materializes_index01_from_new_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = r#"FILE "02 - Trouble.wav" WAVE
+  TRACK 02 AUDIO
+    TITLE "Trouble No More"
+    INDEX 01 00:00:00
+  TRACK 03 AUDIO
+    TITLE "Don't Keep Me Wonderin'"
+    INDEX 00 03:43:37
+FILE "03 - Wonderin.wav" WAVE
+    INDEX 01 00:00:00
+"#;
+        let sheet = parse_cue(cue);
+        assert_eq!(sheet.tracks[1].file.as_deref(), Some("03 - Wonderin.wav"));
+        assert_eq!(sheet.tracks[1].index00_frames, Some(16_762));
+        assert_eq!(sheet.tracks[1].index01_frames, Some(0));
+
+        let trouble_probe = ffprobe_json_exact(44100, 10_000_000, 16);
+        let wonderin_probe = ffprobe_json_exact(44100, 5_000_000, 16);
+        let source = materialize_cue_with_audio_files(
+            cue,
+            &[&trouble_probe, &wonderin_probe],
+            &["02 - Trouble.wav", "03 - Wonderin.wav"],
+            &temp,
+        )
+        .await
+        .expect("noncompliant multi-file pregap layout materializes");
+
+        assert_eq!(source.tracks.len(), 2);
+        assert_staged_file_ref(&source.tracks[0]);
+        assert_eq!(source.tracks[0].expected_samples, Some(10_000_000));
+        assert_staged_file_ref(&source.tracks[1]);
+        assert_eq!(source.tracks[1].expected_samples, Some(5_000_000));
+        assert_eq!(
+            source.tracks[1]
+                .metadata
+                .extra
+                .get("index00_frames")
+                .map(String::as_str),
+            Some("16762")
+        );
+    }
+
+    #[test]
+    fn resolve_audio_reference_errors_on_ambiguous_stem_matches() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let flac = temp.path().join("album.flac");
+        let wav = temp.path().join("album.wav");
+        std::fs::write(&flac, b"fake flac");
+        std::fs::write(&wav, b"fake wav");
+
+        let err = resolve_audio_reference(Some(temp.path()), "album.ape", None)
+            .expect_err("ambiguous stem-only reference should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "error should explain ambiguity: {msg}");
+        assert!(msg.contains("album.flac"), "error should list flac candidate: {msg}");
+        assert!(msg.contains("album.wav"), "error should list wav candidate: {msg}");
+    }
+
+    #[test]
+    fn resolve_audio_reference_falls_back_inside_referenced_subdirectory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let disc = temp.path().join("disc");
+        std::fs::create_dir(&disc).expect("create disc dir");
+        let image = disc.join("image.flac");
+        std::fs::write(&image, b"fake flac");
+
+        let resolved = resolve_audio_reference(Some(temp.path()), "disc/image.wav", None)
+            .expect("extension mismatch should resolve inside referenced subdirectory");
+        assert_eq!(resolved, image);
     }
 
     #[test]
@@ -1806,7 +3249,7 @@ FILE "track2.flac" WAVE
         let cue_path = temp.path().join("album.cue");
         let track1 = temp.path().join("track1.flac");
         let track2 = temp.path().join("track2.flac");
-        write_file(
+        std::fs::write(
             &cue_path,
             br#"FILE "track1.flac" WAVE
   TRACK 01 AUDIO
@@ -1816,13 +3259,78 @@ FILE "track2.flac" WAVE
     INDEX 01 00:00:00
 "#,
         );
-        write_file(&track1, b"fake-audio-data");
-        write_file(&track2, b"fake-audio-data");
+        std::fs::write(&track1, b"fake-audio-data");
+        std::fs::write(&track2, b"fake-audio-data");
 
         let discovered = find_valid_sidecar_cue_for_image(&track2)
             .expect("sidecar search succeeds")
             .expect("multi-file CUE matches referenced audio");
         assert_eq!(discovered, cue_path);
+    }
+
+    #[test]
+    fn malformed_same_stem_sidecar_does_not_route_audio_to_cue_materializer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&image, b"fake-audio-data");
+        std::fs::write(
+            &cue_path,
+            br#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "No INDEX 01"
+"#,
+        );
+
+        let req = test_request(&image);
+        assert!(
+            !is_cue_image_candidate(&req).expect("candidate detection succeeds"),
+            "a malformed same-stem sidecar must not force a normal audio file onto the CUE route"
+        );
+    }
+
+    #[test]
+    fn same_stem_sidecar_must_reference_image_before_routing_audio_to_cue_materializer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let other = temp.path().join("other.flac");
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&image, b"fake-audio-data");
+        std::fs::write(&other, b"fake-audio-data");
+        std::fs::write(
+            &cue_path,
+            br#"FILE "other.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+
+        let req = test_request(&image);
+        assert!(
+            !is_cue_image_candidate(&req).expect("candidate detection succeeds"),
+            "a usable same-stem sidecar for a different image must not hijack this audio file"
+        );
+    }
+
+    #[test]
+    fn valid_same_stem_sidecar_routes_audio_to_cue_materializer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&image, b"fake-audio-data");
+        std::fs::write(
+            &cue_path,
+            br#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+
+        let req = test_request(&image);
+        assert!(
+            is_cue_image_candidate(&req).expect("candidate detection succeeds"),
+            "a valid same-stem sidecar that references the image should select the CUE route"
+        );
     }
 
     #[tokio::test]
@@ -1870,8 +3378,13 @@ FILE "track2.flac" WAVE
     TITLE "Duplicate"
     INDEX 01 01:00:00
 "#;
-        let probe = ffprobe_json_exact(44100, 10_000_000, 16);
-        let result = materialize_cue(cue, &probe, &temp).await;
+        let result = materialize_cue_with_explicit_expected_probes(
+            cue,
+            Vec::new(),
+            &["album.flac"],
+            &temp,
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1892,7 +3405,13 @@ FILE "track2.flac" WAVE
     INDEX 01 05:00:00
 "#;
         let probe = ffprobe_json_exact(44100, 1_000_000, 16);
-        let result = materialize_cue(cue, &probe, &temp).await;
+        let result = materialize_cue_with_explicit_expected_probes(
+            cue,
+            vec![expected_ffprobe(temp.path().join("album.flac"), probe)],
+            &["album.flac"],
+            &temp,
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -1920,10 +3439,9 @@ FILE "track2.flac" WAVE
 
         // Track 2 boundary should use INDEX 01 (03:45:00), not INDEX 00 (03:43:37)
         // INDEX 01 at 03:45:00 = 16875 frames = 16875 * 44100 / 75 = 9,922,500 samples
-        let TrackSourceRef::ImageSegment { start_sample, .. } = &source.tracks[1].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*start_sample, 9_922_500);
+        assert_staged_file_ref(&source.tracks[1]);
+        let boundaries = boundaries_for_cue(cue, total_samples, 44100, true);
+        assert_eq!(boundaries[1].0, 9_922_500);
 
         // INDEX 00 should be preserved in extras
         let extras = &source.tracks[1].metadata.extra;
@@ -1941,10 +3459,8 @@ FILE "track2.flac" WAVE
             .await
             .expect("materialize succeeds");
 
-        let TrackSourceRef::ImageSegment { start_sample, .. } = &source.tracks[0].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*start_sample, 0);
+        assert_staged_file_ref(&source.tracks[0]);
+        assert_eq!(source.tracks[0].expected_samples, Some(10_000_000));
     }
 
     // ── Category D: Unicode/encoding ──
@@ -1997,10 +3513,9 @@ FILE "track2.flac" WAVE
             .expect("materialize succeeds at 96kHz");
 
         // Track 2 at 01:00:00 = 4500 frames = 4500 * 96000 / 75 = 5,760,000 samples
-        let TrackSourceRef::ImageSegment { start_sample, .. } = &source.tracks[1].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*start_sample, 5_760_000);
+        assert_staged_file_ref(&source.tracks[1]);
+        let boundaries = boundaries_for_cue(cue, total_samples, 96000, true);
+        assert_eq!(boundaries[1].0, 5_760_000);
         assert_eq!(source.tracks[0].sample_rate, 96000);
         assert_eq!(source.tracks[0].bit_depth, Some(24));
     }
@@ -2022,10 +3537,9 @@ FILE "track2.flac" WAVE
             .expect("materialize succeeds at 192kHz");
 
         // Track 2 at 02:00:00 = 9000 frames = 9000 * 192000 / 75 = 23,040,000 samples
-        let TrackSourceRef::ImageSegment { start_sample, .. } = &source.tracks[1].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*start_sample, 23_040_000);
+        assert_staged_file_ref(&source.tracks[1]);
+        let boundaries = boundaries_for_cue(cue, total_samples, 192000, true);
+        assert_eq!(boundaries[1].0, 23_040_000);
         assert_eq!(source.tracks[0].sample_rate, 192000);
     }
 
@@ -2044,7 +3558,13 @@ FILE "track2.flac" WAVE
     INDEX 01 04:00:00
 "#;
         let probe = ffprobe_json_approx(44100, 240.045);
-        let result = materialize_cue(cue, &probe, &temp).await;
+        let result = materialize_cue_with_explicit_expected_probes(
+            cue,
+            vec![expected_ffprobe(temp.path().join("album.flac"), probe)],
+            &["album.flac"],
+            &temp,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("coarse"), "error should mention coarse probe: {err}");
@@ -2067,10 +3587,8 @@ FILE "track2.flac" WAVE
             .expect("exact sample count allows small final track");
 
         assert_eq!(source.tracks.len(), 2);
-        let TrackSourceRef::ImageSegment { samples, .. } = &source.tracks[1].source_ref else {
-            panic!("expected ImageSegment");
-        };
-        assert_eq!(*samples, 500);
+        assert_staged_file_ref(&source.tracks[1]);
+        assert_eq!(source.tracks[1].expected_samples, Some(500));
     }
 
     #[test]
@@ -2122,6 +3640,211 @@ FILE "track2.flac" WAVE
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    struct RealProcessToolRunner;
+
+    #[async_trait]
+    impl ToolRunner for RealProcessToolRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            let binary_name = match &cmd.binary {
+                ToolBinary::Ffmpeg => "ffmpeg",
+                ToolBinary::Ffprobe => "ffprobe",
+                _ => panic!("real CUE staging fixture only supports ffmpeg/ffprobe"),
+            };
+
+            let mut process = std::process::Command::new(binary_name);
+            process.args(&cmd.args);
+            if let Some(cwd) = &cmd.cwd {
+                process.current_dir(cwd);
+            }
+            for env_var in &cmd.env {
+                process.env(&env_var.key, env_var.value.expose());
+            }
+
+            let output = process.output().unwrap_or_else(|err| {
+                panic!(
+                    "spawn {binary_name} for real CUE staging fixture failed: {err}; args={:?}",
+                    cmd.args
+                )
+            });
+            let stdout_tail = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr_tail = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "real CUE staging fixture command failed: binary={binary_name} status={:?}\nargs={:?}\nstdout={}\nstderr={}",
+                output.status.code(),
+                cmd.args,
+                stdout_tail,
+                stderr_tail
+            );
+
+            let exit_code = output.status.code().unwrap_or(0);
+            Ok(ToolOutput {
+                exit: crate::convert::pipeline::tool::ProcessExit::Code(exit_code),
+                stdout_tail: stdout_tail.clone(),
+                stderr_tail: stderr_tail.clone(),
+                elapsed: Duration::from_millis(0),
+                command: crate::convert::pipeline::tool::CommandRecord {
+                    binary: cmd.binary,
+                    sanitized_args: cmd.args,
+                    cwd: cmd.cwd,
+                    env_keys: cmd.env.into_iter().map(|ev| ev.key).collect(),
+                    exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(exit_code)),
+                    stdout_tail,
+                    stderr_tail,
+                    elapsed: Duration::from_millis(0),
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn real_ffmpeg_staging_cuts_and_validates_exact_sample_count_when_available() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("ffprobe") {
+            eprintln!("skipping real CUE segment staging fixture: ffmpeg or ffprobe is unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("source.wav");
+        let destination = temp
+            .path()
+            .join("staging/cue-segments/track01-s11025-n22050.wav");
+
+        run_fixture_command(
+            std::process::Command::new("ffmpeg")
+                .arg("-y")
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg("anullsrc=r=44100:cl=mono:d=2")
+                .arg("-c:a")
+                .arg("pcm_s16le")
+                .arg(&image),
+        );
+
+        let runner = RealProcessToolRunner;
+        let cancel = CancellationToken::new();
+        stage_cue_segment_as_s32_wav(
+            &image,
+            11_025,
+            22_050,
+            44_100,
+            &destination,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("real ffmpeg stages the requested exact sample segment");
+
+        validate_staged_cue_segment(&destination, 44_100, 22_050, &runner, &cancel)
+            .await
+            .expect("real ffprobe validates staged pcm_s32le WAV sample count");
+
+        assert!(destination.exists(), "published staged segment should exist");
+        assert!(
+            destination.metadata().expect("staged metadata").len() > 0,
+            "published staged segment should be non-empty"
+        );
+    }
+
+    #[test]
+    fn prefer_embedded_falls_back_to_sidecar_only_when_embedded_absent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&image, b"not-a-real-flac-with-no-readable-tags");
+        std::fs::write(
+            &cue_path,
+            br#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+
+        let mut req = test_request(&image);
+        req.source.cue_sidecar = CueSidecarPolicy::PreferEmbedded;
+
+        let cue_input = resolve_cue_input(&req)
+            .expect("absent embedded CUESHEET falls back to sidecar");
+        assert_eq!(cue_input.origin, CueOrigin::Sidecar);
+        assert_eq!(cue_input.cue_parent.as_deref(), cue_path.parent());
+    }
+
+    #[test]
+    fn prefer_embedded_does_not_swallow_malformed_embedded_cuesheet() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
+            eprintln!(
+                "skipping malformed embedded CUESHEET fixture: ffmpeg or metaflac is unavailable"
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let embedded_cue = temp.path().join("embedded-malformed.cue");
+        let sidecar_cue = temp.path().join("album.cue");
+
+        std::fs::write(
+            &embedded_cue,
+            br#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Malformed embedded CUE with no index"
+"#,
+        );
+        std::fs::write(
+            &sidecar_cue,
+            br#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+
+        run_fixture_command(
+            std::process::Command::new("ffmpeg")
+                .arg("-y")
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg("sine=frequency=440:sample_rate=44100:duration=1")
+                .arg("-c:a")
+                .arg("flac")
+                .arg(&image),
+        );
+        run_fixture_command(
+            std::process::Command::new("metaflac")
+                .arg(format!(
+                    "--set-tag-from-file=CUESHEET={}",
+                    embedded_cue.display()
+                ))
+                .arg(&image),
+        );
+
+        let mut req = test_request(&image);
+        req.source.cue_sidecar = CueSidecarPolicy::PreferEmbedded;
+
+        assert!(
+            is_cue_image_candidate(&req).expect("candidate detection succeeds"),
+            "malformed embedded CUESHEET must still route to the materializer so it can fail visibly"
+        );
+        let err = resolve_cue_input(&req)
+            .expect_err("malformed embedded CUESHEET must not fall back to sidecar");
+        let err = err.to_string();
+        assert!(
+            err.contains("INDEX 01"),
+            "error should report embedded CUE validation failure, got: {err}"
         );
     }
 
@@ -2197,8 +3920,8 @@ FILE "lofty-image.flac" WAVE
         let temp = tempfile::tempdir().expect("temp dir");
         let cue_path = temp.path().join("album.cue");
         let audio_path = temp.path().join("album.flac");
-        write_file(&cue_path, cue_sheet_single_track().as_bytes());
-        write_file(&audio_path, b"fake-audio-data");
+        std::fs::write(&cue_path, cue_sheet_single_track().as_bytes());
+        std::fs::write(&audio_path, b"fake-audio-data");
 
         let runner = StubToolRunner::new();
         runner.push_failure("ffprobe: error reading input");

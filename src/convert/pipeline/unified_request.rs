@@ -88,11 +88,7 @@ pub fn build_pipeline_request_from_settings(
                 .to_path_buf()
         });
 
-    let cue_policy = if is_cue_capable_path(&item.input_path) {
-        CueSidecarPolicy::PreferEmbedded
-    } else {
-        CueSidecarPolicy::IgnoreCue
-    };
+    let cue_policy = cue_policy_for_input_path(&item.input_path);
 
     Ok(PipelineRequest {
         job_id: format!("job-{}", item.id),
@@ -596,14 +592,34 @@ fn preferred_tool_from_option(value: Option<tonepoet_backend::Backend>) -> Prefe
     }
 }
 
+fn cue_policy_for_input_path(path: &Path) -> CueSidecarPolicy {
+    if has_extension(path, "cue") {
+        // A right-clicked `.cue` is the authoritative control file. Do not try
+        // to probe it for embedded tags and do not reinterpret it as an audio
+        // image; the materializer will resolve its FILE references.
+        CueSidecarPolicy::SidecarOnly
+    } else if is_cue_capable_path(path) {
+        CueSidecarPolicy::PreferEmbedded
+    } else {
+        CueSidecarPolicy::IgnoreCue
+    }
+}
+
 fn is_cue_capable_path(path: &Path) -> bool {
     const AUDIO_IMAGE_EXTENSIONS: &[&str] = &[
         "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4", "aac", "opus",
-        "ogg", "ape", "w64", "rf64", "cue",
+        "ogg", "ape", "w64", "rf64",
     ];
     path.extension()
         .and_then(|value| value.to_str())
         .map(|ext| AUDIO_IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case(expected))
         .unwrap_or(false)
 }
 

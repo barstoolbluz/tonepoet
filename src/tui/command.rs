@@ -898,8 +898,27 @@ fn is_nonprobeable_archive(path: &std::path::Path) -> bool {
     }
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| matches!(e.to_lowercase().as_str(), "7z" | "zip" | "rar" | "tar" | "cab" | "dmg" | "tgz" | "tbz2" | "txz"))
+        .map(|e| {
+            matches!(
+                e.to_lowercase().as_str(),
+                "7z" | "zip" | "rar" | "tar" | "cab" | "dmg" | "tgz" | "tbz2" | "txz"
+            )
+        })
         .unwrap_or(false)
+}
+
+fn is_cue_sheet_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("cue"))
+        .unwrap_or(false)
+}
+
+/// Sources that enter the conversion pipeline without an audio probe in the
+/// browse/queue handoff. The materializer performs source-specific validation
+/// later, which is the correct place for archives and CUE control files.
+fn is_nonprobeable_queue_source(path: &std::path::Path) -> bool {
+    is_nonprobeable_archive(path) || is_cue_sheet_path(path)
 }
 
 fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
@@ -1064,11 +1083,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(format!("Path not found: {}", expanded));
                 return;
             }
-            // Archives (7z, zip, rar, etc.) can't be probed by ffmpeg — skip
-            // the probe and load with info=None. The materializer handles
-            // extraction during conversion. ISOs are excluded because SACD
-            // ISOs have their own probe path via magic-byte detection.
-            let (info, metadata) = if is_nonprobeable_archive(&p) {
+            // Archives (7z, zip, rar, etc.) and CUE sheets can't be probed as
+            // audio — skip the probe and load with info=None. The materializer
+            // validates and resolves them during conversion. ISOs are excluded
+            // because SACD ISOs have their own probe path via magic-byte detection.
+            let (info, metadata) = if is_nonprobeable_queue_source(&p) {
                 (None, crate::tui::probe::SourceMetadata::default())
             } else {
                 let info = match crate::tui::probe::probe_audio(&p) {
@@ -3751,14 +3770,17 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
             let path_count = paths.len();
 
             // Probe the first file before touching any state so preset
-            // application stays atomic with a successful load. Archives
-            // (7z, zip, rar, etc.) can't be probed — skip and proceed
-            // with info=None.
-            let (info, metadata) = if is_nonprobeable_archive(&first) {
+            // application stays atomic with a successful load. Archives and
+            // CUE sheets can't be probed as audio — skip and proceed with
+            // info=None.
+            let (info, metadata) = if is_nonprobeable_queue_source(&first) {
                 (None, crate::tui::probe::SourceMetadata::default())
             } else {
                 match crate::tui::probe::probe_audio(&first) {
-                    Ok(i) => (Some(i), crate::tui::probe::read_metadata(&first).unwrap_or_default()),
+                    Ok(i) => (
+                        Some(i),
+                        crate::tui::probe::read_metadata(&first).unwrap_or_default(),
+                    ),
                     Err(e) => {
                         app.set_status(format!("probe error: {}", e));
                         return;

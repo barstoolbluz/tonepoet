@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 pub enum FileFormat {
     /// 7-Zip archive (may contain audio files)
     SevenZip,
+    /// CUE sheet control file. The CUE materializer resolves referenced audio
+    /// image(s); the `.cue` file itself is not probed as audio and is not an
+    /// archive surrogate.
+    CueSheet,
     /// Audio formats
     Audio(AudioFormat),
 }
@@ -511,6 +515,11 @@ impl FormatDetector {
             "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "dmg" | "tgz" | "tbz2" | "txz" => {
                 Ok(FileFormat::SevenZip)
             }
+            // Control files that route to the CUE materializer. These are
+            // deliberately distinct from SevenZip: treating `.cue` as an
+            // archive lets it pass the detector but sends the wrong signal to
+            // downstream code and hides probe/routing mistakes.
+            "cue" => Ok(FileFormat::CueSheet),
             // Audio formats.
             "flac" => Ok(FileFormat::Audio(AudioFormat::Flac)),
             "wav" | "wave" => Ok(FileFormat::Audio(AudioFormat::Wav)),
@@ -561,6 +570,9 @@ impl FormatDetector {
             FileFormat::Audio(format) => Ok(format),
             FileFormat::SevenZip => Err(super::ConversionError::UnsupportedFormat(
                 "Expected audio file, found archive".to_string(),
+            )),
+            FileFormat::CueSheet => Err(super::ConversionError::UnsupportedFormat(
+                "Expected audio file, found CUE sheet".to_string(),
             )),
         }
     }
