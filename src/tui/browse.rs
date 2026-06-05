@@ -1838,6 +1838,14 @@ impl BrowseState {
 /// blocking probe (`probe_audio` + `read_metadata`) runs on `spawn_blocking`
 /// so it doesn't tie up an async worker thread.
 pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::message::AppMessage>) {
+    if is_cue_sheet_path(&path) {
+        // Defense in depth: callers should route CUE preview through
+        // `spawn_cue_proxy_audio_probe`, but never allow a `.cue` text file to
+        // reach ffmpeg probing through this generic audio helper.
+        spawn_cue_proxy_audio_probe(path, tx);
+        return;
+    }
+
     tokio::spawn(async move {
         let path_for_task = path.clone();
         let result: Result<CachedInfo, String> = tokio::task::spawn_blocking(move || {
@@ -1848,6 +1856,43 @@ pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::mes
         })
         .await
         .unwrap_or_else(|join_err| Err(format!("probe task panicked: {}", join_err)));
+
+        let _ = tx
+            .send(super::message::AppMessage::AudioProbeComplete {
+                path,
+                result: Box::new(result),
+            })
+            .await;
+    });
+}
+
+/// Spawn a background tokio task that probes the audio image(s) referenced by
+/// a CUE sheet for Convert-screen batch cursor preview. This deliberately sends
+/// the CUE path as the logical source key while resolving and probing the
+/// referenced image files inside `probe_cue_proxy_source`; the `.cue` text file
+/// itself is never routed through `probe_audio`.
+pub fn spawn_cue_proxy_audio_probe(
+    path: PathBuf,
+    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let path_for_task = path.clone();
+        let result: Result<CachedInfo, String> = tokio::task::spawn_blocking(move || {
+            let result = crate::tui::app::probe_cue_proxy_source(&path_for_task)
+                .map_err(|err| format!("CUE proxy probe failed: {}; set format manually", err))?;
+
+            match result.info {
+                Some(source) => Ok(CachedInfo {
+                    source,
+                    metadata: result.metadata,
+                }),
+                None => Err(result.probe_notice.unwrap_or_else(|| {
+                    "CUE proxy probe returned no source info; set format manually".to_string()
+                })),
+            }
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(format!("CUE proxy probe task panicked: {}", join_err)));
 
         let _ = tx
             .send(super::message::AppMessage::AudioProbeComplete {
@@ -2449,7 +2494,7 @@ fn cue_referenced_audio_paths(cue_paths: &[PathBuf]) -> Vec<PathBuf> {
     referenced
 }
 
-fn materializable_cue_referenced_audio_paths_for_queue(cue_path: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn materializable_cue_referenced_audio_paths_for_queue(cue_path: &Path) -> Result<Vec<PathBuf>, String> {
     let sheet = crate::tui::cue_parser::parse_cue_file(cue_path)
         .map_err(|err| format!("failed to parse CUE: {err}"))?;
     let parent = cue_path
@@ -2527,13 +2572,13 @@ fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Re
 }
 
 #[derive(Debug)]
-enum CueReferenceResolution {
+pub(crate) enum CueReferenceResolution {
     Resolved(PathBuf),
     Missing,
     Ambiguous(Vec<PathBuf>),
 }
 
-fn resolve_cue_file_reference_for_queue(parent: &Path, file_ref: &str) -> CueReferenceResolution {
+pub(crate) fn resolve_cue_file_reference_for_queue(parent: &Path, file_ref: &str) -> CueReferenceResolution {
     let normalized_ref = file_ref.replace('\\', &std::path::MAIN_SEPARATOR.to_string());
     let raw_path = PathBuf::from(&normalized_ref);
 

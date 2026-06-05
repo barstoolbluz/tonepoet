@@ -37,14 +37,26 @@ pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
 
     match mode {
         SourceMode::Empty | SourceMode::Single { .. } => BASE,
-        SourceMode::Batch { paths, .. } => {
+        SourceMode::Batch {
+            paths,
+            cursor,
+            probe_notice,
+            cursor_probe_notice,
+            ..
+        } => {
             let n = paths.len();
             if n <= 1 {
                 return BASE;
             }
-            // Header: summary(1) + selected cursor preview(1) + formats(1).
-            // Pill: expand(1).
-            let header: u16 = 3;
+            // Header: summary(1) + selected cursor preview(1) + optional
+            // persistent warning(1) + formats(1). Pill: expand(1).
+            let effective_notice = effective_batch_probe_notice(
+                paths,
+                *cursor,
+                probe_notice.as_deref(),
+                cursor_probe_notice.as_ref(),
+            );
+            let header: u16 = 3 + if effective_notice.is_some() { 1 } else { 0 };
             let visible = n.min(10);
             let track_rows = ((visible + per_row - 1) / per_row) as u16;
             let overflow: u16 = if n > 10 { 1 } else { 0 };
@@ -55,14 +67,19 @@ pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
         SourceMode::MultiTrack {
             tracks,
             album_title,
+            info,
+            probe_notice,
             ..
         } => {
             let n = tracks.len();
             if n == 0 {
                 return BASE;
             }
-            // Header: filename(1) + album info(1 if present) + track count(1)
-            let header: u16 = if album_title.is_some() { 3 } else { 2 };
+            // Header: filename(1) + album info(1 if present) + source
+            // properties/notice(1 if present) + track count(1).
+            let header: u16 = 2
+                + if album_title.is_some() { 1 } else { 0 }
+                + if info.is_some() || probe_notice.is_some() { 1 } else { 0 };
             let visible = n.min(10);
             let track_rows = ((visible + per_row - 1) / per_row) as u16;
             let overflow: u16 = if n > 10 { 1 } else { 0 };
@@ -112,15 +129,26 @@ pub fn draw_source_pane(
 
     let content_lines = match &source.mode {
         SourceMode::Empty => render_empty(border_color, w),
-        SourceMode::Single { path, info, .. } => {
-            render_single(border_color, w, path, info.as_ref())
-        }
+        SourceMode::Single {
+            path,
+            info,
+            probe_notice,
+            ..
+        } => render_single(
+            border_color,
+            w,
+            path,
+            info.as_ref(),
+            probe_notice.as_deref(),
+        ),
         SourceMode::MultiTrack {
             path,
+            info,
             tracks,
             area_label,
             album_title,
             album_artist,
+            probe_notice,
             scroll,
             cursor,
             selected,
@@ -129,10 +157,12 @@ pub fn draw_source_pane(
             border_color,
             w,
             path,
+            info.as_ref(),
             tracks,
             area_label.as_deref(),
             album_title.as_deref(),
             album_artist.as_deref(),
+            probe_notice.as_deref(),
             *scroll,
             *cursor,
             selected,
@@ -142,6 +172,8 @@ pub fn draw_source_pane(
             paths,
             cursor,
             cursor_info,
+            probe_notice,
+            cursor_probe_notice,
             total_size,
             album_count,
             format_histogram,
@@ -152,6 +184,12 @@ pub fn draw_source_pane(
             paths,
             *cursor,
             cursor_info.as_ref(),
+            effective_batch_probe_notice(
+                paths,
+                *cursor,
+                probe_notice.as_deref(),
+                cursor_probe_notice.as_ref(),
+            ),
             *total_size,
             *album_count,
             format_histogram,
@@ -243,10 +281,31 @@ fn render_single<'a>(
     w: usize,
     path: &std::path::Path,
     info: Option<&SourceInfo>,
+    probe_notice: Option<&str>,
 ) -> Vec<Line<'a>> {
     let Some(info) = info else {
-        // Path is known but probe hasn't completed yet — show a minimal
-        // placeholder so the layout doesn't collapse.
+        // Path is known but no reliable probe info is available yet. When the
+        // source carries a durable notice (notably a malformed/empty direct
+        // `.cue`), show that warning instead of an indefinite probing state.
+        let status_line = if let Some(notice) = probe_notice {
+            bordered_line(
+                border_color,
+                w,
+                vec![
+                    Span::styled("   warning   ", theme::muted()),
+                    Span::styled(
+                        truncate_to(notice, w.saturating_sub(15)),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ],
+            )
+        } else {
+            bordered_line(
+                border_color,
+                w,
+                vec![Span::styled("   probing…", theme::muted())],
+            )
+        };
         return vec![
             bordered_line(
                 border_color,
@@ -256,11 +315,7 @@ fn render_single<'a>(
                     Span::styled(shorten_path(path, w.saturating_sub(16)), theme::bright()),
                 ],
             ),
-            bordered_line(
-                border_color,
-                w,
-                vec![Span::styled("   probing…", theme::muted())],
-            ),
+            status_line,
             bordered_line(border_color, w, vec![]),
             browse_pill_row(border_color, w),
         ];
@@ -311,6 +366,20 @@ fn render_single<'a>(
     ]
 }
 
+fn effective_batch_probe_notice<'a>(
+    paths: &'a [std::path::PathBuf],
+    cursor: usize,
+    batch_notice: Option<&'a str>,
+    cursor_notice: Option<&'a (std::path::PathBuf, String)>,
+) -> Option<&'a str> {
+    if let (Some(current), Some((notice_path, notice))) = (paths.get(cursor), cursor_notice) {
+        if current == notice_path {
+            return Some(notice.as_str());
+        }
+    }
+    batch_notice
+}
+
 /// Render the multi-file batch content: summary + inline file list + pill.
 /// `pane_height` is the total allocated pane height including borders.
 #[allow(clippy::too_many_arguments)]
@@ -320,6 +389,7 @@ fn render_batch<'a>(
     paths: &[std::path::PathBuf],
     cursor: usize,
     cursor_info: Option<&SourceInfo>,
+    probe_notice: Option<&str>,
     total_size: u64,
     album_count: usize,
     format_histogram: &[(AudioFormat, usize)],
@@ -380,7 +450,27 @@ fn render_batch<'a>(
         ],
     ));
 
-    // Line 3: format histogram, e.g. "FLAC (3) · WAV (2)"
+    // Line 3: persistent batch-level probe notice, when present. This is
+    // intentionally separate from the status bar so warnings remain visible
+    // until the source changes.
+    let header_rows: u16 = if let Some(notice) = probe_notice {
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled("   warning   ", theme::muted()),
+                Span::styled(
+                    truncate_to(notice, w.saturating_sub(15)),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ],
+        ));
+        4
+    } else {
+        3
+    };
+
+    // Next line: format histogram, e.g. "FLAC (3) · WAV (2)"
     let hist_str = if format_histogram.is_empty() {
         "(no recognised audio extensions)".to_string()
     } else {
@@ -403,7 +493,6 @@ fn render_batch<'a>(
     // starting at zero, so cursor moves from the source pane and from the
     // metadata pane stay visible without adding another persistent scroll
     // field to SourceMode::Batch.
-    let header_rows: u16 = 3; // summary + selected preview + formats
     let tracks_per_row: usize = if w >= 100 { 2 } else { 1 };
     let list_rows = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
     let has_overflow = n > list_rows.saturating_mul(tracks_per_row);
@@ -689,10 +778,12 @@ fn render_multi_track<'a>(
     border_color: ratatui::style::Color,
     w: usize,
     path: &Path,
+    info: Option<&SourceInfo>,
     tracks: &[super::app::MultiTrackEntry],
     area_label: Option<&str>,
     album_title: Option<&str>,
     album_artist: Option<&str>,
+    probe_notice: Option<&str>,
     scroll: usize,
     cursor: usize,
     selected: &[bool],
@@ -733,6 +824,32 @@ fn render_multi_track<'a>(
         ));
     }
 
+    if let Some(info) = info {
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled("   source    ", theme::muted()),
+                Span::styled(
+                    truncate_to(&batch_cursor_audio_summary(info), w.saturating_sub(15)),
+                    theme::text(),
+                ),
+            ],
+        ));
+    } else if let Some(notice) = probe_notice {
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled("   source    ", theme::muted()),
+                Span::styled(
+                    truncate_to(notice, w.saturating_sub(15)),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ],
+        ));
+    }
+
     // Track count
     lines.push(bordered_line(
         border_color,
@@ -745,7 +862,7 @@ fn render_multi_track<'a>(
 
     // Derive max visible tracks from pane height.
     // pane_height = borders(2) + header_rows + track_rows + pill(1) [+ overflow(1)]
-    let header_rows: u16 = if album_title.is_some() { 3 } else { 2 };
+    let header_rows: u16 = lines.len() as u16;
     let tracks_per_row: usize = if w >= 100 { 2 } else { 1 };
     let mut track_area = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
     // If there will be an overflow indicator, reserve a row for it.
@@ -849,4 +966,96 @@ fn truncate_to(s: &str, max_width: usize) -> String {
         head = candidate;
     }
     format!("{}{}", head, ellipsis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::probe::SourceMetadata;
+    use std::path::PathBuf;
+
+    fn batch_mode_with_notice(probe_notice: Option<String>) -> SourceMode {
+        SourceMode::Batch {
+            paths: vec![PathBuf::from("/tmp/a.cue"), PathBuf::from("/tmp/b.flac")],
+            cursor: 0,
+            cursor_info: None,
+            cursor_metadata: SourceMetadata::default(),
+            probe_notice,
+            cursor_probe_notice: None,
+            total_size: 0,
+            album_count: 1,
+            format_histogram: Vec::new(),
+        }
+    }
+
+
+    #[test]
+    fn render_single_without_info_shows_persistent_probe_notice() {
+        let lines = render_single(
+            Color::White,
+            96,
+            Path::new("/tmp/empty.cue"),
+            None,
+            Some("CUE sheet has no audio tracks"),
+        );
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("warning"));
+        assert!(rendered.contains("CUE sheet has no audio tracks"));
+        assert!(!rendered.contains("probing"));
+    }
+
+    #[test]
+    fn cursor_probe_notice_only_renders_for_matching_batch_cursor_path() {
+        let paths = vec![PathBuf::from("/tmp/a.flac"), PathBuf::from("/tmp/b.cue")];
+        let notice = Some((PathBuf::from("/tmp/b.cue"), "CUE image probe failed; set format manually".to_string()));
+
+        assert_eq!(
+            effective_batch_probe_notice(&paths, 1, None, notice.as_ref()),
+            Some("CUE image probe failed; set format manually")
+        );
+        assert_eq!(effective_batch_probe_notice(&paths, 0, None, notice.as_ref()), None);
+    }
+
+    #[test]
+    fn batch_probe_notice_gets_source_pane_height() {
+        let without = source_pane_height(&batch_mode_with_notice(None), 80);
+        let with = source_pane_height(
+            &batch_mode_with_notice(Some("mixed source properties; set format manually".to_string())),
+            80,
+        );
+
+        assert!(with > without);
+    }
+
+    #[test]
+    fn render_batch_includes_persistent_probe_notice() {
+        let paths = vec![PathBuf::from("/tmp/a.cue"), PathBuf::from("/tmp/b.flac")];
+        let lines = render_batch(
+            Color::White,
+            96,
+            &paths,
+            0,
+            None,
+            Some("mixed source properties; set format manually"),
+            0,
+            1,
+            &[],
+            10,
+        );
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("warning"));
+        assert!(rendered.contains("mixed source properties; set format manually"));
+    }
 }

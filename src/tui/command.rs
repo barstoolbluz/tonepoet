@@ -914,11 +914,11 @@ fn is_cue_sheet_path(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Sources that enter the conversion pipeline without an audio probe in the
-/// browse/queue handoff. The materializer performs source-specific validation
-/// later, which is the correct place for archives and CUE control files.
+/// Sources that enter the conversion pipeline without an immediate audio
+/// probe in the browse/queue handoff. CUE sheets are handled separately by
+/// probing their referenced image file(s), never the CUE text itself.
 fn is_nonprobeable_queue_source(path: &std::path::Path) -> bool {
-    is_nonprobeable_archive(path) || is_cue_sheet_path(path)
+    is_nonprobeable_archive(path)
 }
 
 fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
@@ -1083,12 +1083,20 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(format!("Path not found: {}", expanded));
                 return;
             }
-            // Archives (7z, zip, rar, etc.) and CUE sheets can't be probed as
-            // audio — skip the probe and load with info=None. The materializer
-            // validates and resolves them during conversion. ISOs are excluded
-            // because SACD ISOs have their own probe path via magic-byte detection.
-            let (info, metadata) = if is_nonprobeable_queue_source(&p) {
-                (None, crate::tui::probe::SourceMetadata::default())
+            // Archives (7z, zip, rar, etc.) cannot be probed as audio.
+            // CUE sheets are a special case: keep the CUE as the logical
+            // source, but probe its referenced image file(s) for properties.
+            let (info, metadata, cue_probe_notice) = if is_cue_sheet_path(&p) {
+                match probe_cue_proxy_source(&p) {
+                    Ok(result) => (result.info, result.metadata, result.probe_notice),
+                    Err(e) => (
+                        None,
+                        crate::tui::probe::SourceMetadata::default(),
+                        Some(format!("CUE proxy probe failed: {}; set format manually", e)),
+                    ),
+                }
+            } else if is_nonprobeable_queue_source(&p) {
+                (None, crate::tui::probe::SourceMetadata::default(), None)
             } else {
                 let info = match crate::tui::probe::probe_audio(&p) {
                     Ok(i) => i,
@@ -1099,7 +1107,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     }
                 };
                 let metadata = crate::tui::probe::read_metadata(&p).unwrap_or_default();
-                (Some(info), metadata)
+                (Some(info), metadata, None)
             };
             // Populate the editable metadata pane from the source tags.
             app.convert.metadata.title = metadata.title.clone();
@@ -1108,11 +1116,21 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.convert.metadata.genre = metadata.genre.clone();
             app.convert.metadata.year = metadata.year.clone();
 
-            app.convert.set_source_mode(SourceMode::from_single(p.clone(), info, metadata));
-            app.set_status(format!(
-                "Loaded: {}",
-                p.file_name().unwrap_or_default().to_string_lossy()
+            app.convert.set_source_mode(SourceMode::from_single_with_probe_notice(
+                p.clone(),
+                info,
+                metadata,
+                cue_probe_notice.clone(),
             ));
+            app.convert.apply_source_defaults();
+            if let Some(notice) = cue_probe_notice {
+                app.set_status(format!("Loaded CUE with warning: {}", notice));
+            } else {
+                app.set_status(format!(
+                    "Loaded: {}",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
             app.current_screen = AppScreen::Convert;
             app.recent.record_use_with_db(&p, &app.db);
         }
@@ -3770,16 +3788,26 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
             let path_count = paths.len();
 
             // Probe the first file before touching any state so preset
-            // application stays atomic with a successful load. Archives and
-            // CUE sheets can't be probed as audio — skip and proceed with
-            // info=None.
-            let (info, metadata) = if is_nonprobeable_queue_source(&first) {
-                (None, crate::tui::probe::SourceMetadata::default())
+            // application stays atomic with a successful load. Archives cannot
+            // be probed as audio. CUE sheets are probed through their resolved
+            // image file(s), never through ffmpeg on the CUE text.
+            let (info, metadata, cue_probe_notice) = if is_cue_sheet_path(&first) {
+                match probe_cue_proxy_source(&first) {
+                    Ok(result) => (result.info, result.metadata, result.probe_notice),
+                    Err(e) => (
+                        None,
+                        crate::tui::probe::SourceMetadata::default(),
+                        Some(format!("CUE proxy probe failed: {}; set format manually", e)),
+                    ),
+                }
+            } else if is_nonprobeable_queue_source(&first) {
+                (None, crate::tui::probe::SourceMetadata::default(), None)
             } else {
                 match crate::tui::probe::probe_audio(&first) {
                     Ok(i) => (
                         Some(i),
                         crate::tui::probe::read_metadata(&first).unwrap_or_default(),
+                        None,
                     ),
                     Err(e) => {
                         app.set_status(format!("probe error: {}", e));
@@ -3807,25 +3835,40 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
 
             // Build the SourceMode (computes batch summary synchronously
             // for multi-file batches).
-            let mut mode = SourceMode::from_paths(paths);
+            let mut mode = if path_count == 1 {
+                SourceMode::from_single_with_probe_notice(
+                    first.clone(),
+                    None,
+                    crate::tui::probe::SourceMetadata::default(),
+                    cue_probe_notice.clone(),
+                )
+            } else {
+                SourceMode::from_paths(paths)
+            };
             // Populate the first-file probe result into the appropriate
             // variant so the user sees immediate info on landing.
             match &mut mode {
                 SourceMode::Single {
                     info: slot,
                     metadata: meta_slot,
+                    probe_notice: single_probe_notice,
                     ..
                 } => {
                     *slot = info;
                     *meta_slot = metadata;
+                    *single_probe_notice = cue_probe_notice.clone();
                 }
                 SourceMode::Batch {
                     cursor_info,
                     cursor_metadata,
+                    probe_notice: batch_probe_notice,
+                    cursor_probe_notice,
                     ..
                 } => {
                     *cursor_info = info;
                     *cursor_metadata = metadata;
+                    *batch_probe_notice = cue_probe_notice.clone();
+                    *cursor_probe_notice = None;
                 }
                 SourceMode::MultiTrack {
                     info: slot,
@@ -3853,7 +3896,12 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
             app.previous_screen = Some(AppScreen::Browse);
             app.current_screen = AppScreen::Convert;
 
-            if path_count == 1 {
+            if let Some(notice) = app.convert.source.mode.persistent_probe_notice() {
+                app.set_status(format!(
+                    "CUE warning: {} — review settings, then :commit or :Commit",
+                    notice
+                ));
+            } else if path_count == 1 {
                 app.set_status("review settings, then :commit or :Commit");
             } else {
                 app.set_status(format!(

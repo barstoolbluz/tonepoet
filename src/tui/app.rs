@@ -358,6 +358,344 @@ fn read_embedded_cuesheet_for_preview(path: &Path) -> Option<crate::tui::cue_par
 }
 
 
+fn is_cue_sheet_path_for_preview(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("cue"))
+        .unwrap_or(false)
+}
+
+fn should_render_cue_sheet_as_multitrack(
+    source_is_cue_path: bool,
+    sheet: &crate::tui::cue_parser::CueSheet,
+) -> bool {
+    if source_is_cue_path {
+        // A queued `.cue` is itself the logical source. Preserve CUE semantics,
+        // track rendering, and persistent probe notices even for valid one-track
+        // sheets; otherwise warnings can fall back to transient Single-source
+        // paths. Audio files with embedded/sidecar CUEs keep the historical
+        // split-preview behavior unless the sheet actually describes multiple
+        // tracks.
+        !sheet.tracks.is_empty()
+    } else {
+        sheet.tracks.len() >= 2
+    }
+}
+
+/// Result of probing the audio image(s) referenced by a CUE control file.
+///
+/// The CUE path remains the logical source. `info` is populated only when the
+/// referenced image properties are uniform enough to drive format defaults
+/// safely. `probe_notice` is surfaced in the source pane/status bar when the
+/// app must avoid source-derived defaults.
+#[derive(Debug, Clone)]
+pub(crate) struct CueProxyProbeResult {
+    pub info: Option<SourceInfo>,
+    pub metadata: SourceMetadata,
+    pub probe_notice: Option<String>,
+}
+
+#[cfg(not(test))]
+fn cue_proxy_probe_audio_for_preview(path: &Path) -> Result<SourceInfo, String> {
+    crate::tui::probe::probe_audio(path)
+}
+
+#[cfg(test)]
+fn cue_proxy_probe_audio_for_preview(path: &Path) -> Result<SourceInfo, String> {
+    CUE_PROXY_PROBE_TEST_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(hook) = slot.as_mut() {
+            hook.probed_paths.push(path.to_path_buf());
+            hook.probe_results
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("unexpected CUE proxy probe path in test: {}", path.display())))
+        } else {
+            crate::tui::probe::probe_audio(path)
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn cue_proxy_read_metadata_for_preview(path: &Path) -> SourceMetadata {
+    crate::tui::probe::read_metadata(path).unwrap_or_default()
+}
+
+#[cfg(test)]
+fn cue_proxy_read_metadata_for_preview(path: &Path) -> SourceMetadata {
+    CUE_PROXY_PROBE_TEST_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(hook) = slot.as_mut() {
+            hook.metadata_paths.push(path.to_path_buf());
+            hook.metadata_results.get(path).cloned().unwrap_or_default()
+        } else {
+            crate::tui::probe::read_metadata(path).unwrap_or_default()
+        }
+    })
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CueProxyProbeTestHook {
+    probe_results: std::collections::HashMap<PathBuf, Result<SourceInfo, String>>,
+    metadata_results: std::collections::HashMap<PathBuf, SourceMetadata>,
+    probed_paths: Vec<PathBuf>,
+    metadata_paths: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CUE_PROXY_PROBE_TEST_HOOK: std::cell::RefCell<Option<CueProxyProbeTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+struct CueProxyProbeTestHookGuard;
+
+#[cfg(test)]
+impl Drop for CueProxyProbeTestHookGuard {
+    fn drop(&mut self) {
+        CUE_PROXY_PROBE_TEST_HOOK.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn with_cue_proxy_probe_test_hook<T>(
+    hook: CueProxyProbeTestHook,
+    f: impl FnOnce() -> T,
+) -> (T, CueProxyProbeTestHook) {
+    CUE_PROXY_PROBE_TEST_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "nested CUE proxy test hook");
+        *slot.borrow_mut() = Some(hook);
+    });
+    let guard = CueProxyProbeTestHookGuard;
+    let result = f();
+    let hook = CUE_PROXY_PROBE_TEST_HOOK.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("CUE proxy test hook should still be installed")
+    });
+    std::mem::forget(guard);
+    (result, hook)
+}
+
+/// Probe audio image file(s) referenced by a `.cue`, never the CUE text file.
+///
+/// Single-image CUEs return that image's `SourceInfo`. Track-by-track CUEs
+/// probe every unique FILE target and return aggregate duration/size when the
+/// codec/container/rate/depth/channel properties are uniform. Mixed,
+/// unresolved, ambiguous, or unprobeable references return `info: None` plus a
+/// notice so defaults are not silently derived from a guessed 16/44.1 source.
+pub(crate) fn probe_cue_proxy_source(cue_path: &Path) -> Result<CueProxyProbeResult, String> {
+    let sheet = crate::tui::cue_parser::parse_cue_file(cue_path)
+        .map_err(|err| format!("failed to parse CUE: {err}"))?;
+    let mut metadata = cue_sheet_metadata(&sheet, SourceMetadata::default());
+
+    if sheet.tracks.is_empty() {
+        return Ok(CueProxyProbeResult {
+            info: None,
+            metadata,
+            probe_notice: Some("CUE sheet has no audio tracks".to_string()),
+        });
+    }
+
+    let parent = cue_path
+        .parent()
+        .ok_or_else(|| "CUE path has no parent directory".to_string())?;
+
+    let mut file_refs = Vec::<String>::new();
+    let mut missing_track_refs = Vec::<u32>::new();
+    for track in &sheet.tracks {
+        match track.file.as_deref() {
+            Some(file_ref) if !file_ref.trim().is_empty() => push_unique_string(&mut file_refs, file_ref),
+            _ => missing_track_refs.push(track.number),
+        }
+    }
+
+    if !missing_track_refs.is_empty() {
+        return Ok(CueProxyProbeResult {
+            info: None,
+            metadata,
+            probe_notice: Some(format!(
+                "CUE track(s) {} have no FILE reference; set format manually",
+                format_u32_list(&missing_track_refs)
+            )),
+        });
+    }
+
+    if file_refs.is_empty() {
+        return Ok(CueProxyProbeResult {
+            info: None,
+            metadata,
+            probe_notice: Some("CUE sheet has no FILE references; set format manually".to_string()),
+        });
+    }
+
+    let mut image_paths = Vec::<PathBuf>::new();
+    let mut resolution_errors = Vec::<String>::new();
+    for file_ref in &file_refs {
+        match crate::tui::browse::resolve_cue_file_reference_for_queue(parent, file_ref) {
+            crate::tui::browse::CueReferenceResolution::Resolved(path) => {
+                push_unique_path_for_cue_probe(&mut image_paths, path);
+            }
+            crate::tui::browse::CueReferenceResolution::Missing => {
+                resolution_errors.push(format!("FILE {:?} was not found", file_ref));
+            }
+            crate::tui::browse::CueReferenceResolution::Ambiguous(candidates) => {
+                resolution_errors.push(format!(
+                    "FILE {:?} was ambiguous: {}",
+                    file_ref,
+                    format_candidate_paths_for_cue_probe(&candidates)
+                ));
+            }
+        }
+    }
+
+    if !resolution_errors.is_empty() {
+        return Ok(CueProxyProbeResult {
+            info: None,
+            metadata,
+            probe_notice: Some(format!(
+                "{}; set format manually",
+                resolution_errors.join("; ")
+            )),
+        });
+    }
+
+    let mut probed = Vec::<(PathBuf, SourceInfo)>::new();
+    let mut probe_errors = Vec::<String>::new();
+    for image_path in image_paths {
+        match cue_proxy_probe_audio_for_preview(&image_path) {
+            Ok(info) => {
+                probed.push((image_path, info));
+            }
+            Err(err) => {
+                probe_errors.push(format!("{}: {}", image_path.display(), err));
+            }
+        }
+    }
+
+    if !probe_errors.is_empty() {
+        return Ok(CueProxyProbeResult {
+            info: None,
+            metadata,
+            probe_notice: Some(format!(
+                "CUE image probe failed: {}; set format manually",
+                probe_errors.join("; ")
+            )),
+        });
+    }
+
+    if probed.is_empty() {
+        return Ok(CueProxyProbeResult {
+            info: None,
+            metadata,
+            probe_notice: Some("CUE FILE references resolved to no images; set format manually".to_string()),
+        });
+    }
+
+    let mut first_info = probed[0].1.clone();
+    let uniform = probed
+        .iter()
+        .all(|(_, info)| cue_proxy_probe_properties_match(&first_info, info));
+
+    if !uniform {
+        return Ok(CueProxyProbeResult {
+            info: None,
+            metadata,
+            probe_notice: Some(format!(
+                "mixed source properties across {} CUE image files; set format manually",
+                probed.len()
+            )),
+        });
+    }
+
+    // Only the first image's tags are ever merged into the Convert metadata
+    // pane. Probe every image for uniformity, but avoid redundant tag reads for
+    // multi-file CUEs and skip image-tag reads entirely when the CUE is mixed.
+    let first_metadata = cue_proxy_read_metadata_for_preview(&probed[0].0);
+    metadata = cue_sheet_metadata(&sheet, first_metadata);
+
+    if probed.len() > 1 {
+        first_info.duration_secs = probed.iter().map(|(_, info)| info.duration_secs).sum();
+        first_info.file_size = probed.iter().map(|(_, info)| info.file_size).sum();
+    }
+
+    Ok(CueProxyProbeResult {
+        info: Some(first_info),
+        metadata,
+        probe_notice: None,
+    })
+}
+
+fn cue_sheet_metadata(
+    sheet: &crate::tui::cue_parser::CueSheet,
+    mut metadata: SourceMetadata,
+) -> SourceMetadata {
+    if metadata.album.is_none() {
+        metadata.album = sheet.title.clone();
+    }
+    if metadata.artist.is_none() {
+        metadata.artist = sheet.performer.clone();
+    }
+    if metadata.genre.is_none() {
+        metadata.genre = sheet.genre.clone();
+    }
+    if metadata.year.is_none() {
+        metadata.year = sheet.date.clone();
+    }
+    if metadata.catalog_number.is_none() {
+        metadata.catalog_number = sheet.catalog.clone();
+    }
+    metadata
+}
+
+fn cue_proxy_probe_properties_match(left: &SourceInfo, right: &SourceInfo) -> bool {
+    left.format_name == right.format_name
+        && left.codec == right.codec
+        && left.bit_depth == right.bit_depth
+        && left.sample_rate == right.sample_rate
+        && left.channels == right.channels
+        && left.channel_layout == right.channel_layout
+}
+
+fn push_unique_string(values: &mut Vec<String>, candidate: &str) {
+    if !values.iter().any(|value| value == candidate) {
+        values.push(candidate.to_string());
+    }
+}
+
+fn push_unique_path_for_cue_probe(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|existing| same_path_for_cue_probe(existing, &candidate)) {
+        paths.push(candidate);
+    }
+}
+
+fn same_path_for_cue_probe(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn format_candidate_paths_for_cue_probe(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_u32_list(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 
 /// Merge mode for the output options pane
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -388,6 +726,10 @@ pub enum SourceMode {
         path: PathBuf,
         info: Option<SourceInfo>,
         metadata: SourceMetadata,
+        /// Persistent warning for direct sources whose probe data is unavailable,
+        /// especially malformed or empty `.cue` files that cannot be rendered as
+        /// MultiTrack but still need a durable "set format manually" notice.
+        probe_notice: Option<String>,
     },
     /// A multi-track source (SACD ISO, CUE+image) loaded for review.
     /// The track list comes from TOC/CUE parsing, not audio probing.
@@ -400,6 +742,8 @@ pub enum SourceMode {
         area_label: Option<String>,
         album_title: Option<String>,
         album_artist: Option<String>,
+        /// CUE proxy-probe warning or mixed-properties notice shown in the source pane.
+        probe_notice: Option<String>,
         scroll: usize,
         /// Cursor position in the track list (0-based).
         cursor: usize,
@@ -415,6 +759,15 @@ pub enum SourceMode {
         cursor: usize,
         cursor_info: Option<SourceInfo>,
         cursor_metadata: SourceMetadata,
+        /// Persistent warning for batch-level source probing, especially when
+        /// the first batch item is a CUE sheet whose referenced image files
+        /// are unresolved, unprobeable, or mixed-property. Unlike the status
+        /// line, this stays visible in the source pane until the source changes.
+        probe_notice: Option<String>,
+        /// Cursor-specific warning from lazy batch preview probing. This is
+        /// keyed by path so an async CUE warning cannot appear for the wrong
+        /// selected batch item if the cursor moves before the probe completes.
+        cursor_probe_notice: Option<(PathBuf, String)>,
         /// Sum of file sizes (cheap: `fs::metadata` per path).
         total_size: u64,
         /// Distinct parent-directory count — a rough "album" heuristic.
@@ -463,6 +816,8 @@ impl SourceMode {
                     cursor: 0,
                     cursor_info: None,
                     cursor_metadata: SourceMetadata::default(),
+                    probe_notice: None,
+                    cursor_probe_notice: None,
                     total_size,
                     album_count,
                     format_histogram,
@@ -547,6 +902,18 @@ impl SourceMode {
         }
     }
 
+    /// Durable probe notice for the currently installed source, when one should
+    /// remain visible until the source changes. Cursor-specific batch notices are
+    /// rendered by the source pane because they depend on the selected path.
+    pub fn persistent_probe_notice(&self) -> Option<&str> {
+        match self {
+            Self::Single { probe_notice: Some(notice), .. }
+            | Self::MultiTrack { probe_notice: Some(notice), .. }
+            | Self::Batch { probe_notice: Some(notice), .. } => Some(notice.as_str()),
+            _ => None,
+        }
+    }
+
     /// Number of files (0/1/N for Empty/Single/Batch; 1 for MultiTrack).
     pub fn len(&self) -> usize {
         match self {
@@ -559,6 +926,17 @@ impl SourceMode {
     /// Build a SourceMode for a single path. Detects SACD ISOs and CUE
     /// pairs and returns MultiTrack when a track listing is available.
     pub fn from_single(path: PathBuf, info: Option<SourceInfo>, metadata: SourceMetadata) -> Self {
+        Self::from_single_with_probe_notice(path, info, metadata, None)
+    }
+
+    /// Build a SourceMode for a single path, optionally carrying a CUE
+    /// proxy-probe notice into the MultiTrack source pane.
+    pub fn from_single_with_probe_notice(
+        path: PathBuf,
+        info: Option<SourceInfo>,
+        metadata: SourceMetadata,
+        probe_notice: Option<String>,
+    ) -> Self {
         // SACD ISO detection
         if crate::tui::sacd::is_sacd_iso(&path) {
             if let Ok(sacd) = crate::tui::sacd::parse_sacd_iso(&path) {
@@ -636,6 +1014,7 @@ impl SourceMode {
                         area_label: Some(area_label.to_string()),
                         album_title,
                         album_artist,
+                        probe_notice: None,
                         scroll: 0,
                         cursor: 0,
                         selected: vec![true; track_count],
@@ -644,14 +1023,19 @@ impl SourceMode {
             }
         }
 
-        // CUE detection: prefer embedded CUESHEET, fall back to sidecar.
-        let cue_sheet = read_embedded_cuesheet_for_preview(&path)
-            .or_else(|| {
+        // CUE detection: parse a queued `.cue` directly. For audio images,
+        // prefer embedded CUESHEET metadata, then fall back to a sidecar.
+        let source_is_cue_path = is_cue_sheet_path_for_preview(&path);
+        let cue_sheet = if source_is_cue_path {
+            crate::tui::cue_parser::parse_cue_file(&path).ok()
+        } else {
+            read_embedded_cuesheet_for_preview(&path).or_else(|| {
                 crate::tui::cue_parser::find_sidecar_cue(&path)
                     .and_then(|p| crate::tui::cue_parser::parse_cue_file(&p).ok())
-            });
+            })
+        };
         if let Some(sheet) = cue_sheet {
-            if sheet.tracks.len() >= 2 {
+            if should_render_cue_sheet_as_multitrack(source_is_cue_path, &sheet) {
                 let tracks: Vec<MultiTrackEntry> = sheet
                     .tracks
                     .iter()
@@ -680,6 +1064,7 @@ impl SourceMode {
                     area_label: None,
                     album_title: sheet.title,
                     album_artist: sheet.performer,
+                    probe_notice,
                     scroll: 0,
                     cursor: 0,
                     selected: vec![true; track_count],
@@ -691,6 +1076,7 @@ impl SourceMode {
             path,
             info,
             metadata,
+            probe_notice: if source_is_cue_path { probe_notice } else { None },
         }
     }
 }
@@ -1416,6 +1802,37 @@ impl FormatState {
         }
     }
 
+    /// Clear source-derived choices when the newly installed source has no
+    /// reliable probe info. This keeps a failed, unresolved, or mixed CUE proxy
+    /// probe from inheriting sample-rate, bit-depth, dither, resampler, or DSD
+    /// source-side effects from the previously viewed source. Codec/container
+    /// choices and explicit codec settings are preserved because they are user
+    /// output preferences, not facts derived from the source.
+    pub fn clear_source_derived_defaults(&mut self) {
+        self.source_is_dsd = false;
+        self.dither_overridden = false;
+        self.resampler_overridden = false;
+        self.dsd_gain_mode.select_value(&DsdGainMode::Disabled);
+        self.dsd_gain_db = 0.0;
+
+        if self.is_dsd_selected() {
+            self.sample_rate.select_value(&2_822_400);
+            self.dither.select_value(&DitherType::None);
+            self.resampler.select_value(&ResamplerChoice::None);
+            self.apply_format_constraints();
+            self.cascade_dsd_rate_defaults();
+            return;
+        }
+
+        self.sample_rate.select_value(&44_100);
+        self.bit_depth.select_value(&BitDepthChoice::Int16);
+        self.dither.select_value(&DitherType::None);
+        self.resampler.select_value(&ResamplerChoice::None);
+        self.apply_format_constraints();
+        self.apply_auto_dither(None);
+        self.apply_auto_resampler(None);
+    }
+
     /// Set PCM output defaults to match a PCM source. Called when a source is
     /// first probed or when the output format is PCM and source info becomes
     /// available. Selects the closest available sample rate and bit depth pills,
@@ -1877,8 +2294,11 @@ impl ConvertState {
     /// Apply source-aware format pane defaults after a probe completes.
     /// For PCM sources: matches sample rate and bit depth to source.
     /// For DSD sources with PCM output: sets recommended target rate and 24-bit.
+    /// For sources without reliable probe info, clears source-derived controls
+    /// so stale defaults from a previous source cannot survive the source swap.
     pub fn apply_source_defaults(&mut self) {
         let Some(info) = self.source.mode.current_info() else {
+            self.format.clear_source_derived_defaults();
             return;
         };
         let source_rate = info.sample_rate;
@@ -3236,14 +3656,29 @@ impl AppState {
         }
 
         let first = valid[0].clone();
-        let info = match crate::tui::probe::probe_audio(&first) {
-            Ok(i) => Some(i),
-            Err(e) => {
-                log::warn!("cli: probe failed for {}: {}", first.display(), e);
-                None
+        let (info, metadata, probe_notice) = if is_cue_sheet_path_for_preview(&first) {
+            match probe_cue_proxy_source(&first) {
+                Ok(result) => (result.info, result.metadata, result.probe_notice),
+                Err(e) => {
+                    log::warn!("cli: CUE proxy probe failed for {}: {}", first.display(), e);
+                    (
+                        None,
+                        crate::tui::probe::SourceMetadata::default(),
+                        Some(format!("CUE proxy probe failed: {}; set format manually", e)),
+                    )
+                }
             }
+        } else {
+            let info = match crate::tui::probe::probe_audio(&first) {
+                Ok(i) => Some(i),
+                Err(e) => {
+                    log::warn!("cli: probe failed for {}: {}", first.display(), e);
+                    None
+                }
+            };
+            let metadata = crate::tui::probe::read_metadata(&first).unwrap_or_default();
+            (info, metadata, None)
         };
-        let metadata = crate::tui::probe::read_metadata(&first).unwrap_or_default();
 
         // Populate the editable metadata pane from the first file's tags.
         self.convert.metadata.title = metadata.title.clone();
@@ -3254,23 +3689,33 @@ impl AppState {
 
         // Build the mode (Single for 1 file, Batch for N) and populate
         // first-file probe/metadata in the appropriate variant.
-        let mut mode = SourceMode::from_paths(valid);
+        let mut mode = if valid.len() == 1 {
+            SourceMode::from_single_with_probe_notice(first.clone(), None, SourceMetadata::default(), probe_notice.clone())
+        } else {
+            SourceMode::from_paths(valid)
+        };
         match &mut mode {
             SourceMode::Single {
                 info: slot,
                 metadata: meta_slot,
+                probe_notice: single_probe_notice,
                 ..
             } => {
                 *slot = info;
                 *meta_slot = metadata;
+                *single_probe_notice = probe_notice.clone();
             }
             SourceMode::Batch {
                 cursor_info,
                 cursor_metadata,
+                probe_notice: batch_probe_notice,
+                cursor_probe_notice,
                 ..
             } => {
                 *cursor_info = info;
                 *cursor_metadata = metadata;
+                *batch_probe_notice = probe_notice.clone();
+                *cursor_probe_notice = None;
             }
             SourceMode::MultiTrack {
                 info: slot,
@@ -3285,6 +3730,10 @@ impl AppState {
             }
         }
         self.convert.set_source_mode(mode);
+        // `set_source_mode` only installs the source and updates DSD side effects.
+        // CLI-seeded CUE proxy info must drive the same sample-rate, bit-depth,
+        // dither, and resampler defaults as Browse/queue probe completion.
+        self.convert.apply_source_defaults();
 
         // Record the first file in the recent-files history.
         self.recent.record_use_with_db(&first, &self.db);
@@ -3304,7 +3753,10 @@ impl AppState {
         } else {
             String::new()
         };
-        let status = if valid_count == 1 {
+        let source_probe_notice = self.convert.source.mode.persistent_probe_notice();
+        let status = if let Some(notice) = source_probe_notice {
+            format!("loaded CUE from cli with warning: {}", notice)
+        } else if valid_count == 1 {
             format!(
                 "loaded {}{} from cli — review, then :commit or :Commit",
                 first.file_name().unwrap_or_default().to_string_lossy(),
@@ -4620,6 +5072,514 @@ mod cue_preview_state_tests {
         s.cancel_edit();
         assert_eq!(s.content, "alpha\nbeta\n");
         assert!(!s.is_editing());
+    }
+}
+
+#[cfg(test)]
+mod cue_proxy_probe_tests {
+    use super::*;
+
+    fn source_info(sample_rate: u32, bit_depth: Option<u32>, channels: u32) -> SourceInfo {
+        SourceInfo {
+            format_name: "FLAC".to_string(),
+            codec: "FLAC".to_string(),
+            bit_depth,
+            sample_rate,
+            channels,
+            channel_layout: if channels == 2 { "stereo".to_string() } else { format!("{} ch", channels) },
+            duration_secs: 123.0,
+            file_size: 456,
+        }
+    }
+
+    #[test]
+    fn cue_proxy_uniform_properties_ignore_duration_and_size() {
+        let mut left = source_info(96_000, Some(24), 2);
+        let mut right = source_info(96_000, Some(24), 2);
+        left.duration_secs = 10.0;
+        left.file_size = 100;
+        right.duration_secs = 20.0;
+        right.file_size = 200;
+
+        assert!(cue_proxy_probe_properties_match(&left, &right));
+    }
+
+    #[test]
+    fn cue_proxy_uniform_properties_reject_rate_depth_or_channel_mismatch() {
+        let base = source_info(44_100, Some(16), 2);
+        assert!(!cue_proxy_probe_properties_match(&base, &source_info(48_000, Some(16), 2)));
+        assert!(!cue_proxy_probe_properties_match(&base, &source_info(44_100, Some(24), 2)));
+        assert!(!cue_proxy_probe_properties_match(&base, &source_info(44_100, Some(16), 6)));
+    }
+
+    #[test]
+    fn cue_sheet_metadata_fills_only_missing_fields() {
+        let mut sheet = crate::tui::cue_parser::CueSheet::default();
+        sheet.title = Some("Cue Album".to_string());
+        sheet.performer = Some("Cue Artist".to_string());
+        sheet.genre = Some("Cue Genre".to_string());
+        sheet.date = Some("1984".to_string());
+        sheet.catalog = Some("0123456789012".to_string());
+
+        let mut metadata = SourceMetadata::default();
+        metadata.album = Some("Tagged Album".to_string());
+
+        let merged = cue_sheet_metadata(&sheet, metadata);
+        assert_eq!(merged.album.as_deref(), Some("Tagged Album"));
+        assert_eq!(merged.artist.as_deref(), Some("Cue Artist"));
+        assert_eq!(merged.genre.as_deref(), Some("Cue Genre"));
+        assert_eq!(merged.year.as_deref(), Some("1984"));
+        assert_eq!(merged.catalog_number.as_deref(), Some("0123456789012"));
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tonepoet_{}_{}_{}",
+            prefix,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory should be creatable");
+        dir
+    }
+
+    fn write_test_file(path: &Path, contents: &str) {
+        std::fs::write(path, contents).expect("test file should be writable");
+    }
+
+    #[test]
+    fn direct_one_track_cue_remains_multitrack_with_probe_notice() {
+        let dir = temp_test_dir("one_track");
+        let cue_path = dir.join("single.cue");
+        let cue_text = r#"TITLE "Single Cue Album"
+PERFORMER "Album Artist"
+FILE "image.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Only Track"
+    PERFORMER "Track Artist"
+    INDEX 01 00:00:00
+"#;
+        write_test_file(&cue_path, cue_text);
+
+        let mode = SourceMode::from_single_with_probe_notice(
+            cue_path.clone(),
+            None,
+            SourceMetadata::default(),
+            Some("CUE proxy warning".to_string()),
+        );
+
+        match mode {
+            SourceMode::MultiTrack {
+                path,
+                info,
+                tracks,
+                album_title,
+                album_artist,
+                probe_notice,
+                selected,
+                ..
+            } => {
+                assert_eq!(path, cue_path);
+                assert!(info.is_none());
+                assert_eq!(tracks.len(), 1);
+                assert_eq!(tracks[0].number, 1);
+                assert_eq!(tracks[0].title.as_deref(), Some("Only Track"));
+                assert_eq!(tracks[0].performer.as_deref(), Some("Track Artist"));
+                assert_eq!(album_title.as_deref(), Some("Single Cue Album"));
+                assert_eq!(album_artist.as_deref(), Some("Album Artist"));
+                assert_eq!(probe_notice.as_deref(), Some("CUE proxy warning"));
+                assert_eq!(selected, vec![true]);
+            }
+            other => panic!("expected direct one-track CUE to remain MultiTrack, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn single_image_cue_returns_source_info_and_never_probes_cue_text() {
+        let dir = temp_test_dir("single_image_proxy");
+        let cue_path = dir.join("album.cue");
+        let image_path = dir.join("image.flac");
+        write_test_file(&image_path, "not real audio; probe is mocked");
+        write_test_file(
+            &cue_path,
+            r#"TITLE "Proxy Album"
+PERFORMER "Proxy Artist"
+FILE "image.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 04:00:00
+"#,
+        );
+
+        let mut hook = CueProxyProbeTestHook::default();
+        hook.probe_results
+            .insert(image_path.clone(), Ok(source_info(96_000, Some(24), 2)));
+        let (result, hook) = with_cue_proxy_probe_test_hook(hook, || {
+            probe_cue_proxy_source(&cue_path).expect("CUE proxy probe should succeed")
+        });
+
+        let info = result.info.expect("single-image CUE should expose proxied SourceInfo");
+        assert_eq!(info.sample_rate, 96_000);
+        assert_eq!(info.bit_depth, Some(24));
+        assert!(result.probe_notice.is_none());
+        assert_eq!(result.metadata.album.as_deref(), Some("Proxy Album"));
+        assert_eq!(result.metadata.artist.as_deref(), Some("Proxy Artist"));
+        assert_eq!(hook.probed_paths, vec![image_path.clone()]);
+        assert!(!hook.probed_paths.iter().any(|path| path == &cue_path));
+        assert_eq!(hook.metadata_paths, vec![image_path]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multi_file_uniform_cue_aggregates_duration_and_size() {
+        let dir = temp_test_dir("uniform_aggregate");
+        let cue_path = dir.join("album.cue");
+        let first = dir.join("01.flac");
+        let second = dir.join("02.flac");
+        write_test_file(&first, "mocked");
+        write_test_file(&second, "mocked");
+        write_test_file(
+            &cue_path,
+            r#"FILE "01.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+FILE "02.flac" WAVE
+  TRACK 02 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+
+        let mut first_info = source_info(44_100, Some(16), 2);
+        first_info.duration_secs = 11.5;
+        first_info.file_size = 101;
+        let mut second_info = source_info(44_100, Some(16), 2);
+        second_info.duration_secs = 22.25;
+        second_info.file_size = 202;
+
+        let mut hook = CueProxyProbeTestHook::default();
+        hook.probe_results.insert(first.clone(), Ok(first_info));
+        hook.probe_results.insert(second.clone(), Ok(second_info));
+
+        let (result, hook) = with_cue_proxy_probe_test_hook(hook, || {
+            probe_cue_proxy_source(&cue_path).expect("CUE proxy probe should succeed")
+        });
+
+        let info = result.info.expect("uniform multi-file CUE should expose SourceInfo");
+        assert!((info.duration_secs - 33.75).abs() < f64::EPSILON);
+        assert_eq!(info.file_size, 303);
+        assert!(result.probe_notice.is_none());
+        assert_eq!(hook.probed_paths, vec![first.clone(), second]);
+        assert_eq!(hook.metadata_paths, vec![first]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mixed_cue_keeps_persistent_notice_and_clears_source_defaults() {
+        let dir = temp_test_dir("mixed_defaults");
+        let cue_path = dir.join("mixed.cue");
+        let first = dir.join("01.flac");
+        let second = dir.join("02.flac");
+        write_test_file(&first, "mocked");
+        write_test_file(&second, "mocked");
+        write_test_file(
+            &cue_path,
+            r#"FILE "01.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+FILE "02.flac" WAVE
+  TRACK 02 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+
+        let mut hook = CueProxyProbeTestHook::default();
+        hook.probe_results
+            .insert(first, Ok(source_info(96_000, Some(24), 2)));
+        hook.probe_results
+            .insert(second, Ok(source_info(44_100, Some(16), 2)));
+        let (result, _hook) = with_cue_proxy_probe_test_hook(hook, || {
+            probe_cue_proxy_source(&cue_path).expect("CUE proxy probe should return a warning result")
+        });
+
+        assert!(result.info.is_none());
+        let notice = result.probe_notice.clone().expect("mixed CUE should warn");
+        assert!(notice.contains("mixed source properties"));
+
+        let mode = SourceMode::from_single_with_probe_notice(
+            cue_path.clone(),
+            result.info,
+            result.metadata,
+            result.probe_notice,
+        );
+        match &mode {
+            SourceMode::MultiTrack { probe_notice, .. } => {
+                assert_eq!(probe_notice.as_deref(), Some(notice.as_str()));
+            }
+            other => panic!("expected mixed direct CUE to remain MultiTrack, got {:?}", other),
+        }
+
+        let mut convert = ConvertState::new();
+        convert.set_source_mode(SourceMode::Single {
+            path: PathBuf::from("/tmp/highres.flac"),
+            info: Some(source_info(96_000, Some(24), 2)),
+            metadata: SourceMetadata::default(),
+            probe_notice: None,
+        });
+        convert.apply_source_defaults();
+        assert_eq!(*convert.format.sample_rate.selected_value(), 96_000);
+        assert_eq!(*convert.format.bit_depth.selected_value(), BitDepthChoice::Int24);
+
+        convert.set_source_mode(mode);
+        convert.apply_source_defaults();
+        assert_eq!(*convert.format.sample_rate.selected_value(), 44_100);
+        assert_eq!(*convert.format.bit_depth.selected_value(), BitDepthChoice::Int16);
+        assert_eq!(*convert.format.dither.selected_value(), DitherType::None);
+        assert_eq!(*convert.format.resampler.selected_value(), ResamplerChoice::None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_ambiguous_and_non_audio_cue_file_references_warn() {
+        let dir = temp_test_dir("bad_refs");
+
+        let missing_cue = dir.join("missing.cue");
+        write_test_file(
+            &missing_cue,
+            r#"FILE "missing.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+        let missing = probe_cue_proxy_source(&missing_cue).expect("missing reference should be a warning result");
+        assert!(missing.info.is_none());
+        assert!(missing.probe_notice.unwrap().contains("was not found"));
+
+        let ambiguous_cue = dir.join("ambiguous.cue");
+        write_test_file(&dir.join("ambiguous.flac"), "mocked");
+        write_test_file(&dir.join("ambiguous.wav"), "mocked");
+        write_test_file(
+            &ambiguous_cue,
+            r#"FILE "ambiguous" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+        let ambiguous = probe_cue_proxy_source(&ambiguous_cue).expect("ambiguous reference should be a warning result");
+        assert!(ambiguous.info.is_none());
+        assert!(ambiguous.probe_notice.unwrap().contains("was ambiguous"));
+
+        let non_audio_cue = dir.join("non_audio.cue");
+        let non_audio = dir.join("notes.txt");
+        write_test_file(&non_audio, "not audio");
+        write_test_file(
+            &non_audio_cue,
+            r#"FILE "notes.txt" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+        let mut hook = CueProxyProbeTestHook::default();
+        hook.probe_results
+            .insert(non_audio.clone(), Err("not an audio stream".to_string()));
+        let (non_audio_result, hook) = with_cue_proxy_probe_test_hook(hook, || {
+            probe_cue_proxy_source(&non_audio_cue).expect("non-audio reference should be a warning result")
+        });
+        assert!(non_audio_result.info.is_none());
+        let notice = non_audio_result.probe_notice.expect("non-audio probe failure should warn");
+        assert!(notice.contains("CUE image probe failed"));
+        assert!(notice.contains("set format manually"));
+        assert_eq!(hook.probed_paths, vec![non_audio]);
+        assert!(hook.metadata_paths.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cli_seeded_single_image_cue_applies_source_defaults() {
+        let dir = temp_test_dir("cli_defaults");
+        let cue_path = dir.join("album.cue");
+        let image_path = dir.join("image.flac");
+        write_test_file(&image_path, "mocked");
+        write_test_file(
+            &cue_path,
+            r#"FILE "image.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        );
+
+        let mut hook = CueProxyProbeTestHook::default();
+        hook.probe_results
+            .insert(image_path.clone(), Ok(source_info(96_000, Some(24), 2)));
+
+        let ((), hook) = with_cue_proxy_probe_test_hook(hook, || {
+            let mut app = AppState::new(TonepoetConfig::default());
+            app.seed_from_cli_paths(vec![cue_path.clone()]);
+
+            assert_eq!(app.current_screen, AppScreen::Convert);
+            match &app.convert.source.mode {
+                SourceMode::MultiTrack { info: Some(info), probe_notice, .. } => {
+                    assert_eq!(info.sample_rate, 96_000);
+                    assert_eq!(info.bit_depth, Some(24));
+                    assert!(probe_notice.is_none());
+                }
+                other => panic!("expected CLI-seeded CUE to become probed MultiTrack, got {:?}", other),
+            }
+            assert_eq!(*app.convert.format.sample_rate.selected_value(), 96_000);
+            assert_eq!(*app.convert.format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        });
+
+        assert_eq!(hook.probed_paths, vec![image_path]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_direct_cue_keeps_persistent_single_notice_and_resets_defaults() {
+        let dir = temp_test_dir("empty_cue_notice");
+        let cue_path = dir.join("empty.cue");
+        write_test_file(
+            &cue_path,
+            r#"TITLE "Empty Cue"
+PERFORMER "Nobody"
+"#,
+        );
+
+        let result = probe_cue_proxy_source(&cue_path)
+            .expect("empty but parseable CUE should return a warning result");
+        assert!(result.info.is_none());
+        let notice = result
+            .probe_notice
+            .clone()
+            .expect("empty CUE should carry a warning");
+        assert!(notice.contains("no audio tracks"));
+
+        let mode = SourceMode::from_single_with_probe_notice(
+            cue_path.clone(),
+            result.info,
+            result.metadata,
+            result.probe_notice,
+        );
+        match &mode {
+            SourceMode::Single {
+                path,
+                info,
+                probe_notice,
+                ..
+            } => {
+                assert_eq!(path, &cue_path);
+                assert!(info.is_none());
+                assert_eq!(probe_notice.as_deref(), Some(notice.as_str()));
+            }
+            other => panic!("expected bad direct CUE to remain Single with notice, got {:?}", other),
+        }
+        assert_eq!(mode.persistent_probe_notice(), Some(notice.as_str()));
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.convert.set_source_mode(SourceMode::Single {
+            path: PathBuf::from("/tmp/highres.flac"),
+            info: Some(source_info(96_000, Some(24), 2)),
+            metadata: SourceMetadata::default(),
+            probe_notice: None,
+        });
+        app.convert.apply_source_defaults();
+        assert_eq!(*app.convert.format.sample_rate.selected_value(), 96_000);
+        assert_eq!(*app.convert.format.bit_depth.selected_value(), BitDepthChoice::Int24);
+
+        app.seed_from_cli_paths(vec![cue_path.clone()]);
+        assert_eq!(*app.convert.format.sample_rate.selected_value(), 44_100);
+        assert_eq!(*app.convert.format.bit_depth.selected_value(), BitDepthChoice::Int16);
+        assert_eq!(app.convert.source.mode.persistent_probe_notice(), Some(notice.as_str()));
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("warning"));
+        assert!(status.contains("no audio tracks"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_proxy_test_hook_is_cleared_when_closure_panics() {
+        let panic_result = std::panic::catch_unwind(|| {
+            let _ = with_cue_proxy_probe_test_hook(CueProxyProbeTestHook::default(), || -> () {
+                panic!("intentional panic to verify hook cleanup");
+            });
+        });
+        assert!(panic_result.is_err());
+
+        let ((), hook) = with_cue_proxy_probe_test_hook(CueProxyProbeTestHook::default(), || {});
+        assert!(hook.probed_paths.is_empty());
+        assert!(hook.metadata_paths.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod source_default_reset_tests {
+    use super::*;
+
+    fn source_info(sample_rate: u32, bit_depth: Option<u32>) -> SourceInfo {
+        SourceInfo {
+            format_name: "FLAC".to_string(),
+            codec: "FLAC".to_string(),
+            bit_depth,
+            sample_rate,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 10.0,
+            file_size: 100,
+        }
+    }
+
+    #[test]
+    fn apply_source_defaults_clears_stale_source_values_when_info_is_absent() {
+        let mut convert = ConvertState::new();
+        convert.set_source_mode(SourceMode::Single {
+            path: PathBuf::from("/tmp/highres.flac"),
+            info: Some(source_info(96_000, Some(24))),
+            metadata: SourceMetadata::default(),
+            probe_notice: None,
+        });
+        convert.apply_source_defaults();
+
+        assert_eq!(*convert.format.sample_rate.selected_value(), 96_000);
+        assert_eq!(*convert.format.bit_depth.selected_value(), BitDepthChoice::Int24);
+
+        convert.set_source_mode(SourceMode::MultiTrack {
+            path: PathBuf::from("/tmp/mixed.cue"),
+            info: None,
+            metadata: SourceMetadata::default(),
+            tracks: vec![MultiTrackEntry {
+                number: 1,
+                title: None,
+                performer: None,
+                duration_display: None,
+            }],
+            area_label: None,
+            album_title: None,
+            album_artist: None,
+            probe_notice: Some("mixed source properties; set format manually".to_string()),
+            scroll: 0,
+            cursor: 0,
+            selected: vec![true],
+        });
+        convert.apply_source_defaults();
+
+        assert_eq!(*convert.format.sample_rate.selected_value(), 44_100);
+        assert_eq!(*convert.format.bit_depth.selected_value(), BitDepthChoice::Int16);
+        assert_eq!(*convert.format.dither.selected_value(), DitherType::None);
+        assert_eq!(*convert.format.resampler.selected_value(), ResamplerChoice::None);
+        assert!(!convert.format.source_is_dsd);
     }
 }
 

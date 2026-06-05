@@ -100,8 +100,29 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
         // Skip if already in flight (dedup guard).
         if app.convert.source.batch_probe_pending.as_ref() != Some(&path) {
             app.convert.source.batch_probe_pending = Some(path.clone());
-            super::browse::spawn_audio_probe(path, tx.clone());
+            spawn_batch_cursor_probe(path, tx.clone());
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchCursorProbeKind {
+    Audio,
+    CueProxy,
+}
+
+fn batch_cursor_probe_kind(path: &std::path::Path) -> BatchCursorProbeKind {
+    if super::browse::is_cue_sheet_path(path) {
+        BatchCursorProbeKind::CueProxy
+    } else {
+        BatchCursorProbeKind::Audio
+    }
+}
+
+fn spawn_batch_cursor_probe(path: std::path::PathBuf, tx: mpsc::Sender<AppMessage>) {
+    match batch_cursor_probe_kind(&path) {
+        BatchCursorProbeKind::Audio => super::browse::spawn_audio_probe(path, tx),
+        BatchCursorProbeKind::CueProxy => super::browse::spawn_cue_proxy_audio_probe(path, tx),
     }
 }
 
@@ -295,44 +316,50 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.browse.probe_pending.remove(&path);
             match *result {
                 Ok(mut info) => {
-                    // Check analysis cache for HDCD / PE info that should
-                    // be surfaced in the info pane.
-                    info.metadata.preemphasis_metadata =
-                        super::probe::preemphasis_metadata_check_pub(&path);
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        let mtime = meta
-                            .modified()
-                            .map(crate::db::systemtime_to_unix)
-                            .unwrap_or(0);
-                        if let Some(analysis) = app.db.get_cached_analysis(
-                            &path.display().to_string(),
-                            mtime,
-                            meta.len(),
-                        ) {
-                            if analysis.hdcd_detected == Some(true) {
-                                info.metadata.hdcd_detail = analysis.hdcd_detail;
+                    let is_cue_proxy_result = super::browse::is_cue_sheet_path(&path);
+                    if !is_cue_proxy_result {
+                        // Check analysis cache for HDCD / PE info that should
+                        // be surfaced in the info pane. CUE proxy results are
+                        // keyed by the `.cue` path but describe referenced audio
+                        // images, so do not run image-analysis lookups or persist
+                        // them as ordinary file probes under the text-file path.
+                        info.metadata.preemphasis_metadata =
+                            super::probe::preemphasis_metadata_check_pub(&path);
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            let mtime = meta
+                                .modified()
+                                .map(crate::db::systemtime_to_unix)
+                                .unwrap_or(0);
+                            if let Some(analysis) = app.db.get_cached_analysis(
+                                &path.display().to_string(),
+                                mtime,
+                                meta.len(),
+                            ) {
+                                if analysis.hdcd_detected == Some(true) {
+                                    info.metadata.hdcd_detail = analysis.hdcd_detail;
+                                }
                             }
                         }
-                    }
 
-                    // Clone for the browse cache (shared via Arc).
-                    app.browse
-                        .probe_cache
-                        .insert(path.clone(), Some(std::sync::Arc::new(info.clone())));
+                        // Clone for the browse cache (shared via Arc).
+                        app.browse
+                            .probe_cache
+                            .insert(path.clone(), Some(std::sync::Arc::new(info.clone())));
 
-                    // Persist to SQLite probe cache for cross-session reuse.
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        let mtime = meta
-                            .modified()
-                            .map(crate::db::systemtime_to_unix)
-                            .unwrap_or(0);
-                        let row = crate::db::CachedProbeRow::from_cached_info(&info);
-                        let _ = app.db.store_probe(
-                            &path.display().to_string(),
-                            mtime,
-                            meta.len(),
-                            &row,
-                        );
+                        // Persist to SQLite probe cache for cross-session reuse.
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            let mtime = meta
+                                .modified()
+                                .map(crate::db::systemtime_to_unix)
+                                .unwrap_or(0);
+                            let row = crate::db::CachedProbeRow::from_cached_info(&info);
+                            let _ = app.db.store_probe(
+                                &path.display().to_string(),
+                                mtime,
+                                meta.len(),
+                                &row,
+                            );
+                        }
                     }
 
                     // Phase 6g: route to the Convert source pane if
@@ -356,21 +383,25 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                             cursor,
                             cursor_info,
                             cursor_metadata,
+                            cursor_probe_notice,
                             ..
                         } => {
                             if paths.get(*cursor).map(|p| p == &path).unwrap_or(false) {
                                 *cursor_info = Some(probed_info);
                                 *cursor_metadata = probed_metadata;
+                                *cursor_probe_notice = None;
                             }
                         }
                         super::app::SourceMode::Single {
                             path: single_path,
                             info: info_slot,
                             metadata: metadata_slot,
+                            probe_notice,
                         } => {
                             if single_path == &path {
                                 *info_slot = Some(probed_info);
                                 *metadata_slot = probed_metadata;
+                                *probe_notice = None;
                             }
                         }
                         super::app::SourceMode::MultiTrack {
@@ -390,10 +421,39 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     // Apply source-aware format defaults now that probe info is available.
                     app.convert.apply_source_defaults();
                 }
-                Err(_) => {
-                    // Cache the failure so we don't retry; renderer falls back
-                    // to basic info (path + size) when the value is None.
-                    app.browse.probe_cache.insert(path, None);
+                Err(err) => {
+                    let is_cue_proxy_result = super::browse::is_cue_sheet_path(&path);
+                    if app.convert.source.batch_probe_pending.as_ref() == Some(&path) {
+                        app.convert.source.batch_probe_pending = None;
+                    }
+
+                    if is_cue_proxy_result {
+                        let notice = if err.trim().is_empty() {
+                            "CUE proxy probe failed; set format manually".to_string()
+                        } else {
+                            err
+                        };
+                        if let super::app::SourceMode::Batch {
+                            paths,
+                            cursor,
+                            cursor_info,
+                            cursor_metadata,
+                            cursor_probe_notice,
+                            ..
+                        } = &mut app.convert.source.mode
+                        {
+                            if paths.get(*cursor).map(|p| p == &path).unwrap_or(false) {
+                                *cursor_info = None;
+                                *cursor_metadata = super::probe::SourceMetadata::default();
+                                *cursor_probe_notice = Some((path.clone(), notice));
+                                app.convert.apply_source_defaults();
+                            }
+                        }
+                    } else {
+                        // Cache the failure so we don't retry; renderer falls back
+                        // to basic info (path + size) when the value is None.
+                        app.browse.probe_cache.insert(path, None);
+                    }
                 }
             }
         }
@@ -2002,4 +2062,22 @@ fn handle_cue_fill_complete(
         summary.clone(),
     )));
     app.set_status(summary);
+}
+
+#[cfg(test)]
+mod cue_proxy_batch_cursor_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn batch_cursor_probe_routes_cue_to_proxy_probe() {
+        assert_eq!(
+            batch_cursor_probe_kind(Path::new("/music/disc.cue")),
+            BatchCursorProbeKind::CueProxy
+        );
+        assert_eq!(
+            batch_cursor_probe_kind(Path::new("/music/track.flac")),
+            BatchCursorProbeKind::Audio
+        );
+    }
 }
