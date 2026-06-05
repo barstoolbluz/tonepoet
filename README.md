@@ -1,165 +1,146 @@
 # tonepoet
 
-A batch audio conversion toolkit with an interactive TUI wizard. Handles archive extraction, format conversion (via ffmpeg/sox), ReplayGain, metadata preservation, file renaming, and CUE sheet generation.
+A standalone CLI + TUI audio conversion toolkit for music collectors who care about every detail of the conversion pipeline.
 
-## Status
+## What it does
 
-**Pre-alpha — extracting core from [hexload-tui](https://github.com/barstoolbluz/hexload-tui).**
+tonepoet converts audio between formats with precise control over resampling, dithering, noise shaping, metadata, and file organization. It handles single files, multi-track archives, CUE+image decomposition, and SACD ISO extraction — all through a keyboard-and-mouse-driven terminal interface or batch CLI.
 
-The conversion engine, command builders, queue system, and wizard UI already exist and work inside hexload-tui. This project extracts them into a standalone tool that works with any audio files, not just ones from a specific archive site.
+### Supported formats
 
-## Origin
+**Output:** FLAC, Opus, AAC (libfdk_aac), MP3, ALAC, WAV, WavPack, DSF, DFF, W64, RF64, AIFF, LPCM, WebM, MKV
 
-hexload-tui is a TUI app for browsing/downloading/converting audio from a WordPress-hosted archive. Its conversion subsystem is powerful enough to stand on its own:
+**Input (decode-only):** All output formats plus ISO (SACD), CUE+image, 7z/zip/rar archives, SHN, APE, DTS, AC3
 
-- Batch queue with concurrency control (semaphore-based, configurable workers)
-- ffmpeg and sox backends with automatic fallback
-- Archive extraction (7z, with plans for zip/rar/tar)
-- Format detection (FLAC, WAV, AIFF, WavPack, MP3, AAC, Opus)
-- ReplayGain calculation (album and track modes)
-- Metadata preservation and transfer across formats
-- File/folder renaming based on audio tags
-- CUE sheet generation for multi-track albums
-- Conversion logging
-- Interactive TUI wizard for configuring conversion options
-- Preset system for common conversion profiles
+### Resamplers
 
-## Source Components (in hexload-tui)
+- **Sox** (sox_ng) — rate effect with undocumented `-u` ultra mode (701 taps, 210 dB rejection), sinc FIR pre-filter with full parameter control (taps, attenuation, passband, transition band, Kaiser beta, phase)
+- **Soxr** — via ffmpeg's aresample filter, up to 33-bit precision, Chebyshev filter option
+- **SSRC** — brick-wall sinc interpolation with 7 quality profiles (lightning through insane), ATH psychoacoustic noise shaping, min-phase filters, rate-dependent dither validation
+- Automatic dither suppression when target bit depth >= source (no pointless noise addition)
 
-These are the pieces being extracted. Listed with their hexload-tui paths and dependency status:
+### Disc verification
 
-### Fully Independent (no hexload deps)
+- **AccurateRip** — verify CD rips against the AccurateRip database with common offset detection and full offset scanning
+- **CUETools DB** — CRC32 verification against the CUETools database
+- **Reed-Solomon repair** — built-in parity-based error correction for inaccurate rips using CUETools DB recovery data
+- **Drive offset correction** — re-encode with corrected read offset when AccurateRip identifies a mismatch
 
-| Component | Path in hexload-tui | LOC | What it does |
-|-----------|-------------------|-----|-------------|
-| conversion-backend | `hexloader-tui-conversion-backend-handover/` | ~7,000 | ffmpeg/sox command builders, pipeline execution, tool availability checks |
-| conversion-features | `conversion-features/` | ~1,600 | Conversion log writer, CUE sheet generator |
-| tui-wizard-core | `tui-wizard-core/` | ~7,500 | ratatui-based audio format/quality wizard UI |
-| tui-options-wizard | `integration-package/tui-wizard-core/` | ~9,000 | Enhanced wizard with backend, priority, overwrite options |
-| queue.rs | `src/convert/queue.rs` | ~450 | ConversionQueue, ConversionItem, ConversionStatus, persistence |
-| formats.rs | `src/convert/formats.rs` | ~360 | AudioFormat, FileFormat, FormatDetector, ConversionOptions |
-| labels.rs | `src/convert/labels.rs` | ~610 | Label/pressing info detection from filenames |
-| metadata.rs | `src/convert/metadata.rs` | ~150 | FLAC metadata extraction via metaflac |
-| renaming.rs | `src/convert/renaming.rs` | ~880 | File/album tagging, folder structure from audio tags |
-| simple_wizard.rs | `src/convert/simple_wizard.rs` | ~180 | SimpleWizard state machine (non-UI) |
+### Audio analysis
 
-### Needs Minor Adaptation
+- **Dynamic range (DR)** measurement and reporting
+- **Peak/RMS level** analysis per track and album
+- **Clipping detection** — identify intersample and sample-level clipping
+- **Pre-emphasis detection** — spectral analysis + metadata/catalog heuristics to identify pre-emphasized discs
+- **Bit depth analysis** — actual vs container bit depth
 
-| Component | Path in hexload-tui | LOC | What changes |
-|-----------|-------------------|-----|-------------|
-| processor.rs | `src/convert/processor.rs` | ~4,000 | Replace hexload config/message types with standalone equivalents |
-| wizard_integration.rs | `src/convert/wizard_integration.rs` | ~550 | Mapping between wizard UI state and ConversionOptions — extract as-is |
-| mod.rs | `src/convert/mod.rs` | ~530 | ConversionManager lifecycle — replace AppState refs with standalone config |
+### SACD support
 
-### Hexload-Specific (drop or generalize)
+Native SACD ISO extraction via the built-in sacd-rs crate (byte-exact against sacd_extract, validated across 70+ tracks). DSD-to-PCM conversion through sox with auto-gain peak normalization (`norm` effect), configurable safety margin, and rate-dependent lowpass filtering. DST frame decoding for compressed SACD layers.
 
-| Feature | Notes |
-|---------|-------|
-| Download+Convert workflow | Drop for v1. Users provide files directly. |
-| Default 7z password | Currently a fallback default in processor.rs; make fully configurable via CLI flag or config file |
-| Lineage.txt generation | Generalize as "source metadata annotation" |
+### Metadata and tagging
 
-## External Tool Dependencies
+- **MusicBrainz** — disc-TOC-based release lookup, interactive release picker, per-track title/artist/ISRC population
+- **GNUDB** — freedb/gnudb disc ID lookup with multi-disc support
+- **SACD sidecar XML** — persistent metadata sidecars for SACD ISOs (MusicBrainz tagging workflow)
+- **CUE sheet parsing** — legacy encoding support (CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1252), embedded CUESHEET preferred over sidecar
+- **CUESHEET embedding** — regenerate and embed CUESHEET tags on metadata save
+- **Typed metadata effects** — pipeline tracks source-tag transfer, artwork preservation, and authoritative metadata application independently to prevent silent metadata loss
+- **Per-track metadata editor** — inline tag editing with MusicBrainz integration, CUE preview, revert/restore
 
-| Tool | Purpose | Required? |
-|------|---------|-----------|
-| ffmpeg | Primary conversion backend | Yes (or sox) |
-| sox | Secondary conversion backend, resampling/dithering | Yes (or ffmpeg) |
-| ffprobe | Audio format/bitdepth detection | Recommended |
-| 7z | Archive extraction | For archive input only |
-| metaflac | FLAC metadata read/write | For FLAC operations |
-| loudgain | ReplayGain calculation | For ReplayGain feature |
-| opustags | Opus metadata writing | For Opus output |
-| wvtag | WavPack metadata writing | For WavPack output |
-| AtomicParsley | M4A/AAC metadata writing | For M4A/AAC output |
+### File management
 
-## Planned Interface
+- **Template-based naming** — folder and filename templates with tag variables (%ARTIST%, %ALBUM%, %TITLE%, etc.)
+- **Template builder** — interactive template construction with saved presets
+- **Bulk rename** — tag-based batch renaming with preview
+- **Bookmarks** — saved directory shortcuts
+- **Recent files** — quick access to recently opened paths
+- **Archive password keychain** — stored passwords for encrypted archives
+- **Archive browsing** — preview 7z/zip/rar contents before extraction
 
-### CLI
+## Building
+
+**Requires nix.** The project uses a nix flake for the Rust toolchain, all runtime audio tools, and ffmpeg development libraries.
+
 ```bash
-tonepoet convert ./album.7z --format flac --quality high --replaygain album
-tonepoet convert ./tracks/ --format opus --bitrate 128 --workers 4
-tonepoet convert . --preset "FLAC re-encode"
-tonepoet wizard                    # interactive TUI mode
-tonepoet check-tools               # verify external tool availability
-tonepoet config --set backend=sox  # persistent configuration
+# Enter dev shell
+nix develop --extra-experimental-features 'nix-command flakes'
+
+# Build
+cargo build --release
+
+# Run
+cargo run --release -- tui           # TUI (main interface)
+cargo run --release -- convert ./file.flac --format opus
+cargo run --release -- check-tools   # verify external tools
+cargo run --release -- config --show
+
+# Test
+cargo test --lib --workspace
 ```
 
-### As a Library
-```rust
-use tonepoet::{ConversionManager, ConversionOptions, AudioFormat};
+## TUI
 
-let options = ConversionOptions {
-    output_format: AudioFormat::Flac,
-    // ...
-};
-let mut manager = ConversionManager::new(config);
-manager.add_files(&paths, options)?;
-manager.process_queue().await?;
-```
+The TUI is the primary interface. Five screens: Browse, Library, Convert, Queue, Config.
 
-## Architecture (target)
+- **Browse** — file browser with audio-only filter, type-ahead search, recursive search, visual/range selection, column sorting, right-click context menus, archive preview, info pane with metadata and analysis
+- **Convert** — four-pane staging screen (source, metadata, format, output options) with pill-based controls, per-codec settings overlays (FLAC, AAC, Opus, MP3, WavPack), per-resampler settings overlays (SSRC, Sox, Soxr), preset system, DSD-aware gain controls
+- **Queue** — batch conversion monitor with per-track progress, expandable sub-lines, pause/resume, retry failed, clear completed
+- **Config** — settings editor with archive password keychain
+
+Every action has three input paths: keyboard (vi-style colon commands), mouse clicks, and right-click context menus. Format-specific settings overlays include scrollable context-sensitive help (`?` key).
+
+## Architecture
 
 ```
 tonepoet/
-  src/
-    main.rs              -- CLI entry point (clap)
-    config.rs            -- TOML config loading/saving
-    message.rs           -- ConversionMessage enum for progress reporting
-    convert/
-      mod.rs             -- ConversionManager
-      queue.rs           -- Queue, items, status, persistence
-      formats.rs         -- Format detection, AudioFormat, ConversionOptions
-      processor.rs       -- Orchestration: extract, convert, replaygain, rename
-      metadata.rs        -- Audio metadata extraction
-      labels.rs          -- Label/pressing info detection
-      renaming.rs        -- Tag-based file/folder renaming
-      simple_wizard.rs   -- Wizard state machine
-      wizard_integration.rs -- Wizard state -> ConversionOptions mapping
-  tui/
-    wizard.rs            -- Interactive TUI wizard (from tui-wizard-core)
-    progress.rs          -- TUI progress display for batch operations
-  backend/
-    mod.rs               -- ConversionBackend trait, convert_with_backend()
-    ffmpeg.rs            -- FFmpegBuilder
-    sox.rs               -- SoxBuilder
-    pipeline.rs          -- ConversionPipeline, metadata preservation
-    tools.rs             -- Tool availability checking
-  features/
-    log_writer.rs        -- Conversion result logging
-    cue.rs               -- CUE sheet generation
+├── src/
+│   ├── main.rs             # CLI: tui, convert, check-tools, config
+│   ├── config.rs           # TOML config (~/.config/tonepoet/config.toml)
+│   ├── ctdb_rs/            # CUETools DB client + Reed-Solomon decoder
+│   ├── convert/            # Conversion engine
+│   │   ├── pipeline/       # Staged pipeline: materialize → plan → convert →
+│   │   │                   #   merge → metadata → replaygain → publish
+│   │   ├── processor.rs    # Orchestration
+│   │   └── formats.rs      # Format detection
+│   └── tui/                # Terminal interface
+│       ├── app.rs          # Central state
+│       ├── keybindings.rs  # Key + mouse dispatch
+│       ├── probe.rs        # In-process ffmpeg audio probing
+│       ├── accuraterip.rs  # AccurateRip verification
+│       ├── ctdb.rs         # CUETools DB verification
+│       ├── musicbrainz.rs  # MusicBrainz release lookup + tagging
+│       ├── gnudb.rs        # GNUDB/freedb disc lookup
+│       ├── analyze.rs      # Audio analysis (DR, peaks, clipping)
+│       ├── preemphasis/    # Pre-emphasis detection (spectral + heuristic)
+│       └── draw_*.rs       # Screen rendering
+├── tonepoet-pipeline/      # Conversion planning crate
+│   ├── settings.rs         # PipelineSettings (69 fingerprinted fields)
+│   ├── plugins.rs          # Tool plugins (ffmpeg, sox, ssrc, loudgain)
+│   └── plan.rs             # Conversion planner
+└── crates/
+    ├── sacd-rs/            # SACD ISO reader + DST decoder
+    ├── tonepoet-backend/   # FFmpeg/Sox command builders
+    └── tonepoet-features/  # Log writer, CUE sheet generator
 ```
 
-## Rust Dependencies (expected)
+## External tools
 
-```toml
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
-ratatui = "0.26"
-crossterm = "0.27"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-chrono = "0.4"
-uuid = { version = "1", features = ["v4"] }
-lofty = "0.21"           # audio metadata
-log = "0.4"
-env_logger = "0.10"
-anyhow = "1"
-thiserror = "1"
-dirs = "5"
-regex = "1"
-lazy_static = "1"
-walkdir = "2"             # recursive directory traversal
-tempfile = "3"            # temp dirs for archive extraction
-num_cpus = "1"            # default worker count detection
-indicatif = "0.17"        # CLI progress bars (new, not from hexload)
-```
+All provided by the nix flake:
 
-## Key Design Decisions
+| Tool | Purpose |
+|------|---------|
+| ffmpeg 7.1 (unfree) | Primary backend + in-process probing |
+| sox_ng | Resampling, DSD conversion, dithering |
+| ssrc 2.4.2 | Brick-wall resampling |
+| flac, metaflac | FLAC encode/decode, metadata |
+| lame | MP3 encoding |
+| opusenc, opustags | Opus encoding, metadata |
+| wavpack, wvtag | WavPack encoding, metadata |
+| loudgain | ReplayGain analysis |
+| AtomicParsley | AAC/M4A metadata |
+| 7z (p7zip) | Archive extraction |
 
-1. **CLI-first, wizard second.** Get the conversion pipeline working as a CLI tool before adding the interactive TUI.
-2. **No download integration in v1.** Users provide local files or archives. Download can be a plugin later.
-3. **Configurable everything.** Archive passwords, output paths, worker counts, backends — all via config file or CLI flags. No hardcoded values.
-4. **Preserve the batch architecture.** The semaphore-based concurrent processing with queue persistence is valuable. Keep it.
-5. **Library + binary.** Structure as a library crate with a binary entry point so others can embed it.
+## License
+
+GPL-3.0-or-later
