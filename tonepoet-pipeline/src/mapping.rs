@@ -164,6 +164,7 @@ pub struct SsrcDitherSelection {
 }
 
 impl SsrcDitherSelection {
+    /// Create a new SSRC dither selection with the given dither ID and optional PDF type.
     #[must_use]
     pub const fn new(dither_id: u8, pdf_type: Option<SsrcPdfType>) -> Self {
         Self {

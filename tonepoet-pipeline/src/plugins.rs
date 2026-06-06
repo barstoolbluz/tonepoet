@@ -4,7 +4,7 @@
 //! types. They use the reference files only for argument-shape semantics.
 
 use crate::enums::{
-    AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
+    AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     DsdToPcmGainMode, GainCompensation,
     Mp3Mode, PcmBitDepth, ReplayGainMode, SoxSincPhase,
 };
@@ -328,10 +328,6 @@ impl ToolPlugin for SsrcPlugin {
                 "--profile".into(),
                 profile.as_arg().into(),
             ];
-            let integer_output = !matches!(
-                *target_bit_depth,
-                Some(PcmBitDepth::Float32 | PcmBitDepth::Float64)
-            );
             let needs_dither = match *target_bit_depth {
                 Some(depth) => pcm_conversion_reduces_depth(context.request.source.bit_depth, depth),
                 None => true,
@@ -663,6 +659,7 @@ fn build_ffmpeg_encode_pcm(
             "FFmpeg plugin does not encode this target format",
         ));
     }
+    validate_aac_family_container(context, target_format)?;
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
     let mut args = ffmpeg_base_input_args(&input);
@@ -671,6 +668,7 @@ fn build_ffmpeg_encode_pcm(
         add_ffmpeg_audio_filter_args(context, &mut args, target_rate_hz, Some(target_depth))?;
     }
     add_ffmpeg_pcm_encoder_args(context, &mut args, target_format, target_depth)?;
+    add_ffmpeg_container_format_args(&mut args, target_format);
     add_ffmpeg_container_flags(context, &mut args);
     args.push(output);
     Ok(PlannedCommand::new(
@@ -691,6 +689,7 @@ fn build_ffmpeg_encode_lossy(
     target_rate_hz: Option<u32>,
     apply_processing: bool,
 ) -> Result<PlannedCommand> {
+    validate_aac_family_container(context, target_format)?;
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
     let mut args = ffmpeg_base_input_args(&input);
@@ -761,6 +760,7 @@ fn build_ffmpeg_encode_lossy(
             ));
         }
     }
+    add_ffmpeg_container_format_args(&mut args, target_format);
     add_ffmpeg_container_flags(context, &mut args);
     args.push(output);
     Ok(PlannedCommand::new(
@@ -856,7 +856,6 @@ impl AudioFormat {
                 | AudioFormat::WavPack
                 | AudioFormat::Mp3
                 | AudioFormat::Aac
-                | AudioFormat::Opus
                 | AudioFormat::Alac
         )
     }
@@ -874,8 +873,23 @@ impl AudioFormat {
             AudioFormat::Flac
                 | AudioFormat::Mp3
                 | AudioFormat::Aac
-                | AudioFormat::Opus
                 | AudioFormat::Alac
+        )
+    }
+
+    /// True when the orchestrator-owned post-encode CUE artwork stage has a
+    /// concrete writer for the target container. This is separate from planner
+    /// source artwork transfer because CUE uses an audio-only staged WAV carrier
+    /// plus an extracted artwork sidecar from the original image.
+    #[must_use]
+    pub fn supports_cue_post_encode_artwork_embedding(&self) -> bool {
+        matches!(
+            self,
+            AudioFormat::Flac
+                | AudioFormat::Mp3
+                | AudioFormat::Aac
+                | AudioFormat::Alac
+                | AudioFormat::WavPack
         )
     }
 }
@@ -913,6 +927,7 @@ fn build_ffmpeg_metadata_transfer(
             "FFmpeg metadata rewrite does not support the requested tag/artwork policy for this target format",
         ));
     }
+    validate_aac_family_container(context, target_format)?;
     let encoded_input = required_input_path(step)?;
     let output = required_output_path(step)?;
     let needs_source_metadata_input = transfer_tags || preserve_artwork;
@@ -946,6 +961,8 @@ fn build_ffmpeg_metadata_transfer(
     } else {
         args.push("-vn".into());
     }
+    add_ffmpeg_container_format_args(&mut args, target_format);
+    add_ffmpeg_container_flags(context, &mut args);
     args.push(output);
     Ok(PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
@@ -1174,6 +1191,43 @@ fn ffmpeg_base_input_args(input: &str) -> Vec<String> {
 fn add_ffmpeg_container_flags(context: &PlanContext<'_>, args: &mut Vec<String>) {
     for flag in &context.request.container_ffmpeg_flags {
         args.push(flag.clone());
+    }
+}
+
+fn validate_aac_family_container(context: &PlanContext<'_>, target_format: &AudioFormat) -> Result<()> {
+    let extension = context.target_container_extension();
+    match target_format {
+        AudioFormat::Aac => match extension.as_str() {
+            "m4a" | "mp4" => Ok(()),
+            "aac" => Err(PlanningError::invalid_settings(
+                "output_path",
+                "AAC output is muxed as MP4/M4A by this pipeline; raw .aac output is not implemented, so use .m4a/.mp4 or add an explicit raw-AAC mode",
+            )),
+            _ => Err(PlanningError::invalid_settings(
+                "output_path",
+                "AAC output must use an .m4a or .mp4 container extension unless an explicit raw-AAC mode is implemented",
+            )),
+        },
+        AudioFormat::Alac => match extension.as_str() {
+            "m4a" | "mp4" => Ok(()),
+            _ => Err(PlanningError::invalid_settings(
+                "output_path",
+                "ALAC output must use an .m4a or .mp4 container extension",
+            )),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn add_ffmpeg_container_format_args(args: &mut Vec<String>, target_format: &AudioFormat) {
+    match target_format {
+        // Use the MP4/iPod muxer for AAC-family .m4a outputs. A raw ADTS .aac
+        // stream cannot carry the metadata and artwork contract required here.
+        AudioFormat::Aac | AudioFormat::Alac => {
+            args.push("-f".into());
+            args.push("ipod".into());
+        }
+        _ => {}
     }
 }
 
@@ -1926,13 +1980,134 @@ mod tests {
     fn planner_format_metadata_capabilities_are_centralized_on_audio_format() {
         assert!(AudioFormat::Flac.supports_planner_source_tag_transfer());
         assert!(AudioFormat::Wav.supports_planner_source_tag_transfer());
+        assert!(AudioFormat::Mp3.supports_planner_source_tag_transfer());
+        assert!(!AudioFormat::Opus.supports_planner_source_tag_transfer());
         assert!(!AudioFormat::Dsf.supports_planner_source_tag_transfer());
         assert!(!AudioFormat::Dff.supports_planner_source_tag_transfer());
 
         assert!(AudioFormat::Flac.supports_planner_embedded_artwork_transfer());
         assert!(AudioFormat::Mp3.supports_planner_embedded_artwork_transfer());
+        assert!(AudioFormat::Aac.supports_planner_embedded_artwork_transfer());
+        assert!(AudioFormat::Alac.supports_planner_embedded_artwork_transfer());
+        assert!(!AudioFormat::Opus.supports_planner_embedded_artwork_transfer());
         assert!(!AudioFormat::Wav.supports_planner_embedded_artwork_transfer());
         assert!(!AudioFormat::Dsf.supports_planner_embedded_artwork_transfer());
+
+        assert!(AudioFormat::Flac.supports_cue_post_encode_artwork_embedding());
+        assert!(AudioFormat::Mp3.supports_cue_post_encode_artwork_embedding());
+        assert!(AudioFormat::Aac.supports_cue_post_encode_artwork_embedding());
+        assert!(AudioFormat::Alac.supports_cue_post_encode_artwork_embedding());
+        assert!(AudioFormat::WavPack.supports_cue_post_encode_artwork_embedding());
+        assert!(!AudioFormat::Opus.supports_cue_post_encode_artwork_embedding());
+        assert!(!AudioFormat::Wav.supports_cue_post_encode_artwork_embedding());
+        assert!(!AudioFormat::Aiff.supports_cue_post_encode_artwork_embedding());
+        assert!(!AudioFormat::Dsf.supports_cue_post_encode_artwork_embedding());
+    }
+
+    #[test]
+    fn ffmpeg_aac_command_rejects_raw_aac_suffix_without_raw_mode() {
+        let source = SourceInfo {
+            format: AudioFormat::Wav,
+            codec: crate::enums::AudioCodec::PcmSigned,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(PcmBitDepth::Int16),
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Aac;
+        let request = PlanRequest {
+            input_path: PathBuf::from("realized.wav"),
+            output_path: PathBuf::from("track.aac"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let step = PlanStep::new(
+            0,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: None,
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("realized.wav")),
+            OutputSink::Path(PathBuf::from("track.aac")),
+            "Encode AAC output",
+        );
+
+        let err = FfmpegPlugin
+            .build_command(&request.context(), &step)
+            .expect_err("raw .aac suffix must not produce an MP4 command");
+        assert!(
+            err.to_string().contains("raw .aac output is not implemented"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_aac_and_alac_commands_pin_mp4_m4a_muxer() {
+        let source = SourceInfo {
+            format: AudioFormat::Flac,
+            codec: crate::enums::AudioCodec::Flac,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(PcmBitDepth::Int16),
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+
+        let mut aac_settings = PipelineSettings::default();
+        aac_settings.target_format = AudioFormat::Aac;
+        let aac_request = PlanRequest {
+            input_path: PathBuf::from("realized.flac"),
+            output_path: PathBuf::from("track.m4a"),
+            source: source.clone(),
+            settings: aac_settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let aac_step = PlanStep::new(
+            0,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: None,
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("realized.flac")),
+            OutputSink::Path(PathBuf::from("track.m4a")),
+            "Encode AAC output",
+        );
+        let aac_command = FfmpegPlugin.build_command(&aac_request.context(), &aac_step).unwrap();
+        assert!(aac_command.args.windows(2).any(|window| window[0] == "-f" && window[1] == "ipod"));
+
+        let mut alac_settings = PipelineSettings::default();
+        alac_settings.target_format = AudioFormat::Alac;
+        let alac_request = PlanRequest {
+            input_path: PathBuf::from("realized.flac"),
+            output_path: PathBuf::from("track.m4a"),
+            source,
+            settings: alac_settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let alac_step = PlanStep::new(
+            0,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Alac,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int16,
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("realized.flac")),
+            OutputSink::Path(PathBuf::from("track.m4a")),
+            "Encode ALAC output",
+        );
+        let alac_command = FfmpegPlugin.build_command(&alac_request.context(), &alac_step).unwrap();
+        assert!(alac_command.args.windows(2).any(|window| window[0] == "-f" && window[1] == "ipod"));
     }
 
     #[test]

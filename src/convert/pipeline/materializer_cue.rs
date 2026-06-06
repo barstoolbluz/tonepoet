@@ -1,10 +1,12 @@
 //! PR 8 - CUE image materializer.
 //!
 //! Parses CUE image layouts and stages each CUE track as a bounded 32-bit
-//! signed PCM WAV file. Downstream planning receives ordinary `StagedFile`
-//! inputs, so SoX, SSRC, SOXR/FFmpeg, and plain FFmpeg all use the same
-//! existing file-input contract instead of depending on a separate
-//! `ImageSegment` realization path.
+//! signed PCM WAV file. The staged carrier is always `pcm_s32le`; the
+//! `PreparedTrack::bit_depth` field remains the original probed source-image
+//! bit depth so `target_bit_depth = Source` resolves to the source, not the
+//! carrier. Downstream planning receives a typed `CueSegmentCarrier` source
+//! fact and encodes the requested final target from that validated WAV instead
+//! of re-encoding through an intermediate FLAC carrier.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -47,6 +49,21 @@ struct AudioProbe {
     format_name: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageArtworkProbe {
+    stream_index: u32,
+    codec_name: String,
+    mime_type: String,
+    extension: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedCueArtwork {
+    path: PathBuf,
+    mime_type: String,
+    source_image: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CueOrigin {
     Sidecar,
@@ -78,6 +95,7 @@ impl Materializer for CueImageMaterializer {
 
         let mut probes = HashMap::new();
         let mut image_metadata = HashMap::new();
+        let mut image_artwork = HashMap::new();
         for image_path in &unique_images {
             if cancel.is_cancelled() {
                 return Err(MaterializeError::Cancelled);
@@ -87,6 +105,12 @@ impl Materializer for CueImageMaterializer {
                 probe_audio_image(image_path, runner, cancel).await?,
             );
             image_metadata.insert(path_identity(image_path), read_image_album_metadata(image_path));
+            let artwork = if req.settings.metadata.preserve_artwork {
+                extract_cue_image_artwork(image_path, staging, runner, cancel).await?
+            } else {
+                None
+            };
+            image_artwork.insert(path_identity(image_path), artwork);
         }
 
         let boundaries = compute_track_boundaries_for_layout(
@@ -161,7 +185,13 @@ impl Materializer for CueImageMaterializer {
                     disc_number: None,
                     track_number: track_number_plan[idx].output_number,
                 },
-                source_ref: TrackSourceRef::StagedFile(staged_path),
+                source_ref: TrackSourceRef::CueSegmentCarrier {
+                    path: staged_path,
+                    source_image: image_path.clone(),
+                    start_sample,
+                    samples,
+                    carrier: CueSegmentCarrier::PcmS32LeWav,
+                },
                 metadata,
                 expected_samples: Some(samples),
                 sample_rate: probe.sample_rate,
@@ -170,6 +200,20 @@ impl Materializer for CueImageMaterializer {
         }
 
         let mut album_metadata = cue_album_metadata(&cue_input.sheet, &album_image_metadata, total_tracks);
+        if let Some(artwork) = select_album_artwork(&track_images, &image_artwork) {
+            album_metadata.extra.insert(
+                CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+                artwork.path.display().to_string(),
+            );
+            album_metadata.extra.insert(
+                CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+                artwork.mime_type.clone(),
+            );
+            album_metadata.extra.insert(
+                CUE_ARTWORK_SOURCE_EXTRA_KEY.to_string(),
+                artwork.source_image.display().to_string(),
+            );
+        }
         cue_annotations.add_album_extras(&mut album_metadata.extra);
 
         let provenance = ExtractionProvenance {
@@ -858,6 +902,252 @@ async fn probe_audio_image(
     parse_audio_probe_json(&output.stdout_tail)
 }
 
+
+async fn extract_cue_image_artwork(
+    image: &Path,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<Option<ExtractedCueArtwork>, MaterializeError> {
+    let Some(probe) = probe_image_artwork(image, runner, cancel).await? else {
+        return Ok(None);
+    };
+
+    let destination = staged_cue_artwork_path(staging, image, probe.stream_index, probe.extension);
+    if destination.metadata().map(|meta| meta.is_file() && meta.len() > 0).unwrap_or(false) {
+        return Ok(Some(ExtractedCueArtwork {
+            path: destination,
+            mime_type: probe.mime_type,
+            source_image: image.to_path_buf(),
+        }));
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_destination = temporary_artwork_path(&destination)?;
+    if let Some(parent) = tmp_destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_path_if_exists(&tmp_destination)?;
+
+    let cmd = cue_artwork_extract_command(image, &probe, &tmp_destination);
+    let run_result = runner.run(cmd, cancel).await;
+    match run_result {
+        Ok(_) => {
+            let meta = tmp_destination.metadata().map_err(|err| {
+                MaterializeError::Parse(format!(
+                    "extracted CUE artwork {} is not readable: {err}",
+                    tmp_destination.display()
+                ))
+            })?;
+            if !meta.is_file() || meta.len() == 0 {
+                let _ = remove_path_if_exists(&tmp_destination);
+                return Err(MaterializeError::Parse(format!(
+                    "extracted CUE artwork {} is empty",
+                    tmp_destination.display()
+                )));
+            }
+            sync_file_to_storage(&tmp_destination)?;
+            if destination.exists() {
+                let _ = remove_path_if_exists(&destination);
+            }
+            fs::rename(&tmp_destination, &destination)?;
+            sync_parent_dir_best_effort(&destination);
+            Ok(Some(ExtractedCueArtwork {
+                path: destination,
+                mime_type: probe.mime_type,
+                source_image: image.to_path_buf(),
+            }))
+        }
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            let _ = remove_path_if_exists(&tmp_destination);
+            Err(MaterializeError::Cancelled)
+        }
+        Err(err) => {
+            let _ = remove_path_if_exists(&tmp_destination);
+            Err(err.into())
+        }
+    }
+}
+
+async fn probe_image_artwork(
+    path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<Option<ImageArtworkProbe>, MaterializeError> {
+    let cmd = ToolCommand {
+        binary: ToolBinary::Ffprobe,
+        args: vec![
+            "-v".into(),
+            "error".into(),
+            "-select_streams".into(),
+            "v".into(),
+            "-show_entries".into(),
+            "stream=index,codec_name:stream_disposition=attached_pic:stream_tags=mimetype".into(),
+            "-of".into(),
+            "json".into(),
+            path.display().to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(30),
+    };
+
+    let output = match runner.run(cmd, cancel).await {
+        Ok(output) => output,
+        Err(ToolRunnerError::Cancelled { .. }) => return Err(MaterializeError::Cancelled),
+        Err(err) => return Err(err.into()),
+    };
+
+    parse_image_artwork_probe_json(&output.stdout_tail)
+}
+
+fn parse_image_artwork_probe_json(json_str: &str) -> Result<Option<ImageArtworkProbe>, MaterializeError> {
+    let value: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|err| MaterializeError::Parse(format!("ffprobe artwork JSON parse failed: {err}")))?;
+    let Some(streams) = value.get("streams").and_then(|value| value.as_array()) else {
+        return Ok(None);
+    };
+
+    for stream in streams {
+        let attached_pic = stream
+            .pointer("/disposition/attached_pic")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0)
+            == 1;
+        let codec_name = stream
+            .get("codec_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !attached_pic {
+            continue;
+        }
+        let supported = artwork_codec_to_mime_ext(&codec_name);
+        let Some((mime_type, extension)) = supported else {
+            log::warn!(
+                "CUE image contains attached artwork codec {:?}, but this path currently supports only PNG and JPEG artwork extraction",
+                codec_name
+            );
+            return Ok(None);
+        };
+        let Some(stream_index) = stream.get("index").and_then(json_u32_from_value) else {
+            continue;
+        };
+        let mime_type = stream
+            .pointer("/tags/mimetype")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(mime_type)
+            .to_string();
+        return Ok(Some(ImageArtworkProbe {
+            stream_index,
+            codec_name,
+            mime_type,
+            extension,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn artwork_codec_to_mime_ext(codec_name: &str) -> Option<(&'static str, &'static str)> {
+    match codec_name {
+        "mjpeg" | "jpeg" | "jpg" => Some(("image/jpeg", "jpg")),
+        "png" => Some(("image/png", "png")),
+        _ => None,
+    }
+}
+
+fn cue_artwork_extract_command(
+    image: &Path,
+    probe: &ImageArtworkProbe,
+    destination: &Path,
+) -> ToolCommand {
+    ToolCommand {
+        binary: ToolBinary::Ffmpeg,
+        args: vec![
+            "-v".into(),
+            "error".into(),
+            "-hide_banner".into(),
+            "-nostdin".into(),
+            "-y".into(),
+            "-i".into(),
+            image.display().to_string(),
+            "-map".into(),
+            format!("0:{}", probe.stream_index),
+            "-an".into(),
+            "-sn".into(),
+            "-dn".into(),
+            "-c:v".into(),
+            "copy".into(),
+            "-frames:v".into(),
+            "1".into(),
+            "-f".into(),
+            "image2".into(),
+            destination.display().to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(2 * 60),
+    }
+}
+
+fn staged_cue_artwork_path(
+    staging: &StagingDir,
+    image: &Path,
+    stream_index: u32,
+    extension: &str,
+) -> PathBuf {
+    let stem = image
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_artwork_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "cue-image".to_string());
+    let hash = deterministic_artwork_hash(&image.display().to_string());
+    staging.root.join("cue-artwork").join(format!(
+        "{stem}-{hash:016x}-stream{stream_index}.{extension}"
+    ))
+}
+
+fn sanitize_artwork_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_ascii_lowercase()
+}
+
+fn deterministic_artwork_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn select_album_artwork(
+    track_images: &[PathBuf],
+    artwork_by_image: &HashMap<PathBuf, Option<ExtractedCueArtwork>>,
+) -> Option<ExtractedCueArtwork> {
+    for image_path in track_images {
+        let Some(Some(artwork)) = artwork_by_image.get(&path_identity(image_path)) else {
+            continue;
+        };
+        return Some(artwork.clone());
+    }
+    None
+}
+
 fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError> {
     let value: serde_json::Value = serde_json::from_str(json_str)
         .map_err(|err| MaterializeError::Parse(format!("ffprobe JSON parse failed: {err}")))?;
@@ -1315,6 +1605,32 @@ fn temporary_segment_path(destination: &Path) -> Result<PathBuf, MaterializeErro
         .map(|parent| parent.join(".tmp"))
         .unwrap_or_else(|| PathBuf::from(".tmp"));
     Ok(tmp_dir.join(format!("{file_name}.tmp.{pid}.{stamp}.{random}")))
+}
+
+fn temporary_artwork_path(destination: &Path) -> Result<PathBuf, MaterializeError> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let random = random_temp_suffix()?;
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("cue-artwork");
+    let extension = destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("img");
+    let tmp_dir = destination
+        .parent()
+        .map(|parent| parent.join(".tmp"))
+        .unwrap_or_else(|| PathBuf::from(".tmp"));
+    Ok(tmp_dir.join(format!(
+        "{stem}.tmp.{pid}.{stamp}.{random}.{extension}"
+    )))
 }
 
 fn random_temp_suffix() -> Result<String, MaterializeError> {
@@ -2307,8 +2623,18 @@ mod materializer_cue_tests {
                     .lock()
                     .expect("ffmpeg destination log lock")
                     .push(PathBuf::from(destination));
-                std::fs::write(Path::new(destination), b"RIFF-staged-cue-segment");
+                let bytes = if Path::new(destination)
+                    .components()
+                    .any(|component| component.as_os_str() == std::ffi::OsStr::new("cue-artwork"))
+                {
+                    b"JPEG-artwork".as_slice()
+                } else {
+                    b"RIFF-staged-cue-segment".as_slice()
+                };
+                std::fs::write(Path::new(destination), bytes);
                 String::new()
+            } else if cmd.args.windows(2).any(|pair| pair[0] == "-select_streams" && pair[1] == "v") {
+                r#"{"streams":[]}"#.to_string()
             } else {
                 let probed_path = PathBuf::from(cmd.args.last().expect("ffprobe command has path"));
                 let expected = self
@@ -2425,10 +2751,11 @@ FILE "album.flac" WAVE
     }
 
 
-    fn assert_staged_file_ref(track: &PreparedTrack) -> &Path {
-        let TrackSourceRef::StagedFile(path) = &track.source_ref else {
-            panic!("expected StagedFile so downstream resampler planning uses the existing file-input path");
+    fn assert_cue_segment_carrier_ref(track: &PreparedTrack) -> &Path {
+        let TrackSourceRef::CueSegmentCarrier { path, carrier, .. } = &track.source_ref else {
+            panic!("expected typed CueSegmentCarrier so downstream planning does not infer CUE carrier semantics from a path convention");
         };
+        assert_eq!(*carrier, CueSegmentCarrier::PcmS32LeWav);
         assert_eq!(path.extension().and_then(|value| value.to_str()), Some("wav"));
         path.as_path()
     }
@@ -2592,6 +2919,65 @@ TRACK XX AUDIO
         assert!(cmd.args.windows(2).any(|pair| pair[0] == "-c:a" && pair[1] == "pcm_s32le"));
         assert!(cmd.args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == "wav"));
         assert!(!cmd.args.iter().any(|arg| arg == "-ss" || arg == "-t"));
+    }
+
+    #[test]
+    fn cue_artwork_probe_and_extract_command_use_attached_picture_stream() {
+        let probe = parse_image_artwork_probe_json(
+            r#"{
+              "streams": [{
+                "index": 2,
+                "codec_name": "mjpeg",
+                "disposition": { "attached_pic": 1 },
+                "tags": { "mimetype": "image/jpeg" }
+              }]
+            }"#,
+        )
+        .expect("artwork probe parses")
+        .expect("attached picture stream detected");
+
+        assert_eq!(probe.stream_index, 2);
+        assert_eq!(probe.mime_type, "image/jpeg");
+        assert_eq!(probe.extension, "jpg");
+
+        let cmd = cue_artwork_extract_command(
+            Path::new("album.flac"),
+            &probe,
+            Path::new("staging/cue-artwork/cover.jpg"),
+        );
+        assert!(matches!(cmd.binary, ToolBinary::Ffmpeg));
+        assert!(cmd.args.windows(2).any(|pair| pair[0] == "-map" && pair[1] == "0:2"));
+        assert!(cmd.args.windows(2).any(|pair| pair[0] == "-c:v" && pair[1] == "copy"));
+        assert!(cmd.args.windows(2).any(|pair| pair[0] == "-frames:v" && pair[1] == "1"));
+        assert!(cmd.args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == "image2"));
+        assert!(cmd.args.iter().any(|arg| arg == "-an"));
+    }
+
+    #[test]
+    fn cue_artwork_temp_path_keeps_image_extension_for_ffmpeg_muxer_selection() {
+        let destination = Path::new("staging/cue-artwork/cover.jpg");
+        let temp = temporary_artwork_path(destination).expect("artwork temp path");
+
+        assert_eq!(
+            temp.parent().and_then(|path| path.file_name()).and_then(|name| name.to_str()),
+            Some(".tmp")
+        );
+        assert_eq!(
+            temp.extension().and_then(|value| value.to_str()),
+            Some("jpg")
+        );
+        let name = temp
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("temp file name");
+        assert!(
+            name.starts_with("cover.tmp."),
+            "artwork temp file should preserve the final stem before the temp suffix: {name}"
+        );
+        assert!(
+            name.ends_with(".jpg"),
+            "artwork temp file should preserve an image suffix FFmpeg can use: {name}"
+        );
     }
 
     #[test]
@@ -2974,9 +3360,9 @@ TRACK XX AUDIO
         // Track 1: starts at 0:00:00 = frame 0 = sample 0
         assert_eq!(source.tracks[0].id.track_number, 1);
         assert_eq!(source.tracks[0].id.source_ordinal, 1);
-        assert_staged_file_ref(&source.tracks[0]);
-        assert_staged_file_ref(&source.tracks[1]);
-        assert_staged_file_ref(&source.tracks[2]);
+        assert_cue_segment_carrier_ref(&source.tracks[0]);
+        assert_cue_segment_carrier_ref(&source.tracks[1]);
+        assert_cue_segment_carrier_ref(&source.tracks[2]);
         let boundaries = boundaries_for_cue(&cue_sheet_3_track(), total_samples, 44100, true);
         assert_eq!(boundaries[0], (0, 3_969_000));
 
@@ -3014,7 +3400,7 @@ TRACK XX AUDIO
             .expect("materialize succeeds");
 
         assert_eq!(source.tracks.len(), 1);
-        assert_staged_file_ref(&source.tracks[0]);
+        assert_cue_segment_carrier_ref(&source.tracks[0]);
         assert_eq!(source.tracks[0].expected_samples, Some(total_samples));
         assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("Only Track"));
     }
@@ -3092,7 +3478,7 @@ TRACK XX AUDIO
         let boundaries = boundaries_for_cue(&cue, total_samples, 44100, true);
         let mut prev_end: u64 = 0;
         for (track, (start_sample, samples)) in source.tracks.iter().zip(boundaries.iter()) {
-            assert_staged_file_ref(track);
+            assert_cue_segment_carrier_ref(track);
             assert_eq!(*start_sample, prev_end, "track {} must start where previous ended", track.id.track_number);
             assert!(*samples > 0, "track {} must have positive length", track.id.track_number);
             assert_eq!(track.expected_samples, Some(*samples));
@@ -3161,11 +3547,11 @@ FILE "track2.flac" WAVE
         assert_eq!(source.tracks.len(), 2);
         assert_eq!(source.album_metadata.total_tracks, 2);
 
-        assert_staged_file_ref(&source.tracks[0]);
+        assert_cue_segment_carrier_ref(&source.tracks[0]);
         assert_eq!(source.tracks[0].expected_samples, Some(441_000));
         assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("One"));
 
-        assert_staged_file_ref(&source.tracks[1]);
+        assert_cue_segment_carrier_ref(&source.tracks[1]);
         assert_eq!(source.tracks[1].expected_samples, Some(882_000));
         assert_eq!(source.tracks[1].metadata.title.as_deref(), Some("Two"));
     }
@@ -3200,9 +3586,9 @@ FILE "03 - Wonderin.wav" WAVE
         .expect("noncompliant multi-file pregap layout materializes");
 
         assert_eq!(source.tracks.len(), 2);
-        assert_staged_file_ref(&source.tracks[0]);
+        assert_cue_segment_carrier_ref(&source.tracks[0]);
         assert_eq!(source.tracks[0].expected_samples, Some(10_000_000));
-        assert_staged_file_ref(&source.tracks[1]);
+        assert_cue_segment_carrier_ref(&source.tracks[1]);
         assert_eq!(source.tracks[1].expected_samples, Some(5_000_000));
         assert_eq!(
             source.tracks[1]
@@ -3439,7 +3825,7 @@ FILE "track2.flac" WAVE
 
         // Track 2 boundary should use INDEX 01 (03:45:00), not INDEX 00 (03:43:37)
         // INDEX 01 at 03:45:00 = 16875 frames = 16875 * 44100 / 75 = 9,922,500 samples
-        assert_staged_file_ref(&source.tracks[1]);
+        assert_cue_segment_carrier_ref(&source.tracks[1]);
         let boundaries = boundaries_for_cue(cue, total_samples, 44100, true);
         assert_eq!(boundaries[1].0, 9_922_500);
 
@@ -3459,7 +3845,7 @@ FILE "track2.flac" WAVE
             .await
             .expect("materialize succeeds");
 
-        assert_staged_file_ref(&source.tracks[0]);
+        assert_cue_segment_carrier_ref(&source.tracks[0]);
         assert_eq!(source.tracks[0].expected_samples, Some(10_000_000));
     }
 
@@ -3513,7 +3899,7 @@ FILE "track2.flac" WAVE
             .expect("materialize succeeds at 96kHz");
 
         // Track 2 at 01:00:00 = 4500 frames = 4500 * 96000 / 75 = 5,760,000 samples
-        assert_staged_file_ref(&source.tracks[1]);
+        assert_cue_segment_carrier_ref(&source.tracks[1]);
         let boundaries = boundaries_for_cue(cue, total_samples, 96000, true);
         assert_eq!(boundaries[1].0, 5_760_000);
         assert_eq!(source.tracks[0].sample_rate, 96000);
@@ -3537,7 +3923,7 @@ FILE "track2.flac" WAVE
             .expect("materialize succeeds at 192kHz");
 
         // Track 2 at 02:00:00 = 9000 frames = 9000 * 192000 / 75 = 23,040,000 samples
-        assert_staged_file_ref(&source.tracks[1]);
+        assert_cue_segment_carrier_ref(&source.tracks[1]);
         let boundaries = boundaries_for_cue(cue, total_samples, 192000, true);
         assert_eq!(boundaries[1].0, 23_040_000);
         assert_eq!(source.tracks[0].sample_rate, 192000);
@@ -3587,7 +3973,7 @@ FILE "track2.flac" WAVE
             .expect("exact sample count allows small final track");
 
         assert_eq!(source.tracks.len(), 2);
-        assert_staged_file_ref(&source.tracks[1]);
+        assert_cue_segment_carrier_ref(&source.tracks[1]);
         assert_eq!(source.tracks[1].expected_samples, Some(500));
     }
 

@@ -252,6 +252,28 @@ pub async fn realize_track_with_tool_limits(
             }
             Ok(path.clone())
         }
+        TrackSourceRef::CueSegmentCarrier { path, carrier, .. } => {
+            if !path.exists() {
+                return Err(ConvertError::TrackValidation(format!(
+                    "staged CUE segment carrier does not exist: {}",
+                    path.display()
+                )));
+            }
+            if !path.is_file() {
+                return Err(ConvertError::TrackValidation(format!(
+                    "staged CUE segment carrier is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            if *carrier != CueSegmentCarrier::PcmS32LeWav {
+                return Err(ConvertError::TrackValidation(format!(
+                    "unsupported staged CUE segment carrier {:?} at {}",
+                    carrier,
+                    path.display()
+                )));
+            }
+            Ok(path.clone())
+        }
         TrackSourceRef::ImageSegment {
             image,
             start_sample,
@@ -284,7 +306,7 @@ fn cue_segment_output_name(image: &Path, start_sample: u64, samples: u64) -> Str
             .and_then(|value| value.to_str())
             .unwrap_or("image"),
     );
-    format!("{stem}_{start_sample:012}_{samples:012}.flac")
+    format!("{stem}_{start_sample:012}_{samples:012}.wav")
 }
 
 fn sanitize_segment_component(value: &str) -> String {
@@ -309,7 +331,7 @@ async fn realize_image_segment(
     image: &Path,
     start_sample: u64,
     samples: u64,
-    req: &PipelineRequest,
+    _req: &PipelineRequest,
     staging: &StagingDir,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
@@ -368,17 +390,6 @@ async fn realize_image_segment(
             )
             .await?;
 
-            if req.settings.metadata.transfer_tags || req.settings.metadata.preserve_artwork {
-                reattach_image_metadata_with_ffmpeg(
-                    image,
-                    &out_path,
-                    runner,
-                    cancel,
-                    tool_concurrency_limits,
-                )
-                .await?;
-            }
-
             Ok(())
         }
         .await;
@@ -415,42 +426,15 @@ fn cut_segment_ffmpeg_args(input: &Path, filter: &str, out_path: &Path) -> Vec<S
         input.to_string_lossy().into_owned(),
         "-map".into(),
         "0:a:0".into(),
-        "-map".into(),
-        "0:v?".into(),
-        "-map_metadata".into(),
-        "0".into(),
+        "-vn".into(),
+        "-sn".into(),
+        "-dn".into(),
         "-af".into(),
         filter.to_string(),
+        "-f".into(),
+        "wav".into(),
         "-c:a".into(),
-        "flac".into(),
-        "-c:v".into(),
-        "copy".into(),
-        "-compression_level".into(),
-        "0".into(),
-        out_path.to_string_lossy().into_owned(),
-    ]
-}
-
-fn reattach_image_metadata_ffmpeg_args(segment: &Path, image: &Path, out_path: &Path) -> Vec<String> {
-    vec![
-        "-y".into(),
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "error".into(),
-        "-i".into(),
-        segment.to_string_lossy().into_owned(),
-        "-i".into(),
-        image.to_string_lossy().into_owned(),
-        "-map".into(),
-        "0:a:0".into(),
-        "-map".into(),
-        "1:v?".into(),
-        "-map_metadata".into(),
-        "1".into(),
-        "-c:a".into(),
-        "copy".into(),
-        "-c:v".into(),
-        "copy".into(),
+        "pcm_s32le".into(),
         out_path.to_string_lossy().into_owned(),
     ]
 }
@@ -460,38 +444,32 @@ mod cue_image_segment_command_tests {
     use super::*;
 
     #[test]
-    fn cut_segment_command_copies_image_metadata_and_artwork() {
+    fn cue_segment_command_decodes_to_pcm_s32le_wav_without_stream_copy() {
         let args = cut_segment_ffmpeg_args(
             Path::new("album.flac"),
             "atrim=start_sample=0:end_sample=44100,asetpts=PTS-STARTPTS",
-            Path::new("segment.flac"),
+            Path::new("segment.wav"),
         );
 
         assert!(has_adjacent_arg(&args, "-map", "0:a:0"));
-        assert!(has_adjacent_arg(&args, "-map", "0:v?"));
-        assert!(has_adjacent_arg(&args, "-map_metadata", "0"));
-        assert!(has_adjacent_arg(&args, "-c:a", "flac"));
-        assert!(has_adjacent_arg(&args, "-c:v", "copy"));
-        assert!(!has_adjacent_arg(&args, "-map_metadata", "-1"));
-        assert!(!args.iter().any(|arg| arg == "-vn"));
+        assert!(has_adjacent_arg(&args, "-f", "wav"));
+        assert!(has_adjacent_arg(&args, "-c:a", "pcm_s32le"));
+        assert!(args.iter().any(|arg| arg == "-vn"));
+        assert!(args.iter().any(|arg| arg == "-sn"));
+        assert!(args.iter().any(|arg| arg == "-dn"));
+        assert!(!has_adjacent_arg(&args, "-map", "0:v?"));
+        assert!(!has_adjacent_arg(&args, "-map_metadata", "0"));
+        assert!(!has_adjacent_arg(&args, "-c:a", "copy"));
+        assert!(!has_adjacent_arg(&args, "-c:a", "flac"));
     }
 
     #[test]
-    fn wavpack_fallback_reattach_command_maps_original_image_artwork_and_tags() {
-        let args = reattach_image_metadata_ffmpeg_args(
-            Path::new("realized.flac"),
-            Path::new("album.wv"),
-            Path::new("reattached.flac"),
-        );
-
-        assert_eq!(args.iter().filter(|arg| *arg == "-i").count(), 2);
-        assert!(has_adjacent_arg(&args, "-map", "0:a:0"));
-        assert!(has_adjacent_arg(&args, "-map", "1:v?"));
-        assert!(has_adjacent_arg(&args, "-map_metadata", "1"));
-        assert!(has_adjacent_arg(&args, "-c:a", "copy"));
-        assert!(has_adjacent_arg(&args, "-c:v", "copy"));
-        assert!(!args.iter().any(|arg| arg == "-vn"));
+    fn legacy_image_segment_realization_uses_wav_carrier_name_not_flac() {
+        let name = cue_segment_output_name(Path::new("album.flac"), 0, 44_100);
+        assert!(name.ends_with(".wav"));
+        assert!(!name.ends_with(".flac"));
     }
+
 
     fn has_adjacent_arg(args: &[String], left: &str, right: &str) -> bool {
         args.windows(2).any(|window| window[0] == left && window[1] == right)
@@ -535,50 +513,6 @@ async fn cut_segment_with_ffmpeg(
         }
         Err(err) => Err(ConvertError::Tool(err)),
     }
-}
-
-async fn reattach_image_metadata_with_ffmpeg(
-    image: &Path,
-    out_path: &Path,
-    runner: &dyn ToolRunner,
-    cancel: &CancellationToken,
-    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
-) -> Result<(), ConvertError> {
-    let tmp_path = out_path.with_file_name(format!(
-        ".{}.reattach.{}.flac",
-        out_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("segment.flac"),
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&tmp_path);
-
-    let cmd = ToolCommand {
-        binary: ToolBinary::Ffmpeg,
-        args: reattach_image_metadata_ffmpeg_args(out_path, image, &tmp_path),
-        secret_args: vec![],
-        cwd: None,
-        env: vec![],
-        timeout: DEFAULT_CONVERT_TIMEOUT,
-    };
-
-    let result = match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await {
-        Ok(_) => {
-            fs::rename(&tmp_path, out_path)?;
-            Ok(())
-        }
-        Err(ToolRunnerError::Cancelled { .. }) => {
-            Err(ConvertError::Realize("cancelled".to_string()))
-        }
-        Err(err) => Err(ConvertError::Tool(err)),
-    };
-
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-
-    result
 }
 
 async fn ensure_decoded_wavpack_image(
@@ -843,17 +777,16 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
 
 /// Validate the encoded output's sample count against expected samples.
 ///
-/// Only checks lossless PCM formats (FLAC, WAV, AIFF, WavPack, ALAC) where
-/// sample count must be preserved. Lossy (MP3, AAC, Opus) and DSD formats
-/// are skipped because codec padding or a different sample model makes strict
-/// comparison invalid.
+/// Lossless PCM-preserving targets (FLAC, WAV, AIFF, WavPack, ALAC) must
+/// preserve the staged CUE segment's sample count after final encode. Exact
+/// `duration_ts` probes must match exactly. Duration-only probes get a narrow
+/// one-millisecond sample tolerance to cover container/probe rounding. Lossy
+/// formats and DSD are skipped because codec padding or a different sample
+/// model makes strict comparison invalid.
 ///
-/// Returns the actual probed sample count on success, or the original
-/// expected_samples if validation was skipped or the probe couldn't
-/// determine the sample count. Mismatches are logged as warnings, not
-/// fatal errors — the extraction-stage validation already caught source
-/// problems, so a post-encode drift may indicate an encoder quirk rather
-/// than data loss.
+/// Returns the actual probed sample count on success, the original expected
+/// sample count when validation is intentionally skipped for a non-lossless
+/// target, or a track-validation error when a lossless final output drifts.
 #[allow(dead_code)]
 async fn validate_encoded_output(
     out_path: &Path,
@@ -861,7 +794,7 @@ async fn validate_encoded_output(
     target_format: &tonepoet_pipeline::AudioFormat,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
-) -> Option<u64> {
+) -> Result<Option<u64>, ConvertError> {
     validate_encoded_output_with_tool_limits(
         out_path,
         expected_samples,
@@ -880,56 +813,62 @@ async fn validate_encoded_output_with_tool_limits(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
-) -> Option<u64> {
+) -> Result<Option<u64>, ConvertError> {
     let Some(expected) = expected_samples else {
-        return None;
+        return Ok(None);
     };
 
-    if !target_format.is_pcm_lossless() {
-        return Some(expected);
+    if matches!(
+        target_format,
+        tonepoet_pipeline::AudioFormat::Dsf | tonepoet_pipeline::AudioFormat::Dff
+    ) || !target_format.is_pcm_lossless()
+    {
+        return Ok(Some(expected));
     }
 
-    let probe = match probe_realized_segment_with_tool_limits(
+    let probe = probe_realized_segment_with_tool_limits(
         out_path,
         runner,
         cancel,
         tool_concurrency_limits,
     )
     .await
-    {
-        Ok(probe) => probe,
-        Err(err) => {
-            log::warn!(
-                "post-encode sample validation skipped (probe failed): {} — {err}",
-                out_path.display()
-            );
-            return Some(expected);
-        }
-    };
-
-    let Some(actual) = probe.samples else {
-        log::warn!(
-            "post-encode sample validation skipped (no sample count): {}",
+    .map_err(|err| {
+        ConvertError::TrackValidation(format!(
+            "post-encode sample validation failed for lossless output {}: {err}",
             out_path.display()
-        );
-        return Some(expected);
-    };
+        ))
+    })?;
+
+    let actual = probe.samples.ok_or_else(|| {
+        ConvertError::TrackValidation(format!(
+            "post-encode sample validation failed for lossless output {}: ffprobe returned no sample count or duration",
+            out_path.display()
+        ))
+    })?;
 
     let delta = actual.abs_diff(expected);
-    let allowed = if probe.exact {
-        0
-    } else {
-        (probe.sample_rate / 75).max(1) as u64
-    };
+    let allowed = encoded_output_sample_tolerance(&probe);
 
     if delta > allowed {
-        log::warn!(
-            "post-encode sample drift: expected {expected}, got {actual}, allowed {allowed} — {}",
+        return Err(ConvertError::TrackValidation(format!(
+            "post-encode sample drift for lossless output {}: expected {expected}, got {actual}, allowed {allowed}",
             out_path.display()
-        );
+        )));
     }
 
-    Some(actual)
+    Ok(Some(actual))
+}
+
+fn encoded_output_sample_tolerance(probe: &RealizedProbe) -> u64 {
+    if probe.exact {
+        0
+    } else {
+        // Duration-only probes are a fallback for containers/tools that do not
+        // expose exact `duration_ts`; allow at most one millisecond of sample
+        // rounding at the probed sample rate.
+        (probe.sample_rate / 1000).max(1) as u64
+    }
 }
 
 fn samples_from_stream_duration_ts(stream: &serde_json::Value, sample_rate: u32) -> Option<u64> {
@@ -1487,6 +1426,8 @@ pub fn plan_outputs(
     if let Some(folder_template) = &req.naming.folder_template {
         validate_template(folder_template).map_err(PlanError::InvalidTemplate)?;
     }
+    validate_final_container_extension(&req.settings.target_format, req.container_extension.as_deref())
+        .map_err(PlanError::InvalidTemplate)?;
 
     let output_root = normalize_path(&req.output_root);
     let album_dir = if req.naming.per_album_subdir {
@@ -1882,7 +1823,7 @@ async fn convert_one_track_work(
                 );
                 Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
             } else {
-                let actual_samples = validate_encoded_output_with_tool_limits(
+                let actual_samples = match validate_encoded_output_with_tool_limits(
                     &staged_path,
                     track.expected_samples,
                     &req.settings.target_format,
@@ -1890,7 +1831,21 @@ async fn convert_one_track_work(
                     &cancel,
                     tool_concurrency_limits.as_ref(),
                 )
-                .await;
+                .await
+                {
+                    Ok(samples) => samples,
+                    Err(err) => {
+                        let commands = command_from_convert_error(&err);
+                        let record = failed_track_record(
+                            &track,
+                            Some(realized_input),
+                            Some(staged_path),
+                            commands,
+                            err.to_string(),
+                        );
+                        return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
+                    }
+                };
                 let record = TrackRecord {
                     track_id: track.id.clone(),
                     outcome: TrackOutcome::Ok,
@@ -2325,6 +2280,34 @@ fn planner_metadata_already_satisfied(
     }
 }
 
+#[derive(Debug, Clone)]
+struct CueArtworkSidecar {
+    path: PathBuf,
+    mime_type: Option<String>,
+}
+
+fn cue_artwork_sidecar_from_album_metadata(album: &AlbumMetadata) -> Option<CueArtworkSidecar> {
+    let path = album.extra.get(CUE_ARTWORK_PATH_EXTRA_KEY)?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(CueArtworkSidecar {
+        path: PathBuf::from(path),
+        mime_type: album
+            .extra
+            .get(CUE_ARTWORK_MIME_EXTRA_KEY)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    })
+}
+
+/// Apply metadata tags and CUE artwork to staged audio artifacts.
+///
+/// CUE tracks use an audio-only PCM S32 WAV carrier. When the materializer
+/// extracted original image artwork into a sidecar, this stage owns the
+/// post-encode re-injection step for target containers that have a concrete
+/// writer here. Unsupported target families are deliberately skipped with a
+/// warning rather than pretending the carrier preserved artwork.
 /// Apply metadata tags to staged audio artifacts.
 pub async fn apply_metadata(
     artifacts: &ArtifactSet,
@@ -2350,6 +2333,12 @@ pub async fn apply_metadata_with_tool_limits(
             outcome: StageOutcome::Skipped,
         });
     }
+
+    let cue_artwork = if req.settings.metadata.preserve_artwork {
+        cue_artwork_sidecar_from_album_metadata(&source.album_metadata)
+    } else {
+        None
+    };
 
     match &artifacts.audio {
         AudioArtifacts::Tracks(tracks) => {
@@ -2384,6 +2373,16 @@ pub async fn apply_metadata_with_tool_limits(
                     )
                     .await?;
                 }
+                if let Some(artwork) = cue_artwork.as_ref() {
+                    embed_cue_artwork_for_file(
+                        &artifact.staged_path,
+                        artwork,
+                        runner,
+                        cancel,
+                        tool_concurrency_limits.as_ref(),
+                    )
+                    .await?;
+                }
             }
         }
         AudioArtifacts::Merged(merged) => {
@@ -2404,6 +2403,16 @@ pub async fn apply_metadata_with_tool_limits(
                 tool_concurrency_limits.as_ref(),
             )
             .await?;
+            if let Some(artwork) = cue_artwork.as_ref() {
+                embed_cue_artwork_for_file(
+                    &merged.staged_path,
+                    artwork,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits.as_ref(),
+                )
+                .await?;
+            }
         }
     }
 
@@ -2441,20 +2450,7 @@ fn cue_extra_tag_key(scope: &str, key: &str) -> String {
     }
 }
 
-async fn tag_audio_file(
-    path: &Path,
-    meta: &TrackMetadata,
-    album: &AlbumMetadata,
-    runner: &dyn ToolRunner,
-    cancel: &CancellationToken,
-    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
-) -> Result<(), MetadataError> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
+fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> Vec<(String, String)> {
     let mut tags: Vec<(String, String)> = Vec::new();
     if let Some(ref v) = meta.title {
         push_tag_value(&mut tags, "TITLE", v);
@@ -2462,7 +2458,7 @@ async fn tag_audio_file(
     if let Some(ref v) = meta.artist {
         push_tag_value(&mut tags, "ARTIST", v);
     }
-    if let Some(ref v) = meta.album_artist {
+    if let Some(v) = meta.album_artist.as_ref().or(album.album_artist.as_ref()) {
         push_tag_value(&mut tags, "ALBUMARTIST", v);
     }
     let album_tag = album.extra.get("album_tag_override").or(album.album.as_ref());
@@ -2471,14 +2467,18 @@ async fn tag_audio_file(
     }
     if let Some(ref v) = meta.genre {
         push_tag_value(&mut tags, "GENRE", v);
+    } else if let Some(ref v) = album.genre {
+        push_tag_value(&mut tags, "GENRE", v);
     }
     if let Some(ref v) = meta.date {
+        push_tag_value(&mut tags, "DATE", v);
+    } else if let Some(ref v) = album.date {
         push_tag_value(&mut tags, "DATE", v);
     }
     if let Some(n) = meta.track_number {
         push_tag_value(&mut tags, "TRACKNUMBER", &n.to_string());
     }
-    if let Some(n) = meta.disc_number {
+    if let Some(n) = meta.disc_number.or(album.disc_number) {
         push_tag_value(&mut tags, "DISCNUMBER", &n.to_string());
     }
     if let Some(ref v) = meta.comment {
@@ -2513,13 +2513,18 @@ async fn tag_audio_file(
     if let Some(n) = album.total_discs {
         push_tag_value(&mut tags, "TOTALDISCS", &n.to_string());
     }
-    if let Some(n) = album.disc_number {
-        push_tag_value(&mut tags, "DISCNUMBER", &n.to_string());
-    }
     if let Some(v) = album.extra.get("catalog") {
         push_tag_value(&mut tags, "CATALOG", v);
     }
     for (key, value) in &album.extra {
+        if key == "album_tag_override"
+            || key == CUE_ARTWORK_PATH_EXTRA_KEY
+            || key == CUE_ARTWORK_MIME_EXTRA_KEY
+            || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
+            || key == CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY
+        {
+            continue;
+        }
         let tag_key = cue_extra_tag_key("ALBUM", key);
         push_tag_value(&mut tags, &tag_key, value);
     }
@@ -2528,106 +2533,2245 @@ async fn tag_audio_file(
         push_tag_value(&mut tags, &tag_key, value);
     }
 
+    tags
+}
+
+fn tag_value<'a>(tags: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    tags.iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn ffmpeg_metadata_key(key: &str) -> String {
+    match key {
+        "ALBUMARTIST" => "album_artist".to_string(),
+        "PRE_EMPHASIS" => "pre_emphasis".to_string(),
+        "CUE_FLAGS" => "cue_flags".to_string(),
+        _ => key.to_ascii_lowercase(),
+    }
+}
+
+fn ffmpeg_metadata_value_for_number(
+    tags: &[(String, String)],
+    number_key: &str,
+    total_key: &str,
+) -> Option<String> {
+    let number = tag_value(tags, number_key)?;
+    match tag_value(tags, total_key) {
+        Some(total) if !total.trim().is_empty() => Some(format!("{number}/{total}")),
+        _ => Some(number.to_string()),
+    }
+}
+
+fn ffmpeg_authoritative_metadata_tags(tags: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (key, value) in tags {
+        match key.as_str() {
+            "TRACKNUMBER" => {
+                if let Some(track) = ffmpeg_metadata_value_for_number(tags, "TRACKNUMBER", "TOTALTRACKS") {
+                    push_tag_value(&mut out, "track", &track);
+                }
+            }
+            "DISCNUMBER" => {
+                if let Some(disc) = ffmpeg_metadata_value_for_number(tags, "DISCNUMBER", "TOTALDISCS") {
+                    push_tag_value(&mut out, "disc", &disc);
+                }
+            }
+            "TOTALTRACKS" | "TOTALDISCS" => {}
+            _ => push_tag_value(&mut out, &ffmpeg_metadata_key(key), value),
+        }
+    }
+    out
+}
+
+fn metadata_rewrite_temp_path(path: &Path) -> io::Result<PathBuf> {
+    let parent = parent_dir_or_current(path);
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio");
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("tmp");
+    let prefix = format!(".{file_name}.tonepoet-metadata.");
+    let suffix = format!(".tmp.{ext}");
+    let temp = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(&suffix)
+        .tempfile_in(parent)?;
+    temp.into_temp_path().keep().map_err(|err| err.error)
+}
+
+fn sync_file_before_metadata_replace(path: &Path) -> io::Result<()> {
+    let file = fs::OpenOptions::new().read(true).open(path)?;
+    file.sync_all()
+}
+
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = parent_dir_or_current(path);
+    let dir = fs::File::open(parent)?;
+    dir.sync_all()
+}
+
+fn replace_rewritten_metadata_file(path: &Path, tmp: &Path) -> io::Result<()> {
+    if !tmp.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("metadata rewrite did not create temporary file: {}", tmp.display()),
+        ));
+    }
+    let metadata = fs::metadata(tmp)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("metadata rewrite produced an empty or non-file temporary output: {}", tmp.display()),
+        ));
+    }
+
+    sync_file_before_metadata_replace(tmp)?;
+    // The rewrite temp is created in the same directory as the target, so this
+    // rename is same-filesystem. On POSIX platforms it atomically replaces an
+    // existing target and never exposes a target-absent window.
+    fs::rename(tmp, path)?;
+    sync_parent_dir(path)
+}
+
+const AUTHORITATIVE_CUE_MANAGED_TAG_KEYS: &[&str] = &[
+    "TITLE",
+    "ARTIST",
+    "ALBUMARTIST",
+    "ALBUM",
+    "GENRE",
+    "DATE",
+    "TRACKNUMBER",
+    "TOTALTRACKS",
+    "DISCNUMBER",
+    "TOTALDISCS",
+    "COMMENT",
+    "COMPOSER",
+    "PERFORMER",
+    "ISRC",
+    "PUBLISHER",
+    "COPYRIGHT",
+    "PRE_EMPHASIS",
+    "CUE_FLAGS",
+    "CATALOG",
+];
+
+const TONEPOET_MANAGED_DYNAMIC_TAG_PREFIXES: &[&str] = &[
+    "TONEPOET_ALBUM_",
+    "TONEPOET_TRACK_",
+];
+
+fn normalize_metadata_key(key: &str) -> String {
+    key.trim().to_ascii_uppercase()
+}
+
+fn is_tonepoet_managed_dynamic_tag_key(key: &str) -> bool {
+    let normalized = normalize_metadata_key(key);
+    TONEPOET_MANAGED_DYNAMIC_TAG_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn parse_native_tag_keys(text: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for line in text.lines() {
+        let Some((key, _)) = line
+            .split_once('=')
+            .or_else(|| line.split_once(':'))
+        else {
+            continue;
+        };
+        let key = normalize_metadata_key(key);
+        if key.is_empty() || key == "VENDOR STRING" {
+            continue;
+        }
+        keys.insert(key);
+    }
+    keys
+}
+
+fn native_existing_tag_list_command(path: &Path, ext: &str) -> Option<ToolCommand> {
+    let (binary, args) = match ext {
+        "flac" => (
+            ToolBinary::Metaflac,
+            vec!["--export-tags-to=-".to_string(), path.display().to_string()],
+        ),
+        "opus" | "ogg" => (
+            ToolBinary::Opustags,
+            vec![path.display().to_string()],
+        ),
+        "wv" => (
+            ToolBinary::Wvtag,
+            vec!["--list".to_string(), path.display().to_string()],
+        ),
+        _ => return None,
+    };
+
+    Some(ToolCommand {
+        binary,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(30),
+    })
+}
+
+async fn native_existing_tag_keys(
+    path: &Path,
+    ext: &str,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<BTreeSet<String>, MetadataError> {
+    let Some(cmd) = native_existing_tag_list_command(path, ext) else {
+        return Ok(BTreeSet::new());
+    };
+
+    let output = run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
+        .await
+        .map_err(MetadataError::Tool)?;
+    Ok(parse_native_tag_keys(&output.stdout_tail))
+}
+
+fn authoritative_cue_managed_tag_delete_keys(
+    tags: &[(String, String)],
+    existing_keys: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for key in AUTHORITATIVE_CUE_MANAGED_TAG_KEYS {
+        let key = normalize_metadata_key(key);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+
+    // Current tags include dynamically modeled CUE extras such as
+    // TONEPOET_ALBUM_* and TONEPOET_TRACK_*. They are authoritative for this
+    // run and must be rewritten without duplicates.
+    for (key, _) in tags {
+        let key = normalize_metadata_key(key);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+
+    // Changed-input convergence requires deleting old Tonepoet-owned dynamic
+    // keys that are present on the file but absent from this run's payload.
+    // Do not delete arbitrary user tags; only the owned prefixes below are
+    // considered managed dynamic CUE metadata.
+    for key in existing_keys {
+        if is_tonepoet_managed_dynamic_tag_key(key) && seen.insert(key.clone()) {
+            keys.push(key.clone());
+        }
+    }
+
+    keys
+}
+
+fn metaflac_tag_args(
+    path: &Path,
+    tags: &[(String, String)],
+    existing_keys: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    for key in authoritative_cue_managed_tag_delete_keys(tags, existing_keys) {
+        args.push(format!("--remove-tag={key}"));
+    }
+    for (k, v) in tags {
+        args.push(format!("--set-tag={}={}", k, v));
+    }
+    args.push(path.display().to_string());
+    args
+}
+
+fn opustags_tag_args(
+    path: &Path,
+    tags: &[(String, String)],
+    existing_keys: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    for key in authoritative_cue_managed_tag_delete_keys(tags, existing_keys) {
+        args.push("--delete".into());
+        args.push(key);
+    }
+    for (k, v) in tags {
+        args.push("-s".into());
+        args.push(format!("{}={}", k, v));
+    }
+    args.push("--in-place".into());
+    args.push(path.display().to_string());
+    args
+}
+
+fn wvtag_tag_args(
+    path: &Path,
+    tags: &[(String, String)],
+    existing_keys: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut args = vec!["-q".to_string()];
+    for key in authoritative_cue_managed_tag_delete_keys(tags, existing_keys) {
+        args.push("-d".into());
+        args.push(key);
+    }
+    for (k, v) in tags {
+        args.push("-w".into());
+        args.push(format!("{}={}", k, v));
+    }
+    args.push(path.display().to_string());
+    args
+}
+
+fn ffmpeg_metadata_rewrite_args(
+    path: &Path,
+    tmp: &Path,
+    tags: &[(String, String)],
+) -> Vec<String> {
+    let mut args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        path.display().to_string(),
+        "-map".into(),
+        "0".into(),
+        "-map_metadata".into(),
+        "-1".into(),
+    ];
+    for (k, v) in ffmpeg_authoritative_metadata_tags(tags) {
+        args.push("-metadata".into());
+        args.push(format!("{}={}", k, v));
+    }
+    args.push("-c".into());
+    args.push("copy".into());
+    args.push(tmp.display().to_string());
+    args
+}
+
+fn metadata_tag_command(
+    path: &Path,
+    ext: &str,
+    tags: &[(String, String)],
+    existing_keys: &BTreeSet<String>,
+) -> Result<(ToolCommand, Option<PathBuf>), MetadataError> {
+    let (binary, args, tmp_path) = match ext {
+        "flac" => (ToolBinary::Metaflac, metaflac_tag_args(path, tags, existing_keys), None),
+        "opus" | "ogg" => (ToolBinary::Opustags, opustags_tag_args(path, tags, existing_keys), None),
+        "wv" => (ToolBinary::Wvtag, wvtag_tag_args(path, tags, existing_keys), None),
+        "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif" => {
+            let tmp = metadata_rewrite_temp_path(path)?;
+            let args = ffmpeg_metadata_rewrite_args(path, &tmp, tags);
+            (ToolBinary::Ffmpeg, args, Some(tmp))
+        }
+        _ => return Err(MetadataError::UnsupportedTagFormat(ext.to_string())),
+    };
+
+    let timeout = match binary {
+        ToolBinary::Ffmpeg => Duration::from_secs(60),
+        _ => Duration::from_secs(30),
+    };
+
+    Ok((
+        ToolCommand {
+            binary,
+            args,
+            secret_args: vec![],
+            cwd: None,
+            env: vec![],
+            timeout,
+        },
+        tmp_path,
+    ))
+}
+
+
+fn ffmpeg_artwork_rewrite_args(
+    path: &Path,
+    artwork: &CueArtworkSidecar,
+    tmp: &Path,
+    ext: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        path.display().to_string(),
+        "-i".into(),
+        artwork.path.display().to_string(),
+        "-map".into(),
+        "0:a".into(),
+        "-map_metadata".into(),
+        "0".into(),
+        "-map_chapters".into(),
+        "0".into(),
+        "-map".into(),
+        "1:v:0".into(),
+        "-c:a".into(),
+        "copy".into(),
+        "-c:v".into(),
+        "copy".into(),
+        "-disposition:v:0".into(),
+        "attached_pic".into(),
+        "-metadata:s:v".into(),
+        "title=Album cover".into(),
+        "-metadata:s:v".into(),
+        "comment=Cover (front)".into(),
+    ];
+
+    match ext {
+        "mp3" => {
+            args.push("-id3v2_version".into());
+            args.push("3".into());
+        }
+        "m4a" | "mp4" => {
+            args.push("-f".into());
+            args.push("ipod".into());
+        }
+        _ => {}
+    }
+
+    args.push(tmp.display().to_string());
+    args
+}
+
+fn wvtag_artwork_args(path: &Path, artwork: &CueArtworkSidecar) -> Vec<String> {
+    vec![
+        "-q".to_string(),
+        "-d".to_string(),
+        "Cover Art (Front)".to_string(),
+        "--write-binary-tag".to_string(),
+        format!("Cover Art (Front)=@{}", artwork.path.display()),
+        path.display().to_string(),
+    ]
+}
+
+fn cue_artwork_embed_command(
+    path: &Path,
+    ext: &str,
+    artwork: &CueArtworkSidecar,
+) -> Result<Option<(ToolCommand, Option<PathBuf>)>, MetadataError> {
+    let (binary, args, tmp_path, timeout) = match ext {
+        "flac" | "mp3" | "m4a" | "mp4" => {
+            let tmp = metadata_rewrite_temp_path(path)?;
+            (
+                ToolBinary::Ffmpeg,
+                ffmpeg_artwork_rewrite_args(path, artwork, &tmp, ext),
+                Some(tmp),
+                Duration::from_secs(90),
+            )
+        }
+        "wv" => (
+            ToolBinary::Wvtag,
+            wvtag_artwork_args(path, artwork),
+            None,
+            Duration::from_secs(30),
+        ),
+        // WAV/AIFF artwork conventions are not portable, raw AAC has no MP4
+        // cover atom, and Opus/Ogg needs a METADATA_BLOCK_PICTURE writer rather
+        // than FFmpeg attached-picture stream-copy. Keep these unsupported
+        // cases explicit and non-failing.
+        "wav" | "wave" | "aiff" | "aif" | "aac" | "opus" | "ogg" => return Ok(None),
+        _ => return Ok(None),
+    };
+
+    Ok(Some((
+        ToolCommand {
+            binary,
+            args,
+            secret_args: vec![],
+            cwd: None,
+            env: vec![],
+            timeout,
+        },
+        tmp_path,
+    )))
+}
+
+async fn embed_cue_artwork_for_file(
+    path: &Path,
+    artwork: &CueArtworkSidecar,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), MetadataError> {
+    if !artwork.path.is_file() {
+        return Err(MetadataError::UnsupportedTagFormat(format!(
+            "CUE artwork sidecar is missing: {}",
+            artwork.path.display()
+        )));
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let Some((cmd, tmp_path)) = cue_artwork_embed_command(path, &ext, artwork)? else {
+        log::warn!(
+            "CUE artwork sidecar {} is available, but target {} does not have an implemented post-encode artwork writer on this path",
+            artwork.path.display(),
+            path.display()
+        );
+        return Ok(());
+    };
+
+    let result = run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
+        .await
+        .map_err(MetadataError::Tool);
+
+    if let Err(err) = result {
+        if let Some(tmp) = tmp_path.as_ref() {
+            let _ = fs::remove_file(tmp);
+        }
+        return Err(err);
+    }
+
+    if let Some(tmp) = tmp_path.as_ref() {
+        replace_rewritten_metadata_file(path, tmp)?;
+    }
+
+    Ok(())
+}
+
+async fn tag_audio_file(
+    path: &Path,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), MetadataError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let tags = authoritative_metadata_tags(meta, album);
     if tags.is_empty() {
         return Ok(());
     }
 
-    let cmd = match ext.as_str() {
-        "flac" => {
-            let mut args = Vec::new();
-            for (k, v) in &tags {
-                args.push(format!("--remove-tag={}", k));
-                args.push(format!("--set-tag={}={}", k, v));
-            }
-            args.push(path.display().to_string());
-            ToolCommand {
-                binary: ToolBinary::Metaflac,
-                args,
-                secret_args: vec![],
-                cwd: None,
-                env: vec![],
-                timeout: Duration::from_secs(30),
-            }
-        }
-        "opus" | "ogg" => {
-            let mut args = Vec::new();
-            for (k, _) in &tags {
-                args.push("--delete".into());
-                args.push(k.clone());
-            }
-            for (k, v) in &tags {
-                args.push("-s".into());
-                args.push(format!("{}={}", k, v));
-            }
-            args.push("--in-place".into());
-            args.push(path.display().to_string());
-            ToolCommand {
-                binary: ToolBinary::Opustags,
-                args,
-                secret_args: vec![],
-                cwd: None,
-                env: vec![],
-                timeout: Duration::from_secs(30),
-            }
-        }
-        "wv" => {
-            let mut args = vec!["-q".to_string()];
-            for (k, v) in &tags {
-                args.push("-w".into());
-                args.push(format!("{}={}", k, v));
-            }
-            args.push(path.display().to_string());
-            ToolCommand {
-                binary: ToolBinary::Wvtag,
-                args,
-                secret_args: vec![],
-                cwd: None,
-                env: vec![],
-                timeout: Duration::from_secs(30),
-            }
-        }
-        "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif" => {
-            let tmp = path.with_extension(format!(
-                "tmp.{}",
-                path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
-            ));
-            let mut args = vec!["-y".into(), "-i".into(), path.display().to_string()];
-            for (k, v) in &tags {
-                args.push("-metadata".into());
-                args.push(format!("{}={}", k.to_lowercase(), v));
-            }
-            args.push("-c".into());
-            args.push("copy".into());
-            args.push(tmp.display().to_string());
-            ToolCommand {
-                binary: ToolBinary::Ffmpeg,
-                args,
-                secret_args: vec![],
-                cwd: None,
-                env: vec![],
-                timeout: Duration::from_secs(60),
-            }
-        }
-        _ => {
-            return Err(MetadataError::UnsupportedTagFormat(ext));
-        }
-    };
-
-    run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
+    let existing_keys = native_existing_tag_keys(
+        path,
+        &ext,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await?;
+    let (cmd, tmp_path) = metadata_tag_command(path, &ext, &tags, &existing_keys)?;
+    let result = run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
         .await
-        .map_err(MetadataError::Tool)?;
+        .map_err(MetadataError::Tool);
 
-    if matches!(ext.as_str(), "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif") {
-        let tmp = path.with_extension(format!(
-            "tmp.{}",
-            path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
-        ));
-        if tmp.exists() {
-            fs::rename(&tmp, path)?;
+    if let Err(err) = result {
+        if let Some(tmp) = tmp_path.as_ref() {
+            let _ = fs::remove_file(tmp);
         }
+        return Err(err);
+    }
+
+    if let Some(tmp) = tmp_path.as_ref() {
+        replace_rewritten_metadata_file(path, tmp)?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod metadata_writer_command_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::process::Command as ProcessCommand;
+
+    fn assert_pair(args: &[String], left: &str, right: &str) {
+        assert!(
+            args.windows(2).any(|window| window[0] == left && window[1] == right),
+            "missing adjacent args {left:?} {right:?}: {args:?}"
+        );
+    }
+
+    fn sample_metadata() -> (TrackMetadata, AlbumMetadata) {
+        let mut album_extra = BTreeMap::new();
+        album_extra.insert("catalog".to_string(), "ABC-123".to_string());
+        album_extra.insert("album_tag_override".to_string(), "Cue Album Override".to_string());
+        album_extra.insert("label".to_string(), "Example Label".to_string());
+        album_extra.insert(CUE_ARTWORK_PATH_EXTRA_KEY.to_string(), "staging/cue-artwork/cover.jpg".to_string());
+        album_extra.insert(CUE_ARTWORK_MIME_EXTRA_KEY.to_string(), "image/jpeg".to_string());
+
+        let mut track_extra = BTreeMap::new();
+        track_extra.insert("index_00".to_string(), "00:00:32".to_string());
+
+        (
+            TrackMetadata {
+                title: Some("Cue Track".to_string()),
+                artist: Some("Cue Performer".to_string()),
+                performer: Some("Cue Performer".to_string()),
+                composer: Some("Cue Composer".to_string()),
+                genre: Some("Fusion".to_string()),
+                date: Some("2026".to_string()),
+                track_number: Some(3),
+                isrc: Some("USRC17607839".to_string()),
+                comment: Some("Cue note".to_string()),
+                pre_emphasis: true,
+                extra: track_extra,
+                ..TrackMetadata::default()
+            },
+            AlbumMetadata {
+                album: Some("Cue Album".to_string()),
+                album_artist: Some("Cue Album Artist".to_string()),
+                total_tracks: 12,
+                total_discs: Some(2),
+                disc_number: Some(2),
+                extra: album_extra,
+                ..AlbumMetadata::default()
+            },
+        )
+    }
+
+    #[test]
+    fn authoritative_tags_cover_cue_album_track_and_number_fields() {
+        let (track, album) = sample_metadata();
+        let tags = authoritative_metadata_tags(&track, &album);
+
+        assert!(tags.contains(&("TITLE".to_string(), "Cue Track".to_string())));
+        assert!(tags.contains(&("ARTIST".to_string(), "Cue Performer".to_string())));
+        assert!(tags.contains(&("ALBUMARTIST".to_string(), "Cue Album Artist".to_string())));
+        assert!(tags.contains(&("ALBUM".to_string(), "Cue Album Override".to_string())));
+        assert!(tags.contains(&("TRACKNUMBER".to_string(), "3".to_string())));
+        assert!(tags.contains(&("TOTALTRACKS".to_string(), "12".to_string())));
+        assert!(tags.contains(&("DISCNUMBER".to_string(), "2".to_string())));
+        assert!(tags.contains(&("TOTALDISCS".to_string(), "2".to_string())));
+        assert!(tags.contains(&("ISRC".to_string(), "USRC17607839".to_string())));
+        assert!(tags.contains(&("CATALOG".to_string(), "ABC-123".to_string())));
+        assert!(tags.contains(&("PERFORMER".to_string(), "Cue Performer".to_string())));
+        assert!(tags.contains(&("PRE_EMPHASIS".to_string(), "1".to_string())));
+        assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_ALBUM_TAG_OVERRIDE"));
+        assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_PATH"));
+        assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_MIME"));
+    }
+
+    #[test]
+    fn ffmpeg_tags_use_container_native_track_disc_and_album_artist_keys() {
+        let (track, album) = sample_metadata();
+        let tags = ffmpeg_authoritative_metadata_tags(&authoritative_metadata_tags(&track, &album));
+
+        assert!(tags.contains(&("title".to_string(), "Cue Track".to_string())));
+        assert!(tags.contains(&("album_artist".to_string(), "Cue Album Artist".to_string())));
+        assert!(tags.contains(&("track".to_string(), "3/12".to_string())));
+        assert!(tags.contains(&("disc".to_string(), "2/2".to_string())));
+        assert!(!tags.iter().any(|(key, _)| key == "tracknumber"));
+        assert!(!tags.iter().any(|(key, _)| key == "totaltracks"));
+    }
+
+    #[test]
+    fn ffmpeg_rewrite_args_clear_input_metadata_preserve_streams_and_copy_codecs() {
+        let (track, album) = sample_metadata();
+        let tags = authoritative_metadata_tags(&track, &album);
+        let args = ffmpeg_metadata_rewrite_args(
+            Path::new("track.m4a"),
+            Path::new(".track.m4a.tmp.m4a"),
+            &tags,
+        );
+
+        assert_pair(&args, "-map", "0");
+        assert_pair(&args, "-map_metadata", "-1");
+        assert_pair(&args, "-metadata", "album_artist=Cue Album Artist");
+        assert_pair(&args, "-metadata", "track=3/12");
+        assert_pair(&args, "-metadata", "disc=2/2");
+        assert_pair(&args, "-c", "copy");
+        assert_eq!(args.last().map(String::as_str), Some(".track.m4a.tmp.m4a"));
+    }
+
+    #[test]
+    fn native_managed_dynamic_key_discovery_is_prefix_scoped() {
+        let keys = parse_native_tag_keys(
+            "TITLE=Old\nTONEPOET_ALBUM_STALE=old\nTONEPOET_TRACK_OLD=old\nUSER_NOTE=keep\nVendor String: ignored\n",
+        );
+        assert!(keys.contains("TONEPOET_ALBUM_STALE"));
+        assert!(keys.contains("TONEPOET_TRACK_OLD"));
+        assert!(keys.contains("USER_NOTE"));
+
+        let delete_keys = authoritative_cue_managed_tag_delete_keys(
+            &[("TITLE".to_string(), "New".to_string())],
+            &keys,
+        );
+        assert!(delete_keys.contains(&"TONEPOET_ALBUM_STALE".to_string()));
+        assert!(delete_keys.contains(&"TONEPOET_TRACK_OLD".to_string()));
+        assert!(!delete_keys.contains(&"USER_NOTE".to_string()));
+    }
+
+    #[test]
+    fn native_writer_commands_delete_full_managed_universe_before_writing_present_values() {
+        let tags = vec![
+            ("TITLE".to_string(), "Cue Track".to_string()),
+            ("ARTIST".to_string(), "Cue Performer".to_string()),
+        ];
+
+        let existing = BTreeSet::from([
+            "TONEPOET_ALBUM_STALE_DYNAMIC".to_string(),
+            "USER_NOTE".to_string(),
+        ]);
+        let flac = metaflac_tag_args(Path::new("track.flac"), &tags, &existing);
+        assert!(flac.iter().any(|arg| arg == "--remove-tag=COMMENT"));
+        assert!(flac.iter().any(|arg| arg == "--remove-tag=CATALOG"));
+        assert!(flac.iter().any(|arg| arg == "--remove-tag=TONEPOET_ALBUM_STALE_DYNAMIC"));
+        assert!(!flac.iter().any(|arg| arg == "--remove-tag=USER_NOTE"));
+        assert_pair(&flac, "--set-tag=TITLE=Cue Track", "--set-tag=ARTIST=Cue Performer");
+        assert!(
+            flac.iter().position(|arg| arg == "--remove-tag=COMMENT").unwrap()
+                < flac.iter().position(|arg| arg == "--set-tag=TITLE=Cue Track").unwrap(),
+            "metaflac must delete stale managed keys before setting current values"
+        );
+
+        let opus = opustags_tag_args(Path::new("track.opus"), &tags, &existing);
+        assert_pair(&opus, "--delete", "COMMENT");
+        assert_pair(&opus, "--delete", "CATALOG");
+        assert_pair(&opus, "--delete", "TONEPOET_ALBUM_STALE_DYNAMIC");
+        assert!(!opus.windows(2).any(|pair| pair[0] == "--delete" && pair[1] == "USER_NOTE"));
+        assert_pair(&opus, "-s", "TITLE=Cue Track");
+        assert!(
+            opus.iter().position(|arg| arg == "--delete").unwrap()
+                < opus.iter().position(|arg| arg == "-s").unwrap(),
+            "opustags must delete stale managed keys before setting current values"
+        );
+
+        let wavpack = wvtag_tag_args(Path::new("track.wv"), &tags, &existing);
+        assert_pair(&wavpack, "-d", "COMMENT");
+        assert_pair(&wavpack, "-d", "CATALOG");
+        assert_pair(&wavpack, "-d", "TONEPOET_ALBUM_STALE_DYNAMIC");
+        assert!(!wavpack.windows(2).any(|pair| pair[0] == "-d" && pair[1] == "USER_NOTE"));
+        assert_pair(&wavpack, "-w", "TITLE=Cue Track");
+        assert_pair(&wavpack, "-w", "ARTIST=Cue Performer");
+        assert!(
+            wavpack.iter().position(|arg| arg == "-d").unwrap()
+                < wavpack.iter().position(|arg| arg == "-w").unwrap(),
+            "wvtag must delete stale managed keys before setting current values"
+        );
+    }
+
+    fn executable_on_path(name: &str) -> bool {
+        let Some(paths) = std::env::var_os("PATH") else {
+            return false;
+        };
+        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+    }
+
+    fn ffmpeg_encoder_available(name: &str) -> bool {
+        let Ok(output) = ProcessCommand::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().any(|field| field == name))
+    }
+
+    fn run_checked(tool: &str, args: &[String]) {
+        let output = ProcessCommand::new(tool)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {tool}: {err}"));
+        assert!(
+            output.status.success(),
+            "{tool} failed with status {:?}\nstdout:\n{}\nstderr:\n{}\nargs: {:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            args
+        );
+    }
+
+    fn run_stdout(tool: &str, args: &[String]) -> String {
+        let output = ProcessCommand::new(tool)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {tool}: {err}"));
+        assert!(
+            output.status.success(),
+            "{tool} failed with status {:?}\nstdout:\n{}\nstderr:\n{}\nargs: {:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            args
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn tag_line_key_counts(text: &str) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for line in text.lines() {
+            let key = line
+                .split_once('=')
+                .or_else(|| line.split_once(':'))
+                .map(|(key, _)| key.trim().to_ascii_uppercase());
+            let Some(key) = key else {
+                continue;
+            };
+            if key.is_empty() || key == "VENDOR STRING" {
+                continue;
+            }
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn tag_line_values(text: &str) -> BTreeMap<String, Vec<String>> {
+        let mut values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for line in text.lines() {
+            let Some((key, value)) = line
+                .split_once('=')
+                .or_else(|| line.split_once(':'))
+            else {
+                continue;
+            };
+            let key = key.trim().to_ascii_uppercase();
+            if key.is_empty() || key == "VENDOR STRING" {
+                continue;
+            }
+            values.entry(key).or_default().push(value.trim().to_string());
+        }
+        values
+    }
+
+    fn assert_single_tag_value(
+        values: &BTreeMap<String, Vec<String>>,
+        key: &str,
+        expected: &str,
+    ) {
+        let actual = values.get(key).cloned().unwrap_or_default();
+        assert_eq!(
+            actual,
+            vec![expected.to_string()],
+            "expected {key} to have exactly one authoritative value"
+        );
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
+        fs::create_dir_all(&dir).expect("create temp test directory");
+        dir
+    }
+
+    fn create_sine_audio(path: &Path, codec_args: &[&str]) {
+        let mut args = vec![
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-f".to_string(),
+            "lavfi".to_string(),
+            "-i".to_string(),
+            "sine=frequency=1000:sample_rate=44100:duration=0.25".to_string(),
+        ];
+        args.extend(codec_args.iter().map(|arg| (*arg).to_string()));
+        args.push(path.display().to_string());
+        run_checked("ffmpeg", &args);
+    }
+
+    #[test]
+    fn native_flac_writer_clears_stale_managed_keys_on_real_file_when_tools_are_available() {
+        if !executable_on_path("ffmpeg")
+            || !executable_on_path("metaflac")
+            || !ffmpeg_encoder_available("flac")
+        {
+            eprintln!("skipping real-file FLAC authoritative metadata test; ffmpeg with flac encoder and metaflac are required");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-metaflac-authoritative");
+        let flac_path = dir.join("track.flac");
+        create_sine_audio(&flac_path, &["-c:a", "flac"]);
+
+        let seed_tags = vec![
+            ("TITLE".to_string(), "Old Cue Track".to_string()),
+            ("COMMENT".to_string(), "stale comment".to_string()),
+            ("CATALOG".to_string(), "STALE-CATALOG".to_string()),
+            ("TONEPOET_ALBUM_OLD_DYNAMIC".to_string(), "stale dynamic".to_string()),
+            ("USER_NOTE".to_string(), "preserve me".to_string()),
+        ];
+        let current_tags = vec![
+            ("TITLE".to_string(), "Cue Track".to_string()),
+            ("ARTIST".to_string(), "Cue Performer".to_string()),
+            ("TONEPOET_TRACK_NEW_DYNAMIC".to_string(), "current dynamic".to_string()),
+        ];
+
+        run_checked("metaflac", &metaflac_tag_args(&flac_path, &seed_tags, &BTreeSet::new()));
+        let args = metaflac_tag_args(&flac_path, &current_tags, &parse_native_tag_keys(&run_stdout("metaflac", &["--export-tags-to=-".to_string(), flac_path.display().to_string()])));
+        run_checked("metaflac", &args);
+        run_checked("metaflac", &args);
+
+        let stdout = run_stdout("metaflac", &[
+            "--export-tags-to=-".to_string(),
+            flac_path.display().to_string(),
+        ]);
+        let counts = tag_line_key_counts(&stdout);
+        assert_eq!(counts.get("TITLE").copied().unwrap_or(0), 1, "TITLE should appear once: {counts:?}");
+        assert_eq!(counts.get("ARTIST").copied().unwrap_or(0), 1, "ARTIST should appear once: {counts:?}");
+        assert_eq!(counts.get("COMMENT").copied().unwrap_or(0), 0, "stale COMMENT must be cleared: {counts:?}");
+        assert_eq!(counts.get("CATALOG").copied().unwrap_or(0), 0, "stale CATALOG must be cleared: {counts:?}");
+        assert_eq!(counts.get("TONEPOET_ALBUM_OLD_DYNAMIC").copied().unwrap_or(0), 0, "stale Tonepoet dynamic key must be cleared: {counts:?}");
+        assert_eq!(counts.get("TONEPOET_TRACK_NEW_DYNAMIC").copied().unwrap_or(0), 1, "current Tonepoet dynamic key should appear once: {counts:?}");
+        assert_eq!(counts.get("USER_NOTE").copied().unwrap_or(0), 1, "unrelated user tag should survive: {counts:?}");
+        let values = tag_line_values(&stdout);
+        assert_single_tag_value(&values, "TITLE", "Cue Track");
+        assert_single_tag_value(&values, "USER_NOTE", "preserve me");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_opus_writer_clears_stale_managed_keys_on_real_file_when_tools_are_available() {
+        if !executable_on_path("ffmpeg")
+            || !executable_on_path("opustags")
+            || !ffmpeg_encoder_available("libopus")
+        {
+            eprintln!("skipping real-file Opus authoritative metadata test; ffmpeg with libopus and opustags are required");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-opustags-authoritative");
+        let opus_path = dir.join("track.opus");
+        create_sine_audio(&opus_path, &["-c:a", "libopus", "-b:a", "64k"]);
+
+        let seed_tags = vec![
+            ("TITLE".to_string(), "Old Cue Track".to_string()),
+            ("COMMENT".to_string(), "stale comment".to_string()),
+            ("CATALOG".to_string(), "STALE-CATALOG".to_string()),
+            ("TONEPOET_ALBUM_OLD_DYNAMIC".to_string(), "stale dynamic".to_string()),
+            ("USER_NOTE".to_string(), "preserve me".to_string()),
+        ];
+        let current_tags = vec![
+            ("TITLE".to_string(), "Cue Track".to_string()),
+            ("ARTIST".to_string(), "Cue Performer".to_string()),
+            ("TONEPOET_TRACK_NEW_DYNAMIC".to_string(), "current dynamic".to_string()),
+        ];
+
+        run_checked("opustags", &opustags_tag_args(&opus_path, &seed_tags, &BTreeSet::new()));
+        let args = opustags_tag_args(&opus_path, &current_tags, &parse_native_tag_keys(&run_stdout("opustags", &[opus_path.display().to_string()])));
+        run_checked("opustags", &args);
+        run_checked("opustags", &args);
+
+        let stdout = run_stdout("opustags", &[opus_path.display().to_string()]);
+        let counts = tag_line_key_counts(&stdout);
+        assert_eq!(counts.get("TITLE").copied().unwrap_or(0), 1, "TITLE should appear once: {counts:?}");
+        assert_eq!(counts.get("ARTIST").copied().unwrap_or(0), 1, "ARTIST should appear once: {counts:?}");
+        assert_eq!(counts.get("COMMENT").copied().unwrap_or(0), 0, "stale COMMENT must be cleared: {counts:?}");
+        assert_eq!(counts.get("CATALOG").copied().unwrap_or(0), 0, "stale CATALOG must be cleared: {counts:?}");
+        assert_eq!(counts.get("TONEPOET_ALBUM_OLD_DYNAMIC").copied().unwrap_or(0), 0, "stale Tonepoet dynamic key must be cleared: {counts:?}");
+        assert_eq!(counts.get("TONEPOET_TRACK_NEW_DYNAMIC").copied().unwrap_or(0), 1, "current Tonepoet dynamic key should appear once: {counts:?}");
+        assert_eq!(counts.get("USER_NOTE").copied().unwrap_or(0), 1, "unrelated user tag should survive: {counts:?}");
+        let values = tag_line_values(&stdout);
+        assert_single_tag_value(&values, "TITLE", "Cue Track");
+        assert_single_tag_value(&values, "USER_NOTE", "preserve me");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn read_le_u32(bytes: &[u8], offset: usize) -> usize {
+        u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("four-byte little-endian field"),
+        ) as usize
+    }
+
+    fn apev2_item_key_counts(bytes: &[u8]) -> BTreeMap<String, usize> {
+        let footer = bytes
+            .windows(8)
+            .rposition(|window| window == b"APETAGEX")
+            .expect("WavPack file should contain an APEv2 tag footer");
+        assert!(footer + 32 <= bytes.len(), "truncated APEv2 footer");
+
+        let tag_size = read_le_u32(bytes, footer + 12);
+        let item_count = read_le_u32(bytes, footer + 16);
+        assert!(tag_size >= 32, "APEv2 tag size must include at least the footer");
+        assert!(tag_size <= footer + 32, "APEv2 tag size points before start of file");
+
+        let mut pos = footer + 32 - tag_size;
+        if pos + 32 <= footer && &bytes[pos..pos + 8] == b"APETAGEX" {
+            pos += 32;
+        }
+
+        let mut counts = BTreeMap::new();
+        for _ in 0..item_count {
+            assert!(pos + 8 <= footer, "truncated APEv2 item header");
+            let value_size = read_le_u32(bytes, pos);
+            pos += 8;
+
+            let key_end = bytes[pos..footer]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|relative| pos + relative)
+                .expect("APEv2 item key should be NUL-terminated");
+            let key = String::from_utf8_lossy(&bytes[pos..key_end]).to_ascii_uppercase();
+            pos = key_end + 1;
+            assert!(pos + value_size <= footer, "truncated APEv2 item value");
+            pos += value_size;
+
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        counts
+    }
+
+    #[test]
+    fn wavpack_managed_metadata_is_duplicate_free_on_real_file_when_tools_are_available() {
+        if !executable_on_path("ffmpeg")
+            || !executable_on_path("wvtag")
+            || !ffmpeg_encoder_available("wavpack")
+        {
+            eprintln!("skipping real-file WavPack metadata idempotency test; ffmpeg with wavpack encoder and wvtag are required");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-wvtag-authoritative");
+        let wavpack_path = dir.join("track.wv");
+        create_sine_audio(&wavpack_path, &["-c:a", "wavpack"]);
+
+        let seed_tags = vec![
+            ("TITLE".to_string(), "Old Cue Track".to_string()),
+            ("COMMENT".to_string(), "stale comment".to_string()),
+            ("CATALOG".to_string(), "STALE-CATALOG".to_string()),
+            ("TONEPOET_ALBUM_OLD_DYNAMIC".to_string(), "stale dynamic".to_string()),
+            ("USER_NOTE".to_string(), "preserve me".to_string()),
+        ];
+        let current_tags = vec![
+            ("TITLE".to_string(), "Cue Track".to_string()),
+            ("ARTIST".to_string(), "Cue Performer".to_string()),
+            ("TONEPOET_TRACK_NEW_DYNAMIC".to_string(), "current dynamic".to_string()),
+        ];
+
+        run_checked("wvtag", &wvtag_tag_args(&wavpack_path, &seed_tags, &BTreeSet::new()));
+        let wvtag_args = wvtag_tag_args(&wavpack_path, &current_tags, &apev2_item_key_counts(&fs::read(&wavpack_path).expect("read tagged WavPack file")).keys().cloned().collect::<BTreeSet<_>>());
+        run_checked("wvtag", &wvtag_args);
+        run_checked("wvtag", &wvtag_args);
+
+        let bytes = fs::read(&wavpack_path).expect("read tagged WavPack file");
+        let counts = apev2_item_key_counts(&bytes);
+        for key in ["TITLE", "ARTIST"] {
+            assert_eq!(
+                counts.get(key).copied().unwrap_or(0),
+                1,
+                "managed key {key} must appear exactly once in the final APEv2 tag: {counts:?}"
+            );
+        }
+        for key in ["COMMENT", "CATALOG", "TONEPOET_ALBUM_OLD_DYNAMIC"] {
+            assert_eq!(
+                counts.get(key).copied().unwrap_or(0),
+                0,
+                "stale managed key {key} must be cleared from the final APEv2 tag: {counts:?}"
+            );
+        }
+        assert_eq!(
+            counts.get("TONEPOET_TRACK_NEW_DYNAMIC").copied().unwrap_or(0),
+            1,
+            "current Tonepoet dynamic key should appear once: {counts:?}"
+        );
+        assert_eq!(
+            counts.get("USER_NOTE").copied().unwrap_or(0),
+            1,
+            "unrelated user tag should survive: {counts:?}"
+        );
+        let stdout = run_stdout("wvtag", &["-l".to_string(), wavpack_path.display().to_string()]);
+        let values = tag_line_values(&stdout);
+        assert_single_tag_value(&values, "TITLE", "Cue Track");
+        assert_single_tag_value(&values, "USER_NOTE", "preserve me");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffmpeg_metadata_command_uses_random_same_directory_sidecar_temp_file_for_replacement() {
+        let dir = temp_test_dir("tonepoet-metadata-temp");
+        let path = dir.join("track.mp3");
+        let (track, album) = sample_metadata();
+        let tags = authoritative_metadata_tags(&track, &album);
+        let (cmd, tmp) = metadata_tag_command(&path, "mp3", &tags, &BTreeSet::new())
+            .expect("mp3 metadata command");
+        let tmp = tmp.expect("ffmpeg metadata rewrite must use a temp file");
+
+        assert!(matches!(cmd.binary, ToolBinary::Ffmpeg));
+        assert_eq!(tmp.parent(), Some(dir.as_path()));
+        assert!(matches!(
+            tmp.extension().and_then(|ext| ext.to_str()),
+            Some("mp3")
+        ));
+        assert!(
+            tmp.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".tonepoet-metadata.") && name.ends_with(".tmp.mp3")),
+            "temp path should use a random same-directory rewrite name with the target extension: {}",
+            tmp.display()
+        );
+        assert_pair(&cmd.args, "-map_metadata", "-1");
+        assert_pair(&cmd.args, "-c", "copy");
+
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffmpeg_metadata_temp_paths_are_collision_resistant() {
+        let dir = temp_test_dir("tonepoet-metadata-temp-unique");
+        let path = dir.join("track.m4a");
+        let first = metadata_rewrite_temp_path(&path).expect("first temp path");
+        let second = metadata_rewrite_temp_path(&path).expect("second temp path");
+
+        assert_ne!(first, second, "metadata rewrite temp paths must not be pid-deterministic");
+        assert_eq!(first.parent(), Some(dir.as_path()));
+        assert_eq!(second.parent(), Some(dir.as_path()));
+        assert!(first.file_name().and_then(|name| name.to_str()).unwrap_or_default().ends_with(".tmp.m4a"));
+        assert!(second.file_name().and_then(|name| name.to_str()).unwrap_or_default().ends_with(".tmp.m4a"));
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metadata_rewrite_replaces_target_atomically_and_syncs_visible_state() {
+        let dir = temp_test_dir("tonepoet-metadata-replace");
+        let target = dir.join("track.mp3");
+        fs::write(&target, b"old audio").expect("write old target");
+        let tmp = metadata_rewrite_temp_path(&target).expect("temp path");
+        fs::write(&tmp, b"new audio").expect("write rewritten temp");
+
+        replace_rewritten_metadata_file(&target, &tmp).expect("replace rewritten file");
+
+        assert_eq!(fs::read(&target).expect("read replaced target"), b"new audio");
+        assert!(!tmp.exists(), "temp file should be consumed by replacement");
+        assert!(
+            fs::read_dir(&dir)
+                .expect("read temp dir")
+                .all(|entry| !entry.expect("dir entry").file_name().to_string_lossy().contains(".bak")),
+            "metadata replacement should not create backup windows or backup files"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metadata_rewrite_rejects_empty_temporary_output() {
+        let dir = temp_test_dir("tonepoet-metadata-empty-temp");
+        let target = dir.join("track.mp3");
+        fs::write(&target, b"old audio").expect("write old target");
+        let tmp = metadata_rewrite_temp_path(&target).expect("temp path");
+
+        let err = replace_rewritten_metadata_file(&target, &tmp)
+            .expect_err("empty metadata rewrite temp must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&target).expect("old target should remain"), b"old audio");
+
+        let _ = fs::remove_file(tmp);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cue_artwork_embedding_commands_replace_existing_artwork_by_container() {
+        let dir = temp_test_dir("tonepoet-artwork-command");
+        let artwork = CueArtworkSidecar {
+            path: PathBuf::from("cover.jpg"),
+            mime_type: Some("image/jpeg".to_string()),
+        };
+
+        for (target, ext) in [("track.flac", "flac"), ("track.mp3", "mp3"), ("track.m4a", "m4a")] {
+            let path = dir.join(target);
+            let (cmd, tmp) = cue_artwork_embed_command(&path, ext, &artwork)
+                .expect("artwork command allocation should succeed")
+                .expect("container supports post-encode CUE artwork embedding");
+            assert!(matches!(cmd.binary, ToolBinary::Ffmpeg));
+            let tmp = tmp.expect("FFmpeg artwork embedding must use sidecar temp replacement");
+            assert_eq!(tmp.parent(), Some(dir.as_path()));
+            assert!(
+                tmp.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".tonepoet-metadata.") && name.ends_with(&format!(".tmp.{ext}"))),
+                "artwork rewrite temp should preserve target extension: {}",
+                tmp.display()
+            );
+            assert_pair(&cmd.args, "-map", "0:a");
+            assert_pair(&cmd.args, "-map", "1:v:0");
+            assert!(!cmd.args.windows(2).any(|pair| pair[0] == "-map" && pair[1] == "0:v"));
+            assert_pair(&cmd.args, "-disposition:v:0", "attached_pic");
+            assert_pair(&cmd.args, "-c:a", "copy");
+            assert_pair(&cmd.args, "-c:v", "copy");
+            let _ = fs::remove_file(tmp);
+        }
+
+        let (m4a_cmd, m4a_tmp) = cue_artwork_embed_command(&dir.join("track.m4a"), "m4a", &artwork)
+            .expect("m4a artwork command allocation")
+            .expect("m4a artwork command");
+        assert_pair(&m4a_cmd.args, "-f", "ipod");
+        if let Some(tmp) = m4a_tmp { let _ = fs::remove_file(tmp); }
+
+        let (mp3_cmd, mp3_tmp) = cue_artwork_embed_command(&dir.join("track.mp3"), "mp3", &artwork)
+            .expect("mp3 artwork command allocation")
+            .expect("mp3 artwork command");
+        assert_pair(&mp3_cmd.args, "-id3v2_version", "3");
+        if let Some(tmp) = mp3_tmp { let _ = fs::remove_file(tmp); }
+
+        let (wv_cmd, wv_tmp) = cue_artwork_embed_command(&dir.join("track.wv"), "wv", &artwork)
+            .expect("WavPack artwork command allocation")
+            .expect("WavPack artwork command");
+        assert!(matches!(wv_cmd.binary, ToolBinary::Wvtag));
+        assert!(wv_tmp.is_none());
+        assert_pair(&wv_cmd.args, "-d", "Cover Art (Front)");
+        assert_pair(&wv_cmd.args, "--write-binary-tag", "Cover Art (Front)=@cover.jpg");
+
+        for ext in ["wav", "aiff", "aif", "aac", "opus", "ogg"] {
+            assert!(
+                cue_artwork_embed_command(&dir.join(format!("track.{ext}")), ext, &artwork)
+                    .expect("unsupported artwork command allocation should not fail")
+                    .is_none(),
+                "{ext} artwork must stay explicitly unsupported on this path"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+}
+
+#[cfg(test)]
+mod cue_real_output_matrix_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+    use std::process::Command as ProcessCommand;
+
+    const EXPECTED_DURATION_SECONDS: f64 = 1.50;
+    const LOSSY_DURATION_TOLERANCE_SECONDS: f64 = 0.15;
+
+    #[derive(Clone)]
+    struct MatrixCase {
+        name: &'static str,
+        format: tonepoet_pipeline::AudioFormat,
+        extension: &'static str,
+        container_contains: &'static [&'static str],
+        codec: &'static str,
+        required_encoder: Option<&'static str>,
+        required_taggers: &'static [&'static str],
+        artwork_supported: ArtworkExpectation,
+        supports_album_artist: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ArtworkExpectation {
+        EmbeddedPicture,
+        WavPackApeBinary,
+        Unsupported,
+    }
+
+    fn matrix_cases() -> Vec<MatrixCase> {
+        vec![
+            MatrixCase {
+                name: "cue_to_flac",
+                format: tonepoet_pipeline::AudioFormat::Flac,
+                extension: "flac",
+                container_contains: &["flac"],
+                codec: "flac",
+                required_encoder: Some("flac"),
+                required_taggers: &["metaflac"],
+                artwork_supported: ArtworkExpectation::EmbeddedPicture,
+                supports_album_artist: true,
+            },
+            MatrixCase {
+                name: "cue_to_wav",
+                format: tonepoet_pipeline::AudioFormat::Wav,
+                extension: "wav",
+                container_contains: &["wav"],
+                codec: "pcm_s16le",
+                required_encoder: Some("pcm_s16le"),
+                required_taggers: &[],
+                artwork_supported: ArtworkExpectation::Unsupported,
+                supports_album_artist: false,
+            },
+            MatrixCase {
+                name: "cue_to_wavpack",
+                format: tonepoet_pipeline::AudioFormat::WavPack,
+                extension: "wv",
+                container_contains: &["wv", "wavpack"],
+                codec: "wavpack",
+                required_encoder: Some("wavpack"),
+                required_taggers: &["wvtag"],
+                artwork_supported: ArtworkExpectation::WavPackApeBinary,
+                supports_album_artist: true,
+            },
+            MatrixCase {
+                name: "cue_to_opus",
+                format: tonepoet_pipeline::AudioFormat::Opus,
+                extension: "opus",
+                container_contains: &["ogg"],
+                codec: "opus",
+                required_encoder: Some("libopus"),
+                required_taggers: &["opustags"],
+                artwork_supported: ArtworkExpectation::Unsupported,
+                supports_album_artist: true,
+            },
+            MatrixCase {
+                name: "cue_to_aac_m4a",
+                format: tonepoet_pipeline::AudioFormat::Aac,
+                extension: "m4a",
+                container_contains: &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+                codec: "aac",
+                required_encoder: Some("libfdk_aac"),
+                required_taggers: &[],
+                artwork_supported: ArtworkExpectation::EmbeddedPicture,
+                supports_album_artist: true,
+            },
+            MatrixCase {
+                name: "cue_to_mp3",
+                format: tonepoet_pipeline::AudioFormat::Mp3,
+                extension: "mp3",
+                container_contains: &["mp3"],
+                codec: "mp3",
+                required_encoder: Some("libmp3lame"),
+                required_taggers: &[],
+                artwork_supported: ArtworkExpectation::EmbeddedPicture,
+                supports_album_artist: true,
+            },
+            MatrixCase {
+                name: "cue_to_alac_m4a",
+                format: tonepoet_pipeline::AudioFormat::Alac,
+                extension: "m4a",
+                container_contains: &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+                codec: "alac",
+                required_encoder: Some("alac"),
+                required_taggers: &[],
+                artwork_supported: ArtworkExpectation::EmbeddedPicture,
+                supports_album_artist: true,
+            },
+        ]
+    }
+
+    fn executable_on_path(name: &str) -> bool {
+        let Some(paths) = std::env::var_os("PATH") else {
+            return false;
+        };
+        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+    }
+
+    fn ffmpeg_encoder_available(name: &str) -> bool {
+        let Ok(output) = ProcessCommand::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+        else {
+            return false;
+        };
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().any(|field| field == name))
+    }
+
+    fn env_flag_enabled(value: Option<&str>) -> bool {
+        value
+            .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    }
+
+    fn cue_matrix_strict_mode() -> bool {
+        env_flag_enabled(std::env::var("TONEPOET_CUE_MATRIX_STRICT").ok().as_deref())
+    }
+
+    fn case_unavailability_reasons(case: &MatrixCase) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if !executable_on_path("ffmpeg") {
+            reasons.push("missing ffmpeg executable".to_string());
+        }
+        if !executable_on_path("ffprobe") {
+            reasons.push("missing ffprobe executable".to_string());
+        }
+        if executable_on_path("ffmpeg") {
+            if let Some(encoder) = case.required_encoder {
+                if !ffmpeg_encoder_available(encoder) {
+                    reasons.push(format!("missing ffmpeg encoder {encoder}"));
+                }
+            }
+        }
+        for tool in case.required_taggers {
+            if !executable_on_path(tool) {
+                reasons.push(format!("missing {tool} executable"));
+            }
+        }
+        reasons
+    }
+
+
+    fn run_output(tool: &str, args: &[String]) -> String {
+        let output = ProcessCommand::new(tool)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {tool}: {err}"));
+        assert!(
+            output.status.success(),
+            "{tool} failed with status {:?}\nstdout:\n{}\nstderr:\n{}\nargs: {:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            args
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn run_checked(tool: &str, args: &[String]) {
+        let _ = run_output(tool, args);
+    }
+
+    fn create_fixture_image_and_cue(dir: &Path) -> (PathBuf, PathBuf) {
+        let cover = dir.join("cover.jpg");
+        run_checked(
+            "ffmpeg",
+            &[
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-nostdin".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                "color=c=red:s=64x64:d=0.10".to_string(),
+                "-frames:v".to_string(),
+                "1".to_string(),
+                cover.display().to_string(),
+            ],
+        );
+
+        let image = dir.join("album.flac");
+        run_checked(
+            "ffmpeg",
+            &[
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-nostdin".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                format!("sine=frequency=440:sample_rate=44100:duration={EXPECTED_DURATION_SECONDS}"),
+                "-i".to_string(),
+                cover.display().to_string(),
+                "-map".to_string(),
+                "0:a:0".to_string(),
+                "-map".to_string(),
+                "1:v:0".to_string(),
+                "-c:a".to_string(),
+                "flac".to_string(),
+                "-sample_fmt".to_string(),
+                "s16".to_string(),
+                "-c:v".to_string(),
+                "copy".to_string(),
+                "-disposition:v:0".to_string(),
+                "attached_pic".to_string(),
+                image.display().to_string(),
+            ],
+        );
+
+        let cue = dir.join("album.cue");
+        std::fs::write(
+            &cue,
+            r#"REM GENRE "Fusion"
+REM DATE "2026"
+REM CATALOG ABC1234567890
+PERFORMER "Cue Album Artist"
+TITLE "Cue Album"
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Cue Track"
+    PERFORMER "Cue Artist"
+    ISRC USRC17607839
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("write CUE sheet");
+
+        (image, cue)
+    }
+
+    fn request_for_case(root: &Path, image: &Path, case: &MatrixCase) -> PipelineRequest {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = case.format.clone();
+        settings.force_encode = true;
+        settings.metadata.transfer_tags = false;
+        settings.metadata.preserve_artwork = true;
+        settings.metadata.store_source_audio_md5 = false;
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
+
+        PipelineRequest {
+            job_id: format!("matrix-{}", case.name),
+            item_id: format!("matrix-{}", case.name),
+            container: image.to_path_buf(),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: Some(SacdArea::Stereo),
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            settings,
+            worker_count: Some(1),
+            merge: false,
+            output_root: root.join("out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: false,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+                write_manifest: false,
+            },
+            log: LogPolicy {
+                root: root.join("logs"),
+                write_for_blocked: true,
+                write_json_log: false,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Disabled,
+                generate_cue: false,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    fn ffprobe_json(path: &Path) -> Value {
+        let stdout = run_output(
+            "ffprobe",
+            &[
+                "-v".to_string(),
+                "error".to_string(),
+                "-show_streams".to_string(),
+                "-show_format".to_string(),
+                "-of".to_string(),
+                "json".to_string(),
+                path.display().to_string(),
+            ],
+        );
+        serde_json::from_str(&stdout).expect("ffprobe JSON should parse")
+    }
+
+    fn audio_stream<'a>(probe: &'a Value) -> &'a Value {
+        probe["streams"]
+            .as_array()
+            .and_then(|streams| {
+                streams.iter().find(|stream| {
+                    stream["codec_type"].as_str() == Some("audio")
+                })
+            })
+            .expect("output should contain an audio stream")
+    }
+
+    fn format_tag_map(probe: &Value) -> BTreeMap<String, String> {
+        let mut tags = BTreeMap::new();
+        // Format-level tags (most containers: FLAC, WAV, MP3, M4A, etc.)
+        if let Some(obj) = probe.pointer("/format/tags").and_then(|value| value.as_object()) {
+            for (key, value) in obj {
+                if let Some(value) = value.as_str() {
+                    tags.insert(key.to_ascii_uppercase(), value.to_string());
+                }
+            }
+        }
+        // Stream-level tags (OGG/Opus stores Vorbis comments on the stream)
+        if let Some(streams) = probe.get("streams").and_then(|value| value.as_array()) {
+            for stream in streams {
+                if stream["codec_type"].as_str() == Some("audio") {
+                    if let Some(obj) = stream.get("tags").and_then(|value| value.as_object()) {
+                        for (key, value) in obj {
+                            if let Some(value) = value.as_str() {
+                                tags.entry(key.to_ascii_uppercase()).or_insert_with(|| value.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tags
+    }
+
+    fn attached_picture_count(probe: &Value) -> usize {
+        probe["streams"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|stream| stream["codec_type"].as_str() == Some("video"))
+            .filter(|stream| {
+                stream
+                    .pointer("/disposition/attached_pic")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0)
+                    == 1
+            })
+            .count()
+    }
+
+    fn assert_matrix_duration_or_sample_count(case: &MatrixCase, audio: &Value, probe: &Value) {
+        let sample_rate = audio["sample_rate"]
+            .as_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .expect("ffprobe should expose audio sample_rate");
+        let expected_samples = (EXPECTED_DURATION_SECONDS * f64::from(sample_rate)).round() as u64;
+
+        if case.format.is_pcm_lossless() {
+            if let Some(actual_samples) = samples_from_stream_duration_ts(audio, sample_rate) {
+                assert_eq!(
+                    actual_samples,
+                    expected_samples,
+                    "{} lossless output sample count drifted: expected {expected_samples}, got {actual_samples}",
+                    case.name
+                );
+                return;
+            }
+
+            let duration = probed_duration_seconds(audio, probe);
+            let actual_samples = (duration * f64::from(sample_rate)).round() as u64;
+            let allowed = (sample_rate / 1000).max(1) as u64;
+            let delta = actual_samples.abs_diff(expected_samples);
+            assert!(
+                delta <= allowed,
+                "{} lossless output duration-only sample drift too large: expected {expected_samples} samples ({EXPECTED_DURATION_SECONDS}s), got {actual_samples} samples ({duration}s), allowed {allowed} samples",
+                case.name
+            );
+        } else {
+            let duration = probed_duration_seconds(audio, probe);
+            let delta = (duration - EXPECTED_DURATION_SECONDS).abs();
+            assert!(
+                delta <= LOSSY_DURATION_TOLERANCE_SECONDS,
+                "{} lossy output duration drift too large: expected {EXPECTED_DURATION_SECONDS}, got {duration}, delta {delta}",
+                case.name
+            );
+        }
+    }
+
+    fn probed_duration_seconds(audio: &Value, probe: &Value) -> f64 {
+        audio["duration"]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .or_else(|| {
+                probe
+                    .pointer("/format/duration")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| value.parse::<f64>().ok())
+            })
+            .expect("ffprobe should expose duration")
+    }
+
+    fn assert_container_codec_duration_and_metadata(case: &MatrixCase, path: &Path, probe: &Value) {
+        assert!(path.exists(), "{} output should exist: {}", case.name, path.display());
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some(case.extension),
+            "{} output extension should match the selected container",
+            case.name
+        );
+        let format_name = probe
+            .pointer("/format/format_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            case.container_contains.iter().any(|needle| format_name.contains(needle)),
+            "{} container mismatch: expected one of {:?}, got {format_name:?}",
+            case.name,
+            case.container_contains
+        );
+        let audio = audio_stream(probe);
+        assert_eq!(
+            audio["codec_name"].as_str(),
+            Some(case.codec),
+            "{} audio codec mismatch",
+            case.name
+        );
+        assert_matrix_duration_or_sample_count(case, audio, probe);
+
+        let tags = format_tag_map(probe);
+        assert_tag_value(&tags, "TITLE", "Cue Track", case.name);
+        assert_tag_value(&tags, "ARTIST", "Cue Artist", case.name);
+        assert_tag_value(&tags, "ALBUM", "Cue Album", case.name);
+        if case.supports_album_artist {
+            assert_any_tag_value(&tags, &["ALBUMARTIST", "ALBUM_ARTIST"], "Cue Album Artist", case.name);
+        }
+        assert_any_tag_value(&tags, &["TRACKNUMBER", "TRACK"], "1", case.name);
+        assert_any_tag_value(&tags, &["DATE", "YEAR"], "2026", case.name);
+        assert_tag_value(&tags, "GENRE", "Fusion", case.name);
+    }
+
+    fn assert_tag_value(tags: &BTreeMap<String, String>, key: &str, expected: &str, case_name: &str) {
+        let actual = tags.get(key).unwrap_or_else(|| {
+            panic!("{case_name} missing metadata key {key}; tags were {tags:?}")
+        });
+        assert!(
+            actual.as_str() == expected || actual.split('/').next() == Some(expected),
+            "{case_name} metadata key {key} mismatch: expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    fn assert_any_tag_value(
+        tags: &BTreeMap<String, String>,
+        keys: &[&str],
+        expected: &str,
+        case_name: &str,
+    ) {
+        for key in keys {
+            if let Some(actual) = tags.get(*key) {
+                assert!(
+                    actual.as_str() == expected || actual.split('/').next() == Some(expected),
+                    "{case_name} metadata key {key} mismatch: expected {expected:?}, got {actual:?}"
+                );
+                return;
+            }
+        }
+        panic!("{case_name} missing any of metadata keys {keys:?}; tags were {tags:?}");
+    }
+
+    fn assert_artwork_behavior(case: &MatrixCase, path: &Path, probe: &Value) {
+        match case.artwork_supported {
+            ArtworkExpectation::EmbeddedPicture => {
+                assert_eq!(
+                    attached_picture_count(probe),
+                    1,
+                    "{} should contain exactly one attached picture after repeated metadata/artwork stages",
+                    case.name
+                );
+            }
+            ArtworkExpectation::WavPackApeBinary => {
+                let counts = apev2_item_key_counts(&std::fs::read(path).expect("read WavPack output"));
+                assert_eq!(
+                    counts.get("COVER ART (FRONT)").copied().unwrap_or(0),
+                    1,
+                    "{} should contain exactly one managed WavPack cover-art tag after repeated metadata/artwork stages: {counts:?}",
+                    case.name
+                );
+            }
+            ArtworkExpectation::Unsupported => {
+                assert_eq!(
+                    attached_picture_count(probe),
+                    0,
+                    "{} has explicitly unsupported artwork and should not accidentally preserve carrier/source artwork",
+                    case.name
+                );
+            }
+        }
+    }
+
+    fn assert_native_tag_duplicate_free(case: &MatrixCase, path: &Path) {
+        match &case.format {
+            tonepoet_pipeline::AudioFormat::Flac => {
+                let stdout = run_output("metaflac", &["--export-tags-to=-".to_string(), path.display().to_string()]);
+                let counts = key_value_line_counts(&stdout);
+                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER"]);
+            }
+            tonepoet_pipeline::AudioFormat::Opus => {
+                let stdout = run_output("opustags", &[path.display().to_string()]);
+                let counts = key_value_line_counts(&stdout);
+                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER"]);
+            }
+            tonepoet_pipeline::AudioFormat::WavPack => {
+                let counts = apev2_item_key_counts(&std::fs::read(path).expect("read WavPack output"));
+                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER"]);
+            }
+            tonepoet_pipeline::AudioFormat::Mp3 => {
+                let counts = id3v2_frame_counts(&std::fs::read(path).expect("read MP3 output"));
+                assert_native_key_counts_at_most_once(
+                    case.name,
+                    &counts,
+                    &[
+                        "TIT2", "TPE1", "TPE2", "TALB", "TCON", "TRCK", "TPOS", "TDRC", "TYER",
+                        "TCOM", "TPE3", "TSRC", "TPUB", "TCOP", "COMM",
+                    ],
+                );
+                assert_managed_key_counts_once(case.name, &counts, &["TIT2", "TPE1", "TALB", "TCON", "TRCK"]);
+                if case.artwork_supported == ArtworkExpectation::EmbeddedPicture {
+                    assert_eq!(
+                        counts.get("APIC").copied().unwrap_or(0),
+                        1,
+                        "{} should contain exactly one ID3 APIC frame after repeated artwork rewrites: {counts:?}",
+                        case.name
+                    );
+                }
+            }
+            tonepoet_pipeline::AudioFormat::Aac | tonepoet_pipeline::AudioFormat::Alac => {
+                let counts = mp4_ilst_atom_counts(&std::fs::read(path).expect("read MP4/M4A output"));
+                assert_native_key_counts_at_most_once(
+                    case.name,
+                    &counts,
+                    &["A9nam", "A9ART", "aART", "A9alb", "A9gen", "A9day", "trkn", "disk", "desc", "cprt", "covr"],
+                );
+                assert_managed_key_counts_once(case.name, &counts, &["A9nam", "A9ART", "A9alb", "A9gen", "A9day", "trkn"]);
+                if case.artwork_supported == ArtworkExpectation::EmbeddedPicture {
+                    assert_eq!(
+                        counts.get("covr").copied().unwrap_or(0),
+                        1,
+                        "{} should contain exactly one MP4 covr atom after repeated artwork rewrites: {counts:?}",
+                        case.name
+                    );
+                }
+            }
+            tonepoet_pipeline::AudioFormat::Wav => {
+                let counts = riff_info_key_counts(&std::fs::read(path).expect("read WAV output"));
+                assert_native_key_counts_at_most_once(
+                    case.name,
+                    &counts,
+                    &["INAM", "IART", "IPRD", "IGNR", "ICRD", "IPRT", "ICMT", "ISBJ", "ICOP"],
+                );
+                assert_managed_key_counts_once(case.name, &counts, &["INAM", "IART", "IPRD", "IGNR", "ICRD"]);
+            }
+            tonepoet_pipeline::AudioFormat::Aiff => {
+                let counts = aiff_metadata_chunk_counts(&std::fs::read(path).expect("read AIFF output"));
+                assert_native_key_counts_at_most_once(case.name, &counts, &["NAME", "AUTH", "ANNO", "(C) ", "ID3 "]);
+            }
+            _ => {}
+        }
+    }
+
+    fn key_value_line_counts(text: &str) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for line in text.lines() {
+            let Some((key, _value)) = line.split_once('=') else {
+                continue;
+            };
+            *counts.entry(key.trim().to_ascii_uppercase()).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn assert_managed_key_counts_once(case_name: &str, counts: &BTreeMap<String, usize>, keys: &[&str]) {
+        for key in keys {
+            assert_eq!(
+                counts.get(*key).copied().unwrap_or(0),
+                1,
+                "{case_name} managed key {key} should appear exactly once after repeated metadata stage runs: {counts:?}"
+            );
+        }
+    }
+    fn assert_native_key_counts_at_most_once(case_name: &str, counts: &BTreeMap<String, usize>, keys: &[&str]) {
+        for key in keys {
+            assert!(
+                counts.get(*key).copied().unwrap_or(0) <= 1,
+                "{case_name} native metadata key {key} should not be duplicated after repeated metadata stage runs: {counts:?}"
+            );
+        }
+    }
+
+    fn read_be_u32(bytes: &[u8], offset: usize) -> usize {
+        u32::from_be_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("four-byte big-endian field"),
+        ) as usize
+    }
+
+    fn read_be_u64(bytes: &[u8], offset: usize) -> usize {
+        u64::from_be_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("eight-byte big-endian field"),
+        ) as usize
+    }
+
+    fn read_syncsafe_u32(bytes: &[u8], offset: usize) -> usize {
+        ((bytes[offset] as usize & 0x7f) << 21)
+            | ((bytes[offset + 1] as usize & 0x7f) << 14)
+            | ((bytes[offset + 2] as usize & 0x7f) << 7)
+            | (bytes[offset + 3] as usize & 0x7f)
+    }
+
+    fn id3v2_frame_counts(bytes: &[u8]) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        if bytes.len() < 10 || &bytes[0..3] != b"ID3" {
+            return counts;
+        }
+
+        let major_version = bytes[3];
+        let flags = bytes[5];
+        let tag_size = read_syncsafe_u32(bytes, 6);
+        let end = (10 + tag_size).min(bytes.len());
+        let mut pos = 10;
+
+        if flags & 0x40 != 0 {
+            if major_version == 4 && pos + 4 <= end {
+                let extended_size = read_syncsafe_u32(bytes, pos);
+                pos = pos.saturating_add(extended_size);
+            } else if major_version == 3 && pos + 4 <= end {
+                let extended_size = read_be_u32(bytes, pos);
+                pos = pos.saturating_add(4 + extended_size);
+            }
+        }
+
+        while pos + 10 <= end {
+            let id_bytes = &bytes[pos..pos + 4];
+            if id_bytes.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            if !id_bytes
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            {
+                break;
+            }
+
+            let frame_size = if major_version == 4 {
+                read_syncsafe_u32(bytes, pos + 4)
+            } else {
+                read_be_u32(bytes, pos + 4)
+            };
+            if frame_size == 0 || pos + 10 + frame_size > end {
+                break;
+            }
+
+            let id = String::from_utf8_lossy(id_bytes).to_string();
+            *counts.entry(id).or_insert(0) += 1;
+            pos += 10 + frame_size;
+        }
+
+        counts
+    }
+
+    fn mp4_atom_code(code: &[u8]) -> String {
+        if code.len() == 4 && code[0] == 0xa9 && code[1..].iter().all(|byte| byte.is_ascii()) {
+            format!("A9{}", String::from_utf8_lossy(&code[1..]))
+        } else {
+            String::from_utf8_lossy(code).to_string()
+        }
+    }
+
+    fn walk_mp4_boxes(bytes: &[u8], mut pos: usize, end: usize, in_ilst: bool, counts: &mut BTreeMap<String, usize>) {
+        while pos + 8 <= end {
+            let size32 = read_be_u32(bytes, pos);
+            let code = &bytes[pos + 4..pos + 8];
+            let mut header_size = 8usize;
+            let size = match size32 {
+                0 => end.saturating_sub(pos),
+                1 if pos + 16 <= end => {
+                    header_size = 16;
+                    read_be_u64(bytes, pos + 8)
+                }
+                _ => size32,
+            };
+            if size < header_size || pos + size > end {
+                break;
+            }
+
+            let atom = mp4_atom_code(code);
+            let data_start = pos + header_size;
+            let data_end = pos + size;
+            if in_ilst {
+                *counts.entry(atom).or_insert(0) += 1;
+            } else if code == b"moov" || code == b"udta" {
+                walk_mp4_boxes(bytes, data_start, data_end, false, counts);
+            } else if code == b"meta" && data_start + 4 <= data_end {
+                walk_mp4_boxes(bytes, data_start + 4, data_end, false, counts);
+            } else if code == b"ilst" {
+                walk_mp4_boxes(bytes, data_start, data_end, true, counts);
+            }
+
+            pos += size;
+        }
+    }
+
+    fn mp4_ilst_atom_counts(bytes: &[u8]) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        walk_mp4_boxes(bytes, 0, bytes.len(), false, &mut counts);
+        counts
+    }
+
+    fn riff_info_key_counts(bytes: &[u8]) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+            return counts;
+        }
+
+        let mut pos = 12usize;
+        while pos + 8 <= bytes.len() {
+            let id = &bytes[pos..pos + 4];
+            let size = read_le_u32(bytes, pos + 4);
+            let data_start = pos + 8;
+            let data_end = data_start.saturating_add(size).min(bytes.len());
+            if id == b"LIST" && data_start + 4 <= data_end && &bytes[data_start..data_start + 4] == b"INFO" {
+                let mut item_pos = data_start + 4;
+                while item_pos + 8 <= data_end {
+                    let key = String::from_utf8_lossy(&bytes[item_pos..item_pos + 4]).to_ascii_uppercase();
+                    let item_size = read_le_u32(bytes, item_pos + 4);
+                    *counts.entry(key).or_insert(0) += 1;
+                    let step = 8 + item_size + (item_size & 1);
+                    if step == 0 || item_pos + step > data_end + 1 {
+                        break;
+                    }
+                    item_pos += step;
+                }
+            }
+            let step = 8 + size + (size & 1);
+            if step == 0 {
+                break;
+            }
+            pos += step;
+        }
+        counts
+    }
+
+    fn aiff_metadata_chunk_counts(bytes: &[u8]) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        if bytes.len() < 12 || &bytes[0..4] != b"FORM" || (&bytes[8..12] != b"AIFF" && &bytes[8..12] != b"AIFC") {
+            return counts;
+        }
+
+        let mut pos = 12usize;
+        while pos + 8 <= bytes.len() {
+            let key = String::from_utf8_lossy(&bytes[pos..pos + 4]).to_ascii_uppercase();
+            let size = read_be_u32(bytes, pos + 4);
+            let is_id3 = key == "ID3 ";
+            if matches!(key.as_str(), "NAME" | "AUTH" | "ANNO" | "(C) " | "ID3 ") {
+                *counts.entry(key).or_insert(0) += 1;
+            }
+            if is_id3 && pos + 8 + size <= bytes.len() {
+                let id3_counts = id3v2_frame_counts(&bytes[pos + 8..pos + 8 + size]);
+                for (frame, count) in id3_counts {
+                    *counts.entry(frame).or_insert(0) += count;
+                }
+            }
+            let step = 8 + size + (size & 1);
+            if step == 0 {
+                break;
+            }
+            pos += step;
+        }
+        counts
+    }
+
+    fn read_le_u32(bytes: &[u8], offset: usize) -> usize {
+        u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("four-byte little-endian field"),
+        ) as usize
+    }
+
+    fn apev2_item_key_counts(bytes: &[u8]) -> BTreeMap<String, usize> {
+        let footer = bytes
+            .windows(8)
+            .rposition(|window| window == b"APETAGEX")
+            .expect("file should contain an APEv2 tag footer");
+        assert!(footer + 32 <= bytes.len(), "truncated APEv2 footer");
+
+        let tag_size = read_le_u32(bytes, footer + 12);
+        let item_count = read_le_u32(bytes, footer + 16);
+        assert!(tag_size >= 32, "APEv2 tag size must include at least the footer");
+        assert!(tag_size <= footer + 32, "APEv2 tag size points before start of file");
+
+        let mut pos = footer + 32 - tag_size;
+        if pos + 32 <= footer && &bytes[pos..pos + 8] == b"APETAGEX" {
+            pos += 32;
+        }
+
+        let mut counts = BTreeMap::new();
+        for _ in 0..item_count {
+            assert!(pos + 8 <= footer, "truncated APEv2 item header");
+            let value_size = read_le_u32(bytes, pos);
+            pos += 8;
+
+            let key_end = bytes[pos..footer]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|relative| pos + relative)
+                .expect("APEv2 item key should be NUL-terminated");
+            let key = String::from_utf8_lossy(&bytes[pos..key_end]).to_ascii_uppercase();
+            pos = key_end + 1;
+            assert!(pos + value_size <= footer, "truncated APEv2 item value");
+            pos += value_size;
+
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        counts
+    }
+
+    fn find_extension_under(root: &Path, extension: &str) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(find_extension_under(&path, extension));
+            } else if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+            {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn cue_matrix_validates_real_outputs_when_external_tools_are_available() {
+        let strict = cue_matrix_strict_mode();
+        if !executable_on_path("ffmpeg") || !executable_on_path("ffprobe") {
+            let message = "real CUE matrix output validation requires ffmpeg and ffprobe";
+            if strict {
+                panic!("{message}; TONEPOET_CUE_MATRIX_STRICT=1 forbids skipping required matrix infrastructure");
+            }
+            eprintln!("skipping real CUE matrix output validation; {message}");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (image, _cue) = create_fixture_image_and_cue(temp.path());
+        let cases = matrix_cases();
+        let required_case_count = cases.len();
+        let mut exercised = Vec::new();
+        let mut skipped = Vec::new();
+
+        for case in cases {
+            let unavailable = case_unavailability_reasons(&case);
+            if !unavailable.is_empty() {
+                let reason = format!("{}: {}", case.name, unavailable.join(", "));
+                if strict {
+                    skipped.push(reason);
+                } else {
+                    eprintln!("skipping {reason}");
+                }
+                continue;
+            }
+
+            let case_root = temp.path().join(case.name);
+            std::fs::create_dir_all(case_root.join("out")).expect("case output root");
+            std::fs::create_dir_all(case_root.join("logs")).expect("case log root");
+            let req = request_for_case(&case_root, &image, &case);
+            let staging = StagingDir::new(case_root.join("staging"), req.job_id.clone());
+            let runner = RealToolRunner::new(HashMap::new());
+            let cancel = CancellationToken::new();
+
+            let source = CueImageMaterializer
+                .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+                .await
+                .unwrap_or_else(|err| panic!("{} CUE materialization failed: {err}", case.name));
+            assert_eq!(source.kind, SourceKind::CueImage);
+            assert_eq!(source.tracks.len(), 1);
+            assert!(
+                source.album_metadata.extra.contains_key(CUE_ARTWORK_PATH_EXTRA_KEY),
+                "{} should extract original image artwork as a sidecar",
+                case.name
+            );
+            let TrackSourceRef::CueSegmentCarrier { path, carrier, .. } = &source.tracks[0].source_ref else {
+                panic!("{} should materialize a typed CUE segment carrier", case.name);
+            };
+            assert_eq!(*carrier, CueSegmentCarrier::PcmS32LeWav);
+            assert_eq!(path.extension().and_then(|value| value.to_str()), Some("wav"));
+            assert!(path.exists(), "{} staged PCM WAV segment should exist", case.name);
+            assert!(
+                find_extension_under(&staging.root.join("cue-segments"), "flac").is_empty(),
+                "{} normal CUE path must not create an intermediate FLAC under cue-segments",
+                case.name
+            );
+
+            let plan = plan_outputs(&source, &req).unwrap_or_else(|err| panic!("{} output planning failed: {err}", case.name));
+            assert_eq!(
+                plan.entries[0].final_path.extension().and_then(|value| value.to_str()),
+                Some(case.extension),
+                "{} planned final container extension mismatch",
+                case.name
+            );
+
+            let converted = convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
+            assert!(
+                matches!(converted.record.outcome, StageOutcome::Ok),
+                "{} conversion stage failed: {:?}",
+                case.name,
+                converted.tracks
+            );
+            let AudioArtifacts::Tracks(track_artifacts) = &converted.artifacts.audio else {
+                panic!("{} should produce per-track artifacts", case.name);
+            };
+            assert_eq!(track_artifacts.len(), 1, "{} should produce one converted track", case.name);
+            let output_path = track_artifacts[0].staged_path.clone();
+
+            apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+                .await
+                .unwrap_or_else(|err| panic!("{} first metadata/artwork stage failed: {err}", case.name));
+            let first_probe = ffprobe_json(&output_path);
+            apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+                .await
+                .unwrap_or_else(|err| panic!("{} second metadata/artwork stage failed: {err}", case.name));
+            let second_probe = ffprobe_json(&output_path);
+
+            assert_container_codec_duration_and_metadata(&case, &output_path, &second_probe);
+            assert_artwork_behavior(&case, &output_path, &second_probe);
+            assert_eq!(
+                format_tag_map(&first_probe),
+                format_tag_map(&second_probe),
+                "{} repeated metadata stage should be semantically idempotent",
+                case.name
+            );
+            assert_eq!(
+                attached_picture_count(&first_probe),
+                attached_picture_count(&second_probe),
+                "{} repeated artwork stage should not duplicate attached-picture streams",
+                case.name
+            );
+            assert_native_tag_duplicate_free(&case, &output_path);
+            exercised.push(case.name);
+        }
+
+        if strict {
+            assert!(
+                skipped.is_empty(),
+                "strict CUE matrix mode requires every required target case to run; skipped cases: {skipped:?}"
+            );
+            assert_eq!(
+                exercised.len(),
+                required_case_count,
+                "strict CUE matrix mode requires all required target cases to pass"
+            );
+        } else {
+            assert!(
+                !exercised.is_empty(),
+                "real CUE matrix test did not exercise any target format; install ffmpeg/ffprobe plus at least one target encoder/tagger, or set TONEPOET_CUE_MATRIX_STRICT=1 in release validation"
+            );
+        }
+        eprintln!("exercised real CUE matrix cases: {exercised:?}");
+    }
+
+    #[test]
+    fn cue_matrix_strict_flag_parsing_is_explicit() {
+        assert!(env_flag_enabled(Some("1")));
+        assert!(env_flag_enabled(Some("true")));
+        assert!(env_flag_enabled(Some("YES")));
+        assert!(env_flag_enabled(Some("on")));
+        assert!(!env_flag_enabled(Some("0")));
+        assert!(!env_flag_enabled(Some("false")));
+        assert!(!env_flag_enabled(Some("")));
+        assert!(!env_flag_enabled(None));
+    }
 }
 
 /// Apply ReplayGain tags via loudgain.
@@ -3233,6 +5377,18 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
 fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
     match source_ref {
         TrackSourceRef::StagedFile(path) => format!("staged file {}", path_log_value(path)),
+        TrackSourceRef::CueSegmentCarrier {
+            path,
+            source_image,
+            start_sample,
+            samples,
+            carrier,
+        } => format!(
+            "typed CUE segment carrier {} ({:?}, source {}, start sample {start_sample}, {samples} samples)",
+            path_log_value(path),
+            carrier,
+            path_log_value(source_image)
+        ),
         TrackSourceRef::ImageSegment {
             image,
             start_sample,
@@ -4165,7 +6321,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
                 );
                 Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
             } else {
-                let actual_samples = validate_encoded_output_with_tool_limits(
+                let actual_samples = match validate_encoded_output_with_tool_limits(
                     &staged_path,
                     realized.track.expected_samples,
                     &realized.req.settings.target_format,
@@ -4173,7 +6329,21 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
                     &realized.cancel,
                     tool_concurrency_limits.as_ref(),
                 )
-                .await;
+                .await
+                {
+                    Ok(samples) => samples,
+                    Err(err) => {
+                        let commands = command_from_convert_error(&err);
+                        let record = failed_track_record(
+                            &realized.track,
+                            Some(realized.realized_path),
+                            Some(staged_path),
+                            commands,
+                            err.to_string(),
+                        );
+                        return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
+                    }
+                };
                 let record = TrackRecord {
                     track_id: realized.track.id.clone(),
                     outcome: TrackOutcome::Ok,
@@ -5781,12 +7951,60 @@ fn normalized_collision_key(path: &Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
 }
 
+fn default_audio_container_extension<'a>(
+    format: &'a PlannerAudioFormat,
+    container_extension: Option<&'a str>,
+) -> &'a str {
+    match format {
+        PlannerAudioFormat::Aac | PlannerAudioFormat::Alac => match container_extension {
+            Some(extension) if matches!(extension.trim().to_ascii_lowercase().as_str(), "m4a" | "mp4") => {
+                extension
+            }
+            _ => "m4a",
+        },
+        _ => match container_extension {
+            Some(extension) if !extension.trim().is_empty() => extension,
+            _ => format.extension(),
+        },
+    }
+}
+
+fn validate_final_container_extension(
+    format: &PlannerAudioFormat,
+    container_extension: Option<&str>,
+) -> Result<(), String> {
+    let Some(extension) = container_extension
+        .map(str::trim)
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| extension.to_ascii_lowercase())
+    else {
+        return Ok(());
+    };
+
+    match format {
+        PlannerAudioFormat::Aac => match extension.as_str() {
+            "m4a" | "mp4" => Ok(()),
+            "aac" => Err(
+                "AAC output is muxed as MP4/M4A by this pipeline; raw .aac output is not implemented, so use .m4a/.mp4 or add an explicit raw-AAC mode".to_string(),
+            ),
+            _ => Err(
+                "AAC output must use an .m4a or .mp4 container extension unless an explicit raw-AAC mode is implemented".to_string(),
+            ),
+        },
+        PlannerAudioFormat::Alac => match extension.as_str() {
+            "m4a" | "mp4" => Ok(()),
+            _ => Err("ALAC output must use an .m4a or .mp4 container extension".to_string()),
+        },
+        _ => Ok(()),
+    }
+}
+
 fn append_default_extension(
     path: &mut PathBuf,
     format: &PlannerAudioFormat,
     container_extension: Option<&str>,
 ) {
-    let ext = container_extension.unwrap_or(format.extension());
+    let ext = default_audio_container_extension(format, container_extension);
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -5821,12 +8039,130 @@ fn staged_audio_path(
         .and_then(|s| s.to_str())
         .map(sanitize_component)
         .unwrap_or_else(|| format!("track-{:03}", id.source_ordinal));
+    let extension = final_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|extension| match format {
+            PlannerAudioFormat::Aac | PlannerAudioFormat::Alac => {
+                matches!(extension.as_str(), "m4a" | "mp4")
+            }
+            _ => true,
+        })
+        .unwrap_or_else(|| default_audio_container_extension(format, None).to_string());
+
     convert_root.join(format!(
         "{:03}-{}.{}",
         id.source_ordinal,
         file_stem,
-        format.extension()
+        extension
     ))
+}
+
+#[cfg(test)]
+mod cue_container_extension_tests {
+    use super::*;
+
+    #[test]
+    fn aac_and_alac_default_to_m4a_container() {
+        let mut aac = PathBuf::from("03 - Track");
+        append_default_extension(&mut aac, &PlannerAudioFormat::Aac, None);
+        assert_eq!(aac.extension().and_then(|value| value.to_str()), Some("m4a"));
+
+        let mut alac = PathBuf::from("03 - Track");
+        append_default_extension(&mut alac, &PlannerAudioFormat::Alac, None);
+        assert_eq!(alac.extension().and_then(|value| value.to_str()), Some("m4a"));
+    }
+
+    #[test]
+    fn staged_aac_and_alac_paths_use_m4a_so_ffmpeg_selects_mp4_muxer() {
+        let id = TrackId {
+            source_ordinal: 3,
+            disc_number: None,
+            track_number: 3,
+        };
+        let convert_root = Path::new("convert");
+
+        let aac = staged_audio_path(
+            convert_root,
+            Path::new("03 - Track.m4a"),
+            &id,
+            &PlannerAudioFormat::Aac,
+        );
+        assert_eq!(aac.extension().and_then(|value| value.to_str()), Some("m4a"));
+
+        let alac = staged_audio_path(
+            convert_root,
+            Path::new("03 - Track.m4a"),
+            &id,
+            &PlannerAudioFormat::Alac,
+        );
+        assert_eq!(alac.extension().and_then(|value| value.to_str()), Some("m4a"));
+    }
+
+    #[test]
+    fn explicit_container_extension_override_is_honored() {
+        let mut wav = PathBuf::from("track");
+        append_default_extension(&mut wav, &PlannerAudioFormat::Wav, Some("rf64"));
+        assert_eq!(wav.extension().and_then(|value| value.to_str()), Some("rf64"));
+    }
+
+    #[test]
+    fn explicit_raw_aac_container_extension_is_rejected() {
+        let err = validate_final_container_extension(&PlannerAudioFormat::Aac, Some("aac"))
+            .expect_err("raw AAC is not an implemented AAC container mode");
+        assert!(err.contains("raw .aac output is not implemented"), "{err}");
+        assert_eq!(default_audio_container_extension(&PlannerAudioFormat::Aac, Some("aac")), "m4a");
+    }
+
+    #[test]
+    fn explicit_aac_mp4_containers_are_accepted() {
+        validate_final_container_extension(&PlannerAudioFormat::Aac, Some("m4a")).unwrap();
+        validate_final_container_extension(&PlannerAudioFormat::Aac, Some("mp4")).unwrap();
+        validate_final_container_extension(&PlannerAudioFormat::Alac, Some("m4a")).unwrap();
+        validate_final_container_extension(&PlannerAudioFormat::Alac, Some("mp4")).unwrap();
+    }
+
+    #[test]
+    fn template_raw_aac_suffix_is_normalized_to_m4a_default() {
+        let mut aac = PathBuf::from("03 - Track.aac");
+        append_default_extension(&mut aac, &PlannerAudioFormat::Aac, None);
+        assert_eq!(aac.extension().and_then(|value| value.to_str()), Some("m4a"));
+    }
+
+    #[test]
+    fn staged_path_respects_final_path_extension_override() {
+        let id = TrackId {
+            source_ordinal: 4,
+            disc_number: None,
+            track_number: 4,
+        };
+        let staged = staged_audio_path(
+            Path::new("convert"),
+            Path::new("04 - Track.rf64"),
+            &id,
+            &PlannerAudioFormat::Wav,
+        );
+        assert_eq!(staged.extension().and_then(|value| value.to_str()), Some("rf64"));
+    }
+
+
+    #[test]
+    fn staged_aac_path_does_not_inherit_raw_aac_suffix() {
+        let id = TrackId {
+            source_ordinal: 5,
+            disc_number: None,
+            track_number: 5,
+        };
+        let staged = staged_audio_path(
+            Path::new("convert"),
+            Path::new("05 - Track.aac"),
+            &id,
+            &PlannerAudioFormat::Aac,
+        );
+        assert_eq!(staged.extension().and_then(|value| value.to_str()), Some("m4a"));
+    }
 }
 
 fn command_from_convert_error(err: &ConvertError) -> Vec<CommandRecord> {
@@ -6408,6 +8744,7 @@ fn build_manifest_for_album(
                     .find(|t| t.id == artifact.track_id)
                     .map(|t| match &t.source_ref {
                         TrackSourceRef::StagedFile(p) => p.clone(),
+                        TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.clone(),
                         TrackSourceRef::ImageSegment { image, .. } => image.clone(),
                         TrackSourceRef::SacdTrack { iso, .. } => iso.clone(),
                     })
@@ -7702,7 +10039,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             "source-audio MD5 satisfaction must not suppress SACD sidecar/TOC metadata writing"
         );
 
-        let runner = BlockingToolRunner::with_behaviors([ToolBehavior::Succeed]);
+        let runner = BlockingToolRunner::with_behaviors([
+            ToolBehavior::Succeed, // inspect existing native tags
+            ToolBehavior::Succeed, // write authoritative tags
+        ]);
         let reporter = RecordingReporter::new();
         let cancel = CancellationToken::new();
         let report = finish_pipeline_album_for_scheduler(
@@ -7717,9 +10057,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
         assert!(matches!(stage_outcome(&report, PipelineStage::Metadata), Some(StageOutcome::Ok)));
         let transcript = runner.transcript();
-        assert_eq!(transcript.len(), 1, "metadata stage emits exactly one tag-writing command");
+        assert_eq!(transcript.len(), 2, "metadata stage first inspects existing native tags, then writes authoritative tags");
         assert_eq!(transcript[0].binary, ToolBinary::Metaflac);
-        let args = &transcript[0].sanitized_args;
+        assert!(transcript[0].sanitized_args.iter().any(|arg| arg == "--export-tags-to=-"));
+        assert_eq!(transcript[1].binary, ToolBinary::Metaflac);
+        let args = &transcript[1].sanitized_args;
         let tags = set_tag_values(args);
         for (key, value) in [
             ("TITLE", "Medley: I Remember You..."),
@@ -8776,15 +11118,14 @@ mod validate_encoded_output_tests {
         )
         .await;
 
-        assert_eq!(result, Some(1_000_000));
+        assert_eq!(result.expect("validation should pass"), Some(1_000_000));
     }
 
     #[tokio::test]
-    async fn lossless_target_with_drifted_samples_returns_actual_and_warns() {
+    async fn lossless_target_with_exact_sample_drift_fails() {
         let temp = tempfile::tempdir().expect("temp dir");
         let out = temp.path().join("track.wav");
         std::fs::write(&out, b"fake-wav").expect("write");
-        // Probe returns 1,000,100 but expected is 1,000,000 — drift of 100
         let runner = stub_with_probe(&ffprobe_exact_json(44100, 1_000_100));
         let cancel = CancellationToken::new();
 
@@ -8797,8 +11138,7 @@ mod validate_encoded_output_tests {
         )
         .await;
 
-        // Returns actual (probed) value, not expected
-        assert_eq!(result, Some(1_000_100));
+        assert!(matches!(result, Err(ConvertError::TrackValidation(message)) if message.contains("post-encode sample drift")));
     }
 
     #[tokio::test]
@@ -8819,7 +11159,7 @@ mod validate_encoded_output_tests {
         )
         .await;
 
-        assert_eq!(result, Some(1_000_000));
+        assert_eq!(result.expect("lossy validation should skip"), Some(1_000_000));
         // Verify no probe was attempted
         assert_eq!(runner.transcript().len(), 0);
     }
@@ -8841,7 +11181,7 @@ mod validate_encoded_output_tests {
         )
         .await;
 
-        assert_eq!(result, Some(1_000_000));
+        assert_eq!(result.expect("DSD validation should skip"), Some(1_000_000));
         assert_eq!(runner.transcript().len(), 0);
     }
 
@@ -8862,18 +11202,18 @@ mod validate_encoded_output_tests {
         )
         .await;
 
-        assert_eq!(result, None);
+        assert_eq!(result.expect("missing expected samples should skip"), None);
         assert_eq!(runner.transcript().len(), 0);
     }
 
     #[tokio::test]
-    async fn approximate_probe_allows_small_drift() {
+    async fn approximate_probe_allows_only_one_millisecond_drift() {
         let temp = tempfile::tempdir().expect("temp dir");
         let out = temp.path().join("track.flac");
         std::fs::write(&out, b"fake-flac").expect("write");
-        // Expected 1,000,000. Duration 22.685 sec → round(22.685 * 44100) = 1,000,409.
-        // Drift = 409, allowed = 44100/75 = 588. 409 < 588 → within tolerance.
-        let runner = stub_with_probe(&ffprobe_approx_json(44100, 22.685));
+        // Expected 1,000,000. Duration 22.676s -> 1,000,012 samples.
+        // One-millisecond fallback tolerance at 44.1 kHz is 44 samples.
+        let runner = stub_with_probe(&ffprobe_approx_json(44100, 22.676));
         let cancel = CancellationToken::new();
 
         let result = validate_encoded_output(
@@ -8883,12 +11223,31 @@ mod validate_encoded_output_tests {
             &runner,
             &cancel,
         )
+        .await
+        .expect("duration-only drift inside one millisecond should pass");
+
+        let actual = result.expect("lossless validation should return probed samples");
+        assert_ne!(actual, 1_000_000, "approximate probe should return the probed value");
+        assert!(actual.abs_diff(1_000_000) <= 44, "drift {} should be within one millisecond", actual.abs_diff(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn approximate_probe_rejects_more_than_one_millisecond_drift() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.alac.m4a");
+        std::fs::write(&out, b"fake-alac").expect("write");
+        let runner = stub_with_probe(&ffprobe_approx_json(44100, 22.678));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output(
+            &out,
+            Some(1_000_000),
+            &tonepoet_pipeline::AudioFormat::Alac,
+            &runner,
+            &cancel,
+        )
         .await;
 
-        assert!(result.is_some());
-        let actual = result.unwrap();
-        // Probed value should reflect the approximate duration, not the expected value
-        assert_ne!(actual, 1_000_000, "approximate probe should return a different value");
-        assert!(actual.abs_diff(1_000_000) <= 588, "drift {} should be within tolerance 588", actual.abs_diff(1_000_000));
+        assert!(matches!(result, Err(ConvertError::TrackValidation(message)) if message.contains("post-encode sample drift")));
     }
 }

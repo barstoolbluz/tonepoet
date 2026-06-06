@@ -51,6 +51,22 @@ pub struct PlanContext<'a> {
 }
 
 impl PlanContext<'_> {
+    /// Container extension selected by the caller for the final artifact.
+    ///
+    /// The planner must respect this rather than deriving every work path from
+    /// the codec enum. In particular AAC and ALAC are published as MP4/M4A
+    /// containers so metadata and artwork can be represented by the muxer.
+    #[must_use]
+    pub fn target_container_extension(&self) -> String {
+        self.request
+            .output_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .filter(|extension| !extension.trim().is_empty())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_else(|| default_container_extension_for_format(&self.request.settings.target_format).to_string())
+    }
+
     /// Deterministic path for an intermediate stage.
     #[must_use]
     pub fn intermediate_path(&self, step_index: usize, extension: &str) -> PathBuf {
@@ -79,7 +95,7 @@ impl PlanContext<'_> {
     /// Deterministic first work path used before the caller atomically renames to the requested path.
     #[must_use]
     pub fn final_work_path(&self) -> PathBuf {
-        let extension = self.request.settings.target_format.extension();
+        let extension = self.target_container_extension();
         let base_dir = self
             .request
             .intermediate_dir
@@ -847,6 +863,45 @@ fn collect_cleanup_paths(
     paths.into_iter().collect()
 }
 
+
+fn default_container_extension_for_format(format: &AudioFormat) -> &str {
+    match format {
+        AudioFormat::Aac | AudioFormat::Alac => "m4a",
+        _ => format.extension(),
+    }
+}
+
+fn validate_requested_container_extension(request: &PlanRequest) -> Result<()> {
+    let extension = request
+        .output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.trim().is_empty())
+        .map(|extension| extension.to_ascii_lowercase());
+
+    match &request.settings.target_format {
+        AudioFormat::Aac => match extension.as_deref() {
+            None | Some("m4a" | "mp4") => Ok(()),
+            Some("aac") => Err(PlanningError::invalid_settings(
+                "output_path",
+                "AAC output is muxed as MP4/M4A by this pipeline; raw .aac output is not implemented, so use .m4a/.mp4 or add an explicit raw-AAC mode",
+            )),
+            Some(_) => Err(PlanningError::invalid_settings(
+                "output_path",
+                "AAC output must use an .m4a or .mp4 container extension unless an explicit raw-AAC mode is implemented",
+            )),
+        },
+        AudioFormat::Alac => match extension.as_deref() {
+            None | Some("m4a" | "mp4") => Ok(()),
+            Some(_) => Err(PlanningError::invalid_settings(
+                "output_path",
+                "ALAC output must use an .m4a or .mp4 container extension",
+            )),
+        },
+        _ => Ok(()),
+    }
+}
+
 fn validate_request_paths(request: &PlanRequest) -> Result<()> {
     if request.input_path.as_os_str().is_empty() {
         return Err(PlanningError::invalid_settings(
@@ -866,6 +921,7 @@ fn validate_request_paths(request: &PlanRequest) -> Result<()> {
             "input and output paths must differ; callers that want replacement should execute the work-file plan and atomically rename after success",
         ));
     }
+    validate_requested_container_extension(request)?;
     if let Some(work_dir) = &request.intermediate_dir {
         if work_dir.as_os_str().is_empty() {
             return Err(PlanningError::invalid_settings(
@@ -1336,8 +1392,7 @@ fn append_post_processing(
     current_output_path: &mut PathBuf,
 ) -> Result<()> {
     if needs_metadata_transfer_step(request, steps) {
-        let next =
-            context.intermediate_path(steps.len(), request.settings.target_format.extension());
+        let next = context.intermediate_path(steps.len(), &context.target_container_extension());
         let input = InputSource::Path(current_output_path.clone());
         push_metadata_transfer(request, steps, input, next.as_path());
         *current_output_path = next;
@@ -1551,6 +1606,62 @@ mod metadata_pruning_tests {
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn plan_context_uses_requested_output_container_extension_for_work_paths() {
+        let mut request = metadata_pruning_request();
+        request.settings.target_format = AudioFormat::Aac;
+        request.output_path = PathBuf::from("track.m4a");
+        request.intermediate_dir = Some(PathBuf::from("work"));
+        let context = request.context();
+
+        assert_eq!(context.target_container_extension(), "m4a");
+        assert_eq!(
+            context.final_work_path(),
+            PathBuf::from("work/.track.tonepoet-final.m4a")
+        );
+        assert_eq!(
+            context.intermediate_path(2, &context.target_container_extension()),
+            PathBuf::from("work/.track.tonepoet-stage-02.m4a")
+        );
+    }
+
+    #[test]
+    fn plan_context_defaults_aac_to_m4a_when_no_extension_is_requested() {
+        let mut request = metadata_pruning_request();
+        request.settings.target_format = AudioFormat::Aac;
+        request.output_path = PathBuf::from("track");
+        let context = request.context();
+
+        assert_eq!(context.target_container_extension(), "m4a");
+        assert_eq!(context.final_work_path(), PathBuf::from(".track.tonepoet-final.m4a"));
+    }
+
+    #[test]
+    fn plan_rejects_aac_with_raw_aac_suffix_without_explicit_raw_mode() {
+        let mut request = metadata_pruning_request();
+        request.settings.target_format = AudioFormat::Aac;
+        request.output_path = PathBuf::from("track.aac");
+
+        let err = plan_conversion(&request).expect_err("raw AAC suffix should not pass MP4 muxer planning");
+        assert!(
+            err.to_string().contains("raw .aac output is not implemented"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_rejects_alac_with_non_mp4_suffix() {
+        let mut request = metadata_pruning_request();
+        request.settings.target_format = AudioFormat::Alac;
+        request.output_path = PathBuf::from("track.alac");
+
+        let err = plan_conversion(&request).expect_err("ALAC must be planned as M4A/MP4");
+        assert!(
+            err.to_string().contains("ALAC output must use"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

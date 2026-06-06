@@ -218,6 +218,20 @@ pub struct TrackId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackSourceRef {
     StagedFile(PathBuf),
+    CueSegmentCarrier {
+        /// Validated, sample-bounded CUE segment carrier produced by the
+        /// materializer. This is an audio-only `pcm_s32le` WAV file and must
+        /// not be treated as the original source image for tag, artwork, MD5,
+        /// or source-bit-depth policy.
+        path: PathBuf,
+        /// Original image file from which this CUE segment was decoded. Kept as
+        /// provenance only; CUE cuts must not stream-copy compressed packets
+        /// from this image.
+        source_image: PathBuf,
+        start_sample: u64,
+        samples: u64,
+        carrier: CueSegmentCarrier,
+    },
     ImageSegment {
         image: PathBuf,
         start_sample: u64,
@@ -228,6 +242,34 @@ pub enum TrackSourceRef {
         track_index: u32,
         area: SacdArea,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CueSegmentCarrier {
+    PcmS32LeWav,
+}
+
+impl CueSegmentCarrier {
+    #[must_use]
+    pub const fn bit_depth(self) -> u32 {
+        match self {
+            Self::PcmS32LeWav => 32,
+        }
+    }
+
+    #[must_use]
+    pub const fn codec_name(self) -> &'static str {
+        match self {
+            Self::PcmS32LeWav => "pcm_s32le",
+        }
+    }
+
+    #[must_use]
+    pub const fn container_name(self) -> &'static str {
+        match self {
+            Self::PcmS32LeWav => "wav",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +317,15 @@ pub struct AlbumMetadata {
     pub extra: BTreeMap<String, String>,
 }
 
+/// AlbumMetadata.extra key used by the CUE materializer to hand original
+/// image artwork to the post-encode metadata/artwork stage. The staged CUE
+/// WAV carrier is audio-only; this sidecar preserves the artwork source fact
+/// without pretending the WAV contains it.
+pub const CUE_ARTWORK_PATH_EXTRA_KEY: &str = "tonepoet_cue_artwork_path";
+pub const CUE_ARTWORK_MIME_EXTRA_KEY: &str = "tonepoet_cue_artwork_mime";
+pub const CUE_ARTWORK_SOURCE_EXTRA_KEY: &str = "tonepoet_cue_artwork_source";
+pub const CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY: &str = "tonepoet_cue_artwork_unsupported";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionProvenance {
     pub source_kind: SourceKind,
@@ -290,6 +341,9 @@ pub struct PreparedTrack {
     pub metadata: TrackMetadata,
     pub expected_samples: Option<u64>,
     pub sample_rate: u32,
+    /// Probed bit depth of the original source image/file when available. For
+    /// CUE image tracks this remains the original image depth; it is not the
+    /// `pcm_s32le` depth of the staged segment WAV carrier.
     pub bit_depth: Option<u32>,
 }
 

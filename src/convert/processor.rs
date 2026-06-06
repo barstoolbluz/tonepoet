@@ -1063,7 +1063,9 @@ fn next_album_source_work(
                     tool_concurrency_limits.clone(),
                 )
             }
-            TrackSourceRef::ImageSegment { .. } | TrackSourceRef::SacdTrack { .. } => {
+            TrackSourceRef::CueSegmentCarrier { .. }
+            | TrackSourceRef::ImageSegment { .. }
+            | TrackSourceRef::SacdTrack { .. } => {
                 build_realize_work(
                     album,
                     track_index,
@@ -1104,7 +1106,8 @@ fn build_realize_work(
     let item_id = album.req.item_id.clone();
     let track_id = track.id.clone();
     let kind = match &track.source_ref {
-        TrackSourceRef::ImageSegment { .. } => WorkKind::CueSplitTrack { track_id: track_id.clone() },
+        TrackSourceRef::CueSegmentCarrier { .. }
+        | TrackSourceRef::ImageSegment { .. } => WorkKind::CueSplitTrack { track_id: track_id.clone() },
         TrackSourceRef::SacdTrack { .. } => WorkKind::SacdExtractTrack { track_id: track_id.clone() },
         TrackSourceRef::StagedFile(_) => WorkKind::EncodeTrack { track_id: track_id.clone() },
     };

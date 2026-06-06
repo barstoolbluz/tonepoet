@@ -11,7 +11,7 @@ use tonepoet_pipeline::{
 use super::errors::ConvertError;
 use super::types::{
     AlbumMetadata, PlannedMetadataSatisfaction, PipelineRequest, PreparedSource, PreparedTrack,
-    SourceKind, StageRequirement, TrackMetadata, TrackSourceRef,
+    CueSegmentCarrier, SourceKind, StageRequirement, TrackMetadata, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
 };
 
 pub fn plan_request_for_track(
@@ -33,6 +33,29 @@ pub fn plan_request_for_track(
     }
 
     let mut settings = request.settings.clone();
+    // CUE materialization now produces an audio-only, validated PCM S32LE WAV
+    // carrier. It is a sample-bounded decoded segment, not the original image
+    // container, so the planner must not claim source tag/artwork transfer or
+    // source-audio MD5 from this carrier. Authoritative CUE tags remain owned by
+    // the post-encode metadata stage. Force an encode step so a target WAV does
+    // not passthrough-copy the S32 carrier when the requested target depth is
+    // `Source` and the original image depth happened to match the carrier.
+    if cue_pcm_segment_carrier_bit_depth(track).is_some() {
+        settings.force_encode = true;
+        if settings.metadata.transfer_tags {
+            log::warn!(
+                "metadata.transfer_tags requested for a CUE PCM segment carrier; source-container tag transfer from the original image is unsupported on this path and will be skipped"
+            );
+            settings.metadata.transfer_tags = false;
+        }
+        if settings.metadata.preserve_artwork {
+            log::warn!(
+                "metadata.preserve_artwork requested for a CUE PCM segment carrier; planner artwork transfer from the audio-only carrier is disabled; original image artwork, when extracted by the CUE materializer, is handled by the post-encode metadata/artwork stage"
+            );
+            settings.metadata.preserve_artwork = false;
+        }
+        settings.metadata.store_source_audio_md5 = false;
+    }
     for message in apply_unsupported_target_metadata_policy_downgrades(&mut settings) {
         log::warn!("{message}");
     }
@@ -66,7 +89,11 @@ pub fn plan_request_for_track(
     // completed tracks.
     settings.replay_gain.mode = None;
     if matches!(settings.target_bit_depth, BitDepthTarget::Source) {
-        if let Some(depth) = source.bit_depth {
+        let resolved_source_depth = track
+            .bit_depth
+            .and_then(pcm_bit_depth_from_u32)
+            .or(source.bit_depth);
+        if let Some(depth) = resolved_source_depth {
             settings.target_bit_depth = BitDepthTarget::Pcm(depth);
         }
     }
@@ -231,27 +258,43 @@ pub fn source_supports_source_tag_transfer(
     req: &PipelineRequest,
     source: &PreparedSource,
 ) -> bool {
-    !matches!(source.kind, SourceKind::SacdIso)
+    !matches!(source.kind, SourceKind::SacdIso | SourceKind::CueImage)
         && req.settings.target_format.supports_planner_source_tag_transfer()
 }
 
 /// Return whether the current source/materializer plus target-format path can
-/// preserve source artwork through the per-track planner. This is intentionally
-/// narrower than "non-SACD": FFmpeg can only preserve embedded artwork for
-/// target formats whose planner-owned capability supports artwork, and SACD ISO
-/// materialization currently extracts audio plus text metadata but no artwork.
+/// preserve source artwork. Ordinary file sources rely on planner-owned source
+/// artwork transfer. CUE image sources are different: they use an audio-only
+/// staged WAV carrier plus a materializer-extracted artwork sidecar, so their
+/// artwork obligation is owned by the post-encode metadata/artwork stage.
 ///
-/// Concrete command-level satisfaction is carried by typed planner metadata
-/// effects and aggregated from the final `ConversionPlan`; this function only
-/// defines which original artwork requests are meaningful obligations for the
-/// orchestrator skip gate.
+/// Concrete command-level satisfaction is carried either by typed planner
+/// metadata effects or by the orchestrator metadata/artwork stage. This function
+/// only defines which original artwork requests are meaningful obligations for
+/// the skip gate.
 #[must_use]
 pub fn source_supports_source_artwork_preservation(
     req: &PipelineRequest,
     source: &PreparedSource,
 ) -> bool {
-    !matches!(source.kind, SourceKind::SacdIso)
-        && req.settings.target_format.supports_planner_embedded_artwork_transfer()
+    match source.kind {
+        SourceKind::CueImage => cue_source_has_extracted_artwork(source)
+            && req
+                .settings
+                .target_format
+                .supports_cue_post_encode_artwork_embedding(),
+        SourceKind::SacdIso => false,
+        _ => req.settings.target_format.supports_planner_embedded_artwork_transfer(),
+    }
+}
+
+fn cue_source_has_extracted_artwork(source: &PreparedSource) -> bool {
+    source
+        .album_metadata
+        .extra
+        .get(CUE_ARTWORK_PATH_EXTRA_KEY)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Decide whether the legacy album metadata stage is still necessary after the
@@ -326,7 +369,9 @@ pub fn source_info_for_realized_track(
     let bit_depth = if is_dsd {
         None
     } else {
-        track.bit_depth.and_then(pcm_bit_depth_from_u32)
+        cue_pcm_segment_carrier_bit_depth(track)
+            .or(track.bit_depth)
+            .and_then(pcm_bit_depth_from_u32)
     };
     let sample_kind = if is_dsd {
         Some(SampleKind::Dsd)
@@ -411,6 +456,18 @@ fn pcm_bit_depth_from_u32(bits: u32) -> Option<PcmBitDepth> {
     }
 }
 
+fn cue_pcm_segment_carrier_bit_depth(track: &PreparedTrack) -> Option<u32> {
+    match &track.source_ref {
+        TrackSourceRef::CueSegmentCarrier { carrier, .. } => Some(carrier.bit_depth()),
+        // Legacy callers that still use ImageSegment are realized by stages.rs as
+        // the same validated PCM S32LE WAV carrier. New CUE materialization must
+        // use the typed CueSegmentCarrier variant instead of relying on a path
+        // convention.
+        TrackSourceRef::ImageSegment { .. } => Some(CueSegmentCarrier::PcmS32LeWav.bit_depth()),
+        _ => None,
+    }
+}
+
 fn flac_streaminfo_audio_md5(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut magic = [0_u8; 4];
@@ -449,7 +506,7 @@ fn flac_streaminfo_audio_md5(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
     use tonepoet_pipeline::{AudioFormat as PlannerFormat, PipelineSettings, PlanAction, PlanRequest};
@@ -463,10 +520,10 @@ mod tests {
     };
     use crate::convert::pipeline::types::{
         AlbumMetadata, CueSidecarPolicy, ExtractionProvenance, FailurePolicy, LogPolicy,
-        PlannedMetadataSatisfaction, NamingCollisionPolicy, NamingPolicy, OverwritePolicy,
+        CueSegmentCarrier, PlannedMetadataSatisfaction, NamingCollisionPolicy, NamingPolicy, OverwritePolicy,
         PipelineRequest, PreparedSource, PreparedTrack, PublishPolicy, SacdArea, SourceKind,
         SourceOptions, StagePolicy, StageRequirement, TrackId, TrackMetadata, TrackSelection,
-        TrackSourceRef,
+        TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
     };
 
     fn request(root: &Path) -> PipelineRequest {
@@ -528,6 +585,16 @@ mod tests {
             expected_samples: Some(1_000),
             sample_rate: 2_822_400,
             bit_depth: None,
+        }
+    }
+
+    fn cue_carrier(path: PathBuf, source_image: PathBuf, start_sample: u64, samples: u64) -> TrackSourceRef {
+        TrackSourceRef::CueSegmentCarrier {
+            path,
+            source_image,
+            start_sample,
+            samples,
+            carrier: CueSegmentCarrier::PcmS32LeWav,
         }
     }
 
@@ -657,28 +724,54 @@ mod tests {
     }
 
     #[test]
-    fn cue_image_segment_keeps_source_tag_artwork_policy_enabled() {
+    fn cue_pcm_segment_disables_source_container_metadata_policies() {
         let temp = TempDir::new().expect("temp dir");
-        let input = temp.path().join("realized-segment.flac");
-        write_minimal_flac_with_md5(&input);
+        let input = temp.path().join("staging/cue-segments/realized-segment.wav");
+        std::fs::create_dir_all(input.parent().unwrap()).expect("cue staging dir");
+        std::fs::write(&input, b"placeholder pcm wav").expect("placeholder staged WAV");
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
         req.settings.metadata.transfer_tags = true;
         req.settings.metadata.preserve_artwork = true;
         req.settings.metadata.store_source_audio_md5 = true;
-        let track = track(TrackSourceRef::ImageSegment {
-            image: temp.path().join("album.flac"),
-            start_sample: 0,
-            samples: 44_100,
-        });
+        let mut track = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
+        track.sample_rate = 44_100;
+        track.bit_depth = Some(16);
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
             .expect("CUE image-segment plan request builds");
 
+        assert!(!planned.settings.metadata.transfer_tags);
+        assert!(!planned.settings.metadata.preserve_artwork);
+        assert!(!planned.settings.metadata.store_source_audio_md5);
+        assert!(planned.settings.force_encode);
+        assert_eq!(planned.source.bit_depth, Some(tonepoet_pipeline::PcmBitDepth::Int32));
+        assert_eq!(planned.settings.target_bit_depth, tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16));
+    }
+
+    #[test]
+    fn staged_file_path_under_cue_segments_is_not_a_cue_carrier_without_typed_fact() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("staging/cue-segments/not-a-cue-carrier.wav");
+        std::fs::create_dir_all(input.parent().unwrap()).expect("cue-looking staging dir");
+        std::fs::write(&input, b"ordinary staged wav").expect("placeholder staged WAV");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        let mut track = track(TrackSourceRef::StagedFile(input.clone()));
+        track.sample_rate = 44_100;
+        track.bit_depth = Some(16);
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("ordinary staged WAV plan request builds");
+
         assert!(planned.settings.metadata.transfer_tags);
         assert!(planned.settings.metadata.preserve_artwork);
-        assert!(planned.settings.metadata.store_source_audio_md5);
+        assert!(!planned.settings.force_encode);
+        assert_eq!(planned.source.bit_depth, Some(tonepoet_pipeline::PcmBitDepth::Int16));
     }
 
     #[test]
@@ -700,10 +793,136 @@ mod tests {
 
         let obligations = metadata_obligations_for_request(&req, &src);
 
-        assert!(obligations.source_tags_transferred);
-        assert!(obligations.artwork_transferred);
+        assert!(!obligations.source_tags_transferred);
+        assert!(!obligations.artwork_transferred);
         assert!(obligations.authoritative_tags_applied);
         assert!(!obligations.source_audio_md5_written);
+    }
+
+    #[test]
+    fn cue_artwork_obligation_is_present_only_with_extracted_sidecar_and_supported_target() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.metadata.preserve_artwork = true;
+        req.settings.target_format = PlannerFormat::Mp3;
+        let mut src = source(
+            SourceKind::CueImage,
+            track(TrackSourceRef::ImageSegment {
+                image: temp.path().join("album.flac"),
+                start_sample: 0,
+                samples: 44_100,
+            }),
+            temp.path(),
+        );
+        src.album_metadata.extra.insert(
+            CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+            temp.path().join("cue-artwork/cover.jpg").display().to_string(),
+        );
+
+        let obligations = metadata_obligations_for_request(&req, &src);
+        assert!(obligations.artwork_transferred);
+
+        req.settings.target_format = PlannerFormat::Opus;
+        let opus_obligations = metadata_obligations_for_request(&req, &src);
+        assert!(
+            !opus_obligations.artwork_transferred,
+            "Opus/Ogg CUE artwork remains unsupported until a METADATA_BLOCK_PICTURE writer exists"
+        );
+    }
+
+    #[test]
+    fn cue_validated_pcm_segment_plans_directly_to_multiformat_targets() {
+        let formats = [
+            (PlannerFormat::Flac, "flac"),
+            (PlannerFormat::Wav, "wav"),
+            (PlannerFormat::WavPack, "wv"),
+            (PlannerFormat::Opus, "opus"),
+            (PlannerFormat::Aac, "m4a"),
+            (PlannerFormat::Mp3, "mp3"),
+            (PlannerFormat::Alac, "m4a"),
+        ];
+
+        for (format, extension) in formats.iter().cloned() {
+            let temp = TempDir::new().expect("temp dir");
+            let input = temp.path().join("staging/cue-segments/realized-segment.wav");
+            std::fs::create_dir_all(input.parent().unwrap()).expect("cue staging dir");
+            std::fs::write(&input, b"placeholder pcm wav").expect("placeholder staged WAV");
+            let output = temp.path().join(format!("out.{extension}"));
+            let mut req = request(temp.path());
+            req.settings.target_format = format.clone();
+            req.settings.metadata.transfer_tags = true;
+            req.settings.metadata.preserve_artwork = true;
+            let mut prepared = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
+            prepared.sample_rate = 44_100;
+            prepared.bit_depth = Some(16);
+
+            let planned = plan_request_for_track(
+                &req,
+                &prepared,
+                &input,
+                &output,
+                temp.path().join("work"),
+            )
+            .expect("CUE image-segment plan request builds for target");
+
+            assert_eq!(planned.source.format, PlannerFormat::Wav);
+            assert_eq!(planned.source.bit_depth, Some(tonepoet_pipeline::PcmBitDepth::Int32));
+            assert_eq!(planned.settings.target_bit_depth, tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16));
+            assert!(planned.settings.force_encode);
+            assert_eq!(planned.settings.target_format, format);
+            assert_eq!(
+                planned.output_path.extension().and_then(|value| value.to_str()),
+                Some(extension)
+            );
+            let _ = tonepoet_pipeline::plan_conversion(&planned)
+                .expect("planner accepts validated PCM WAV input for target");
+        }
+    }
+
+    #[test]
+    fn cue_wav_target_reencodes_from_s32_carrier_to_original_source_depth() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("staging/cue-segments/track01.wav");
+        std::fs::create_dir_all(input.parent().unwrap()).expect("cue staging dir");
+        std::fs::write(&input, b"placeholder pcm wav").expect("placeholder staged WAV");
+        let output = temp.path().join("out.wav");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Wav;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        let mut prepared = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
+        prepared.sample_rate = 44_100;
+        prepared.bit_depth = Some(16);
+
+        let planned = plan_request_for_track(
+            &req,
+            &prepared,
+            &input,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect("CUE staged WAV plan request builds");
+        let plan = tonepoet_pipeline::plan_topology(&planned).expect("topology builds");
+
+        assert!(planned.settings.force_encode);
+        assert_eq!(planned.source.bit_depth, Some(tonepoet_pipeline::PcmBitDepth::Int32));
+        assert_eq!(planned.settings.target_bit_depth, tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16));
+        match plan {
+            tonepoet_pipeline::TopologyPlan::Execute { steps, .. } => {
+                assert!(steps.iter().any(|step| matches!(
+                    step.operation,
+                    tonepoet_pipeline::PlanOperation::EncodePcm {
+                        target_format: PlannerFormat::Wav,
+                        target_bit_depth: tonepoet_pipeline::PcmBitDepth::Int16,
+                        ..
+                    }
+                )));
+            }
+            tonepoet_pipeline::TopologyPlan::Passthrough { reason } => {
+                panic!("CUE staged S32 WAV must not passthrough-copy: {reason}");
+            }
+        }
     }
 
     #[test]
@@ -779,6 +998,28 @@ mod tests {
         assert!(messages.iter().any(|message| message.contains("metadata.transfer_tags requested")));
         assert!(messages.iter().any(|message| message.contains("metadata.preserve_artwork requested")));
         assert!(messages.iter().all(|message| message.contains("unsupported for this track")));
+    }
+
+    #[test]
+    fn opus_target_downgrades_planner_source_tags_and_artwork() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = PlannerFormat::Opus;
+        settings.metadata.transfer_tags = true;
+        settings.metadata.preserve_artwork = true;
+
+        let messages = apply_unsupported_target_metadata_policy_downgrades(&mut settings);
+
+        assert!(
+            !settings.metadata.transfer_tags,
+            "Opus authoritative CUE tags are written by the post-encode opustags stage, not by planner source-tag transfer"
+        );
+        assert!(
+            !settings.metadata.preserve_artwork,
+            "Opus/Ogg artwork remains unsupported until a METADATA_BLOCK_PICTURE writer exists"
+        );
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| message.contains("metadata.transfer_tags requested")));
+        assert!(messages.iter().any(|message| message.contains("metadata.preserve_artwork requested")));
     }
 
     #[test]
