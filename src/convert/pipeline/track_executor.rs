@@ -47,6 +47,48 @@ pub struct ExecutedTrackPlan {
     pub command_hash: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct TrackExecutionError {
+    pub error: ConvertError,
+    pub commands: Vec<CommandRecord>,
+    message: Option<String>,
+}
+
+impl TrackExecutionError {
+    fn new(error: ConvertError, commands: Vec<CommandRecord>) -> Self {
+        Self {
+            error,
+            commands,
+            message: None,
+        }
+    }
+
+    fn with_message(mut self, message: impl Into<String>) -> Self {
+        let message = message.into();
+        if !message.trim().is_empty() {
+            self.message = Some(message);
+        }
+        self
+    }
+}
+
+impl From<ConvertError> for TrackExecutionError {
+    fn from(error: ConvertError) -> Self {
+        Self::new(error, Vec::new())
+    }
+}
+
+impl std::fmt::Display for TrackExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.message {
+            Some(message) => f.write_str(message),
+            None => write!(f, "{}", self.error),
+        }
+    }
+}
+
+impl std::error::Error for TrackExecutionError {}
+
 #[derive(Debug, Clone)]
 pub struct ToolConcurrencyLimits {
     sox: Arc<Semaphore>,
@@ -160,7 +202,7 @@ pub async fn execute_planned_track_conversion(
     progress: &mut OperationProgressTracker<'_>,
     start_fraction: f32,
     end_fraction: f32,
-) -> Result<ExecutedTrackPlan, ConvertError> {
+) -> Result<ExecutedTrackPlan, TrackExecutionError> {
     let work_dir = convert_root.join(format!(".track-{:04}.work", track.id.source_ordinal));
     reset_track_work_dir(&work_dir)?;
 
@@ -229,7 +271,9 @@ pub async fn execute_planned_track_conversion(
             )
             .await?;
             if let Some(finalization) = finalization {
-                apply_finalization(finalization)?;
+                if let Err(err) = apply_finalization(finalization) {
+                    return Err(TrackExecutionError::new(err, commands));
+                }
             }
             progress
                 .estimated_with_key(
@@ -305,14 +349,17 @@ async fn execute_commands(
     start_fraction: f32,
     end_fraction: f32,
     track_label: String,
-) -> Result<Vec<CommandRecord>, ConvertError> {
+) -> Result<Vec<CommandRecord>, TrackExecutionError> {
     let mut records = Vec::with_capacity(commands.len());
     let windows = command_windows(commands, start_fraction, end_fraction);
 
     for (index, planned) in commands.iter().enumerate() {
         if cancel.is_cancelled() {
             progress.cancel_requested().await;
-            return Err(ConvertError::Realize("cancelled".to_string()));
+            return Err(TrackExecutionError::new(
+                ConvertError::Realize("cancelled".to_string()),
+                records,
+            ));
         }
         let (window_start, window_end) = windows[index];
         let label = format!(
@@ -330,25 +377,39 @@ async fn execute_commands(
             )
             .await;
 
-        let mut cmd = planned_command_to_tool_command(planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)?;
-        let output = {
-            let _tool_permit =
-                acquire_tool_permit(&mut cmd, tool_concurrency_limits.as_ref(), cancel).await?;
-            run_planned_command(
-                cmd,
-                planned,
-                runner,
-                cancel,
-                tool_paths,
-                progress,
-                window_start,
-                window_end,
-                &label,
-            )
-            .await
-            .map_err(|err| format_tool_error(index, planned, err))?
+        let mut cmd = match planned_command_to_tool_command(planned, DEFAULT_PLANNED_COMMAND_TIMEOUT) {
+            Ok(cmd) => cmd,
+            Err(err) => return Err(TrackExecutionError::new(err, records)),
         };
-        records.push(output.command);
+        let _tool_permit = match acquire_tool_permit(&mut cmd, tool_concurrency_limits.as_ref(), cancel).await {
+            Ok(permit) => permit,
+            Err(err) => {
+                let err = annotate_tool_error(tool_permit_error_to_runner_error(err, &cmd), planned);
+                return Err(track_execution_error_from_tool_error(index, planned, err, records));
+            }
+        };
+        let output = match run_planned_command(
+            cmd,
+            planned,
+            runner,
+            cancel,
+            tool_paths,
+            progress,
+            window_start,
+            window_end,
+            &label,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                let err = annotate_tool_error(err, planned);
+                return Err(track_execution_error_from_tool_error(index, planned, err, records));
+            }
+        };
+        let mut record = output.command;
+        record.description = non_empty_planned_description(planned);
+        records.push(record);
 
         progress
             .estimated_with_key(
@@ -429,6 +490,7 @@ fn tool_permit_error_to_runner_error(err: ConvertError, cmd: &ToolCommand) -> To
 
 fn command_record_for_unstarted_command(cmd: &ToolCommand) -> CommandRecord {
     CommandRecord {
+        description: None,
         binary: cmd.binary,
         sanitized_args: cmd.args.clone(),
         cwd: cmd.cwd.clone(),
@@ -437,6 +499,15 @@ fn command_record_for_unstarted_command(cmd: &ToolCommand) -> CommandRecord {
         stdout_tail: String::new(),
         stderr_tail: String::new(),
         elapsed: Duration::ZERO,
+    }
+}
+
+fn non_empty_planned_description(planned: &PlannedCommand) -> Option<String> {
+    let description = planned.description.trim();
+    if description.is_empty() {
+        None
+    } else {
+        Some(description.to_string())
     }
 }
 
@@ -485,6 +556,7 @@ fn successful_captured_tool_output_for_test(cmd: ToolCommand) -> ToolOutput {
         stderr_tail: String::new(),
         elapsed,
         command: CommandRecord {
+            description: None,
             binary: cmd.binary,
             sanitized_args: cmd.args.clone(),
             cwd: cmd.cwd.clone(),
@@ -648,26 +720,84 @@ fn cleanup_paths(paths: &[PathBuf]) {
     }
 }
 
-fn format_tool_error(
+fn annotate_tool_error(mut err: ToolRunnerError, planned: &PlannedCommand) -> ToolRunnerError {
+    let description = non_empty_planned_description(planned);
+    match &mut err {
+        ToolRunnerError::Spawn { command }
+        | ToolRunnerError::Timeout { command, .. }
+        | ToolRunnerError::Cancelled { command }
+        | ToolRunnerError::NonZeroExit { command, .. } => {
+            command.description = description;
+        }
+        ToolRunnerError::Io(_) => {}
+    }
+    err
+}
+
+fn track_execution_error_from_tool_error(
     index: usize,
     planned: &PlannedCommand,
     err: ToolRunnerError,
-) -> ConvertError {
+    mut records: Vec<CommandRecord>,
+) -> TrackExecutionError {
+    let message = planned_tool_error_message(index, planned, &err);
+    if let Some(record) = command_record_from_tool_error(&err) {
+        records.push(record);
+    }
+    TrackExecutionError::new(format_tool_error(index, planned, err), records).with_message(message)
+}
+
+fn planned_tool_error_message(
+    index: usize,
+    planned: &PlannedCommand,
+    err: &ToolRunnerError,
+) -> String {
     match err {
-        ToolRunnerError::NonZeroExit { stderr_tail, .. } => ConvertError::Backend(format!(
+        ToolRunnerError::NonZeroExit { stderr_tail, .. } => format!(
             "planned command {} failed ({}): {}",
             index + 1,
             planned.description,
             stderr_tail
-        )),
-        ToolRunnerError::Timeout { elapsed, .. } => ConvertError::Backend(format!(
+        ),
+        ToolRunnerError::Timeout { elapsed, .. } => format!(
             "planned command {} timed out after {:?} ({})",
             index + 1,
             elapsed,
             planned.description
-        )),
+        ),
+        ToolRunnerError::Cancelled { .. } => "cancelled".to_string(),
+        ToolRunnerError::Spawn { .. } => format!(
+            "planned command {} failed to start ({})",
+            index + 1,
+            planned.description
+        ),
+        ToolRunnerError::Io(err) => format!(
+            "planned command {} failed before execution ({}): {}",
+            index + 1,
+            planned.description,
+            err
+        ),
+    }
+}
+
+fn format_tool_error(
+    _index: usize,
+    _planned: &PlannedCommand,
+    err: ToolRunnerError,
+) -> ConvertError {
+    match err {
         ToolRunnerError::Cancelled { .. } => ConvertError::Realize("cancelled".to_string()),
         other => ConvertError::Tool(other),
+    }
+}
+
+fn command_record_from_tool_error(err: &ToolRunnerError) -> Option<CommandRecord> {
+    match err {
+        ToolRunnerError::Spawn { command }
+        | ToolRunnerError::Timeout { command, .. }
+        | ToolRunnerError::Cancelled { command }
+        | ToolRunnerError::NonZeroExit { command, .. } => Some(command.clone()),
+        ToolRunnerError::Io(_) => None,
     }
 }
 
@@ -686,9 +816,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use async_trait::async_trait;
+
     use crate::convert::pipeline::tool::blocking_test_runner::{
         tool_gate, BlockingToolRunner, ToolBehavior,
     };
+    use crate::convert::pipeline::tool::StubToolRunner;
     use crate::convert::pipeline::types::{
         CueSidecarPolicy, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
         OverwritePolicy, PipelineStage, PublishPolicy, SacdArea, SourceOptions, StagePolicy,
@@ -799,7 +932,7 @@ mod tests {
         runner: &dyn ToolRunner,
         cancel: &CancellationToken,
         limits: Option<Arc<ToolConcurrencyLimits>>,
-    ) -> Result<Vec<CommandRecord>, ConvertError> {
+    ) -> Result<Vec<CommandRecord>, TrackExecutionError> {
         let mut progress = OperationProgressTracker::new(
             "track-executor-test".to_string(),
             PipelineStage::Convert,
@@ -817,6 +950,216 @@ mod tests {
             "test track".to_string(),
         )
         .await
+    }
+
+    fn command_record_for_test_tool_command(
+        cmd: &ToolCommand,
+        exit: Option<ProcessExit>,
+        stderr: &str,
+        elapsed: Duration,
+    ) -> CommandRecord {
+        CommandRecord {
+            description: None,
+            binary: cmd.binary,
+            sanitized_args: cmd.sanitized_args(),
+            cwd: cmd.cwd.clone(),
+            env_keys: cmd.env_keys(),
+            exit,
+            stdout_tail: String::new(),
+            stderr_tail: stderr.to_string(),
+            elapsed,
+        }
+    }
+
+    struct TimeoutToolRunnerForTest;
+
+    #[async_trait]
+    impl ToolRunner for TimeoutToolRunnerForTest {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            let elapsed = Duration::from_secs(42);
+            Err(ToolRunnerError::Timeout {
+                elapsed,
+                command: command_record_for_test_tool_command(
+                    &cmd,
+                    None,
+                    "timed out in test",
+                    elapsed,
+                ),
+            })
+        }
+    }
+
+    struct CancelledToolRunnerForTest;
+
+    #[async_trait]
+    impl ToolRunner for CancelledToolRunnerForTest {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            Err(ToolRunnerError::Cancelled {
+                command: command_record_for_test_tool_command(
+                    &cmd,
+                    None,
+                    "cancelled in test",
+                    Duration::from_secs(7),
+                ),
+            })
+        }
+    }
+
+
+    #[tokio::test]
+    async fn failed_planned_command_preserves_partial_records_and_planned_description() {
+        let temp = TempDir::new().expect("temp dir");
+        let cancel = CancellationToken::new();
+        let runner = StubToolRunner::new();
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                description: None,
+                binary: ToolBinary::Ssrc,
+                sanitized_args: Vec::new(),
+                cwd: None,
+                env_keys: Vec::new(),
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        });
+        runner.push_failure("encoder exploded");
+
+        let mut decode = planned_command_for_test(
+            ToolIdentifier::Ssrc,
+            vec!["decode".to_string()],
+            &temp.path().join("decoded.wav"),
+        );
+        decode.description = "Decode FLAC to PCM".to_string();
+        let mut encode = planned_command_for_test(
+            ToolIdentifier::Ssrc,
+            vec!["encode".to_string()],
+            &temp.path().join("encoded.flac"),
+        );
+        encode.description = "Encode FLAC".to_string();
+
+        let err = execute_commands_for_test(vec![decode, encode], &runner, &cancel, None)
+            .await
+            .expect_err("second planned command fails");
+
+        assert!(matches!(
+            &err.error,
+            ConvertError::Tool(ToolRunnerError::NonZeroExit { .. })
+        ));
+        assert_eq!(err.commands.len(), 2);
+        assert_eq!(
+            err.commands[0].description.as_deref(),
+            Some("Decode FLAC to PCM")
+        );
+        assert_eq!(err.commands[1].description.as_deref(), Some("Encode FLAC"));
+        assert_eq!(err.commands[1].stderr_tail, "encoder exploded");
+        assert!(
+            err.to_string().contains("planned command 2 failed (Encode FLAC)"),
+            "display error keeps the planned step context"
+        );
+    }
+
+
+    #[tokio::test]
+    async fn non_zero_planned_command_failure_retains_command_record_description() {
+        let temp = TempDir::new().expect("temp dir");
+        let cancel = CancellationToken::new();
+        let runner = StubToolRunner::new();
+        runner.push_failure("encoder returned non-zero");
+
+        let mut encode = planned_command_for_test(
+            ToolIdentifier::Ssrc,
+            vec!["encode".to_string(), "out.flac".to_string()],
+            &temp.path().join("encoded.flac"),
+        );
+        encode.description = "Encode FLAC level 8".to_string();
+
+        let err = execute_commands_for_test(vec![encode], &runner, &cancel, None)
+            .await
+            .expect_err("planned command should fail");
+
+        assert!(matches!(
+            &err.error,
+            ConvertError::Tool(ToolRunnerError::NonZeroExit { .. })
+        ));
+        assert_eq!(err.commands.len(), 1);
+        assert_eq!(
+            err.commands[0].description.as_deref(),
+            Some("Encode FLAC level 8")
+        );
+        assert_eq!(err.commands[0].stderr_tail, "encoder returned non-zero");
+        assert_eq!(err.commands[0].exit, Some(ProcessExit::Code(1)));
+    }
+
+    #[tokio::test]
+    async fn timeout_planned_command_preserves_failing_command_record() {
+        let temp = TempDir::new().expect("temp dir");
+        let cancel = CancellationToken::new();
+        let runner = TimeoutToolRunnerForTest;
+        let mut encode = planned_command_for_test(
+            ToolIdentifier::Ssrc,
+            vec!["encode".to_string(), "slow.flac".to_string()],
+            &temp.path().join("slow.flac"),
+        );
+        encode.description = "Encode slow FLAC".to_string();
+
+        let err = execute_commands_for_test(vec![encode], &runner, &cancel, None)
+            .await
+            .expect_err("planned command should time out");
+
+        assert!(matches!(
+            &err.error,
+            ConvertError::Tool(ToolRunnerError::Timeout { .. })
+        ));
+        assert_eq!(err.commands.len(), 1);
+        assert_eq!(
+            err.commands[0].description.as_deref(),
+            Some("Encode slow FLAC")
+        );
+        assert!(err.commands[0].sanitized_args.iter().any(|arg| arg == "encode"));
+        assert_eq!(err.commands[0].exit, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_planned_command_preserves_failing_command_record() {
+        let temp = TempDir::new().expect("temp dir");
+        let cancel = CancellationToken::new();
+        let runner = CancelledToolRunnerForTest;
+        let mut encode = planned_command_for_test(
+            ToolIdentifier::Ssrc,
+            vec!["encode".to_string(), "cancel.flac".to_string()],
+            &temp.path().join("cancel.flac"),
+        );
+        encode.description = "Encode cancellable FLAC".to_string();
+
+        let err = execute_commands_for_test(vec![encode], &runner, &cancel, None)
+            .await
+            .expect_err("planned command should be cancelled");
+
+        assert!(matches!(
+            &err.error,
+            ConvertError::Realize(message) if message == "cancelled"
+        ));
+        assert_eq!(err.commands.len(), 1);
+        assert_eq!(
+            err.commands[0].description.as_deref(),
+            Some("Encode cancellable FLAC")
+        );
+        assert!(err.commands[0].sanitized_args.iter().any(|arg| arg == "encode"));
+        assert_eq!(err.commands[0].exit, None);
     }
 
 
@@ -1539,7 +1882,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
         chain: &SyntheticChain,
         runner: &dyn ToolRunner,
         cancel: &CancellationToken,
-    ) -> Result<Vec<CommandRecord>, ConvertError> {
+    ) -> Result<Vec<CommandRecord>, TrackExecutionError> {
         reset_track_work_dir(&chain.work_dir)?;
         cleanup_paths(chain.plan.cleanup_paths());
         let mut progress = OperationProgressTracker::new(
@@ -1569,7 +1912,9 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                 {
                     Ok(records) => {
                         if let Some(finalization) = finalization {
-                            apply_finalization(finalization)?;
+                            if let Err(err) = apply_finalization(finalization) {
+                                return Err(TrackExecutionError::new(err, records));
+                            }
                         }
                         Ok(records)
                     }
@@ -1639,7 +1984,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
     fn scheduled_failure_output_for_chain(
         chain: &SyntheticChain,
         track: &PreparedTrack,
-        error: &ConvertError,
+        error: &TrackExecutionError,
         commands: Vec<CommandRecord>,
     ) -> ScheduledTrackOutput {
         ScheduledTrackOutput {
@@ -1724,7 +2069,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                 &chain,
                 &synthetic_track(&chain),
                 &err,
-                runner.transcript(),
+                err.commands.clone(),
             );
 
             assert!(err.to_string().contains(&format!(

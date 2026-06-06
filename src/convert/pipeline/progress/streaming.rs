@@ -526,6 +526,7 @@ fn build_record(
         stdout_tail: stdout_tail.to_string(),
         stderr_tail: stderr_tail.to_string(),
         elapsed,
+        description: None,
     }
 }
 

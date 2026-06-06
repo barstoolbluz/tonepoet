@@ -2666,6 +2666,7 @@ mod materializer_cue_tests {
                     stdout_tail: String::new(),
                     stderr_tail: String::new(),
                     elapsed: Duration::from_millis(10),
+                    description: None,
                 },
             })
         }
@@ -2898,6 +2899,7 @@ TRACK XX AUDIO
                     stdout_tail: String::new(),
                     stderr_tail: String::new(),
                     elapsed: Duration::from_millis(10),
+                    description: None,
                 },
             })
         }
@@ -4085,6 +4087,7 @@ FILE "track2.flac" WAVE
                     stdout_tail,
                     stderr_tail,
                     elapsed: Duration::from_millis(0),
+                    description: None,
                 },
             })
         }

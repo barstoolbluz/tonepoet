@@ -39,7 +39,12 @@ use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{CommandRecord, RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 use crate::convert::ConversionStatus;
-use tonepoet_pipeline::AudioFormat as PlannerAudioFormat;
+use tonepoet_pipeline::{
+    AacProfile, AudioFormat as PlannerAudioFormat, BitDepthTarget, DitherType,
+    DsdLowpassMethod, DsdRate, DsdToPcmGainMode, Mp3Mode, NyquistTransition,
+    OpusContentType, PcmBitDepth, PreferredTool, RateTarget, ResampleQuality,
+    SoxSincPhase, SsrcPdfType, SsrcProfile, WavPackMode,
+};
 use crate::tui::sacd::{
     parse_sacd_iso, AreaInfo, PlayTime, SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE,
     SACD_SAMPLE_RATE_HZ,
@@ -1870,13 +1875,14 @@ async fn convert_one_track_work(
             }
         }
         Err(err) => {
-            let commands = command_from_convert_error(&err);
+            let error = err.to_string();
+            let commands = err.commands;
             let record = failed_track_record(
                 &track,
                 Some(realized_input),
                 Some(staged_path),
                 commands,
-                err.to_string(),
+                error,
             );
             Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
         }
@@ -2346,6 +2352,7 @@ pub async fn apply_metadata_with_tool_limits(
                 if cancel.is_cancelled() {
                     return Err(MetadataError::Tool(ToolRunnerError::Cancelled {
                         command: CommandRecord {
+                            description: None,
                             binary: ToolBinary::Metaflac,
                             sanitized_args: vec![],
                             cwd: None,
@@ -4877,7 +4884,14 @@ pub async fn run_features(
     };
 
     let log_staged = staging.root.join("conversion.log");
-    let log_content = build_conversion_log(outcome, source, req);
+    let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings);
+    let log_content = build_conversion_log(
+        outcome,
+        source,
+        req,
+        &artifacts,
+        Some(settings_fingerprint),
+    );
     fs::write(&log_staged, &log_content)?;
     artifacts.sidecars.push(SidecarArtifact {
         kind: SidecarKind::ConversionLog,
@@ -4909,10 +4923,17 @@ fn build_conversion_log(
     outcome: &AlbumOutcome,
     source: &PreparedSource,
     req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+    settings_fingerprint: Option<tonepoet_pipeline::SettingsFingerprint>,
 ) -> String {
     let mut log = String::new();
     let tracks = collect_outcome_tracks(outcome);
     let source_tracks_by_ordinal = build_source_track_index(source);
+    let artifacts_by_track_id = build_track_artifact_index(artifacts);
+    let metadata_stage_result = metadata_stage_outcome(outcome);
+    let resampling_applies = resampling_applies_for_source(source, &req.settings);
+    let bit_depth_change_applies = bit_depth_change_applies_for_source(source, &req.settings);
+    let dithering_applies = dithering_applies_for_source(source, &req.settings);
     let successful_count = tracks
         .iter()
         .filter(|track| matches!(track.outcome, TrackOutcome::Ok))
@@ -4952,6 +4973,9 @@ fn build_conversion_log(
     );
     push_kv_line(&mut log, "Job ID", &req.job_id);
     push_kv_line(&mut log, "Item ID", &req.item_id);
+    if let Some(fingerprint) = settings_fingerprint {
+        push_kv_line(&mut log, "Settings fingerprint", fingerprint.to_string());
+    }
     log.push('\n');
 
     log.push_str("Source Information\n");
@@ -4978,44 +5002,19 @@ fn build_conversion_log(
     );
     log.push('\n');
 
+    append_provenance_section(&mut log, &source.provenance);
+    append_artwork_section(&mut log, source, req, outcome, artifacts);
+
     log.push_str("Conversion Settings\n");
     log.push_str("-------------------\n");
-    push_kv_line(&mut log, "Target format", req.settings.target_format.display_name());
-    push_kv_line(&mut log, "Preferred tool", format!("{:?}", req.settings.preferred_tool));
-    push_kv_line(&mut log, "Target sample rate", format!("{:?}", req.settings.target_sample_rate));
-    push_kv_line(&mut log, "Target bit depth", format!("{:?}", req.settings.target_bit_depth));
-    push_kv_line(&mut log, "Resample quality", format!("{:?}", req.settings.resample_quality));
-    push_kv_line(&mut log, "Nyquist transition", format!("{:?}", req.settings.nyquist_transition));
-    push_kv_line(&mut log, "Dither type", format!("{:?}", req.settings.dither_type));
-    push_kv_line(&mut log, "Force encode", yes_no(req.settings.force_encode));
-    push_kv_line(&mut log, "FLAC compression", req.settings.flac.compression_level.to_string());
-    push_kv_line(&mut log, "MP3 mode", format!("{:?}", req.settings.mp3.mode));
-    push_kv_line(&mut log, "MP3 bitrate", format!("{} kbps", req.settings.mp3.bitrate_kbps));
-    push_kv_line(&mut log, "AAC profile", format!("{:?}", req.settings.aac.profile));
-    push_kv_line(&mut log, "AAC bitrate", format!("{} kbps", req.settings.aac.bitrate_kbps));
-    push_kv_line(&mut log, "Opus bitrate", format!("{} kbps", req.settings.opus.bitrate_kbps));
-    push_kv_line(&mut log, "WavPack mode", format!("{:?}", req.settings.wavpack.mode));
-    push_kv_line(&mut log, "Merge mode", yes_no(req.merge));
-    push_kv_line(
+    append_conversion_settings_section(
         &mut log,
-        "Metadata",
-        stage_requirement_label(req.stages.metadata),
+        source,
+        req,
+        resampling_applies,
+        bit_depth_change_applies,
+        dithering_applies,
     );
-    push_kv_line(
-        &mut log,
-        "ReplayGain",
-        stage_requirement_label(req.stages.replaygain),
-    );
-    push_kv_line(
-        &mut log,
-        "Features",
-        stage_requirement_label(req.stages.features),
-    );
-    match &req.naming.folder_template {
-        Some(template) => push_kv_line(&mut log, "Folder template", template),
-        None => push_kv_line(&mut log, "Folder template", "album-name fallback"),
-    }
-    push_kv_line(&mut log, "Filename template", &req.naming.template);
     log.push('\n');
 
     log.push_str("Per-Track Results\n");
@@ -5030,6 +5029,9 @@ fn build_conversion_log(
                 source_tracks_by_ordinal
                     .get(&record.track_id.source_ordinal)
                     .copied(),
+                artifacts_by_track_id.get(&record.track_id).copied(),
+                req,
+                metadata_stage_result,
             );
         }
     }
@@ -5089,7 +5091,26 @@ fn build_source_track_index<'a>(source: &'a PreparedSource) -> BTreeMap<u32, &'a
     tracks_by_ordinal
 }
 
-fn append_track_log(log: &mut String, record: &TrackRecord, prepared: Option<&PreparedTrack>) {
+fn build_track_artifact_index<'a>(artifacts: &'a ArtifactSet) -> BTreeMap<TrackId, &'a TrackArtifact> {
+    let mut artifacts_by_track_id = BTreeMap::new();
+    if let AudioArtifacts::Tracks(tracks) = &artifacts.audio {
+        for artifact in tracks {
+            artifacts_by_track_id
+                .entry(artifact.track_id.clone())
+                .or_insert(artifact);
+        }
+    }
+    artifacts_by_track_id
+}
+
+fn append_track_log(
+    log: &mut String,
+    record: &TrackRecord,
+    prepared: Option<&PreparedTrack>,
+    artifact: Option<&TrackArtifact>,
+    req: &PipelineRequest,
+    metadata_stage_result: Option<&StageOutcome>,
+) {
     log.push_str(&escape_log_value(&track_display_label(record, prepared)));
     log.push('\n');
     match &record.outcome {
@@ -5111,6 +5132,17 @@ fn append_track_log(log: &mut String, record: &TrackRecord, prepared: Option<&Pr
             source_audio.push_str(&format!(", {expected_samples} expected samples"));
         }
         push_kv_line(log, "  Source audio", source_audio);
+        push_kv_line(log, "  Conversion", conversion_summary(track, req));
+    }
+
+    if let Some(pipeline) = planned_pipeline_label(&record.commands)
+        .or_else(|| passthrough_pipeline_label(record, prepared, req))
+    {
+        push_kv_line(log, "  Pipeline", pipeline);
+    }
+
+    if let Some(metadata) = metadata_satisfaction_label(artifact, req.stages.metadata, metadata_stage_result) {
+        push_kv_line(log, "  Metadata", metadata);
     }
 
     push_kv_line(
@@ -5160,6 +5192,1038 @@ fn append_track_log(log: &mut String, record: &TrackRecord, prepared: Option<&Pr
         }
     }
     log.push('\n');
+}
+
+fn append_provenance_section(log: &mut String, provenance: &ExtractionProvenance) {
+    log.push_str("Provenance\n");
+    log.push_str("----------\n");
+    if let Some(sha256) = provenance
+        .source_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        push_kv_line(log, "Source SHA-256", sha256);
+    }
+    push_kv_line(
+        log,
+        "Extracted at",
+        provenance
+            .extracted_at
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string(),
+    );
+    if !provenance.tool_versions.is_empty() {
+        let versions = provenance
+            .tool_versions
+            .iter()
+            .filter_map(|(tool, version)| {
+                let tool = tool.trim();
+                let version = version.trim();
+                if tool.is_empty() || version.is_empty() {
+                    None
+                } else {
+                    Some(format!("{tool} {version}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        if !versions.is_empty() {
+            push_kv_line(log, "Tool versions", versions.join(", "));
+        }
+    }
+    log.push('\n');
+}
+
+fn append_artwork_section(
+    log: &mut String,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    outcome: &AlbumOutcome,
+    artifacts: &ArtifactSet,
+) {
+    let Some(artwork) = cue_artwork_sidecar_from_album_metadata(&source.album_metadata) else {
+        return;
+    };
+    let artwork_format = artwork
+        .mime_type
+        .as_deref()
+        .map(artwork_mime_label)
+        .unwrap_or("artwork");
+    push_kv_line(
+        log,
+        "Artwork",
+        format!(
+            "extracted {artwork_format} from source image → {}",
+            cue_artwork_log_outcome(req, outcome, artifacts)
+        ),
+    );
+    log.push('\n');
+}
+
+fn append_conversion_settings_section(
+    log: &mut String,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    resampling_applies: bool,
+    bit_depth_change_applies: bool,
+    dithering_applies: bool,
+) {
+    let settings = &req.settings;
+    push_kv_line(log, "Target format", settings.target_format.display_name());
+    if resampling_applies {
+        push_kv_line(
+            log,
+            "Target sample rate",
+            target_sample_rate_setting_label(source, settings),
+        );
+        push_kv_line(log, "Preferred resampler tool", preferred_resampler_label(settings));
+    }
+    if bit_depth_change_applies {
+        push_kv_line(
+            log,
+            "Target bit depth",
+            bit_depth_target_label(settings.target_bit_depth),
+        );
+    }
+    if dithering_applies {
+        push_kv_line(log, "Dither type", dither_type_label(settings.dither_type));
+    }
+    push_kv_line(log, "Force encode", yes_no(settings.force_encode));
+    push_kv_line(log, "Merge mode", yes_no(req.merge));
+
+    append_target_format_settings(log, settings);
+    if resampling_applies {
+        append_resampler_settings(log, settings);
+    }
+    if source_is_dsd(source) || settings.target_format.is_dsd() {
+        append_dsd_settings(log, source, settings);
+    }
+
+    push_kv_line(log, "Metadata", stage_requirement_label(req.stages.metadata));
+    push_kv_line(log, "ReplayGain", stage_requirement_label(req.stages.replaygain));
+    push_kv_line(log, "Features", stage_requirement_label(req.stages.features));
+    match &req.naming.folder_template {
+        Some(template) => push_kv_line(log, "Folder template", template),
+        None => push_kv_line(log, "Folder template", "album-name fallback"),
+    }
+    push_kv_line(log, "Filename template", &req.naming.template);
+}
+
+fn append_target_format_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
+    match &settings.target_format {
+        PlannerAudioFormat::Flac => {
+            push_kv_line(log, "FLAC compression", settings.flac.compression_level.to_string());
+        }
+        PlannerAudioFormat::Mp3 => {
+            push_kv_line(log, "MP3 mode", mp3_mode_label(settings.mp3.mode));
+            push_kv_line(log, "MP3 bitrate", format!("{} kbps", settings.mp3.bitrate_kbps));
+            match settings.mp3.mode {
+                Mp3Mode::Vbr => push_kv_line(log, "MP3 VBR quality", settings.mp3.vbr_quality.to_string()),
+                Mp3Mode::Cbr | Mp3Mode::Abr => {}
+            }
+        }
+        PlannerAudioFormat::Aac => {
+            push_kv_line(log, "AAC profile", aac_profile_label(settings.aac.profile));
+            push_kv_line(log, "AAC bitrate", format!("{} kbps", settings.aac.bitrate_kbps));
+        }
+        PlannerAudioFormat::Opus => {
+            push_kv_line(log, "Opus bitrate", format!("{} kbps", settings.opus.bitrate_kbps));
+            push_kv_line(log, "Opus application", opus_content_type_label(settings.opus.content_type));
+            push_kv_line(log, "Opus complexity", settings.opus.complexity.to_string());
+        }
+        PlannerAudioFormat::WavPack => {
+            push_kv_line(log, "WavPack mode", wavpack_mode_label(settings.wavpack.mode));
+            if settings.wavpack.hybrid {
+                push_kv_line(
+                    log,
+                    "WavPack hybrid bitrate",
+                    format!("{} kbps/ch", settings.wavpack.hybrid_bitrate_kbps),
+                );
+                push_kv_line(
+                    log,
+                    "WavPack correction file",
+                    yes_no(settings.wavpack.correction_file),
+                );
+            }
+        }
+        PlannerAudioFormat::Alac
+        | PlannerAudioFormat::Wav
+        | PlannerAudioFormat::Aiff
+        | PlannerAudioFormat::Dsf
+        | PlannerAudioFormat::Dff
+        | PlannerAudioFormat::Dts
+        | PlannerAudioFormat::Ac3
+        | PlannerAudioFormat::Custom { .. } => {}
+    }
+}
+
+fn append_resampler_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
+    match preferred_resampler_family(settings) {
+        ResamplerFamily::Ssrc => append_ssrc_settings(log, settings),
+        ResamplerFamily::Sox => append_sox_resampler_settings(log, settings),
+        ResamplerFamily::Soxr => append_soxr_resampler_settings(log, settings),
+        ResamplerFamily::Auto => {
+            push_kv_line(log, "Resample quality", resample_quality_label(settings.resample_quality));
+            push_kv_line(log, "Nyquist transition", nyquist_transition_label(settings.nyquist_transition));
+            append_non_default_resampler_overrides(log, settings);
+        }
+    }
+}
+
+fn append_ssrc_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
+    let ssrc = settings.ssrc;
+    push_kv_line(log, "SSRC profile", ssrc_profile_label(ssrc.profile, settings.resample_quality, ssrc.insane_mode));
+    if let Some(attenuation) = ssrc.attenuation_db {
+        push_kv_line(log, "SSRC attenuation", format!("{} dB", decimal_label(attenuation)));
+    }
+    push_kv_line(log, "SSRC minimum phase", yes_no(ssrc.min_phase));
+    if let Some(dither_id) = ssrc.dither_id {
+        push_kv_line(log, "SSRC dither ID", dither_id.to_string());
+    }
+    if let Some(pdf_type) = ssrc.pdf_type {
+        push_kv_line(log, "SSRC PDF type", ssrc_pdf_type_label(pdf_type));
+    }
+    push_kv_line(log, "SSRC insane mode", yes_no(ssrc.insane_mode));
+}
+
+fn append_sox_resampler_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
+    let sox = settings.sox_resampler;
+    push_kv_line(log, "SoX quality", resample_quality_label(settings.resample_quality));
+    push_kv_line(log, "SoX Nyquist transition", nyquist_transition_label(settings.nyquist_transition));
+    if sox.chebyshev {
+        push_kv_line(log, "SoX steep/Chebyshev", "yes");
+    }
+    if let Some(bandwidth) = sox.bandwidth_pct {
+        push_kv_line(log, "SoX bandwidth", format!("{}%", decimal_label(bandwidth)));
+    }
+    if let Some(phase) = sox.phase {
+        push_kv_line(log, "SoX phase response", phase.to_string());
+    }
+    if sox.allow_aliasing {
+        push_kv_line(log, "SoX allow aliasing", "yes");
+    }
+    append_sox_sinc_settings(log, settings);
+}
+
+fn append_soxr_resampler_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
+    let soxr = settings.soxr_resampler;
+    push_kv_line(
+        log,
+        "Soxr quality preset",
+        resample_quality_label(settings.resample_quality),
+    );
+    if let Some(phase) = soxr.phase {
+        push_kv_line(log, "Soxr phase response", phase.to_string());
+    }
+    if let Some(cutoff) = soxr.cutoff {
+        push_kv_line(log, "Soxr cutoff override", decimal_label(cutoff));
+    }
+    if soxr.chebyshev {
+        push_kv_line(log, "Soxr Chebyshev", "yes");
+    }
+}
+
+fn append_non_default_resampler_overrides(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
+    if settings.ssrc.force
+        || settings.ssrc.insane_mode
+        || settings.ssrc.profile.is_some()
+        || settings.ssrc.attenuation_db.is_some()
+        || settings.ssrc.min_phase
+        || settings.ssrc.dither_id.is_some()
+        || settings.ssrc.pdf_type.is_some()
+    {
+        append_ssrc_settings(log, settings);
+    }
+    if settings.sox_resampler.chebyshev
+        || settings.sox_resampler.bandwidth_pct.is_some()
+        || settings.sox_resampler.phase.is_some()
+        || settings.sox_resampler.allow_aliasing
+        || settings.sox_resampler.sinc_taps.is_some()
+        || settings.sox_resampler.sinc_attenuation_db.is_some()
+        || settings.sox_resampler.sinc_passband_hz.is_some()
+        || settings.sox_resampler.sinc_transition_hz.is_some()
+        || settings.sox_resampler.sinc_kaiser_beta.is_some()
+        || settings.sox_resampler.sinc_phase.is_some()
+    {
+        append_sox_resampler_settings(log, settings);
+    }
+    if settings.soxr_resampler.chebyshev
+        || settings.soxr_resampler.cutoff.is_some()
+        || settings.soxr_resampler.phase.is_some()
+    {
+        append_soxr_resampler_settings(log, settings);
+    }
+}
+
+fn append_sox_sinc_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
+    let sox = settings.sox_resampler;
+    if sox.sinc_taps.is_none()
+        && sox.sinc_attenuation_db.is_none()
+        && sox.sinc_passband_hz.is_none()
+        && sox.sinc_transition_hz.is_none()
+        && sox.sinc_kaiser_beta.is_none()
+        && sox.sinc_phase.is_none()
+    {
+        return;
+    }
+    if let Some(taps) = sox.sinc_taps {
+        push_kv_line(log, "SoX sinc taps", taps.to_string());
+    }
+    if let Some(attenuation) = sox.sinc_attenuation_db {
+        push_kv_line(log, "SoX sinc attenuation", format!("{attenuation} dB"));
+    }
+    if let Some(passband) = sox.sinc_passband_hz {
+        push_kv_line(log, "SoX sinc passband", format!("{} Hz", decimal_label(passband)));
+    }
+    if let Some(transition) = sox.sinc_transition_hz {
+        push_kv_line(log, "SoX sinc transition", format!("{} Hz", decimal_label(transition)));
+    }
+    if let Some(beta) = sox.sinc_kaiser_beta {
+        push_kv_line(log, "SoX sinc Kaiser beta", decimal_label(beta));
+    }
+    if let Some(phase) = sox.sinc_phase {
+        push_kv_line(log, "SoX sinc phase", sox_sinc_phase_label(phase));
+    }
+}
+
+fn append_dsd_settings(
+    log: &mut String,
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) {
+    if source_is_dsd(source) && !settings.target_format.is_dsd() {
+        push_kv_line(log, "DSD gain mode", dsd_gain_mode_label(settings.dsd.dsd_to_pcm_gain_mode));
+        push_kv_line(
+            log,
+            "DSD auto gain margin",
+            format!("{} dB", decimal_label(settings.dsd.dsd_to_pcm_auto_gain_margin_db)),
+        );
+        if let Some(gain) = settings.dsd.dsd_to_pcm_gain_db {
+            push_kv_line(log, "DSD manual gain", format!("{} dB", decimal_label(gain)));
+        }
+        push_kv_line(
+            log,
+            "DSD→PCM lowpass method",
+            dsd_lowpass_method_label(settings.dsd.dsd_to_pcm_lowpass),
+        );
+    }
+
+    if settings.target_format.is_dsd() {
+        push_kv_line(
+            log,
+            "PCM→DSD filter preset",
+            format!("{:?}", settings.dsd.pcm_to_dsd_filter),
+        );
+    }
+}
+
+fn planned_pipeline_label(commands: &[CommandRecord]) -> Option<String> {
+    if commands.is_empty() {
+        return None;
+    }
+    let parts = commands
+        .iter()
+        .map(|command| {
+            command
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| command_line_label(command))
+        })
+        .collect::<Vec<_>>();
+    Some(parts.join(" → "))
+}
+
+fn passthrough_pipeline_label(
+    record: &TrackRecord,
+    prepared: Option<&PreparedTrack>,
+    req: &PipelineRequest,
+) -> Option<String> {
+    if !record.commands.is_empty() || !matches!(record.outcome, TrackOutcome::Ok) {
+        return None;
+    }
+
+    let track = prepared?;
+    if source_audio_matches_target_for_passthrough(track, &req.settings) {
+        Some("passthrough copy".to_string())
+    } else {
+        None
+    }
+}
+
+fn source_audio_matches_target_for_passthrough(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    if settings.force_encode || !source_track_format_matches_target(track, &settings.target_format) {
+        return false;
+    }
+
+    let Some(target_rate) = resolved_target_rate_hz(track, settings) else {
+        return false;
+    };
+    if target_rate != track.sample_rate {
+        return false;
+    }
+
+    if settings.target_format.is_dsd() {
+        return true;
+    }
+
+    resolved_target_bit_depth(track, settings.target_bit_depth) == track.bit_depth
+}
+
+fn source_track_format_matches_target(track: &PreparedTrack, target: &PlannerAudioFormat) -> bool {
+    let extension = source_ref_extension(&track.source_ref)
+        .unwrap_or_default()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+
+    match target {
+        PlannerAudioFormat::Flac => extension == "flac",
+        PlannerAudioFormat::Mp3 => extension == "mp3",
+        PlannerAudioFormat::Aac | PlannerAudioFormat::Alac => false,
+        PlannerAudioFormat::Opus => matches!(extension.as_str(), "opus" | "ogg"),
+        PlannerAudioFormat::WavPack => extension == "wv",
+        PlannerAudioFormat::Wav => matches!(extension.as_str(), "wav" | "wave" | "rf64"),
+        PlannerAudioFormat::Aiff => matches!(extension.as_str(), "aiff" | "aif"),
+        PlannerAudioFormat::Dsf => extension == "dsf",
+        PlannerAudioFormat::Dff => extension == "dff",
+        PlannerAudioFormat::Dts => extension == "dts",
+        PlannerAudioFormat::Ac3 => extension == "ac3",
+        PlannerAudioFormat::Custom { .. } => false,
+    }
+}
+
+fn metadata_satisfaction_label(
+    artifact: Option<&TrackArtifact>,
+    metadata_stage: StageRequirement,
+    metadata_stage_result: Option<&StageOutcome>,
+) -> Option<String> {
+    let artifact = artifact?;
+    let satisfied = artifact.metadata_satisfaction;
+    let required = artifact.metadata_required;
+    if !satisfied.any() || satisfied.satisfies(required) {
+        return None;
+    }
+
+    let mut parts = metadata_satisfied_parts(satisfied);
+    parts.extend(metadata_remaining_requirement_parts(
+        metadata_stage,
+        metadata_stage_result,
+        satisfied,
+        required,
+    ));
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
+fn metadata_satisfied_parts(value: PlannedMetadataSatisfaction) -> Vec<String> {
+    let mut parts = Vec::new();
+    if value.source_tags_transferred {
+        parts.push("planner transferred source tags".to_string());
+    }
+    if value.artwork_transferred {
+        parts.push("planner transferred artwork".to_string());
+    }
+    if value.source_audio_md5_written {
+        parts.push("planner wrote source audio MD5".to_string());
+    }
+    if value.authoritative_tags_applied {
+        parts.push("authoritative CUE tags already applied".to_string());
+    }
+    parts
+}
+
+fn metadata_remaining_requirement_parts(
+    metadata_stage: StageRequirement,
+    metadata_stage_result: Option<&StageOutcome>,
+    satisfied: PlannedMetadataSatisfaction,
+    required: PlannedMetadataSatisfaction,
+) -> Vec<String> {
+    let remaining = PlannedMetadataSatisfaction {
+        source_tags_transferred: required.source_tags_transferred && !satisfied.source_tags_transferred,
+        artwork_transferred: required.artwork_transferred && !satisfied.artwork_transferred,
+        source_audio_md5_written: required.source_audio_md5_written && !satisfied.source_audio_md5_written,
+        authoritative_tags_applied: required.authoritative_tags_applied && !satisfied.authoritative_tags_applied,
+    };
+    if !remaining.any() {
+        return Vec::new();
+    }
+
+    let dimensions = metadata_dimension_labels(remaining).join(", ");
+    let status = match metadata_stage {
+        StageRequirement::Disabled => "metadata stage disabled".to_string(),
+        StageRequirement::Enabled => match metadata_stage_result {
+            Some(StageOutcome::Ok) => {
+                "metadata stage completed; per-track writes not recorded".to_string()
+            }
+            Some(StageOutcome::Skipped) => "metadata stage skipped".to_string(),
+            Some(StageOutcome::Failed(reason)) => {
+                format!("metadata stage failed: {}", escape_log_value(reason))
+            }
+            None => "metadata stage outcome unavailable".to_string(),
+        },
+    };
+
+    vec![format!("remaining required metadata: {dimensions} ({status})")]
+}
+
+fn metadata_dimension_labels(value: PlannedMetadataSatisfaction) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if value.source_tags_transferred {
+        labels.push("source tags");
+    }
+    if value.artwork_transferred {
+        labels.push("artwork");
+    }
+    if value.source_audio_md5_written {
+        labels.push("source audio MD5");
+    }
+    if value.authoritative_tags_applied {
+        labels.push("authoritative CUE tags");
+    }
+    labels
+}
+
+fn conversion_summary(track: &PreparedTrack, req: &PipelineRequest) -> String {
+    let source_rate = track.sample_rate;
+    let source_depth = track.bit_depth;
+    let source_format = source_track_format_label(track);
+    let target_rate = resolved_target_rate_hz(track, &req.settings).unwrap_or(source_rate);
+    let target_depth = if req.settings.target_format.is_dsd() {
+        None
+    } else {
+        resolved_target_bit_depth(track, req.settings.target_bit_depth)
+    };
+    let mut summary = format!(
+        "{} {} → {} {}",
+        stream_description(source_depth, source_rate, Some(&source_format)),
+        source_format,
+        target_stream_description(track, target_depth, target_rate, &req.settings),
+        req.settings.target_format.display_name(),
+    );
+    let mut transforms = Vec::new();
+    if source_rate != target_rate {
+        transforms.push(format!("{} resampling", preferred_resampler_label(&req.settings)));
+    }
+    if dither_applies(source_depth, target_depth, req.settings.dither_type) {
+        transforms.push(format!("{} dither", dither_type_label(req.settings.dither_type)));
+    }
+    if !transforms.is_empty() {
+        summary.push_str(&format!(" ({})", transforms.join(", ")));
+    }
+    summary
+}
+
+fn stream_description(
+    bit_depth: Option<u32>,
+    sample_rate: u32,
+    dsd_format_hint: Option<&str>,
+) -> String {
+    if dsd_format_hint == Some("DSD") {
+        if let Some(rate) = DsdRate::from_hz(sample_rate) {
+            return dsd_rate_label(rate).to_string();
+        }
+    }
+    let rate = format_sample_rate(sample_rate);
+    match bit_depth {
+        Some(bits) => format!("{bits}-bit/{rate}"),
+        None => rate,
+    }
+}
+
+fn target_stream_description(
+    track: &PreparedTrack,
+    bit_depth: Option<u32>,
+    sample_rate: u32,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> String {
+    if settings.target_format.is_dsd() {
+        let target_dsd_rate = match settings.target_sample_rate {
+            RateTarget::Dsd(rate) => Some(rate),
+            RateTarget::Source => source_track_dsd_rate(track),
+            RateTarget::PcmHz(_) => None,
+        }
+        .or_else(|| DsdRate::from_hz(sample_rate));
+        if let Some(rate) = target_dsd_rate {
+            return dsd_rate_label(rate).to_string();
+        }
+    }
+    stream_description(bit_depth, sample_rate, None)
+}
+
+fn resampling_applies_for_source(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    source.tracks.iter().any(|track| {
+        resolved_target_rate_hz(track, settings)
+            .map(|target| target != track.sample_rate)
+            .unwrap_or(false)
+    })
+}
+
+fn bit_depth_change_applies_for_source(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    if settings.target_format.is_dsd() {
+        return false;
+    }
+    source.tracks.iter().any(|track| {
+        match (track.bit_depth, resolved_target_bit_depth(track, settings.target_bit_depth)) {
+            (Some(source_depth), Some(target_depth)) => source_depth != target_depth,
+            _ => false,
+        }
+    })
+}
+
+fn dithering_applies_for_source(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    if settings.target_format.is_dsd() {
+        return false;
+    }
+    source.tracks.iter().any(|track| {
+        dither_applies(
+            track.bit_depth,
+            resolved_target_bit_depth(track, settings.target_bit_depth),
+            settings.dither_type,
+        )
+    })
+}
+
+fn dither_applies(source_depth: Option<u32>, target_depth: Option<u32>, dither: DitherType) -> bool {
+    if dither == DitherType::None {
+        return false;
+    }
+    match (source_depth, target_depth) {
+        (Some(source_depth), Some(target_depth)) => target_depth < source_depth,
+        _ => false,
+    }
+}
+
+fn resolved_target_rate_hz(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<u32> {
+    match settings.target_sample_rate {
+        RateTarget::Source if !settings.target_format.is_dsd() => Some(
+            source_track_dsd_rate(track)
+                .map(DsdRate::default_pcm_target_hz)
+                .unwrap_or(track.sample_rate),
+        ),
+        RateTarget::Source => Some(track.sample_rate),
+        RateTarget::PcmHz(hz) => Some(hz),
+        RateTarget::Dsd(rate) => Some(rate.hz()),
+    }
+}
+
+fn resolved_target_bit_depth(track: &PreparedTrack, target: BitDepthTarget) -> Option<u32> {
+    match target {
+        BitDepthTarget::Source => track.bit_depth,
+        BitDepthTarget::Pcm(depth) => Some(depth.bits()),
+    }
+}
+
+fn source_is_dsd(source: &PreparedSource) -> bool {
+    source.kind == SourceKind::SacdIso
+        || source
+            .tracks
+            .iter()
+            .any(|track| source_track_dsd_rate(track).is_some())
+}
+
+fn source_track_dsd_rate(track: &PreparedTrack) -> Option<DsdRate> {
+    let rate = DsdRate::from_hz(track.sample_rate)?;
+    if track.bit_depth.is_none() || matches!(track.source_ref, TrackSourceRef::SacdTrack { .. }) {
+        Some(rate)
+    } else {
+        None
+    }
+}
+
+fn source_track_format_label(track: &PreparedTrack) -> String {
+    if source_track_dsd_rate(track).is_some() {
+        return "DSD".to_string();
+    }
+    source_ref_extension(&track.source_ref)
+        .as_deref()
+        .map(audio_extension_label)
+        .unwrap_or("source")
+        .to_string()
+}
+
+fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
+    let path = match source_ref {
+        TrackSourceRef::StagedFile(path) => path,
+        TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image,
+        TrackSourceRef::ImageSegment { image, .. } => image,
+        TrackSourceRef::SacdTrack { .. } => return Some("dsd".to_string()),
+    };
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn audio_extension_label(extension: &str) -> &'static str {
+    match extension.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "flac" => "FLAC",
+        "wav" | "wave" => "WAV",
+        "aiff" | "aif" => "AIFF",
+        "wv" => "WavPack",
+        "mp3" => "MP3",
+        "m4a" | "mp4" | "aac" => "AAC/ALAC",
+        "opus" | "ogg" => "Opus",
+        "dsf" | "dff" | "dsd" | "iso" => "DSD",
+        _ => "source",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResamplerFamily {
+    Auto,
+    Ssrc,
+    Sox,
+    Soxr,
+}
+
+fn preferred_resampler_family(settings: &tonepoet_pipeline::PipelineSettings) -> ResamplerFamily {
+    if settings.ssrc.force || settings.nyquist_transition == NyquistTransition::BrickWall {
+        return ResamplerFamily::Ssrc;
+    }
+    match &settings.preferred_tool {
+        PreferredTool::Ssrc => ResamplerFamily::Ssrc,
+        PreferredTool::Sox => ResamplerFamily::Sox,
+        PreferredTool::Ffmpeg => ResamplerFamily::Soxr,
+        PreferredTool::Auto | PreferredTool::Custom(_) => ResamplerFamily::Auto,
+    }
+}
+
+fn preferred_resampler_label(settings: &tonepoet_pipeline::PipelineSettings) -> &'static str {
+    match preferred_resampler_family(settings) {
+        ResamplerFamily::Ssrc => "SSRC",
+        ResamplerFamily::Sox => "SoX",
+        ResamplerFamily::Soxr => "soxr",
+        ResamplerFamily::Auto => "Auto",
+    }
+}
+
+fn target_sample_rate_setting_label(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> String {
+    match settings.target_sample_rate {
+        RateTarget::PcmHz(hz) => format_sample_rate(hz),
+        RateTarget::Dsd(rate) => dsd_rate_label(rate).to_string(),
+        RateTarget::Source => {
+            let labels = source
+                .tracks
+                .iter()
+                .filter_map(|track| {
+                    resolved_target_rate_hz(track, settings)
+                        .filter(|target_rate| *target_rate != track.sample_rate)
+                        .map(|target_rate| target_rate_setting_label_for_hz(target_rate, settings))
+                })
+                .collect::<BTreeSet<_>>();
+            match labels.len() {
+                0 => "source".to_string(),
+                1 => labels.into_iter().next().unwrap_or_else(|| "source".to_string()),
+                _ => format!(
+                    "source-derived ({})",
+                    labels.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            }
+        }
+    }
+}
+
+fn target_rate_setting_label_for_hz(
+    rate_hz: u32,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> String {
+    if settings.target_format.is_dsd() {
+        DsdRate::from_hz(rate_hz)
+            .map(dsd_rate_label)
+            .map(str::to_string)
+            .unwrap_or_else(|| format_sample_rate(rate_hz))
+    } else {
+        format_sample_rate(rate_hz)
+    }
+}
+
+fn bit_depth_target_label(target: BitDepthTarget) -> String {
+    match target {
+        BitDepthTarget::Source => "source".to_string(),
+        BitDepthTarget::Pcm(depth) => pcm_bit_depth_label(depth).to_string(),
+    }
+}
+
+fn pcm_bit_depth_label(depth: PcmBitDepth) -> &'static str {
+    match depth {
+        PcmBitDepth::Int8 => "8-bit",
+        PcmBitDepth::Int16 => "16-bit",
+        PcmBitDepth::Int24 => "24-bit",
+        PcmBitDepth::Int32 => "32-bit integer",
+        PcmBitDepth::Float32 => "32-bit float",
+        PcmBitDepth::Float64 => "64-bit float",
+    }
+}
+
+fn dsd_rate_label(rate: DsdRate) -> &'static str {
+    match rate {
+        DsdRate::Dsd64 => "DSD64",
+        DsdRate::Dsd128 => "DSD128",
+        DsdRate::Dsd256 => "DSD256",
+        DsdRate::Dsd512 => "DSD512",
+        DsdRate::Dsd1024 => "DSD1024",
+    }
+}
+
+fn dither_type_label(value: DitherType) -> &'static str {
+    match value {
+        DitherType::None => "none",
+        DitherType::Tpdf => "TPDF",
+        DitherType::SlopedTpdf => "sloped TPDF",
+        DitherType::Shibata => "Shibata",
+        DitherType::Lipshitz => "Lipshitz",
+        DitherType::FWeighted => "F-weighted",
+        DitherType::ModifiedEWeighted => "modified E-weighted",
+        DitherType::ImprovedEWeighted => "improved E-weighted",
+        DitherType::Gesemann => "Gesemann",
+        DitherType::LowShibata => "low-Shibata",
+        DitherType::HighShibata => "high-Shibata",
+    }
+}
+
+fn resample_quality_label(value: ResampleQuality) -> &'static str {
+    match value {
+        ResampleQuality::Low => "low",
+        ResampleQuality::Medium => "medium",
+        ResampleQuality::High => "high",
+        ResampleQuality::VeryHigh => "very high",
+        ResampleQuality::Ultra => "ultra",
+        ResampleQuality::Insane => "insane",
+    }
+}
+
+fn nyquist_transition_label(value: NyquistTransition) -> &'static str {
+    match value {
+        NyquistTransition::Gentle => "gentle",
+        NyquistTransition::Medium => "medium",
+        NyquistTransition::Steep => "steep",
+        NyquistTransition::Sharp => "sharp",
+        NyquistTransition::BrickWall => "brick-wall",
+    }
+}
+
+fn mp3_mode_label(value: Mp3Mode) -> &'static str {
+    match value {
+        Mp3Mode::Cbr => "CBR",
+        Mp3Mode::Vbr => "VBR",
+        Mp3Mode::Abr => "ABR",
+    }
+}
+
+fn aac_profile_label(value: AacProfile) -> &'static str {
+    match value {
+        AacProfile::LcAac => "LC-AAC",
+        AacProfile::HeAac => "HE-AAC",
+        AacProfile::HeAacV2 => "HE-AAC v2",
+    }
+}
+
+fn opus_content_type_label(value: OpusContentType) -> &'static str {
+    match value {
+        OpusContentType::Auto => "auto",
+        OpusContentType::Music => "music",
+        OpusContentType::Speech => "speech",
+    }
+}
+
+fn wavpack_mode_label(value: WavPackMode) -> &'static str {
+    match value {
+        WavPackMode::Normal => "normal",
+        WavPackMode::Fast => "fast",
+        WavPackMode::High => "high",
+        WavPackMode::VeryHigh => "very high",
+    }
+}
+
+fn ssrc_profile_label(
+    profile: Option<SsrcProfile>,
+    quality: ResampleQuality,
+    insane_mode: bool,
+) -> &'static str {
+    if insane_mode {
+        return "insane";
+    }
+    match profile {
+        Some(SsrcProfile::Insane) => "insane",
+        Some(SsrcProfile::High) => "high",
+        Some(SsrcProfile::Long) => "long",
+        Some(SsrcProfile::Standard) => "standard",
+        Some(SsrcProfile::Short) => "short",
+        Some(SsrcProfile::Fast) => "fast",
+        Some(SsrcProfile::Lightning) => "lightning",
+        None => resample_quality_label(quality),
+    }
+}
+
+fn ssrc_pdf_type_label(value: SsrcPdfType) -> &'static str {
+    match value {
+        SsrcPdfType::Rectangular => "rectangular",
+        SsrcPdfType::Triangular => "triangular",
+    }
+}
+
+fn sox_sinc_phase_label(value: SoxSincPhase) -> &'static str {
+    match value {
+        SoxSincPhase::Linear => "linear",
+        SoxSincPhase::Minimum => "minimum",
+        SoxSincPhase::Intermediate => "intermediate",
+    }
+}
+
+fn dsd_gain_mode_label(value: DsdToPcmGainMode) -> &'static str {
+    match value {
+        DsdToPcmGainMode::Disabled => "disabled",
+        DsdToPcmGainMode::Auto => "auto",
+        DsdToPcmGainMode::Manual => "manual",
+    }
+}
+
+fn dsd_lowpass_method_label(value: DsdLowpassMethod) -> &'static str {
+    match value {
+        DsdLowpassMethod::Auto => "auto",
+        DsdLowpassMethod::SoxUltra => "SoX ultra",
+        DsdLowpassMethod::Sinc => "sinc",
+    }
+}
+
+fn artwork_mime_label(mime: &str) -> &'static str {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => "JPEG",
+        "image/png" => "PNG",
+        "image/webp" => "WebP",
+        "image/gif" => "GIF",
+        _ => "artwork",
+    }
+}
+
+fn cue_artwork_log_outcome(
+    req: &PipelineRequest,
+    outcome: &AlbumOutcome,
+    artifacts: &ArtifactSet,
+) -> String {
+    if !req.settings.metadata.preserve_artwork {
+        return "skipped (artwork preservation disabled)".to_string();
+    }
+
+    if let Some(planner_transfer) = planner_artwork_transfer_label(artifacts) {
+        if planner_transfer.complete {
+            return planner_transfer.label;
+        }
+        return format!(
+            "{}; {}",
+            planner_transfer.label,
+            cue_artwork_metadata_stage_outcome(req, outcome)
+        );
+    }
+
+    cue_artwork_metadata_stage_outcome(req, outcome)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtworkTransferLabel {
+    label: String,
+    complete: bool,
+}
+
+fn planner_artwork_transfer_label(artifacts: &ArtifactSet) -> Option<ArtworkTransferLabel> {
+    let AudioArtifacts::Tracks(tracks) = &artifacts.audio else {
+        return None;
+    };
+    let total = tracks.len();
+    if total == 0 {
+        return None;
+    }
+    let transferred = tracks
+        .iter()
+        .filter(|track| track.metadata_satisfaction.artwork_transferred)
+        .count();
+    if transferred == 0 {
+        return None;
+    }
+    if transferred == total {
+        return Some(ArtworkTransferLabel {
+            label: "planner transferred artwork into output".to_string(),
+            complete: true,
+        });
+    }
+    Some(ArtworkTransferLabel {
+        label: format!("planner transferred artwork for {transferred}/{total} output(s)"),
+        complete: false,
+    })
+}
+
+fn cue_artwork_metadata_stage_outcome(req: &PipelineRequest, outcome: &AlbumOutcome) -> String {
+    if req.stages.metadata == StageRequirement::Disabled {
+        return "skipped (metadata stage disabled)".to_string();
+    }
+    if !cue_artwork_supported_by_target(&req.settings.target_format) {
+        return format!(
+            "skipped ({} container unsupported)",
+            req.settings.target_format.display_name()
+        );
+    }
+
+    match metadata_stage_outcome(outcome) {
+        Some(StageOutcome::Ok) => {
+            "metadata stage completed post-encode artwork embedding".to_string()
+        }
+        Some(StageOutcome::Skipped) => "not confirmed (metadata stage skipped)".to_string(),
+        Some(StageOutcome::Failed(reason)) => {
+            format!("not confirmed (metadata stage failed: {reason})")
+        }
+        None => "not confirmed (metadata stage outcome unavailable)".to_string(),
+    }
+}
+
+fn metadata_stage_outcome(outcome: &AlbumOutcome) -> Option<&StageOutcome> {
+    outcome_stage_records(outcome)
+        .iter()
+        .find(|stage| stage.stage == PipelineStage::Metadata)
+        .map(|stage| &stage.outcome)
+}
+
+fn cue_artwork_supported_by_target(format: &PlannerAudioFormat) -> bool {
+    matches!(
+        format,
+        PlannerAudioFormat::Flac
+            | PlannerAudioFormat::Mp3
+            | PlannerAudioFormat::Aac
+            | PlannerAudioFormat::Alac
+            | PlannerAudioFormat::WavPack
+    )
+}
+
+fn decimal_label(value: f32) -> String {
+    let mut text = format!("{value:.3}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
 }
 
 fn collect_outcome_tracks(outcome: &AlbumOutcome) -> Vec<&TrackRecord> {
@@ -6368,13 +7432,14 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
             }
         }
         Err(err) => {
-            let commands = command_from_convert_error(&err);
+            let error = err.to_string();
+            let commands = err.commands;
             let record = failed_track_record(
                 &realized.track,
                 Some(realized.realized_path),
                 Some(staged_path),
                 commands,
-                err.to_string(),
+                error,
             );
             Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
         }
@@ -7263,6 +8328,7 @@ async fn finalize_report(
     let item_id = req.item_id.clone();
     let mut durable_log = None;
     let mut terminal_error_override: Option<String> = None;
+    let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings);
     let should_write = req.log.write_json_log
         && match &outcome {
             AlbumOutcome::Complete { .. } | AlbumOutcome::Partial { .. } => true,
@@ -7282,7 +8348,7 @@ async fn finalize_report(
             published: published.clone(),
             outcome: logged_outcome.clone(),
             durable_log: None,
-            settings_fingerprint: None,
+            settings_fingerprint: Some(settings_fingerprint),
             manifest_path: pipeline_report_manifest_path(&published),
         };
         // Write the log alongside the album artifacts when possible,
@@ -7344,7 +8410,7 @@ async fn finalize_report(
         published,
         outcome,
         durable_log,
-        settings_fingerprint: None,
+        settings_fingerprint: Some(settings_fingerprint),
     }
 }
 
@@ -8960,6 +10026,7 @@ mod conversion_log_tests {
 
     fn command_record() -> CommandRecord {
         CommandRecord {
+            description: None,
             binary: ToolBinary::Ffmpeg,
             sanitized_args: vec![
                 "-i".to_string(),
@@ -9028,6 +10095,40 @@ mod conversion_log_tests {
         ]
     }
 
+    fn log_test_artifacts() -> ArtifactSet {
+        ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![
+                TrackArtifact {
+                    track_id: TrackId {
+                        source_ordinal: 1,
+                        disc_number: Some(1),
+                        track_number: 1,
+                    },
+                    staged_path: PathBuf::from("/encoded/01.flac"),
+                    final_path: PathBuf::from("/out/01.flac"),
+                    samples: Some(44_100),
+                    metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                    metadata_required: PlannedMetadataSatisfaction::none(),
+                    planned_command_hash: None,
+                },
+                TrackArtifact {
+                    track_id: TrackId {
+                        source_ordinal: 2,
+                        disc_number: Some(1),
+                        track_number: 2,
+                    },
+                    staged_path: PathBuf::from("/encoded/02.flac"),
+                    final_path: PathBuf::from("/out/02.flac"),
+                    samples: None,
+                    metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                    metadata_required: PlannedMetadataSatisfaction::none(),
+                    planned_command_hash: None,
+                },
+            ]),
+            sidecars: Vec::new(),
+        }
+    }
+
     #[test]
     fn build_conversion_log_complete_contains_required_sections() {
         let source = log_test_source();
@@ -9036,7 +10137,8 @@ mod conversion_log_tests {
             tracks: vec![ok_record()],
             stages: stage_records(),
         };
-        let log = build_conversion_log(&outcome, &source, &req);
+        let artifacts = log_test_artifacts();
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("TONEPOET CONVERSION LOG"));
         assert!(log.contains("Source Information"));
@@ -9061,7 +10163,8 @@ mod conversion_log_tests {
             failed: vec![failed_record()],
             stages: stage_records(),
         };
-        let log = build_conversion_log(&outcome, &source, &req);
+        let artifacts = log_test_artifacts();
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Disc 1, Track 1: One"));
         assert!(log.contains("Status: Success"));
@@ -9084,7 +10187,8 @@ mod conversion_log_tests {
             }],
             reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
         };
-        let log = build_conversion_log(&outcome, &source, &req);
+        let artifacts = log_test_artifacts();
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Result: Blocked (required stage failed: Convert)"));
         assert!(log.contains("Convert: Failed (convert failed)"));
@@ -9098,7 +10202,8 @@ mod conversion_log_tests {
             tracks: vec![ok_record()],
             stages: stage_records(),
         };
-        let log = build_conversion_log(&outcome, &source, &req);
+        let artifacts = log_test_artifacts();
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Source audio: 44.1kHz, 24-bit, 44100 expected samples"));
         assert!(log.contains("Size: 2.0 KB -> 1.0 KB (50.0% smaller)"));
@@ -9116,11 +10221,550 @@ mod conversion_log_tests {
             tracks: vec![ok_record()],
             stages: stage_records(),
         };
-        let log = build_conversion_log(&outcome, &source, &req);
+        let artifacts = log_test_artifacts();
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Materialize: Ok"));
         assert!(log.contains("ReplayGain: Skipped"));
         assert!(log.contains("Features: Ok"));
+    }
+
+    #[test]
+    fn format_aware_settings_include_only_target_codec_family() {
+        let source = log_test_source();
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+
+        let mut flac_req = log_test_request();
+        flac_req.settings.target_format = PlannerAudioFormat::Flac;
+        let flac_log = build_conversion_log(&outcome, &source, &flac_req, &artifacts, None);
+        assert!(flac_log.contains("FLAC compression"));
+        assert!(!flac_log.contains("MP3 mode"));
+        assert!(!flac_log.contains("AAC profile"));
+        assert!(!flac_log.contains("Opus bitrate"));
+        assert!(!flac_log.contains("WavPack mode"));
+
+        let mut mp3_req = log_test_request();
+        mp3_req.settings.target_format = PlannerAudioFormat::Mp3;
+        mp3_req.settings.mp3.mode = Mp3Mode::Cbr;
+        let mp3_log = build_conversion_log(&outcome, &source, &mp3_req, &artifacts, None);
+        assert!(mp3_log.contains("MP3 mode: CBR"));
+        assert!(mp3_log.contains("MP3 bitrate: 320 kbps"));
+        assert!(!mp3_log.contains("FLAC compression"));
+        assert!(!mp3_log.contains("AAC profile"));
+    }
+
+    #[test]
+    fn resampler_settings_are_printed_only_for_actual_rate_changes() {
+        let source = log_test_source();
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+
+        let req = log_test_request();
+        let no_resample_log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+        assert!(!no_resample_log.contains("Preferred resampler tool"));
+        assert!(!no_resample_log.contains("SSRC profile"));
+
+        let mut resample_req = log_test_request();
+        resample_req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
+        resample_req.settings.preferred_tool = PreferredTool::Ssrc;
+        resample_req.settings.ssrc.attenuation_db = Some(1.5);
+        resample_req.settings.ssrc.min_phase = true;
+        resample_req.settings.ssrc.dither_id = Some(2);
+        resample_req.settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
+        let resample_log = build_conversion_log(&outcome, &source, &resample_req, &artifacts, None);
+        assert!(resample_log.contains("Preferred resampler tool: SSRC"));
+        assert!(resample_log.contains("SSRC attenuation: 1.5 dB"));
+        assert!(resample_log.contains("SSRC minimum phase: Yes"));
+        assert!(resample_log.contains("SSRC dither ID: 2"));
+        assert!(resample_log.contains("SSRC PDF type: triangular"));
+    }
+
+    #[test]
+    fn soxr_settings_use_precise_labels_and_do_not_invent_stopband() {
+        let source = log_test_source();
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+
+        let mut req = log_test_request();
+        req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
+        req.settings.preferred_tool = PreferredTool::Ffmpeg;
+        req.settings.resample_quality = ResampleQuality::VeryHigh;
+        req.settings.soxr_resampler.cutoff = Some(0.97);
+        req.settings.soxr_resampler.phase = Some(45);
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Preferred resampler tool: soxr"));
+        assert!(log.contains("Soxr quality preset: very high"));
+        assert!(log.contains("Soxr cutoff override: 0.97"));
+        assert!(log.contains("Soxr phase response: 45"));
+        assert!(!log.contains("Soxr precision"));
+        assert!(!log.contains("Soxr passband end"));
+        assert!(!log.contains("Soxr stopband begin"));
+    }
+
+    #[test]
+    fn soxr_log_does_not_claim_identical_passband_and_stopband_from_single_cutoff() {
+        let source = log_test_source();
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+
+        let mut req = log_test_request();
+        req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
+        req.settings.preferred_tool = PreferredTool::Ffmpeg;
+        req.settings.soxr_resampler.cutoff = Some(0.91);
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Soxr cutoff override: 0.91"));
+        assert!(!log.contains("Soxr passband end: 0.91"));
+        assert!(!log.contains("Soxr stopband begin: 0.91"));
+    }
+
+    #[test]
+    fn dsd_settings_are_printed_only_for_dsd_sources() {
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let req = log_test_request();
+        let pcm_log = build_conversion_log(&outcome, &log_test_source(), &req, &artifacts, None);
+        assert!(!pcm_log.contains("DSD gain mode"));
+
+        let mut dsd_source = log_test_source();
+        dsd_source.kind = SourceKind::SacdIso;
+        dsd_source.tracks[0].sample_rate = 2_822_400;
+        dsd_source.tracks[0].bit_depth = None;
+        let mut dsd_req = log_test_request();
+        dsd_req.settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+        let dsd_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
+        assert!(dsd_log.contains("DSD gain mode: auto"));
+        assert!(dsd_log.contains("DSD auto gain margin"));
+        assert!(dsd_log.contains("DSD→PCM lowpass method"));
+        assert!(!dsd_log.contains("DSD filter preset"));
+        assert!(!dsd_log.contains("PCM→DSD filter preset"));
+    }
+
+    #[test]
+    fn pcm_to_dsd_settings_use_specific_filter_preset_label() {
+        let mut source = log_test_source();
+        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
+        source.tracks[0].sample_rate = 88_200;
+        source.tracks[0].bit_depth = Some(24);
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Dsf;
+        req.settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd64);
+
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("PCM→DSD filter preset"));
+        // "DSD filter preset" without the PCM→ prefix must not appear
+        assert!(!log.lines().any(|line| {
+            line.contains("DSD filter preset") && !line.contains("PCM→DSD filter preset")
+        }));
+        assert!(!log.contains("DSD→PCM lowpass method"));
+    }
+
+    #[test]
+    fn pipeline_line_prefers_planned_command_descriptions() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.commands[0].description = Some("Decode FLAC to PCM".to_string());
+        let mut second = command_record();
+        second.description = Some("Encode FLAC level 8".to_string());
+        record.commands.push(second);
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Pipeline: Decode FLAC to PCM → Encode FLAC level 8"));
+    }
+
+    #[test]
+    fn passthrough_copy_tracks_get_pipeline_line_without_command_records() {
+        let mut source = log_test_source();
+        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac"));
+        source.tracks[0].sample_rate = 44_100;
+        source.tracks[0].bit_depth = Some(24);
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.target_bit_depth = BitDepthTarget::Source;
+        req.settings.force_encode = false;
+
+        let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.commands = Vec::new();
+        record.realized_input = Some(PathBuf::from("/stage/01.flac"));
+        record.output_file = Some(PathBuf::from("/encoded/01.flac"));
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Pipeline: passthrough copy"));
+        assert!(log.contains("Commands: none recorded"));
+    }
+
+    #[test]
+    fn empty_command_tracks_do_not_claim_passthrough_when_audio_changes() {
+        let mut source = log_test_source();
+        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
+        source.tracks[0].sample_rate = 96_000;
+        source.tracks[0].bit_depth = Some(24);
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::PcmHz(44_100);
+
+        let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.commands = Vec::new();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(!log.contains("Pipeline: passthrough copy"));
+        assert!(log.contains("Commands: none recorded"));
+    }
+
+    #[test]
+    fn conversion_summary_shows_rate_depth_and_processing_changes() {
+        let mut source = log_test_source();
+        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac"));
+        source.tracks[0].sample_rate = 96_000;
+        source.tracks[0].bit_depth = Some(24);
+        let mut req = log_test_request();
+        req.settings.target_sample_rate = RateTarget::PcmHz(44_100);
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        req.settings.preferred_tool = PreferredTool::Ssrc;
+        req.settings.dither_type = DitherType::Tpdf;
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains(
+            "Conversion: 24-bit/96kHz FLAC → 16-bit/44.1kHz FLAC (SSRC resampling, TPDF dither)"
+        ));
+        assert!(log.contains("Target sample rate: 44.1kHz"));
+        assert!(log.contains("Target bit depth: 16-bit"));
+        assert!(log.contains("Dither type: TPDF"));
+    }
+
+    #[test]
+    fn dsd_source_rate_target_source_logs_planner_default_pcm_rate() {
+        let mut source = log_test_source();
+        source.kind = SourceKind::SacdIso;
+        source.tracks[0].sample_rate = DsdRate::Dsd64.hz();
+        source.tracks[0].bit_depth = None;
+        source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
+            iso: PathBuf::from("/music/source.iso"),
+            track_index: 0,
+            area: SacdArea::Stereo,
+        };
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::Source;
+
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Target sample rate: 88.2kHz"));
+        assert!(log.contains("Preferred resampler tool"));
+        assert!(log.contains("Conversion: DSD64 DSD → 88.2kHz FLAC"));
+        assert!(!log.contains("Conversion: DSD64 DSD → 2822.4kHz FLAC"));
+    }
+
+    #[test]
+    fn target_dsd_rates_are_logged_as_dsd_rate_labels() {
+        let mut source = log_test_source();
+        source.tracks[0].sample_rate = 96_000;
+        source.tracks[0].bit_depth = Some(24);
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Dsf;
+        req.settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd128);
+
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Target sample rate: DSD128"));
+        assert!(log.contains("Conversion: 24-bit/96kHz WAV → DSD128 DSF"));
+        assert!(!log.contains("Conversion: 24-bit/96kHz WAV → 5644.8kHz DSF"));
+    }
+
+    #[test]
+    fn pcm_to_dsd64_target_summary_uses_dsd_rate_label_not_hz() {
+        let mut source = log_test_source();
+        source.tracks[0].sample_rate = 96_000;
+        source.tracks[0].bit_depth = Some(24);
+        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Dsf;
+        req.settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd64);
+
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Target sample rate: DSD64"));
+        assert!(log.contains("Conversion: 24-bit/96kHz WAV → DSD64 DSF"));
+        assert!(!log.contains("2822.4kHz DSF"));
+    }
+
+    #[test]
+    fn provenance_artwork_metadata_and_fingerprint_are_logged_when_available() {
+        let mut source = log_test_source();
+        source.provenance.source_sha256 = Some("abc123".to_string());
+        source
+            .provenance
+            .tool_versions
+            .insert("ffmpeg".to_string(), "7.1".to_string());
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+            "/stage/cover.jpg".to_string(),
+        );
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+            "image/jpeg".to_string(),
+        );
+
+        let req = log_test_request();
+        let fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings);
+        let mut artifacts = log_test_artifacts();
+        if let AudioArtifacts::Tracks(tracks) = &mut artifacts.audio {
+            tracks[0].metadata_satisfaction = PlannedMetadataSatisfaction {
+                source_tags_transferred: true,
+                ..PlannedMetadataSatisfaction::none()
+            };
+            tracks[0].metadata_required = PlannedMetadataSatisfaction {
+                source_tags_transferred: true,
+                authoritative_tags_applied: true,
+                ..PlannedMetadataSatisfaction::none()
+            };
+        }
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, Some(fingerprint));
+
+        assert!(log.contains(&format!("Settings fingerprint: {fingerprint}")));
+        assert!(log.contains("Provenance"));
+        assert!(log.contains("Source SHA-256: abc123"));
+        assert!(log.contains("Tool versions: ffmpeg 7.1"));
+        assert!(log.contains(
+            "Artwork: extracted JPEG from source image → not confirmed (metadata stage outcome unavailable)"
+        ));
+        assert!(!log.contains("Artwork: extracted JPEG from source image → embedded in output"));
+        assert!(log.contains(
+            "Metadata: planner transferred source tags; remaining required metadata: authoritative CUE tags (metadata stage outcome unavailable)"
+        ));
+        assert!(!log.contains("metadata stage wrote authoritative tags"));
+        assert!(!log.contains("authoritative tags"));
+    }
+
+    #[test]
+    fn metadata_satisfaction_log_does_not_claim_per_track_metadata_stage_writes() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let mut artifacts = log_test_artifacts();
+        if let AudioArtifacts::Tracks(tracks) = &mut artifacts.audio {
+            tracks[0].metadata_satisfaction = PlannedMetadataSatisfaction {
+                source_tags_transferred: true,
+                ..PlannedMetadataSatisfaction::none()
+            };
+            tracks[0].metadata_required = PlannedMetadataSatisfaction {
+                source_tags_transferred: true,
+                authoritative_tags_applied: true,
+                ..PlannedMetadataSatisfaction::none()
+            };
+        }
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Metadata,
+                outcome: StageOutcome::Ok,
+            }],
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains(
+            "Metadata: planner transferred source tags; remaining required metadata: authoritative CUE tags (metadata stage completed; per-track writes not recorded)"
+        ));
+        assert!(!log.contains("metadata stage wrote"));
+        assert!(!log.contains("authoritative tags"));
+    }
+
+    #[test]
+    fn artwork_log_uses_metadata_stage_evidence_before_claiming_post_encode_embedding() {
+        let mut source = log_test_source();
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+            "/stage/cover.jpg".to_string(),
+        );
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+            "image/png".to_string(),
+        );
+        let req = log_test_request();
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Metadata,
+                outcome: StageOutcome::Ok,
+            }],
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains(
+            "Artwork: extracted PNG from source image → metadata stage completed post-encode artwork embedding"
+        ));
+        assert!(!log.contains("Artwork: extracted PNG from source image → embedded in output"));
+    }
+
+    #[test]
+    fn artwork_log_prefers_planner_metadata_satisfaction_when_artwork_was_transferred() {
+        let mut source = log_test_source();
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+            "/stage/cover.jpg".to_string(),
+        );
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+            "image/jpeg".to_string(),
+        );
+        let mut artifacts = log_test_artifacts();
+        if let AudioArtifacts::Tracks(tracks) = &mut artifacts.audio {
+            for track in tracks {
+                track.metadata_satisfaction = PlannedMetadataSatisfaction {
+                    artwork_transferred: true,
+                    ..PlannedMetadataSatisfaction::none()
+                };
+            }
+        }
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Metadata,
+                outcome: StageOutcome::Skipped,
+            }],
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains(
+            "Artwork: extracted JPEG from source image → planner transferred artwork into output"
+        ));
+    }
+
+    #[test]
+    fn artwork_log_reports_skipped_for_unsupported_target_format() {
+        let mut source = log_test_source();
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+            "/stage/cover.jpg".to_string(),
+        );
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+            "image/jpeg".to_string(),
+        );
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Wav;
+        req.settings.metadata.preserve_artwork = true;
+
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Metadata,
+                outcome: StageOutcome::Ok,
+            }],
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains(
+            "Artwork: extracted JPEG from source image → skipped (WAV container unsupported)"
+        ));
+        assert!(!log.contains("embedded in output"));
+        assert!(!log.contains("metadata stage completed post-encode artwork embedding"));
+    }
+
+    #[test]
+    fn artwork_log_reports_skipped_when_preservation_is_disabled() {
+        let mut source = log_test_source();
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+            "/stage/cover.png".to_string(),
+        );
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+            "image/png".to_string(),
+        );
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.metadata.preserve_artwork = false;
+
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Metadata,
+                outcome: StageOutcome::Ok,
+            }],
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains(
+            "Artwork: extracted PNG from source image → skipped (artwork preservation disabled)"
+        ));
+        assert!(!log.contains("embedded in output"));
+        assert!(!log.contains("metadata stage completed post-encode artwork embedding"));
     }
 
     #[test]
@@ -9137,7 +10781,10 @@ mod conversion_log_tests {
             failed: vec![record],
             stages: vec![],
         };
-        let log = build_conversion_log(&outcome, &log_test_source(), &log_test_request());
+        let source = log_test_source();
+        let req = log_test_request();
+        let artifacts = log_test_artifacts();
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Error: first line\\nsecond line"));
         assert!(log.contains("'arg\\nnext'"));
@@ -10352,6 +11999,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             stderr_tail: String::new(),
             elapsed: Duration::from_millis(10),
             command: CommandRecord {
+                description: None,
                 binary: ToolBinary::Ffprobe,
                 sanitized_args: vec!["input.flac".to_string()],
                 cwd: None,
@@ -11088,6 +12736,7 @@ mod validate_encoded_output_tests {
             stderr_tail: String::new(),
             elapsed: Duration::from_millis(1),
             command: CommandRecord {
+                description: None,
                 binary: ToolBinary::Ffprobe,
                 sanitized_args: vec![],
                 cwd: None,

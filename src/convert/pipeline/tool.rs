@@ -119,6 +119,11 @@ pub enum ProcessExit {
 /// contains a secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandRecord {
+    /// User-facing planner description for this invocation, when the command
+    /// originated from a `PlannedCommand`. Kept optional so older durable logs
+    /// and non-planner tool calls remain backward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub binary: ToolBinary,
     pub sanitized_args: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -204,6 +209,7 @@ impl StubToolRunner {
 
     fn record(&self, cmd: &ToolCommand, exit: Option<ProcessExit>, stderr: &str) -> CommandRecord {
         CommandRecord {
+            description: None,
             binary: cmd.binary,
             sanitized_args: cmd.sanitized_args(),
             cwd: cmd.cwd.clone(),
@@ -318,6 +324,7 @@ impl RealToolRunner {
         elapsed: Duration,
     ) -> CommandRecord {
         CommandRecord {
+            description: None,
             binary: cmd.binary,
             sanitized_args: cmd.sanitized_args(),
             cwd: cmd.cwd.clone(),
@@ -599,6 +606,7 @@ pub(crate) mod blocking_test_runner {
 
         fn record(cmd: &ToolCommand, exit: Option<ProcessExit>, stderr: &str) -> CommandRecord {
             CommandRecord {
+                description: None,
                 binary: cmd.binary,
                 sanitized_args: cmd.sanitized_args(),
                 cwd: cmd.cwd.clone(),
