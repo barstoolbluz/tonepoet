@@ -1,23 +1,31 @@
 # tonepoet
 
-A standalone CLI + TUI audio conversion toolkit for music collectors who care about every detail of the conversion pipeline.
+A standalone CLI + TUI audio conversion and metadata management toolkit for music collectors who're fastidious as fuck about every. bloody. detail. of their libraries.
+
+But tonepoet is absolutely usable by normies, too: it exposes an intuitive, mouse- and keyboard-driven UX for working with audio file metadata, as well as sensible, opinionated defaults for converting audio files. Convert from DSD to PCM, PCM to PCM, PCM to DSD, etc., inheriting sensible, high-performance defaults ... or specifying your own.
 
 ## What it does
 
-tonepoet converts audio between formats with precise control over resampling, dithering, noise shaping, metadata, and file organization. It handles single files, multi-track archives, CUE+image decomposition, and SACD ISO extraction — all through a keyboard-and-mouse-driven terminal interface or batch CLI.
+tonepoet is a music library workstation in your terminal: browse and manage your collection, verify disc rips, analyze audio quality, tag from MusicBrainz, and convert between any format — all through a keyboard-and-mouse-driven TUI or batch CLI. It handles single files, multi-track archives, CUE+image decomposition, and SACD ISO extraction.
 
-### Supported formats
+### Browsing and file management
 
-**Output:** FLAC, Opus, AAC (libfdk_aac), MP3, ALAC, WAV, WavPack, DSF, DFF, W64, RF64, AIFF, LPCM, WebM, MKV
+- **File browser** — audio-only filtering, type-ahead and recursive search, visual/range selection, column sorting, right-click context menus, info pane with metadata and analysis
+- **Archive browsing** — preview 7z/zip/rar contents before extraction, password keychain for encrypted archives
+- **Template-based naming** — folder and filename templates with tag variables (%ARTIST%, %ALBUM%, %TITLE%, etc.), interactive template builder with saved presets
+- **Bulk rename** — tag-based batch renaming with preview
+- **Bookmarks** — saved directory shortcuts
+- **Recent files** — quick access to recently opened paths
 
-**Input (decode-only):** All output formats plus ISO (SACD), CUE+image, 7z/zip/rar archives, SHN, APE, DTS, AC3
+### Metadata and tagging
 
-### Resamplers
-
-- **Sox** (sox_ng) — rate effect with undocumented `-u` ultra mode (701 taps, 210 dB rejection), sinc FIR pre-filter with full parameter control (taps, attenuation, passband, transition band, Kaiser beta, phase)
-- **Soxr** — via ffmpeg's aresample filter, up to 33-bit precision, Chebyshev filter option
-- **SSRC** — brick-wall sinc interpolation with 7 quality profiles (lightning through insane), ATH psychoacoustic noise shaping, min-phase filters, rate-dependent dither validation
-- Automatic dither suppression when target bit depth >= source (no pointless noise addition)
+- **MusicBrainz** — disc-TOC-based release lookup, interactive release picker, per-track title/artist/ISRC population
+- **GNUDB** — freedb/gnudb disc ID lookup with multi-disc support
+- **Per-track metadata editor** — inline tag editing with MusicBrainz integration, CUE preview, revert/restore
+- **SACD sidecar XML** — persistent metadata sidecars for SACD ISOs (MusicBrainz tagging workflow)
+- **CUE sheet parsing** — legacy encoding support (CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1252), embedded CUESHEET preferred over sidecar
+- **CUESHEET embedding** — regenerate and embed CUESHEET tags on metadata save
+- **Typed metadata effects** — pipeline tracks source-tag transfer, artwork preservation, and authoritative metadata application independently to prevent silent metadata loss
 
 ### Disc verification
 
@@ -34,29 +42,22 @@ tonepoet converts audio between formats with precise control over resampling, di
 - **Pre-emphasis detection** — spectral analysis + metadata/catalog heuristics to identify pre-emphasized discs
 - **Bit depth analysis** — actual vs container bit depth
 
+### Conversion
+
+**Output:** FLAC, Opus, AAC (libfdk_aac), MP3, ALAC, WAV, WavPack, DSF, DFF, W64, RF64, AIFF, LPCM, WebM, MKV
+
+**Input (decode-only):** All output formats plus ISO (SACD), CUE+image, 7z/zip/rar archives, SHN, APE, DTS, AC3
+
+**Resamplers:**
+
+- **Sox** (sox_ng) — rate effect with undocumented `-u` ultra mode (701 taps, 210 dB rejection), sinc FIR pre-filter with full parameter control (taps, attenuation, passband, transition band, Kaiser beta, phase)
+- **Soxr** — via ffmpeg's aresample filter, up to 33-bit precision, Chebyshev filter option
+- **SSRC** — brick-wall sinc interpolation with 7 quality profiles (lightning through insane), ATH psychoacoustic noise shaping, min-phase filters, rate-dependent dither validation
+- Automatic dither suppression when target bit depth >= source (no pointless noise addition)
+
 ### SACD support
 
 Native SACD ISO extraction via the built-in sacd-rs crate (byte-exact against sacd_extract, validated across 70+ tracks). DSD-to-PCM conversion through sox with auto-gain peak normalization (`norm` effect), configurable safety margin, and rate-dependent lowpass filtering. DST frame decoding for compressed SACD layers.
-
-### Metadata and tagging
-
-- **MusicBrainz** — disc-TOC-based release lookup, interactive release picker, per-track title/artist/ISRC population
-- **GNUDB** — freedb/gnudb disc ID lookup with multi-disc support
-- **SACD sidecar XML** — persistent metadata sidecars for SACD ISOs (MusicBrainz tagging workflow)
-- **CUE sheet parsing** — legacy encoding support (CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1252), embedded CUESHEET preferred over sidecar
-- **CUESHEET embedding** — regenerate and embed CUESHEET tags on metadata save
-- **Typed metadata effects** — pipeline tracks source-tag transfer, artwork preservation, and authoritative metadata application independently to prevent silent metadata loss
-- **Per-track metadata editor** — inline tag editing with MusicBrainz integration, CUE preview, revert/restore
-
-### File management
-
-- **Template-based naming** — folder and filename templates with tag variables (%ARTIST%, %ALBUM%, %TITLE%, etc.)
-- **Template builder** — interactive template construction with saved presets
-- **Bulk rename** — tag-based batch renaming with preview
-- **Bookmarks** — saved directory shortcuts
-- **Recent files** — quick access to recently opened paths
-- **Archive password keychain** — stored passwords for encrypted archives
-- **Archive browsing** — preview 7z/zip/rar contents before extraction
 
 ## Building
 
@@ -81,9 +82,9 @@ cargo test --lib --workspace
 
 ## TUI
 
-The TUI is the primary interface. Five screens: Browse, Library, Convert, Queue, Config.
+The TUI is the primary interface. Five screens: Browse, Library, Convert, Queue, Config. Browse is the home screen — it's where you manage your collection, verify rips, analyze audio, tag from MusicBrainz, and stage files for conversion.
 
-- **Browse** — file browser with audio-only filter, type-ahead search, recursive search, visual/range selection, column sorting, right-click context menus, archive preview, info pane with metadata and analysis
+- **Browse** — full-featured file browser with audio-only filtering, type-ahead and recursive search, visual/range selection, column sorting, right-click context menus with disc verification, audio analysis, metadata editing, and conversion actions. Info pane shows metadata, analysis results, and artwork.
 - **Convert** — four-pane staging screen (source, metadata, format, output options) with pill-based controls, per-codec settings overlays (FLAC, AAC, Opus, MP3, WavPack), per-resampler settings overlays (SSRC, Sox, Soxr), preset system, DSD-aware gain controls
 - **Queue** — batch conversion monitor with per-track progress, expandable sub-lines, pause/resume, retry failed, clear completed
 - **Config** — settings editor with archive password keychain
