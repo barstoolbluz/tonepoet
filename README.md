@@ -4,6 +4,8 @@ A standalone CLI + TUI audio conversion and metadata management toolkit for musi
 
 But tonepoet is absolutely usable by normies, too: it exposes an intuitive, mouse- and keyboard-driven UX for working with audio file metadata, as well as sensible, opinionated defaults for converting audio files. Convert from DSD to PCM, PCM to PCM, PCM to DSD, etc., inheriting sensible, high-performance defaults ... or specifying your own.
 
+> **Status:** tonepoet is unfinished and under heavy active development, with multiple commits landing daily for months. Features described below are at varying stages of completeness. Expect rough edges, breaking changes, and missing documentation.
+
 ## What it does
 
 tonepoet is a music library workstation in your terminal: browse and manage your collection, verify disc rips, analyze audio quality, tag from MusicBrainz, and convert between any format — all through a keyboard-and-mouse-driven TUI or batch CLI. It handles single files, multi-track archives, CUE+image decomposition, and SACD ISO extraction.
