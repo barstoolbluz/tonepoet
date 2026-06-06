@@ -615,16 +615,19 @@ impl<'a> FrameReader<'a> {
 
     /// Explicit end-of-range flush. Returns a complete pending frame if
     /// one is buffered, applies the time filter, and clears pending state.
+    /// A trailing incomplete frame at the track boundary is normal — the
+    /// TOC sector range rarely aligns to DSD frame boundaries. Record it
+    /// in stats but never treat it as a hard error.
     pub fn flush(&mut self) -> Result<Option<Frame>, FrameError> {
         let Some(pending) = self.pending.take() else {
             return Ok(None);
         };
         if !frame_is_complete(&pending, self.expected_channel_count) {
-            self.handle_incomplete_frame(
+            self.record_dropped_frame(
                 self.end_lsn,
-                pending,
+                &pending,
                 "end of extraction range before frame completed",
-            )?;
+            );
             return Ok(None);
         }
         let frame = pending.into_frame();

@@ -615,6 +615,11 @@ async fn run_convert(
             }
         }
 
+        // Mark all items as queued now that settings/requests are attached.
+        for item in q.all_items_mut() {
+            item.status = ConversionStatus::Queued;
+        }
+
         let total = q.all_items().len();
         if total == 0 {
             anyhow::bail!("No supported files found in the provided paths");
@@ -713,7 +718,6 @@ fn add_item_to_queue(
             .or_else(|| config.conversion.archive_password.clone())
             .or_else(|| tonepoet::tui::keychain::load_keychain().into_iter().next());
     }
-    item.status = ConversionStatus::Queued;
     queue.add_item_direct(item);
 }
 
