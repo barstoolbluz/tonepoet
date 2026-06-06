@@ -1249,16 +1249,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test fixture does not trigger overflow; continuation sectors do not accumulate into a single pending frame"]
     fn recovery_records_dropped_frame_event_on_buffer_overflow() {
-        let chunk = vec![0xaa; 2045];
+        // Frame-start sector overhead: 1 (header) + 2 (packet info) + 3 (frame info) = 6 bytes.
+        // Continuation sector overhead: 1 (header) + 2 (packet info) = 3 bytes.
+        // Sector size: 2048. Max payloads: 2042 (start), 2045 (continuation).
+        let start_chunk = vec![0xaa; 2042];
+        let cont_chunk = vec![0xaa; 2045];
         let mut sectors = vec![synth_audio_sector(
             true,
-            &chunk,
+            &start_chunk,
             Timecode { minutes: 0, seconds: 0, frames: 1 },
         )];
-        while sectors.len() * chunk.len() <= MAX_FRAME_SIZE {
-            sectors.push(synth_continuation_sector(&chunk));
+        let mut total_payload = start_chunk.len();
+        while total_payload <= MAX_FRAME_SIZE {
+            sectors.push(synth_continuation_sector(&cont_chunk));
+            total_payload += cont_chunk.len();
         }
 
         let overflow_lsn = (sectors.len() - 1) as u64;
