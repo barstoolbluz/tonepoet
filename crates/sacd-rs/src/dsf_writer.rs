@@ -52,13 +52,18 @@ const HEADER_TOTAL_SIZE: u64 = DSD_CHUNK_SIZE + FMT_CHUNK_SIZE + DATA_CHUNK_HEAD
 const DSF_VERSION: u32 = 1;
 const FORMAT_ID_DSD: u32 = 0;
 
-/// Channel-type field values per Sony DSF spec. We map only the
-/// configurations that actually appear on SACDs.
+/// Channel-type field values per Sony DSF spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ChannelType {
     Mono = 1,
     Stereo = 2,
+    /// Front Left / Front Right / Center.
+    ThreeChannel = 3,
+    /// Front Left / Front Right / Back Left / Back Right.
+    Quad = 4,
+    /// Front Left / Front Right / Center / LFE.
+    FourChannel = 5,
     /// L/R/C/Ls/Rs (5-channel surround, no LFE).
     Surround5 = 6,
     /// 5.1 (L/R/C/LFE/Ls/Rs).
@@ -66,17 +71,27 @@ pub enum ChannelType {
 }
 
 impl ChannelType {
-    /// Pick the channel-type code for a given channel count. Mirrors
-    /// the C reference's defaulting: anything we don't recognize
-    /// falls through to Stereo.
-    pub fn from_channel_count(n: u8) -> Self {
+    /// Pick a valid DSF channel-type code for a channel count when no richer
+    /// layout information is available. Four-channel output defaults to quad;
+    /// callers that need the alternate L/R/C/LFE layout should use the explicit
+    /// header serializer or a future layout-aware writer constructor.
+    pub fn try_from_channel_count(n: u8) -> Option<Self> {
         match n {
-            1 => Self::Mono,
-            2 => Self::Stereo,
-            5 => Self::Surround5,
-            6 => Self::Surround51,
-            _ => Self::Stereo,
+            1 => Some(Self::Mono),
+            2 => Some(Self::Stereo),
+            3 => Some(Self::ThreeChannel),
+            4 => Some(Self::Quad),
+            5 => Some(Self::Surround5),
+            6 => Some(Self::Surround51),
+            _ => None,
         }
+    }
+
+    /// Backward-compatible convenience mapping. Unsupported counts return
+    /// Stereo, but production writer construction uses [`try_from_channel_count`]
+    /// and rejects unsupported layouts instead of emitting inconsistent headers.
+    pub fn from_channel_count(n: u8) -> Self {
+        Self::try_from_channel_count(n).unwrap_or(Self::Stereo)
     }
 }
 
@@ -110,6 +125,7 @@ const fn build_bit_reverse_table() -> [u8; 256] {
 /// Header is written at construction time as a placeholder; the
 /// final header (with sample_count + file size filled in) is written
 /// in `finish()` after seeking back.
+#[derive(Debug)]
 pub struct DsfWriter<W: Write + Seek> {
     writer: W,
     channel_count: u8,
@@ -150,7 +166,15 @@ impl<W: Write + Seek> DsfWriter<W> {
                 "channel_count must be > 0",
             ));
         }
-        let channel_type = ChannelType::from_channel_count(channel_count);
+        let channel_type = ChannelType::try_from_channel_count(channel_count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported DSF channel_count {}; supported counts are 1 through 6",
+                    channel_count
+                ),
+            )
+        })?;
         // Reserve header space with zeros; finalized in finish().
         writer.seek(SeekFrom::Start(0))?;
         let zero_header = vec![0u8; HEADER_TOTAL_SIZE as usize];
@@ -354,13 +378,22 @@ mod tests {
 
     #[test]
     fn channel_type_mapping_matches_spec() {
-        assert_eq!(ChannelType::from_channel_count(1), ChannelType::Mono);
-        assert_eq!(ChannelType::from_channel_count(2), ChannelType::Stereo);
-        assert_eq!(ChannelType::from_channel_count(5), ChannelType::Surround5);
-        assert_eq!(ChannelType::from_channel_count(6), ChannelType::Surround51);
-        // Unrecognized falls through to Stereo (matches C reference).
-        assert_eq!(ChannelType::from_channel_count(3), ChannelType::Stereo);
+        assert_eq!(ChannelType::try_from_channel_count(1), Some(ChannelType::Mono));
+        assert_eq!(ChannelType::try_from_channel_count(2), Some(ChannelType::Stereo));
+        assert_eq!(ChannelType::try_from_channel_count(3), Some(ChannelType::ThreeChannel));
+        assert_eq!(ChannelType::try_from_channel_count(4), Some(ChannelType::Quad));
+        assert_eq!(ChannelType::try_from_channel_count(5), Some(ChannelType::Surround5));
+        assert_eq!(ChannelType::try_from_channel_count(6), Some(ChannelType::Surround51));
+        assert_eq!(ChannelType::try_from_channel_count(7), None);
         assert_eq!(ChannelType::from_channel_count(7), ChannelType::Stereo);
+    }
+
+    #[test]
+    fn writer_rejects_unsupported_channel_count_instead_of_mislabeling_header() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let err = DsfWriter::new(&mut cursor, 7, SACD_SAMPLING_FREQUENCY).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("unsupported DSF channel_count"));
     }
 
     #[test]

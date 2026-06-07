@@ -25,10 +25,14 @@ impl<'a> BitReader<'a> {
     }
 
     pub(crate) fn read_bit(&mut self) -> Result<u8, DstError> {
-        let total_bits = self.input.len().saturating_mul(8);
+        let total_bits = self.input.len().checked_mul(8).ok_or(
+            DstError::InternalDecodeError("bit reader input length overflow"),
+        )?;
         if self.bit_pos >= total_bits {
             if self.zero_pad_after_eof {
-                self.bit_pos = self.bit_pos.saturating_add(1);
+                self.bit_pos = self.bit_pos.checked_add(1).ok_or(
+                    DstError::InternalDecodeError("bit reader position overflow"),
+                )?;
                 return Ok(0);
             }
             return Err(DstError::UnexpectedEof {
@@ -38,7 +42,9 @@ impl<'a> BitReader<'a> {
 
         let byte = self.input[self.bit_pos / 8];
         let shift = 7 - (self.bit_pos % 8);
-        self.bit_pos += 1;
+        self.bit_pos = self.bit_pos.checked_add(1).ok_or(
+            DstError::InternalDecodeError("bit reader position overflow"),
+        )?;
         Ok((byte >> shift) & 1)
     }
 

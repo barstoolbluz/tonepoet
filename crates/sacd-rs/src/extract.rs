@@ -11,13 +11,12 @@
 //!
 //! ## Error semantics
 //!
-//! On any error mid-stream, the output writer is dropped without
-//! calling `finish()`. The output file ends up with the placeholder
-//! header (zero chunk sizes) plus the partial audio bytes from
-//! sectors that succeeded before the error. The file is structurally
-//! a valid DSF/DSDIFF but reports zero audio data in its header —
-//! parsers will treat it as empty. **Callers should discard the
-//! output file on any error.**
+//! On any error mid-stream, the low-level writer is dropped without
+//! calling `finish()`. Callers that pass their own `Write + Seek` sink remain
+//! responsible for discarding partial output. User-facing path APIs such as
+//! [`extract_track_to_path`] and [`write_dsd_source_to_path`] wrap the same
+//! writers in an [`crate::output_transaction::OutputTransaction`] so final
+//! paths are published only after the full operation succeeds.
 //!
 //! ## Channel-count parameter
 //!
@@ -27,16 +26,22 @@
 //! orchestrator trusts the caller's parameter and never validates.
 
 use crate::dff_footer::{render_dff_footer, DffMetadata};
+use crate::dff_dst_writer::{DffDstWriter, DffDstWriterStats};
 use crate::dff_writer::DffWriter;
 use crate::dsf_writer::{DsfWriter, SACD_SAMPLING_FREQUENCY};
-use crate::dst::{decode_frame, DstError};
+use crate::dst::{DstEncoderEffort, DstEncoderOptions, DstError, RawDstFallbackPolicy};
 use crate::frame::{
-    DroppedFrameEvent, FrameError, FrameFormat, FrameReader, FrameReaderStats, RecoveryEvent,
+    DroppedFrameEvent, FrameError, FrameFormat, FrameReaderStats, FrameTimeFilter, RecoveryEvent,
+};
+use crate::source_model::{
+    DsdSource, DsdSourceError, DsdSourceFrame, IsoTrackSource, IsoTrackSourceOptions,
+    SourceDsdFrame,
 };
 use crate::id3::{render_id3v24, Id3Metadata};
 use crate::iso_reader::IsoReader;
-use std::borrow::Cow;
+use crate::output_transaction::{OutputOverwritePolicy, OutputTransaction, OutputTransactionError};
 use std::io::{self, Seek, Write};
+use std::path::{Path, PathBuf};
 
 /// Output container format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +52,278 @@ pub enum OutputFormat {
     /// Philips DSDIFF (.dff). Clustered-frame passthrough,
     /// MSB-first byte ordering.
     Dff,
+    /// Philips DSDIFF/DST (.dff with `CMPR = "DST "`). Source DST frames
+    /// are preserved byte-for-byte whenever possible; plain DSD frames are
+    /// encoded only when the verified predictive DST subset is profitable.
+    /// This is lossless DST syntax with material-dependent compression, not
+    /// compression parity with SACD mastering encoders. If compression is
+    /// unavailable, extraction fails rather than emitting raw DST fallback
+    /// frames with uncertain common-decoder portability. Use
+    /// [`OutputFormat::Dff`] or [`SourceDstHandling::DecodeToDsdiffDsd`] for
+    /// DSDIFF/DSD output in that case.
+    DffDst,
+}
+
+/// Policy for source SACD frames that are already DST-coded.
+///
+/// The mode name describes the actual operation, including whether the output
+/// remains DSDIFF/DST or is deliberately decoded to ordinary DSDIFF/DSD. The
+/// default is [`Self::PassthroughExistingDst`]: preserve professional source
+/// compression byte-for-byte and decode only to compute the mandatory DSDIFF
+/// `DSTC` checksum. Re-encoding source DST is never implicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDstHandling {
+    /// Preserve the original source DST payload byte-for-byte and decode it
+    /// only to compute the mandatory DSDIFF `DSTC` checksum. This is the
+    /// archival/default behavior for DST-coded SACD areas.
+    PassthroughExistingDst,
+    /// Run the configured encoder against the decoded DSD for telemetry, but
+    /// still write the original source DST payload. Use for corpus analysis
+    /// when measuring the in-tree encoder against professional SACD frames.
+    AnalyzeThenPassthroughExistingDst,
+    /// Decode source DST to DSD and encode it again with the configured
+    /// encoder policy. This is not recommended for archival extraction; use it
+    /// only to evaluate or normalize encoder output.
+    ReencodeDst,
+    /// Decode source DST frames and write an ordinary DSDIFF/DSD stream instead
+    /// of a DSDIFF/DST stream. This mode is a target-container policy, not an
+    /// encoder fallback; extraction routes through `DffWriter` so the output
+    /// declares `CMPR = "DSD "` and contains no `DSTF` chunks.
+    DecodeToDsdiffDsd,
+    /// Reject source DST frames instead of preserving, decoding, or re-encoding
+    /// them. This is useful for tests that must prove the extraction path saw
+    /// no source compression.
+    RejectSourceDst,
+}
+
+#[allow(non_upper_case_globals)]
+impl SourceDstHandling {
+    /// Backward-compatible alias for [`Self::PassthroughExistingDst`].
+    pub const Preserve: Self = Self::PassthroughExistingDst;
+    /// Backward-compatible alias for [`Self::AnalyzeThenPassthroughExistingDst`].
+    pub const AnalyzeThenPreserve: Self = Self::AnalyzeThenPassthroughExistingDst;
+    /// Backward-compatible alias for [`Self::ReencodeDst`].
+    pub const DecodeAndReencode: Self = Self::ReencodeDst;
+    /// Backward-compatible alias for [`Self::RejectSourceDst`].
+    pub const Reject: Self = Self::RejectSourceDst;
+}
+
+/// Policy for plain DSD source frames when the requested target is
+/// DSDIFF/DST, or when a DFF/DST request is explicitly re-routed to ordinary
+/// DSDIFF/DSD by [`SourceDstHandling::DecodeToDsdiffDsd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainDsdDstHandling {
+    /// Encode plain DSD as verified predictive DST only. Raw DST fallback is
+    /// disabled even if the embedded encoder options were built with it
+    /// enabled. This is the portable production default for uncompressed SACD
+    /// source areas.
+    EncodeUncompressedSourceToDst,
+    /// Encode plain DSD predictively, but permit explicit raw `DSTCoded = 0`
+    /// fallback for controlled decoder sets. This mode is opt-in because common
+    /// external-decoder portability of raw DST frames has not been proven.
+    EncodeUncompressedSourceToDstWithRawFallback,
+    /// Write plain DSD unchanged as ordinary DSDIFF/DSD. This state is valid
+    /// only with [`SourceDstHandling::DecodeToDsdiffDsd`], where the whole
+    /// request intentionally routes through [`DffWriter`] and emits `CMPR =
+    /// "DSD "` rather than any `DSTF` chunks.
+    WriteUncompressedSourceAsDsdiffDsd,
+    /// Reject plain DSD frames. Use with
+    /// [`SourceDstHandling::PassthroughExistingDst`] for a passthrough-only
+    /// extraction profile.
+    RejectUncompressedSource,
+}
+
+#[allow(non_upper_case_globals)]
+impl PlainDsdDstHandling {
+    /// Backward-compatible alias for [`Self::EncodeUncompressedSourceToDst`].
+    pub const PredictiveOnly: Self = Self::EncodeUncompressedSourceToDst;
+    /// Backward-compatible alias for [`Self::EncodeUncompressedSourceToDstWithRawFallback`].
+    pub const PredictiveWithRawFallback: Self = Self::EncodeUncompressedSourceToDstWithRawFallback;
+    /// Backward-compatible alias for [`Self::RejectUncompressedSource`].
+    pub const Reject: Self = Self::RejectUncompressedSource;
+}
+
+/// DSDIFF/DST extraction policy and encoder mechanism.
+///
+/// The outer policy decides what to do with source DST and plain DSD frames;
+/// [`DstEncoderOptions`] remains the mechanism that controls predictive search,
+/// verification, candidate orders, quantization, pruning, and raw-fallback
+/// eligibility. Preset constructors cover the common operating modes while
+/// still allowing callers to supply an exact encoder configuration. Generated
+/// DST output is described conservatively: verified predictive subset,
+/// material-dependent compression, no mastering-encoder parity claim, and no
+/// broad external-corpus claim until the formal acceptance gate passes.
+#[derive(Debug, Clone)]
+pub struct DstExtractionOptions {
+    /// Handling for already-DST-coded source frames.
+    pub source_dst: SourceDstHandling,
+    /// Handling for uncompressed/plain DSD source frames.
+    pub plain_dsd: PlainDsdDstHandling,
+    /// Predictive encoder configuration used whenever this extraction path
+    /// needs to generate a new DST frame or analyze a source frame.
+    pub encoder: DstEncoderOptions,
+}
+
+impl Default for DstExtractionOptions {
+    fn default() -> Self {
+        Self::portable()
+    }
+}
+
+impl DstExtractionOptions {
+    /// Production/archival profile: preserve source DST; encode plain DSD only
+    /// as verified, profitable predictive DST. No raw DST fallback.
+    pub fn portable() -> Self {
+        let mut encoder = DstEncoderOptions::default();
+        encoder.raw_fallback = RawDstFallbackPolicy::Disabled;
+        Self {
+            source_dst: SourceDstHandling::PassthroughExistingDst,
+            plain_dsd: PlainDsdDstHandling::EncodeUncompressedSourceToDst,
+            encoder,
+        }
+    }
+
+    /// Strict generated-predictive profile: all written frames are generated by
+    /// this encoder and must be predictive. Source DST is decoded and re-coded,
+    /// so this is for encoder validation rather than archival extraction.
+    pub fn strict_predictive_only() -> Self {
+        let mut encoder = DstEncoderOptions::default();
+        encoder.raw_fallback = RawDstFallbackPolicy::Disabled;
+        Self {
+            source_dst: SourceDstHandling::ReencodeDst,
+            plain_dsd: PlainDsdDstHandling::EncodeUncompressedSourceToDst,
+            encoder,
+        }
+    }
+
+    /// Passthrough-only profile: write source DST byte-for-byte and reject plain
+    /// DSD frames. This is appropriate when the caller expects a DST-coded SACD
+    /// area and wants to fail if the source is not already compressed.
+    pub fn passthrough_only() -> Self {
+        let mut encoder = DstEncoderOptions::default();
+        encoder.raw_fallback = RawDstFallbackPolicy::Disabled;
+        Self {
+            source_dst: SourceDstHandling::PassthroughExistingDst,
+            plain_dsd: PlainDsdDstHandling::RejectUncompressedSource,
+            encoder,
+        }
+    }
+
+
+    /// Write any DSD source as ordinary DSDIFF/DSD. Source DST frames are
+    /// decoded to plain DSD, and plain DSD source frames are copied unchanged;
+    /// the output declares `CMPR = "DSD "` and contains no `DSTF` chunks. This
+    /// is the explicit compatibility escape hatch when the caller wants a DFF
+    /// file but does not want source DST passthrough or re-encoding.
+    pub fn decode_to_dsdiff_dsd() -> Self {
+        let mut encoder = DstEncoderOptions::default();
+        encoder.raw_fallback = RawDstFallbackPolicy::Disabled;
+        Self {
+            source_dst: SourceDstHandling::DecodeToDsdiffDsd,
+            plain_dsd: PlainDsdDstHandling::WriteUncompressedSourceAsDsdiffDsd,
+            encoder,
+        }
+    }
+
+    /// Explicit compatibility-test profile: preserve source DST and allow raw
+    /// DST fallback for plain DSD when predictive compression is unavailable or
+    /// unprofitable. Do not use as a default for broadly playable files.
+    pub fn raw_fallback_compatibility() -> Self {
+        let mut encoder = DstEncoderOptions::default();
+        encoder.raw_fallback = RawDstFallbackPolicy::Enabled;
+        Self {
+            source_dst: SourceDstHandling::PassthroughExistingDst,
+            plain_dsd: PlainDsdDstHandling::EncodeUncompressedSourceToDstWithRawFallback,
+            encoder,
+        }
+    }
+
+    /// Fast profile: fewer predictor candidates, shared tables only, exact
+    /// verification retained, raw fallback disabled.
+    pub fn fast() -> Self {
+        let mut encoder = DstEncoderOptions::default();
+        encoder.effort = DstEncoderEffort::Fast;
+        encoder.candidate_prediction_orders = vec![8, 16];
+        encoder.coefficient_quantization_scales = vec![192, 128];
+        encoder.coefficient_prune_thresholds = vec![0, 2];
+        encoder.per_channel_filters = false;
+        encoder.verify = true;
+        encoder.raw_fallback = RawDstFallbackPolicy::Disabled;
+        Self {
+            source_dst: SourceDstHandling::PassthroughExistingDst,
+            plain_dsd: PlainDsdDstHandling::EncodeUncompressedSourceToDst,
+            encoder,
+        }
+    }
+
+    /// Higher-effort compression profile: larger predictor-order, coefficient
+    /// scale, and pruning search; exact verification retained; raw fallback
+    /// disabled.
+    pub fn high_compression() -> Self {
+        let mut encoder = DstEncoderOptions::default();
+        encoder.effort = DstEncoderEffort::HighCompression;
+        encoder.fast_prescreen = false;
+        encoder.candidate_prediction_orders = vec![4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
+        encoder.coefficient_quantization_scales = vec![320, 255, 224, 192, 160, 128, 96, 64];
+        encoder.coefficient_prune_thresholds = vec![0, 1, 2, 3, 4, 6, 8];
+        encoder.per_channel_filters = true;
+        encoder.verify = true;
+        encoder.raw_fallback = RawDstFallbackPolicy::Disabled;
+        Self {
+            source_dst: SourceDstHandling::PassthroughExistingDst,
+            plain_dsd: PlainDsdDstHandling::EncodeUncompressedSourceToDst,
+            encoder,
+        }
+    }
+
+    /// Corpus-analysis profile: preserve professional source DST payloads while
+    /// running the in-tree encoder against their decoded DSD to populate
+    /// aggregate telemetry. Plain DSD uses the high-compression predictive path.
+    pub fn corpus_analysis() -> Self {
+        let mut this = Self::high_compression();
+        this.source_dst = SourceDstHandling::AnalyzeThenPassthroughExistingDst;
+        this
+    }
+
+    /// Start from an exact encoder mechanism while keeping production policy.
+    pub fn with_encoder_options(mut self, encoder: DstEncoderOptions) -> Self {
+        self.encoder = encoder;
+        self
+    }
+
+    /// Override source-DST handling.
+    pub fn with_source_dst_handling(mut self, handling: SourceDstHandling) -> Self {
+        self.source_dst = handling;
+        match handling {
+            SourceDstHandling::DecodeToDsdiffDsd => {
+                self.plain_dsd = PlainDsdDstHandling::WriteUncompressedSourceAsDsdiffDsd;
+            }
+            _ if self.plain_dsd == PlainDsdDstHandling::WriteUncompressedSourceAsDsdiffDsd => {
+                self.plain_dsd = PlainDsdDstHandling::EncodeUncompressedSourceToDst;
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Override plain-DSD handling.
+    pub fn with_plain_dsd_handling(mut self, handling: PlainDsdDstHandling) -> Self {
+        self.plain_dsd = handling;
+        self
+    }
+
+    fn encoder_for_plain_dsd(&self) -> DstEncoderOptions {
+        let mut encoder = self.encoder.clone();
+        encoder.raw_fallback = match self.plain_dsd {
+            PlainDsdDstHandling::EncodeUncompressedSourceToDst
+            | PlainDsdDstHandling::WriteUncompressedSourceAsDsdiffDsd
+            | PlainDsdDstHandling::RejectUncompressedSource => RawDstFallbackPolicy::Disabled,
+            PlainDsdDstHandling::EncodeUncompressedSourceToDstWithRawFallback => {
+                RawDstFallbackPolicy::Enabled
+            }
+        };
+        encoder
+    }
 }
 
 /// Time-based frame filter for excluding pre-gap and inter-track
@@ -94,9 +371,9 @@ impl TimeFilter {
 ///
 /// This struct intentionally remains source-compatible with the original
 /// public API: callers may still construct it with a struct literal using
-/// exactly these public fields. New high-integrity controls live in
-/// [`ExtractIntegrityOptions`] and are supplied through
-/// [`extract_track_with_integrity_options`].
+/// exactly these public fields. DSDIFF/DST policy lives in
+/// [`DstExtractionOptions`] and is supplied through the DST-specific
+/// extraction entry points.
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
     pub start_lsn: u64,
@@ -118,6 +395,57 @@ pub struct ExtractOptions {
     /// appended to DFF output after audio. Matches sacd_extract's
     /// non-edit-master default footer.
     pub dff_metadata: Option<DffMetadata>,
+}
+
+
+/// Output-side options for writing any common [`DsdSource`].
+///
+/// Unlike [`ExtractOptions`], this struct does not describe an ISO sector
+/// range. It is the sink policy used by the common source-model pipeline for
+/// SACD ISO sources, DSF files, DSDIFF/DSD files, and DSDIFF/DST files.
+#[derive(Debug, Clone)]
+pub struct DsdSourceExtractOptions {
+    pub format: OutputFormat,
+    pub id3_metadata: Option<Id3Metadata>,
+    pub dff_metadata: Option<DffMetadata>,
+    pub dst: DstExtractionOptions,
+}
+
+impl DsdSourceExtractOptions {
+    pub fn new(format: OutputFormat) -> Self {
+        Self {
+            format,
+            id3_metadata: None,
+            dff_metadata: None,
+            dst: DstExtractionOptions::default(),
+        }
+    }
+
+    pub fn with_id3_metadata(mut self, metadata: Id3Metadata) -> Self {
+        self.id3_metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_dff_metadata(mut self, metadata: DffMetadata) -> Self {
+        self.dff_metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_dst_options(mut self, dst: DstExtractionOptions) -> Self {
+        self.dst = dst;
+        self
+    }
+}
+
+impl From<&ExtractOptions> for DsdSourceExtractOptions {
+    fn from(opts: &ExtractOptions) -> Self {
+        Self {
+            format: opts.format,
+            id3_metadata: opts.id3_metadata.clone(),
+            dff_metadata: opts.dff_metadata.clone(),
+            dst: DstExtractionOptions::default(),
+        }
+    }
 }
 
 impl ExtractOptions {
@@ -159,6 +487,7 @@ impl ExtractOptions {
         self.dff_metadata = Some(meta);
         self
     }
+
 }
 
 /// Additive controls for integrity-sensitive extraction.
@@ -252,6 +581,8 @@ pub enum ExtractError {
     Io(io::Error),
     /// Failure decoding a DST-encoded frame.
     Dst(DstError),
+    /// Failure in the common source-model layer.
+    Source(DsdSourceError),
 }
 
 impl std::fmt::Display for ExtractError {
@@ -260,6 +591,7 @@ impl std::fmt::Display for ExtractError {
             Self::Frame(e) => write!(f, "frame read error: {}", e),
             Self::Io(e) => write!(f, "output write error: {}", e),
             Self::Dst(e) => write!(f, "DST decode error: {}", e),
+            Self::Source(e) => write!(f, "DSD source error: {}", e),
         }
     }
 }
@@ -281,6 +613,90 @@ impl From<io::Error> for ExtractError {
 impl From<DstError> for ExtractError {
     fn from(e: DstError) -> Self {
         Self::Dst(e)
+    }
+}
+
+impl From<DsdSourceError> for ExtractError {
+    fn from(e: DsdSourceError) -> Self {
+        match e {
+            DsdSourceError::Io(e) => Self::Io(e),
+            DsdSourceError::Frame(e) => Self::Frame(e),
+            DsdSourceError::Dst(e) => Self::Dst(e),
+            other => Self::Source(other),
+        }
+    }
+}
+
+/// Error returned by path-based, transaction-protected extraction and conversion.
+///
+/// This error preserves the final path, temporary path, original extraction or
+/// conversion failure, and any cleanup failure from removing the temporary file.
+#[derive(Debug)]
+pub enum ExtractToPathError {
+    /// Creating, committing, or explicitly aborting the output transaction
+    /// failed before or after the extraction body ran.
+    Transaction(OutputTransactionError),
+    /// The extraction/conversion body failed after the temporary file had been
+    /// created. The final output path was not published. `cleanup_error` is
+    /// populated only if removing the temporary file also failed.
+    OperationFailed {
+        final_path: PathBuf,
+        temp_path: PathBuf,
+        source: ExtractError,
+        cleanup_error: Option<OutputTransactionError>,
+    },
+}
+
+impl ExtractToPathError {
+    /// Destination path requested by the caller.
+    pub fn final_path(&self) -> &Path {
+        match self {
+            Self::Transaction(e) => e.final_path(),
+            Self::OperationFailed { final_path, .. } => final_path.as_path(),
+        }
+    }
+
+    /// Temporary path involved in the failure, if a transaction had already
+    /// been created.
+    pub fn temp_path(&self) -> Option<&Path> {
+        match self {
+            Self::Transaction(e) => e.temp_path(),
+            Self::OperationFailed { temp_path, .. } => Some(temp_path.as_path()),
+        }
+    }
+}
+
+impl std::fmt::Display for ExtractToPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transaction(e) => write!(f, "{}", e),
+            Self::OperationFailed {
+                final_path,
+                temp_path,
+                source,
+                cleanup_error,
+            } => {
+                write!(
+                    f,
+                    "transactional extraction to {} failed while writing temporary file {}: {}",
+                    final_path.display(),
+                    temp_path.display(),
+                    source
+                )?;
+                if let Some(cleanup_error) = cleanup_error {
+                    write!(f, "; temporary cleanup also failed: {}", cleanup_error)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExtractToPathError {}
+
+impl From<OutputTransactionError> for ExtractToPathError {
+    fn from(e: OutputTransactionError) -> Self {
+        Self::Transaction(e)
     }
 }
 
@@ -411,6 +827,8 @@ pub struct ExtractReport {
     pub stats: ExtractStats,
     /// Parser, sector-recovery, and integrity diagnostics.
     pub integrity: ExtractIntegrityReport,
+    /// DSDIFF/DST writer telemetry. Present for [`OutputFormat::DffDst`] only when the selected policy actually writes DSDIFF/DST, not when [`SourceDstHandling::DecodeToDsdiffDsd`] routes to ordinary DSDIFF/DSD.
+    pub dff_dst: Option<DffDstWriterStats>,
 }
 
 impl ExtractReport {
@@ -432,6 +850,13 @@ impl ExtractReport {
 
     pub fn dropped_frame_events(&self) -> &[DroppedFrameEvent] {
         self.integrity.dropped_frame_events()
+    }
+
+    /// DSDIFF/DST writer telemetry, when the output format was
+    /// [`OutputFormat::DffDst`] and the selected policy wrote DSDIFF/DST rather
+    /// than routing through [`SourceDstHandling::DecodeToDsdiffDsd`].
+    pub fn dff_dst_stats(&self) -> Option<&DffDstWriterStats> {
+        self.dff_dst.as_ref()
     }
 }
 
@@ -476,6 +901,7 @@ pub fn extract_track<W: Write + Seek>(
         output,
         opts,
         ExtractIntegrityOptions::strict(),
+        DstExtractionOptions::default(),
     )?;
     // A trailing incomplete frame at the end of the extraction range
     // is normal — TOC sector ranges rarely align to DSD frame boundaries.
@@ -496,8 +922,8 @@ pub fn extract_track<W: Write + Seek>(
 
 /// High-integrity extraction entry point.
 ///
-/// This additive API preserves [`extract_track`] and [`ExtractOptions`] source
-/// compatibility while returning all recovery and parser-integrity state.
+/// This additive API preserves [`extract_track`] while returning all recovery,
+/// parser-integrity, and DSDIFF/DST writer telemetry state.
 /// In strict/default mode (`recover_sector_errors == false`), malformed
 /// sectors, read errors, invalid timecodes, frame-format mismatches, strict
 /// channel-count mismatches, and incomplete pending frames fail the operation.
@@ -512,7 +938,141 @@ pub fn extract_track_with_integrity_options<W: Write + Seek>(
     opts: ExtractOptions,
     integrity_options: ExtractIntegrityOptions,
 ) -> Result<ExtractReport, ExtractError> {
-    extract_track_impl(iso, output, opts, integrity_options)
+    extract_track_impl(
+        iso,
+        output,
+        opts,
+        integrity_options,
+        DstExtractionOptions::default(),
+    )
+}
+
+/// Extract one ISO track with explicit DSDIFF/DST handling while preserving
+/// the source-compatible [`ExtractOptions`] shape.
+///
+/// Use this when requesting [`OutputFormat::DffDst`] and the caller needs a
+/// policy other than [`DstExtractionOptions::default`]. Existing DST-coded
+/// source frames are passed through by default; decode-and-reencode and raw DST
+/// fallback are explicit through [`DstExtractionOptions`].
+pub fn extract_track_with_dst_options<W: Write + Seek>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    dst_options: DstExtractionOptions,
+) -> Result<ExtractStats, ExtractError> {
+    let report = extract_track_impl(
+        iso,
+        output,
+        opts,
+        ExtractIntegrityOptions::strict(),
+        dst_options,
+    )?;
+    Ok(report.stats)
+}
+
+/// High-integrity extraction with explicit DSDIFF/DST handling.
+pub fn extract_track_with_integrity_and_dst_options<W: Write + Seek>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    integrity_options: ExtractIntegrityOptions,
+    dst_options: DstExtractionOptions,
+) -> Result<ExtractReport, ExtractError> {
+    extract_track_impl(iso, output, opts, integrity_options, dst_options)
+}
+
+/// Extract one ISO track directly to a final filesystem path using a
+/// transaction-protected output file.
+///
+/// The low-level writers still stream to caller-owned sinks. This path-facing
+/// helper is the application-level safety wrapper: it writes to a unique
+/// temporary file in the destination directory, commits only after extraction
+/// and writer finalization succeed, and removes the temporary file on failure.
+/// Existing final files are refused unless `overwrite` is
+/// [`OutputOverwritePolicy::ReplaceExisting`].
+pub fn extract_track_to_path<P: AsRef<Path>>(
+    iso: &mut IsoReader,
+    final_path: P,
+    opts: ExtractOptions,
+    integrity_options: ExtractIntegrityOptions,
+    overwrite: OutputOverwritePolicy,
+) -> Result<ExtractReport, ExtractToPathError> {
+    extract_track_to_path_with_dst_options(
+        iso,
+        final_path,
+        opts,
+        integrity_options,
+        DstExtractionOptions::default(),
+        overwrite,
+    )
+}
+
+/// Extract one ISO track directly to a final filesystem path with explicit
+/// DSDIFF/DST handling and transaction-protected publication.
+pub fn extract_track_to_path_with_dst_options<P: AsRef<Path>>(
+    iso: &mut IsoReader,
+    final_path: P,
+    opts: ExtractOptions,
+    integrity_options: ExtractIntegrityOptions,
+    dst_options: DstExtractionOptions,
+    overwrite: OutputOverwritePolicy,
+) -> Result<ExtractReport, ExtractToPathError> {
+    let final_path = final_path.as_ref().to_path_buf();
+    let mut tx = OutputTransaction::create(&final_path, overwrite)?;
+    let temp_path = tx.temp_path().to_path_buf();
+    match extract_track_with_integrity_and_dst_options(
+        iso,
+        &mut tx,
+        opts,
+        integrity_options,
+        dst_options,
+    ) {
+        Ok(report) => {
+            tx.commit()?;
+            Ok(report)
+        }
+        Err(source) => {
+            let cleanup_error = tx.abort().err();
+            Err(ExtractToPathError::OperationFailed {
+                final_path,
+                temp_path,
+                source,
+                cleanup_error,
+            })
+        }
+    }
+}
+
+/// Write any common DSD source directly to a final filesystem path using the
+/// same transaction contract as [`extract_track_to_path`].
+pub fn write_dsd_source_to_path<S, P>(
+    source: &mut S,
+    final_path: P,
+    opts: DsdSourceExtractOptions,
+    overwrite: OutputOverwritePolicy,
+) -> Result<ExtractReport, ExtractToPathError>
+where
+    S: DsdSource + ?Sized,
+    P: AsRef<Path>,
+{
+    let final_path = final_path.as_ref().to_path_buf();
+    let mut tx = OutputTransaction::create(&final_path, overwrite)?;
+    let temp_path = tx.temp_path().to_path_buf();
+    match write_dsd_source(source, &mut tx, opts) {
+        Ok(report) => {
+            tx.commit()?;
+            Ok(report)
+        }
+        Err(source) => {
+            let cleanup_error = tx.abort().err();
+            Err(ExtractToPathError::OperationFailed {
+                final_path,
+                temp_path,
+                source,
+                cleanup_error,
+            })
+        }
+    }
 }
 
 fn extract_track_impl<W: Write + Seek>(
@@ -520,90 +1080,238 @@ fn extract_track_impl<W: Write + Seek>(
     output: &mut W,
     opts: ExtractOptions,
     integrity_options: ExtractIntegrityOptions,
+    dst_options: DstExtractionOptions,
 ) -> Result<ExtractReport, ExtractError> {
-    let mut reader = FrameReader::new(iso, opts.start_lsn, opts.end_lsn);
-    reader.set_expected_channel_count(opts.channel_count);
+    let mut source_opts = IsoTrackSourceOptions::new(
+        opts.start_lsn,
+        opts.end_lsn,
+        opts.channel_count,
+        SACD_SAMPLING_FREQUENCY,
+    )
+    .with_strict_channel_count(integrity_options.strict_channel_count)
+    .with_sector_recovery(integrity_options.recover_sector_errors);
+
     if let Some(frame_format) = integrity_options.frame_format {
-        reader.set_expected_frame_format(frame_format);
+        source_opts = source_opts.with_frame_format(frame_format);
     }
-    reader.set_strict_channel_count(integrity_options.strict_channel_count);
-    reader.set_recover_sector_errors(integrity_options.recover_sector_errors);
     if let Some(filter) = opts.time_filter {
-        reader.set_timecode_filter(filter.start_frame, filter.duration_frames);
+        source_opts = source_opts.with_time_filter(FrameTimeFilter::new(
+            filter.start_frame,
+            filter.duration_frames,
+        ));
     }
+
+    let mut source = IsoTrackSource::new(iso, source_opts);
+    let mut sink_options = DsdSourceExtractOptions::from(&opts);
+    sink_options.dst = dst_options;
+    let mut report = write_dsd_source(&mut source, output, sink_options)?;
+    report.integrity = ExtractIntegrityReport::from_reader_stats(source.frame_reader_stats());
+    Ok(report)
+}
+
+/// Write any common DSD source to a DSF, DSDIFF/DSD, or DSDIFF/DST sink.
+///
+/// This is the extraction/conversion core after the common source-model
+/// refactor. SACD ISO extraction is now just one producer of [`DsdSource`]
+/// frames; DSF, DSDIFF/DSD, and DSDIFF/DST file inputs can feed the same sink
+/// policy. Existing source DST frames stay encoded until this function's
+/// output policy explicitly decodes or re-encodes them.
+pub fn write_dsd_source<S, W>(
+    source: &mut S,
+    output: &mut W,
+    opts: DsdSourceExtractOptions,
+) -> Result<ExtractReport, ExtractError>
+where
+    S: DsdSource + ?Sized,
+    W: Write + Seek,
+{
+    let channel_count = source_channel_count_u8(source.source_info().channel_count)?;
+    let sample_rate = source.source_info().sample_rate;
 
     match opts.format {
         OutputFormat::Dsf => {
-            let mut writer = DsfWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
+            let mut writer = DsfWriter::new(output, channel_count, sample_rate)?;
             if let Some(ref meta) = opts.id3_metadata {
                 writer.set_id3_footer(render_id3v24(meta));
             }
-            let report = drain_frames(&mut reader, None, |data| {
-                writer.write_interleaved(data).map_err(ExtractError::Io)
+            let report = drain_source_decoded(source, |frame| {
+                writer.write_interleaved(&frame.data).map_err(ExtractError::Io)
             })?;
             writer.finish()?;
             Ok(report)
         }
         OutputFormat::Dff => {
-            let mut writer = DffWriter::new(output, opts.channel_count, SACD_SAMPLING_FREQUENCY)?;
+            let mut writer = DffWriter::new(output, channel_count, sample_rate)?;
             if let Some(ref meta) = opts.dff_metadata {
                 writer.set_footer_bytes(render_dff_footer(meta));
             }
-            let report = drain_frames(&mut reader, None, |data| {
-                writer.write_frame(data).map_err(ExtractError::Io)
+            let report = drain_source_decoded(source, |frame| {
+                writer.write_frame(&frame.data).map_err(ExtractError::Io)
             })?;
+            writer.finish()?;
+            Ok(report)
+        }
+        OutputFormat::DffDst => {
+            if opts.dst.source_dst == SourceDstHandling::DecodeToDsdiffDsd {
+                if opts.dst.plain_dsd != PlainDsdDstHandling::WriteUncompressedSourceAsDsdiffDsd {
+                    return Err(ExtractError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "DecodeToDsdiffDsd requires plain_dsd = WriteUncompressedSourceAsDsdiffDsd so all source frames route to ordinary DSDIFF/DSD",
+                    )));
+                }
+                let mut writer = DffWriter::new(output, channel_count, sample_rate)?;
+                if let Some(ref meta) = opts.dff_metadata {
+                    writer.set_footer_bytes(render_dff_footer(meta));
+                }
+                let report = drain_source_decoded(source, |frame| {
+                    writer.write_frame(&frame.data).map_err(ExtractError::Io)
+                })?;
+                writer.finish()?;
+                return Ok(report);
+            }
+
+            let mut writer = DffDstWriter::new(output, channel_count, sample_rate)?;
+            if let Some(ref meta) = opts.dff_metadata {
+                writer.set_footer_bytes(render_dff_footer(meta));
+            }
+            let mut report = drain_source_to_dff_dst(source, &mut writer, &opts.dst)?;
+            report.dff_dst = Some(writer.stats().clone());
             writer.finish()?;
             Ok(report)
         }
     }
 }
 
-/// Drain frames from `reader`, applying `time_filter` (if any),
-/// decoding DST frames in the keep-range, and forwarding each kept
-/// frame's clustered DSD bytes to `write_data`.
-///
-/// Filter-then-DST order mirrors sacd_extract's `frame_read_callback`
-/// nesting: out-of-range DST frames are silently dropped without
-/// triggering an decode error.
-fn drain_frames<F>(
-    reader: &mut FrameReader<'_>,
-    time_filter: Option<TimeFilter>,
-    mut write_data: F,
+fn source_channel_count_u8(channel_count: u16) -> Result<u8, ExtractError> {
+    let channels = u8::try_from(channel_count).map_err(|_| {
+        ExtractError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("source channel count {} exceeds writer interface", channel_count),
+        ))
+    })?;
+    if channels == 0 {
+        return Err(ExtractError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source channel count is zero",
+        )));
+    }
+    Ok(channels)
+}
+
+fn drain_source_decoded<S, F>(
+    source: &mut S,
+    mut write_frame: F,
 ) -> Result<ExtractReport, ExtractError>
 where
-    F: FnMut(&[u8]) -> Result<(), ExtractError>,
+    S: DsdSource + ?Sized,
+    F: FnMut(&SourceDsdFrame) -> Result<(), ExtractError>,
 {
     let mut stats = ExtractStats::default();
-    while let Some(frame) = reader.next_frame()? {
-        // (1) Time filter: matches sacd_extract's outer-guard
-        // ordering. Out-of-range frames drop silently regardless
-        // of compression.
-        if let Some(filter) = time_filter {
-            if !filter.includes(frame.timecode.as_frame_count()) {
-                continue;
+    while let Some(frame) = source.next_source_frame()? {
+        let decoded = frame.into_decoded_dsd()?;
+        write_frame(&decoded)?;
+        stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
+            ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract frame counter overflow"))
+        })?;
+        stats.audio_bytes = stats.audio_bytes.checked_add(decoded.data.len() as u64).ok_or_else(|| {
+            ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract byte counter overflow"))
+        })?;
+    }
+    Ok(ExtractReport { stats, integrity: ExtractIntegrityReport::default(), dff_dst: None })
+}
+
+fn drain_source_to_dff_dst<S, W>(
+    source: &mut S,
+    writer: &mut DffDstWriter<W>,
+    dst_options: &DstExtractionOptions,
+) -> Result<ExtractReport, ExtractError>
+where
+    S: DsdSource + ?Sized,
+    W: Write + Seek,
+{
+    let mut stats = ExtractStats::default();
+    while let Some(frame) = source.next_source_frame()? {
+        match frame {
+            DsdSourceFrame::Dst(dst) => {
+                let decoded = dst.decode_checked()?;
+                match dst_options.source_dst {
+                    SourceDstHandling::PassthroughExistingDst => {
+                        writer
+                            .write_passthrough_frame(&dst.encoded, &decoded.data)
+                            .map_err(ExtractError::Io)?;
+                    }
+                    SourceDstHandling::AnalyzeThenPassthroughExistingDst => {
+                        writer
+                            .analyze_interleaved_frame_with_options(&decoded.data, &dst_options.encoder)
+                            .map_err(ExtractError::Io)?;
+                        writer
+                            .write_passthrough_frame(&dst.encoded, &decoded.data)
+                            .map_err(ExtractError::Io)?;
+                    }
+                    SourceDstHandling::ReencodeDst => {
+                        writer
+                            .write_interleaved_frame_with_options(&decoded.data, &dst_options.encoder)
+                            .map_err(ExtractError::Io)?;
+                    }
+                    SourceDstHandling::DecodeToDsdiffDsd => {
+                        return Err(ExtractError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "DecodeToDsdiffDsd must route through the DSDIFF/DSD writer before DSTF emission",
+                        )));
+                    }
+                    SourceDstHandling::RejectSourceDst => {
+                        return Err(ExtractError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "source DST frame encountered but DST extraction policy is RejectSourceDst",
+                        )));
+                    }
+                }
+                stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
+                    ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract frame counter overflow"))
+                })?;
+                stats.audio_bytes = stats.audio_bytes.checked_add(decoded.data.len() as u64).ok_or_else(|| {
+                    ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract byte counter overflow"))
+                })?;
+            }
+            DsdSourceFrame::Dsd(dsd) => {
+                match dst_options.plain_dsd {
+                    PlainDsdDstHandling::RejectUncompressedSource => {
+                        return Err(ExtractError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "plain DSD frame encountered but DSDIFF/DST policy is passthrough-only; use OutputFormat::Dff for DSDIFF/DSD or select a predictive DST policy",
+                        )));
+                    }
+                    PlainDsdDstHandling::WriteUncompressedSourceAsDsdiffDsd => {
+                        return Err(ExtractError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "WriteUncompressedSourceAsDsdiffDsd is valid only with SourceDstHandling::DecodeToDsdiffDsd; use OutputFormat::Dff for ordinary DSDIFF/DSD or select a DFF/DST plain-DSD policy",
+                        )));
+                    }
+                    PlainDsdDstHandling::EncodeUncompressedSourceToDst
+                    | PlainDsdDstHandling::EncodeUncompressedSourceToDstWithRawFallback => {
+                        let encoder = dst_options.encoder_for_plain_dsd();
+                        writer
+                            .write_interleaved_frame_with_options(&dsd.data, &encoder)
+                            .map_err(ExtractError::Io)?;
+                    }
+                }
+                stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
+                    ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract frame counter overflow"))
+                })?;
+                stats.audio_bytes = stats.audio_bytes.checked_add(dsd.data.len() as u64).ok_or_else(|| {
+                    ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract byte counter overflow"))
+                })?;
             }
         }
-        // (2) DST decode: only applies to in-range frames.
-        let payload: Cow<'_, [u8]> = if frame.dst_encoded {
-            Cow::Owned(decode_frame(&frame.data, frame.channel_count)?)
-        } else {
-            Cow::Borrowed(&frame.data)
-        };
-
-        // (3) Write to format-specific sink.
-        write_data(payload.as_ref())?;
-        stats.frames_read += 1;
-        stats.audio_bytes += payload.len() as u64;
     }
-    let integrity = ExtractIntegrityReport::from_reader_stats(reader.stats());
-    Ok(ExtractReport { stats, integrity })
+    Ok(ExtractReport { stats, integrity: ExtractIntegrityReport::default(), dff_dst: None })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dsf_writer::BLOCK_SIZE_PER_CHANNEL;
-    use crate::frame::{FrameFormat, Timecode, FRAME_SIZE_UNCOMPRESSED};
+    use crate::frame::{FrameFormat, Timecode, DATA_TYPE_AUDIO, FRAME_SIZE_UNCOMPRESSED};
     use crate::iso_reader::SECTOR_SIZE;
     use crate::test_util::{
         sha256_hex, synth_audio_sector, synth_continuation_sector, synth_dst_sector, tc_at,
@@ -622,6 +1330,34 @@ mod tests {
         while off < frame_bytes.len() {
             let chunk = (frame_bytes.len() - off).min(PART_SIZE);
             sectors.push(synth_continuation_sector(&frame_bytes[off..off + chunk]));
+            off += chunk;
+        }
+        sectors
+    }
+
+    fn synth_dst_frame_sectors(payload: &[u8], channel_count: u8, tc: Timecode) -> Vec<Vec<u8>> {
+        fn continuation(payload: &[u8]) -> Vec<u8> {
+            assert!(payload.len() <= 2045);
+            let mut s = Vec::with_capacity(SECTOR_SIZE as usize);
+            s.push(1u8 | (1u8 << 5));
+            s.extend_from_slice(&[
+                ((DATA_TYPE_AUDIO & 0x07) << 3) | (((payload.len() as u16 >> 8) as u8) & 0x07),
+                ((payload.len() & 0xff) as u8),
+            ]);
+            s.extend_from_slice(payload);
+            s.resize(SECTOR_SIZE as usize, 0);
+            s
+        }
+
+        let first_len = payload.len().min(2041);
+        let remaining = payload.len().saturating_sub(first_len);
+        let continuation_count = (remaining + 2044) / 2045;
+        let sector_count = u8::try_from(1 + continuation_count).expect("synthetic DST sector count fits u8");
+        let mut sectors = vec![synth_dst_sector(&payload[..first_len], channel_count, sector_count, tc)];
+        let mut off = first_len;
+        while off < payload.len() {
+            let chunk = (payload.len() - off).min(2045);
+            sectors.push(continuation(&payload[off..off + chunk]));
             off += chunk;
         }
         sectors
@@ -694,6 +1430,44 @@ mod tests {
         (output.into_inner(), stats)
     }
 
+    fn run_extract_report_with_dst_options(
+        sectors: Vec<Vec<u8>>,
+        channel_count: u8,
+        dst: DstExtractionOptions,
+    ) -> (Vec<u8>, ExtractReport) {
+        let end_lsn = sectors.len() as u64;
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, end_lsn, channel_count, OutputFormat::DffDst);
+        let report = extract_track_with_integrity_and_dst_options(
+            &mut iso,
+            &mut output,
+            opts,
+            ExtractIntegrityOptions::strict(),
+            dst,
+        )
+        .expect("extract should succeed");
+        (output.into_inner(), report)
+    }
+
+    #[test]
+    fn extract_options_struct_literal_remains_source_compatible() {
+        let opts = ExtractOptions {
+            start_lsn: 0,
+            end_lsn: 1,
+            channel_count: 2,
+            format: OutputFormat::Dsf,
+            time_filter: None,
+            id3_metadata: None,
+            dff_metadata: None,
+        };
+        assert_eq!(opts.start_lsn, 0);
+        assert_eq!(opts.end_lsn, 1);
+        assert_eq!(opts.channel_count, 2);
+        assert_eq!(opts.format, OutputFormat::Dsf);
+    }
+
     #[test]
     fn extract_uncompressed_stereo_to_dff_preserves_bytes() {
         // One stereo uncompressed frame = 2 * 4704 = 9408 bytes.
@@ -722,6 +1496,285 @@ mod tests {
         assert_eq!(
             sha256_hex(&out),
             "10c9f7c4adb39d98bc7b6056a79afdcf34df23ed9d85e6e6a108201d37e91961",
+        );
+    }
+
+    #[test]
+    fn extract_uncompressed_stereo_to_dff_dst_writes_decodable_dstf() {
+        let frame = vec![0u8; FRAME_SIZE_UNCOMPRESSED * 2];
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        );
+        let (out, report) = run_extract_report_with_dst_options(
+            sectors,
+            2,
+            DstExtractionOptions::raw_fallback_compatibility(),
+        );
+        let stats = report.stats;
+
+        let mut cursor = std::io::Cursor::new(out.clone());
+        let info = crate::container::inspect_dsd_container(&mut cursor).unwrap();
+        assert_eq!(info.compression, crate::container::DsdCompression::Dst);
+        assert_eq!(info.channel_count, 2);
+        assert_eq!(info.sample_count_per_channel, Some(37_632));
+
+        let dstf = out.windows(4).position(|w| w == b"DSTF").unwrap();
+        let dstf_size = read_u64_be(&out, dstf + 4) as usize;
+        let dstf_payload = &out[dstf + 12..dstf + 12 + dstf_size];
+        assert_eq!(crate::dst::decode_frame(dstf_payload, 2).unwrap(), frame);
+
+        let frte = out.windows(4).position(|w| w == b"FRTE").unwrap();
+        assert_eq!(&out[frte + 12..frte + 16], &1u32.to_be_bytes());
+        assert_eq!(&out[frte + 16..frte + 18], &75u16.to_be_bytes());
+
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, 9408);
+    }
+
+    #[test]
+    fn extract_uncompressed_mono_to_dff_dst_rejects_implicit_raw_fallback() {
+        let frame = vec![0u8; FRAME_SIZE_UNCOMPRESSED];
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        );
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 1, OutputFormat::DffDst);
+        let err = extract_track(&mut iso, &mut output, opts).unwrap_err();
+        match err {
+            ExtractError::Io(io_err) => {
+                assert_eq!(io_err.kind(), io::ErrorKind::InvalidInput);
+                let msg = io_err.to_string();
+                assert!(
+                    msg.contains("raw fallback") || msg.contains("unavailable") || msg.contains("DSDIFF/DSD"),
+                    "unexpected error: {}",
+                    io_err
+                );
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+
+        let (dff, stats) = run_extract(sectors, 1, OutputFormat::Dff);
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, FRAME_SIZE_UNCOMPRESSED as u64);
+        let mut cursor = std::io::Cursor::new(dff.clone());
+        let info = crate::container::inspect_dsd_container(&mut cursor).unwrap();
+        assert_eq!(info.compression, crate::container::DsdCompression::Dsd);
+        let start = info.data_offset as usize;
+        assert_eq!(&dff[start..start + FRAME_SIZE_UNCOMPRESSED], &frame[..]);
+    }
+
+    #[test]
+    fn extract_dst_source_to_dff_dst_preserves_original_dstf_payload() {
+        let frame = vec![0u8; FRAME_SIZE_UNCOMPRESSED * 2];
+        let encoded = crate::dst::encode_uncompressed_frame_interleaved(&frame, 2)
+            .expect("raw DST source fixture should encode");
+        let sectors = synth_dst_frame_sectors(
+            &encoded,
+            2,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        );
+
+        let (out, stats) = run_extract(sectors, 2, OutputFormat::DffDst);
+        let dstf = out.windows(4).position(|w| w == b"DSTF").unwrap();
+        let dstf_size = read_u64_be(&out, dstf + 4) as usize;
+        let dstf_payload = &out[dstf + 12..dstf + 12 + dstf_size];
+
+        assert_eq!(dstf_payload, encoded.as_slice());
+        assert_eq!(crate::dst::decode_frame(dstf_payload, 2).unwrap(), frame);
+        assert_eq!(stats.frames_read, 1);
+        assert_eq!(stats.audio_bytes, FRAME_SIZE_UNCOMPRESSED as u64 * 2);
+    }
+
+    #[test]
+    fn extraction_can_explicitly_decode_source_dst_to_dsdiff_dsd() {
+        let frame = vec![0u8; FRAME_SIZE_UNCOMPRESSED * 2];
+        let encoded = crate::dst::encode_uncompressed_frame_interleaved(&frame, 2)
+            .expect("raw DST source fixture should encode");
+        let sectors = synth_dst_frame_sectors(
+            &encoded,
+            2,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        );
+
+        let (out, report) = run_extract_report_with_dst_options(
+            sectors,
+            2,
+            DstExtractionOptions::decode_to_dsdiff_dsd(),
+        );
+        assert!(report.dff_dst_stats().is_none());
+        assert!(out.windows(4).all(|w| w != b"DSTF"));
+
+        let mut cursor = std::io::Cursor::new(out.clone());
+        let info = crate::container::inspect_dsd_container(&mut cursor).unwrap();
+        assert_eq!(info.compression, crate::container::DsdCompression::Dsd);
+        assert_eq!(info.channel_count, 2);
+        let start = info.data_offset as usize;
+        assert_eq!(&out[start..start + frame.len()], &frame[..]);
+        assert_eq!(report.stats.frames_read, 1);
+        assert_eq!(report.stats.audio_bytes, frame.len() as u64);
+    }
+
+    #[test]
+    fn extraction_raw_fallback_mode_threads_encoder_policy() {
+        let frame = vec![0u8; FRAME_SIZE_UNCOMPRESSED];
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        );
+        let (out, report) = run_extract_report_with_dst_options(
+            sectors,
+            1,
+            DstExtractionOptions::raw_fallback_compatibility(),
+        );
+        let stats = report.dff_dst_stats().expect("DFF/DST stats should be present");
+        assert_eq!(stats.frames_written, 1);
+        assert_eq!(stats.raw_frames_written, 1);
+        assert_eq!(stats.predictive_frames_written, 0);
+        assert_eq!(stats.frames[0].mode, crate::dff_dst_writer::DffDstFrameMode::RawFallback);
+        let dstf = out.windows(4).position(|w| w == b"DSTF").unwrap();
+        let dstf_size = read_u64_be(&out, dstf + 4) as usize;
+        let dstf_payload = &out[dstf + 12..dstf + 12 + dstf_size];
+        assert_eq!(dstf_payload[0], 0);
+        assert_eq!(crate::dst::decode_frame(dstf_payload, 1).unwrap(), frame);
+    }
+
+    #[test]
+    fn extraction_passthrough_only_rejects_plain_dsd() {
+        let frame = vec![0u8; FRAME_SIZE_UNCOMPRESSED * 2];
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        );
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::DffDst);
+        let err = extract_track_with_dst_options(
+            &mut iso,
+            &mut output,
+            opts,
+            DstExtractionOptions::passthrough_only(),
+        )
+        .unwrap_err();
+        match err {
+            ExtractError::Io(io_err) => {
+                assert_eq!(io_err.kind(), io::ErrorKind::InvalidInput);
+                assert!(io_err.to_string().contains("passthrough-only"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extraction_corpus_analysis_preserves_source_dst_and_records_attempt() {
+        let frame = vec![0u8; FRAME_SIZE_UNCOMPRESSED * 2];
+        let encoded = crate::dst::encode_uncompressed_frame_interleaved(&frame, 2)
+            .expect("raw DST source fixture should encode");
+        let sectors = synth_dst_frame_sectors(
+            &encoded,
+            2,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        );
+
+        let (out, report) = run_extract_report_with_dst_options(
+            sectors,
+            2,
+            DstExtractionOptions::corpus_analysis(),
+        );
+        let dstf = out.windows(4).position(|w| w == b"DSTF").unwrap();
+        let dstf_size = read_u64_be(&out, dstf + 4) as usize;
+        let dstf_payload = &out[dstf + 12..dstf + 12 + dstf_size];
+        assert_eq!(dstf_payload, encoded.as_slice());
+
+        let stats = report.dff_dst_stats().expect("DFF/DST stats should be present");
+        assert_eq!(stats.frames_written, 1);
+        assert_eq!(stats.passthrough_frames_written, 1);
+        assert_eq!(stats.encode_attempts, 1);
+        assert!(stats.predictive_candidates > 0);
+    }
+
+    #[test]
+    fn dst_extraction_presets_separate_policy_from_mechanism() {
+        let mut encoder = crate::dst::DstEncoderOptions::default();
+        encoder.minimum_savings_bytes = 17;
+        encoder.raw_fallback = RawDstFallbackPolicy::Enabled;
+
+        let opts = DstExtractionOptions::portable().with_encoder_options(encoder.clone());
+        assert_eq!(opts.source_dst, SourceDstHandling::PassthroughExistingDst);
+        assert_eq!(opts.plain_dsd, PlainDsdDstHandling::EncodeUncompressedSourceToDst);
+        assert_eq!(opts.encoder.minimum_savings_bytes, 17);
+        assert_eq!(opts.encoder.raw_fallback, RawDstFallbackPolicy::Enabled);
+        assert_eq!(opts.encoder_for_plain_dsd().raw_fallback, RawDstFallbackPolicy::Disabled);
+
+        let raw = DstExtractionOptions::raw_fallback_compatibility();
+        assert_eq!(
+            raw.plain_dsd,
+            PlainDsdDstHandling::EncodeUncompressedSourceToDstWithRawFallback
+        );
+        assert_eq!(
+            raw.encoder_for_plain_dsd().raw_fallback,
+            RawDstFallbackPolicy::Enabled
+        );
+
+        let decode = DstExtractionOptions::decode_to_dsdiff_dsd();
+        assert_eq!(decode.source_dst, SourceDstHandling::DecodeToDsdiffDsd);
+        assert_eq!(
+            decode.plain_dsd,
+            PlainDsdDstHandling::WriteUncompressedSourceAsDsdiffDsd
+        );
+        let decode_builder =
+            DstExtractionOptions::portable().with_source_dst_handling(SourceDstHandling::DecodeToDsdiffDsd);
+        assert_eq!(
+            decode_builder.plain_dsd,
+            PlainDsdDstHandling::WriteUncompressedSourceAsDsdiffDsd
+        );
+        let restored = decode_builder.with_source_dst_handling(SourceDstHandling::PassthroughExistingDst);
+        assert_eq!(
+            restored.plain_dsd,
+            PlainDsdDstHandling::EncodeUncompressedSourceToDst
+        );
+
+        let corpus = DstExtractionOptions::corpus_analysis();
+        assert_eq!(corpus.source_dst, SourceDstHandling::AnalyzeThenPassthroughExistingDst);
+        assert_eq!(corpus.plain_dsd, PlainDsdDstHandling::EncodeUncompressedSourceToDst);
+        assert!(
+            corpus.encoder.candidate_prediction_orders.len()
+                > DstExtractionOptions::fast()
+                    .encoder
+                    .candidate_prediction_orders
+                    .len()
         );
     }
 
@@ -1452,6 +2505,66 @@ mod tests {
     }
 
     #[test]
+    fn extract_dff_dst_with_dff_metadata_appends_footer_and_updates_frm8() {
+        use crate::dff_footer::{render_dff_footer, DffMetadata};
+        use crate::id3::Id3Metadata;
+
+        let frame = vec![0u8; FRAME_SIZE_UNCOMPRESSED * 2];
+        let sectors = synth_uncompressed_frame_sectors(
+            &frame,
+            Timecode {
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        );
+        let meta = DffMetadata {
+            diar: Some("ARTIST".into()),
+            diti: Some("TITLE".into()),
+            duration_minutes_total: 0,
+            duration_seconds: 1,
+            duration_frames: 0,
+            disc_date_year: 2026,
+            disc_date_month_1_indexed: 5,
+            disc_date_day: 13,
+            disc_or_album_title: "ALBUM".into(),
+            creation_year: 2026,
+            creation_month_0_indexed: 4,
+            creation_day: 13,
+            creation_hour: 12,
+            creation_minute: 0,
+            creating_machine: "test".into(),
+            id3: Id3Metadata {
+                tit2: Some("TITLE".into()),
+                ..Default::default()
+            },
+        };
+        let footer_bytes = render_dff_footer(&meta);
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::DffDst)
+            .with_dff_metadata(meta);
+        let report = extract_track_with_integrity_and_dst_options(
+            &mut iso,
+            &mut output,
+            opts,
+            ExtractIntegrityOptions::strict(),
+            DstExtractionOptions::raw_fallback_compatibility(),
+        )
+        .unwrap();
+        assert!(report.dff_dst_stats().is_some());
+
+        let out = output.into_inner();
+        assert_eq!(read_u64_be(&out, 4) as usize, out.len() - 12);
+        assert!(out.ends_with(&footer_bytes));
+        let dsti_pos = out.windows(4).position(|w| w == b"DSTI").unwrap();
+        let footer_pos = out.len() - footer_bytes.len();
+        assert!(dsti_pos < footer_pos, "metadata footer must follow DSTI");
+    }
+
+    #[test]
     fn extract_no_dff_metadata_omits_footer() {
         // Regression: when dff_metadata = None, DFF output has
         // no footer (PR 1e behavior preserved).
@@ -1772,6 +2885,271 @@ mod tests {
         assert_eq!(integrity.frame_format_mismatches, sectors.len() as u64);
         assert!(integrity.recovery_events().iter().all(|e| e.error.contains("frame-format mismatch")));
         assert!(report.integrity_loss_detected());
+    }
+
+
+    #[test]
+    fn common_source_dsdiff_dsd_to_dsf_uses_extraction_sink() {
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = DffWriter::new(&mut input, 2, SACD_SAMPLING_FREQUENCY).unwrap();
+            writer.write_frame(&frame).unwrap();
+            writer.finish().unwrap();
+        }
+        input.set_position(0);
+        let mut source = crate::source_model::open_dsd_source(input).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+
+        let report = write_dsd_source(
+            &mut source,
+            &mut output,
+            DsdSourceExtractOptions::new(OutputFormat::Dsf),
+        )
+        .unwrap();
+        assert_eq!(report.stats.frames_read, 1);
+        assert_eq!(report.stats.audio_bytes, frame.len() as u64);
+
+        output.set_position(0);
+        let mut roundtrip = crate::source_model::open_dsd_source(output).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(got) = roundtrip.next_source_frame().unwrap() {
+            match got {
+                DsdSourceFrame::Dsd(dsd) => decoded.extend_from_slice(&dsd.data),
+                DsdSourceFrame::Dst(_) => panic!("DSF output must yield decoded DSD"),
+            }
+        }
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn common_source_plain_dsd_with_decode_to_dsdiff_dsd_writes_ordinary_dff() {
+        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = DffWriter::new(&mut input, 2, SACD_SAMPLING_FREQUENCY).unwrap();
+            writer.write_frame(&frame).unwrap();
+            writer.finish().unwrap();
+        }
+        input.set_position(0);
+        let mut source = crate::source_model::open_dsd_source(input).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+
+        let report = write_dsd_source(
+            &mut source,
+            &mut output,
+            DsdSourceExtractOptions::new(OutputFormat::DffDst)
+                .with_dst_options(DstExtractionOptions::decode_to_dsdiff_dsd()),
+        )
+        .unwrap();
+        assert_eq!(report.stats.frames_read, 1);
+        assert_eq!(report.stats.audio_bytes, frame.len() as u64);
+        assert!(report.dff_dst_stats().is_none());
+
+        let out = output.into_inner();
+        assert!(out.windows(4).all(|w| w != b"DSTF"));
+        let mut cursor = std::io::Cursor::new(out.clone());
+        let info = crate::container::inspect_dsd_container(&mut cursor).unwrap();
+        assert_eq!(info.compression, crate::container::DsdCompression::Dsd);
+        assert_eq!(info.channel_count, 2);
+        let start = info.data_offset as usize;
+        assert_eq!(&out[start..start + frame.len()], &frame[..]);
+    }
+
+    #[test]
+    fn common_source_dsdiff_dst_to_dff_dst_preserves_source_dst_payload() {
+        let frame = vec![0; FRAME_SIZE_UNCOMPRESSED * 2];
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = DffDstWriter::new(&mut input, 2, SACD_SAMPLING_FREQUENCY).unwrap();
+            writer.write_interleaved_frame_allowing_raw_fallback(&frame).unwrap();
+            writer.finish().unwrap();
+        }
+        let input_bytes = input.into_inner();
+
+        let mut original = crate::source_model::open_dsd_source(std::io::Cursor::new(input_bytes.clone())).unwrap();
+        let original_encoded = match original.next_source_frame().unwrap().unwrap() {
+            DsdSourceFrame::Dst(dst) => dst.encoded,
+            DsdSourceFrame::Dsd(_) => panic!("expected DSDIFF/DST source"),
+        };
+
+        let mut source = crate::source_model::open_dsd_source(std::io::Cursor::new(input_bytes)).unwrap();
+        let mut output = std::io::Cursor::new(Vec::<u8>::new());
+        let report = write_dsd_source(
+            &mut source,
+            &mut output,
+            DsdSourceExtractOptions::new(OutputFormat::DffDst),
+        )
+        .unwrap();
+        assert_eq!(report.stats.frames_read, 1);
+        let dst_stats = report.dff_dst_stats().unwrap();
+        assert_eq!(dst_stats.passthrough_frames_written, 1);
+
+        output.set_position(0);
+        let mut roundtrip = crate::source_model::open_dsd_source(output).unwrap();
+        let got_encoded = match roundtrip.next_source_frame().unwrap().unwrap() {
+            DsdSourceFrame::Dst(dst) => dst.encoded,
+            DsdSourceFrame::Dsd(_) => panic!("DffDst output must stay DST"),
+        };
+        assert_eq!(got_encoded, original_encoded);
+    }
+
+
+    #[derive(Debug)]
+    struct PathTestSource {
+        info: crate::source_model::DsdSourceInfo,
+        frames: std::collections::VecDeque<SourceDsdFrame>,
+    }
+
+    impl PathTestSource {
+        fn one_frame(channel_count: u16) -> Self {
+            let frame = SourceDsdFrame {
+                frame_index: 0,
+                data: vec![0x69, 0x96, 0x00, 0xff],
+                channel_count,
+                sample_rate: SACD_SAMPLING_FREQUENCY,
+                byte_order: crate::container::DsdByteOrder::MsbFirst,
+                timecode: None,
+                is_final: true,
+            };
+            Self {
+                info: crate::source_model::DsdSourceInfo {
+                    kind: crate::source_model::DsdSourceKind::DsdiffDsd,
+                    channel_count,
+                    sample_rate: SACD_SAMPLING_FREQUENCY,
+                    compression: crate::container::DsdCompression::Dsd,
+                    sample_count_per_channel: None,
+                    container: None,
+                    iso_range: None,
+                },
+                frames: std::collections::VecDeque::from([frame]),
+            }
+        }
+
+        fn invalid_zero_channel() -> Self {
+            Self {
+                info: crate::source_model::DsdSourceInfo {
+                    kind: crate::source_model::DsdSourceKind::DsdiffDsd,
+                    channel_count: 0,
+                    sample_rate: SACD_SAMPLING_FREQUENCY,
+                    compression: crate::container::DsdCompression::Dsd,
+                    sample_count_per_channel: None,
+                    container: None,
+                    iso_range: None,
+                },
+                frames: std::collections::VecDeque::new(),
+            }
+        }
+    }
+
+    impl DsdSource for PathTestSource {
+        fn source_info(&self) -> &crate::source_model::DsdSourceInfo {
+            &self.info
+        }
+
+        fn next_source_frame(&mut self) -> Result<Option<DsdSourceFrame>, DsdSourceError> {
+            Ok(self.frames.pop_front().map(DsdSourceFrame::Dsd))
+        }
+    }
+
+    #[test]
+    fn write_dsd_source_to_path_commits_only_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("track.dff");
+        let mut source = PathTestSource::one_frame(2);
+        let report = write_dsd_source_to_path(
+            &mut source,
+            &final_path,
+            DsdSourceExtractOptions::new(OutputFormat::Dff),
+            OutputOverwritePolicy::RefuseExisting,
+        )
+        .unwrap();
+        assert_eq!(report.stats.frames_read, 1);
+        assert!(final_path.exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().path() != final_path)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn write_dsd_source_to_path_refuses_existing_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("track.dff");
+        std::fs::write(&final_path, b"existing-good-file").unwrap();
+        let mut source = PathTestSource::one_frame(2);
+        let err = write_dsd_source_to_path(
+            &mut source,
+            &final_path,
+            DsdSourceExtractOptions::new(OutputFormat::Dff),
+            OutputOverwritePolicy::RefuseExisting,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExtractToPathError::Transaction(OutputTransactionError::ExistingOutputRefused { .. })));
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"existing-good-file");
+    }
+
+    #[test]
+    fn write_dsd_source_to_path_failure_removes_temp_and_keeps_no_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("track.dff");
+        let mut source = PathTestSource::invalid_zero_channel();
+        let err = write_dsd_source_to_path(
+            &mut source,
+            &final_path,
+            DsdSourceExtractOptions::new(OutputFormat::Dff),
+            OutputOverwritePolicy::RefuseExisting,
+        )
+        .unwrap_err();
+        let temp_path = err.temp_path().unwrap().to_path_buf();
+        assert!(!final_path.exists());
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn write_dsd_source_to_path_forced_failure_preserves_existing_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("track.dff");
+        std::fs::write(&final_path, b"existing-good-file").unwrap();
+        let mut source = PathTestSource::invalid_zero_channel();
+        let err = write_dsd_source_to_path(
+            &mut source,
+            &final_path,
+            DsdSourceExtractOptions::new(OutputFormat::Dff),
+            OutputOverwritePolicy::ReplaceExisting,
+        )
+        .unwrap_err();
+        let temp_path = err.temp_path().unwrap().to_path_buf();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"existing-good-file");
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn write_dsd_source_to_path_repeated_forced_runs_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("track.dff");
+        let mut source = PathTestSource::one_frame(2);
+        write_dsd_source_to_path(
+            &mut source,
+            &final_path,
+            DsdSourceExtractOptions::new(OutputFormat::Dff),
+            OutputOverwritePolicy::ReplaceExisting,
+        )
+        .unwrap();
+        let first = std::fs::read(&final_path).unwrap();
+
+        let mut source = PathTestSource::one_frame(2);
+        write_dsd_source_to_path(
+            &mut source,
+            &final_path,
+            DsdSourceExtractOptions::new(OutputFormat::Dff),
+            OutputOverwritePolicy::ReplaceExisting,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), first);
     }
 
 }
