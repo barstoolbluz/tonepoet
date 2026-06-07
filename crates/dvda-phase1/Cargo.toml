@@ -1,0 +1,18 @@
+[package]
+name = "dvda-phase1-bundle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+iso-isomage = ["dep:isomage"]
+
+[dependencies]
+thiserror = "1"
+isomage = { version = "2.1", optional = true }
+
+[dev-dependencies]
+# The fixture tests are skipped automatically when tests/fixtures/dvda is absent.

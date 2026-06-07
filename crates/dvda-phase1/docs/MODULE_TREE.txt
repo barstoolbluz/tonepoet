@@ -1,0 +1,20 @@
+src/tui/dvda/
+  mod.rs
+  error.rs
+  endian.rs
+  model.rs
+  parser.rs
+  sector.rs
+  volume/
+    mod.rs
+    dir.rs
+    iso.rs
+  ifo/
+    mod.rs
+    amg.rs
+    atsi.rs
+    samg.rs
+
+tests/
+  dvda_phase1_unit.rs       # synthetic unit coverage; no corpus required
+  dvda_phase1_fixtures.rs   # seven-disc fixture integration/AOTT assertions

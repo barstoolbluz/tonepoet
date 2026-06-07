@@ -1,0 +1,8 @@
+# Add to the crate that owns src/tui/dvda.
+
+[dependencies]
+thiserror = "1"
+isomage = { version = "2.1", optional = true }
+
+[features]
+iso-isomage = ["dep:isomage"]
