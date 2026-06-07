@@ -300,7 +300,7 @@ pub async fn realize_track_with_tool_limits(
             iso,
             track_index,
             area,
-        } => realize_sacd_track(iso, *track_index, *area, staging, cancel, progress_tracker).await,
+        } => realize_sacd_track(iso, *track_index, *area, &req.settings.target_format, staging, cancel, progress_tracker).await,
     }
 }
 
@@ -913,6 +913,7 @@ async fn realize_sacd_track(
     iso: &Path,
     track_index: u32,
     area: SacdArea,
+    target_format: &tonepoet_pipeline::AudioFormat,
     staging: &StagingDir,
     cancel: &CancellationToken,
     progress_tracker: Option<&mut OperationProgressTracker<'_>>,
@@ -929,6 +930,7 @@ async fn realize_sacd_track(
 
     let iso = iso.to_path_buf();
     let staging_root = staging.root.clone();
+    let target_format = target_format.clone();
 
     let output = match progress_tracker {
         Some(tracker) => {
@@ -936,8 +938,9 @@ async fn realize_sacd_track(
                 async {
                     let iso = iso.clone();
                     let staging_root = staging_root.clone();
+                    let target_format = target_format.clone();
                     tokio::task::spawn_blocking(move || {
-                        realize_sacd_track_blocking(&iso, track_index, area, &staging_root)
+                        realize_sacd_track_blocking(&iso, track_index, area, &target_format, &staging_root)
                     })
                     .await
                     .map_err(|err| {
@@ -952,7 +955,7 @@ async fn realize_sacd_track(
             .await?
         }
         None => tokio::task::spawn_blocking(move || {
-            realize_sacd_track_blocking(&iso, track_index, area, &staging_root)
+            realize_sacd_track_blocking(&iso, track_index, area, &target_format, &staging_root)
         })
         .await
         .map_err(|err| ConvertError::Realize(format!("SACD extraction task failed: {err}")))??,
@@ -969,6 +972,7 @@ fn realize_sacd_track_blocking(
     iso: &Path,
     track_index: u32,
     area: SacdArea,
+    target_format: &tonepoet_pipeline::AudioFormat,
     staging_root: &Path,
 ) -> Result<PathBuf, ConvertError> {
     let metadata = parse_sacd_iso(iso).map_err(sacd_error_to_convert)?;
@@ -1009,12 +1013,20 @@ fn realize_sacd_track_blocking(
             ConvertError::TrackValidation("SACD track sector range overflows".to_string())
         })?;
 
+    let output_format = match target_format {
+        tonepoet_pipeline::AudioFormat::Dff => OutputFormat::Dff,
+        _ => OutputFormat::Dsf,
+    };
+    let output_ext = match output_format {
+        OutputFormat::Dff => "dff",
+        _ => "dsf",
+    };
+
     let realized_dir = staging_root.join("realized-sacd-tracks");
     fs::create_dir_all(&realized_dir)?;
-    let expectation = DsfExpectation::from_area(area_info, entry.duration);
-    let out_path = realized_dir.join(sacd_track_output_name(iso, area, track_index, entry));
+    let out_path = realized_dir.join(sacd_track_output_name(iso, area, track_index, entry, output_ext));
 
-    if dsf_output_is_ready_for(&out_path, expectation) {
+    if sacd_output_is_ready(&out_path, output_format, area_info, entry.duration) {
         return Ok(out_path);
     }
 
@@ -1034,7 +1046,7 @@ fn realize_sacd_track_blocking(
             start_lsn,
             end_lsn,
             area_info.header.channel_count,
-            OutputFormat::Dsf,
+            output_format,
         );
         let stats = extract_track(&mut iso_reader, &mut writer, options).map_err(|err| {
             ConvertError::Realize(format!(
@@ -1046,7 +1058,7 @@ fn realize_sacd_track_blocking(
         writer.sync_all()?;
         drop(writer);
 
-        validate_sacd_realization(&tmp_path, area_info, entry.duration, stats)?;
+        validate_sacd_realization(&tmp_path, output_format, area_info, entry.duration, stats)?;
         Ok(())
     })();
 
@@ -1098,6 +1110,7 @@ fn sacd_track_output_name(
     area: SacdArea,
     track_index: u32,
     entry: &TrackEntry,
+    ext: &str,
 ) -> String {
     let stem = sanitize_segment_component(
         iso.file_stem()
@@ -1106,7 +1119,7 @@ fn sacd_track_output_name(
     );
     let path_hash = stable_path_hash(iso);
     format!(
-        "{stem}_{path_hash:016x}_{}_track_{:03}_{:08x}_{:08x}.dsf",
+        "{stem}_{path_hash:016x}_{}_track_{:03}_{:08x}_{:08x}.{ext}",
         sacd_area_label(area),
         track_index + 1,
         entry.start_lsn,
@@ -1118,7 +1131,7 @@ fn unique_sacd_tmp_path(out_path: &Path) -> PathBuf {
     let file_name = out_path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("track.dsf");
+        .unwrap_or("track");
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
@@ -1143,6 +1156,27 @@ impl DsfExpectation {
     }
 }
 
+fn sacd_output_is_ready(
+    path: &Path,
+    format: OutputFormat,
+    area_info: &AreaInfo,
+    duration: PlayTime,
+) -> bool {
+    match format {
+        OutputFormat::Dsf => {
+            let expectation = DsfExpectation::from_area(area_info, duration);
+            dsf_output_is_ready_for(path, expectation)
+        }
+        _ => {
+            // For DFF/DFF-DST: basic existence + non-empty check.
+            // The extraction already validates via ExtractStats.
+            path.metadata()
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 struct DsfHeader {
@@ -1162,6 +1196,7 @@ fn dsf_output_is_ready_for(path: &Path, expectation: DsfExpectation) -> bool {
 
 fn validate_sacd_realization(
     path: &Path,
+    format: OutputFormat,
     area_info: &AreaInfo,
     duration: PlayTime,
     stats: ExtractStats,
@@ -1181,7 +1216,9 @@ fn validate_sacd_realization(
     }
 
     let expectation = DsfExpectation::from_area(area_info, duration);
-    validate_dsf_container(path, Some(expectation))?;
+    if matches!(format, OutputFormat::Dsf) {
+        validate_dsf_container(path, Some(expectation))?;
+    }
 
     let expected_frames = u64::from(playtime_to_frame_count(duration));
     if expected_frames > 0 {
@@ -1379,7 +1416,7 @@ pub(crate) mod sacd_stage_test_support {
             length_lsn,
             ..TrackEntry::default()
         };
-        sacd_track_output_name(path, area, track_index, &entry)
+        sacd_track_output_name(path, area, track_index, &entry, "dsf")
     }
 
     pub(crate) fn playtime_frames_for_test(minutes: u8, seconds: u8, frames: u8) -> u32 {
