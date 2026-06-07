@@ -1,0 +1,2971 @@
+[
+  {
+    "directory": "tests/fixtures/dvda/hawks_and_doves",
+    "amg": {
+      "magic": "DVDAUDIO-AMG",
+      "amg_last_sector": 13948,
+      "amgi_last_sector": 6,
+      "spec_version": "0x12",
+      "amg_category": 0,
+      "nr_of_volumes": 1,
+      "this_volume_nr": 1,
+      "disc_side": 1,
+      "nr_of_video_title_sets": 1,
+      "nr_of_audio_title_sets": 2,
+      "provider_identifier": ""
+    },
+    "samg": {
+      "magic": "DVDAUDIOSAPP",
+      "nr_of_tracks": 10,
+      "spec_version": "0x12",
+      "tracks": [
+        {
+          "entry": 1,
+          "group": 1,
+          "track": 1,
+          "first_pts": 666,
+          "len_in_pts": 12221387,
+          "duration_seconds": 135.793,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 24914,
+          "abs_last_sector": 62428
+        },
+        {
+          "entry": 2,
+          "group": 1,
+          "track": 2,
+          "first_pts": 666,
+          "len_in_pts": 41679346,
+          "duration_seconds": 463.104,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 62429,
+          "abs_last_sector": 190669
+        },
+        {
+          "entry": 3,
+          "group": 1,
+          "track": 3,
+          "first_pts": 666,
+          "len_in_pts": 23508163,
+          "duration_seconds": 261.202,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 190670,
+          "abs_last_sector": 262827
+        },
+        {
+          "entry": 4,
+          "group": 1,
+          "track": 4,
+          "first_pts": 666,
+          "len_in_pts": 16125061,
+          "duration_seconds": 179.167,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 262828,
+          "abs_last_sector": 309802
+        },
+        {
+          "entry": 5,
+          "group": 1,
+          "track": 5,
+          "first_pts": 666,
+          "len_in_pts": 12782693,
+          "duration_seconds": 142.03,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 309803,
+          "abs_last_sector": 351838
+        },
+        {
+          "entry": 6,
+          "group": 1,
+          "track": 6,
+          "first_pts": 666,
+          "len_in_pts": 13535918,
+          "duration_seconds": 150.399,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 351839,
+          "abs_last_sector": 395664
+        },
+        {
+          "entry": 7,
+          "group": 1,
+          "track": 7,
+          "first_pts": 666,
+          "len_in_pts": 12000081,
+          "duration_seconds": 133.334,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 395665,
+          "abs_last_sector": 433793
+        },
+        {
+          "entry": 8,
+          "group": 1,
+          "track": 8,
+          "first_pts": 666,
+          "len_in_pts": 14436163,
+          "duration_seconds": 160.402,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 433794,
+          "abs_last_sector": 480657
+        },
+        {
+          "entry": 9,
+          "group": 1,
+          "track": 9,
+          "first_pts": 666,
+          "len_in_pts": 18696163,
+          "duration_seconds": 207.735,
+          "zone": "AOB",
+          "group1_sample_rate": 176400,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 480658,
+          "abs_last_sector": 517426
+        },
+        {
+          "entry": 10,
+          "group": 1,
+          "track": 10,
+          "first_pts": 11257,
+          "len_in_pts": 93093,
+          "duration_seconds": 1.034,
+          "zone": "VOB",
+          "group1_sample_rate": 48000,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 794491,
+          "abs_last_sector": 794647
+        }
+      ]
+    },
+    "atsi": {
+      "ATS_01": {
+        "magic": "DVDAUDIO-ATS",
+        "ats_last_sector": 492516,
+        "atsi_last_sector": 1,
+        "spec_version": "0x12",
+        "is_audio_titleset": true,
+        "atstt_vobs_sector": 2,
+        "audio_formats": [
+          {
+            "audio_type": 256,
+            "audio_type_hex": "0x0100",
+            "group1_sample_rate": 176400,
+            "group1_bit_depth": 24,
+            "group2_sample_rate": 0,
+            "group2_bit_depth": 0,
+            "channel_assignment": 1,
+            "channel_layout": "L R",
+            "index": 0
+          }
+        ],
+        "titles": [
+          {
+            "title_number": 129,
+            "track_count": 9,
+            "index_count": 9,
+            "len_in_pts": 164984975,
+            "duration_seconds": 1833.166,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 192,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 666,
+                "len_in_pts": 12221387,
+                "duration_seconds": 135.793,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 0,
+                    "last_sector": 37514
+                  }
+                ],
+                "first_sector": 0,
+                "last_sector": 37514
+              },
+              {
+                "track_number": 2,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 666,
+                "len_in_pts": 41679346,
+                "duration_seconds": 463.104,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 37515,
+                    "last_sector": 165755
+                  }
+                ],
+                "first_sector": 37515,
+                "last_sector": 165755
+              },
+              {
+                "track_number": 3,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 3,
+                "first_pts": 666,
+                "len_in_pts": 23508163,
+                "duration_seconds": 261.202,
+                "sector_pointers": [
+                  {
+                    "index": 3,
+                    "first_sector": 165756,
+                    "last_sector": 237913
+                  }
+                ],
+                "first_sector": 165756,
+                "last_sector": 237913
+              },
+              {
+                "track_number": 4,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 4,
+                "first_pts": 666,
+                "len_in_pts": 16125061,
+                "duration_seconds": 179.167,
+                "sector_pointers": [
+                  {
+                    "index": 4,
+                    "first_sector": 237914,
+                    "last_sector": 284888
+                  }
+                ],
+                "first_sector": 237914,
+                "last_sector": 284888
+              },
+              {
+                "track_number": 5,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 5,
+                "first_pts": 666,
+                "len_in_pts": 12782693,
+                "duration_seconds": 142.03,
+                "sector_pointers": [
+                  {
+                    "index": 5,
+                    "first_sector": 284889,
+                    "last_sector": 326924
+                  }
+                ],
+                "first_sector": 284889,
+                "last_sector": 326924
+              },
+              {
+                "track_number": 6,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 6,
+                "first_pts": 666,
+                "len_in_pts": 13535918,
+                "duration_seconds": 150.399,
+                "sector_pointers": [
+                  {
+                    "index": 6,
+                    "first_sector": 326925,
+                    "last_sector": 370750
+                  }
+                ],
+                "first_sector": 326925,
+                "last_sector": 370750
+              },
+              {
+                "track_number": 7,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 7,
+                "first_pts": 666,
+                "len_in_pts": 12000081,
+                "duration_seconds": 133.334,
+                "sector_pointers": [
+                  {
+                    "index": 7,
+                    "first_sector": 370751,
+                    "last_sector": 408879
+                  }
+                ],
+                "first_sector": 370751,
+                "last_sector": 408879
+              },
+              {
+                "track_number": 8,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 8,
+                "first_pts": 666,
+                "len_in_pts": 14436163,
+                "duration_seconds": 160.402,
+                "sector_pointers": [
+                  {
+                    "index": 8,
+                    "first_sector": 408880,
+                    "last_sector": 455743
+                  }
+                ],
+                "first_sector": 408880,
+                "last_sector": 455743
+              },
+              {
+                "track_number": 9,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 9,
+                "first_pts": 666,
+                "len_in_pts": 18696163,
+                "duration_seconds": 207.735,
+                "sector_pointers": [
+                  {
+                    "index": 9,
+                    "first_sector": 455744,
+                    "last_sector": 492512
+                  }
+                ],
+                "first_sector": 455744,
+                "last_sector": 492512
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 0,
+                "last_sector": 37514
+              },
+              {
+                "index": 2,
+                "first_sector": 37515,
+                "last_sector": 165755
+              },
+              {
+                "index": 3,
+                "first_sector": 165756,
+                "last_sector": 237913
+              },
+              {
+                "index": 4,
+                "first_sector": 237914,
+                "last_sector": 284888
+              },
+              {
+                "index": 5,
+                "first_sector": 284889,
+                "last_sector": 326924
+              },
+              {
+                "index": 6,
+                "first_sector": 326925,
+                "last_sector": 370750
+              },
+              {
+                "index": 7,
+                "first_sector": 370751,
+                "last_sector": 408879
+              },
+              {
+                "index": 8,
+                "first_sector": 408880,
+                "last_sector": 455743
+              },
+              {
+                "index": 9,
+                "first_sector": 455744,
+                "last_sector": 492512
+              }
+            ]
+          }
+        ]
+      },
+      "ATS_02": {
+        "magic": "DVDAUDIO-ATS",
+        "ats_last_sector": 18,
+        "atsi_last_sector": 1,
+        "spec_version": "0x12",
+        "is_audio_titleset": false,
+        "atstt_vobs_sector": 6,
+        "audio_formats": [],
+        "titles": [
+          {
+            "title_number": 129,
+            "track_count": 1,
+            "index_count": 1,
+            "len_in_pts": 93093,
+            "duration_seconds": 1.034,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 192,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 11257,
+                "len_in_pts": 93093,
+                "duration_seconds": 1.034,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 0,
+                    "last_sector": 156
+                  }
+                ],
+                "first_sector": 0,
+                "last_sector": 156
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 0,
+                "last_sector": 156
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "cppm": {
+      "mkb_present": true,
+      "mkb_size": 3145728
+    },
+    "files": {
+      "ATS_01_0.IFO": 4096,
+      "ATS_02_0.IFO": 4096,
+      "AUDIO_PP.IFO": 131072,
+      "AUDIO_SV.IFO": 4096,
+      "AUDIO_TS.IFO": 14336,
+      "DVDAUDIO.MKB": 3145728
+    }
+  },
+  {
+    "directory": "tests/fixtures/dvda/hdad2009",
+    "amg": {
+      "magic": "DVDAUDIO-AMG",
+      "amg_last_sector": 22,
+      "amgi_last_sector": 3,
+      "spec_version": "0x10",
+      "amg_category": 0,
+      "nr_of_volumes": 1,
+      "this_volume_nr": 1,
+      "disc_side": 1,
+      "nr_of_video_title_sets": 0,
+      "nr_of_audio_title_sets": 1,
+      "provider_identifier": ""
+    },
+    "samg": {
+      "magic": "DVDAUDIOSAPP",
+      "nr_of_tracks": 5,
+      "spec_version": "0x00",
+      "tracks": [
+        {
+          "entry": 1,
+          "group": 1,
+          "track": 1,
+          "first_pts": 75,
+          "len_in_pts": 59490000,
+          "duration_seconds": 661.0,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 855,
+          "abs_last_sector": 241163
+        },
+        {
+          "entry": 2,
+          "group": 1,
+          "track": 2,
+          "first_pts": 59490075,
+          "len_in_pts": 38475000,
+          "duration_seconds": 427.5,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 241164,
+          "abs_last_sector": 397817
+        },
+        {
+          "entry": 3,
+          "group": 1,
+          "track": 3,
+          "first_pts": 75,
+          "len_in_pts": 44640000,
+          "duration_seconds": 496.0,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 397818,
+          "abs_last_sector": 586310
+        },
+        {
+          "entry": 4,
+          "group": 1,
+          "track": 4,
+          "first_pts": 44640075,
+          "len_in_pts": 45540000,
+          "duration_seconds": 506.0,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 586311,
+          "abs_last_sector": 776924
+        },
+        {
+          "entry": 5,
+          "group": 1,
+          "track": 5,
+          "first_pts": 90180075,
+          "len_in_pts": 22376099,
+          "duration_seconds": 248.623,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 776925,
+          "abs_last_sector": 865264
+        }
+      ]
+    },
+    "atsi": {
+      "ATS_01": {
+        "magic": "DVDAUDIO-ATS",
+        "ats_last_sector": 864413,
+        "atsi_last_sector": 1,
+        "spec_version": "0x10",
+        "is_audio_titleset": true,
+        "atstt_vobs_sector": 2,
+        "audio_formats": [
+          {
+            "audio_type": 256,
+            "audio_type_hex": "0x0100",
+            "group1_sample_rate": 192000,
+            "group1_bit_depth": 24,
+            "group2_sample_rate": 0,
+            "group2_bit_depth": 0,
+            "channel_assignment": 1,
+            "channel_layout": "L R",
+            "index": 0
+          }
+        ],
+        "titles": [
+          {
+            "title_number": 129,
+            "track_count": 2,
+            "index_count": 2,
+            "len_in_pts": 97965000,
+            "duration_seconds": 1088.5,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 192,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 75,
+                "len_in_pts": 59490000,
+                "duration_seconds": 661.0,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 0,
+                    "last_sector": 240308
+                  }
+                ],
+                "first_sector": 0,
+                "last_sector": 240308
+              },
+              {
+                "track_number": 2,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 59490075,
+                "len_in_pts": 38475000,
+                "duration_seconds": 427.5,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 240309,
+                    "last_sector": 396962
+                  }
+                ],
+                "first_sector": 240309,
+                "last_sector": 396962
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 0,
+                "last_sector": 240308
+              },
+              {
+                "index": 2,
+                "first_sector": 240309,
+                "last_sector": 396962
+              }
+            ]
+          },
+          {
+            "title_number": 130,
+            "track_count": 3,
+            "index_count": 3,
+            "len_in_pts": 112556099,
+            "duration_seconds": 1250.623,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 192,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 75,
+                "len_in_pts": 44640000,
+                "duration_seconds": 496.0,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 396963,
+                    "last_sector": 585455
+                  }
+                ],
+                "first_sector": 396963,
+                "last_sector": 585455
+              },
+              {
+                "track_number": 2,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 44640075,
+                "len_in_pts": 45540000,
+                "duration_seconds": 506.0,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 585456,
+                    "last_sector": 776069
+                  }
+                ],
+                "first_sector": 585456,
+                "last_sector": 776069
+              },
+              {
+                "track_number": 3,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 3,
+                "first_pts": 90180075,
+                "len_in_pts": 22376099,
+                "duration_seconds": 248.623,
+                "sector_pointers": [
+                  {
+                    "index": 3,
+                    "first_sector": 776070,
+                    "last_sector": 864409
+                  }
+                ],
+                "first_sector": 776070,
+                "last_sector": 864409
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 396963,
+                "last_sector": 585455
+              },
+              {
+                "index": 2,
+                "first_sector": 585456,
+                "last_sector": 776069
+              },
+              {
+                "index": 3,
+                "first_sector": 776070,
+                "last_sector": 864409
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "cppm": {
+      "mkb_present": false,
+      "mkb_size": 0
+    },
+    "files": {
+      "ATS_01_0.IFO": 4096,
+      "AUDIO_PP.IFO": 131072,
+      "AUDIO_SV.IFO": 4096,
+      "AUDIO_TS.IFO": 8192
+    }
+  },
+  {
+    "directory": "tests/fixtures/dvda/mgletsgetiton",
+    "amg": {
+      "magic": "DVDAUDIO-AMG",
+      "amg_last_sector": 4813,
+      "amgi_last_sector": 4,
+      "spec_version": "0x12",
+      "amg_category": 0,
+      "nr_of_volumes": 1,
+      "this_volume_nr": 1,
+      "disc_side": 1,
+      "nr_of_video_title_sets": 1,
+      "nr_of_audio_title_sets": 1,
+      "provider_identifier": ""
+    },
+    "samg": {
+      "magic": "DVDAUDIOSAPP",
+      "nr_of_tracks": 21,
+      "spec_version": "0x12",
+      "tracks": [
+        {
+          "entry": 1,
+          "group": 1,
+          "track": 9,
+          "first_pts": 585,
+          "len_in_pts": 108000,
+          "duration_seconds": 1.2,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 961845,
+          "abs_last_sector": 961950
+        },
+        {
+          "entry": 2,
+          "group": 2,
+          "track": 1,
+          "first_pts": 660,
+          "len_in_pts": 26320275,
+          "duration_seconds": 292.447,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 961951,
+          "abs_last_sector": 1061661
+        },
+        {
+          "entry": 3,
+          "group": 2,
+          "track": 2,
+          "first_pts": 660,
+          "len_in_pts": 18852675,
+          "duration_seconds": 209.474,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1061662,
+          "abs_last_sector": 1132953
+        },
+        {
+          "entry": 4,
+          "group": 2,
+          "track": 3,
+          "first_pts": 18853335,
+          "len_in_pts": 21761025,
+          "duration_seconds": 241.789,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1132954,
+          "abs_last_sector": 1214103
+        },
+        {
+          "entry": 5,
+          "group": 2,
+          "track": 4,
+          "first_pts": 660,
+          "len_in_pts": 17412675,
+          "duration_seconds": 193.474,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1214104,
+          "abs_last_sector": 1280649
+        },
+        {
+          "entry": 6,
+          "group": 2,
+          "track": 5,
+          "first_pts": 660,
+          "len_in_pts": 14660475,
+          "duration_seconds": 162.894,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1280650,
+          "abs_last_sector": 1337375
+        },
+        {
+          "entry": 7,
+          "group": 2,
+          "track": 6,
+          "first_pts": 660,
+          "len_in_pts": 23115825,
+          "duration_seconds": 256.842,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1337376,
+          "abs_last_sector": 1425291
+        },
+        {
+          "entry": 8,
+          "group": 2,
+          "track": 7,
+          "first_pts": 660,
+          "len_in_pts": 25695000,
+          "duration_seconds": 285.5,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1425292,
+          "abs_last_sector": 1523933
+        },
+        {
+          "entry": 9,
+          "group": 2,
+          "track": 8,
+          "first_pts": 660,
+          "len_in_pts": 23980050,
+          "duration_seconds": 266.445,
+          "zone": "AOB",
+          "group1_sample_rate": 192000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1523934,
+          "abs_last_sector": 1612362
+        },
+        {
+          "entry": 10,
+          "group": 2,
+          "track": 9,
+          "first_pts": 585,
+          "len_in_pts": 108000,
+          "duration_seconds": 1.2,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1612363,
+          "abs_last_sector": 1612468
+        },
+        {
+          "entry": 11,
+          "group": 3,
+          "track": 1,
+          "first_pts": 585,
+          "len_in_pts": 13385925,
+          "duration_seconds": 148.732,
+          "zone": "AOB",
+          "group1_sample_rate": 48000,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1612469,
+          "abs_last_sector": 1626747
+        },
+        {
+          "entry": 12,
+          "group": 3,
+          "track": 2,
+          "first_pts": 585,
+          "len_in_pts": 108000,
+          "duration_seconds": 1.2,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1626748,
+          "abs_last_sector": 1626853
+        },
+        {
+          "entry": 13,
+          "group": 4,
+          "track": 1,
+          "first_pts": 585,
+          "len_in_pts": 2630938,
+          "duration_seconds": 29.233,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1626854,
+          "abs_last_sector": 1629432
+        },
+        {
+          "entry": 14,
+          "group": 4,
+          "track": 2,
+          "first_pts": 585,
+          "len_in_pts": 3068979,
+          "duration_seconds": 34.1,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1629433,
+          "abs_last_sector": 1632440
+        },
+        {
+          "entry": 15,
+          "group": 4,
+          "track": 3,
+          "first_pts": 585,
+          "len_in_pts": 2825959,
+          "duration_seconds": 31.4,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1632441,
+          "abs_last_sector": 1635210
+        },
+        {
+          "entry": 16,
+          "group": 4,
+          "track": 4,
+          "first_pts": 585,
+          "len_in_pts": 2906938,
+          "duration_seconds": 32.299,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1635211,
+          "abs_last_sector": 1638059
+        },
+        {
+          "entry": 17,
+          "group": 4,
+          "track": 5,
+          "first_pts": 585,
+          "len_in_pts": 2936897,
+          "duration_seconds": 32.632,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1638060,
+          "abs_last_sector": 1640938
+        },
+        {
+          "entry": 18,
+          "group": 4,
+          "track": 6,
+          "first_pts": 585,
+          "len_in_pts": 3077959,
+          "duration_seconds": 34.2,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1640939,
+          "abs_last_sector": 1643955
+        },
+        {
+          "entry": 19,
+          "group": 4,
+          "track": 7,
+          "first_pts": 585,
+          "len_in_pts": 2904000,
+          "duration_seconds": 32.267,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1643956,
+          "abs_last_sector": 1646801
+        },
+        {
+          "entry": 20,
+          "group": 4,
+          "track": 8,
+          "first_pts": 585,
+          "len_in_pts": 3032979,
+          "duration_seconds": 33.7,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1646802,
+          "abs_last_sector": 1649774
+        },
+        {
+          "entry": 21,
+          "group": 4,
+          "track": 9,
+          "first_pts": 585,
+          "len_in_pts": 108000,
+          "duration_seconds": 1.2,
+          "zone": "AOB",
+          "group1_sample_rate": 44100,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1626748,
+          "abs_last_sector": 1626853
+        }
+      ]
+    },
+    "atsi": {
+      "ATS_01": {
+        "magic": "DVDAUDIO-ATS",
+        "ats_last_sector": 1628268,
+        "atsi_last_sector": 3,
+        "spec_version": "0x12",
+        "is_audio_titleset": true,
+        "atstt_vobs_sector": 4,
+        "audio_formats": [
+          {
+            "audio_type": 256,
+            "audio_type_hex": "0x0100",
+            "group1_sample_rate": 96000,
+            "group1_bit_depth": 24,
+            "group2_sample_rate": 96000,
+            "group2_bit_depth": 24,
+            "channel_assignment": 19,
+            "channel_layout": "L R C Ls Rs + L R C",
+            "index": 0
+          },
+          {
+            "audio_type": 256,
+            "audio_type_hex": "0x0100",
+            "group1_sample_rate": 192000,
+            "group1_bit_depth": 24,
+            "group2_sample_rate": 0,
+            "group2_bit_depth": 0,
+            "channel_assignment": 1,
+            "channel_layout": "L R",
+            "index": 2
+          }
+        ],
+        "titles": [
+          {
+            "title_number": 129,
+            "track_count": 8,
+            "index_count": 8,
+            "len_in_pts": 171967275,
+            "duration_seconds": 1910.747,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 192,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 660,
+                "len_in_pts": 26300925,
+                "duration_seconds": 292.233,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 0,
+                    "last_sector": 144105
+                  }
+                ],
+                "first_sector": 0,
+                "last_sector": 144105
+              },
+              {
+                "track_number": 2,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 660,
+                "len_in_pts": 18890475,
+                "duration_seconds": 209.894,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 144106,
+                    "last_sector": 247637
+                  }
+                ],
+                "first_sector": 144106,
+                "last_sector": 247637
+              },
+              {
+                "track_number": 3,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 3,
+                "first_pts": 18891135,
+                "len_in_pts": 21732675,
+                "duration_seconds": 241.474,
+                "sector_pointers": [
+                  {
+                    "index": 3,
+                    "first_sector": 247638,
+                    "last_sector": 366370
+                  }
+                ],
+                "first_sector": 247638,
+                "last_sector": 366370
+              },
+              {
+                "track_number": 4,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 4,
+                "first_pts": 660,
+                "len_in_pts": 17436300,
+                "duration_seconds": 193.737,
+                "sector_pointers": [
+                  {
+                    "index": 4,
+                    "first_sector": 366371,
+                    "last_sector": 462335
+                  }
+                ],
+                "first_sector": 366371,
+                "last_sector": 462335
+              },
+              {
+                "track_number": 5,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 5,
+                "first_pts": 660,
+                "len_in_pts": 14651025,
+                "duration_seconds": 162.789,
+                "sector_pointers": [
+                  {
+                    "index": 5,
+                    "first_sector": 462336,
+                    "last_sector": 544130
+                  }
+                ],
+                "first_sector": 462336,
+                "last_sector": 544130
+              },
+              {
+                "track_number": 6,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 6,
+                "first_pts": 660,
+                "len_in_pts": 23103975,
+                "duration_seconds": 256.711,
+                "sector_pointers": [
+                  {
+                    "index": 6,
+                    "first_sector": 544131,
+                    "last_sector": 669722
+                  }
+                ],
+                "first_sector": 544131,
+                "last_sector": 669722
+              },
+              {
+                "track_number": 7,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 7,
+                "first_pts": 660,
+                "len_in_pts": 25692600,
+                "duration_seconds": 285.473,
+                "sector_pointers": [
+                  {
+                    "index": 7,
+                    "first_sector": 669723,
+                    "last_sector": 812436
+                  }
+                ],
+                "first_sector": 669723,
+                "last_sector": 812436
+              },
+              {
+                "track_number": 8,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 8,
+                "first_pts": 660,
+                "len_in_pts": 24159300,
+                "duration_seconds": 268.437,
+                "sector_pointers": [
+                  {
+                    "index": 8,
+                    "first_sector": 812437,
+                    "last_sector": 940330
+                  }
+                ],
+                "first_sector": 812437,
+                "last_sector": 940330
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 0,
+                "last_sector": 144105
+              },
+              {
+                "index": 2,
+                "first_sector": 144106,
+                "last_sector": 247637
+              },
+              {
+                "index": 3,
+                "first_sector": 247638,
+                "last_sector": 366370
+              },
+              {
+                "index": 4,
+                "first_sector": 366371,
+                "last_sector": 462335
+              },
+              {
+                "index": 5,
+                "first_sector": 462336,
+                "last_sector": 544130
+              },
+              {
+                "index": 6,
+                "first_sector": 544131,
+                "last_sector": 669722
+              },
+              {
+                "index": 7,
+                "first_sector": 669723,
+                "last_sector": 812436
+              },
+              {
+                "index": 8,
+                "first_sector": 812437,
+                "last_sector": 940330
+              }
+            ]
+          },
+          {
+            "title_number": 130,
+            "track_count": 1,
+            "index_count": 1,
+            "len_in_pts": 108000,
+            "duration_seconds": 1.2,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 200,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 585,
+                "len_in_pts": 108000,
+                "duration_seconds": 1.2,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 940331,
+                    "last_sector": 940436
+                  }
+                ],
+                "first_sector": 940331,
+                "last_sector": 940436
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 940331,
+                "last_sector": 940436
+              }
+            ]
+          },
+          {
+            "title_number": 131,
+            "track_count": 8,
+            "index_count": 8,
+            "len_in_pts": 171798000,
+            "duration_seconds": 1908.867,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 208,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 660,
+                "len_in_pts": 26320275,
+                "duration_seconds": 292.447,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 940437,
+                    "last_sector": 1040147
+                  }
+                ],
+                "first_sector": 940437,
+                "last_sector": 1040147
+              },
+              {
+                "track_number": 2,
+                "track_type": 80,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 660,
+                "len_in_pts": 18852675,
+                "duration_seconds": 209.474,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 1040148,
+                    "last_sector": 1111439
+                  }
+                ],
+                "first_sector": 1040148,
+                "last_sector": 1111439
+              },
+              {
+                "track_number": 3,
+                "track_type": 16,
+                "downmix_matrix": -1,
+                "index_start": 3,
+                "first_pts": 18853335,
+                "len_in_pts": 21761025,
+                "duration_seconds": 241.789,
+                "sector_pointers": [
+                  {
+                    "index": 3,
+                    "first_sector": 1111440,
+                    "last_sector": 1192589
+                  }
+                ],
+                "first_sector": 1111440,
+                "last_sector": 1192589
+              },
+              {
+                "track_number": 4,
+                "track_type": 80,
+                "downmix_matrix": -1,
+                "index_start": 4,
+                "first_pts": 660,
+                "len_in_pts": 17412675,
+                "duration_seconds": 193.474,
+                "sector_pointers": [
+                  {
+                    "index": 4,
+                    "first_sector": 1192590,
+                    "last_sector": 1259135
+                  }
+                ],
+                "first_sector": 1192590,
+                "last_sector": 1259135
+              },
+              {
+                "track_number": 5,
+                "track_type": 80,
+                "downmix_matrix": -1,
+                "index_start": 5,
+                "first_pts": 660,
+                "len_in_pts": 14660475,
+                "duration_seconds": 162.894,
+                "sector_pointers": [
+                  {
+                    "index": 5,
+                    "first_sector": 1259136,
+                    "last_sector": 1315861
+                  }
+                ],
+                "first_sector": 1259136,
+                "last_sector": 1315861
+              },
+              {
+                "track_number": 6,
+                "track_type": 80,
+                "downmix_matrix": -1,
+                "index_start": 6,
+                "first_pts": 660,
+                "len_in_pts": 23115825,
+                "duration_seconds": 256.842,
+                "sector_pointers": [
+                  {
+                    "index": 6,
+                    "first_sector": 1315862,
+                    "last_sector": 1403777
+                  }
+                ],
+                "first_sector": 1315862,
+                "last_sector": 1403777
+              },
+              {
+                "track_number": 7,
+                "track_type": 80,
+                "downmix_matrix": -1,
+                "index_start": 7,
+                "first_pts": 660,
+                "len_in_pts": 25695000,
+                "duration_seconds": 285.5,
+                "sector_pointers": [
+                  {
+                    "index": 7,
+                    "first_sector": 1403778,
+                    "last_sector": 1502419
+                  }
+                ],
+                "first_sector": 1403778,
+                "last_sector": 1502419
+              },
+              {
+                "track_number": 8,
+                "track_type": 80,
+                "downmix_matrix": -1,
+                "index_start": 8,
+                "first_pts": 660,
+                "len_in_pts": 23980050,
+                "duration_seconds": 266.445,
+                "sector_pointers": [
+                  {
+                    "index": 8,
+                    "first_sector": 1502420,
+                    "last_sector": 1590848
+                  }
+                ],
+                "first_sector": 1502420,
+                "last_sector": 1590848
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 940437,
+                "last_sector": 1040147
+              },
+              {
+                "index": 2,
+                "first_sector": 1040148,
+                "last_sector": 1111439
+              },
+              {
+                "index": 3,
+                "first_sector": 1111440,
+                "last_sector": 1192589
+              },
+              {
+                "index": 4,
+                "first_sector": 1192590,
+                "last_sector": 1259135
+              },
+              {
+                "index": 5,
+                "first_sector": 1259136,
+                "last_sector": 1315861
+              },
+              {
+                "index": 6,
+                "first_sector": 1315862,
+                "last_sector": 1403777
+              },
+              {
+                "index": 7,
+                "first_sector": 1403778,
+                "last_sector": 1502419
+              },
+              {
+                "index": 8,
+                "first_sector": 1502420,
+                "last_sector": 1590848
+              }
+            ]
+          },
+          {
+            "title_number": 132,
+            "track_count": 1,
+            "index_count": 1,
+            "len_in_pts": 108000,
+            "duration_seconds": 1.2,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 200,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 585,
+                "len_in_pts": 108000,
+                "duration_seconds": 1.2,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 1590849,
+                    "last_sector": 1590954
+                  }
+                ],
+                "first_sector": 1590849,
+                "last_sector": 1590954
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 1590849,
+                "last_sector": 1590954
+              }
+            ]
+          },
+          {
+            "title_number": 133,
+            "track_count": 2,
+            "index_count": 2,
+            "len_in_pts": 13493925,
+            "duration_seconds": 149.933,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 216,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 585,
+                "len_in_pts": 13385925,
+                "duration_seconds": 148.732,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 1590955,
+                    "last_sector": 1605233
+                  }
+                ],
+                "first_sector": 1590955,
+                "last_sector": 1605233
+              },
+              {
+                "track_number": 2,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 585,
+                "len_in_pts": 108000,
+                "duration_seconds": 1.2,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 1605234,
+                    "last_sector": 1605339
+                  }
+                ],
+                "first_sector": 1605234,
+                "last_sector": 1605339
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 1590955,
+                "last_sector": 1605233
+              },
+              {
+                "index": 2,
+                "first_sector": 1605234,
+                "last_sector": 1605339
+              }
+            ]
+          },
+          {
+            "title_number": 134,
+            "track_count": 9,
+            "index_count": 9,
+            "len_in_pts": 23492649,
+            "duration_seconds": 261.029,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 200,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 585,
+                "len_in_pts": 2630938,
+                "duration_seconds": 29.233,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 1605340,
+                    "last_sector": 1607918
+                  }
+                ],
+                "first_sector": 1605340,
+                "last_sector": 1607918
+              },
+              {
+                "track_number": 2,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 585,
+                "len_in_pts": 3068979,
+                "duration_seconds": 34.1,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 1607919,
+                    "last_sector": 1610926
+                  }
+                ],
+                "first_sector": 1607919,
+                "last_sector": 1610926
+              },
+              {
+                "track_number": 3,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 3,
+                "first_pts": 585,
+                "len_in_pts": 2825959,
+                "duration_seconds": 31.4,
+                "sector_pointers": [
+                  {
+                    "index": 3,
+                    "first_sector": 1610927,
+                    "last_sector": 1613696
+                  }
+                ],
+                "first_sector": 1610927,
+                "last_sector": 1613696
+              },
+              {
+                "track_number": 4,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 4,
+                "first_pts": 585,
+                "len_in_pts": 2906938,
+                "duration_seconds": 32.299,
+                "sector_pointers": [
+                  {
+                    "index": 4,
+                    "first_sector": 1613697,
+                    "last_sector": 1616545
+                  }
+                ],
+                "first_sector": 1613697,
+                "last_sector": 1616545
+              },
+              {
+                "track_number": 5,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 5,
+                "first_pts": 585,
+                "len_in_pts": 2936897,
+                "duration_seconds": 32.632,
+                "sector_pointers": [
+                  {
+                    "index": 5,
+                    "first_sector": 1616546,
+                    "last_sector": 1619424
+                  }
+                ],
+                "first_sector": 1616546,
+                "last_sector": 1619424
+              },
+              {
+                "track_number": 6,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 6,
+                "first_pts": 585,
+                "len_in_pts": 3077959,
+                "duration_seconds": 34.2,
+                "sector_pointers": [
+                  {
+                    "index": 6,
+                    "first_sector": 1619425,
+                    "last_sector": 1622441
+                  }
+                ],
+                "first_sector": 1619425,
+                "last_sector": 1622441
+              },
+              {
+                "track_number": 7,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 7,
+                "first_pts": 585,
+                "len_in_pts": 2904000,
+                "duration_seconds": 32.267,
+                "sector_pointers": [
+                  {
+                    "index": 7,
+                    "first_sector": 1622442,
+                    "last_sector": 1625287
+                  }
+                ],
+                "first_sector": 1622442,
+                "last_sector": 1625287
+              },
+              {
+                "track_number": 8,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 8,
+                "first_pts": 585,
+                "len_in_pts": 3032979,
+                "duration_seconds": 33.7,
+                "sector_pointers": [
+                  {
+                    "index": 8,
+                    "first_sector": 1625288,
+                    "last_sector": 1628260
+                  }
+                ],
+                "first_sector": 1625288,
+                "last_sector": 1628260
+              },
+              {
+                "track_number": 9,
+                "track_type": 200,
+                "downmix_matrix": -1,
+                "index_start": 9,
+                "first_pts": 585,
+                "len_in_pts": 108000,
+                "duration_seconds": 1.2,
+                "sector_pointers": [
+                  {
+                    "index": 9,
+                    "first_sector": 1605234,
+                    "last_sector": 1605339
+                  }
+                ],
+                "first_sector": 1605234,
+                "last_sector": 1605339
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 1605340,
+                "last_sector": 1607918
+              },
+              {
+                "index": 2,
+                "first_sector": 1607919,
+                "last_sector": 1610926
+              },
+              {
+                "index": 3,
+                "first_sector": 1610927,
+                "last_sector": 1613696
+              },
+              {
+                "index": 4,
+                "first_sector": 1613697,
+                "last_sector": 1616545
+              },
+              {
+                "index": 5,
+                "first_sector": 1616546,
+                "last_sector": 1619424
+              },
+              {
+                "index": 6,
+                "first_sector": 1619425,
+                "last_sector": 1622441
+              },
+              {
+                "index": 7,
+                "first_sector": 1622442,
+                "last_sector": 1625287
+              },
+              {
+                "index": 8,
+                "first_sector": 1625288,
+                "last_sector": 1628260
+              },
+              {
+                "index": 9,
+                "first_sector": 1605234,
+                "last_sector": 1605339
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "cppm": {
+      "mkb_present": true,
+      "mkb_size": 3145728
+    },
+    "files": {
+      "ATS_01_0.IFO": 8192,
+      "AUDIO_PP.IFO": 131072,
+      "AUDIO_SV.IFO": 4096,
+      "AUDIO_TS.IFO": 10240,
+      "DVDAUDIO.MKB": 3145728
+    }
+  },
+  {
+    "directory": "tests/fixtures/dvda/talking_heads_77",
+    "amg": {
+      "magic": "DVDAUDIO-AMG",
+      "amg_last_sector": 62948,
+      "amgi_last_sector": 5,
+      "spec_version": "0x12",
+      "amg_category": 0,
+      "nr_of_volumes": 1,
+      "this_volume_nr": 1,
+      "disc_side": 1,
+      "nr_of_video_title_sets": 3,
+      "nr_of_audio_title_sets": 2,
+      "provider_identifier": ""
+    },
+    "samg": {
+      "magic": "DVDAUDIOSAPP",
+      "nr_of_tracks": 15,
+      "spec_version": "0x12",
+      "tracks": [
+        {
+          "entry": 1,
+          "group": 1,
+          "track": 1,
+          "first_pts": 660,
+          "len_in_pts": 15252000,
+          "duration_seconds": 169.467,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1308257,
+          "abs_last_sector": 1344002
+        },
+        {
+          "entry": 2,
+          "group": 1,
+          "track": 2,
+          "first_pts": 660,
+          "len_in_pts": 17076000,
+          "duration_seconds": 189.733,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1344003,
+          "abs_last_sector": 1383701
+        },
+        {
+          "entry": 3,
+          "group": 1,
+          "track": 3,
+          "first_pts": 17076660,
+          "len_in_pts": 16985400,
+          "duration_seconds": 188.727,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1383702,
+          "abs_last_sector": 1413960
+        },
+        {
+          "entry": 4,
+          "group": 1,
+          "track": 4,
+          "first_pts": 34062060,
+          "len_in_pts": 21237600,
+          "duration_seconds": 235.973,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1413961,
+          "abs_last_sector": 1464051
+        },
+        {
+          "entry": 5,
+          "group": 1,
+          "track": 5,
+          "first_pts": 660,
+          "len_in_pts": 9384000,
+          "duration_seconds": 104.267,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1464052,
+          "abs_last_sector": 1486616
+        },
+        {
+          "entry": 6,
+          "group": 1,
+          "track": 6,
+          "first_pts": 9384660,
+          "len_in_pts": 26055000,
+          "duration_seconds": 289.5,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1486617,
+          "abs_last_sector": 1535822
+        },
+        {
+          "entry": 7,
+          "group": 1,
+          "track": 7,
+          "first_pts": 35439660,
+          "len_in_pts": 22617000,
+          "duration_seconds": 251.3,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1535823,
+          "abs_last_sector": 1577670
+        },
+        {
+          "entry": 8,
+          "group": 1,
+          "track": 8,
+          "first_pts": 660,
+          "len_in_pts": 16392000,
+          "duration_seconds": 182.133,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1577671,
+          "abs_last_sector": 1607367
+        },
+        {
+          "entry": 9,
+          "group": 1,
+          "track": 9,
+          "first_pts": 16392660,
+          "len_in_pts": 18141000,
+          "duration_seconds": 201.567,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1607368,
+          "abs_last_sector": 1650858
+        },
+        {
+          "entry": 10,
+          "group": 1,
+          "track": 10,
+          "first_pts": 34533660,
+          "len_in_pts": 23526000,
+          "duration_seconds": 261.4,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1650859,
+          "abs_last_sector": 1693302
+        },
+        {
+          "entry": 11,
+          "group": 1,
+          "track": 11,
+          "first_pts": 660,
+          "len_in_pts": 24422400,
+          "duration_seconds": 271.36,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1693303,
+          "abs_last_sector": 1738704
+        },
+        {
+          "entry": 12,
+          "group": 1,
+          "track": 12,
+          "first_pts": 660,
+          "len_in_pts": 23865600,
+          "duration_seconds": 265.173,
+          "zone": "AOB",
+          "group1_sample_rate": 96000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1738705,
+          "abs_last_sector": 1787630
+        },
+        {
+          "entry": 13,
+          "group": 1,
+          "track": 13,
+          "first_pts": 660,
+          "len_in_pts": 15773925,
+          "duration_seconds": 175.266,
+          "zone": "AOB",
+          "group1_sample_rate": 48000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1787631,
+          "abs_last_sector": 1808010
+        },
+        {
+          "entry": 14,
+          "group": 1,
+          "track": 14,
+          "first_pts": 660,
+          "len_in_pts": 90000,
+          "duration_seconds": 1.0,
+          "zone": "AOB",
+          "group1_sample_rate": 48000,
+          "group1_bit_depth": 24,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 1808011,
+          "abs_last_sector": 1808020
+        },
+        {
+          "entry": 15,
+          "group": 2,
+          "track": 1,
+          "first_pts": 5400,
+          "len_in_pts": 93093,
+          "duration_seconds": 1.034,
+          "zone": "VOB",
+          "group1_sample_rate": 48000,
+          "group1_bit_depth": 16,
+          "group2_sample_rate": 0,
+          "group2_bit_depth": 0,
+          "channel_assignment": 1,
+          "channel_layout": "L R",
+          "abs_first_sector": 2153225,
+          "abs_last_sector": 2153328
+        }
+      ]
+    },
+    "atsi": {
+      "ATS_01": {
+        "magic": "DVDAUDIO-ATS",
+        "ats_last_sector": 1736006,
+        "atsi_last_sector": 5,
+        "spec_version": "0x12",
+        "is_audio_titleset": true,
+        "atstt_vobs_sector": 6,
+        "audio_formats": [
+          {
+            "audio_type": 256,
+            "audio_type_hex": "0x0100",
+            "group1_sample_rate": 96000,
+            "group1_bit_depth": 24,
+            "group2_sample_rate": 96000,
+            "group2_bit_depth": 24,
+            "channel_assignment": 20,
+            "channel_layout": "L R C LFE Ls Rs + L R C",
+            "index": 0
+          },
+          {
+            "audio_type": 256,
+            "audio_type_hex": "0x0100",
+            "group1_sample_rate": 96000,
+            "group1_bit_depth": 24,
+            "group2_sample_rate": 0,
+            "group2_bit_depth": 0,
+            "channel_assignment": 1,
+            "channel_layout": "L R",
+            "index": 1
+          },
+          {
+            "audio_type": 256,
+            "audio_type_hex": "0x0100",
+            "group1_sample_rate": 48000,
+            "group1_bit_depth": 24,
+            "group2_sample_rate": 0,
+            "group2_bit_depth": 0,
+            "channel_assignment": 1,
+            "channel_layout": "L R",
+            "index": 2
+          }
+        ],
+        "titles": [
+          {
+            "title_number": 129,
+            "track_count": 13,
+            "index_count": 13,
+            "len_in_pts": 250416000,
+            "duration_seconds": 2782.4,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 192,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 660,
+                "len_in_pts": 15383400,
+                "duration_seconds": 170.927,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 0,
+                    "last_sector": 78455
+                  }
+                ],
+                "first_sector": 0,
+                "last_sector": 78455
+              },
+              {
+                "track_number": 2,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 660,
+                "len_in_pts": 17019000,
+                "duration_seconds": 189.1,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 78456,
+                    "last_sector": 162389
+                  }
+                ],
+                "first_sector": 78456,
+                "last_sector": 162389
+              },
+              {
+                "track_number": 3,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 3,
+                "first_pts": 17019660,
+                "len_in_pts": 16983000,
+                "duration_seconds": 188.7,
+                "sector_pointers": [
+                  {
+                    "index": 3,
+                    "first_sector": 162390,
+                    "last_sector": 246691
+                  }
+                ],
+                "first_sector": 162390,
+                "last_sector": 246691
+              },
+              {
+                "track_number": 4,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 4,
+                "first_pts": 34002660,
+                "len_in_pts": 21192600,
+                "duration_seconds": 235.473,
+                "sector_pointers": [
+                  {
+                    "index": 4,
+                    "first_sector": 246692,
+                    "last_sector": 350933
+                  }
+                ],
+                "first_sector": 246692,
+                "last_sector": 350933
+              },
+              {
+                "track_number": 5,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 5,
+                "first_pts": 660,
+                "len_in_pts": 9351000,
+                "duration_seconds": 103.9,
+                "sector_pointers": [
+                  {
+                    "index": 5,
+                    "first_sector": 350934,
+                    "last_sector": 396283
+                  }
+                ],
+                "first_sector": 350934,
+                "last_sector": 396283
+              },
+              {
+                "track_number": 6,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 6,
+                "first_pts": 9351660,
+                "len_in_pts": 26055000,
+                "duration_seconds": 289.5,
+                "sector_pointers": [
+                  {
+                    "index": 6,
+                    "first_sector": 396284,
+                    "last_sector": 524985
+                  }
+                ],
+                "first_sector": 396284,
+                "last_sector": 524985
+              },
+              {
+                "track_number": 7,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 7,
+                "first_pts": 35406660,
+                "len_in_pts": 22239000,
+                "duration_seconds": 247.1,
+                "sector_pointers": [
+                  {
+                    "index": 7,
+                    "first_sector": 524986,
+                    "last_sector": 634628
+                  }
+                ],
+                "first_sector": 524986,
+                "last_sector": 634628
+              },
+              {
+                "track_number": 8,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 8,
+                "first_pts": 660,
+                "len_in_pts": 16346400,
+                "duration_seconds": 181.627,
+                "sector_pointers": [
+                  {
+                    "index": 8,
+                    "first_sector": 634629,
+                    "last_sector": 715315
+                  }
+                ],
+                "first_sector": 634629,
+                "last_sector": 715315
+              },
+              {
+                "track_number": 9,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 9,
+                "first_pts": 16347060,
+                "len_in_pts": 19011600,
+                "duration_seconds": 211.24,
+                "sector_pointers": [
+                  {
+                    "index": 9,
+                    "first_sector": 715316,
+                    "last_sector": 811761
+                  }
+                ],
+                "first_sector": 715316,
+                "last_sector": 811761
+              },
+              {
+                "track_number": 10,
+                "track_type": 0,
+                "downmix_matrix": -1,
+                "index_start": 10,
+                "first_pts": 35358660,
+                "len_in_pts": 23324400,
+                "duration_seconds": 259.16,
+                "sector_pointers": [
+                  {
+                    "index": 10,
+                    "first_sector": 811762,
+                    "last_sector": 923870
+                  }
+                ],
+                "first_sector": 811762,
+                "last_sector": 923870
+              },
+              {
+                "track_number": 11,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 11,
+                "first_pts": 660,
+                "len_in_pts": 25230600,
+                "duration_seconds": 280.34,
+                "sector_pointers": [
+                  {
+                    "index": 11,
+                    "first_sector": 923871,
+                    "last_sector": 1043837
+                  }
+                ],
+                "first_sector": 923871,
+                "last_sector": 1043837
+              },
+              {
+                "track_number": 12,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 12,
+                "first_pts": 660,
+                "len_in_pts": 22946400,
+                "duration_seconds": 254.96,
+                "sector_pointers": [
+                  {
+                    "index": 12,
+                    "first_sector": 1043838,
+                    "last_sector": 1157408
+                  }
+                ],
+                "first_sector": 1043838,
+                "last_sector": 1157408
+              },
+              {
+                "track_number": 13,
+                "track_type": 64,
+                "downmix_matrix": -1,
+                "index_start": 13,
+                "first_pts": 660,
+                "len_in_pts": 15333600,
+                "duration_seconds": 170.373,
+                "sector_pointers": [
+                  {
+                    "index": 13,
+                    "first_sector": 1157409,
+                    "last_sector": 1236230
+                  }
+                ],
+                "first_sector": 1157409,
+                "last_sector": 1236230
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 0,
+                "last_sector": 78455
+              },
+              {
+                "index": 2,
+                "first_sector": 78456,
+                "last_sector": 162389
+              },
+              {
+                "index": 3,
+                "first_sector": 162390,
+                "last_sector": 246691
+              },
+              {
+                "index": 4,
+                "first_sector": 246692,
+                "last_sector": 350933
+              },
+              {
+                "index": 5,
+                "first_sector": 350934,
+                "last_sector": 396283
+              },
+              {
+                "index": 6,
+                "first_sector": 396284,
+                "last_sector": 524985
+              },
+              {
+                "index": 7,
+                "first_sector": 524986,
+                "last_sector": 634628
+              },
+              {
+                "index": 8,
+                "first_sector": 634629,
+                "last_sector": 715315
+              },
+              {
+                "index": 9,
+                "first_sector": 715316,
+                "last_sector": 811761
+              },
+              {
+                "index": 10,
+                "first_sector": 811762,
+                "last_sector": 923870
+              },
+              {
+                "index": 11,
+                "first_sector": 923871,
+                "last_sector": 1043837
+              },
+              {
+                "index": 12,
+                "first_sector": 1043838,
+                "last_sector": 1157408
+              },
+              {
+                "index": 13,
+                "first_sector": 1157409,
+                "last_sector": 1236230
+              }
+            ]
+          },
+          {
+            "title_number": 1,
+            "track_count": 13,
+            "index_count": 13,
+            "len_in_pts": 250727925,
+            "duration_seconds": 2785.866,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 200,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 660,
+                "len_in_pts": 15252000,
+                "duration_seconds": 169.467,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 1236231,
+                    "last_sector": 1271976
+                  }
+                ],
+                "first_sector": 1236231,
+                "last_sector": 1271976
+              },
+              {
+                "track_number": 2,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 2,
+                "first_pts": 660,
+                "len_in_pts": 17076000,
+                "duration_seconds": 189.733,
+                "sector_pointers": [
+                  {
+                    "index": 2,
+                    "first_sector": 1271977,
+                    "last_sector": 1311675
+                  }
+                ],
+                "first_sector": 1271977,
+                "last_sector": 1311675
+              },
+              {
+                "track_number": 3,
+                "track_type": 8,
+                "downmix_matrix": -1,
+                "index_start": 3,
+                "first_pts": 17076660,
+                "len_in_pts": 16985400,
+                "duration_seconds": 188.727,
+                "sector_pointers": [
+                  {
+                    "index": 3,
+                    "first_sector": 1311676,
+                    "last_sector": 1341934
+                  }
+                ],
+                "first_sector": 1311676,
+                "last_sector": 1341934
+              },
+              {
+                "track_number": 4,
+                "track_type": 8,
+                "downmix_matrix": -1,
+                "index_start": 4,
+                "first_pts": 34062060,
+                "len_in_pts": 21237600,
+                "duration_seconds": 235.973,
+                "sector_pointers": [
+                  {
+                    "index": 4,
+                    "first_sector": 1341935,
+                    "last_sector": 1392025
+                  }
+                ],
+                "first_sector": 1341935,
+                "last_sector": 1392025
+              },
+              {
+                "track_number": 5,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 5,
+                "first_pts": 660,
+                "len_in_pts": 9384000,
+                "duration_seconds": 104.267,
+                "sector_pointers": [
+                  {
+                    "index": 5,
+                    "first_sector": 1392026,
+                    "last_sector": 1414590
+                  }
+                ],
+                "first_sector": 1392026,
+                "last_sector": 1414590
+              },
+              {
+                "track_number": 6,
+                "track_type": 8,
+                "downmix_matrix": -1,
+                "index_start": 6,
+                "first_pts": 9384660,
+                "len_in_pts": 26055000,
+                "duration_seconds": 289.5,
+                "sector_pointers": [
+                  {
+                    "index": 6,
+                    "first_sector": 1414591,
+                    "last_sector": 1463796
+                  }
+                ],
+                "first_sector": 1414591,
+                "last_sector": 1463796
+              },
+              {
+                "track_number": 7,
+                "track_type": 8,
+                "downmix_matrix": -1,
+                "index_start": 7,
+                "first_pts": 35439660,
+                "len_in_pts": 22617000,
+                "duration_seconds": 251.3,
+                "sector_pointers": [
+                  {
+                    "index": 7,
+                    "first_sector": 1463797,
+                    "last_sector": 1505644
+                  }
+                ],
+                "first_sector": 1463797,
+                "last_sector": 1505644
+              },
+              {
+                "track_number": 8,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 8,
+                "first_pts": 660,
+                "len_in_pts": 16392000,
+                "duration_seconds": 182.133,
+                "sector_pointers": [
+                  {
+                    "index": 8,
+                    "first_sector": 1505645,
+                    "last_sector": 1535341
+                  }
+                ],
+                "first_sector": 1505645,
+                "last_sector": 1535341
+              },
+              {
+                "track_number": 9,
+                "track_type": 8,
+                "downmix_matrix": -1,
+                "index_start": 9,
+                "first_pts": 16392660,
+                "len_in_pts": 18141000,
+                "duration_seconds": 201.567,
+                "sector_pointers": [
+                  {
+                    "index": 9,
+                    "first_sector": 1535342,
+                    "last_sector": 1578832
+                  }
+                ],
+                "first_sector": 1535342,
+                "last_sector": 1578832
+              },
+              {
+                "track_number": 10,
+                "track_type": 8,
+                "downmix_matrix": -1,
+                "index_start": 10,
+                "first_pts": 34533660,
+                "len_in_pts": 23526000,
+                "duration_seconds": 261.4,
+                "sector_pointers": [
+                  {
+                    "index": 10,
+                    "first_sector": 1578833,
+                    "last_sector": 1621276
+                  }
+                ],
+                "first_sector": 1578833,
+                "last_sector": 1621276
+              },
+              {
+                "track_number": 11,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 11,
+                "first_pts": 660,
+                "len_in_pts": 24422400,
+                "duration_seconds": 271.36,
+                "sector_pointers": [
+                  {
+                    "index": 11,
+                    "first_sector": 1621277,
+                    "last_sector": 1666678
+                  }
+                ],
+                "first_sector": 1621277,
+                "last_sector": 1666678
+              },
+              {
+                "track_number": 12,
+                "track_type": 72,
+                "downmix_matrix": -1,
+                "index_start": 12,
+                "first_pts": 660,
+                "len_in_pts": 23865600,
+                "duration_seconds": 265.173,
+                "sector_pointers": [
+                  {
+                    "index": 12,
+                    "first_sector": 1666679,
+                    "last_sector": 1715604
+                  }
+                ],
+                "first_sector": 1666679,
+                "last_sector": 1715604
+              },
+              {
+                "track_number": 13,
+                "track_type": 80,
+                "downmix_matrix": -1,
+                "index_start": 13,
+                "first_pts": 660,
+                "len_in_pts": 15773925,
+                "duration_seconds": 175.266,
+                "sector_pointers": [
+                  {
+                    "index": 13,
+                    "first_sector": 1715605,
+                    "last_sector": 1735984
+                  }
+                ],
+                "first_sector": 1715605,
+                "last_sector": 1735984
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 1236231,
+                "last_sector": 1271976
+              },
+              {
+                "index": 2,
+                "first_sector": 1271977,
+                "last_sector": 1311675
+              },
+              {
+                "index": 3,
+                "first_sector": 1311676,
+                "last_sector": 1341934
+              },
+              {
+                "index": 4,
+                "first_sector": 1341935,
+                "last_sector": 1392025
+              },
+              {
+                "index": 5,
+                "first_sector": 1392026,
+                "last_sector": 1414590
+              },
+              {
+                "index": 6,
+                "first_sector": 1414591,
+                "last_sector": 1463796
+              },
+              {
+                "index": 7,
+                "first_sector": 1463797,
+                "last_sector": 1505644
+              },
+              {
+                "index": 8,
+                "first_sector": 1505645,
+                "last_sector": 1535341
+              },
+              {
+                "index": 9,
+                "first_sector": 1535342,
+                "last_sector": 1578832
+              },
+              {
+                "index": 10,
+                "first_sector": 1578833,
+                "last_sector": 1621276
+              },
+              {
+                "index": 11,
+                "first_sector": 1621277,
+                "last_sector": 1666678
+              },
+              {
+                "index": 12,
+                "first_sector": 1666679,
+                "last_sector": 1715604
+              },
+              {
+                "index": 13,
+                "first_sector": 1715605,
+                "last_sector": 1735984
+              }
+            ]
+          },
+          {
+            "title_number": 130,
+            "track_count": 1,
+            "index_count": 1,
+            "len_in_pts": 90000,
+            "duration_seconds": 1.0,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 208,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 660,
+                "len_in_pts": 90000,
+                "duration_seconds": 1.0,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 1735985,
+                    "last_sector": 1735994
+                  }
+                ],
+                "first_sector": 1735985,
+                "last_sector": 1735994
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 1735985,
+                "last_sector": 1735994
+              }
+            ]
+          }
+        ]
+      },
+      "ATS_02": {
+        "magic": "DVDAUDIO-ATS",
+        "ats_last_sector": 18,
+        "atsi_last_sector": 1,
+        "spec_version": "0x12",
+        "is_audio_titleset": false,
+        "atstt_vobs_sector": 6,
+        "audio_formats": [],
+        "titles": [
+          {
+            "title_number": 129,
+            "track_count": 1,
+            "index_count": 1,
+            "len_in_pts": 93093,
+            "duration_seconds": 1.034,
+            "tracks": [
+              {
+                "track_number": 1,
+                "track_type": 192,
+                "downmix_matrix": -1,
+                "index_start": 1,
+                "first_pts": 5400,
+                "len_in_pts": 93093,
+                "duration_seconds": 1.034,
+                "sector_pointers": [
+                  {
+                    "index": 1,
+                    "first_sector": 0,
+                    "last_sector": 103
+                  }
+                ],
+                "first_sector": 0,
+                "last_sector": 103
+              }
+            ],
+            "sector_pointers": [
+              {
+                "index": 1,
+                "first_sector": 0,
+                "last_sector": 103
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "cppm": {
+      "mkb_present": true,
+      "mkb_size": 3145728
+    },
+    "files": {
+      "ATS_01_0.IFO": 12288,
+      "ATS_02_0.IFO": 4096,
+      "AUDIO_PP.IFO": 131072,
+      "AUDIO_SV.IFO": 4096,
+      "AUDIO_TS.IFO": 12288,
+      "DVDAUDIO.MKB": 3145728
+    }
+  }
+]
