@@ -740,17 +740,12 @@ impl<'a> FrameReader<'a> {
                     reason: "packet offset overflow".into(),
                 }
             })?;
-            if packet_end > sector.len() {
-                return Err(FrameError::MalformedSector {
-                    lsn,
-                    reason: format!(
-                        "packet payload [{}..{}) exceeds sector length {}",
-                        payload_offset,
-                        packet_end,
-                        sector.len()
-                    ),
-                });
-            }
+            // Clamp to sector boundary. Some real-world SACDs declare
+            // packet lengths that extend past the 2048-byte sector —
+            // the reference C extractor reads whatever fits and the
+            // extra bytes don't exist on disc. Truncate silently to
+            // match that behavior.
+            let packet_end = packet_end.min(sector.len());
 
             match packet.data_type {
                 DATA_TYPE_AUDIO => {

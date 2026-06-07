@@ -1087,7 +1087,7 @@ fn realize_sacd_track_blocking(
             &mut iso_reader,
             &mut writer,
             options,
-            ExtractIntegrityOptions::strict(),
+            ExtractIntegrityOptions::strict().with_sector_recovery(true),
         )
         .map_err(|err| {
             ConvertError::Realize(format!(

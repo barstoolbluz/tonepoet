@@ -2262,18 +2262,40 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 && app.pending_metadata_editor.is_none()
             {
                 let sel = collect_selection_for_file_ops(app);
-                let sacd_isos: Vec<std::path::PathBuf> = sel
-                    .iter()
-                    .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")))
-                    .filter(|p| super::sacd::is_sacd_iso(p))
-                    .cloned()
-                    .collect();
-                let has_audio = sel.iter().any(|p| {
-                    matches!(
-                        super::browse::classify_file(p),
+                // Look for SACD ISOs in the selection. When the
+                // selection is a directory, scan one level deep for
+                // ISOs inside it (right-click on a folder containing
+                // an ISO is the common case).
+                let mut sacd_isos: Vec<std::path::PathBuf> = Vec::new();
+                let mut has_audio = false;
+                for path in &sel {
+                    if path.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(path) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso"))
+                                    && super::sacd::is_sacd_iso(&p)
+                                {
+                                    sacd_isos.push(p);
+                                } else if matches!(
+                                    super::browse::classify_file(&p),
+                                    super::browse::EntryKind::AudioFile(_)
+                                ) {
+                                    has_audio = true;
+                                }
+                            }
+                        }
+                    } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso"))
+                        && super::sacd::is_sacd_iso(path)
+                    {
+                        sacd_isos.push(path.clone());
+                    } else if matches!(
+                        super::browse::classify_file(path),
                         super::browse::EntryKind::AudioFile(_)
-                    )
-                });
+                    ) {
+                        has_audio = true;
+                    }
+                }
 
                 if sacd_isos.len() > 1 {
                     app.set_status(":tags-mb: multiple SACD ISOs selected — select one at a time");

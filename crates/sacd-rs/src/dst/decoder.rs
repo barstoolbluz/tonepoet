@@ -348,10 +348,10 @@ fn decode_uncompressed_dst_payload(
     out: &mut [u8],
 ) -> Result<(), DstError> {
     let _marker = reader.read_bit()?;
-    let reserved = reader.read_bits(6)?;
-    if reserved != 0 {
-        return Err(DstError::MalformedFrame("invalid uncompressed DST header"));
-    }
+    // 6 reserved bits — the spec says these should be zero, but some
+    // early Japanese SACDs set non-zero values. The reference C decoder
+    // (libdstdec) ignores them, so we do the same.
+    let _reserved = reader.read_bits(6)?;
 
     for byte in out.iter_mut() {
         *byte = reader.read_bits(8)? as u8;

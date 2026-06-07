@@ -409,6 +409,10 @@ pub struct DsdSourceExtractOptions {
     pub id3_metadata: Option<Id3Metadata>,
     pub dff_metadata: Option<DffMetadata>,
     pub dst: DstExtractionOptions,
+    /// When true, DST decode failures produce a silence frame (0x55)
+    /// instead of aborting extraction. Matches the reference C
+    /// extractor's behavior of logging errors and continuing.
+    pub recover_decode_errors: bool,
 }
 
 impl DsdSourceExtractOptions {
@@ -418,6 +422,7 @@ impl DsdSourceExtractOptions {
             id3_metadata: None,
             dff_metadata: None,
             dst: DstExtractionOptions::default(),
+            recover_decode_errors: false,
         }
     }
 
@@ -428,6 +433,11 @@ impl DsdSourceExtractOptions {
 
     pub fn with_dff_metadata(mut self, metadata: DffMetadata) -> Self {
         self.dff_metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_recover_decode_errors(mut self, recover: bool) -> Self {
+        self.recover_decode_errors = recover;
         self
     }
 
@@ -444,6 +454,7 @@ impl From<&ExtractOptions> for DsdSourceExtractOptions {
             id3_metadata: opts.id3_metadata.clone(),
             dff_metadata: opts.dff_metadata.clone(),
             dst: DstExtractionOptions::default(),
+            recover_decode_errors: false,
         }
     }
 }
@@ -1104,6 +1115,7 @@ fn extract_track_impl<W: Write + Seek>(
     let mut source = IsoTrackSource::new(iso, source_opts);
     let mut sink_options = DsdSourceExtractOptions::from(&opts);
     sink_options.dst = dst_options;
+    sink_options.recover_decode_errors = integrity_options.recover_sector_errors;
     let mut report = write_dsd_source(&mut source, output, sink_options)?;
     report.integrity = ExtractIntegrityReport::from_reader_stats(source.frame_reader_stats());
     Ok(report)
@@ -1134,7 +1146,7 @@ where
             if let Some(ref meta) = opts.id3_metadata {
                 writer.set_id3_footer(render_id3v24(meta));
             }
-            let report = drain_source_decoded(source, |frame| {
+            let report = drain_source_decoded(source, opts.recover_decode_errors, |frame| {
                 writer.write_interleaved(&frame.data).map_err(ExtractError::Io)
             })?;
             writer.finish()?;
@@ -1145,7 +1157,7 @@ where
             if let Some(ref meta) = opts.dff_metadata {
                 writer.set_footer_bytes(render_dff_footer(meta));
             }
-            let report = drain_source_decoded(source, |frame| {
+            let report = drain_source_decoded(source, opts.recover_decode_errors, |frame| {
                 writer.write_frame(&frame.data).map_err(ExtractError::Io)
             })?;
             writer.finish()?;
@@ -1163,7 +1175,7 @@ where
                 if let Some(ref meta) = opts.dff_metadata {
                     writer.set_footer_bytes(render_dff_footer(meta));
                 }
-                let report = drain_source_decoded(source, |frame| {
+                let report = drain_source_decoded(source, opts.recover_decode_errors, |frame| {
                     writer.write_frame(&frame.data).map_err(ExtractError::Io)
                 })?;
                 writer.finish()?;
@@ -1200,15 +1212,46 @@ fn source_channel_count_u8(channel_count: u16) -> Result<u8, ExtractError> {
 
 fn drain_source_decoded<S, F>(
     source: &mut S,
+    recover_decode_errors: bool,
     mut write_frame: F,
 ) -> Result<ExtractReport, ExtractError>
 where
     S: DsdSource + ?Sized,
     F: FnMut(&SourceDsdFrame) -> Result<(), ExtractError>,
 {
+    use crate::dsd_file::inspect::DsdByteOrder;
+
     let mut stats = ExtractStats::default();
+    let mut integrity = ExtractIntegrityReport::default();
     while let Some(frame) = source.next_source_frame()? {
-        let decoded = frame.into_decoded_dsd()?;
+        let decoded = match frame.into_decoded_dsd() {
+            Ok(d) => d,
+            Err(err) if recover_decode_errors => {
+                // DST decode failed — write DSD silence (0x55, alternating
+                // bits) for the expected frame size and continue. Matches the
+                // reference C extractor's behavior of logging errors and not
+                // aborting. The silence frame preserves frame count and
+                // duration so downstream validation doesn't drift.
+                eprintln!("DST decode error (recovered with silence): {err}");
+                integrity.frames_dropped_incomplete += 1;
+                let info = source.source_info();
+                let silence_len = expected_decoded_frame_len(info.channel_count, info.sample_rate);
+                let silence_frame = SourceDsdFrame {
+                    data: vec![0x55u8; silence_len],
+                    frame_index: stats.frames_read,
+                    channel_count: info.channel_count,
+                    sample_rate: info.sample_rate,
+                    byte_order: DsdByteOrder::MsbFirst,
+                    timecode: None,
+                    is_final: false,
+                };
+                write_frame(&silence_frame)?;
+                stats.frames_read += 1;
+                stats.audio_bytes += silence_len as u64;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         write_frame(&decoded)?;
         stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
             ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract frame counter overflow"))
@@ -1217,7 +1260,15 @@ where
             ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract byte counter overflow"))
         })?;
     }
-    Ok(ExtractReport { stats, integrity: ExtractIntegrityReport::default(), dff_dst: None })
+    Ok(ExtractReport { stats, integrity, dff_dst: None })
+}
+
+/// Expected decoded frame size in bytes for a given channel count and sample rate.
+fn expected_decoded_frame_len(channel_count: u16, sample_rate: u32) -> usize {
+    use crate::frame::FRAME_SIZE_UNCOMPRESSED;
+    let channels = channel_count as usize;
+    let rate_multiplier = (sample_rate / 44_100).max(64) / 64;
+    FRAME_SIZE_UNCOMPRESSED * channels * rate_multiplier as usize
 }
 
 fn drain_source_to_dff_dst<S, W>(
