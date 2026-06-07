@@ -1999,6 +1999,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                 bytes_in: None,
                 bytes_out: None,
                 duration: None,
+                dsd_dst_stats: None,
             },
             artifact: None,
             ok: false,

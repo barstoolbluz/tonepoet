@@ -562,6 +562,90 @@ pub enum TrackOutcome {
     Err(String),
 }
 
+
+/// DSD/DST operation counters carried through reports and durable logs.
+///
+/// The app fills this from sacd-rs extraction reports when available and from
+/// source-independent DSF/DSDIFF validation when a track enters or leaves the
+/// planner as a standalone DSD file. Zero fields are meaningful: for example, a
+/// DSF -> FLAC conversion can have frames read but no DSD frames emitted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DsdDstPipelineStats {
+    #[serde(default)]
+    pub frames_read: u64,
+    #[serde(default)]
+    pub frames_decoded: u64,
+    #[serde(default)]
+    pub frames_emitted: u64,
+    #[serde(default)]
+    pub crc_checked: u64,
+    #[serde(default)]
+    pub crc_passed: u64,
+    #[serde(default)]
+    pub crc_failed: u64,
+    #[serde(default)]
+    pub crc_missing: u64,
+    #[serde(default)]
+    pub dst_passthrough_frames: u64,
+    #[serde(default)]
+    pub dst_decoded_frames: u64,
+    #[serde(default)]
+    pub dst_reencoded_frames: u64,
+    #[serde(default)]
+    pub dst_raw_fallback_frames: u64,
+    #[serde(default)]
+    pub bytes_read: u64,
+    #[serde(default)]
+    pub bytes_written: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_error_frame: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_error_offset: Option<u64>,
+}
+
+impl DsdDstPipelineStats {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.frames_read == 0
+            && self.frames_decoded == 0
+            && self.frames_emitted == 0
+            && self.crc_checked == 0
+            && self.crc_passed == 0
+            && self.crc_failed == 0
+            && self.crc_missing == 0
+            && self.dst_passthrough_frames == 0
+            && self.dst_decoded_frames == 0
+            && self.dst_reencoded_frames == 0
+            && self.dst_raw_fallback_frames == 0
+            && self.bytes_read == 0
+            && self.bytes_written == 0
+            && self.first_error_frame.is_none()
+            && self.first_error_offset.is_none()
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.frames_read = self.frames_read.saturating_add(other.frames_read);
+        self.frames_decoded = self.frames_decoded.saturating_add(other.frames_decoded);
+        self.frames_emitted = self.frames_emitted.saturating_add(other.frames_emitted);
+        self.crc_checked = self.crc_checked.saturating_add(other.crc_checked);
+        self.crc_passed = self.crc_passed.saturating_add(other.crc_passed);
+        self.crc_failed = self.crc_failed.saturating_add(other.crc_failed);
+        self.crc_missing = self.crc_missing.saturating_add(other.crc_missing);
+        self.dst_passthrough_frames = self.dst_passthrough_frames.saturating_add(other.dst_passthrough_frames);
+        self.dst_decoded_frames = self.dst_decoded_frames.saturating_add(other.dst_decoded_frames);
+        self.dst_reencoded_frames = self.dst_reencoded_frames.saturating_add(other.dst_reencoded_frames);
+        self.dst_raw_fallback_frames = self.dst_raw_fallback_frames.saturating_add(other.dst_raw_fallback_frames);
+        self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
+        self.bytes_written = self.bytes_written.saturating_add(other.bytes_written);
+        if self.first_error_frame.is_none() {
+            self.first_error_frame = other.first_error_frame;
+        }
+        if self.first_error_offset.is_none() {
+            self.first_error_offset = other.first_error_offset;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackRecord {
     pub track_id: TrackId,
@@ -573,6 +657,8 @@ pub struct TrackRecord {
     pub bytes_in: Option<u64>,
     pub bytes_out: Option<u64>,
     pub duration: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsd_dst_stats: Option<DsdDstPipelineStats>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,6 +685,8 @@ pub enum StageOutcome {
 pub struct StageRecord {
     pub stage: PipelineStage,
     pub outcome: StageOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsd_dst_stats: Option<DsdDstPipelineStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

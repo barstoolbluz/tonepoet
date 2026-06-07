@@ -44,7 +44,7 @@ pub use ops::{
 pub use policy::{DsdFileReadPolicies, DsdiffIndexValidationPolicy, DstCrcValidationPolicy};
 pub use reader::{
     open_dsd_as_decoded_reader, open_dsd_file, DsdChannelFrame, DsdDecodedFileReader,
-    DsdFileReader, DsdFrame, DsdFrameReader, DsdFrameSeek, DsdReadError, DsfStreamReader,
+    DsdFileReader, DsdFrame, DsdFrameReader, DsdFrameRef, DsdFrameSeek, DsdReadError, DsfStreamReader,
     DsdDsdiffStreamReader, DstCrcStatus, DstDsdiffStreamReader, DstFrame, DstFrameReader,
     DstToDsdAdapter,
 };

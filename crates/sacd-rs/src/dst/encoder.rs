@@ -14,7 +14,7 @@
 //! acceptance must be proven by an acceptance gate before UI or release copy
 //! claims more.
 
-use super::decoder::decode_frame;
+use super::decoder::{decode_frame_with_rate, DstRate};
 use super::tables::{
     log2_floor_usize, prob_dst_x_bit, FRAME_BITS_PER_CHANNEL, FRAME_BYTES_PER_CHANNEL,
     MAX_CHANNELS, MAX_TABLE_LEN,
@@ -44,6 +44,10 @@ const PRESCREEN_MIN_TRANSITION_PERCENT: u32 = 48;
 pub enum DstEncodeError {
     /// DST frame helpers support one to six DSD channels.
     InvalidChannelCount { channel_count: u8 },
+    /// DSDIFF/DST frame helpers support DSD64, DSD128, and DSD256 only.
+    UnsupportedRate { sample_rate: u32 },
+    /// Predictive DST coding is not verified for this rate/channel layout.
+    PredictiveUnsupportedLayout { channel_count: u8, rate: DstRate },
     /// The caller supplied a frame whose byte count does not match one full
     /// DST frame for the declared channel count.
     InvalidFrameLength { expected: usize, actual: usize },
@@ -74,6 +78,17 @@ impl fmt::Display for DstEncodeError {
                     channel_count, MAX_CHANNELS
                 )
             }
+            Self::UnsupportedRate { sample_rate } => write!(
+                f,
+                "unsupported DST sample rate {}; expected DSD64, DSD128, or DSD256",
+                sample_rate
+            ),
+            Self::PredictiveUnsupportedLayout { channel_count, rate } => write!(
+                f,
+                "predictive DST generation for {} channel(s) at {} Hz is unavailable; legal source-DST can still be decoded or passed through, caller-supplied encoded DST can still be written, and raw fallback requires explicit opt-in",
+                channel_count,
+                rate.sample_rate()
+            ),
             Self::InvalidFrameLength { expected, actual } => {
                 write!(f, "invalid DST frame length {}; expected {} bytes", actual, expected)
             }
@@ -118,6 +133,9 @@ pub enum DstEncodeFailureClass {
     /// Predictive DST coding is not implemented for the requested channel
     /// layout.
     PredictiveUnsupportedChannelCount,
+    /// Predictive DST coding is not verified for the requested rate/channel
+    /// layout.
+    PredictiveUnsupportedLayout,
     /// Predictive coding produced only candidates that were absent,
     /// pre-screened, larger than raw DST syntax, or smaller by less than the
     /// configured savings threshold.
@@ -135,8 +153,10 @@ impl DstEncodeError {
     pub fn failure_class(&self) -> DstEncodeFailureClass {
         match self {
             Self::InvalidChannelCount { .. }
+            | Self::UnsupportedRate { .. }
             | Self::InvalidFrameLength { .. }
             | Self::InvalidPredictionOrder { .. } => DstEncodeFailureClass::InvalidInput,
+            Self::PredictiveUnsupportedLayout { .. } => DstEncodeFailureClass::PredictiveUnsupportedLayout,
             Self::PredictiveUnsupportedChannelCount { .. } => {
                 DstEncodeFailureClass::PredictiveUnsupportedChannelCount
             }
@@ -428,50 +448,120 @@ impl DstFrameEncodeTelemetry {
     }
 }
 
-/// Number of interleaved DSD bytes in a full DST frame for `channel_count`.
+/// Writer/encoder operation whose legal layout differs from the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DstPolicyScope {
+    /// DSDIFF/DST container construction and metadata.
+    Container,
+    /// Existing source-DST payload preserved byte-for-byte.
+    SourceDstPassthrough,
+    /// Encoded DST payload supplied directly by the caller.
+    CallerSuppliedDst,
+    /// Explicit raw `DSTCoded = 0` fallback frame.
+    RawFallback,
+    /// Newly generated predictive DST payload.
+    PredictiveGeneration,
+}
+
+/// Parse a DSDIFF/DST sample rate into DST frame geometry.
+pub fn dst_rate_from_sample_rate(sample_rate: u32) -> Result<DstRate, DstEncodeError> {
+    DstRate::from_sample_rate(sample_rate).map_err(|_| DstEncodeError::UnsupportedRate { sample_rate })
+}
+
+/// Number of interleaved DSD bytes in a full DSD64 DST frame for `channel_count`.
 ///
-/// DST/SACD frames carry 37,632 one-bit samples per channel at DSD64, i.e.
-/// 4,704 bytes per channel. The byte layout expected here is the same clustered
-/// MSB-first interleaving used by SACD sectors and DSDIFF/DSD payloads:
-/// `ch0_byte0, ch1_byte0, ..., chN_byte0, ch0_byte1, ...`.
+/// This preserves the historical SACD-oriented helper. Use
+/// [`dst_interleaved_frame_len_for_rate`] for DSD128/DSD256 DSDIFF/DST.
 pub fn dst_interleaved_frame_len(channel_count: u8) -> Result<usize, DstEncodeError> {
+    dst_interleaved_frame_len_for_rate(DstRate::Dsd64, channel_count)
+}
+
+/// Number of interleaved DSD bytes in a full DST frame at `rate`.
+///
+/// A DST frame carries `588 * Fs44` one-bit samples per channel. The byte layout
+/// expected here is the same clustered MSB-first interleaving used by SACD
+/// sectors and DSDIFF/DSD payloads: `ch0_byte0, ch1_byte0, ..., chN_byte0,
+/// ch0_byte1, ...`.
+pub fn dst_interleaved_frame_len_for_rate(
+    rate: DstRate,
+    channel_count: u8,
+) -> Result<usize, DstEncodeError> {
     validate_channel_count(channel_count)?;
-    Ok(FRAME_BYTES_PER_CHANNEL * usize::from(channel_count))
+    dst_frame_bytes_per_channel(rate)
+        .and_then(|per_channel| per_channel.checked_mul(usize::from(channel_count)))
+        .ok_or(DstEncodeError::InvalidFrameLength {
+            expected: usize::MAX,
+            actual: usize::MAX,
+        })
 }
 
 /// Returns true for legal DST container/read/decode/passthrough channel counts.
 ///
 /// DST syntax and the in-tree decoder support channel counts 1 through 6. This
-/// is intentionally broader than predictive generation support: a legal
-/// source-DST frame may be decoded or passed through even when this crate cannot
-/// yet prove newly generated predictive DST for that layout.
+/// is intentionally wider than predictive generation support: a legal source-DST
+/// frame may be decoded or passed through even when this crate cannot yet prove
+/// newly generated predictive DST for that layout.
 pub fn is_legal_dst_channel_count(channel_count: u8) -> bool {
     (1..=MAX_COMPRESSED_CHANNELS).contains(&channel_count)
 }
 
-/// Returns true for channel counts accepted by explicit raw `DSTCoded = 0`
-/// fallback helpers.
-///
-/// Raw fallback is never implicit. It is an explicit compatibility/test mode,
-/// currently limited to the same legal 1-through-6 DST channel-count range as
-/// container validation and decode support.
-pub fn supports_raw_dst_fallback_channel_count(channel_count: u8) -> bool {
-    is_legal_dst_channel_count(channel_count)
+/// Returns true when `scope` supports `rate` and `channel_count`.
+pub fn supports_dst_policy(scope: DstPolicyScope, rate: DstRate, channel_count: u8) -> bool {
+    match validate_dst_policy(scope, rate, channel_count) {
+        Ok(()) => true,
+        Err(_) => false,
+    }
 }
 
-/// Returns true for channel counts this crate can generate as verified
+/// Validate the independent DST support policy for an operation.
+pub fn validate_dst_policy(
+    scope: DstPolicyScope,
+    rate: DstRate,
+    channel_count: u8,
+) -> Result<(), DstEncodeError> {
+    validate_channel_count(channel_count)?;
+    match scope {
+        DstPolicyScope::Container
+        | DstPolicyScope::SourceDstPassthrough
+        | DstPolicyScope::CallerSuppliedDst
+        | DstPolicyScope::RawFallback => Ok(()),
+        DstPolicyScope::PredictiveGeneration => {
+            if rate == DstRate::Dsd64 && supports_predictive_channel_count(channel_count) {
+                Ok(())
+            } else {
+                Err(DstEncodeError::PredictiveUnsupportedLayout { channel_count, rate })
+            }
+        }
+    }
+}
+
+/// Returns true for rate/channel layouts accepted by explicit raw `DSTCoded = 0`
+/// fallback helpers.
+pub fn supports_raw_dst_fallback_layout(rate: DstRate, channel_count: u8) -> bool {
+    supports_dst_policy(DstPolicyScope::RawFallback, rate, channel_count)
+}
+
+/// Returns true for channel counts accepted by explicit raw `DSTCoded = 0`
+/// fallback helpers at DSD64.
+pub fn supports_raw_dst_fallback_channel_count(channel_count: u8) -> bool {
+    supports_raw_dst_fallback_layout(DstRate::Dsd64, channel_count)
+}
+
+/// Returns true for rate/channel layouts this crate can generate as verified
 /// predictive DST.
-///
-/// Predictive generation is intentionally narrower than container/decode/
-/// passthrough support. The current in-tree predictive encoder is treated as
-/// verified only for stereo and six-channel layouts.
+pub fn supports_predictive_dst_layout(rate: DstRate, channel_count: u8) -> bool {
+    supports_dst_policy(DstPolicyScope::PredictiveGeneration, rate, channel_count)
+}
+
+/// Returns true for DSD64 channel counts this crate can generate as verified
+/// predictive DST.
 pub fn supports_predictive_dst_channel_count(channel_count: u8) -> bool {
-    supports_predictive_channel_count(channel_count)
+    supports_predictive_dst_layout(DstRate::Dsd64, channel_count)
 }
 
 /// Compatibility alias for callers that previously used this predicate for
-/// generated DSDIFF/DST output. It means verified predictive generation support,
-/// not legal container/read/decode/passthrough support.
+/// generated DSDIFF/DST output. It means verified DSD64 predictive generation
+/// support, not legal container/read/decode/passthrough support.
 pub fn supports_verified_dst_channel_count(channel_count: u8) -> bool {
     supports_predictive_dst_channel_count(channel_count)
 }
@@ -494,20 +584,41 @@ pub fn encode_frame_interleaved(
     channel_count: u8,
     options: &DstEncoderOptions,
 ) -> Result<EncodedDstFrame, DstEncodeError> {
-    encode_frame_interleaved_with_telemetry(interleaved_dsd, channel_count, options).0
+    encode_frame_interleaved_with_rate(interleaved_dsd, channel_count, DstRate::Dsd64, options)
 }
 
-/// Encode one full interleaved DSD frame and return telemetry even when the
+/// Encode one full interleaved DSD frame at an explicit DST rate.
+pub fn encode_frame_interleaved_with_rate(
+    interleaved_dsd: &[u8],
+    channel_count: u8,
+    rate: DstRate,
+    options: &DstEncoderOptions,
+) -> Result<EncodedDstFrame, DstEncodeError> {
+    encode_frame_interleaved_with_rate_and_telemetry(interleaved_dsd, channel_count, rate, options).0
+}
+
+/// Encode one full DSD64 interleaved DSD frame and return telemetry even when the
 /// frame is rejected.
 pub fn encode_frame_interleaved_with_telemetry(
     interleaved_dsd: &[u8],
     channel_count: u8,
     options: &DstEncoderOptions,
 ) -> (Result<EncodedDstFrame, DstEncodeError>, DstFrameEncodeTelemetry) {
+    encode_frame_interleaved_with_rate_and_telemetry(interleaved_dsd, channel_count, DstRate::Dsd64, options)
+}
+
+/// Encode one full interleaved DSD frame at an explicit DST rate and return
+/// telemetry even when the frame is rejected.
+pub fn encode_frame_interleaved_with_rate_and_telemetry(
+    interleaved_dsd: &[u8],
+    channel_count: u8,
+    rate: DstRate,
+    options: &DstEncoderOptions,
+) -> (Result<EncodedDstFrame, DstEncodeError>, DstFrameEncodeTelemetry) {
     let started_at = Instant::now();
     let mut telemetry = DstFrameEncodeTelemetry::new(interleaved_dsd.len());
 
-    let expected = match dst_interleaved_frame_len(channel_count) {
+    let expected = match dst_interleaved_frame_len_for_rate(rate, channel_count) {
         Ok(expected) => expected,
         Err(err) => return finish_encode_error(err, telemetry, started_at),
     };
@@ -527,18 +638,19 @@ pub fn encode_frame_interleaved_with_telemetry(
 
     let raw_len = telemetry.raw_dst_bytes;
 
-    if !supports_predictive_channel_count(channel_count) {
+    if let Err(err) = validate_dst_policy(DstPolicyScope::PredictiveGeneration, rate, channel_count) {
         return raw_fallback_or_error_with_telemetry(
             interleaved_dsd,
             channel_count,
+            rate,
             options,
             telemetry,
             started_at,
-            DstEncodeError::PredictiveUnsupportedChannelCount { channel_count },
+            err,
         );
     }
 
-    match encode_predictive_search(interleaved_dsd, channel_count, options, &mut telemetry) {
+    match encode_predictive_search(interleaved_dsd, channel_count, rate, options, &mut telemetry) {
         Ok(candidate) if is_worth_using(candidate.bytes.len(), raw_len, options.minimum_savings_bytes) => {
             telemetry.encoded_bytes = candidate.bytes.len();
             telemetry.selected_encoding = Some(DstFrameEncoding::Predictive);
@@ -561,6 +673,7 @@ pub fn encode_frame_interleaved_with_telemetry(
             raw_fallback_or_error_with_telemetry(
                 interleaved_dsd,
                 channel_count,
+                rate,
                 options,
                 telemetry,
                 started_at,
@@ -570,6 +683,7 @@ pub fn encode_frame_interleaved_with_telemetry(
         Err(err) => raw_fallback_or_error_with_telemetry(
             interleaved_dsd,
             channel_count,
+            rate,
             options,
             telemetry,
             started_at,
@@ -645,10 +759,20 @@ pub fn encode_predictive_frame_interleaved(
     channel_count: u8,
     options: &DstEncoderOptions,
 ) -> Result<Vec<u8>, DstEncodeError> {
-    encode_predictive_frame_interleaved_with_telemetry(interleaved_dsd, channel_count, options).0
+    encode_predictive_frame_interleaved_with_rate(interleaved_dsd, channel_count, DstRate::Dsd64, options)
 }
 
-/// Encode one full interleaved DSD frame predictively and return candidate-search
+/// Encode one full interleaved DSD frame predictively at an explicit DST rate.
+pub fn encode_predictive_frame_interleaved_with_rate(
+    interleaved_dsd: &[u8],
+    channel_count: u8,
+    rate: DstRate,
+    options: &DstEncoderOptions,
+) -> Result<Vec<u8>, DstEncodeError> {
+    encode_predictive_frame_interleaved_with_rate_and_telemetry(interleaved_dsd, channel_count, rate, options).0
+}
+
+/// Encode one full DSD64 interleaved DSD frame predictively and return candidate-search
 /// telemetry. This helper does not apply the raw-fallback policy; callers that
 /// need production selection should use [`encode_frame_interleaved_with_telemetry`].
 pub fn encode_predictive_frame_interleaved_with_telemetry(
@@ -656,10 +780,21 @@ pub fn encode_predictive_frame_interleaved_with_telemetry(
     channel_count: u8,
     options: &DstEncoderOptions,
 ) -> (Result<Vec<u8>, DstEncodeError>, DstFrameEncodeTelemetry) {
+    encode_predictive_frame_interleaved_with_rate_and_telemetry(interleaved_dsd, channel_count, DstRate::Dsd64, options)
+}
+
+/// Encode one full interleaved DSD frame predictively at an explicit DST rate and
+/// return candidate-search telemetry.
+pub fn encode_predictive_frame_interleaved_with_rate_and_telemetry(
+    interleaved_dsd: &[u8],
+    channel_count: u8,
+    rate: DstRate,
+    options: &DstEncoderOptions,
+) -> (Result<Vec<u8>, DstEncodeError>, DstFrameEncodeTelemetry) {
     let started_at = Instant::now();
     let mut telemetry = DstFrameEncodeTelemetry::new(interleaved_dsd.len());
 
-    let expected = match dst_interleaved_frame_len(channel_count) {
+    let expected = match dst_interleaved_frame_len_for_rate(rate, channel_count) {
         Ok(expected) => expected,
         Err(err) => return finish_predictive_error(err, telemetry, started_at),
     };
@@ -673,15 +808,11 @@ pub fn encode_predictive_frame_interleaved_with_telemetry(
             started_at,
         );
     }
-    if !supports_predictive_channel_count(channel_count) {
-        return finish_predictive_error(
-            DstEncodeError::PredictiveUnsupportedChannelCount { channel_count },
-            telemetry,
-            started_at,
-        );
+    if let Err(err) = validate_dst_policy(DstPolicyScope::PredictiveGeneration, rate, channel_count) {
+        return finish_predictive_error(err, telemetry, started_at);
     }
 
-    match encode_predictive_search(interleaved_dsd, channel_count, options, &mut telemetry) {
+    match encode_predictive_search(interleaved_dsd, channel_count, rate, options, &mut telemetry) {
         Ok(candidate) => {
             telemetry.encoded_bytes = candidate.bytes.len();
             telemetry.selected_encoding = Some(DstFrameEncoding::Predictive);
@@ -700,19 +831,18 @@ struct PredictiveCandidate {
 fn encode_predictive_search(
     interleaved_dsd: &[u8],
     channel_count: u8,
+    rate: DstRate,
     options: &DstEncoderOptions,
     telemetry: &mut DstFrameEncodeTelemetry,
 ) -> Result<PredictiveCandidate, DstEncodeError> {
-    let expected = dst_interleaved_frame_len(channel_count)?;
+    let expected = dst_interleaved_frame_len_for_rate(rate, channel_count)?;
     if interleaved_dsd.len() != expected {
         return Err(DstEncodeError::InvalidFrameLength {
             expected,
             actual: interleaved_dsd.len(),
         });
     }
-    if !supports_predictive_channel_count(channel_count) {
-        return Err(DstEncodeError::PredictiveUnsupportedChannelCount { channel_count });
-    }
+    validate_dst_policy(DstPolicyScope::PredictiveGeneration, rate, channel_count)?;
 
     if let Some(prescreen) = fast_prescreen(interleaved_dsd, options) {
         telemetry.prescreen_sample_bytes = prescreen.sample_bytes;
@@ -769,7 +899,7 @@ fn encode_predictive_search(
                     telemetry.predictive_candidates = telemetry.predictive_candidates.saturating_add(1);
 
                     if options.verify {
-                        match verify_predictive_candidate(&candidate, channel_count, interleaved_dsd) {
+                        match verify_predictive_candidate(&candidate, channel_count, rate, interleaved_dsd) {
                             Ok(()) => {}
                             Err(kind) => {
                                 saw_unverified_candidate = true;
@@ -831,9 +961,10 @@ fn encode_predictive_search(
 fn verify_predictive_candidate(
     candidate: &[u8],
     channel_count: u8,
+    rate: DstRate,
     source: &[u8],
 ) -> Result<(), DstVerificationFailureKind> {
-    match decode_frame(candidate, channel_count) {
+    match decode_frame_with_rate(candidate, channel_count, rate) {
         Ok(decoded) if decoded.as_slice() == source => Ok(()),
         Ok(_) => Err(DstVerificationFailureKind::DecodedDsdMismatch),
         Err(_) => Err(DstVerificationFailureKind::DecodeError),
@@ -874,7 +1005,17 @@ pub fn encode_uncompressed_frame_interleaved(
     interleaved_dsd: &[u8],
     channel_count: u8,
 ) -> Result<Vec<u8>, DstEncodeError> {
-    let expected = dst_interleaved_frame_len(channel_count)?;
+    encode_uncompressed_frame_interleaved_with_rate(interleaved_dsd, channel_count, DstRate::Dsd64)
+}
+
+/// Encode one full interleaved DSD frame at `rate` as a valid uncompressed DST frame.
+pub fn encode_uncompressed_frame_interleaved_with_rate(
+    interleaved_dsd: &[u8],
+    channel_count: u8,
+    rate: DstRate,
+) -> Result<Vec<u8>, DstEncodeError> {
+    validate_dst_policy(DstPolicyScope::RawFallback, rate, channel_count)?;
+    let expected = dst_interleaved_frame_len_for_rate(rate, channel_count)?;
     if interleaved_dsd.len() != expected {
         return Err(DstEncodeError::InvalidFrameLength {
             expected,
@@ -903,7 +1044,17 @@ pub fn encode_uncompressed_frame_interleaved_padded(
     interleaved_dsd: &[u8],
     channel_count: u8,
 ) -> Result<(Vec<u8>, Vec<u8>), DstEncodeError> {
-    let expected = dst_interleaved_frame_len(channel_count)?;
+    encode_uncompressed_frame_interleaved_padded_with_rate(interleaved_dsd, channel_count, DstRate::Dsd64)
+}
+
+/// Encode a possibly short final DSD frame at `rate` by zero-padding it to a full DST frame.
+pub fn encode_uncompressed_frame_interleaved_padded_with_rate(
+    interleaved_dsd: &[u8],
+    channel_count: u8,
+    rate: DstRate,
+) -> Result<(Vec<u8>, Vec<u8>), DstEncodeError> {
+    validate_dst_policy(DstPolicyScope::RawFallback, rate, channel_count)?;
+    let expected = dst_interleaved_frame_len_for_rate(rate, channel_count)?;
     if interleaved_dsd.len() > expected {
         return Err(DstEncodeError::InvalidFrameLength {
             expected,
@@ -913,7 +1064,7 @@ pub fn encode_uncompressed_frame_interleaved_padded(
 
     let mut padded = vec![0u8; expected];
     padded[..interleaved_dsd.len()].copy_from_slice(interleaved_dsd);
-    let encoded = encode_uncompressed_frame_interleaved(&padded, channel_count)?;
+    let encoded = encode_uncompressed_frame_interleaved_with_rate(&padded, channel_count, rate)?;
     Ok((encoded, padded))
 }
 
@@ -921,6 +1072,7 @@ pub fn encode_uncompressed_frame_interleaved_padded(
 fn raw_fallback_or_error_with_telemetry(
     interleaved_dsd: &[u8],
     channel_count: u8,
+    rate: DstRate,
     options: &DstEncoderOptions,
     mut telemetry: DstFrameEncodeTelemetry,
     started_at: Instant,
@@ -933,7 +1085,7 @@ fn raw_fallback_or_error_with_telemetry(
             || options.verification_failure_policy == DstVerificationFailurePolicy::AllowRawFallback);
 
     if raw_fallback_allowed {
-        match encode_uncompressed_frame_interleaved(interleaved_dsd, channel_count) {
+        match encode_uncompressed_frame_interleaved_with_rate(interleaved_dsd, channel_count, rate) {
             Ok(bytes) => {
                 telemetry.encoded_bytes = bytes.len();
                 telemetry.selected_encoding = Some(DstFrameEncoding::Uncompressed);
@@ -990,6 +1142,14 @@ fn finish_predictive_result(
     started_at: Instant,
 ) -> (Result<Vec<u8>, DstEncodeError>, DstFrameEncodeTelemetry) {
     (result, telemetry.finish(started_at))
+}
+
+fn dst_frame_bytes_per_channel(rate: DstRate) -> Option<usize> {
+    match rate {
+        DstRate::Dsd64 => Some(FRAME_BYTES_PER_CHANNEL),
+        DstRate::Dsd128 => FRAME_BYTES_PER_CHANNEL.checked_mul(2),
+        DstRate::Dsd256 => FRAME_BYTES_PER_CHANNEL.checked_mul(4),
+    }
 }
 
 fn validate_channel_count(channel_count: u8) -> Result<(), DstEncodeError> {
@@ -1637,10 +1797,14 @@ fn propagate_carry(bits: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dst::decode_frame;
+    use crate::dst::{decode_frame, decode_frame_with_rate};
 
     fn patterned_frame(channel_count: u8) -> Vec<u8> {
-        let mut interleaved = vec![0u8; dst_interleaved_frame_len(channel_count).unwrap()];
+        patterned_frame_for_rate(DstRate::Dsd64, channel_count)
+    }
+
+    fn patterned_frame_for_rate(rate: DstRate, channel_count: u8) -> Vec<u8> {
+        let mut interleaved = vec![0u8; dst_interleaved_frame_len_for_rate(rate, channel_count).unwrap()];
         for (i, b) in interleaved.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(37).wrapping_add(11);
         }
@@ -1661,6 +1825,86 @@ mod tests {
         let interleaved = patterned_frame(6);
         let encoded = encode_uncompressed_frame_interleaved(&interleaved, 6).unwrap();
         assert_eq!(decode_frame(&encoded, 6).unwrap(), interleaved);
+    }
+
+    #[test]
+    fn dst_frame_geometry_scales_by_rate() {
+        assert_eq!(dst_interleaved_frame_len_for_rate(DstRate::Dsd64, 2).unwrap(), 4_704 * 2);
+        assert_eq!(dst_interleaved_frame_len_for_rate(DstRate::Dsd128, 2).unwrap(), 9_408 * 2);
+        assert_eq!(dst_interleaved_frame_len_for_rate(DstRate::Dsd256, 2).unwrap(), 18_816 * 2);
+        assert_eq!(dst_interleaved_frame_len_for_rate(DstRate::Dsd128, 6).unwrap(), 9_408 * 6);
+        assert_eq!(dst_interleaved_frame_len_for_rate(DstRate::Dsd256, 6).unwrap(), 18_816 * 6);
+    }
+
+    #[test]
+    fn policy_matrix_separates_container_passthrough_raw_and_predictive() {
+        for rate in [DstRate::Dsd64, DstRate::Dsd128, DstRate::Dsd256] {
+            for channel_count in 1..=6 {
+                assert!(supports_dst_policy(DstPolicyScope::Container, rate, channel_count));
+                assert!(supports_dst_policy(DstPolicyScope::SourceDstPassthrough, rate, channel_count));
+                assert!(supports_dst_policy(DstPolicyScope::CallerSuppliedDst, rate, channel_count));
+                assert!(supports_dst_policy(DstPolicyScope::RawFallback, rate, channel_count));
+            }
+        }
+
+        assert!(supports_dst_policy(DstPolicyScope::PredictiveGeneration, DstRate::Dsd64, 2));
+        assert!(supports_dst_policy(DstPolicyScope::PredictiveGeneration, DstRate::Dsd64, 6));
+        for rate in [DstRate::Dsd128, DstRate::Dsd256] {
+            assert!(!supports_dst_policy(DstPolicyScope::PredictiveGeneration, rate, 2));
+            assert!(!supports_dst_policy(DstPolicyScope::PredictiveGeneration, rate, 6));
+        }
+        for channel_count in [1, 3, 4, 5] {
+            assert!(!supports_dst_policy(
+                DstPolicyScope::PredictiveGeneration,
+                DstRate::Dsd64,
+                channel_count
+            ));
+        }
+    }
+
+    #[test]
+    fn unsupported_sample_rate_is_structured() {
+        assert_eq!(
+            dst_rate_from_sample_rate(96_000).unwrap_err(),
+            DstEncodeError::UnsupportedRate { sample_rate: 96_000 }
+        );
+    }
+
+    #[test]
+    fn dsd128_and_dsd256_predictive_generation_rejects_without_implicit_raw_fallback() {
+        for rate in [DstRate::Dsd128, DstRate::Dsd256] {
+            let interleaved = patterned_frame_for_rate(rate, 2);
+            let (result, telemetry) = encode_frame_interleaved_with_rate_and_telemetry(
+                &interleaved,
+                2,
+                rate,
+                &DstEncoderOptions::default(),
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                DstEncodeError::PredictiveUnsupportedLayout {
+                    channel_count: 2,
+                    rate,
+                }
+            );
+            assert_eq!(telemetry.selected_encoding, None);
+            assert_eq!(telemetry.raw_fallback_reason, None);
+            assert_eq!(telemetry.terminal_error, Some(DstEncodeFailureClass::PredictiveUnsupportedLayout));
+        }
+    }
+
+    #[test]
+    fn dsd128_and_dsd256_raw_dst_fallback_requires_explicit_policy() {
+        for rate in [DstRate::Dsd128, DstRate::Dsd256] {
+            let interleaved = patterned_frame_for_rate(rate, 2);
+            let options = DstEncoderOptions {
+                raw_fallback: RawDstFallbackPolicy::Enabled,
+                ..DstEncoderOptions::default()
+            };
+            let encoded = encode_frame_interleaved_with_rate(&interleaved, 2, rate, &options).unwrap();
+            assert_eq!(encoded.encoding, DstFrameEncoding::Uncompressed);
+            assert_eq!(decode_frame_with_rate(&encoded.bytes, 2, rate).unwrap(), interleaved);
+        }
     }
 
     #[test]
@@ -1688,7 +1932,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            DstEncodeError::PredictiveUnsupportedChannelCount { channel_count: 1 }
+            DstEncodeError::PredictiveUnsupportedLayout {
+                channel_count: 1,
+                rate: DstRate::Dsd64,
+            }
         );
     }
 
@@ -1704,6 +1951,7 @@ mod tests {
         let (result, telemetry) = raw_fallback_or_error_with_telemetry(
             &interleaved,
             2,
+            DstRate::Dsd64,
             &options,
             telemetry,
             Instant::now(),
@@ -1727,6 +1975,7 @@ mod tests {
         let (result, telemetry) = raw_fallback_or_error_with_telemetry(
             &interleaved,
             2,
+            DstRate::Dsd64,
             &options,
             telemetry,
             Instant::now(),
@@ -1760,14 +2009,14 @@ mod tests {
     fn verification_failure_kind_distinguishes_decode_error_and_mismatch() {
         let source = vec![0u8; dst_interleaved_frame_len(2).unwrap()];
         assert_eq!(
-            verify_predictive_candidate(&[0x80], 2, &source).unwrap_err(),
+            verify_predictive_candidate(&[0x80], 2, DstRate::Dsd64, &source).unwrap_err(),
             DstVerificationFailureKind::DecodeError
         );
 
         let other = vec![0xffu8; dst_interleaved_frame_len(2).unwrap()];
         let encoded = encode_uncompressed_frame_interleaved(&other, 2).unwrap();
         assert_eq!(
-            verify_predictive_candidate(&encoded, 2, &source).unwrap_err(),
+            verify_predictive_candidate(&encoded, 2, DstRate::Dsd64, &source).unwrap_err(),
             DstVerificationFailureKind::DecodedDsdMismatch
         );
     }

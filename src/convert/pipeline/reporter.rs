@@ -641,6 +641,7 @@ mod broadcast_reporter_tests {
                 record: StageRecord {
                     stage: PipelineStage::ReplayGain,
                     outcome: StageOutcome::Ok,
+                    dsd_dst_stats: None,
                 },
             })
             .await;
@@ -665,6 +666,7 @@ mod broadcast_reporter_tests {
                 record: StageRecord {
                     stage: PipelineStage::Features,
                     outcome: StageOutcome::Skipped,
+                    dsd_dst_stats: None,
                 },
             })
             .await;

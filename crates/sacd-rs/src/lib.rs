@@ -53,6 +53,75 @@ pub mod source_model;
 pub mod stream_ops;
 pub mod stream_reader;
 
+#[cfg(test)]
+pub(crate) mod test_allocation_counter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) struct CountingAllocator;
+
+    static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static COUNT_ALLOCATIONS_ON_THREAD: Cell<bool> = Cell::new(false);
+    }
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    struct AllocationCounterGuard;
+
+    impl Drop for AllocationCounterGuard {
+        fn drop(&mut self) {
+            COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| enabled.set(false));
+        }
+    }
+
+    pub(crate) fn allocation_count_for<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| enabled.set(true));
+        let _guard = AllocationCounterGuard;
+        ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+        let result = f();
+        let allocations = ALLOCATION_COUNT.load(Ordering::SeqCst);
+        (result, allocations)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_GLOBAL_ALLOCATOR: test_allocation_counter::CountingAllocator = test_allocation_counter::CountingAllocator;
+
 pub use dsd_file::{
     describe_container, drain_decoded_dsd_source, inspect_dsd_container, inspect_dsdiff,
     inspect_dsf, open_dsd_as_decoded_reader, open_dsd_asset, open_dsd_file,

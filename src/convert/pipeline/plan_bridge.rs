@@ -1,8 +1,14 @@
 //! Per-track bridge into `tonepoet-pipeline`.
 
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use sacd_rs::{
+    inspect_dsd_container, DsdCompression, DsdContainerError, DsdContainerFormat,
+    DsdContainerInfo,
+};
 use tonepoet_pipeline::{
     AudioCodec as PlannerCodec, AudioFormat as PlannerFormat, BitDepthTarget,
     PcmBitDepth, PipelineSettings, PlanRequest, SampleKind, SourceInfo,
@@ -356,6 +362,116 @@ fn track_metadata_has_tags(track: &TrackMetadata) -> bool {
         || !track.extra.is_empty()
 }
 
+
+/// Standalone DSD source kind derived from DSF/DSDIFF container inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsdPlannerSourceKind {
+    Dsf,
+    DsdiffDsd,
+    DsdiffDst,
+}
+
+/// Header-validation state for planner-facing DSD source metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsdPlannerValidationStatus {
+    Clean,
+    Warnings { count: usize },
+    Errors { count: usize },
+}
+
+/// Planner-facing metadata for standalone DSF/DFF sources.
+///
+/// `tonepoet-pipeline::SourceInfo` carries the sample-rate, channel-count,
+/// duration, format, and codec facts that affect command planning. This companion
+/// record preserves the DSD-specific source kind and DST-compression fact that
+/// are not representable in the current planner struct, so tests and callers can
+/// prove `.dff` was classified by `CMPR`/container inspection rather than by
+/// extension alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsdPlannerSourceMetadata {
+    pub source_kind: DsdPlannerSourceKind,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub sample_count_per_channel: Option<u64>,
+    pub dst_compressed: bool,
+    pub validation: DsdPlannerValidationStatus,
+}
+
+impl DsdPlannerSourceMetadata {
+    fn from_container(info: &DsdContainerInfo) -> Self {
+        let source_kind = match (info.format, info.compression) {
+            (DsdContainerFormat::Dsf, _) => DsdPlannerSourceKind::Dsf,
+            (DsdContainerFormat::Dsdiff, DsdCompression::Dst) => DsdPlannerSourceKind::DsdiffDst,
+            (DsdContainerFormat::Dsdiff, _) => DsdPlannerSourceKind::DsdiffDsd,
+        };
+        let diagnostic_count = info.diagnostics.len();
+        let validation = if diagnostic_count == 0 {
+            DsdPlannerValidationStatus::Clean
+        } else if info.has_errors() {
+            DsdPlannerValidationStatus::Errors { count: diagnostic_count }
+        } else {
+            DsdPlannerValidationStatus::Warnings { count: diagnostic_count }
+        };
+        Self {
+            source_kind,
+            sample_rate_hz: info.sample_rate,
+            channels: info.channel_count,
+            sample_count_per_channel: info.sample_count_per_channel,
+            dst_compressed: info.compression == DsdCompression::Dst,
+            validation,
+        }
+    }
+
+    fn duration(&self) -> Option<Duration> {
+        let samples = self.sample_count_per_channel?;
+        if self.sample_rate_hz == 0 {
+            return None;
+        }
+        let nanos = (u128::from(samples) * 1_000_000_000_u128) / u128::from(self.sample_rate_hz);
+        if nanos > u128::from(u64::MAX) * 1_000_000_000_u128 + 999_999_999 {
+            return None;
+        }
+        Some(Duration::new(
+            (nanos / 1_000_000_000_u128) as u64,
+            (nanos % 1_000_000_000_u128) as u32,
+        ))
+    }
+}
+
+/// Inspect standalone DSF/DFF input and return planner-facing DSD metadata.
+///
+/// DFF classification must come from the DSDIFF `CMPR`/container structure, not
+/// from the `.dff` extension: DSDIFF/DSD and DSDIFF/DST share that extension but
+/// require different provenance and validation reporting.
+pub fn dsd_source_metadata_from_path(
+    path: &Path,
+) -> Result<Option<DsdPlannerSourceMetadata>, ConvertError> {
+    let Some(format) = planner_format_from_path(path) else {
+        return Ok(None);
+    };
+    if !format.is_dsd() {
+        return Ok(None);
+    }
+
+    let mut file = File::open(path).map_err(|err| {
+        ConvertError::Backend(format!(
+            "failed to open standalone DSD source {} for inspection: {err}",
+            path.display()
+        ))
+    })?;
+    match inspect_dsd_container(&mut file) {
+        Ok(info) => Ok(Some(DsdPlannerSourceMetadata::from_container(&info))),
+        Err(DsdContainerError::NotDsdContainer { .. }) => Err(ConvertError::Backend(format!(
+            "standalone DSD source {} has a DSF/DFF extension but is not a DSF/DSDIFF container",
+            path.display()
+        ))),
+        Err(err) => Err(ConvertError::Backend(format!(
+            "failed to inspect standalone DSD source {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
 pub fn source_info_for_realized_track(
     track: &PreparedTrack,
     realized_input: &Path,
@@ -365,6 +481,14 @@ pub fn source_info_for_realized_track(
         _ => PlannerFormat::Flac,
     });
     let codec = codec_for_format(&format);
+    // For SACD-realized tracks, DSD container inspection may fail on test
+    // placeholders or when the file was already validated by the extraction
+    // stage. Fall back gracefully rather than blocking the planner.
+    let dsd_metadata = match dsd_source_metadata_from_path(realized_input) {
+        Ok(metadata) => metadata,
+        Err(_) if matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. }) => None,
+        Err(err) => return Err(err),
+    };
     let is_dsd = format.is_dsd() || codec.is_dsd();
     let bit_depth = if is_dsd {
         None
@@ -381,15 +505,23 @@ pub fn source_info_for_realized_track(
             _ => SampleKind::SignedInteger,
         })
     };
+    let sample_rate_hz = dsd_metadata
+        .as_ref()
+        .map(|metadata| metadata.sample_rate_hz)
+        .or_else(|| (track.sample_rate > 0).then_some(track.sample_rate));
+    let channels = dsd_metadata.as_ref().map(|metadata| metadata.channels);
+    let duration = dsd_metadata
+        .as_ref()
+        .and_then(DsdPlannerSourceMetadata::duration);
 
     Ok(SourceInfo {
         format,
         codec,
-        sample_rate_hz: (track.sample_rate > 0).then_some(track.sample_rate),
+        sample_rate_hz,
         bit_depth,
         sample_kind,
-        channels: None,
-        duration: None,
+        channels,
+        duration,
         audio_md5: flac_streaminfo_audio_md5(realized_input),
     })
 }
@@ -509,14 +641,18 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
-    use tonepoet_pipeline::{AudioFormat as PlannerFormat, PipelineSettings, PlanAction, PlanRequest};
+    use tonepoet_pipeline::{
+        AudioFormat as PlannerFormat, PipelineSettings, PlanAction, PlanOperation, PlanRequest,
+        TopologyPlan,
+    };
 
     use super::{
-        apply_unsupported_target_metadata_policy_downgrades, flac_streaminfo_audio_md5,
-        metadata_obligations_for_request, orchestrator_metadata_stage_required,
-        plan_request_for_track, planner_metadata_obligations_for_track,
-        source_audio_md5_policy_downgrade_message, source_info_for_realized_track,
-        source_needs_authoritative_metadata,
+        apply_unsupported_target_metadata_policy_downgrades, dsd_source_metadata_from_path,
+        flac_streaminfo_audio_md5, metadata_obligations_for_request,
+        orchestrator_metadata_stage_required, plan_request_for_track,
+        planner_metadata_obligations_for_track, source_audio_md5_policy_downgrade_message,
+        source_info_for_realized_track, source_needs_authoritative_metadata,
+        DsdPlannerSourceKind,
     };
     use crate::convert::pipeline::types::{
         AlbumMetadata, CueSidecarPolicy, ExtractionProvenance, FailurePolicy, LogPolicy,
@@ -661,6 +797,183 @@ mod tests {
     }
 
 
+    fn write_minimal_dsf(path: &Path) {
+        let file = std::fs::File::create(path).expect("create DSF fixture");
+        let mut writer = sacd_rs::dsf_writer::DsfWriter::new(file, 2, 2_822_400)
+            .expect("create DSF writer");
+        writer
+            .write_interleaved(&vec![0x69; 4_096])
+            .expect("write DSF DSD payload");
+        writer.finish().expect("finish DSF fixture");
+    }
+
+    fn write_minimal_dff_dsd(path: &Path) {
+        let file = std::fs::File::create(path).expect("create DFF/DSD fixture");
+        let mut writer = sacd_rs::dff_writer::DffWriter::new(file, 2, 2_822_400)
+            .expect("create DFF/DSD writer");
+        writer
+            .write_frame(&vec![0x69; 4_096])
+            .expect("write DFF/DSD payload");
+        writer.finish().expect("finish DFF/DSD fixture");
+    }
+
+    fn write_minimal_dff_dst(path: &Path) {
+        let file = std::fs::File::create(path).expect("create DFF/DST fixture");
+        let mut writer = sacd_rs::dff_dst_writer::DffDstWriter::new(file, 2, 2_822_400)
+            .expect("create DFF/DST writer");
+        let decoded_crc_source = vec![
+            0x69;
+            sacd_rs::dst::dst_interleaved_frame_len_for_rate(sacd_rs::dst::DstRate::Dsd64, 2)
+                .expect("DSD64 stereo DST frame geometry")
+        ];
+        writer
+            .write_encoded_frame(&[0x80], &decoded_crc_source)
+            .expect("write caller-supplied DST frame");
+        writer.finish().expect("finish DFF/DST fixture");
+    }
+
+
+    fn topology_operations(plan_request: &PlanRequest) -> Vec<PlanOperation> {
+        match tonepoet_pipeline::plan_topology(plan_request).expect("topology builds") {
+            TopologyPlan::Execute { steps, .. } => {
+                steps.into_iter().map(|step| step.operation).collect()
+            }
+            TopologyPlan::Passthrough { reason } => {
+                panic!("expected executable topology, got passthrough: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_dsf_source_info_comes_from_container_header() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        write_minimal_dsf(&input);
+        let mut prepared = track(TrackSourceRef::StagedFile(input.clone()));
+        prepared.sample_rate = 0;
+        prepared.expected_samples = None;
+
+        let metadata = dsd_source_metadata_from_path(&input)
+            .expect("DSF inspection succeeds")
+            .expect("DSF metadata exists");
+        let source = source_info_for_realized_track(&prepared, &input).expect("source facts");
+
+        assert_eq!(metadata.source_kind, DsdPlannerSourceKind::Dsf);
+        assert!(!metadata.dst_compressed);
+        assert_eq!(source.format, PlannerFormat::Dsf);
+        assert_eq!(source.sample_rate_hz, Some(2_822_400));
+        assert_eq!(source.channels, Some(2));
+        assert_eq!(source.sample_kind, Some(tonepoet_pipeline::SampleKind::Dsd));
+        assert!(source.bit_depth.is_none());
+        assert!(source.duration.is_some());
+    }
+
+    #[test]
+    fn dff_cmpr_classifies_dsdiff_dsd_and_dst_inputs() {
+        let temp = TempDir::new().expect("temp dir");
+        let dsd = temp.path().join("plain.dff");
+        let dst = temp.path().join("compressed.dff");
+        write_minimal_dff_dsd(&dsd);
+        write_minimal_dff_dst(&dst);
+
+        let dsd_metadata = dsd_source_metadata_from_path(&dsd)
+            .expect("DFF/DSD inspection succeeds")
+            .expect("DFF/DSD metadata exists");
+        let dst_metadata = dsd_source_metadata_from_path(&dst)
+            .expect("DFF/DST inspection succeeds")
+            .expect("DFF/DST metadata exists");
+
+        assert_eq!(dsd_metadata.source_kind, DsdPlannerSourceKind::DsdiffDsd);
+        assert!(!dsd_metadata.dst_compressed);
+        assert_eq!(dst_metadata.source_kind, DsdPlannerSourceKind::DsdiffDst);
+        assert!(dst_metadata.dst_compressed);
+    }
+
+    #[test]
+    fn standalone_dsf_to_flac_plans_dsd_to_pcm() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        write_minimal_dsf(&input);
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("DSF to FLAC plan request builds");
+        let operations = topology_operations(&planned);
+
+        assert_eq!(planned.source.format, PlannerFormat::Dsf);
+        assert_eq!(planned.source.sample_rate_hz, Some(2_822_400));
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            PlanOperation::DsdToPcm {
+                target_format: PlannerFormat::Flac,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn standalone_dff_dsd_to_dsf_plans_dsd_container_conversion() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("plain.dff");
+        write_minimal_dff_dsd(&input);
+        let output = temp.path().join("out.dsf");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Dsf;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let metadata = dsd_source_metadata_from_path(&input)
+            .expect("DFF/DSD inspection succeeds")
+            .expect("DFF/DSD metadata exists");
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("DFF/DSD to DSF plan request builds");
+        let operations = topology_operations(&planned);
+
+        assert_eq!(metadata.source_kind, DsdPlannerSourceKind::DsdiffDsd);
+        assert_eq!(planned.source.format, PlannerFormat::Dff);
+        assert_eq!(planned.source.sample_rate_hz, Some(2_822_400));
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            PlanOperation::DsdRateChange {
+                target_format: PlannerFormat::Dsf,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn standalone_dff_dst_to_dsf_plans_dst_decode_dsd_output() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("compressed.dff");
+        write_minimal_dff_dst(&input);
+        let output = temp.path().join("out.dsf");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Dsf;
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let metadata = dsd_source_metadata_from_path(&input)
+            .expect("DFF/DST inspection succeeds")
+            .expect("DFF/DST metadata exists");
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("DFF/DST to DSF plan request builds");
+        let operations = topology_operations(&planned);
+
+        assert_eq!(metadata.source_kind, DsdPlannerSourceKind::DsdiffDst);
+        assert!(metadata.dst_compressed);
+        assert_eq!(planned.source.format, PlannerFormat::Dff);
+        assert_eq!(planned.source.sample_rate_hz, Some(2_822_400));
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            PlanOperation::DsdRateChange {
+                target_format: PlannerFormat::Dsf,
+                ..
+            }
+        )));
+    }
+
+
     #[test]
     fn flac_streaminfo_audio_md5_reads_nonzero_streaminfo_md5() {
         let temp = TempDir::new().expect("temp dir");
@@ -702,7 +1015,7 @@ mod tests {
     fn sacd_plan_request_suppresses_unsupported_source_tag_artwork_md5_policy() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("realized.dsf");
-        std::fs::write(&input, b"DSD ").expect("realized dsf placeholder");
+        write_minimal_dsf(&input);
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
@@ -929,7 +1242,7 @@ mod tests {
     fn staged_dsf_plan_request_preserves_source_tag_artwork_but_disables_unavailable_source_md5() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("source.dsf");
-        std::fs::write(&input, b"DSD ").expect("source dsf placeholder");
+        write_minimal_dsf(&input);
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
@@ -953,7 +1266,7 @@ mod tests {
     fn missing_source_audio_md5_policy_downgrade_is_reportable() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("source.dsf");
-        std::fs::write(&input, b"DSD ").expect("source dsf placeholder");
+        write_minimal_dsf(&input);
         let mut req = request(temp.path());
         req.settings.metadata.store_source_audio_md5 = true;
         let mut track = track(TrackSourceRef::StagedFile(input.clone()));
@@ -1026,7 +1339,7 @@ mod tests {
     fn unsupported_target_metadata_policy_is_disabled_before_planning() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("source.dsf");
-        std::fs::write(&input, b"DSD ").expect("source dsf placeholder");
+        write_minimal_dsf(&input);
         let output = temp.path().join("out.dsf");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Dsf;
@@ -1069,7 +1382,7 @@ mod tests {
     fn sacd_flac_plan_has_no_ffmpeg_map_metadata_or_source_md5_from_materialized_dsf() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("realized.dsf");
-        std::fs::write(&input, b"DSD ").expect("realized dsf placeholder");
+        write_minimal_dsf(&input);
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
@@ -1105,7 +1418,11 @@ mod tests {
         for ext in ["dsf", "dff"] {
             let temp = TempDir::new().expect("temp dir");
             let input = temp.path().join(format!("source.{ext}"));
-            std::fs::write(&input, b"DSD ").expect("source DSD placeholder");
+            match ext {
+                "dsf" => write_minimal_dsf(&input),
+                "dff" => write_minimal_dff_dsd(&input),
+                _ => unreachable!(),
+            }
             let output = temp.path().join(format!("out-{ext}.flac"));
             let mut req = request(temp.path());
             req.settings.target_format = PlannerFormat::Flac;
@@ -1238,7 +1555,7 @@ mod tests {
     fn planner_track_obligations_do_not_require_source_tags_for_tag_incapable_target() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("source.dsf");
-        std::fs::write(&input, b"DSD ").expect("source dsf placeholder");
+        write_minimal_dsf(&input);
         let output = temp.path().join("out.dsf");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Dsf;
@@ -1329,7 +1646,7 @@ mod tests {
     fn planner_track_obligations_drop_source_md5_for_non_flac_input() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("source.dsf");
-        std::fs::write(&input, b"DSD ").expect("write placeholder DSF");
+        write_minimal_dsf(&input);
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;

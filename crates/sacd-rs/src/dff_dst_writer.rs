@@ -27,10 +27,11 @@
 //! external-decoder corpus validation is an acceptance-gate item, not assumed.
 
 use crate::dst::{
-    dst_interleaved_frame_len, encode_frame_interleaved_with_telemetry,
-    is_legal_dst_channel_count, DstEncodeError, DstEncodeFailureClass, DstEncoderOptions,
-    DstFrameEncodeTelemetry, DstFrameEncoding, DstTableStrategy, DstVerificationFailureKind,
-    DstVerificationFailurePolicy, RawDstFallbackPolicy,
+    dst_interleaved_frame_len_for_rate, dst_rate_from_sample_rate,
+    encode_frame_interleaved_with_rate_and_telemetry, validate_dst_policy,
+    DstEncodeError, DstEncodeFailureClass, DstEncoderOptions,
+    DstFrameEncodeTelemetry, DstFrameEncoding, DstPolicyScope, DstRate, DstTableStrategy,
+    DstVerificationFailureKind, DstVerificationFailurePolicy, RawDstFallbackPolicy,
 };
 use std::io::{self, Seek, SeekFrom, Write};
 use std::time::Duration;
@@ -734,6 +735,7 @@ impl DffDstWriterStats {
 pub struct DffDstWriter<W: Write + Seek> {
     writer: W,
     channel_count: u8,
+    rate: DstRate,
     frm8_size_offset: u64,
     dst_size_offset: u64,
     frte_frame_count_offset: u64,
@@ -755,7 +757,8 @@ impl<W: Write + Seek> DffDstWriter<W> {
     /// Create a writer and emit the static DSDIFF/DST header. The writer's
     /// stream position is reset to zero.
     pub fn new(mut writer: W, channel_count: u8, sample_rate: u32) -> io::Result<Self> {
-        validate_channel_count(channel_count)?;
+        let rate = dst_rate_from_sample_rate(sample_rate).map_err(invalid_input)?;
+        validate_dst_policy(DstPolicyScope::Container, rate, channel_count).map_err(invalid_input)?;
         writer.seek(SeekFrom::Start(0))?;
 
         writer.write_all(FRM8)?;
@@ -779,6 +782,7 @@ impl<W: Write + Seek> DffDstWriter<W> {
         Ok(Self {
             writer,
             channel_count,
+            rate,
             frm8_size_offset,
             dst_size_offset,
             frte_frame_count_offset,
@@ -809,7 +813,7 @@ impl<W: Write + Seek> DffDstWriter<W> {
     /// an error when the compressed candidate is not smaller or cannot be
     /// verified. This avoids implicit raw DST frames whose common-decoder
     /// portability is not proven. `interleaved_dsd` must contain exactly
-    /// `4704 * channel_count` bytes in DSDIFF/SACD clustered layout. For short
+    /// one full DST frame for this writer's sample rate in DSDIFF/SACD clustered layout. For short
     /// final frames, use [`crate::dst::encode_uncompressed_frame_interleaved_padded`]
     /// yourself and pass the returned padded DSD source to
     /// [`Self::write_encoded_frame`].
@@ -861,8 +865,12 @@ impl<W: Write + Seek> DffDstWriter<W> {
         interleaved_dsd: &[u8],
         options: &DstEncoderOptions,
     ) -> io::Result<()> {
-        let (encoded, telemetry) =
-            encode_frame_interleaved_with_telemetry(interleaved_dsd, self.channel_count, options);
+        let (encoded, telemetry) = encode_frame_interleaved_with_rate_and_telemetry(
+            interleaved_dsd,
+            self.channel_count,
+            self.rate,
+            options,
+        );
         let encoded = match encoded {
             Ok(encoded) => encoded,
             Err(err) => {
@@ -892,8 +900,12 @@ impl<W: Write + Seek> DffDstWriter<W> {
         interleaved_dsd: &[u8],
         options: &DstEncoderOptions,
     ) -> io::Result<()> {
-        let (encoded, telemetry) =
-            encode_frame_interleaved_with_telemetry(interleaved_dsd, self.channel_count, options);
+        let (encoded, telemetry) = encode_frame_interleaved_with_rate_and_telemetry(
+            interleaved_dsd,
+            self.channel_count,
+            self.rate,
+            options,
+        );
         self.stats.record_encode_attempt(&telemetry)?;
         match encoded {
             Ok(_) => Ok(()),
@@ -986,7 +998,7 @@ impl<W: Write + Seek> DffDstWriter<W> {
         encoded_dst_frame: &[u8],
         interleaved_dsd_for_crc: &[u8],
     ) -> io::Result<()> {
-        let expected = dst_interleaved_frame_len(self.channel_count).map_err(invalid_input)?;
+        let expected = dst_interleaved_frame_len_for_rate(self.rate, self.channel_count).map_err(invalid_input)?;
         if interleaved_dsd_for_crc.len() != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1177,20 +1189,6 @@ fn compression_ratio_milli(raw_bytes: u64, encoded_bytes: u64) -> u32 {
     milli.min(u128::from(u32::MAX)) as u32
 }
 
-fn validate_channel_count(channel_count: u8) -> io::Result<()> {
-    if is_legal_dst_channel_count(channel_count) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "DSDIFF/DST container/read/decode/passthrough support is limited to legal DST channel counts 1 through 6; got {}. Predictive generation is a separate policy and is currently verified only for 2-channel and 6-channel layouts",
-                channel_count
-            ),
-        ))
-    }
-}
-
 fn invalid_input<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
 }
@@ -1239,9 +1237,10 @@ mod tests {
     use super::*;
     use crate::container::{inspect_dsd_container, DsdCompression, DsdContainerFormat};
     use crate::dst::{
-        decode_frame, dst_interleaved_frame_len, is_legal_dst_channel_count,
-        supports_predictive_dst_channel_count, supports_raw_dst_fallback_channel_count,
-        supports_verified_dst_channel_count,
+        decode_frame, decode_frame_with_rate, dst_interleaved_frame_len,
+        dst_interleaved_frame_len_for_rate, encode_uncompressed_frame_interleaved_with_rate,
+        is_legal_dst_channel_count, supports_dst_policy, supports_predictive_dst_channel_count,
+        supports_raw_dst_fallback_channel_count, supports_verified_dst_channel_count,
     };
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
@@ -1388,13 +1387,136 @@ mod tests {
                 Err(err) => err,
             };
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let msg = err.to_string();
             assert!(
-                err.to_string().contains("1 through 6"),
+                msg.contains("1 through 6") || msg.contains("1..=6") || msg.contains("expected 1"),
                 "unexpected error for {} channel(s): {}",
                 channel_count,
                 err
             );
         }
+    }
+
+    #[test]
+    fn writer_rejects_unsupported_dst_sample_rate() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let err = match DffDstWriter::new(&mut cursor, 2, 96_000) {
+            Ok(_) => panic!("unexpectedly accepted unsupported sample rate"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unsupported DST sample rate"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn writer_policy_matrix_is_rate_aware() {
+        for rate in [DstRate::Dsd64, DstRate::Dsd128, DstRate::Dsd256] {
+            for channel_count in 1..=6 {
+                assert!(supports_dst_policy(DstPolicyScope::Container, rate, channel_count));
+                assert!(supports_dst_policy(DstPolicyScope::SourceDstPassthrough, rate, channel_count));
+                assert!(supports_dst_policy(DstPolicyScope::CallerSuppliedDst, rate, channel_count));
+                assert!(supports_dst_policy(DstPolicyScope::RawFallback, rate, channel_count));
+            }
+        }
+        assert!(supports_dst_policy(DstPolicyScope::PredictiveGeneration, DstRate::Dsd64, 2));
+        assert!(supports_dst_policy(DstPolicyScope::PredictiveGeneration, DstRate::Dsd64, 6));
+        assert!(!supports_dst_policy(DstPolicyScope::PredictiveGeneration, DstRate::Dsd128, 2));
+        assert!(!supports_dst_policy(DstPolicyScope::PredictiveGeneration, DstRate::Dsd256, 6));
+    }
+
+    #[test]
+    fn writer_uses_dsd128_and_dsd256_frame_geometry_for_caller_supplied_dst() {
+        for (rate, sample_rate) in [
+            (DstRate::Dsd128, 5_644_800),
+            (DstRate::Dsd256, 11_289_600),
+        ] {
+            let frame = vec![0u8; dst_interleaved_frame_len_for_rate(rate, 2).unwrap()];
+            let encoded = encode_uncompressed_frame_interleaved_with_rate(&frame, 2, rate).unwrap();
+            let mut cursor = Cursor::new(Vec::<u8>::new());
+            {
+                let mut writer = DffDstWriter::new(&mut cursor, 2, sample_rate).unwrap();
+                writer.write_encoded_frame(&encoded, &frame).unwrap();
+                assert_eq!(writer.stats().caller_supplied_frames_written, 1);
+                assert_eq!(writer.stats().predictive_frames_written, 0);
+                assert_eq!(writer.stats().raw_frames_written, 0);
+                writer.finish().unwrap();
+            }
+            let bytes = cursor.into_inner();
+            let dstf = bytes.windows(4).position(|w| w == b"DSTF").unwrap();
+            let dstf_size = read_u64_be(&bytes, dstf + 4) as usize;
+            let dstf_payload = &bytes[dstf + 12..dstf + 12 + dstf_size];
+            assert_eq!(decode_frame_with_rate(dstf_payload, 2, rate).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn writer_accepts_higher_rate_source_dst_passthrough_without_reencoding() {
+        let rate = DstRate::Dsd128;
+        let frame = vec![0u8; dst_interleaved_frame_len_for_rate(rate, 2).unwrap()];
+        let encoded = encode_uncompressed_frame_interleaved_with_rate(&frame, 2, rate).unwrap();
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = DffDstWriter::new(&mut cursor, 2, rate.sample_rate()).unwrap();
+            writer.write_passthrough_frame(&encoded, &frame).unwrap();
+            assert_eq!(writer.stats().passthrough_frames_written, 1);
+            assert_eq!(writer.stats().caller_supplied_frames_written, 0);
+            assert_eq!(writer.stats().encode_attempts, 0);
+            assert_eq!(writer.stats().predictive_frames_written, 0);
+            assert_eq!(writer.stats().raw_frames_written, 0);
+            writer.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+        let dstf = bytes.windows(4).position(|w| w == b"DSTF").unwrap();
+        let dstf_size = read_u64_be(&bytes, dstf + 4) as usize;
+        let dstf_payload = &bytes[dstf + 12..dstf + 12 + dstf_size];
+        assert_eq!(dstf_payload, encoded.as_slice());
+        assert_eq!(decode_frame_with_rate(dstf_payload, 2, rate).unwrap(), frame);
+    }
+
+    #[test]
+    fn writer_rejects_dsd64_sized_crc_source_for_higher_rate_dst() {
+        let rate = DstRate::Dsd128;
+        let sample_rate = rate.sample_rate();
+        let frame = vec![0u8; dst_interleaved_frame_len_for_rate(rate, 2).unwrap()];
+        let encoded = encode_uncompressed_frame_interleaved_with_rate(&frame, 2, rate).unwrap();
+        let dsd64_sized_crc_source = vec![0u8; dst_interleaved_frame_len(2).unwrap()];
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let mut writer = DffDstWriter::new(&mut cursor, 2, sample_rate).unwrap();
+        let err = writer
+            .write_encoded_frame(&encoded, &dsd64_sized_crc_source)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(&frame.len().to_string()),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn higher_rate_predictive_writer_rejects_without_implicit_raw_fallback() {
+        let rate = DstRate::Dsd128;
+        let frame = vec![0u8; dst_interleaved_frame_len_for_rate(rate, 2).unwrap()];
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let mut writer = DffDstWriter::new(&mut cursor, 2, rate.sample_rate()).unwrap();
+        let err = writer.write_interleaved_frame(&frame).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("predictive DST generation for 2 channel(s) at 5644800 Hz"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(writer.predictive_frames_written(), 0);
+        assert_eq!(writer.raw_frames_written(), 0);
+
+        let mut options = DstEncoderOptions::default();
+        options.raw_fallback = RawDstFallbackPolicy::Enabled;
+        writer.write_interleaved_frame_with_options(&frame, &options).unwrap();
+        assert_eq!(writer.raw_frames_written(), 1);
     }
 
     #[test]

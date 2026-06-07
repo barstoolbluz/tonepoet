@@ -12,7 +12,7 @@
 use crate::dsd_file::inspect::{DsdCompression, DsdContainerDiagnostic, DsdContainerFormat, DsdContainerInfo};
 use crate::dff_writer::DffWriter;
 use crate::dsf_writer::DsfWriter;
-use crate::dst::{decode_frame_with_rate, DstRate};
+use crate::dst::{DstDecoder, DstRate};
 use crate::dsd_file::reader::{
     open_dsd_file, DsdDecodedFileReader, DsdFileReader, DsdFrameReader, DsdReadError,
     DstCrcStatus, DstFrameReader,
@@ -387,6 +387,18 @@ fn validate_dst_reader<R: DstFrameReader>(
     } else {
         None
     };
+    let mut dst_decoder = if let Some(rate) = rate {
+        match DstDecoder::new(channels, rate) {
+            Ok(decoder) => Some(decoder),
+            Err(err) => {
+                push_failure(report, DsdValidationFailureKind::Unsupported, None, None, err.to_string());
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let mut decoded_buffer = expected_decoded_len.map(|len| vec![0u8; len]);
 
     loop {
         if frame_limit_reached(report.frames_seen(), max_frames) {
@@ -424,38 +436,40 @@ fn validate_dst_reader<R: DstFrameReader>(
             }
         }
         if decode_dst {
-            let rate = match DstRate::from_sample_rate(frame.sample_rate) {
-                Ok(rate) => rate,
+            let Some(decoded_buffer) = decoded_buffer.as_mut() else {
+                push_failure(report, DsdValidationFailureKind::DstDecode, Some(frame.frame_index), Some(frame.payload_offset), "decoded DST validation buffer is not initialized");
+                return;
+            };
+            let Some(decoder) = dst_decoder.as_mut() else {
+                push_failure(report, DsdValidationFailureKind::DstDecode, Some(frame.frame_index), Some(frame.payload_offset), "DST decoder is not initialized");
+                return;
+            };
+            let decoded_len = match decoder.decode_frame_into(&frame.encoded, decoded_buffer) {
+                Ok(decoded_len) => decoded_len,
                 Err(err) => {
                     push_failure(report, DsdValidationFailureKind::DstDecode, Some(frame.frame_index), Some(frame.payload_offset), err.to_string());
                     return;
                 }
             };
-            let decoded = match decode_frame_with_rate(&frame.encoded, channels, rate) {
-                Ok(decoded) => decoded,
-                Err(err) => {
-                    push_failure(report, DsdValidationFailureKind::DstDecode, Some(frame.frame_index), Some(frame.payload_offset), err.to_string());
-                    return;
-                }
-            };
-            if Some(decoded.len()) != expected_decoded_len {
+            if Some(decoded_len) != expected_decoded_len {
                 push_failure(
                     report,
                     DsdValidationFailureKind::DstDecode,
                     Some(frame.frame_index),
                     Some(frame.payload_offset),
-                    format!("DST decoder returned {} bytes, expected {}", decoded.len(), expected_decoded_len.unwrap_or(0)),
+                    format!("DST decoder returned {} bytes, expected {}", decoded_len, expected_decoded_len.unwrap_or(0)),
                 );
                 return;
             }
-            let crc_status = DstCrcStatus::verify(frame.dstc, &decoded);
+            let decoded = &decoded_buffer[..decoded_len];
+            let crc_status = DstCrcStatus::verify(frame.dstc, decoded);
             if !record_dst_crc_status(report, Some(frame.frame_index), Some(frame.payload_offset), &crc_status) {
                 return;
             }
             if matches!(&crc_status, DstCrcStatus::PresentFailed { .. } | DstCrcStatus::Malformed { .. }) {
                 return;
             }
-            report.decoded_dsd_bytes = match report.decoded_dsd_bytes.checked_add(decoded.len() as u64) {
+            report.decoded_dsd_bytes = match report.decoded_dsd_bytes.checked_add(decoded_len as u64) {
                 Some(n) => n,
                 None => {
                     push_failure(report, DsdValidationFailureKind::Read, Some(frame.frame_index), Some(frame.payload_offset), "decoded DSD byte counter overflow");

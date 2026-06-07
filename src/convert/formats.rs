@@ -529,6 +529,8 @@ impl FormatDetector {
             "m4a" | "mp4" => Ok(FileFormat::Audio(Self::detect_m4a_codec(path))),
             "aac" => Ok(FileFormat::Audio(AudioFormat::Aac)),
             "opus" => Ok(FileFormat::Audio(AudioFormat::Opus)),
+            "dsf" => Ok(FileFormat::Audio(AudioFormat::Dsf)),
+            "dff" => Ok(FileFormat::Audio(AudioFormat::Dff)),
             _ => Err(super::ConversionError::UnsupportedFormat(format!(
                 "Unsupported format: .{}",
                 extension
@@ -630,4 +632,35 @@ impl AudioFormat {
 /// Default CUE generation mode for backward compatibility
 fn default_cue_generation_mode() -> String {
     "IfMerging".to_string()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{AudioFormat, FileFormat, FormatDetector};
+    use std::path::Path;
+
+    #[test]
+    fn detect_accepts_standalone_dsf_and_dff_as_audio() {
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.dsf")).expect("DSF is supported"),
+            FileFormat::Audio(AudioFormat::Dsf)
+        );
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.dff")).expect("DFF is supported"),
+            FileFormat::Audio(AudioFormat::Dff)
+        );
+    }
+
+    #[test]
+    fn detect_audio_accepts_standalone_dsf_and_dff() {
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.DSF")).expect("uppercase DSF is supported"),
+            AudioFormat::Dsf
+        );
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.DFF")).expect("uppercase DFF is supported"),
+            AudioFormat::Dff
+        );
+    }
 }

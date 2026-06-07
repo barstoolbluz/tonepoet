@@ -22,7 +22,7 @@
 use crate::dsd_file::inspect::{
     DsdByteOrder, DsdCompression, DsdContainerFormat, DsdContainerInfo,
 };
-use crate::dst::{decode_frame_with_rate, DstError, DstRate};
+use crate::dst::{decode_frame_with_rate_into, DstError, DstRate};
 use crate::frame::{
     FrameError, FrameFormat, FrameReader, FrameReaderStats, FrameTimeFilter, Timecode,
 };
@@ -218,13 +218,20 @@ impl SourceDstFrame {
                 )
             })
             .map_err(DsdSourceError::Dst)?;
-        let decoded = decode_frame_with_rate(&self.encoded, channels, rate).map_err(DsdSourceError::Dst)?;
-        if decoded.len() != expected_len {
+        let mut decoded = vec![0u8; expected_len];
+        let decoded_len = decode_frame_with_rate_into(
+            &self.encoded,
+            channels,
+            rate,
+            &mut decoded,
+        )
+        .map_err(DsdSourceError::Dst)?;
+        if decoded_len != expected_len {
             return Err(DsdSourceError::Malformed {
                 reason: format!(
                     "decoded DST frame {} has {} byte(s), expected {}",
                     self.frame_index,
-                    decoded.len(),
+                    decoded_len,
                     expected_len
                 ),
             });

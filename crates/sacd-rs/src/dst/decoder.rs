@@ -89,6 +89,20 @@ pub fn decode_frame(input: &[u8], channel_count: u8) -> Result<Vec<u8>, DstError
     decode_frame_with_rate(input, channel_count, DstRate::Dsd64)
 }
 
+/// Decode one DSD64 DST frame into caller-owned decoded-output storage.
+///
+/// On success, returns the exact number of decoded bytes written into `output`.
+/// Bytes after the returned length are left untouched. This API covers the DST
+/// decoder's output storage; higher-level adapters that return owned frame
+/// structs may still allocate to satisfy their ownership contract.
+pub fn decode_frame_into(
+    input: &[u8],
+    channel_count: u8,
+    output: &mut [u8],
+) -> Result<usize, DstError> {
+    decode_frame_with_rate_into(input, channel_count, DstRate::Dsd64, output)
+}
+
 /// Decode one DST frame at an explicit DSD rate.
 pub fn decode_frame_with_rate(
     input: &[u8],
@@ -97,6 +111,22 @@ pub fn decode_frame_with_rate(
 ) -> Result<Vec<u8>, DstError> {
     let mut decoder = DstDecoder::new(channel_count, rate)?;
     decoder.decode_frame(input)
+}
+
+/// Decode one DST frame at an explicit DSD rate into caller-owned decoded-output storage.
+///
+/// On success, returns the exact number of decoded bytes written into `output`.
+/// Bytes after the returned length are left untouched. This API covers the DST
+/// decoder's output storage; higher-level adapters that return owned frame
+/// structs may still allocate to satisfy their ownership contract.
+pub fn decode_frame_with_rate_into(
+    input: &[u8],
+    channel_count: u8,
+    rate: DstRate,
+    output: &mut [u8],
+) -> Result<usize, DstError> {
+    let mut decoder = DstDecoder::new(channel_count, rate)?;
+    decoder.decode_frame_into(input, output)
 }
 
 /// Stateful DST decoder for a fixed channel count and DSD rate.
@@ -149,27 +179,45 @@ impl DstDecoder {
     }
 
     pub fn decode_frame(&mut self, input: &[u8]) -> Result<Vec<u8>, DstError> {
+        let expected = self.dsd_frame_bytes()?;
+        let mut out = vec![0u8; expected];
+        let written = self.decode_frame_into(input, &mut out)?;
+        if written != expected {
+            return Err(DstError::OutputSizeMismatch {
+                expected,
+                actual: written,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn decode_frame_into(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, DstError> {
+        let expected = self.dsd_frame_bytes()?;
+        if output.len() < expected {
+            return Err(DstError::OutputBufferTooSmall {
+                required: expected,
+                actual: output.len(),
+            });
+        }
         if input.is_empty() {
             return Err(DstError::UnexpectedEof { consumed: 0 });
         }
 
-        let expected = self.dsd_frame_bytes()?;
-        let mut out = vec![0u8; expected];
+        let out = &mut output[..expected];
+        out.fill(0);
         let mut reader = BitReader::new(input);
 
         match reader.read_bit()? {
-            0 => decode_uncompressed_dst_payload(&mut reader, &mut out)?,
-            1 => self.decode_compressed_dst_payload(&mut reader, &mut out)?,
+            0 => decode_uncompressed_dst_payload(&mut reader, out)?,
+            1 => self.decode_compressed_dst_payload(&mut reader, out)?,
             _ => unreachable!(),
         }
 
-        if out.len() != expected {
-            return Err(DstError::OutputSizeMismatch {
-                expected,
-                actual: out.len(),
-            });
-        }
-        Ok(out)
+        Ok(expected)
     }
 
     fn decode_compressed_dst_payload(
@@ -185,17 +233,19 @@ impl DstDecoder {
 
         let mut arithmetic = ArithmeticCoder::new(reader)?;
         let filters = build_filters(&syntax.filter_tables)?;
-        let filter_for_bit = syntax.filter_segments.expand_map(
+        let mut filter_cursor = SegmentCursorSet::new(
+            &syntax.filter_segments,
             self.channel_count,
             self.frame_bits_per_channel,
             syntax.filter_tables.elements,
-            "filter",
+            SegmentKind::Filter,
         )?;
-        let probability_for_bit = syntax.probability_segments.expand_map(
+        let mut probability_cursor = SegmentCursorSet::new(
+            &syntax.probability_segments,
             self.channel_count,
             self.frame_bits_per_channel,
             syntax.probability_tables.elements,
-            "probability",
+            SegmentKind::Probability,
         )?;
 
         let mut status = [[0xAAu8; 16]; MAX_CHANNELS];
@@ -211,16 +261,14 @@ impl DstDecoder {
                 ))?;
 
             for ch in 0..self.channel_count {
-                let map_index = ch
-                    .checked_mul(self.frame_bits_per_channel)
-                    .and_then(|n| n.checked_add(bit_index))
-                    .ok_or(DstError::ArithmeticDecodeFailure(
-                        "DST segment map index overflow",
-                    ))?;
-                let filter_element = filter_for_bit[map_index];
-                if filter_element >= syntax.filter_tables.elements {
-                    return Err(DstError::InvalidMapping("filter map references undefined table"));
-                }
+                let filter_element = filter_cursor.table_for_bit(
+                    &syntax.filter_segments,
+                    ch,
+                    bit_index,
+                    self.frame_bits_per_channel,
+                    syntax.filter_tables.elements,
+                    SegmentKind::Filter,
+                )?;
 
                 let mut predict = 0i32;
                 for tap in 0..16 {
@@ -232,12 +280,14 @@ impl DstDecoder {
                 {
                     128
                 } else {
-                    let probability_element = probability_for_bit[map_index];
-                    if probability_element >= syntax.probability_tables.elements {
-                        return Err(DstError::InvalidMapping(
-                            "probability map references undefined table",
-                        ));
-                    }
+                    let probability_element = probability_cursor.table_for_bit(
+                        &syntax.probability_segments,
+                        ch,
+                        bit_index,
+                        self.frame_bits_per_channel,
+                        syntax.probability_tables.elements,
+                        SegmentKind::Probability,
+                    )?;
                     let length = syntax.probability_tables.length[probability_element];
                     if length == 0 {
                         return Err(DstError::InvalidProbabilityTable(
@@ -257,8 +307,9 @@ impl DstDecoder {
 
                 let residual = i32::from(arithmetic.get(reader, probability)?);
                 let dsd_bit = ((predict >> 15) ^ residual) & 1;
+                let output_index = checked_decoded_output_index(byte_base, ch, out.len())?;
                 if dsd_bit != 0 {
-                    out[byte_base + ch] |= 1u8 << bit_in_byte;
+                    out[output_index] |= 1u8 << bit_in_byte;
                 }
 
                 push_status_bit(&mut status[ch], dsd_bit as u8);
@@ -274,6 +325,22 @@ fn validate_channel_count(channel_count: u8) -> Result<usize, DstError> {
         1..=6 => Ok(usize::from(channel_count)),
         _ => Err(DstError::InvalidChannelCount { channel_count }),
     }
+}
+
+fn checked_decoded_output_index(
+    byte_base: usize,
+    channel: usize,
+    output_len: usize,
+) -> Result<usize, DstError> {
+    let index = byte_base
+        .checked_add(channel)
+        .ok_or(DstError::ArithmeticDecodeFailure(
+            "DST output byte index overflow",
+        ))?;
+    if index >= output_len {
+        return Err(DstError::OutputOverflow { limit: output_len });
+    }
+    Ok(index)
 }
 
 fn decode_uncompressed_dst_payload(
@@ -482,17 +549,13 @@ impl SegmentData {
         Ok(())
     }
 
-    fn expand_map(
+    fn validate_decode_mapping(
         &self,
         channels: usize,
         bits_per_channel: usize,
         table_count: usize,
-        kind: &'static str,
-    ) -> Result<Vec<usize>, DstError> {
-        let total = channels
-            .checked_mul(bits_per_channel)
-            .ok_or(DstError::ArithmeticDecodeFailure("segment map size overflow"))?;
-        let mut map = vec![0usize; total];
+        kind: SegmentKind,
+    ) -> Result<(), DstError> {
         for ch in 0..channels {
             let mut start = 0usize;
             let count = self.segment_count[ch];
@@ -502,37 +565,128 @@ impl SegmentData {
             for seg in 0..count {
                 let table = self.table_for_segment[ch][seg];
                 if table >= table_count {
-                    return Err(DstError::InvalidMapping(match kind {
-                        "filter" => "filter segment references undefined table",
-                        _ => "probability segment references undefined table",
-                    }));
+                    return Err(DstError::InvalidMapping(kind.undefined_table_message()));
                 }
-                let end = if seg + 1 == count {
-                    bits_per_channel
-                } else {
-                    let len_bits = self
-                        .resolution
-                        .checked_mul(8)
-                        .and_then(|n| n.checked_mul(self.segment_len[ch][seg]))
-                        .ok_or(DstError::InvalidSegment("expanded segment length overflow"))?;
-                    start
-                        .checked_add(len_bits)
-                        .ok_or(DstError::InvalidSegment("expanded segment boundary overflow"))?
-                };
+                let end = self.segment_end_from_start(ch, seg, count, start, bits_per_channel)?;
                 if end > bits_per_channel || end < start {
                     return Err(DstError::InvalidSegment("segment boundary exceeds frame"));
                 }
-                let row_start = ch
-                    .checked_mul(bits_per_channel)
-                    .ok_or(DstError::ArithmeticDecodeFailure("segment row offset overflow"))?;
-                map[row_start + start..row_start + end].fill(table);
                 start = end;
             }
             if start != bits_per_channel {
                 return Err(DstError::InvalidSegment("segments do not cover frame"));
             }
         }
-        Ok(map)
+        Ok(())
+    }
+
+    fn segment_end_from_start(
+        &self,
+        ch: usize,
+        seg: usize,
+        segment_count: usize,
+        start: usize,
+        bits_per_channel: usize,
+    ) -> Result<usize, DstError> {
+        if seg + 1 == segment_count {
+            return Ok(bits_per_channel);
+        }
+        start
+            .checked_add(self.segment_len_bits(ch, seg)?)
+            .ok_or(DstError::InvalidSegment("expanded segment boundary overflow"))
+    }
+
+    fn segment_len_bits(&self, ch: usize, seg: usize) -> Result<usize, DstError> {
+        self.resolution
+            .checked_mul(8)
+            .and_then(|n| n.checked_mul(self.segment_len[ch][seg]))
+            .ok_or(DstError::InvalidSegment("expanded segment length overflow"))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SegmentKind {
+    Filter,
+    Probability,
+}
+
+impl SegmentKind {
+    fn undefined_table_message(self) -> &'static str {
+        match self {
+            Self::Filter => "filter segment references undefined table",
+            Self::Probability => "probability segment references undefined table",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SegmentCursor {
+    segment_index: usize,
+    segment_start_bit: usize,
+    segment_end_bit: usize,
+}
+
+#[derive(Debug)]
+struct SegmentCursorSet {
+    cursors: [SegmentCursor; MAX_CHANNELS],
+}
+
+impl SegmentCursorSet {
+    fn new(
+        segments: &SegmentData,
+        channels: usize,
+        bits_per_channel: usize,
+        table_count: usize,
+        kind: SegmentKind,
+    ) -> Result<Self, DstError> {
+        segments.validate_decode_mapping(channels, bits_per_channel, table_count, kind)?;
+
+        let mut cursors = [SegmentCursor::default(); MAX_CHANNELS];
+        for ch in 0..channels {
+            let count = segments.segment_count[ch];
+            cursors[ch].segment_end_bit = segments.segment_end_from_start(
+                ch,
+                0,
+                count,
+                0,
+                bits_per_channel,
+            )?;
+        }
+        Ok(Self { cursors })
+    }
+
+    fn table_for_bit(
+        &mut self,
+        segments: &SegmentData,
+        ch: usize,
+        bit_index: usize,
+        bits_per_channel: usize,
+        table_count: usize,
+        kind: SegmentKind,
+    ) -> Result<usize, DstError> {
+        let count = segments.segment_count[ch];
+        let cursor = &mut self.cursors[ch];
+        while bit_index >= cursor.segment_end_bit && cursor.segment_index + 1 < count {
+            cursor.segment_index += 1;
+            cursor.segment_start_bit = cursor.segment_end_bit;
+            cursor.segment_end_bit = segments.segment_end_from_start(
+                ch,
+                cursor.segment_index,
+                count,
+                cursor.segment_start_bit,
+                bits_per_channel,
+            )?;
+        }
+
+        if bit_index < cursor.segment_start_bit || bit_index >= cursor.segment_end_bit {
+            return Err(DstError::InvalidSegment("segments do not cover frame"));
+        }
+
+        let table = segments.table_for_segment[ch][cursor.segment_index];
+        if table >= table_count {
+            return Err(DstError::InvalidMapping(kind.undefined_table_message()));
+        }
+        Ok(table)
     }
 }
 
@@ -970,6 +1124,66 @@ mod tests {
                 assert!(decoded.iter().all(|&b| b == channels));
             }
         }
+    }
+
+    #[test]
+    fn decode_frame_into_writes_exact_frame_and_preserves_tail() {
+        let channels = 2;
+        let rate = DstRate::Dsd64;
+        let expected = rate.frame_bytes_per_channel().unwrap() * usize::from(channels);
+        let input = raw_dst_frame(channels, rate, 0x3c);
+        let mut output = vec![0xa5; expected + 16];
+
+        let written = decode_frame_with_rate_into(&input, channels, rate, &mut output).unwrap();
+
+        assert_eq!(written, expected);
+        assert!(output[..expected].iter().all(|&b| b == 0x3c));
+        assert!(output[expected..].iter().all(|&b| b == 0xa5));
+    }
+
+    #[test]
+    fn decode_frame_into_rejects_undersized_output_before_reading() {
+        let channels = 2;
+        let rate = DstRate::Dsd64;
+        let expected = rate.frame_bytes_per_channel().unwrap() * usize::from(channels);
+        let mut output = vec![0xa5; expected - 1];
+
+        let err = decode_frame_with_rate_into(&[], channels, rate, &mut output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DstError::OutputBufferTooSmall {
+                required,
+                actual
+            } if required == expected && actual == expected - 1
+        ));
+        assert!(output.iter().all(|&b| b == 0xa5));
+    }
+
+    #[test]
+    fn compressed_output_index_guard_reports_output_overflow() {
+        // Public decode APIs pass a slice sized to exact frame geometry, making
+        // this branch unreachable through a well-formed public call. Exercise
+        // the private compressed-path guard directly so future sink changes keep
+        // oversized decoded output structured as OutputOverflow.
+        let err = checked_decoded_output_index(9, 1, 10).unwrap_err();
+
+        assert!(matches!(err, DstError::OutputOverflow { limit: 10 }));
+    }
+
+    #[test]
+    fn stateful_decoder_into_clears_reused_buffer() {
+        let channels = 1;
+        let rate = DstRate::Dsd64;
+        let expected = rate.frame_bytes_per_channel().unwrap();
+        let mut output = vec![0xff; expected];
+        let mut decoder = DstDecoder::new(channels, rate).unwrap();
+
+        decoder
+            .decode_frame_into(&raw_dst_frame(channels, rate, 0x00), &mut output)
+            .unwrap();
+
+        assert!(output.iter().all(|&b| b == 0x00));
     }
 
     #[test]

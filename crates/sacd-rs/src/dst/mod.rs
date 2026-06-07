@@ -20,18 +20,28 @@ mod decoder;
 mod encoder;
 mod tables;
 
-pub use decoder::{decode_frame, decode_frame_with_rate, DstDecoder, DstRate};
+pub use decoder::{
+    decode_frame, decode_frame_into, decode_frame_with_rate, decode_frame_with_rate_into,
+    DstDecoder, DstRate,
+};
 pub use encoder::{
-    dst_interleaved_frame_len, encode_frame_interleaved, encode_frame_interleaved_with_telemetry,
+    dst_interleaved_frame_len, dst_interleaved_frame_len_for_rate, dst_rate_from_sample_rate,
+    encode_frame_interleaved, encode_frame_interleaved_with_rate,
+    encode_frame_interleaved_with_rate_and_telemetry, encode_frame_interleaved_with_telemetry,
     encode_frames_interleaved_ordered,
-    encode_predictive_frame_interleaved, encode_predictive_frame_interleaved_with_telemetry,
+    encode_predictive_frame_interleaved, encode_predictive_frame_interleaved_with_rate,
+    encode_predictive_frame_interleaved_with_rate_and_telemetry,
+    encode_predictive_frame_interleaved_with_telemetry,
     encode_uncompressed_frame_interleaved, encode_uncompressed_frame_interleaved_padded,
-    is_legal_dst_channel_count, supports_predictive_dst_channel_count,
-    supports_raw_dst_fallback_channel_count, supports_verified_dst_channel_count,
+    encode_uncompressed_frame_interleaved_padded_with_rate,
+    encode_uncompressed_frame_interleaved_with_rate,
+    is_legal_dst_channel_count, supports_dst_policy, supports_predictive_dst_channel_count,
+    supports_predictive_dst_layout, supports_raw_dst_fallback_channel_count,
+    supports_raw_dst_fallback_layout, supports_verified_dst_channel_count, validate_dst_policy,
     DstEncodeError, DstEncodeFailureClass, DstEncoderEffort,
-    DstEncoderOptions, DstFrameEncodeTelemetry, DstFrameEncoding, DstSelectedPredictor,
-    DstTableStrategy, DstVerificationFailureKind, DstVerificationFailurePolicy,
-    EncodedDstFrame, RawDstFallbackPolicy,
+    DstEncoderOptions, DstFrameEncodeTelemetry, DstFrameEncoding, DstPolicyScope,
+    DstSelectedPredictor, DstTableStrategy, DstVerificationFailureKind,
+    DstVerificationFailurePolicy, EncodedDstFrame, RawDstFallbackPolicy,
 };
 
 /// DST decoder error. Every C `assert()` / failure path in the upstream
@@ -57,9 +67,17 @@ pub enum DstError {
     InvalidArithmeticCode,
     /// Arithmetic decoder reached an impossible state.
     ArithmeticDecodeFailure(&'static str),
+    /// Caller-supplied output buffer is smaller than the decoded frame geometry.
+    OutputBufferTooSmall { required: usize, actual: usize },
     /// Decoder produced the wrong number of bytes.
     OutputSizeMismatch { expected: usize, actual: usize },
-    /// Decoder tried to emit more output than the fixed budget.
+    /// Decoder tried to emit more output than the fixed decoded-frame budget.
+    ///
+    /// Public decode APIs pre-slice their output buffer to the exact DSD frame
+    /// geometry before decoding, so valid calls cannot grow past the budget.
+    /// This variant covers internal geometry-invariant violations and keeps the
+    /// failure structured if a future sink decouples decode geometry from the
+    /// caller-provided slice length.
     OutputOverflow { limit: usize },
     /// Catch-all for upstream `return -1` paths that don't fit a more
     /// specific variant.
@@ -84,6 +102,9 @@ impl std::fmt::Display for DstError {
             DstError::InvalidProbabilityTable(msg) => write!(f, "invalid DST probability table: {}", msg),
             DstError::InvalidArithmeticCode => write!(f, "invalid DST arithmetic-code start bit"),
             DstError::ArithmeticDecodeFailure(msg) => write!(f, "DST arithmetic decode failure: {}", msg),
+            DstError::OutputBufferTooSmall { required, actual } => {
+                write!(f, "DST output buffer has {} bytes; required {}", actual, required)
+            }
             DstError::OutputSizeMismatch { expected, actual } => {
                 write!(f, "decoded DST output has {} bytes; expected {}", actual, expected)
             }

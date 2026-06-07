@@ -23,7 +23,7 @@ use crate::dsd_file::inspect::{
     DsdContainerInfo,
 };
 use crate::dff_dst_writer::dst_frame_crc;
-use crate::dst::{decode_frame_with_rate, DstError, DstRate};
+use crate::dst::{DstDecoder, DstError, DstRate};
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -69,6 +69,34 @@ pub struct DsdFrame {
     pub sample_rate: u32,
     pub byte_order: DsdByteOrder,
     pub is_final: bool,
+}
+
+/// A borrowed chunk of uncompressed DSD in canonical `sacd-rs` layout.
+///
+/// This mirrors [`DsdFrame`] for adapters that can lend a decoded frame from
+/// reusable internal storage. Converting it back to [`DsdFrame`] necessarily
+/// copies the payload into an owned `Vec<u8>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsdFrameRef<'a> {
+    pub frame_index: u64,
+    pub data: &'a [u8],
+    pub channel_count: u16,
+    pub sample_rate: u32,
+    pub byte_order: DsdByteOrder,
+    pub is_final: bool,
+}
+
+impl DsdFrameRef<'_> {
+    pub fn to_owned_frame(&self) -> DsdFrame {
+        DsdFrame {
+            frame_index: self.frame_index,
+            data: self.data.to_vec(),
+            channel_count: self.channel_count,
+            sample_rate: self.sample_rate,
+            byte_order: self.byte_order,
+            is_final: self.is_final,
+        }
+    }
 }
 
 /// A DSDIFF/DSD frame deinterleaved into per-channel byte vectors.
@@ -907,9 +935,13 @@ impl<R: Read + Seek> DsdFrameSeek for DstDsdiffStreamReader<R> {
 /// The adapter verifies decoded frames against DSDIFF `DSTC` values when the
 /// file supplies them. It does not silently continue after corrupt encoded
 /// payloads, checksum mismatches, illegal channel counts/rates, or short decoder
-/// output.
+/// output. `next_dsd_frame_ref()` lends from the adapter's reusable decoded
+/// buffer. The [`DsdFrameReader`] implementation returns owned [`DsdFrame`]
+/// values and therefore copies that slice into `DsdFrame.data`.
 pub struct DstToDsdAdapter<R: DstFrameReader> {
     inner: R,
+    decoder: DstDecoder,
+    decode_buffer: Vec<u8>,
     expected_decoded_len: usize,
     decoded_frame_index: u64,
     last_crc_status: Option<DstCrcStatus>,
@@ -920,8 +952,11 @@ impl<R: DstFrameReader> DstToDsdAdapter<R> {
         let channels = checked_dst_channel_count(inner.info())?;
         let rate = checked_dst_rate(inner.info())?;
         let expected_decoded_len = dst_decoded_frame_len(channels, rate)?;
+        let decoder = DstDecoder::new(channels, rate).map_err(DsdReadError::Dst)?;
         Ok(Self {
             inner,
+            decoder,
+            decode_buffer: vec![0u8; expected_decoded_len],
             expected_decoded_len,
             decoded_frame_index: 0,
             last_crc_status: None,
@@ -940,30 +975,30 @@ impl<R: DstFrameReader> DstToDsdAdapter<R> {
     pub fn into_inner(self) -> R {
         self.inner
     }
-}
 
-impl<R: DstFrameReader> DsdFrameReader for DstToDsdAdapter<R> {
-    fn info(&self) -> &DsdContainerInfo {
-        self.inner.info()
-    }
-
-    fn next_dsd_frame(&mut self) -> Result<Option<DsdFrame>, DsdReadError> {
+    /// Decode and lend the next DSD frame from the adapter's reusable buffer.
+    ///
+    /// The returned slice remains valid until the next mutable operation on this
+    /// adapter. Callers that need an owned frame can use the [`DsdFrameReader`]
+    /// implementation or [`DsdFrameRef::to_owned_frame`], both of which copy the
+    /// payload into `DsdFrame.data`.
+    pub fn next_dsd_frame_ref(&mut self) -> Result<Option<DsdFrameRef<'_>>, DsdReadError> {
         let Some(frame) = self.inner.next_dst_frame()? else {
             return Ok(None);
         };
-        let channels = checked_dst_channel_count(self.inner.info())?;
-        let rate = checked_dst_rate(self.inner.info())?;
-        let decoded = decode_frame_with_rate(&frame.encoded, channels, rate)?;
-        if decoded.len() != self.expected_decoded_len {
+        let decoded_len = self
+            .decoder
+            .decode_frame_into(&frame.encoded, &mut self.decode_buffer)?;
+        if decoded_len != self.expected_decoded_len {
             return Err(malformed(
                 frame.payload_offset,
                 format!(
                     "DST decoder returned {} bytes for frame {}, expected {}",
-                    decoded.len(), frame.frame_index, self.expected_decoded_len
+                    decoded_len, frame.frame_index, self.expected_decoded_len
                 ),
             ));
         }
-        let crc_status = DstCrcStatus::verify(frame.dstc, &decoded);
+        let crc_status = DstCrcStatus::verify(frame.dstc, &self.decode_buffer[..decoded_len]);
         if matches!(&crc_status, DstCrcStatus::PresentFailed { .. } | DstCrcStatus::Malformed { .. }) {
             return Err(DsdReadError::DstCrc {
                 offset: frame.payload_offset,
@@ -972,19 +1007,39 @@ impl<R: DstFrameReader> DsdFrameReader for DstToDsdAdapter<R> {
             });
         }
         self.last_crc_status = Some(crc_status);
-        let out = DsdFrame {
-            frame_index: self.decoded_frame_index,
-            data: decoded,
-            channel_count: self.inner.info().channel_count,
-            sample_rate: self.inner.info().sample_rate,
-            byte_order: DsdByteOrder::MsbFirst,
-            is_final: frame.is_final,
-        };
+
+        let frame_index = self.decoded_frame_index;
+        let channel_count = self.inner.info().channel_count;
+        let sample_rate = self.inner.info().sample_rate;
+        let is_final = frame.is_final;
         self.decoded_frame_index = self
             .decoded_frame_index
             .checked_add(1)
             .ok_or_else(|| malformed(frame.payload_offset, "decoded DST frame index overflow"))?;
-        Ok(Some(out))
+
+        Ok(Some(DsdFrameRef {
+            frame_index,
+            data: &self.decode_buffer[..decoded_len],
+            channel_count,
+            sample_rate,
+            byte_order: DsdByteOrder::MsbFirst,
+            is_final,
+        }))
+    }
+
+    #[cfg(test)]
+    fn decode_buffer_ptr_for_test(&self) -> *const u8 {
+        self.decode_buffer.as_ptr()
+    }
+}
+
+impl<R: DstFrameReader> DsdFrameReader for DstToDsdAdapter<R> {
+    fn info(&self) -> &DsdContainerInfo {
+        self.inner.info()
+    }
+
+    fn next_dsd_frame(&mut self) -> Result<Option<DsdFrame>, DsdReadError> {
+        Ok(self.next_dsd_frame_ref()?.map(|frame| frame.to_owned_frame()))
     }
 }
 
@@ -1510,6 +1565,7 @@ mod tests {
     use crate::dff_writer::DffWriter;
     use crate::dsf_writer::{ChannelType, DsfWriter};
     use crate::dst::{dst_interleaved_frame_len, encode_uncompressed_frame_interleaved};
+    use crate::test_allocation_counter::allocation_count_for;
     use std::io::Cursor;
 
     fn collect_dsd<R: DsdFrameReader>(reader: &mut R) -> Vec<u8> {
@@ -1522,6 +1578,80 @@ mod tests {
 
     fn read_u64_be_from(buf: &[u8], off: usize) -> u64 {
         u64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
+    }
+
+    struct PreloadedDstFrameReader {
+        info: DsdContainerInfo,
+        frames: Vec<Option<DstFrame>>,
+        next_index: usize,
+    }
+
+    impl PreloadedDstFrameReader {
+        fn new(decoded_frames: &[Vec<u8>], channel_count: u16, sample_rate: u32) -> Self {
+            let encoded_frames: Vec<Vec<u8>> = decoded_frames
+                .iter()
+                .map(|frame| encode_uncompressed_frame_interleaved(frame, channel_count as u8).unwrap())
+                .collect();
+            let data_size = encoded_frames.iter().map(|f| f.len() as u64).sum();
+            let sample_count_per_channel = decoded_frames
+                .len()
+                .checked_mul(decoded_frames[0].len() / usize::from(channel_count))
+                .and_then(|bytes| bytes.checked_mul(8))
+                .map(|samples| samples as u64);
+            let mut frames = Vec::with_capacity(encoded_frames.len());
+            let final_index = encoded_frames.len().saturating_sub(1);
+            for (idx, encoded) in encoded_frames.into_iter().enumerate() {
+                frames.push(Some(DstFrame {
+                    frame_index: idx as u64,
+                    chunk_offset: 0,
+                    payload_offset: 0,
+                    encoded,
+                    dstc: Some(dst_frame_crc(&decoded_frames[idx])),
+                    crc_status: DstCrcStatus::PresentUnchecked {
+                        expected: dst_frame_crc(&decoded_frames[idx]),
+                    },
+                    physical_chunk_size: 0,
+                    sample_rate,
+                    channel_count,
+                    is_final: idx == final_index,
+                }));
+            }
+            Self {
+                info: DsdContainerInfo {
+                    format: DsdContainerFormat::Dsdiff,
+                    compression: DsdCompression::Dst,
+                    byte_order: DsdByteOrder::MsbFirst,
+                    channel_count,
+                    sample_rate,
+                    sample_count_per_channel,
+                    data_offset: 0,
+                    data_size,
+                    metadata_offset: None,
+                    channel_ids: vec![*b"SLFT", *b"SRGT"],
+                    dsf_block_size_per_channel: None,
+                    dsdiff_cmpr_code: Some(*b"DST "),
+                    dsdiff_frm8_size: None,
+                    dsdiff_frm8_end: None,
+                    diagnostics: Vec::new(),
+                },
+                frames,
+                next_index: 0,
+            }
+        }
+    }
+
+    impl DstFrameReader for PreloadedDstFrameReader {
+        fn info(&self) -> &DsdContainerInfo {
+            &self.info
+        }
+
+        fn next_dst_frame(&mut self) -> Result<Option<DstFrame>, DsdReadError> {
+            let Some(slot) = self.frames.get_mut(self.next_index) else {
+                return Ok(None);
+            };
+            self.next_index += 1;
+            Ok(Some(slot.take().expect("preloaded DST frame already consumed")))
+        }
     }
 
     #[test]
@@ -2325,6 +2455,95 @@ mod tests {
         let mut decoded_reader = DstToDsdAdapter::new(encoded_reader).unwrap();
         decoded_reader.seek_frame(0).unwrap();
         assert_eq!(decoded_reader.next_dsd_frame().unwrap().unwrap().data, decoded);
+    }
+
+    #[test]
+    fn dsdiff_dst_adapter_borrowed_path_has_no_per_frame_allocations() {
+        let frame_len = dst_interleaved_frame_len(2).unwrap();
+        let decoded_a = vec![0xff; frame_len];
+        let decoded_b = vec![0x00; frame_len];
+        let encoded_reader = PreloadedDstFrameReader::new(
+            &[decoded_a.clone(), decoded_b.clone()],
+            2,
+            SACD_SAMPLING_FREQUENCY,
+        );
+        let mut decoded_reader = DstToDsdAdapter::new(encoded_reader).unwrap();
+        let buffer_ptr = decoded_reader.decode_buffer_ptr_for_test();
+
+        let ((), allocations) = allocation_count_for(|| {
+            let first = decoded_reader.next_dsd_frame_ref().unwrap().unwrap();
+            assert_eq!(first.data, decoded_a.as_slice());
+            assert_eq!(first.data.as_ptr(), buffer_ptr);
+            assert!(!first.is_final);
+
+            let second = decoded_reader.next_dsd_frame_ref().unwrap().unwrap();
+            assert_eq!(second.data, decoded_b.as_slice());
+            assert_eq!(second.data.as_ptr(), buffer_ptr);
+            assert!(second.is_final);
+
+            assert!(decoded_reader.next_dsd_frame_ref().unwrap().is_none());
+        });
+
+        assert_eq!(allocations, 0, "borrowed decoded-frame path allocated per frame");
+    }
+
+    #[test]
+    fn dsdiff_dst_adapter_owned_trait_allocates_once_per_returned_frame() {
+        let frame_len = dst_interleaved_frame_len(2).unwrap();
+        let decoded_a = vec![0xff; frame_len];
+        let decoded_b = vec![0x00; frame_len];
+        let encoded_reader = PreloadedDstFrameReader::new(
+            &[decoded_a.clone(), decoded_b.clone()],
+            2,
+            SACD_SAMPLING_FREQUENCY,
+        );
+        let mut decoded_reader = DstToDsdAdapter::new(encoded_reader).unwrap();
+        let buffer_ptr = decoded_reader.decode_buffer_ptr_for_test();
+
+        let ((), allocations) = allocation_count_for(|| {
+            let first = decoded_reader.next_dsd_frame().unwrap().unwrap();
+            assert_eq!(first.data, decoded_a);
+            assert_ne!(first.data.as_ptr(), buffer_ptr);
+            assert!(!first.is_final);
+
+            let second = decoded_reader.next_dsd_frame().unwrap().unwrap();
+            assert_eq!(second.data, decoded_b);
+            assert_ne!(second.data.as_ptr(), buffer_ptr);
+            assert!(second.is_final);
+
+            assert!(decoded_reader.next_dsd_frame().unwrap().is_none());
+        });
+
+        assert_eq!(allocations, 2, "owned DsdFrame path should allocate one Vec per returned frame");
+    }
+
+    #[test]
+    fn dsdiff_dst_adapter_can_lend_decoded_frame_without_owned_copy() {
+        let frame_len = dst_interleaved_frame_len(2).unwrap();
+        let decoded = vec![0x69; frame_len];
+        let encoded = encode_uncompressed_frame_interleaved(&decoded, 2).unwrap();
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = DffDstWriter::new(&mut cursor, 2, SACD_SAMPLING_FREQUENCY).unwrap();
+            writer.write_encoded_frame(&encoded, &decoded).unwrap();
+            writer.finish().unwrap();
+        }
+        cursor.set_position(0);
+
+        let encoded_reader = DstDsdiffStreamReader::new(cursor).unwrap();
+        let mut decoded_reader = DstToDsdAdapter::new(encoded_reader).unwrap();
+        let buffer_ptr = decoded_reader.decode_buffer_ptr_for_test();
+
+        let borrowed_ptr = {
+            let frame = decoded_reader.next_dsd_frame_ref().unwrap().unwrap();
+            assert_eq!(frame.data, decoded.as_slice());
+            assert_eq!(frame.channel_count, 2);
+            assert_eq!(frame.sample_rate, SACD_SAMPLING_FREQUENCY);
+            frame.data.as_ptr()
+        };
+
+        assert_eq!(borrowed_ptr, buffer_ptr);
+        assert!(decoded_reader.next_dsd_frame_ref().unwrap().is_none());
     }
 
 }

@@ -49,7 +49,8 @@ use crate::tui::sacd::{
     parse_sacd_iso, AreaInfo, PlayTime, SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE,
     SACD_SAMPLE_RATE_HZ,
 };
-use sacd_rs::extract::{extract_track, ExtractOptions, ExtractStats, OutputFormat};
+use sacd_rs::dsd_file::{validate_dsd_stream, DsdValidationMode, DsdValidationOptions, DsdValidationReport};
+use sacd_rs::extract::{extract_track_with_integrity_options, ExtractIntegrityOptions, ExtractOptions, ExtractReport, ExtractStats, OutputFormat};
 use sacd_rs::iso_reader::IsoReader;
 
 const DEFAULT_CONVERT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
@@ -237,6 +238,28 @@ pub async fn realize_track_with_tool_limits(
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     progress_tracker: Option<&mut OperationProgressTracker<'_>>,
 ) -> Result<PathBuf, ConvertError> {
+    realize_track_with_tool_limits_and_stats(
+        src,
+        req,
+        staging,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+        progress_tracker,
+    )
+    .await
+    .map(|realized| realized.path)
+}
+
+async fn realize_track_with_tool_limits_and_stats(
+    src: &TrackSourceRef,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+) -> Result<RealizedTrackInfo, ConvertError> {
     if cancel.is_cancelled() {
         return Err(ConvertError::Realize("cancelled".to_string()));
     }
@@ -255,7 +278,10 @@ pub async fn realize_track_with_tool_limits(
                     path.display()
                 )));
             }
-            Ok(path.clone())
+            Ok(RealizedTrackInfo {
+                path: path.clone(),
+                dsd_dst_stats: dsd_dst_stats_from_file(path, Some(file_len(path).unwrap_or(0)), None),
+            })
         }
         TrackSourceRef::CueSegmentCarrier { path, carrier, .. } => {
             if !path.exists() {
@@ -277,7 +303,7 @@ pub async fn realize_track_with_tool_limits(
                     path.display()
                 )));
             }
-            Ok(path.clone())
+            Ok(RealizedTrackInfo::without_stats(path.clone()))
         }
         TrackSourceRef::ImageSegment {
             image,
@@ -295,6 +321,7 @@ pub async fn realize_track_with_tool_limits(
                 tool_concurrency_limits.as_ref(),
             )
             .await
+            .map(RealizedTrackInfo::without_stats)
         }
         TrackSourceRef::SacdTrack {
             iso,
@@ -917,7 +944,7 @@ async fn realize_sacd_track(
     staging: &StagingDir,
     cancel: &CancellationToken,
     progress_tracker: Option<&mut OperationProgressTracker<'_>>,
-) -> Result<PathBuf, ConvertError> {
+) -> Result<RealizedTrackInfo, ConvertError> {
     if cancel.is_cancelled() {
         return Err(ConvertError::Realize("cancelled".to_string()));
     }
@@ -974,7 +1001,7 @@ fn realize_sacd_track_blocking(
     area: SacdArea,
     target_format: &tonepoet_pipeline::AudioFormat,
     staging_root: &Path,
-) -> Result<PathBuf, ConvertError> {
+) -> Result<RealizedTrackInfo, ConvertError> {
     let metadata = parse_sacd_iso(iso).map_err(sacd_error_to_convert)?;
     let area_info = sacd_area_info(&metadata, area).ok_or_else(|| {
         ConvertError::TrackValidation(format!(
@@ -1027,7 +1054,15 @@ fn realize_sacd_track_blocking(
     let out_path = realized_dir.join(sacd_track_output_name(iso, area, track_index, entry, output_ext));
 
     if sacd_output_is_ready(&out_path, output_format, area_info, entry.duration) {
-        return Ok(out_path);
+        let stats = dsd_dst_stats_from_file(
+            &out_path,
+            None,
+            Some(file_len(&out_path).unwrap_or(0)),
+        );
+        return Ok(RealizedTrackInfo {
+            path: out_path,
+            dsd_dst_stats: stats,
+        });
     }
 
     let tmp_path = unique_sacd_tmp_path(&out_path);
@@ -1048,7 +1083,13 @@ fn realize_sacd_track_blocking(
             area_info.header.channel_count,
             output_format,
         );
-        let stats = extract_track(&mut iso_reader, &mut writer, options).map_err(|err| {
+        let report = extract_track_with_integrity_options(
+            &mut iso_reader,
+            &mut writer,
+            options,
+            ExtractIntegrityOptions::strict(),
+        )
+        .map_err(|err| {
             ConvertError::Realize(format!(
                 "SACD extraction failed for {} track {}: {err}",
                 iso.display(),
@@ -1058,17 +1099,28 @@ fn realize_sacd_track_blocking(
         writer.sync_all()?;
         drop(writer);
 
-        validate_sacd_realization(&tmp_path, output_format, area_info, entry.duration, stats)?;
-        Ok(())
+        validate_sacd_realization(&tmp_path, output_format, area_info, entry.duration, report.stats)?;
+        Ok(dsd_dst_stats_from_extract_report(&report, Some(file_len(&tmp_path).unwrap_or(0))))
     })();
 
-    if let Err(err) = extraction_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err);
-    }
+    let mut dsd_dst_stats = match extraction_result {
+        Ok(stats) => stats,
+        Err(err) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+    };
 
     match fs::rename(&tmp_path, &out_path) {
-        Ok(()) => Ok(out_path),
+        Ok(()) => {
+            if let Some(stats) = dsd_dst_stats.as_mut() {
+                stats.bytes_written = file_len(&out_path).unwrap_or(stats.bytes_written);
+            }
+            Ok(RealizedTrackInfo {
+                path: out_path,
+                dsd_dst_stats,
+            })
+        }
         Err(first_err) if out_path.exists() => {
             let _ = fs::remove_file(&out_path);
             fs::rename(&tmp_path, &out_path).map_err(|second_err| {
@@ -1082,7 +1134,13 @@ fn realize_sacd_track_blocking(
                     ),
                 ))
             })?;
-            Ok(out_path)
+            if let Some(stats) = dsd_dst_stats.as_mut() {
+                stats.bytes_written = file_len(&out_path).unwrap_or(stats.bytes_written);
+            }
+            Ok(RealizedTrackInfo {
+                path: out_path,
+                dsd_dst_stats,
+            })
         }
         Err(err) => {
             let _ = fs::remove_file(&tmp_path);
@@ -1584,11 +1642,27 @@ pub struct ScheduledRealizedTrack {
     pub track: PreparedTrack,
     pub final_path: PathBuf,
     pub realized_path: PathBuf,
+    pub realized_dsd_dst_stats: Option<DsdDstPipelineStats>,
     pub req: PipelineRequest,
     pub staging_root: PathBuf,
     pub staging_job: String,
     pub convert_root: PathBuf,
     pub cancel: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+struct RealizedTrackInfo {
+    path: PathBuf,
+    dsd_dst_stats: Option<DsdDstPipelineStats>,
+}
+
+impl RealizedTrackInfo {
+    fn without_stats(path: PathBuf) -> Self {
+        Self {
+            path,
+            dsd_dst_stats: None,
+        }
+    }
 }
 
 /// Build a deterministic failed track output for scheduler boundary failures.
@@ -1615,6 +1689,7 @@ pub fn scheduled_worker_failure_output(
             bytes_in: None,
             bytes_out: None,
             duration: None,
+            dsd_dst_stats: None,
         },
         artifact: None,
         ok: false,
@@ -1769,20 +1844,21 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     }
 
     let failed = records.iter().any(|record| matches!(record.outcome, TrackOutcome::Err(_)));
+    let record = convert_stage_record_for_tracks(
+        &records,
+        if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
+            StageOutcome::Failed("one or more tracks failed".to_string())
+        } else {
+            StageOutcome::Ok
+        },
+    );
     ConvertStageResult {
         tracks: records,
         artifacts: ArtifactSet {
             audio: AudioArtifacts::Tracks(artifacts),
             sidecars: Vec::new(),
         },
-        record: stage_record(
-            PipelineStage::Convert,
-            if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
-                StageOutcome::Failed("one or more tracks failed".to_string())
-            } else {
-                StageOutcome::Ok
-            },
-        ),
+        record,
     }
 }
 
@@ -1803,7 +1879,7 @@ async fn convert_one_track_work(
     let runner = RealToolRunner::new(tool_paths.clone());
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
-    let realized_input = match realize_track_with_tool_limits(
+    let realized = match realize_track_with_tool_limits_and_stats(
         &track.source_ref,
         &req,
         &staging,
@@ -1814,12 +1890,14 @@ async fn convert_one_track_work(
     )
     .await
     {
-        Ok(path) => path,
+        Ok(realized) => realized,
         Err(err) => {
             let record = failed_track_record(&track, None, Some(staged_path), Vec::new(), err.to_string());
             return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
         }
     };
+    let realized_input = realized.path;
+    let realized_dsd_dst_stats = realized.dsd_dst_stats;
 
     if let Some(parent) = staged_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
@@ -1888,16 +1966,25 @@ async fn convert_one_track_work(
                         return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
                     }
                 };
+                let mut dsd_dst_stats = realized_dsd_dst_stats;
+                merge_optional_dsd_dst_stats(
+                    &mut dsd_dst_stats,
+                    dsd_dst_stats_from_file(&staged_path, None, bytes_out),
+                );
+                apply_byte_totals_to_stats(&mut dsd_dst_stats, bytes_in, bytes_out);
+                let mut commands = executed.commands;
+                append_dsd_dst_stats_to_command_descriptions(&mut commands, dsd_dst_stats.as_ref());
                 let record = TrackRecord {
                     track_id: track.id.clone(),
                     outcome: TrackOutcome::Ok,
                     source_ref: track.source_ref.clone(),
                     realized_input: Some(realized_input),
                     output_file: Some(staged_path.clone()),
-                    commands: executed.commands,
+                    commands,
                     bytes_in,
                     bytes_out,
                     duration: Some(executed.elapsed),
+                    dsd_dst_stats,
                 };
                 let artifact = TrackArtifact {
                     planned_command_hash: executed.command_hash,
@@ -2053,6 +2140,7 @@ pub async fn merge_tracks_with_tool_limits(
             StageRecord {
                 stage: PipelineStage::Merge,
                 outcome: StageOutcome::Skipped,
+                dsd_dst_stats: None,
             },
         ));
     }
@@ -2089,6 +2177,7 @@ pub async fn merge_tracks_with_tool_limits(
             StageRecord {
                 stage: PipelineStage::Merge,
                 outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
             },
         ));
     }
@@ -2253,6 +2342,7 @@ pub async fn merge_tracks_with_tool_limits(
         StageRecord {
             stage: PipelineStage::Merge,
             outcome: StageOutcome::Ok,
+            dsd_dst_stats: None,
         },
     ))
 }
@@ -2374,6 +2464,7 @@ pub async fn apply_metadata_with_tool_limits(
         return Ok(StageRecord {
             stage: PipelineStage::Metadata,
             outcome: StageOutcome::Skipped,
+            dsd_dst_stats: None,
         });
     }
 
@@ -2463,6 +2554,7 @@ pub async fn apply_metadata_with_tool_limits(
     Ok(StageRecord {
         stage: PipelineStage::Metadata,
         outcome: StageOutcome::Ok,
+        dsd_dst_stats: None,
     })
 }
 
@@ -4839,6 +4931,7 @@ pub async fn apply_replaygain_with_tool_limits(
         return Ok(StageRecord {
             stage: PipelineStage::ReplayGain,
             outcome: StageOutcome::Skipped,
+            dsd_dst_stats: None,
         });
     }
 
@@ -4849,6 +4942,7 @@ pub async fn apply_replaygain_with_tool_limits(
                 return Ok(StageRecord {
                     stage: PipelineStage::ReplayGain,
                     outcome: StageOutcome::Skipped,
+                    dsd_dst_stats: None,
                 });
             }
             args.push("-a".to_string());
@@ -4881,6 +4975,7 @@ pub async fn apply_replaygain_with_tool_limits(
     Ok(StageRecord {
         stage: PipelineStage::ReplayGain,
         outcome: StageOutcome::Ok,
+        dsd_dst_stats: None,
     })
 }
 
@@ -4900,6 +4995,7 @@ pub async fn run_features(
             StageRecord {
                 stage: PipelineStage::Features,
                 outcome: StageOutcome::Skipped,
+                dsd_dst_stats: None,
             },
         ));
     }
@@ -4952,6 +5048,7 @@ pub async fn run_features(
         StageRecord {
             stage: PipelineStage::Features,
             outcome: StageOutcome::Ok,
+            dsd_dst_stats: None,
         },
     ))
 }
@@ -5081,10 +5178,15 @@ fn build_conversion_log(
         log.push_str("No stage records were produced.\n");
     } else {
         for stage in stages {
+            let mut summary = stage_outcome_label(&stage.outcome);
+            if let Some(stats) = stage.dsd_dst_stats.as_ref() {
+                summary.push_str("; ");
+                summary.push_str(&format_dsd_dst_stats_inline(stats));
+            }
             push_kv_line(
                 &mut log,
                 pipeline_stage_label(stage.stage),
-                stage_outcome_label(&stage.outcome),
+                summary,
             );
         }
     }
@@ -5208,6 +5310,10 @@ fn append_track_log(
         (Some(bytes_in), None) => push_kv_line(log, "  Input size", format_bytes(bytes_in)),
         (None, Some(bytes_out)) => push_kv_line(log, "  Output size", format_bytes(bytes_out)),
         (None, None) => log.push_str("  Size: unknown\n"),
+    }
+
+    if let Some(stats) = record.dsd_dst_stats.as_ref() {
+        push_kv_line(log, "  DSD/DST stats", format_dsd_dst_stats_inline(stats));
     }
 
     if let Some(duration) = record.duration {
@@ -7323,7 +7429,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits(
     let runner = RealToolRunner::new(tool_paths);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, Some(reporter));
-    match realize_track_with_tool_limits(
+    match realize_track_with_tool_limits_and_stats(
         &track.source_ref,
         &req,
         &staging,
@@ -7334,11 +7440,12 @@ pub async fn realize_track_for_scheduler_with_tool_limits(
     )
     .await
     {
-        Ok(realized_path) => Ok(ScheduledRealizedTrack {
+        Ok(realized) => Ok(ScheduledRealizedTrack {
             index: track_index,
             track,
             final_path,
-            realized_path,
+            realized_path: realized.path,
+            realized_dsd_dst_stats: realized.dsd_dst_stats,
             req,
             staging_root,
             staging_job,
@@ -7445,16 +7552,25 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
                         return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
                     }
                 };
+                let mut dsd_dst_stats = realized.realized_dsd_dst_stats.clone();
+                merge_optional_dsd_dst_stats(
+                    &mut dsd_dst_stats,
+                    dsd_dst_stats_from_file(&staged_path, None, bytes_out),
+                );
+                apply_byte_totals_to_stats(&mut dsd_dst_stats, bytes_in, bytes_out);
+                let mut commands = executed.commands;
+                append_dsd_dst_stats_to_command_descriptions(&mut commands, dsd_dst_stats.as_ref());
                 let record = TrackRecord {
                     track_id: realized.track.id.clone(),
                     outcome: TrackOutcome::Ok,
                     source_ref: realized.track.source_ref.clone(),
-                    realized_input: Some(realized.realized_path),
+                    realized_input: Some(realized.realized_path.clone()),
                     output_file: Some(staged_path.clone()),
-                    commands: executed.commands,
+                    commands,
                     bytes_in,
                     bytes_out,
                     duration: Some(executed.elapsed),
+                    dsd_dst_stats,
                 };
                 let artifact = TrackArtifact {
                     track_id: realized.track.id.clone(),
@@ -7523,20 +7639,21 @@ fn convert_result_from_scheduled_outputs(
     }
 
     let failed = records.iter().any(|record| matches!(record.outcome, TrackOutcome::Err(_)));
+    let record = convert_stage_record_for_tracks(
+        &records,
+        if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
+            StageOutcome::Failed("one or more tracks failed".to_string())
+        } else {
+            StageOutcome::Ok
+        },
+    );
     ConvertStageResult {
         tracks: records,
         artifacts: ArtifactSet {
             audio: AudioArtifacts::Tracks(artifacts),
             sidecars: Vec::new(),
         },
-        record: stage_record(
-            PipelineStage::Convert,
-            if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
-                StageOutcome::Failed("one or more tracks failed".to_string())
-            } else {
-                StageOutcome::Ok
-            },
-        ),
+        record,
     }
 }
 
@@ -8603,7 +8720,200 @@ fn validate_root_dir(path: &Path, label: &str) -> Result<(), RequestValidationEr
 }
 
 fn stage_record(stage: PipelineStage, outcome: StageOutcome) -> StageRecord {
-    StageRecord { stage, outcome }
+    StageRecord {
+        stage,
+        outcome,
+        dsd_dst_stats: None,
+    }
+}
+
+fn convert_stage_record_for_tracks(tracks: &[TrackRecord], outcome: StageOutcome) -> StageRecord {
+    StageRecord {
+        stage: PipelineStage::Convert,
+        outcome,
+        dsd_dst_stats: aggregate_track_dsd_dst_stats(tracks),
+    }
+}
+
+fn aggregate_track_dsd_dst_stats(tracks: &[TrackRecord]) -> Option<DsdDstPipelineStats> {
+    let mut aggregate = DsdDstPipelineStats::default();
+    for stats in tracks.iter().filter_map(|record| record.dsd_dst_stats.as_ref()) {
+        aggregate.merge(stats);
+    }
+    if aggregate.is_empty() {
+        None
+    } else {
+        Some(aggregate)
+    }
+}
+
+fn merge_optional_dsd_dst_stats(
+    base: &mut Option<DsdDstPipelineStats>,
+    incoming: Option<DsdDstPipelineStats>,
+) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    if incoming.is_empty() {
+        return;
+    }
+    match base {
+        Some(base) => base.merge(&incoming),
+        None => *base = Some(incoming),
+    }
+}
+
+fn apply_byte_totals_to_stats(
+    stats: &mut Option<DsdDstPipelineStats>,
+    bytes_in: Option<u64>,
+    bytes_out: Option<u64>,
+) {
+    let Some(stats) = stats.as_mut() else {
+        return;
+    };
+    if let Some(bytes_in) = bytes_in {
+        stats.bytes_read = bytes_in;
+    }
+    if let Some(bytes_out) = bytes_out {
+        stats.bytes_written = bytes_out;
+    }
+}
+
+fn append_dsd_dst_stats_to_command_descriptions(
+    commands: &mut [CommandRecord],
+    stats: Option<&DsdDstPipelineStats>,
+) {
+    let Some(stats) = stats.filter(|stats| !stats.is_empty()) else {
+        return;
+    };
+    let Some(command) = commands.first_mut() else {
+        return;
+    };
+    let summary = format_dsd_dst_stats_inline(stats);
+    command.description = Some(match command.description.take() {
+        Some(existing) if !existing.trim().is_empty() => format!("{}; {}", existing.trim(), summary),
+        _ => summary,
+    });
+}
+
+fn dsd_dst_stats_from_file(
+    path: &Path,
+    bytes_read: Option<u64>,
+    bytes_written: Option<u64>,
+) -> Option<DsdDstPipelineStats> {
+    if !is_dsd_container_path(path) {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let report = validate_dsd_stream(
+        file,
+        DsdValidationOptions {
+            mode: DsdValidationMode::DecodeDst,
+            max_frames: None,
+        },
+    );
+    let mut stats = dsd_dst_stats_from_validation_report(&report);
+    let output_role = bytes_written.is_some() && bytes_read.is_none();
+    let input_role = bytes_read.is_some() && bytes_written.is_none();
+    if output_role {
+        stats.frames_read = 0;
+        stats.frames_decoded = 0;
+        stats.dst_decoded_frames = 0;
+    }
+    if input_role {
+        stats.frames_emitted = 0;
+    }
+    stats.bytes_read = bytes_read.or_else(|| file_len(path)).unwrap_or(0);
+    stats.bytes_written = bytes_written.unwrap_or(0);
+    if stats.is_empty() {
+        None
+    } else {
+        Some(stats)
+    }
+}
+
+fn is_dsd_container_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "dsf" | "dff"))
+        .unwrap_or(false)
+}
+
+fn dsd_dst_stats_from_validation_report(report: &DsdValidationReport) -> DsdDstPipelineStats {
+    let mut stats = DsdDstPipelineStats {
+        frames_read: report.frames_seen(),
+        frames_decoded: report.dst_frames_seen,
+        frames_emitted: report.dsd_frames_seen.saturating_add(report.dst_frames_seen),
+        crc_checked: report.dstc_passed_frames.saturating_add(report.dstc_failed_frames),
+        crc_passed: report.dstc_passed_frames,
+        crc_failed: report.dstc_failed_frames.saturating_add(report.dstc_malformed_frames),
+        crc_missing: report.dstc_no_crc_frames,
+        dst_decoded_frames: report.dst_frames_seen,
+        ..DsdDstPipelineStats::default()
+    };
+    if let Some(failure) = report.failures.first() {
+        stats.first_error_frame = failure.frame_index;
+        stats.first_error_offset = failure.offset;
+    }
+    stats
+}
+
+fn dsd_dst_stats_from_extract_report(
+    report: &ExtractReport,
+    bytes_written: Option<u64>,
+) -> Option<DsdDstPipelineStats> {
+    let mut stats = DsdDstPipelineStats {
+        frames_read: report.stats.frames_read,
+        frames_emitted: report.stats.frames_read,
+        bytes_written: bytes_written.unwrap_or(report.stats.audio_bytes),
+        ..DsdDstPipelineStats::default()
+    };
+
+    if let Some(writer) = report.dff_dst_stats() {
+        stats.frames_emitted = writer.frames_written;
+        stats.dst_passthrough_frames = writer.passthrough_frames_written;
+        stats.dst_reencoded_frames = writer.predictive_frames_written;
+        stats.dst_raw_fallback_frames = writer.raw_frames_written;
+        stats.bytes_read = writer.total_raw_bytes;
+        stats.bytes_written = writer.total_encoded_bytes;
+    }
+
+    if stats.is_empty() {
+        None
+    } else {
+        Some(stats)
+    }
+}
+
+fn format_dsd_dst_stats_inline(stats: &DsdDstPipelineStats) -> String {
+    format!(
+        "DSD/DST stats: frames read {}, decoded {}, emitted {}; CRC checked {} (passed {}, failed {}, missing {}); DST passthrough {}, decoded {}, reencoded {}, raw {}; bytes read {}, written {}{}",
+        stats.frames_read,
+        stats.frames_decoded,
+        stats.frames_emitted,
+        stats.crc_checked,
+        stats.crc_passed,
+        stats.crc_failed,
+        stats.crc_missing,
+        stats.dst_passthrough_frames,
+        stats.dst_decoded_frames,
+        stats.dst_reencoded_frames,
+        stats.dst_raw_fallback_frames,
+        stats.bytes_read,
+        stats.bytes_written,
+        first_dsd_dst_error_suffix(stats),
+    )
+}
+
+fn first_dsd_dst_error_suffix(stats: &DsdDstPipelineStats) -> String {
+    match (stats.first_error_frame, stats.first_error_offset) {
+        (None, None) => String::new(),
+        (frame, offset) => format!(
+            "; first error frame {}, offset {}",
+            frame.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            offset.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        ),
+    }
 }
 
 async fn emit_stage_started(reporter: &dyn PipelineReporter, item_id: &str, stage: PipelineStage) {
@@ -9296,6 +9606,7 @@ fn failed_track_record(
         bytes_in: None,
         bytes_out: None,
         duration: None,
+        dsd_dst_stats: None,
     }
 }
 
@@ -10094,6 +10405,7 @@ mod conversion_log_tests {
             bytes_in: Some(2048),
             bytes_out: Some(1024),
             duration: Some(Duration::from_secs(65)),
+            dsd_dst_stats: None,
         }
     }
 
@@ -10112,6 +10424,7 @@ mod conversion_log_tests {
             bytes_in: Some(4096),
             bytes_out: None,
             duration: None,
+            dsd_dst_stats: None,
         }
     }
 
@@ -10120,14 +10433,17 @@ mod conversion_log_tests {
             StageRecord {
                 stage: PipelineStage::Materialize,
                 outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
             },
             StageRecord {
                 stage: PipelineStage::ReplayGain,
                 outcome: StageOutcome::Skipped,
+                dsd_dst_stats: None,
             },
             StageRecord {
                 stage: PipelineStage::Features,
                 outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
             },
         ]
     }
@@ -10221,6 +10537,7 @@ mod conversion_log_tests {
             stages: vec![StageRecord {
                 stage: PipelineStage::Convert,
                 outcome: StageOutcome::Failed("convert failed".to_string()),
+                dsd_dst_stats: None,
             }],
             reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
         };
@@ -10437,6 +10754,50 @@ mod conversion_log_tests {
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Pipeline: Decode FLAC to PCM → Encode FLAC level 8"));
+    }
+
+    #[test]
+    fn dsd_dst_stats_are_written_to_track_stage_and_command_log() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.dsd_dst_stats = Some(DsdDstPipelineStats {
+            frames_read: 2,
+            frames_decoded: 1,
+            frames_emitted: 2,
+            crc_checked: 1,
+            crc_passed: 1,
+            crc_missing: 1,
+            dst_passthrough_frames: 1,
+            dst_decoded_frames: 1,
+            dst_reencoded_frames: 0,
+            dst_raw_fallback_frames: 0,
+            bytes_read: 8192,
+            bytes_written: 4096,
+            ..DsdDstPipelineStats::default()
+        });
+        append_dsd_dst_stats_to_command_descriptions(&mut record.commands, record.dsd_dst_stats.as_ref());
+        let stage = convert_stage_record_for_tracks(&[record.clone()], StageOutcome::Ok);
+
+        assert_eq!(stage.dsd_dst_stats.as_ref().unwrap().frames_read, 2);
+        assert!(record.commands[0]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("DSD/DST stats: frames read 2, decoded 1, emitted 2"));
+
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: vec![stage],
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("DSD/DST stats: frames read 2, decoded 1, emitted 2"));
+        assert!(log.contains("CRC checked 1 (passed 1, failed 0, missing 1)"));
+        assert!(log.contains("DST passthrough 1, decoded 1, reencoded 0, raw 0"));
+        assert!(log.contains("bytes read 8192, written 4096"));
+        assert!(log.contains("Convert: Ok; DSD/DST stats"));
     }
 
     #[test]
@@ -10664,6 +11025,7 @@ mod conversion_log_tests {
             stages: vec![StageRecord {
                 stage: PipelineStage::Metadata,
                 outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
             }],
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
@@ -10693,6 +11055,7 @@ mod conversion_log_tests {
             stages: vec![StageRecord {
                 stage: PipelineStage::Metadata,
                 outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
             }],
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
@@ -10729,6 +11092,7 @@ mod conversion_log_tests {
             stages: vec![StageRecord {
                 stage: PipelineStage::Metadata,
                 outcome: StageOutcome::Skipped,
+                dsd_dst_stats: None,
             }],
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
@@ -10760,6 +11124,7 @@ mod conversion_log_tests {
             stages: vec![StageRecord {
                 stage: PipelineStage::Metadata,
                 outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
             }],
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
@@ -10793,6 +11158,7 @@ mod conversion_log_tests {
             stages: vec![StageRecord {
                 stage: PipelineStage::Metadata,
                 outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
             }],
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
@@ -11508,6 +11874,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             bytes_in: None,
             bytes_out: None,
             duration: None,
+            dsd_dst_stats: None,
         }
     }
 

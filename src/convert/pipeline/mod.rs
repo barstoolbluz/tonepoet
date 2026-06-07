@@ -117,6 +117,7 @@ mod tests {
             bytes_in: None,
             bytes_out: None,
             duration: None,
+            dsd_dst_stats: None,
         }
     }
 
