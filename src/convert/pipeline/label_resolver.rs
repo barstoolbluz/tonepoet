@@ -502,7 +502,17 @@ impl LabelResolver for DictionaryLabelResolver {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        let container_text = container_name.to_string();
+        let parent_name = container
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let container_text = if parent_name.is_empty() {
+            container_name.to_string()
+        } else {
+            format!("{parent_name} {container_name}")
+        };
+        let is_archive = is_archive_extension(container);
 
         if let Some(label) = digital_download_label(metadata, &container_text) {
             return Some(ResolvedLabel {
@@ -513,7 +523,15 @@ impl LabelResolver for DictionaryLabelResolver {
         }
 
         let catalog_country = self.resolve_catalog_country(metadata);
-        let hexload_match = self.find_hexload_mapping(&container_text);
+        // Hexload mappings are designed for PBThal-style archives where
+        // folder/file names encode pressing info. Non-archive sources
+        // (ISOs, standalone audio) have album titles as filenames where
+        // country names like "Spain" cause false positives.
+        let hexload_match = if is_archive {
+            self.find_hexload_mapping(&container_text)
+        } else {
+            None
+        };
 
         let tag_label = nonempty_extra(&metadata.extra, "label");
         let mut label = tag_label
@@ -532,7 +550,9 @@ impl LabelResolver for DictionaryLabelResolver {
             .or(catalog_country)
             .or_else(|| self.country_from_label(label.as_deref()))
             .or_else(|| hexload_match.and_then(|mapping| self.country_from_hexload(mapping)))
-            .or_else(|| self.find_country_in_container_text(&container_text));
+            // Container-text country scan only for archives — non-archive
+            // filenames contain album titles where country words are common.
+            .or_else(|| if is_archive { self.find_country_in_container_text(&container_text) } else { None });
 
         country = country.and_then(|value| self.normalize_country(&value));
         country = normalize_germany_for_year(country, metadata.date.as_deref());
@@ -643,6 +663,13 @@ pub fn enrich_with_label_info(
                 .or_insert(pressing);
         }
     }
+}
+
+fn is_archive_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "7z" | "zip" | "rar"))
+        .unwrap_or(false)
 }
 
 fn sort_aliases_longest_first(aliases: &mut [Alias]) {
