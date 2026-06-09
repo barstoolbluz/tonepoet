@@ -510,9 +510,9 @@ impl ExtractOptions {
 #[derive(Debug, Clone)]
 /// SB-AUDIT: SB-AUDIO-012..SB-AUDIO-015
 pub struct ExtractIntegrityOptions {
-    /// Authoritative area-TOC frame format. When set, extraction validates
-    /// every audio sector header against it and uses it to choose DST versus
-    /// plain-DSD frame-info layout.
+    /// Authoritative area-TOC frame format. When set, extraction uses it to
+    /// classify completed frames as DST or plain DSD. Per-sector header bits
+    /// still choose only that sector's frame-info entry width.
     pub frame_format: Option<FrameFormat>,
     /// If true, the frame reader records and skips malformed/unreadable
     /// sectors instead of failing immediately. The in-progress frame is
@@ -537,9 +537,9 @@ impl Default for ExtractIntegrityOptions {
 
 impl ExtractIntegrityOptions {
     /// Strict validation profile. Malformed sectors, read errors, invalid
-    /// timecodes, incomplete frames, frame-format mismatches, and strict
-    /// channel-count mismatches fail the extraction. This is the default and
-    /// should be used for regression validation and byte-exact comparisons.
+    /// timecodes, incomplete frames, and strict channel-count mismatches fail
+    /// the extraction. This is the default and should be used for regression
+    /// validation and byte-exact comparisons.
     pub fn strict() -> Self {
         Self::default()
     }
@@ -563,7 +563,8 @@ impl ExtractIntegrityOptions {
 
     /// Attach the area-TOC frame format. This is the preferred constructor
     /// path for high-integrity extraction because it makes the area TOC the
-    /// source of truth and rejects sectors whose compression bit disagrees.
+    /// DSD/DST source of truth while leaving sector header bits to describe
+    /// frame-info entry width.
     pub fn with_frame_format(mut self, frame_format: FrameFormat) -> Self {
         self.frame_format = Some(frame_format);
         self
@@ -755,8 +756,10 @@ pub struct ExtractIntegrityReport {
     /// Number of sector header compression bits that disagreed with the
     /// authoritative area-TOC frame format.
     pub frame_format_mismatches: u64,
-    /// Number of frame-info timecodes outside the normalized SACD ranges
-    /// (`seconds >= 60` or `frames >= 75`).
+    /// Number of frame-info timecodes whose frame component is outside
+    /// the 75 fps SACD sub-second range (`frames >= 75`). Raw seconds
+    /// values greater than 59 are still converted with TIME_FRAMECOUNT
+    /// semantics for sacd_extract compatibility.
     pub invalid_timecodes: u64,
     /// Bytes emitted by the frame parser before DST decoding. For DST this
     /// is encoded bytes; `ExtractStats::audio_bytes` is bytes actually written.
@@ -880,24 +883,16 @@ impl ExtractReport {
 ///
 /// ## LSN range + time filter
 ///
-/// Two valid call patterns produce identical output for real SACDs:
+/// The caller supplies the half-open LSN range `[start_lsn, end_lsn)`.
+/// For SACD ISO materialization, tonepoet derives that range from area
+/// TOC + SACDTRL1 queueing semantics: track 0 starts at area `track_start`,
+/// later tracks start at their track-list start, non-final tracks end at
+/// the next track start plus one, and the final track ends at area
+/// `track_end + 1`.
 ///
-/// 1. **Pre-trimmed LSN range, no filter** — pass tonepoet's
-///    `TrackEntry.start_lsn` + `length_lsn` from SACDTRL1, with
-///    `opts.time_filter = None`. The SACDTRL1 range already
-///    excludes pre-gaps + inter-track pauses, so no frame filter
-///    is needed.
-///
-/// 2. **Wide LSN range + time filter** — pass the
-///    `area_toc.track_start..track_start_lsn[next_track]` range
-///    plus `opts.time_filter = Some(TimeFilter { ... })` built from
-///    SACDTRL2's per-track start time + duration. This matches
-///    sacd_extract's default behavior (`audio_frame_trimming = 1`).
-///
-/// Both patterns produce sacd_extract-default-equivalent audio
-/// output. Pattern 1 is more efficient (fewer sectors read);
-/// pattern 2 is sacd_extract-faithful when reproducing legacy
-/// behavior matters.
+/// A separate time filter remains available for callers that deliberately
+/// choose wider ranges, but the FLAC intermediate path passes an already
+/// queued range with no time filter.
 ///
 /// On error, the output writer is dropped without `finish()`;
 /// the file ends up with a placeholder header (zero chunk sizes)
@@ -936,8 +931,8 @@ pub fn extract_track<W: Write + Seek>(
 /// This additive API preserves [`extract_track`] while returning all recovery,
 /// parser-integrity, and DSDIFF/DST writer telemetry state.
 /// In strict/default mode (`recover_sector_errors == false`), malformed
-/// sectors, read errors, invalid timecodes, frame-format mismatches, strict
-/// channel-count mismatches, and incomplete pending frames fail the operation.
+/// sectors, read errors, invalid timecodes, strict channel-count mismatches,
+/// and incomplete pending frames fail the operation.
 /// In salvage mode ([`ExtractIntegrityOptions::salvage`]), the operation may
 /// succeed after damaged sectors are skipped, but every skipped sector and
 /// dropped partial frame is retained in [`ExtractReport::integrity`]. A caller
@@ -955,6 +950,26 @@ pub fn extract_track_with_integrity_options<W: Write + Seek>(
         opts,
         integrity_options,
         DstExtractionOptions::default(),
+    )
+}
+
+/// Extract one ISO track with the area-TOC frame format supplied directly.
+///
+/// This keeps [`ExtractOptions`] source-compatible for callers that build it
+/// with struct literals while giving SACD ISO materialization a direct path
+/// for authoritative DSD/DST routing.
+pub fn extract_track_with_area_frame_format<W: Write + Seek>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    area_frame_format: FrameFormat,
+    integrity_options: ExtractIntegrityOptions,
+) -> Result<ExtractReport, ExtractError> {
+    extract_track_with_integrity_options(
+        iso,
+        output,
+        opts,
+        integrity_options.with_frame_format(area_frame_format),
     )
 }
 
@@ -1377,6 +1392,41 @@ mod tests {
         let mut sectors = Vec::new();
         let first = frame_bytes.len().min(PART_SIZE);
         sectors.push(synth_audio_sector(true, &frame_bytes[..first], tc));
+        let mut off = first;
+        while off < frame_bytes.len() {
+            let chunk = (frame_bytes.len() - off).min(PART_SIZE);
+            sectors.push(synth_continuation_sector(&frame_bytes[off..off + chunk]));
+            off += chunk;
+        }
+        sectors
+    }
+
+    fn packet_info_bytes(frame_start: bool, data_type: u8, packet_length: u16) -> [u8; 2] {
+        assert!(packet_length <= 0x07ff);
+        [
+            (if frame_start { 0x80 } else { 0 })
+                | ((data_type & 0x07) << 3)
+                | (((packet_length >> 8) as u8) & 0x07),
+            packet_length as u8,
+        ]
+    }
+
+    fn synth_uncompressed_frame_with_misleading_dst_bit(
+        frame_bytes: &[u8],
+        tc: Timecode,
+    ) -> Vec<Vec<u8>> {
+        let first = frame_bytes.len().min(2041);
+        let mut first_sector = vec![0u8; SECTOR_SIZE as usize];
+        first_sector[0] = 1 | (1 << 2) | (1 << 5);
+        first_sector[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            first as u16,
+        ));
+        first_sector[3..7].copy_from_slice(&[tc.minutes, tc.seconds, tc.frames, 0xa5]);
+        first_sector[7..7 + first].copy_from_slice(&frame_bytes[..first]);
+
+        let mut sectors = vec![first_sector];
         let mut off = first;
         while off < frame_bytes.len() {
             let chunk = (frame_bytes.len() - off).min(PART_SIZE);
@@ -2892,52 +2942,29 @@ mod tests {
     }
 
     #[test]
-    fn area_frame_format_mismatch_fails_normal_extraction() {
+    fn uncompressed_area_ignores_misleading_sector_dst_bit_for_dsf() {
         let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
-        let sectors = synth_uncompressed_frame_sectors(&frame, tc_at(1));
+        let sectors = synth_uncompressed_frame_with_misleading_dst_bit(&frame, tc_at(1));
 
         let td = write_iso(&sectors);
         let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
         let mut output = std::io::Cursor::new(Vec::<u8>::new());
-        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
-        let err = extract_track_with_integrity_options(
+        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dsf);
+        let report = extract_track_with_area_frame_format(
             &mut iso,
             &mut output,
             opts,
-            ExtractIntegrityOptions::new().with_frame_format(FrameFormat::Dst),
-        )
-        .expect_err("area TOC says DST but sector header says DSD");
-        assert!(matches!(err, ExtractError::Frame(FrameError::FrameFormatMismatch { .. })), "got {:?}", err);
-    }
-
-    #[test]
-    fn area_frame_format_mismatch_is_reported_in_recovery_extraction() {
-        let frame = pattern(FRAME_SIZE_UNCOMPRESSED * 2);
-        let sectors = synth_uncompressed_frame_sectors(&frame, tc_at(1));
-
-        let td = write_iso(&sectors);
-        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
-        let mut output = std::io::Cursor::new(Vec::<u8>::new());
-        let opts = ExtractOptions::new(0, sectors.len() as u64, 2, OutputFormat::Dff);
-        let report = extract_track_with_integrity_options(
-            &mut iso,
-            &mut output,
-            opts,
-            ExtractIntegrityOptions::new()
-                .with_frame_format(FrameFormat::Dst)
-                .with_sector_recovery(true),
+            FrameFormat::Dsd3In14,
+            ExtractIntegrityOptions::strict(),
         )
         .unwrap();
-        let stats = report.stats;
-        let integrity = &report.integrity;
 
-        assert_eq!(stats.frames_read, 0);
-        assert_eq!(integrity.sectors_skipped, sectors.len() as u64);
-        assert_eq!(integrity.frame_format_mismatches, sectors.len() as u64);
-        assert!(integrity.recovery_events().iter().all(|e| e.error.contains("frame-format mismatch")));
-        assert!(report.integrity_loss_detected());
+        assert_eq!(report.stats.frames_read, 1);
+        assert_eq!(report.stats.audio_bytes, frame.len() as u64);
+        assert_eq!(report.integrity.frame_format_mismatches, 0);
+        assert_eq!(report.integrity.sectors_skipped, 0);
+        assert!(!report.integrity_loss_detected());
     }
-
 
     #[test]
     fn common_source_dsdiff_dsd_to_dsf_uses_extraction_sink() {

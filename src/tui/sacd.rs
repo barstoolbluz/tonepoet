@@ -1047,9 +1047,13 @@ impl PlayTime {
             + self.frames as u32
     }
 
-    /// True for normalized ScarletBook timecodes.
+    /// True when the sub-second frame component is within the 75 fps SACD clock.
+    ///
+    /// SACDTRL2 stores track times as raw frame-count fields.  The seconds
+    /// byte can exceed 59 on real discs; sacd_extract still feeds it to
+    /// TIME_FRAMECOUNT directly.  Only the frame byte is a sub-second index.
     pub fn is_normalized(&self) -> bool {
-        self.seconds < 60 && self.frames < SACD_FRAME_RATE as u8
+        self.frames < SACD_FRAME_RATE as u8
     }
 
     pub fn is_zero(&self) -> bool {
@@ -1491,20 +1495,26 @@ pub fn parse_trl2(buf: &[u8], track_count: u8) -> Result<Vec<(PlayTime, PlayTime
         )));
     }
     let mut out = Vec::with_capacity(track_count as usize);
-    // each area_tracklist_time_t = 4 bytes (m, s, f, flags).
-    // start[255] at offset 0x08, duration[255] at offset 0x08 + 255*4 = 0x08 + 1020 = 0x404.
+    // Each on-disc SACDTRL2 entry is the same layout sacd_extract maps
+    // directly onto `area_tracklist_time_t`: bytes 0, 1 and 2 are
+    // minutes, seconds and 75-fps frame index; byte 3 carries flags /
+    // reserved bits. Do not skip byte 0 here. For example, an entry
+    // containing `45 2a 22 00` denotes 69:42:34, matching
+    // sacd_extract's TIME_FRAMECOUNT interpretation.
     let start_base = 8;
     let dur_base = 8 + 255 * 4;
     for i in 0..track_count as usize {
+        let start = start_base + i * 4;
+        let dur = dur_base + i * 4;
         let s = PlayTime {
-            minutes: buf[start_base + i * 4],
-            seconds: buf[start_base + i * 4 + 1],
-            frames: buf[start_base + i * 4 + 2],
+            minutes: buf[start],
+            seconds: buf[start + 1],
+            frames: buf[start + 2],
         };
         let d = PlayTime {
-            minutes: buf[dur_base + i * 4],
-            seconds: buf[dur_base + i * 4 + 1],
-            frames: buf[dur_base + i * 4 + 2],
+            minutes: buf[dur],
+            seconds: buf[dur + 1],
+            frames: buf[dur + 2],
         };
         out.push((s, d));
     }
@@ -1949,81 +1959,110 @@ impl AreaInfo {
     /// Convert the parsed area TOC frame-format nibble into the extraction
     /// crate's authoritative `FrameFormat` type.
     ///
-    /// This is the production handoff point requested by the refactor brief:
+    /// This is the production handoff point requested by the extraction brief:
     /// extraction must not rediscover DST/plain-DSD solely from per-sector
-    /// bits. The area TOC is authoritative and the frame reader validates
-    /// sector headers against this value.
+    /// bits. The area TOC is authoritative for frame classification and
+    /// decoder routing.
     pub fn extraction_frame_format(&self) -> sacd_rs::FrameFormat {
         sacd_rs::FrameFormat::from_nibble(self.header.frame_format.as_nibble())
     }
 
     /// Build source-compatible extraction options from this area's parsed TOC
-    /// and one track entry.
+    /// and one selected track, using sacd_extract queueing semantics.
     ///
-    /// The normal path uses SACDTRL1's pre-trimmed `(start_lsn, length_lsn)`
-    /// range. If SACDTRL1 length is absent but a plausible start LSN exists,
-    /// this falls back to the next track start or the area end LSN and attaches
-    /// the SACDTRL2 time filter so pause/pre-gap frames are not emitted.
+    /// Track 0 starts at the area TOC `track_start`. Later tracks start at
+    /// their SACDTRL1 `track_start_lsn`. Non-final tracks end at the next
+    /// track start plus one sector. The final track ends at
+    /// `area_toc.track_end + 1`, matching sacd_extract's queued
+    /// `length_lsn = area_toc->track_end - start_lsn + 1` and its
+    /// `[start_lsn, start_lsn + length_lsn)` processing loop.
+    ///
+    /// The wider scan window is paired with sacd_extract-style default
+    /// audio-frame trimming: only frames whose frame-info timecode lands in
+    /// `[TrackEntry.start_time, TrackEntry.start_time + TrackEntry.duration)`
+    /// are emitted.
     pub fn track_extract_options(
         &self,
         track_index: usize,
         output_format: sacd_rs::extract::OutputFormat,
     ) -> Result<sacd_rs::extract::ExtractOptions, SacdExtractionError> {
-        let track = self.tracks.get(track_index).ok_or(
+        let entry = self.tracks.get(track_index).ok_or(
             SacdExtractionError::TrackIndexOutOfRange {
                 requested: track_index,
                 track_count: self.tracks.len(),
             },
         )?;
 
-        let start_lsn = track.start_lsn as u64;
-        if start_lsn == 0 {
-            return Err(SacdExtractionError::MissingTrackSectorRange { track_index });
-        }
-
-        let mut used_wide_range_fallback = false;
-        let end_lsn = if track.length_lsn != 0 {
-            start_lsn.saturating_add(track.length_lsn as u64)
+        let start_lsn = if track_index == 0 {
+            self.header.track_start_lsn as u64
         } else {
-            used_wide_range_fallback = true;
-            self.tracks
-                .get(track_index + 1)
-                .map(|next| next.start_lsn as u64)
-                .filter(|&next_start| next_start > start_lsn)
-                .unwrap_or(self.header.track_end_lsn as u64)
+            let start = self.tracks[track_index].start_lsn as u64;
+            if start == 0 {
+                return Err(SacdExtractionError::MissingTrackSectorRange { track_index });
+            }
+            start
         };
 
-        if end_lsn <= start_lsn {
+        let end_lsn = if let Some(next) = self.tracks.get(track_index + 1) {
+            let next_start = next.start_lsn as u64;
+            if next_start == 0 {
+                return Err(SacdExtractionError::MissingTrackSectorRange { track_index });
+            }
+            next_start.checked_add(1).ok_or(
+                SacdExtractionError::MissingTrackSectorRange { track_index },
+            )?
+        } else {
+            (self.header.track_end_lsn as u64).checked_add(1).ok_or(
+                SacdExtractionError::MissingTrackSectorRange { track_index },
+            )?
+        };
+
+        if start_lsn == 0 || end_lsn <= start_lsn {
             return Err(SacdExtractionError::MissingTrackSectorRange { track_index });
         }
 
-        let mut opts = sacd_rs::extract::ExtractOptions::new(
+        let filter_start = entry.start_time.as_frame_count();
+        let duration_end = filter_start.saturating_add(entry.duration.as_frame_count());
+        let mut filter_end = duration_end;
+
+        // sacd_extract trims completed output frames by absolute frame
+        // timecode while its sector queue overlaps adjacent tracks and can
+        // extend into lead-out garbage. On some discs the TRL2 duration table
+        // overshoots the next absolute start / area total; bound the emit
+        // window by those absolute times so tail or next-track frames are not
+        // treated as in-track integrity loss.
+        if let Some(next) = self.tracks.get(track_index + 1) {
+            let next_start = next.start_time.as_frame_count();
+            if next_start > filter_start {
+                filter_end = filter_end.min(next_start);
+            }
+        } else {
+            let area_end = self.header.total_playtime.as_frame_count();
+            if area_end > filter_start {
+                filter_end = filter_end.min(area_end);
+            }
+        }
+
+        let filter_duration = filter_end.saturating_sub(filter_start);
+
+        Ok(sacd_rs::extract::ExtractOptions::new(
             start_lsn,
             end_lsn,
             self.header.channel_count,
             output_format,
-        );
-
-        if used_wide_range_fallback
-            && track.start_time.is_normalized()
-            && track.duration.is_normalized()
-            && !track.duration.is_zero()
-        {
-            opts = opts.with_time_filter(sacd_rs::extract::TimeFilter::new(
-                track.start_time.as_frame_count(),
-                track.duration.as_frame_count(),
-            ));
-        }
-
-        Ok(opts)
+        )
+        .with_time_filter(sacd_rs::extract::TimeFilter::new(
+            filter_start,
+            filter_duration,
+        )))
     }
 
     /// Build the high-integrity extraction controls for this area.
     ///
     /// This always passes
     /// `sacd_rs::FrameFormat::from_nibble(area.header.frame_format.as_nibble())`
-    /// into `ExtractIntegrityOptions`, so production extraction validates the
-    /// sector stream against the area TOC's frame format end to end.
+    /// into `ExtractIntegrityOptions`, so production extraction routes
+    /// DSD/DST by the area TOC end to end.
     pub fn track_integrity_options(
         &self,
         mode: SacdExtractionMode,
@@ -3540,9 +3579,11 @@ mod tests {
             b[start_base + i * 4 + 0] = s.minutes;
             b[start_base + i * 4 + 1] = s.seconds;
             b[start_base + i * 4 + 2] = s.frames;
+            b[start_base + i * 4 + 3] = 0;
             b[dur_base + i * 4 + 0] = d.minutes;
             b[dur_base + i * 4 + 1] = d.seconds;
             b[dur_base + i * 4 + 2] = d.frames;
+            b[dur_base + i * 4 + 3] = 0;
         }
         b
     }
@@ -3595,6 +3636,47 @@ mod tests {
             }
         );
         assert_eq!(v[1].1.total_seconds(), 4.0 * 60.0 + 12.0);
+    }
+
+    #[test]
+    fn parse_trl2_matches_sacd_extract_time_entry_layout() {
+        let mut b = vec![0u8; SECTOR_SIZE as usize];
+        b[0..8].copy_from_slice(SACD_TRL2_MAGIC);
+        let start_base = 8;
+        let dur_base = 8 + 255 * 4;
+        b[start_base..start_base + 4].copy_from_slice(&[0x45, 0x2a, 0x22, 0x00]);
+        b[dur_base..dur_base + 4].copy_from_slice(&[0x0c, 0x3b, 0x1f, 0x00]);
+
+        let v = parse_trl2(&b, 1).expect("parse");
+        assert_eq!(
+            v[0].0,
+            PlayTime {
+                minutes: 0x45,
+                seconds: 0x2a,
+                frames: 0x22,
+            }
+        );
+        assert_eq!(
+            v[0].1,
+            PlayTime {
+                minutes: 0x0c,
+                seconds: 0x3b,
+                frames: 0x1f,
+            }
+        );
+        assert_eq!(v[0].0.as_frame_count(), 313_684);
+        assert_eq!(v[0].1.as_frame_count(), 58_456);
+    }
+
+    #[test]
+    fn play_time_counts_seconds_above_59() {
+        let t = PlayTime {
+            minutes: 40,
+            seconds: 61,
+            frames: 0,
+        };
+        assert_eq!(t.as_frame_count(), 40 * 60 * SACD_FRAME_RATE + 61 * SACD_FRAME_RATE);
+        assert!(t.is_normalized());
     }
 
     /// End-to-end test: write a synthetic SACD ISO with master TOC,
@@ -4385,15 +4467,95 @@ mod tests {
     }
 
     #[test]
-    fn area_track_extract_options_use_toc_channel_count_and_trl1_range() {
+    fn area_track_extract_options_use_toc_start_and_area_end_for_single_track() {
         let area = build_extraction_test_area(2); // DSD3-in-14
         let opts = area
             .track_extract_options(0, sacd_rs::extract::OutputFormat::Dff)
             .expect("track options");
-        assert_eq!(opts.start_lsn, 600);
-        assert_eq!(opts.end_lsn, 614);
+        assert_eq!(opts.start_lsn, area.header.track_start_lsn as u64);
+        assert_eq!(opts.end_lsn, area.header.track_end_lsn as u64 + 1);
         assert_eq!(opts.channel_count, area.header.channel_count);
-        assert_eq!(opts.time_filter, None);
+        assert_eq!(
+            opts.time_filter,
+            Some(sacd_rs::extract::TimeFilter::new(
+                area.tracks[0].start_time.as_frame_count(),
+                area.tracks[0].duration.as_frame_count(),
+            ))
+        );
+    }
+
+    #[test]
+    fn non_final_track_extract_options_use_next_track_start_plus_one() {
+        let mut area = build_extraction_test_area(2); // DSD3-in-14
+        area.header.track_start_lsn = 540;
+        area.header.track_end_lsn = 900;
+        area.tracks = vec![
+            TrackEntry {
+                start_lsn: 540,
+                length_lsn: 50,
+                start_time: PlayTime { minutes: 0, seconds: 0, frames: 0 },
+                duration: PlayTime { minutes: 0, seconds: 8, frames: 0 },
+                ..TrackEntry::default()
+            },
+            TrackEntry {
+                start_lsn: 600,
+                length_lsn: 100,
+                start_time: PlayTime { minutes: 0, seconds: 8, frames: 0 },
+                duration: PlayTime { minutes: 0, seconds: 4, frames: 0 },
+                ..TrackEntry::default()
+            },
+        ];
+
+        let opts = area
+            .track_extract_options(0, sacd_rs::extract::OutputFormat::Dff)
+            .expect("track options");
+
+        assert_eq!(opts.start_lsn, 540);
+        assert_eq!(opts.end_lsn, 601);
+        assert_eq!(
+            opts.time_filter,
+            Some(sacd_rs::extract::TimeFilter::new(
+                area.tracks[0].start_time.as_frame_count(),
+                area.tracks[0].duration.as_frame_count(),
+            ))
+        );
+    }
+
+    #[test]
+    fn final_track_extract_options_use_area_track_end_plus_one_not_trl1_length() {
+        let mut area = build_extraction_test_area(2); // DSD3-in-14
+        area.header.track_start_lsn = 540;
+        area.header.track_end_lsn = 700;
+        area.tracks = vec![
+            TrackEntry {
+                start_lsn: 540,
+                length_lsn: 50,
+                start_time: PlayTime { minutes: 0, seconds: 0, frames: 0 },
+                duration: PlayTime { minutes: 0, seconds: 8, frames: 0 },
+                ..TrackEntry::default()
+            },
+            TrackEntry {
+                start_lsn: 600,
+                length_lsn: 1_000,
+                start_time: PlayTime { minutes: 0, seconds: 8, frames: 0 },
+                duration: PlayTime { minutes: 0, seconds: 4, frames: 0 },
+                ..TrackEntry::default()
+            },
+        ];
+
+        let opts = area
+            .track_extract_options(1, sacd_rs::extract::OutputFormat::Dff)
+            .expect("track options");
+
+        assert_eq!(opts.start_lsn, 600);
+        assert_eq!(opts.end_lsn, 701);
+        assert_eq!(
+            opts.time_filter,
+            Some(sacd_rs::extract::TimeFilter::new(
+                area.tracks[1].start_time.as_frame_count(),
+                area.tracks[1].duration.as_frame_count(),
+            ))
+        );
     }
 
     #[test]

@@ -150,7 +150,11 @@ impl Timecode {
     }
 
     pub fn is_normalized(self) -> bool {
-        self.seconds < 60 && self.frames < 75
+        // Match sacd_extract's TIME_FRAMECOUNT treatment for raw SACD
+        // time fields: the seconds byte contributes 75-frame units even
+        // when it is greater than 59. The frame byte remains a sub-second
+        // index in the 75 fps SACD clock.
+        self.frames < 75
     }
 }
 
@@ -374,8 +378,8 @@ pub struct FrameReaderStats {
     pub frames_filtered: u64,
     pub frames_dropped_incomplete: u64,
     pub channel_mismatches: u64,
-    /// Number of sectors whose audio header compression bit disagreed
-    /// with the authoritative area-TOC frame format supplied by the caller.
+    /// Number of sectors whose area-TOC frame format was unusable for
+    /// DSD/DST classification in recovery mode.
     pub frame_format_mismatches: u64,
     pub invalid_timecodes: u64,
     pub bytes_emitted: u64,
@@ -527,6 +531,7 @@ pub struct FrameReader<'a> {
     expected_frame_format: Option<FrameFormat>,
     strict_channel_count: bool,
     time_filter: Option<FrameTimeFilter>,
+    past_time_filter_end: bool,
     recover_sector_errors: bool,
     stats: FrameReaderStats,
 }
@@ -573,6 +578,7 @@ impl<'a> FrameReader<'a> {
             expected_frame_format: None,
             strict_channel_count: false,
             time_filter: None,
+            past_time_filter_end: false,
             recover_sector_errors: false,
             stats: FrameReaderStats::default(),
         }
@@ -587,9 +593,10 @@ impl<'a> FrameReader<'a> {
         }
     }
 
-    /// Area-TOC frame-format cross-check. When supplied, this becomes the
-    /// authoritative DST/plain-DSD structural type for the sector grammar;
-    /// sector header compression bits are validated against it.
+    /// Area-TOC frame-format routing. When supplied, this value decides
+    /// whether completed frames are plain DSD or DST. The sector header
+    /// compression bit still controls only that sector's frame-info entry
+    /// width.
     pub fn set_expected_frame_format(&mut self, frame_format: FrameFormat) {
         self.expected_frame_format = Some(frame_format);
     }
@@ -600,6 +607,7 @@ impl<'a> FrameReader<'a> {
 
     pub fn set_timecode_filter(&mut self, start_frame: u32, duration_frames: u32) {
         self.time_filter = Some(FrameTimeFilter::new(start_frame, duration_frames));
+        self.past_time_filter_end = false;
     }
 
     /// Continue after malformed sectors or read failures. The current
@@ -657,11 +665,9 @@ impl<'a> FrameReader<'a> {
             let lsn = self.cur_lsn;
             self.cur_lsn += 1;
 
-            // Move the reusable sector buffer out of `self` while the
-            // parser borrows packet payload slices from it. This avoids
-            // cloning each packet into a temporary Vec just to satisfy the
-            // borrow checker; the hot path now appends directly from the
-            // ISO sector buffer into the pending frame buffer.
+            // Move the reusable sector buffer out of `self` before parsing.
+            // Packet payload assembly may read ahead through `self.iso`, while
+            // the main loop still returns here to process each LSN in order.
             let mut sector_buf = std::mem::take(&mut self.sector_buf);
             let read_result = self.iso.read_sector(lsn, &mut sector_buf);
             match read_result {
@@ -672,11 +678,7 @@ impl<'a> FrameReader<'a> {
                     match sector_result {
                         Ok(()) => {}
                         Err(err) if self.recover_sector_errors => {
-                            if matches!(
-                                err,
-                                FrameError::FrameFormatMismatch { .. }
-                                    | FrameError::UnsupportedFrameFormat { .. }
-                            ) {
+                            if matches!(err, FrameError::FrameFormatMismatch { .. }) {
                                 self.stats.frame_format_mismatches += 1;
                             }
                             self.stats.malformed_sectors += 1;
@@ -729,6 +731,10 @@ impl<'a> FrameReader<'a> {
         for packet in parsed.packets.iter().copied() {
             let packet_len = packet.packet_length as usize;
             if packet_len > MAX_PACKET_SIZE {
+                if self.can_skip_malformed_packet_after_time_window(&parsed.frame_infos) {
+                    self.stats.frames_filtered += 1;
+                    return Ok(());
+                }
                 return Err(FrameError::MalformedSector {
                     lsn,
                     reason: format!("packet length {} exceeds {}", packet_len, MAX_PACKET_SIZE),
@@ -740,24 +746,20 @@ impl<'a> FrameReader<'a> {
                     reason: "packet offset overflow".into(),
                 }
             })?;
-            // Clamp to sector boundary. Some real-world SACDs declare
-            // packet lengths that extend past the 2048-byte sector —
-            // the reference C extractor reads whatever fits and the
-            // extra bytes don't exist on disc. Truncate silently to
-            // match that behavior.
-            let packet_end = packet_end.min(sector.len());
 
             match packet.data_type {
                 DATA_TYPE_AUDIO => {
-                    let packet_data = &sector[payload_offset..packet_end];
-                    self.feed_audio_packet(
+                    let needs_payload = self.prepare_audio_packet(
                         lsn,
                         parsed.dst_encoded,
                         packet,
-                        packet_data,
                         &parsed.frame_infos,
                         &mut frame_info_idx,
                     )?;
+                    if needs_payload {
+                        let packet_data = self.read_packet_payload(lsn, sector, payload_offset, packet_len)?;
+                        self.append_audio_packet_payload(lsn, &packet_data)?;
+                    }
                 }
                 DATA_TYPE_SUPPLEMENTARY | DATA_TYPE_PADDING => {}
                 _ => {}
@@ -769,77 +771,177 @@ impl<'a> FrameReader<'a> {
         Ok(())
     }
 
-    fn feed_audio_packet(
+    fn read_packet_payload(
+        &mut self,
+        lsn: u64,
+        sector: &[u8],
+        payload_offset: usize,
+        packet_len: usize,
+    ) -> Result<Vec<u8>, FrameError> {
+        if packet_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let sector_size = SECTOR_SIZE as usize;
+        let mut payload = Vec::with_capacity(packet_len);
+        let mut absolute_offset = payload_offset;
+        let mut remaining = packet_len;
+
+        while remaining > 0 {
+            let sector_delta = absolute_offset / sector_size;
+            let offset = absolute_offset % sector_size;
+            let take = remaining.min(sector_size - offset);
+            let sector_lsn = lsn.checked_add(sector_delta as u64).ok_or_else(|| {
+                FrameError::MalformedSector {
+                    lsn,
+                    reason: "packet lookahead LSN overflow".into(),
+                }
+            })?;
+
+            if sector_lsn >= self.end_lsn {
+                return Err(FrameError::MalformedSector {
+                    lsn,
+                    reason: format!(
+                        "packet payload extends past extraction range: end LSN {}",
+                        self.end_lsn
+                    ),
+                });
+            }
+
+            if sector_delta == 0 {
+                let end = offset.checked_add(take).ok_or_else(|| FrameError::MalformedSector {
+                    lsn,
+                    reason: "packet slice overflow".into(),
+                })?;
+                if end > sector.len() {
+                    return Err(FrameError::MalformedSector {
+                        lsn,
+                        reason: "packet payload starts beyond current sector".into(),
+                    });
+                }
+                payload.extend_from_slice(&sector[offset..end]);
+            } else {
+                let mut lookahead = vec![0u8; sector_size];
+                self.iso.read_sector(sector_lsn, &mut lookahead)?;
+                payload.extend_from_slice(&lookahead[offset..offset + take]);
+            }
+
+            absolute_offset = absolute_offset.checked_add(take).ok_or_else(|| {
+                FrameError::MalformedSector {
+                    lsn,
+                    reason: "packet offset overflow".into(),
+                }
+            })?;
+            remaining -= take;
+        }
+
+        Ok(payload)
+    }
+
+    fn prepare_audio_packet(
         &mut self,
         lsn: u64,
         dst_encoded: bool,
         packet: AudioPacketInfo,
-        packet_data: &[u8],
         frame_infos: &[AudioFrameInfo],
         frame_info_idx: &mut usize,
-    ) -> Result<(), FrameError> {
-        if packet.frame_start {
-            if let Some(prev) = self.pending.take() {
-                self.finish_or_drop(
-                    lsn,
-                    prev,
-                    "new frame_start encountered before previous frame completed",
-                )?;
-            }
-
-            let info = frame_infos.get(*frame_info_idx).copied().ok_or_else(|| {
-                FrameError::MalformedSector {
-                    lsn,
-                    reason: format!(
-                        "audio frame_start without frame_info (idx {}, count {})",
-                        *frame_info_idx,
-                        frame_infos.len()
-                    ),
-                }
-            })?;
-            *frame_info_idx += 1;
-
-            if !info.timecode.is_normalized() {
-                self.stats.invalid_timecodes += 1;
-                if !self.recover_sector_errors {
-                    return Err(FrameError::InvalidTimecode {
-                        lsn,
-                        timecode: info.timecode,
-                    });
-                }
-            }
-
-            let channel_count = if dst_encoded {
-                let derived = info.derived_channel_count();
-                if let Some(expected) = self.expected_channel_count {
-                    if derived != expected {
-                        self.stats.channel_mismatches += 1;
-                        if self.strict_channel_count {
-                            return Err(FrameError::ChannelCountMismatch {
-                                lsn,
-                                expected,
-                                derived,
-                                timecode: info.timecode,
-                            });
-                        }
-                    }
-                    expected
-                } else {
-                    derived
-                }
-            } else {
-                self.expected_channel_count.unwrap_or(0)
-            };
-
-            self.pending = Some(PendingFrame {
-                data: Vec::with_capacity(frame_initial_capacity(dst_encoded, channel_count)),
-                timecode: info.timecode,
-                channel_count,
-                dst_encoded,
-                sector_count: info.sector_count,
-            });
+    ) -> Result<bool, FrameError> {
+        if !packet.frame_start {
+            return Ok(self.pending.is_some());
         }
 
+        if let Some(prev) = self.pending.take() {
+            self.finish_or_drop(
+                lsn,
+                prev,
+                "new frame_start encountered before previous frame completed",
+            )?;
+        }
+
+        let Some(info) = frame_infos.get(*frame_info_idx).copied() else {
+            if self.can_skip_missing_frame_info_after_time_window() {
+                self.stats.frames_filtered += 1;
+                return Ok(false);
+            }
+            return Err(FrameError::MalformedSector {
+                lsn,
+                reason: format!(
+                    "audio frame_start without frame_info (idx {}, count {})",
+                    *frame_info_idx,
+                    frame_infos.len()
+                ),
+            });
+        };
+        *frame_info_idx += 1;
+
+        // Match sacd_extract's output trimming order: compute the absolute
+        // frame count from the frame-info timecode first and discard
+        // out-of-window frames before validating the BCD-like fields. This
+        // lets garbage/lead-out frames outside the selected track interval be
+        // filtered without forcing payload assembly or reporting integrity
+        // loss for data that will never be emitted. Record when the stream has
+        // advanced past the selected interval so later frame-start garbage that
+        // carries no frame_info can be skipped without weakening in-window
+        // integrity checks.
+        let selected = self.timecode_selected(info.timecode);
+        self.observe_timecode_for_filter_end(info.timecode);
+        if !selected {
+            self.stats.frames_filtered += 1;
+            return Ok(false);
+        }
+
+        if !info.timecode.is_normalized() {
+            if self.can_skip_after_selected_time_window() {
+                self.stats.frames_filtered += 1;
+                return Ok(false);
+            }
+            self.stats.invalid_timecodes += 1;
+            if !self.recover_sector_errors {
+                return Err(FrameError::InvalidTimecode {
+                    lsn,
+                    timecode: info.timecode,
+                });
+            }
+        }
+
+        let channel_count = if dst_encoded {
+            let derived = info.derived_channel_count();
+            if let Some(expected) = self.expected_channel_count {
+                if derived != expected {
+                    self.stats.channel_mismatches += 1;
+                    if self.strict_channel_count {
+                        return Err(FrameError::ChannelCountMismatch {
+                            lsn,
+                            expected,
+                            derived,
+                            timecode: info.timecode,
+                        });
+                    }
+                }
+                expected
+            } else {
+                derived
+            }
+        } else {
+            self.expected_channel_count.unwrap_or(0)
+        };
+
+        self.pending = Some(PendingFrame {
+            data: Vec::with_capacity(frame_initial_capacity(dst_encoded, channel_count)),
+            timecode: info.timecode,
+            channel_count,
+            dst_encoded,
+            sector_count: info.sector_count,
+        });
+
+        Ok(true)
+    }
+
+    fn append_audio_packet_payload(
+        &mut self,
+        lsn: u64,
+        packet_data: &[u8],
+    ) -> Result<(), FrameError> {
         if let Some(pending) = self.pending.as_ref() {
             let attempted = pending.data.len().saturating_add(packet_data.len());
             if attempted > MAX_FRAME_SIZE {
@@ -898,6 +1000,15 @@ impl<'a> FrameReader<'a> {
         pending: PendingFrame,
         reason: &'static str,
     ) -> Result<(), FrameError> {
+        if self.can_skip_after_selected_time_window()
+            || self.pending_frame_outside_time_filter(&pending)
+            || self.pending_frame_reaches_dynamic_time_tail(&pending)
+        {
+            self.stats.frames_filtered += 1;
+            self.past_time_filter_end = true;
+            return Ok(());
+        }
+
         let error = FrameError::IncompleteFrame {
             lsn,
             timecode: pending.timecode,
@@ -914,6 +1025,29 @@ impl<'a> FrameReader<'a> {
         }
     }
 
+    fn pending_frame_outside_time_filter(&mut self, pending: &PendingFrame) -> bool {
+        let Some(filter) = self.time_filter else {
+            return false;
+        };
+        self.observe_timecode_for_filter_end(pending.timecode);
+        !filter.includes(pending.timecode)
+    }
+
+    fn pending_frame_reaches_dynamic_time_tail(&self, pending: &PendingFrame) -> bool {
+        let Some(filter) = self.time_filter else {
+            return false;
+        };
+        let emitted_or_ready = self
+            .stats
+            .frames_emitted
+            .saturating_add(self.ready.len() as u64);
+        if emitted_or_ready == 0 {
+            return false;
+        }
+        let dynamic_end = filter.start_frame.saturating_add(emitted_or_ready as u32);
+        pending.timecode.as_frame_count() >= dynamic_end
+    }
+
     fn record_dropped_frame(&mut self, lsn: u64, pending: &PendingFrame, reason: &'static str) {
         self.stats.frames_dropped_incomplete += 1;
         self.stats.dropped_frame_events.push(DroppedFrameEvent {
@@ -926,9 +1060,68 @@ impl<'a> FrameReader<'a> {
         });
     }
 
+    fn observe_timecode_for_filter_end(&mut self, timecode: Timecode) {
+        if let Some(filter) = self.time_filter {
+            if timecode.as_frame_count() >= filter.end_frame {
+                self.past_time_filter_end = true;
+            }
+        }
+    }
+
+    fn can_skip_missing_frame_info_after_time_window(&self) -> bool {
+        self.can_skip_after_selected_time_window()
+    }
+
+    fn can_skip_after_selected_time_window(&self) -> bool {
+        if self.time_filter.is_none() {
+            return false;
+        }
+        if self.past_time_filter_end {
+            return true;
+        }
+        let Some(filter) = self.time_filter else {
+            return false;
+        };
+        let duration = filter.end_frame.saturating_sub(filter.start_frame) as u64;
+        duration > 0
+            && self
+                .stats
+                .frames_emitted
+                .saturating_add(self.ready.len() as u64)
+                >= duration
+    }
+
+    fn can_skip_malformed_packet_after_time_window(
+        &mut self,
+        frame_infos: &[AudioFrameInfo],
+    ) -> bool {
+        if self.can_skip_after_selected_time_window() {
+            return true;
+        }
+
+        let Some(filter) = self.time_filter else {
+            return false;
+        };
+        let Some(first_info) = frame_infos.first().copied() else {
+            return false;
+        };
+        if first_info.timecode.as_frame_count() >= filter.end_frame {
+            self.past_time_filter_end = true;
+            return true;
+        }
+        false
+    }
+
     fn frame_selected(&self, frame: &Frame) -> bool {
+        self.timecode_selected(frame.timecode)
+    }
+
+    fn timecode_selected(&self, timecode: Timecode) -> bool {
+        if self.past_time_filter_end {
+            return false;
+        }
         self.time_filter
-            .map(|f| f.includes(frame.timecode))
+            .map(|f| f.includes(timecode))
             .unwrap_or(true)
     }
 }
@@ -946,7 +1139,8 @@ fn parse_sector_header(
     }
 
     let header = AudioFrameHeader::from_byte(sector[0]);
-    let dst_encoded = sector_dst_layout(lsn, header, expected_frame_format)?;
+    let dst_encoded = frame_dst_routing(lsn, expected_frame_format, header.dst_encoded)?;
+    let frame_info_uses_dst_width = header.dst_encoded;
     let mut offset = 1usize;
 
     let packet_count = header.packet_info_count as usize;
@@ -974,7 +1168,7 @@ fn parse_sector_header(
     }
 
     let frame_count = header.frame_info_count as usize;
-    let frame_info_size = if dst_encoded { 4 } else { 3 };
+    let frame_info_size = if frame_info_uses_dst_width { 4 } else { 3 };
     let frame_info_bytes = frame_count.checked_mul(frame_info_size).ok_or_else(|| {
         FrameError::MalformedSector {
             lsn,
@@ -990,11 +1184,14 @@ fn parse_sector_header(
 
     let mut frame_infos = Vec::with_capacity(frame_count);
     for _ in 0..frame_count {
-        let info = AudioFrameInfo::from_bytes(&sector[offset..offset + frame_info_size], dst_encoded)
-            .ok_or_else(|| FrameError::MalformedSector {
-                lsn,
-                reason: "short frame_info".into(),
-            })?;
+        let info = AudioFrameInfo::from_bytes(
+            &sector[offset..offset + frame_info_size],
+            frame_info_uses_dst_width,
+        )
+        .ok_or_else(|| FrameError::MalformedSector {
+            lsn,
+            reason: "short frame_info".into(),
+        })?;
         frame_infos.push(info);
         offset += frame_info_size;
     }
@@ -1002,34 +1199,27 @@ fn parse_sector_header(
     Ok(ParsedSector { dst_encoded, packets, frame_infos, payload_offset: offset })
 }
 
-fn sector_dst_layout(
+fn frame_dst_routing(
     lsn: u64,
-    header: AudioFrameHeader,
     expected_frame_format: Option<FrameFormat>,
+    sector_dst_encoded: bool,
 ) -> Result<bool, FrameError> {
     let Some(format) = expected_frame_format else {
-        return Ok(header.dst_encoded);
+        return Ok(sector_dst_encoded);
     };
-    let expected_dst = match format {
-        FrameFormat::Dst => true,
+
+    match format {
+        FrameFormat::Dst => Ok(true),
         FrameFormat::Dsd3In14
         | FrameFormat::Dsd3In16
         | FrameFormat::Dsd4
         | FrameFormat::Dsd5
         | FrameFormat::Dsd6
-        | FrameFormat::Dsd7 => false,
+        | FrameFormat::Dsd7 => Ok(false),
         FrameFormat::Reserved | FrameFormat::Unknown(_) => {
-            return Err(FrameError::UnsupportedFrameFormat { lsn, area_format: format });
+            Err(FrameError::UnsupportedFrameFormat { lsn, area_format: format })
         }
-    };
-    if header.dst_encoded != expected_dst {
-        return Err(FrameError::FrameFormatMismatch {
-            lsn,
-            area_format: format,
-            sector_dst_encoded: header.dst_encoded,
-        });
     }
-    Ok(expected_dst)
 }
 
 fn frame_initial_capacity(dst_encoded: bool, channel_count: u8) -> usize {
@@ -1066,6 +1256,27 @@ fn frame_is_complete(p: &PendingFrame, expected_channel_count: Option<u8>) -> bo
 mod tests {
     use super::*;
     use crate::test_util::{synth_audio_sector, synth_continuation_sector, write_iso};
+
+
+    fn packet_info_bytes(frame_start: bool, data_type: u8, packet_length: u16) -> [u8; 2] {
+        assert!(packet_length <= 0x07ff);
+        [
+            (if frame_start { 0x80 } else { 0 })
+                | ((data_type & 0x07) << 3)
+                | (((packet_length >> 8) as u8) & 0x07),
+            packet_length as u8,
+        ]
+    }
+
+    fn packet_start_sector(dst_bit: bool, frame_info: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut sector = vec![0u8; SECTOR_SIZE as usize];
+        sector[0] = (if dst_bit { 1 } else { 0 }) | (1 << 2) | (1 << 5);
+        sector[1..3].copy_from_slice(&packet_info_bytes(true, DATA_TYPE_AUDIO, payload.len() as u16));
+        let payload_offset = 3 + frame_info.len();
+        sector[3..payload_offset].copy_from_slice(frame_info);
+        sector[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
+        sector
+    }
 
     #[test]
     fn header_parsing_extracts_bitfields() {
@@ -1127,6 +1338,86 @@ mod tests {
         assert!(reader.next_frame().unwrap().is_none());
     }
 
+
+    #[test]
+    fn cross_sector_packet_payload_reads_following_sector_bytes() {
+        let first_payload_len = SECTOR_SIZE as usize - 6;
+        let mut expected = Vec::new();
+        expected.extend((0..first_payload_len).map(|idx| 0x40_u8.wrapping_add(idx as u8)));
+        expected.extend([0xa1, 0xb2, 0xc3]);
+
+        let mut first_sector = packet_start_sector(
+            false,
+            &[0, 0, 1],
+            &expected[..first_payload_len],
+        );
+        first_sector[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            expected.len() as u16,
+        ));
+        let mut second_sector = vec![0u8; SECTOR_SIZE as usize];
+        second_sector[..3].copy_from_slice(&expected[first_payload_len..]);
+
+        let td = write_iso(&[first_sector.clone(), second_sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 2);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+
+        reader.process_sector_bytes(0, &first_sector).unwrap();
+
+        let pending = reader.pending.as_ref().expect("pending frame");
+        assert!(!pending.dst_encoded);
+        assert_eq!(pending.data, expected);
+    }
+
+
+    #[test]
+    fn cross_sector_lookahead_does_not_skip_next_sector_scan() {
+        let first_payload_len = SECTOR_SIZE as usize - 6;
+        let mut expected = vec![0x5a; first_payload_len];
+        expected.extend([0xa1, 0xb2, 0xc3]);
+
+        let mut first_sector = packet_start_sector(false, &[0, 0, 1], &expected[..first_payload_len]);
+        first_sector[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            expected.len() as u16,
+        ));
+        let mut second_sector = vec![0u8; SECTOR_SIZE as usize];
+        second_sector[..3].copy_from_slice(&expected[first_payload_len..]);
+
+        let td = write_iso(&[first_sector, second_sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 2);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_recover_sector_errors(true);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        assert_eq!(reader.stats().sectors_read, 2);
+    }
+
+    #[test]
+    fn dsd_area_uses_sector_dst_bit_only_for_frame_info_width() {
+        let payload = [0x11, 0x22, 0x33, 0x44];
+        let sector = packet_start_sector(true, &[0, 0, 1, 0xa5], &payload);
+
+        let td = write_iso(&[sector.clone()]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+
+        reader.process_sector_bytes(0, &sector).unwrap();
+
+        let pending = reader.pending.as_ref().expect("pending frame");
+        assert!(!pending.dst_encoded);
+        assert_eq!(pending.data, payload);
+        assert_eq!(pending.timecode, Timecode { minutes: 0, seconds: 0, frames: 1 });
+    }
+
     #[test]
     fn time_filter_drops_out_of_range_frame_before_yield() {
         let frame_bytes: Vec<u8> = (0..(FRAME_SIZE_UNCOMPRESSED * 2))
@@ -1156,6 +1447,167 @@ mod tests {
     }
 
     #[test]
+    fn out_of_filter_frame_start_does_not_read_cross_sector_payload_past_end_lsn() {
+        let current_sector_payload_len = SECTOR_SIZE as usize - 6;
+        let advertised_packet_len = current_sector_payload_len + 3;
+        let current_sector_payload = vec![0x7c; current_sector_payload_len];
+        let mut sector = packet_start_sector(
+            false,
+            &[0, 0, 10],
+            &current_sector_payload,
+        );
+        sector[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            advertised_packet_len as u16,
+        ));
+
+        let td = write_iso(&[sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(20, 10);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.sectors_read, 1);
+        assert_eq!(stats.frames_filtered, 1);
+        assert_eq!(stats.malformed_sectors, 0);
+        assert_eq!(stats.io_errors, 0);
+    }
+
+
+    #[test]
+    fn out_of_filter_invalid_timecode_is_filtered_before_strict_validation() {
+        let current_sector_payload_len = SECTOR_SIZE as usize - 6;
+        let advertised_packet_len = current_sector_payload_len + 3;
+        let current_sector_payload = vec![0x8d; current_sector_payload_len];
+        let mut sector = packet_start_sector(
+            false,
+            &[77, 240, 241],
+            &current_sector_payload,
+        );
+        sector[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            advertised_packet_len as u16,
+        ));
+
+        let td = write_iso(&[sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(0, 100);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.frames_filtered, 1);
+        assert_eq!(stats.invalid_timecodes, 0);
+        assert_eq!(stats.malformed_sectors, 0);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+    }
+
+    #[test]
+    fn missing_frame_info_after_time_filter_end_is_skipped() {
+        let after_end = packet_start_sector(
+            false,
+            &[0, 0, 20],
+            &[0x11, 0x22, 0x33, 0x44],
+        );
+
+        let mut no_info = vec![0u8; SECTOR_SIZE as usize];
+        no_info[0] = 1 << 5; // one packet, zero frame_info entries
+        no_info[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            4,
+        ));
+        no_info[3..7].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+
+        let td = write_iso(&[after_end, no_info]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 2);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(0, 10);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.frames_filtered, 2);
+        assert_eq!(stats.malformed_sectors, 0);
+        assert_eq!(stats.sectors_skipped, 0);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+    }
+
+
+    #[test]
+    fn missing_frame_info_after_emitting_filter_duration_is_skipped() {
+        let frame_bytes: Vec<u8> = vec![0x42; FRAME_SIZE_UNCOMPRESSED * 2];
+        let part_size = 2000;
+        let mut sectors = vec![synth_audio_sector(
+            true,
+            &frame_bytes[..part_size],
+            Timecode { minutes: 0, seconds: 0, frames: 0 },
+        )];
+        let mut written = part_size;
+        while written < frame_bytes.len() {
+            let chunk = (frame_bytes.len() - written).min(part_size);
+            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
+            written += chunk;
+        }
+
+        let mut no_info = vec![0u8; SECTOR_SIZE as usize];
+        no_info[0] = 1 << 5; // one packet, zero frame_info entries
+        no_info[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            4,
+        ));
+        no_info[3..7].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        sectors.push(no_info);
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(0, 1);
+
+        let frame = reader.next_frame().unwrap().expect("selected frame");
+        assert_eq!(frame.data, frame_bytes);
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.frames_emitted, 1);
+        assert_eq!(stats.frames_filtered, 1);
+        assert_eq!(stats.malformed_sectors, 0);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+    }
+
+    #[test]
+    fn missing_frame_info_before_time_filter_end_still_fails() {
+        let mut no_info = vec![0u8; SECTOR_SIZE as usize];
+        no_info[0] = 1 << 5; // one packet, zero frame_info entries
+        no_info[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            4,
+        ));
+        no_info[3..7].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+
+        let td = write_iso(&[no_info]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(0, 10);
+
+        let err = reader.next_frame().expect_err("missing frame_info must fail in window");
+        assert!(matches!(err, FrameError::MalformedSector { .. }));
+    }
+
+    #[test]
     fn malformed_packet_bounds_error_not_panic() {
         let mut sector = vec![0u8; SECTOR_SIZE as usize];
         sector[0] = 1 << 5; // one packet, no frame info, uncompressed
@@ -1169,13 +1621,279 @@ mod tests {
     }
 
     #[test]
+    fn malformed_packet_after_time_filter_end_is_skipped() {
+        let mut sector = packet_start_sector(
+            false,
+            &[82, 41, 65],
+            &[0xaa, 0xbb, 0xcc, 0xdd],
+        );
+        sector[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            2047,
+        ));
+
+        let td = write_iso(&[sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(0, 100);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.frames_filtered, 1);
+        assert_eq!(stats.malformed_sectors, 0);
+        assert_eq!(stats.sectors_skipped, 0);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+    }
+
+    #[test]
+    fn malformed_packet_before_time_filter_end_still_fails() {
+        let mut sector = packet_start_sector(
+            false,
+            &[0, 0, 5],
+            &[0xaa, 0xbb, 0xcc, 0xdd],
+        );
+        sector[1..3].copy_from_slice(&packet_info_bytes(
+            true,
+            DATA_TYPE_AUDIO,
+            2047,
+        ));
+
+        let td = write_iso(&[sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(0, 10);
+
+        let err = reader.next_frame().expect_err("in-window malformed packet must fail");
+        assert!(matches!(err, FrameError::MalformedSector { .. }));
+    }
+
+    #[test]
+    fn incomplete_frame_after_time_filter_end_is_filtered_not_dropped() {
+        let td = write_iso(&[]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 0);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(191_550, 9_375);
+
+        let pending = PendingFrame {
+            data: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            timecode: Timecode { minutes: 82, seconds: 41, frames: 65 },
+            channel_count: 2,
+            dst_encoded: false,
+            sector_count: 0,
+        };
+
+        reader
+            .handle_incomplete_frame(
+                1_737_218,
+                pending,
+                "new frame_start encountered before previous frame completed",
+            )
+            .unwrap();
+
+        let stats = reader.stats();
+        assert_eq!(stats.frames_filtered, 1);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+        assert_eq!(stats.dropped_frame_events.len(), 0);
+    }
+
+    #[test]
+    fn incomplete_frame_inside_time_filter_still_fails() {
+        let td = write_iso(&[]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 0);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(191_550, 9_375);
+
+        let pending = PendingFrame {
+            data: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            timecode: Timecode { minutes: 42, seconds: 34, frames: 0 },
+            channel_count: 2,
+            dst_encoded: false,
+            sector_count: 0,
+        };
+
+        let err = reader
+            .handle_incomplete_frame(
+                1_464_418,
+                pending,
+                "new frame_start encountered before previous frame completed",
+            )
+            .expect_err("in-window incomplete frame must fail");
+        assert!(matches!(err, FrameError::IncompleteFrame { .. }));
+        assert_eq!(reader.stats().frames_dropped_incomplete, 1);
+    }
+
+    #[test]
+    fn incomplete_frame_at_dynamic_tail_is_filtered_not_dropped() {
+        let td = write_iso(&[]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 0);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(313_684, 99_155);
+        reader.stats.frames_emitted = 58_456;
+
+        let pending = PendingFrame {
+            data: vec![0xaa; 5_376],
+            timecode: Timecode { minutes: 82, seconds: 41, frames: 65 },
+            channel_count: 2,
+            dst_encoded: false,
+            sector_count: 0,
+        };
+
+        reader
+            .handle_incomplete_frame(
+                1_737_218,
+                pending,
+                "new frame_start encountered before previous frame completed",
+            )
+            .unwrap();
+
+        let stats = reader.stats();
+        assert_eq!(stats.frames_filtered, 1);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+        assert_eq!(stats.dropped_frame_events.len(), 0);
+    }
+
+    #[test]
+    fn incomplete_frame_after_dynamic_tail_is_filtered_even_with_lower_garbage_timecode() {
+        let td = write_iso(&[]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 0);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(313_684, 99_155);
+        reader.stats.frames_emitted = 58_456;
+
+        let first_tail = PendingFrame {
+            data: vec![0xaa; 5_376],
+            timecode: Timecode { minutes: 82, seconds: 41, frames: 65 },
+            channel_count: 2,
+            dst_encoded: false,
+            sector_count: 0,
+        };
+        reader
+            .handle_incomplete_frame(
+                1_737_218,
+                first_tail,
+                "new frame_start encountered before previous frame completed",
+            )
+            .unwrap();
+
+        let later_garbage = PendingFrame {
+            data: vec![0xbb; 938],
+            timecode: Timecode { minutes: 79, seconds: 98, frames: 43 },
+            channel_count: 2,
+            dst_encoded: false,
+            sector_count: 0,
+        };
+        reader
+            .handle_incomplete_frame(
+                1_737_661,
+                later_garbage,
+                "new frame_start encountered before previous frame completed",
+            )
+            .unwrap();
+
+        let stats = reader.stats();
+        assert_eq!(stats.frames_filtered, 2);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+        assert_eq!(stats.dropped_frame_events.len(), 0);
+    }
+
+    #[test]
+    fn complete_frame_after_dynamic_tail_is_filtered_even_with_lower_garbage_timecode() {
+        let td = write_iso(&[]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 0);
+        reader.set_expected_channel_count(2);
+        reader.set_expected_frame_format(FrameFormat::Dsd3In14);
+        reader.set_timecode_filter(313_684, 99_155);
+        reader.stats.frames_emitted = 58_456;
+
+        let first_tail = PendingFrame {
+            data: vec![0xaa; 5_376],
+            timecode: Timecode { minutes: 82, seconds: 41, frames: 65 },
+            channel_count: 2,
+            dst_encoded: false,
+            sector_count: 0,
+        };
+        reader
+            .handle_incomplete_frame(
+                1_737_218,
+                first_tail,
+                "new frame_start encountered before previous frame completed",
+            )
+            .unwrap();
+
+        let later_complete = PendingFrame {
+            data: vec![0xcc; FRAME_SIZE_UNCOMPRESSED * 2],
+            timecode: Timecode { minutes: 79, seconds: 98, frames: 43 },
+            channel_count: 2,
+            dst_encoded: false,
+            sector_count: 0,
+        };
+        reader
+            .finish_or_drop(1_737_662, later_complete, "frame completed")
+            .unwrap();
+
+        let stats = reader.stats();
+        assert_eq!(stats.frames_filtered, 2);
+        assert_eq!(stats.frames_emitted, 58_456);
+        assert!(reader.ready.is_empty());
+    }
+
+    #[test]
+    fn invalid_timecode_after_emitting_filter_duration_is_skipped() {
+        let complete: Vec<u8> = vec![0x44; FRAME_SIZE_UNCOMPRESSED * 2];
+        let part_size = 2000;
+        let mut sectors = vec![synth_audio_sector(
+            true,
+            &complete[..part_size],
+            Timecode { minutes: 0, seconds: 0, frames: 0 },
+        )];
+        let mut written = part_size;
+        while written < complete.len() {
+            let chunk = (complete.len() - written).min(part_size);
+            sectors.push(synth_continuation_sector(&complete[written..written + chunk]));
+            written += chunk;
+        }
+        sectors.push(synth_audio_sector(
+            true,
+            &[0x55; 2000],
+            Timecode { minutes: 0, seconds: 0, frames: 186 },
+        ));
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
+        reader.set_expected_channel_count(2);
+        reader.set_timecode_filter(0, 1);
+
+        let frame = reader.next_frame().unwrap().expect("selected frame");
+        assert_eq!(frame.timecode, Timecode { minutes: 0, seconds: 0, frames: 0 });
+        assert!(reader.next_frame().unwrap().is_none());
+        assert_eq!(reader.stats().frames_filtered, 1);
+        assert_eq!(reader.stats().invalid_timecodes, 0);
+        assert_eq!(reader.stats().frames_dropped_incomplete, 0);
+    }
+
+    #[test]
     fn invalid_timecode_fails_in_strict_mode() {
         let frame_bytes: Vec<u8> = vec![0x55; FRAME_SIZE_UNCOMPRESSED * 2];
         let part_size = 2000;
         let mut sectors = vec![synth_audio_sector(
             true,
             &frame_bytes[..part_size],
-            Timecode { minutes: 0, seconds: 60, frames: 0 },
+            Timecode { minutes: 0, seconds: 0, frames: 75 },
         )];
         let mut written = part_size;
         while written < frame_bytes.len() {
@@ -1189,9 +1907,37 @@ mod tests {
         let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
         reader.set_expected_channel_count(2);
 
-        let err = reader.next_frame().expect_err("invalid timecode must fail strict mode");
+        let err = reader.next_frame().expect_err("invalid frame component must fail strict mode");
         assert!(matches!(err, FrameError::InvalidTimecode { .. }));
         assert_eq!(reader.stats().invalid_timecodes, 1);
+    }
+
+    #[test]
+    fn timecode_seconds_above_59_are_counted_not_rejected() {
+        let frame_bytes: Vec<u8> = vec![0x77; FRAME_SIZE_UNCOMPRESSED * 2];
+        let part_size = 2000;
+        let mut sectors = vec![synth_audio_sector(
+            true,
+            &frame_bytes[..part_size],
+            Timecode { minutes: 1, seconds: 74, frames: 0 },
+        )];
+        let mut written = part_size;
+        while written < frame_bytes.len() {
+            let chunk = (frame_bytes.len() - written).min(part_size);
+            sectors.push(synth_continuation_sector(&frame_bytes[written..written + chunk]));
+            written += chunk;
+        }
+
+        let td = write_iso(&sectors);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, sectors.len() as u64);
+        reader.set_expected_channel_count(2);
+        reader.set_timecode_filter(0, 20_000);
+
+        let frame = reader.next_frame().unwrap().expect("frame with raw seconds > 59");
+        assert_eq!(frame.timecode.as_frame_count(), 1 * 60 * 75 + 74 * 75);
+        assert_eq!(frame.data, frame_bytes);
+        assert_eq!(reader.stats().invalid_timecodes, 0);
     }
 
     #[test]
@@ -1201,7 +1947,7 @@ mod tests {
         let mut sectors = vec![synth_audio_sector(
             true,
             &frame_bytes[..part_size],
-            Timecode { minutes: 0, seconds: 60, frames: 0 },
+            Timecode { minutes: 0, seconds: 0, frames: 75 },
         )];
         let mut written = part_size;
         while written < frame_bytes.len() {

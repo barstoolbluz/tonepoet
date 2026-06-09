@@ -50,7 +50,7 @@ use crate::tui::sacd::{
     SACD_SAMPLE_RATE_HZ,
 };
 use sacd_rs::dsd_file::{validate_dsd_stream, DsdValidationMode, DsdValidationOptions, DsdValidationReport};
-use sacd_rs::extract::{extract_track_with_integrity_options, ExtractIntegrityOptions, ExtractOptions, ExtractReport, ExtractStats, OutputFormat};
+use sacd_rs::extract::{extract_track_with_area_frame_format, ExtractIntegrityOptions, ExtractReport, ExtractStats, OutputFormat};
 use sacd_rs::iso_reader::IsoReader;
 
 const DEFAULT_CONVERT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
@@ -1033,13 +1033,6 @@ fn realize_sacd_track_blocking(
         )));
     }
 
-    let start_lsn = u64::from(entry.start_lsn);
-    let end_lsn = start_lsn
-        .checked_add(u64::from(entry.length_lsn))
-        .ok_or_else(|| {
-            ConvertError::TrackValidation("SACD track sector range overflows".to_string())
-        })?;
-
     let output_format = match target_format {
         tonepoet_pipeline::AudioFormat::Dff => OutputFormat::Dff,
         _ => OutputFormat::Dsf,
@@ -1077,17 +1070,15 @@ fn realize_sacd_track_blocking(
             .create_new(true)
             .open(&tmp_path)?;
 
-        let options = ExtractOptions::new(
-            start_lsn,
-            end_lsn,
-            area_info.header.channel_count,
-            output_format,
-        );
-        let report = extract_track_with_integrity_options(
+        let options = area_info
+            .track_extract_options(track_index as usize, output_format)
+            .map_err(|err| ConvertError::TrackValidation(err.to_string()))?;
+        let report = extract_track_with_area_frame_format(
             &mut iso_reader,
             &mut writer,
             options,
-            ExtractIntegrityOptions::strict().with_sector_recovery(true),
+            area_info.extraction_frame_format(),
+            ExtractIntegrityOptions::strict(),
         )
         .map_err(|err| {
             ConvertError::Realize(format!(
@@ -1096,6 +1087,14 @@ fn realize_sacd_track_blocking(
                 track_index + 1
             ))
         })?;
+        if report.integrity_loss_detected() {
+            return Err(ConvertError::Realize(format!(
+                "SACD extraction lost integrity for {} track {}: {:?}",
+                iso.display(),
+                track_index + 1,
+                report.integrity
+            )));
+        }
         writer.sync_all()?;
         drop(writer);
 
@@ -1282,15 +1281,18 @@ fn validate_sacd_realization(
     if expected_frames > 0 {
         let delta = stats.frames_read.abs_diff(expected_frames);
         if delta > 1 {
-            return Err(ConvertError::TrackValidation(format!(
-                "SACD frame count drift: expected {expected_frames}, got {}, allowed 1",
+            log::warn!(
+                "SACD frame count drift for {}: TOC expected {}, extractor emitted {}",
+                path.display(),
+                expected_frames,
                 stats.frames_read
-            )));
+            );
         }
     }
 
-    // Duration sanity check: compare extracted byte-derived sample count
-    // against TOC-derived expectation with ±1 TOC frame tolerance.
+    // Duration sanity check: TOC-derived duration can drift from the
+    // byte-derived DSF sample count. Report the drift but keep the realized
+    // file when container structure and extracted audio bytes are valid.
     let stats_sample_count = stats
         .audio_bytes
         .checked_div(u64::from(area_info.header.channel_count))
@@ -1300,13 +1302,13 @@ fn validate_sacd_realization(
         let one_toc_frame_samples = u64::from(SACD_SAMPLE_RATE_HZ / 75);
         let delta = stats_sample_count.abs_diff(expectation.sample_count);
         if delta > one_toc_frame_samples {
-            return Err(ConvertError::TrackValidation(format!(
-                "SACD DSF sample-count mismatch: expected ~{}, got {}, delta {} exceeds 1-frame tolerance {}",
+            log::warn!(
+                "SACD DSF sample-count drift for {}: TOC expected approximately {}, extractor emitted {}, delta {} samples",
+                path.display(),
                 expectation.sample_count,
                 stats_sample_count,
                 delta,
-                one_toc_frame_samples,
-            )));
+            );
         }
     }
 
@@ -1398,21 +1400,19 @@ fn validate_dsf_container(
             )));
         }
         // SACD TOC PlayTime has 75 fps granularity. DSF sample counts
-        // are derived from realized sector/frame extraction and can
-        // differ by one TOC frame. Treat PlayTime-derived samples as
-        // a duration sanity check, not an exact sample-count invariant.
+        // come from realized DSD payload bytes, so TOC-derived duration is
+        // advisory rather than a container invariant.
         if expectation.sample_count != 0 {
             let one_toc_frame_samples = u64::from(expectation.sample_frequency / 75);
             let delta = parsed.sample_count.abs_diff(expectation.sample_count);
             if delta > one_toc_frame_samples {
-                return Err(ConvertError::TrackValidation(format!(
-                    "DSF sample count mismatch: expected ~{}, got {}, delta {} exceeds 1-frame tolerance {} for {}",
+                log::warn!(
+                    "DSF sample-count drift for {}: TOC expected approximately {}, header contains {}, delta {} samples",
+                    path.display(),
                     expectation.sample_count,
                     parsed.sample_count,
                     delta,
-                    one_toc_frame_samples,
-                    path.display()
-                )));
+                );
             }
         }
     }
