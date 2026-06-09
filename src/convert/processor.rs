@@ -24,12 +24,17 @@ use crate::convert::pipeline::{
     prepare_pipeline_item_for_scheduler, realize_track_for_scheduler_with_tool_limits,
     run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_worker_failure_output,
     AlbumCompletionTracker,
-    AlbumReadiness, BroadcastReporter, CueSidecarPolicy, FailurePolicy, LogPolicy,
-    NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PoolLimits,
-    PreparedTrack, PublishPolicy, RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
+    AlbumReadiness, BroadcastReporter, PipelineRequest, PoolLimits,
+    RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
-    SharedWorkerPool, SourceKind, SourceOptions, StagePolicy, StageRequirement, ToolConcurrencyLimits,
-    TrackId, TrackMetadata, TrackSelection, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
+    SharedWorkerPool, SourceKind, ToolConcurrencyLimits,
+    TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
+};
+#[cfg(test)]
+use crate::convert::pipeline::{
+    CueSidecarPolicy, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
+    OverwritePolicy, PreparedTrack, PublishPolicy, SourceOptions, StagePolicy, StageRequirement,
+    TrackId, TrackMetadata, TrackSelection,
 };
 
 /// Configuration for the conversion processor.

@@ -677,7 +677,7 @@ impl SimpleWizard {
 
     /// Check if destination needs to be selected and show browser if needed
     /// Returns true if browser was shown, false if ready to start conversion
-    pub fn check_and_prompt_for_destination(&mut self) -> bool {
+    pub fn _check_and_prompt_for_destination(&mut self) -> bool {
         if self.destination_mode == DestinationMode::AskEveryTime {
             self.needs_destination_selection = true;
             self.show_destination_browser();

@@ -1324,6 +1324,7 @@ fn compute_track_boundaries_for_layout(
     Ok(boundaries)
 }
 
+#[cfg(test)]
 fn compute_track_boundaries(
     sheet: &CueSheet,
     total_samples: u64,

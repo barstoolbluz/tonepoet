@@ -571,6 +571,7 @@ fn parse_file_line(line: &str) -> Option<String> {
 }
 
 /// Parse a `TRACK NN AUDIO` line, returning the track number.
+#[cfg(test)]
 fn parse_track_line(line: &str) -> Option<u32> {
     let (number, is_audio) = parse_track_header(line)?;
     if is_audio {

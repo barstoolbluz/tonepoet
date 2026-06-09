@@ -512,7 +512,7 @@ impl SegmentData {
     }
 
     fn copy_from_filter_for_probability(filter: &SegmentData, channels: usize) -> Result<Self, DstError> {
-        let mut probability = filter.clone();
+        let probability = filter.clone();
         for ch in 0..channels {
             for seg in 0..probability.segment_count[ch] {
                 let len_units = probability.segment_len[ch][seg];

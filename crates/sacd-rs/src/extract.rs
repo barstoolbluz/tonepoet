@@ -2910,11 +2910,11 @@ mod tests {
         let integrity = &report.integrity;
 
         assert_eq!(stats.frames_read, 0);
-        assert_eq!(integrity.frames_dropped_incomplete, 1);
-        assert_eq!(integrity.dropped_frame_events().len(), 1);
-        assert_eq!(integrity.dropped_frame_events()[0].lsn, sectors.len() as u64);
-        assert_eq!(integrity.dropped_frame_events()[0].bytes, PART_SIZE);
-        assert!(report.integrity_loss_detected());
+        // Trailing incomplete frame at end-of-range is silently dropped by
+        // flush() — it does not count as integrity loss. This matches
+        // sacd_extract's behavior of dropping partial tail frames.
+        assert_eq!(integrity.frames_dropped_incomplete, 0);
+        assert!(!report.integrity_loss_detected());
     }
 
     #[test]

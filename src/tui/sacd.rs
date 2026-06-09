@@ -3065,11 +3065,6 @@ fn file_complete_sector_count(path: &Path) -> Result<u64, SacdError> {
     Ok(size / SECTOR_SIZE)
 }
 
-fn read_sector(path: &Path, lsn: u64) -> Result<Vec<u8>, SacdError> {
-    let mut reader = SectorReader::open(path)?;
-    reader.read_sector(lsn)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

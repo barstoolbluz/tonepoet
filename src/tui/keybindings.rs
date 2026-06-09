@@ -7182,7 +7182,7 @@ fn handle_format_settings_mouse(
                 }
             }
             FormatSettingsKind::Ssrc { .. } => {
-                let field5_y = popup_y + 6;
+                let _field5_y = popup_y + 6;
                 match my {
                     y if y == field1_y => Some(FormatSettingsFocus::SsrcAttenuation),
                     y if y == field2_y => Some(FormatSettingsFocus::SsrcMinPhase),

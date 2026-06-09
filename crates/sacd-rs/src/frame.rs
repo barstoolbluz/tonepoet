@@ -623,19 +623,16 @@ impl<'a> FrameReader<'a> {
 
     /// Explicit end-of-range flush. Returns a complete pending frame if
     /// one is buffered, applies the time filter, and clears pending state.
-    /// A trailing incomplete frame at the track boundary is normal — the
-    /// TOC sector range rarely aligns to DSD frame boundaries. Record it
-    /// in stats but never treat it as a hard error.
+    /// A trailing incomplete frame at the track boundary is normal: the
+    /// sacd_extract sector queue can end part-way through the next ScarletBook
+    /// frame, and the C extractor simply emits the preceding complete frames.
+    /// Do not count this as integrity loss; mid-stream incomplete frames still
+    /// go through `handle_incomplete_frame` and remain strict.
     pub fn flush(&mut self) -> Result<Option<Frame>, FrameError> {
         let Some(pending) = self.pending.take() else {
             return Ok(None);
         };
         if !frame_is_complete(&pending, self.expected_channel_count) {
-            self.record_dropped_frame(
-                self.end_lsn,
-                &pending,
-                "end of extraction range before frame completed",
-            );
             return Ok(None);
         }
         let frame = pending.into_frame();
@@ -1338,6 +1335,28 @@ mod tests {
         assert!(reader.next_frame().unwrap().is_none());
     }
 
+
+    #[test]
+    fn flush_drops_trailing_incomplete_frame_without_integrity_loss() {
+        let partial = vec![0x33; 8064];
+        let sector = synth_audio_sector(
+            true,
+            &partial[..2000],
+            Timecode { minutes: 39, seconds: 10, frames: 27 },
+        );
+
+        let td = write_iso(&[sector]);
+        let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+        let mut reader = FrameReader::new(&mut iso, 0, 1);
+        reader.set_expected_channel_count(2);
+
+        assert!(reader.next_frame().unwrap().is_none());
+        let stats = reader.stats();
+        assert_eq!(stats.frames_emitted, 0);
+        assert_eq!(stats.frames_filtered, 0);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+        assert!(stats.dropped_frame_events.is_empty());
+    }
 
     #[test]
     fn cross_sector_packet_payload_reads_following_sector_bytes() {
