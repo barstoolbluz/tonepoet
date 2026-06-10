@@ -684,6 +684,10 @@ async fn run_convert(
         .process_queue_with_progress(queue.clone(), None)
         .await;
 
+    // Drop the processor (and its progress_tx sender) so the progress display
+    // task's recv() loop terminates instead of blocking forever.
+    drop(processor);
+
     // Wait for progress display to finish
     let _ = progress_handle.await;
 
