@@ -13,6 +13,11 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod dvda_channel_layout;
+pub(crate) mod dvda_demux;
+pub(crate) mod dvda_lpcm;
+pub(crate) mod dvda_mlp;
+pub(crate) mod dvda_realize;
 pub mod errors;
 pub mod label_resolver;
 pub mod materializer_7z;

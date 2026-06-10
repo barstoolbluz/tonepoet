@@ -394,6 +394,36 @@ pub enum TrackSourceRef {
         /// discs do not reliably encode the format in `track_type`, and SAMG-only
         /// records do not identify an ATS format table entry.
         audio_format_index: Option<u8>,
+        /// IFO-derived scalar sample rate used to validate decoded DVD-Audio WAV output.
+        /// This remains optional for multi-format ATS records where Phase 2 cannot
+        /// identify a single active audio-format table entry from structure alone.
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_sample_rate: Option<u32>,
+        /// IFO-derived total channel count used to validate decoded DVD-Audio WAV output.
+        /// This remains optional when the IFO record does not expose a channel assignment.
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_channel_count: Option<u32>,
+        /// IFO-derived source bit depth. DVD-Audio MLP is decoded to `pcm_s32le`
+        /// for the pipeline carrier, so this records the source-depth assertion
+        /// rather than the WAV container sample format.
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_bit_depth: Option<u32>,
+        /// IFO channel-assignment code from the active ATS/SAMG audio-format record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_channel_assignment_code: Option<u8>,
+        /// IFO group-format details from the active ATS/SAMG audio-format record.
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_group1_sample_rate: Option<u32>,
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_group2_sample_rate: Option<u32>,
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_group1_bit_depth: Option<u32>,
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_group2_bit_depth: Option<u32>,
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_group1_channel_count: Option<u32>,
+        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        expected_group2_channel_count: Option<u32>,
         sector_ranges: Vec<DvdaSectorRangeRef>,
         aob_files: Vec<DvdaAobFileRef>,
     },
@@ -459,9 +489,9 @@ pub enum DvdaSectorAddressSpace {
     /// Sector numbers are relative to the beginning of the selected ATS AOB
     /// logical address space and should be resolved through `aob_files`.
     AtsAobRelative { title_set_nr: u8 },
-    /// Sector numbers came directly from SAMG absolute-sector fields. They are
-    /// sufficient for Phase 2 structure/provenance but require Phase 3 reader
-    /// support before audio can be realized.
+    /// Sector numbers came directly from SAMG absolute-sector fields. Realization
+    /// resolves these through raw ISO sector reads because copied directory trees
+    /// do not preserve disc logical sector addresses.
     SamgAbsolute,
 }
 
@@ -532,6 +562,19 @@ pub enum DvdaCopyProtectionEvidenceSource {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DvdaCopyProtectionHandlingPolicy {
+    /// Detect CPPM evidence, explain the block, and skip realization. This
+    /// build intentionally does not include CPPM decryption or key-management.
+    DetectExplainSkip,
+}
+
+impl Default for DvdaCopyProtectionHandlingPolicy {
+    fn default() -> Self {
+        Self::DetectExplainSkip
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DvdaCopyProtectionBlock {
     pub scheme: DvdaCopyProtectionScheme,
@@ -540,6 +583,11 @@ pub struct DvdaCopyProtectionBlock {
     pub evidence_filename: Option<String>,
     pub mkb_present: bool,
     pub cppm_detected: bool,
+    #[serde(default)]
+    pub handling_policy: DvdaCopyProtectionHandlingPolicy,
+    pub decryption_supported: bool,
+    pub skip_reason: String,
+    pub user_explanation: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
 }
@@ -552,8 +600,11 @@ impl DvdaCopyProtectionBlock {
             .as_deref()
             .unwrap_or("unknown source file");
         format!(
-            "CPPM detected from {filename} (MKB present: {}, parser CPPM flag: {})",
-            self.mkb_present, self.cppm_detected
+            "CPPM detected from {filename} (MKB present: {}, parser CPPM flag: {}, policy: {:?}, decryption supported: {})",
+            self.mkb_present,
+            self.cppm_detected,
+            self.handling_policy,
+            self.decryption_supported
         )
     }
 }

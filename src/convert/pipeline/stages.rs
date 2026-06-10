@@ -28,6 +28,7 @@ use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
 use super::materializer_dvda::{is_dvda_candidate, DvdaAudioMaterializer};
 use super::materializer_single::SingleFileMaterializer;
+use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
     execute_planned_track_conversion, run_tool_command_with_concurrency,
 };
@@ -245,6 +246,7 @@ pub async fn realize_track_with_tool_limits(
 ) -> Result<PathBuf, ConvertError> {
     realize_track_with_tool_limits_and_stats(
         src,
+        None,
         req,
         staging,
         runner,
@@ -258,6 +260,7 @@ pub async fn realize_track_with_tool_limits(
 
 async fn realize_track_with_tool_limits_and_stats(
     src: &TrackSourceRef,
+    prepared_track: Option<&PreparedTrack>,
     req: &PipelineRequest,
     staging: &StagingDir,
     runner: &dyn ToolRunner,
@@ -333,7 +336,25 @@ async fn realize_track_with_tool_limits_and_stats(
             track_index,
             area,
         } => realize_sacd_track(iso, *track_index, *area, &req.settings.target_format, staging, cancel, progress_tracker).await,
-        TrackSourceRef::DvdaTrack { .. } => Err(ConvertError::UnsupportedTrackSource),
+        TrackSourceRef::DvdaTrack { .. } => {
+            let expected_audio = DvdaSourceAudioExpectation::from_prepared_track_and_source(prepared_track, src);
+            let audio_policy = DvdaRealizationAudioPolicy::new(
+                bit_depth_target_label(req.settings.target_bit_depth).to_string(),
+                prepared_track.and_then(|track| resolved_target_bit_depth(track, req.settings.target_bit_depth)),
+            );
+            realize_dvda_track(
+                src,
+                expected_audio,
+                audio_policy,
+                staging,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+                progress_tracker,
+            )
+            .await
+            .map(RealizedTrackInfo::without_stats)
+        }
     }
 }
 
@@ -1906,6 +1927,7 @@ async fn convert_one_track_work(
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
     let realized = match realize_track_with_tool_limits_and_stats(
         &track.source_ref,
+        Some(&track),
         &req,
         &staging,
         &runner,
@@ -5262,6 +5284,15 @@ fn append_source_blocking_lines(log: &mut String, source: &PreparedSource) {
     if let Some(source) = extra.get("dvda_copy_protection_source") {
         push_kv_line(log, "Copy protection evidence", source);
     }
+    if let Some(policy) = extra.get("dvda_copy_protection_policy") {
+        push_kv_line(log, "Copy protection policy", policy);
+    }
+    if let Some(supported) = extra.get("dvda_cppm_decryption_supported") {
+        push_kv_line(log, "CPPM decryption supported", supported);
+    }
+    if let Some(reason) = extra.get("dvda_copy_protection_skip_reason") {
+        push_kv_line(log, "Copy protection skip reason", reason);
+    }
     if let Some(file) = extra.get("dvda_copy_protection_file") {
         push_kv_line(log, "Copy protection source", file);
     } else if mkb {
@@ -7599,6 +7630,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits(
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, Some(reporter));
     match realize_track_with_tool_limits_and_stats(
         &track.source_ref,
+        Some(&track),
         &req,
         &staging,
         &runner,

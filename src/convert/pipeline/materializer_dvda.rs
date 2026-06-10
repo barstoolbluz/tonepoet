@@ -217,6 +217,10 @@ fn dvda_copy_protection_block(disc: &DvdaDisc) -> DvdaCopyProtectionBlock {
         evidence_filename,
         mkb_present: disc.copy_protection.mkb_present,
         cppm_detected: disc.copy_protection.cppm_detected,
+        handling_policy: DvdaCopyProtectionHandlingPolicy::DetectExplainSkip,
+        decryption_supported: false,
+        skip_reason: "CPPM-protected DVD-Audio source; this build detects, explains, and skips protected AOB realization instead of attempting decryption".to_string(),
+        user_explanation: "This DVD-Audio source appears to use CPPM copy protection. tonepoet can report the DVD-Audio structure and track metadata, but this build will not decrypt CPPM-protected audio sectors. Use an unencrypted disc image or another source that has already been made accessible by a legally authorized workflow.".to_string(),
         diagnostics,
     }
 }
@@ -235,6 +239,18 @@ fn mark_tracks_blocked_for_copy_protection(tracks: &mut [PreparedTrack], block: 
         track.metadata.extra.insert(
             "dvda_copy_protection_source".to_string(),
             format!("{:?}", block.evidence_source),
+        );
+        track.metadata.extra.insert(
+            "dvda_copy_protection_policy".to_string(),
+            format!("{:?}", block.handling_policy),
+        );
+        track.metadata.extra.insert(
+            "dvda_cppm_decryption_supported".to_string(),
+            block.decryption_supported.to_string(),
+        );
+        track.metadata.extra.insert(
+            "dvda_copy_protection_skip_reason".to_string(),
+            block.skip_reason.clone(),
         );
         if let Some(filename) = &block.evidence_filename {
             track
@@ -714,7 +730,7 @@ fn append_title_tracks(
 
         let source_ordinal = tracks.len() as u32 + 1;
         let group_track_ordinal = group_track_ordinal_from_lengths(tracks.len(), group_start_len)?;
-        let audio_facts = audio_facts_for_title_set(title_set);
+        let audio_facts = audio_facts_for_title_chapter(title_set, chapter);
         let source_audio = source_audio_descriptor_for_facts(audio_facts);
         let aob_inventory_covers_track = sector_ranges_are_covered(chapter, &aob_files);
 
@@ -815,6 +831,16 @@ fn ats_track_source_ref(
         title_track_count_declared: Some(title.track_count_declared),
         title_index_count_declared: Some(title.index_count_declared),
         audio_format_index: audio_facts.format_index,
+        expected_sample_rate: audio_facts.sample_rate,
+        expected_channel_count: expected_channel_count_for_facts(audio_facts),
+        expected_bit_depth: audio_facts.bit_depth.map(u32::from),
+        expected_channel_assignment_code: expected_channel_assignment_code_for_facts(audio_facts),
+        expected_group1_sample_rate: expected_group1_sample_rate_for_facts(audio_facts),
+        expected_group2_sample_rate: expected_group2_sample_rate_for_facts(audio_facts),
+        expected_group1_bit_depth: expected_group1_bit_depth_for_facts(audio_facts),
+        expected_group2_bit_depth: expected_group2_bit_depth_for_facts(audio_facts),
+        expected_group1_channel_count: expected_group1_channel_count_for_facts(audio_facts),
+        expected_group2_channel_count: expected_group2_channel_count_for_facts(audio_facts),
         sector_ranges: chapter.sector_ranges.iter().map(sector_range_ref).collect(),
         aob_files,
     }
@@ -868,6 +894,16 @@ fn prepared_track_from_samg_track(
             title_track_count_declared: None,
             title_index_count_declared: None,
             audio_format_index: None,
+            expected_sample_rate: audio_facts.sample_rate,
+            expected_channel_count: expected_channel_count_for_facts(audio_facts),
+            expected_bit_depth: audio_facts.bit_depth.map(u32::from),
+            expected_channel_assignment_code: expected_channel_assignment_code_for_facts(audio_facts),
+            expected_group1_sample_rate: expected_group1_sample_rate_for_facts(audio_facts),
+            expected_group2_sample_rate: expected_group2_sample_rate_for_facts(audio_facts),
+            expected_group1_bit_depth: expected_group1_bit_depth_for_facts(audio_facts),
+            expected_group2_bit_depth: expected_group2_bit_depth_for_facts(audio_facts),
+            expected_group1_channel_count: expected_group1_channel_count_for_facts(audio_facts),
+            expected_group2_channel_count: expected_group2_channel_count_for_facts(audio_facts),
             sector_ranges: vec![DvdaSectorRangeRef {
                 index_nr: 1,
                 first: samg_track.abs_first_sector,
@@ -1023,45 +1059,71 @@ struct AudioFacts<'a> {
 enum AudioFormatResolution {
     NoPresentFormat,
     SinglePresentFormat,
+    TrackTypeAudioFormatIndex,
     MultiplePresentFormats,
     SamgTrackRecord,
 }
 
 fn audio_facts_for_title_set(title_set: &TitleSet) -> AudioFacts<'_> {
-    let present: Vec<&AudioAttributes> = title_set
+    let present: Vec<&AudioAttributes> = present_audio_formats(title_set);
+
+    match present.as_slice() {
+        [] => unknown_audio_facts(AudioFormatResolution::NoPresentFormat),
+        [attr] => audio_facts_from_attr(*attr, AudioFormatResolution::SinglePresentFormat),
+        _ => unknown_audio_facts(AudioFormatResolution::MultiplePresentFormats),
+    }
+}
+
+fn audio_facts_for_title_chapter<'a>(
+    title_set: &'a TitleSet,
+    chapter: &AudioChapter,
+) -> AudioFacts<'a> {
+    let present: Vec<&'a AudioAttributes> = present_audio_formats(title_set);
+
+    match present.as_slice() {
+        [] => unknown_audio_facts(AudioFormatResolution::NoPresentFormat),
+        [attr] => audio_facts_from_attr(*attr, AudioFormatResolution::SinglePresentFormat),
+        _ => {
+            let candidate = chapter.track_type_low_bits_candidate;
+            present
+                .iter()
+                .copied()
+                .find(|attr| attr.format_index == candidate)
+                .map(|attr| audio_facts_from_attr(attr, AudioFormatResolution::TrackTypeAudioFormatIndex))
+                .unwrap_or_else(|| unknown_audio_facts(AudioFormatResolution::MultiplePresentFormats))
+        }
+    }
+}
+
+fn present_audio_formats(title_set: &TitleSet) -> Vec<&AudioAttributes> {
+    title_set
         .audio_formats
         .iter()
         .filter(|attr| attr.present)
-        .collect();
+        .collect()
+}
 
-    match present.as_slice() {
-        [] => AudioFacts {
-            format_index: None,
-            attr: None,
-            channel_format: None,
-            channel_assignment: None,
-            sample_rate: None,
-            bit_depth: None,
-            resolution: AudioFormatResolution::NoPresentFormat,
-        },
-        [attr] => AudioFacts {
-            format_index: Some(attr.format_index),
-            attr: Some(*attr),
-            channel_format: Some(&attr.channel_format),
-            channel_assignment: attr.channel_assignment.as_ref(),
-            sample_rate: primary_sample_rate(&attr.channel_format),
-            bit_depth: primary_bit_depth(&attr.channel_format),
-            resolution: AudioFormatResolution::SinglePresentFormat,
-        },
-        _ => AudioFacts {
-            format_index: None,
-            attr: None,
-            channel_format: None,
-            channel_assignment: None,
-            sample_rate: None,
-            bit_depth: None,
-            resolution: AudioFormatResolution::MultiplePresentFormats,
-        },
+fn audio_facts_from_attr(attr: &AudioAttributes, resolution: AudioFormatResolution) -> AudioFacts<'_> {
+    AudioFacts {
+        format_index: Some(attr.format_index),
+        attr: Some(attr),
+        channel_format: Some(&attr.channel_format),
+        channel_assignment: attr.channel_assignment.as_ref(),
+        sample_rate: primary_sample_rate(&attr.channel_format),
+        bit_depth: primary_bit_depth(&attr.channel_format),
+        resolution,
+    }
+}
+
+fn unknown_audio_facts<'a>(resolution: AudioFormatResolution) -> AudioFacts<'a> {
+    AudioFacts {
+        format_index: None,
+        attr: None,
+        channel_format: None,
+        channel_assignment: None,
+        sample_rate: None,
+        bit_depth: None,
+        resolution,
     }
 }
 
@@ -1075,6 +1137,51 @@ fn audio_facts_for_samg_track(track: &SamgTrack) -> AudioFacts<'_> {
         bit_depth: primary_bit_depth(&track.channel_format),
         resolution: AudioFormatResolution::SamgTrackRecord,
     }
+}
+
+fn expected_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    audio_facts.channel_assignment.and_then(|assignment| {
+        let channels = channel_count(assignment);
+        (channels > 0).then_some(u32::from(channels))
+    })
+}
+
+fn expected_channel_assignment_code_for_facts(audio_facts: AudioFacts<'_>) -> Option<u8> {
+    audio_facts.channel_format.map(|format| format.assignment_code)
+}
+
+fn expected_group1_sample_rate_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    audio_facts.channel_format.and_then(|format| format.group1_sample_rate)
+}
+
+fn expected_group2_sample_rate_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    audio_facts.channel_format.and_then(|format| format.group2_sample_rate)
+}
+
+fn expected_group1_bit_depth_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    audio_facts
+        .channel_format
+        .and_then(|format| format.group1_bits)
+        .map(u32::from)
+}
+
+fn expected_group2_bit_depth_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    audio_facts
+        .channel_format
+        .and_then(|format| format.group2_bits)
+        .map(u32::from)
+}
+
+fn expected_group1_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    audio_facts
+        .channel_assignment
+        .and_then(|assignment| (assignment.group1_channels > 0).then_some(u32::from(assignment.group1_channels)))
+}
+
+fn expected_group2_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    audio_facts
+        .channel_assignment
+        .and_then(|assignment| (assignment.group2_channels > 0).then_some(u32::from(assignment.group2_channels)))
 }
 
 fn source_audio_descriptor_for_facts(audio_facts: AudioFacts<'_>) -> SourceAudioDescriptor {
@@ -1166,6 +1273,7 @@ fn audio_format_resolution_label(resolution: AudioFormatResolution) -> &'static 
     match resolution {
         AudioFormatResolution::NoPresentFormat => "no_present_format",
         AudioFormatResolution::SinglePresentFormat => "single_present_format",
+        AudioFormatResolution::TrackTypeAudioFormatIndex => "track_type_audio_format_index",
         AudioFormatResolution::MultiplePresentFormats => "multiple_present_formats_unknown_until_aob_demux",
         AudioFormatResolution::SamgTrackRecord => "samg_track_record",
     }
@@ -1235,6 +1343,15 @@ fn album_metadata(
     insert_nonempty(&mut extra, "dvda_mkb_present", disc.copy_protection.mkb_present.to_string());
     insert_nonempty(&mut extra, "dvda_cppm_detected", disc.copy_protection.cppm_detected.to_string());
     insert_nonempty(&mut extra, "dvda_copy_protection_source", format!("{:?}", disc.copy_protection.source));
+    if disc.copy_protection.mkb_present || disc.copy_protection.cppm_detected {
+        insert_nonempty(&mut extra, "dvda_copy_protection_policy", "DetectExplainSkip".to_string());
+        insert_nonempty(&mut extra, "dvda_cppm_decryption_supported", "false".to_string());
+        insert_nonempty(
+            &mut extra,
+            "dvda_copy_protection_skip_reason",
+            "CPPM-protected DVD-Audio source; this build detects, explains, and skips protected AOB realization instead of attempting decryption".to_string(),
+        );
+    }
     if disc.copy_protection.mkb_present {
         insert_nonempty(&mut extra, "dvda_copy_protection_file", "DVDAUDIO.MKB".to_string());
     }
@@ -1748,6 +1865,16 @@ mod tests {
                 title_track_count_declared: Some(1),
                 title_index_count_declared: Some(1),
                 audio_format_index: None,
+                expected_sample_rate: Some(48_000),
+                expected_channel_count: Some(2),
+                expected_bit_depth: Some(24),
+                expected_channel_assignment_code: Some(1),
+                expected_group1_sample_rate: Some(48_000),
+                expected_group2_sample_rate: None,
+                expected_group1_bit_depth: Some(24),
+                expected_group2_bit_depth: None,
+                expected_group1_channel_count: Some(2),
+                expected_group2_channel_count: None,
                 sector_ranges: vec![DvdaSectorRangeRef {
                     index_nr: 1,
                     first: 0,
@@ -2266,7 +2393,7 @@ mod tests {
 
     #[test]
     fn atsi_track_source_ref_carries_typed_decode_boundary_fields() {
-        let title_set = title_set_with_audio_formats(vec![audio_attr(2, Some(96_000), Some(24))]);
+        let title_set = title_set_with_audio_formats(vec![audio_attr_with_channels(2, Some(96_000), Some(24), Some(2))]);
         let title = AudioTitle {
             title_set_nr: 1,
             title_nr: 0x83,
@@ -2340,6 +2467,16 @@ mod tests {
                 ats_track_nr,
                 samg_track_nr,
                 audio_format_index,
+                expected_sample_rate,
+                expected_channel_count,
+                expected_bit_depth,
+                expected_channel_assignment_code,
+                expected_group1_sample_rate,
+                expected_group2_sample_rate,
+                expected_group1_bit_depth,
+                expected_group2_bit_depth,
+                expected_group1_channel_count,
+                expected_group2_channel_count,
                 samg_ordinal,
                 ..
             } => {
@@ -2353,6 +2490,13 @@ mod tests {
                 assert_eq!(first_pts, 12_345);
                 assert_eq!(len_in_pts, 90_000);
                 assert_eq!(track_type, Some(0xa5));
+                assert_eq!(expected_sample_rate, Some(96_000));
+                assert_eq!(expected_channel_count, Some(2));
+                assert_eq!(expected_bit_depth, Some(24));
+                assert_eq!(expected_channel_assignment_code, Some(1));
+                assert_eq!(expected_group1_sample_rate, Some(96_000));
+                assert_eq!(expected_group1_bit_depth, Some(24));
+                assert_eq!(expected_group1_channel_count, Some(2));
                 assert_eq!(index_start, Some(7));
                 assert_eq!(downmix_matrix, Some(3));
                 assert_eq!(title_table_offset, Some(0x120));
@@ -2467,6 +2611,35 @@ mod tests {
     }
 
     #[test]
+    fn multi_format_ats_resolves_active_format_from_track_type_candidate() {
+        let title_set = title_set_with_audio_formats(vec![
+            audio_attr(0, Some(48_000), Some(20)),
+            audio_attr(2, Some(192_000), Some(24)),
+        ]);
+        let chapter = AudioChapter {
+            track_nr: 1,
+            track_type: 0xa2,
+            track_type_low_bits_candidate: 2,
+            downmix_matrix: None,
+            index_start: 1,
+            first_pts: 0,
+            len_in_pts: 90_000,
+            sector_ranges: vec![crate::tui::dvda::SectorRange {
+                index_nr: 1,
+                first: 10,
+                last: 20,
+            }],
+        };
+
+        let facts = audio_facts_for_title_chapter(&title_set, &chapter);
+
+        assert_eq!(facts.format_index, Some(2));
+        assert_eq!(facts.sample_rate, Some(192_000));
+        assert_eq!(facts.bit_depth, Some(24));
+        assert_eq!(facts.resolution, AudioFormatResolution::TrackTypeAudioFormatIndex);
+    }
+
+    #[test]
     fn mixed_group_rates_do_not_collapse_to_one_reported_rate() {
         let title_set = title_set_with_audio_formats(vec![AudioAttributes {
             format_index: 0,
@@ -2542,6 +2715,16 @@ mod tests {
                 title_len_in_pts,
                 title_track_count_declared,
                 title_index_count_declared,
+                expected_sample_rate,
+                expected_channel_count,
+                expected_bit_depth,
+                expected_channel_assignment_code,
+                expected_group1_sample_rate,
+                expected_group2_sample_rate,
+                expected_group1_bit_depth,
+                expected_group2_bit_depth,
+                expected_group1_channel_count,
+                expected_group2_channel_count,
                 sector_ranges,
                 aob_files,
                 ..
@@ -2567,7 +2750,14 @@ mod tests {
                 assert_eq!(title_table_offset, None);
                 assert_eq!(title_len_in_pts, None);
                 assert_eq!(title_track_count_declared, None);
-                assert_eq!(title_index_count_declared, None);
+                        assert_eq!(title_index_count_declared, None);
+                assert_eq!(expected_sample_rate, Some(48_000));
+                assert_eq!(expected_channel_count, None);
+                assert_eq!(expected_bit_depth, Some(24));
+                assert_eq!(expected_channel_assignment_code, Some(12));
+                assert_eq!(expected_group1_sample_rate, Some(48_000));
+                assert_eq!(expected_group1_bit_depth, Some(24));
+                assert_eq!(expected_group1_channel_count, None);
                 assert_eq!(sector_address_space, DvdaSectorAddressSpace::SamgAbsolute);
                 assert_eq!(sector_ranges.len(), 1);
                 assert_eq!(sector_ranges[0].first, 100);

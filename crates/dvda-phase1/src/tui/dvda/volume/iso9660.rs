@@ -1,12 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Read-only DVD-Audio ISO9660 bridge backend.
+//! Read-only ISO9660 bridge backend for DVD-Audio images.
 //!
-//! Some DVD-Audio images include an ISO9660 bridge in addition to UDF. Detection
-//! may therefore prove `/AUDIO_TS/AUDIO_TS.IFO` through ISO9660 even when the UDF
-//! backend cannot mount the image. This volume backend keeps the detection and
-//! materialization evidence path aligned by exposing the same AUDIO_TS files
-//! through the `DvdaVolume` trait.
+//! Some DVD-Audio ISO images expose `AUDIO_TS` through the ISO9660 bridge even
+//! when the UDF index is absent or unreadable. This backend indexes only the
+//! `AUDIO_TS` directory and exposes files through the existing `DvdaVolume`
+//! trait. It is intentionally read-only and bounded.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -16,28 +15,28 @@ use std::path::{Path, PathBuf};
 use crate::tui::dvda::error::{DvdaError, Result};
 use crate::tui::dvda::volume::{DvdaFile, DvdaVolume};
 
-const DVD_SECTOR_SIZE: u64 = 2048;
-const DVD_SECTOR_SIZE_USIZE: usize = 2048;
-const FIRST_VOLUME_DESCRIPTOR_SECTOR: u64 = 16;
-const MAX_VOLUME_DESCRIPTORS: u32 = 256;
+const ISO_SECTOR_SIZE: u64 = 2048;
+const ISO_SECTOR_SIZE_USIZE: usize = 2048;
+const VOLUME_DESCRIPTOR_START_SECTOR: u64 = 16;
+const PRIMARY_VOLUME_DESCRIPTOR: u8 = 1;
+const VOLUME_DESCRIPTOR_SET_TERMINATOR: u8 = 255;
+const ISO9660_MAGIC: &[u8; 5] = b"CD001";
+const ROOT_DIRECTORY_RECORD_OFFSET: usize = 156;
+const MAX_VOLUME_DESCRIPTORS: u64 = 256;
 const MAX_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Iso9660DvdaVolume {
     iso_path: PathBuf,
-    files: BTreeMap<String, Iso9660IndexedFile>,
+    files: BTreeMap<String, Iso9660Entry>,
 }
 
 impl Iso9660DvdaVolume {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let iso_path = path.into();
-        let mut reader = Iso9660Reader::open(&iso_path)?;
-        let files = reader.index_audio_ts_files()?;
-        if !files.contains_key("AUDIO_TS.IFO") {
-            return Err(DvdaError::MissingFile {
-                candidates: vec![format!("{}:AUDIO_TS/AUDIO_TS.IFO", iso_path.display())],
-            });
-        }
+        let mut file = File::open(&iso_path).map_err(|source| DvdaError::io(iso_path.display().to_string(), source))?;
+        let root = read_primary_volume_descriptor(&mut file, &iso_path)?;
+        let files = index_audio_ts_files(&mut file, &iso_path, root)?;
         Ok(Self { iso_path, files })
     }
 
@@ -46,49 +45,56 @@ impl Iso9660DvdaVolume {
     }
 
     pub fn audio_ts_file_names(&self) -> impl Iterator<Item = &str> {
-        self.files.values().map(|file| file.name.as_str())
+        self.files.keys().map(String::as_str)
     }
 }
 
 impl DvdaVolume for Iso9660DvdaVolume {
     fn open_audio_ts_file(&self, name: &str) -> Result<Box<dyn DvdaFile>> {
         let key = sanitize_audio_ts_name(name)?;
-        let Some(indexed) = self.files.get(&key) else {
+        let Some(entry) = self.files.get(&key) else {
             return Err(DvdaError::MissingFile {
                 candidates: vec![format!("{}:AUDIO_TS/{key}", self.iso_path.display())],
             });
         };
-        Ok(Box::new(Iso9660File::open(&self.iso_path, indexed)?))
+        Ok(Box::new(Iso9660File::open(&self.iso_path, entry)?))
     }
 
     fn file_len(&self, name: &str) -> Result<Option<u64>> {
         let key = sanitize_audio_ts_name(name)?;
-        Ok(self.files.get(&key).map(|file| file.len))
+        Ok(self.files.get(&key).map(|entry| entry.len))
     }
 }
 
 #[derive(Clone, Debug)]
-struct Iso9660IndexedFile {
+struct Iso9660Entry {
     name: String,
     extent_lba: u32,
     len: u64,
+    is_dir: bool,
+}
+
+impl Iso9660Entry {
+    fn offset(&self) -> u64 {
+        u64::from(self.extent_lba) * ISO_SECTOR_SIZE
+    }
 }
 
 struct Iso9660File {
     file: File,
-    start: u64,
-    pos: u64,
+    offset: u64,
     len: u64,
+    pos: u64,
 }
 
 impl Iso9660File {
-    fn open(iso_path: &Path, indexed: &Iso9660IndexedFile) -> Result<Self> {
-        let file = File::open(iso_path).map_err(|source| DvdaError::io(iso_path.display().to_string(), source))?;
+    fn open(path: &Path, entry: &Iso9660Entry) -> Result<Self> {
+        let file = File::open(path).map_err(|source| DvdaError::io(path.display().to_string(), source))?;
         Ok(Self {
             file,
-            start: u64::from(indexed.extent_lba) * DVD_SECTOR_SIZE,
+            offset: entry.offset(),
+            len: entry.len,
             pos: 0,
-            len: indexed.len,
         })
     }
 }
@@ -100,14 +106,14 @@ impl DvdaFile for Iso9660File {
 }
 
 impl Read for Iso9660File {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() || self.pos >= self.len {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || out.is_empty() {
             return Ok(0);
         }
-        let count = (self.len - self.pos).min(buf.len() as u64) as usize;
-        self.file.seek(SeekFrom::Start(self.start + self.pos))?;
-        let read = self.file.read(&mut buf[..count])?;
-        self.pos = self.pos.saturating_add(read as u64);
+        let count = (self.len - self.pos).min(out.len() as u64) as usize;
+        self.file.seek(SeekFrom::Start(self.offset + self.pos))?;
+        let read = self.file.read(&mut out[..count])?;
+        self.pos += read as u64;
         Ok(read)
     }
 }
@@ -122,282 +128,205 @@ impl Seek for Iso9660File {
         if next < 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "negative seek in ISO9660 file"));
         }
-        self.pos = (next as u64).min(self.len);
+        self.pos = next as u64;
         Ok(self.pos)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Iso9660DirRecord {
-    extent_lba: u32,
-    data_len: u32,
-    file_flags: u8,
-}
-
-impl Iso9660DirRecord {
-    fn is_directory(self) -> bool {
-        self.file_flags & 0x02 != 0
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Iso9660Root {
-    record: Iso9660DirRecord,
-    joliet: bool,
-}
-
-struct Iso9660Reader {
-    path: PathBuf,
-    file: File,
-}
-
-impl Iso9660Reader {
-    fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(|source| DvdaError::io(path.display().to_string(), source))?;
-        Ok(Self { path: path.to_path_buf(), file })
-    }
-
-    fn index_audio_ts_files(&mut self) -> Result<BTreeMap<String, Iso9660IndexedFile>> {
-        for root in self.roots()? {
-            if let Some(audio_ts) = self.find_child(root.record, root.joliet, "AUDIO_TS", true)? {
-                let files = self.index_directory(audio_ts, root.joliet)?;
-                if !files.is_empty() {
-                    return Ok(files);
-                }
-            }
+fn read_primary_volume_descriptor(file: &mut File, path: &Path) -> Result<Iso9660Entry> {
+    let mut sector = [0_u8; ISO_SECTOR_SIZE_USIZE];
+    for index in 0..MAX_VOLUME_DESCRIPTORS {
+        let sector_nr = VOLUME_DESCRIPTOR_START_SECTOR + index;
+        file.seek(SeekFrom::Start(sector_nr * ISO_SECTOR_SIZE))
+            .map_err(|source| DvdaError::io(path.display().to_string(), source))?;
+        let read = file.read(&mut sector).map_err(|source| DvdaError::io(path.display().to_string(), source))?;
+        if read == 0 {
+            break;
         }
-        Err(DvdaError::MissingFile {
-            candidates: vec![format!("{}:AUDIO_TS/AUDIO_TS.IFO", self.path.display())],
-        })
-    }
-
-    fn roots(&mut self) -> Result<Vec<Iso9660Root>> {
-        let mut roots = Vec::new();
-        let mut sector = FIRST_VOLUME_DESCRIPTOR_SECTOR;
-        for _ in 0..MAX_VOLUME_DESCRIPTORS {
-            let bytes = match self.read_sector(sector) {
-                Ok(bytes) => bytes,
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(DvdaError::io(self.path.display().to_string(), err)),
-            };
-            if &bytes[1..6] != b"CD001" || bytes[6] != 1 {
-                break;
-            }
-            match bytes[0] {
-                1 => {
-                    if let Some((record, _)) = parse_directory_record(&bytes[156..], false) {
-                        roots.push(Iso9660Root { record, joliet: false });
-                    }
-                }
-                2 => {
-                    if let Some((record, _)) = parse_directory_record(&bytes[156..], true) {
-                        roots.push(Iso9660Root { record, joliet: true });
-                    }
-                }
-                255 => break,
-                _ => {}
-            }
-            sector = sector.saturating_add(1);
-        }
-        Ok(roots)
-    }
-
-    fn find_child(
-        &mut self,
-        directory: Iso9660DirRecord,
-        joliet: bool,
-        wanted_name: &str,
-        wanted_directory: bool,
-    ) -> Result<Option<Iso9660DirRecord>> {
-        if !directory.is_directory() {
-            return Ok(None);
-        }
-        let bytes = self.read_record_bytes(directory)?;
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            let record_len = bytes[offset] as usize;
-            if record_len == 0 {
-                let next_sector = ((offset / DVD_SECTOR_SIZE_USIZE) + 1) * DVD_SECTOR_SIZE_USIZE;
-                if next_sector <= offset {
-                    return Ok(None);
-                }
-                offset = next_sector;
-                continue;
-            }
-            if offset + record_len > bytes.len() {
-                return Ok(None);
-            }
-            let Some((record, name)) = parse_directory_record(&bytes[offset..offset + record_len], joliet) else {
-                return Ok(None);
-            };
-            if iso9660_name_matches(&name, wanted_name) && record.is_directory() == wanted_directory {
-                return Ok(Some(record));
-            }
-            offset += record_len;
-        }
-        Ok(None)
-    }
-
-    fn index_directory(&mut self, directory: Iso9660DirRecord, joliet: bool) -> Result<BTreeMap<String, Iso9660IndexedFile>> {
-        if !directory.is_directory() {
-            return Ok(BTreeMap::new());
-        }
-        let bytes = self.read_record_bytes(directory)?;
-        let mut files = BTreeMap::new();
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            let record_len = bytes[offset] as usize;
-            if record_len == 0 {
-                let next_sector = ((offset / DVD_SECTOR_SIZE_USIZE) + 1) * DVD_SECTOR_SIZE_USIZE;
-                if next_sector <= offset {
-                    break;
-                }
-                offset = next_sector;
-                continue;
-            }
-            if offset + record_len > bytes.len() {
-                break;
-            }
-            if let Some((record, name)) = parse_directory_record(&bytes[offset..offset + record_len], joliet) {
-                if !record.is_directory() && name != "." && name != ".." {
-                    let normalized = normalize_iso9660_file_name(&name);
-                    if !normalized.is_empty() {
-                        files.insert(
-                            normalized.clone(),
-                            Iso9660IndexedFile {
-                                name: normalized,
-                                extent_lba: record.extent_lba,
-                                len: u64::from(record.data_len),
-                            },
-                        );
-                    }
-                }
-            }
-            offset += record_len;
-        }
-        Ok(files)
-    }
-
-    fn read_record_bytes(&mut self, record: Iso9660DirRecord) -> Result<Vec<u8>> {
-        let len = u64::from(record.data_len);
-        if len > MAX_DIRECTORY_BYTES {
-            return Err(DvdaError::Iso {
-                message: format!("ISO9660 directory is too large: {len} bytes"),
+        if read < ISO_SECTOR_SIZE_USIZE {
+            return Err(DvdaError::ShortRead {
+                context: format!("ISO9660 volume descriptor sector {sector_nr}"),
+                needed: ISO_SECTOR_SIZE_USIZE,
+                available: read,
             });
         }
-        let mut bytes = vec![0_u8; len as usize];
-        self.file
-            .seek(SeekFrom::Start(u64::from(record.extent_lba) * DVD_SECTOR_SIZE))
-            .map_err(|source| DvdaError::io(self.path.display().to_string(), source))?;
-        self.file
-            .read_exact(&mut bytes)
-            .map_err(|source| DvdaError::io(self.path.display().to_string(), source))?;
-        Ok(bytes)
-    }
-
-    fn read_sector(&mut self, sector: u64) -> io::Result<[u8; DVD_SECTOR_SIZE_USIZE]> {
-        let mut bytes = [0_u8; DVD_SECTOR_SIZE_USIZE];
-        self.file.seek(SeekFrom::Start(sector * DVD_SECTOR_SIZE))?;
-        self.file.read_exact(&mut bytes)?;
-        Ok(bytes)
-    }
-}
-
-fn parse_directory_record(bytes: &[u8], joliet: bool) -> Option<(Iso9660DirRecord, String)> {
-    let record_len = *bytes.first()? as usize;
-    if record_len == 0 || record_len > bytes.len() || record_len < 34 {
-        return None;
-    }
-    let name_len = *bytes.get(32)? as usize;
-    let name_start = 33usize;
-    let name_end = name_start.checked_add(name_len)?;
-    if name_end > record_len {
-        return None;
-    }
-    let extent_lba = u32::from_le_bytes(bytes.get(2..6)?.try_into().ok()?);
-    let data_len = u32::from_le_bytes(bytes.get(10..14)?.try_into().ok()?);
-    let file_flags = *bytes.get(25)?;
-    let raw_name = &bytes[name_start..name_end];
-    let name = decode_iso9660_name(raw_name, joliet);
-    Some((Iso9660DirRecord { extent_lba, data_len, file_flags }, name))
-}
-
-fn decode_iso9660_name(raw_name: &[u8], joliet: bool) -> String {
-    if raw_name == [0] {
-        return ".".to_string();
-    }
-    if raw_name == [1] {
-        return "..".to_string();
-    }
-    if joliet && raw_name.len() % 2 == 0 {
-        let mut units = Vec::with_capacity(raw_name.len() / 2);
-        for chunk in raw_name.chunks_exact(2) {
-            units.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+        if &sector[1..6] != ISO9660_MAGIC || sector[6] != 1 {
+            continue;
         }
-        String::from_utf16_lossy(&units)
+        match sector[0] {
+            PRIMARY_VOLUME_DESCRIPTOR => {
+                let record = parse_directory_record(
+                    &sector[ROOT_DIRECTORY_RECORD_OFFSET..],
+                    "ISO9660 primary volume descriptor root directory",
+                )?;
+                if !record.is_dir {
+                    return Err(DvdaError::parse("ISO9660 primary volume descriptor", "root record is not a directory"));
+                }
+                return Ok(record);
+            }
+            VOLUME_DESCRIPTOR_SET_TERMINATOR => break,
+            _ => {}
+        }
+    }
+
+    Err(DvdaError::MissingFile {
+        candidates: vec![format!("{}:ISO9660 primary volume descriptor", path.display())],
+    })
+}
+
+fn index_audio_ts_files(file: &mut File, path: &Path, root: Iso9660Entry) -> Result<BTreeMap<String, Iso9660Entry>> {
+    let root_entries = read_directory(file, path, &root, "ISO9660 root directory")?;
+    let audio_ts = root_entries
+        .into_iter()
+        .find(|entry| entry.is_dir && canonical_iso_name(&entry.name).eq_ignore_ascii_case("AUDIO_TS"))
+        .ok_or_else(|| DvdaError::MissingFile {
+            candidates: vec![format!("{}:AUDIO_TS", path.display())],
+        })?;
+
+    let mut files = BTreeMap::new();
+    for mut entry in read_directory(file, path, &audio_ts, "ISO9660 AUDIO_TS directory")? {
+        if entry.is_dir {
+            continue;
+        }
+        let key = canonical_iso_name(&entry.name);
+        if key.is_empty() {
+            continue;
+        }
+        entry.name = key.clone();
+        files.entry(key).or_insert(entry);
+    }
+    Ok(files)
+}
+
+fn read_directory(file: &mut File, path: &Path, dir: &Iso9660Entry, context: &str) -> Result<Vec<Iso9660Entry>> {
+    if dir.len > MAX_DIRECTORY_BYTES {
+        return Err(DvdaError::parse(
+            context,
+            format!("directory is too large to index safely: {} bytes", dir.len),
+        ));
+    }
+    let mut data = vec![0_u8; dir.len as usize];
+    file.seek(SeekFrom::Start(dir.offset()))
+        .map_err(|source| DvdaError::io(path.display().to_string(), source))?;
+    file.read_exact(&mut data).map_err(|source| DvdaError::io(path.display().to_string(), source))?;
+
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let record_len = data[offset] as usize;
+        if record_len == 0 {
+            let next_sector = ((offset / ISO_SECTOR_SIZE_USIZE) + 1) * ISO_SECTOR_SIZE_USIZE;
+            if next_sector <= offset {
+                break;
+            }
+            offset = next_sector;
+            continue;
+        }
+        if offset + record_len > data.len() {
+            return Err(DvdaError::ShortRead {
+                context: format!("{context} directory record"),
+                needed: offset + record_len,
+                available: data.len(),
+            });
+        }
+        let record = parse_directory_record(&data[offset..offset + record_len], context)?;
+        if record.name != "\0" && record.name != "\x01" {
+            entries.push(record);
+        }
+        offset += record_len;
+    }
+    Ok(entries)
+}
+
+fn parse_directory_record(bytes: &[u8], context: &str) -> Result<Iso9660Entry> {
+    if bytes.len() < 34 {
+        return Err(DvdaError::ShortRead {
+            context: context.to_string(),
+            needed: 34,
+            available: bytes.len(),
+        });
+    }
+    let record_len = bytes[0] as usize;
+    if record_len != 0 && record_len > bytes.len() {
+        return Err(DvdaError::ShortRead {
+            context: context.to_string(),
+            needed: record_len,
+            available: bytes.len(),
+        });
+    }
+    let name_len = bytes[32] as usize;
+    let name_end = 33usize.checked_add(name_len).ok_or_else(|| DvdaError::parse(context, "directory-record name length overflow"))?;
+    if name_end > bytes.len() {
+        return Err(DvdaError::ShortRead {
+            context: format!("{context} directory-record name"),
+            needed: name_end,
+            available: bytes.len(),
+        });
+    }
+
+    let extent_lba = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+    let len = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as u64;
+    let is_dir = bytes[25] & 0x02 != 0;
+    let name_bytes = &bytes[33..name_end];
+    let name = if name_bytes == [0] {
+        "\0".to_string()
+    } else if name_bytes == [1] {
+        "\x01".to_string()
     } else {
-        String::from_utf8_lossy(raw_name).to_string()
-    }
+        String::from_utf8_lossy(name_bytes).into_owned()
+    };
+
+    Ok(Iso9660Entry {
+        name,
+        extent_lba,
+        len,
+        is_dir,
+    })
 }
 
-fn iso9660_name_matches(actual: &str, wanted: &str) -> bool {
-    normalize_iso9660_file_name(actual) == wanted.to_ascii_uppercase()
-}
-
-fn normalize_iso9660_file_name(name: &str) -> String {
-    let mut actual = name.to_ascii_uppercase();
-    if let Some((prefix, _version)) = actual.split_once(';') {
-        actual = prefix.to_string();
-    }
-    while actual.ends_with('.') {
-        actual.pop();
-    }
-    actual
+fn canonical_iso_name(name: &str) -> String {
+    let without_version = name.split_once(';').map(|(stem, _)| stem).unwrap_or(name);
+    without_version.trim_end_matches('.').to_ascii_uppercase()
 }
 
 fn sanitize_audio_ts_name(name: &str) -> Result<String> {
-    let raw = name.replace('\\', "/");
-    if raw.contains("..") {
-        return Err(DvdaError::Iso { message: format!("invalid ISO9660 AUDIO_TS path: {name}") });
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name == "."
+        || name == ".."
+    {
+        return Err(DvdaError::parse("AUDIO_TS filename", format!("invalid filename {name:?}")));
     }
-    let Some(file_name) = raw.rsplit('/').next().filter(|part| !part.is_empty()) else {
-        return Err(DvdaError::Iso { message: format!("invalid ISO9660 AUDIO_TS path: {name}") });
-    };
-    Ok(normalize_iso9660_file_name(file_name))
+    Ok(canonical_iso_name(name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
-    use std::path::PathBuf;
 
     const DVDA_AMG_MAGIC: &[u8] = b"DVDAUDIO-AMG";
 
     #[test]
-    fn opens_audio_ts_ifo_through_iso9660_bridge() {
-        let path = temp_test_path("dvda_iso9660_volume.iso");
+    fn reads_audio_ts_file_from_minimal_iso9660_image() {
+        let path = temp_test_path("iso9660_volume_reads_audio_ts.iso");
         std::fs::write(&path, minimal_iso9660_dvda_image(true)).expect("write ISO fixture");
 
-        let volume = Iso9660DvdaVolume::open(&path).expect("ISO9660 DVD-Audio volume");
-        let mut ifo = volume.open_audio_ts_file("AUDIO_TS.IFO").expect("AUDIO_TS.IFO");
-        let mut magic = vec![0_u8; DVDA_AMG_MAGIC.len()];
-        ifo.read_exact(&mut magic).expect("read magic");
-        assert_eq!(magic, DVDA_AMG_MAGIC);
-        assert_eq!(volume.file_len("AUDIO_TS.IFO").expect("len"), Some(DVDA_AMG_MAGIC.len() as u64));
+        let volume = Iso9660DvdaVolume::open(&path).expect("open ISO9660 bridge");
+        assert_eq!(volume.file_len("AUDIO_TS.IFO").expect("file len"), Some(DVDA_AMG_MAGIC.len() as u64));
+        assert_eq!(volume.read_audio_ts_file("AUDIO_TS.IFO").expect("read IFO"), DVDA_AMG_MAGIC);
+        assert_eq!(volume.read_audio_ts_file("audio_ts.ifo").expect("case-insensitive read"), DVDA_AMG_MAGIC);
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn rejects_stray_magic_without_audio_ts_path() {
-        let path = temp_test_path("dvda_iso9660_volume_stray.iso");
-        let mut bytes = vec![0_u8; DVD_SECTOR_SIZE_USIZE * 24];
-        bytes[DVD_SECTOR_SIZE_USIZE * 20..DVD_SECTOR_SIZE_USIZE * 20 + DVDA_AMG_MAGIC.len()]
-            .copy_from_slice(DVDA_AMG_MAGIC);
-        std::fs::write(&path, bytes).expect("write ISO fixture");
+    fn rejects_iso9660_image_without_audio_ts_path() {
+        let path = temp_test_path("iso9660_volume_rejects_missing_audio_ts.iso");
+        std::fs::write(&path, minimal_iso9660_dvda_image(false)).expect("write ISO fixture");
 
-        assert!(Iso9660DvdaVolume::open(&path).is_err());
+        assert!(matches!(Iso9660DvdaVolume::open(&path), Err(DvdaError::MissingFile { .. })));
 
         let _ = std::fs::remove_file(path);
     }
@@ -411,37 +340,37 @@ mod tests {
     }
 
     fn minimal_iso9660_dvda_image(include_path: bool) -> Vec<u8> {
-        let mut image = vec![0_u8; DVD_SECTOR_SIZE_USIZE * 24];
+        let mut image = vec![0_u8; ISO_SECTOR_SIZE_USIZE * 24];
 
-        let root_record = iso9660_test_record(&[0], 18, DVD_SECTOR_SIZE as u32, 0x02);
-        let pvd = &mut image[DVD_SECTOR_SIZE_USIZE * 16..DVD_SECTOR_SIZE_USIZE * 17];
+        let root_record = iso9660_test_record(&[0], 18, ISO_SECTOR_SIZE as u32, 0x02);
+        let pvd = &mut image[ISO_SECTOR_SIZE_USIZE * 16..ISO_SECTOR_SIZE_USIZE * 17];
         pvd[0] = 1;
         pvd[1..6].copy_from_slice(b"CD001");
         pvd[6] = 1;
         pvd[156..156 + root_record.len()].copy_from_slice(&root_record);
 
-        let vdst = &mut image[DVD_SECTOR_SIZE_USIZE * 17..DVD_SECTOR_SIZE_USIZE * 18];
+        let vdst = &mut image[ISO_SECTOR_SIZE_USIZE * 17..ISO_SECTOR_SIZE_USIZE * 18];
         vdst[0] = 255;
         vdst[1..6].copy_from_slice(b"CD001");
         vdst[6] = 1;
 
         if include_path {
-            let root_dir = &mut image[DVD_SECTOR_SIZE_USIZE * 18..DVD_SECTOR_SIZE_USIZE * 19];
+            let root_dir = &mut image[ISO_SECTOR_SIZE_USIZE * 18..ISO_SECTOR_SIZE_USIZE * 19];
             let mut offset = 0usize;
             for record in [
-                iso9660_test_record(&[0], 18, DVD_SECTOR_SIZE as u32, 0x02),
-                iso9660_test_record(&[1], 18, DVD_SECTOR_SIZE as u32, 0x02),
-                iso9660_test_record(b"AUDIO_TS", 19, DVD_SECTOR_SIZE as u32, 0x02),
+                iso9660_test_record(&[0], 18, ISO_SECTOR_SIZE as u32, 0x02),
+                iso9660_test_record(&[1], 18, ISO_SECTOR_SIZE as u32, 0x02),
+                iso9660_test_record(b"AUDIO_TS", 19, ISO_SECTOR_SIZE as u32, 0x02),
             ] {
                 root_dir[offset..offset + record.len()].copy_from_slice(&record);
                 offset += record.len();
             }
 
-            let audio_dir = &mut image[DVD_SECTOR_SIZE_USIZE * 19..DVD_SECTOR_SIZE_USIZE * 20];
+            let audio_dir = &mut image[ISO_SECTOR_SIZE_USIZE * 19..ISO_SECTOR_SIZE_USIZE * 20];
             let mut offset = 0usize;
             for record in [
-                iso9660_test_record(&[0], 19, DVD_SECTOR_SIZE as u32, 0x02),
-                iso9660_test_record(&[1], 18, DVD_SECTOR_SIZE as u32, 0x02),
+                iso9660_test_record(&[0], 19, ISO_SECTOR_SIZE as u32, 0x02),
+                iso9660_test_record(&[1], 18, ISO_SECTOR_SIZE as u32, 0x02),
                 iso9660_test_record(b"AUDIO_TS.IFO;1", 20, DVDA_AMG_MAGIC.len() as u32, 0x00),
             ] {
                 audio_dir[offset..offset + record.len()].copy_from_slice(&record);
@@ -449,8 +378,8 @@ mod tests {
             }
         }
 
-        image[DVD_SECTOR_SIZE_USIZE * 20..DVD_SECTOR_SIZE_USIZE * 20 + DVDA_AMG_MAGIC.len()]
-            .copy_from_slice(DVDA_AMG_MAGIC);
+        let ifo = &mut image[ISO_SECTOR_SIZE_USIZE * 20..ISO_SECTOR_SIZE_USIZE * 20 + DVDA_AMG_MAGIC.len()];
+        ifo.copy_from_slice(DVDA_AMG_MAGIC);
         image
     }
 
