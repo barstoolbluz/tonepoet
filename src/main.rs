@@ -599,6 +599,8 @@ async fn run_convert(
         }
 
         // Attach pipeline request template to each item if pipeline flags were set.
+        // Otherwise, ensure each item has PipelineSettings from legacy options
+        // so the scheduler's validate_full_settings_handoff() passes.
         if let Some(ref template) = pipeline_request_template {
             for item in q.all_items_mut() {
                 let mut req = template.clone();
@@ -612,6 +614,13 @@ async fn run_convert(
                         Some(tonepoet::convert::pipeline::SecretString::new(pw.clone()));
                 }
                 item.pipeline_request = Some(req);
+            }
+        } else {
+            // No pipeline-specific flags — attach PipelineSettings from legacy
+            // ConversionOptions so the processor can build a PipelineRequest.
+            let settings = tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options);
+            for item in q.all_items_mut() {
+                item.options.pipeline_settings = Some(settings.clone());
             }
         }
 
