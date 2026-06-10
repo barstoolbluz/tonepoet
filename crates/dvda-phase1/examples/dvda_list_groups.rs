@@ -2,7 +2,7 @@
 
 use std::env;
 
-use dvda_phase1_bundle::tui::dvda::{parse_dvda_volume, DirectoryDvdaVolume};
+use dvda_phase1::tui::dvda::{parse_dvda_volume, DirectoryDvdaVolume};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = env::args().nth(1).ok_or("usage: dvda_list_groups <dvd-audio-root-or-AUDIO_TS>")?;

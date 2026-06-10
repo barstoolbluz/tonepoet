@@ -4,11 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dvda_phase1_bundle::tui::dvda::ifo::amg::{parse_amg, parse_aott_srpt};
-use dvda_phase1_bundle::tui::dvda::ifo::atsi::parse_atsi;
-use dvda_phase1_bundle::tui::dvda::ifo::samg::parse_samg;
-use dvda_phase1_bundle::tui::dvda::sector::{build_aob_inventory, AobSectorReader};
-use dvda_phase1_bundle::tui::dvda::{
+use dvda_phase1::tui::dvda::ifo::amg::{parse_amg, parse_aott_srpt};
+use dvda_phase1::tui::dvda::ifo::atsi::parse_atsi;
+use dvda_phase1::tui::dvda::ifo::samg::parse_samg;
+use dvda_phase1::tui::dvda::sector::{build_aob_inventory, AobSectorReader};
+use dvda_phase1::tui::dvda::{
     bit_depth_from_code, channel_assignment, parse_channel_format, parse_dvda_volume,
     sample_rate_from_code, DirectoryDvdaVolume, DvdaError, DvdaVolume, SamgZone, DVD_BLOCK_SIZE,
 };
@@ -112,8 +112,8 @@ fn parse_atsi_extracts_audio_formats_titles_tracks_and_sector_assignment() {
     let title = &title_set.titles[0];
     assert_eq!(title.title_set_nr, 1);
     assert_eq!(title.title_nr, 129);
-    assert_eq!(title.audio_format_index, Some(0));
-    assert_eq!(title.audio_format_indices, vec![0]);
+    assert_eq!(title.uniform_track_type_low_bits_candidate, Some(0));
+    assert_eq!(title.track_type_low_bits_candidates, vec![0]);
     assert_eq!(title.track_count_declared, 2);
     assert_eq!(title.index_count_declared, 3);
     assert_eq!(title.len_in_pts, 270_000);
@@ -122,7 +122,7 @@ fn parse_atsi_extracts_audio_formats_titles_tracks_and_sector_assignment() {
     let track1 = &title.chapters[0];
     assert_eq!(track1.track_nr, 1);
     assert_eq!(track1.track_type, 0);
-    assert_eq!(track1.audio_format_index, Some(0));
+    assert_eq!(track1.track_type_low_bits_candidate, 0);
     assert_eq!(track1.downmix_matrix, Some(1));
     assert_eq!(track1.index_start, 1);
     assert_eq!(track1.first_pts, 0);
@@ -134,7 +134,7 @@ fn parse_atsi_extracts_audio_formats_titles_tracks_and_sector_assignment() {
     let track2 = &title.chapters[1];
     assert_eq!(track2.track_nr, 2);
     assert_eq!(track2.track_type, 0);
-    assert_eq!(track2.audio_format_index, Some(0));
+    assert_eq!(track2.track_type_low_bits_candidate, 0);
     assert_eq!(track2.downmix_matrix, Some(2));
     assert_eq!(track2.index_start, 3);
     assert_eq!(track2.first_pts, 180_000);
@@ -161,22 +161,22 @@ fn parse_atsi_exposes_per_title_and_per_chapter_audio_format_indices() {
     assert_eq!(title_set.titles.len(), 2);
     let multichannel = &title_set.titles[0];
     assert_eq!(multichannel.title_nr, 129);
-    assert_eq!(multichannel.audio_format_index, Some(0));
-    assert_eq!(multichannel.audio_format_indices, vec![0]);
+    assert_eq!(multichannel.uniform_track_type_low_bits_candidate, Some(0));
+    assert_eq!(multichannel.track_type_low_bits_candidates, vec![0]);
     assert_eq!(multichannel.chapters[0].track_type, 0);
-    assert_eq!(multichannel.chapters[0].audio_format_index, Some(0));
+    assert_eq!(multichannel.chapters[0].track_type_low_bits_candidate, 0);
 
     let stereo = &title_set.titles[1];
     assert_eq!(stereo.title_nr, 130);
-    assert_eq!(stereo.audio_format_index, Some(2));
-    assert_eq!(stereo.audio_format_indices, vec![2]);
+    assert_eq!(stereo.uniform_track_type_low_bits_candidate, Some(2));
+    assert_eq!(stereo.track_type_low_bits_candidates, vec![2]);
     assert_eq!(stereo.chapters[0].track_type, 2);
-    assert_eq!(stereo.chapters[0].audio_format_index, Some(2));
+    assert_eq!(stereo.chapters[0].track_type_low_bits_candidate, 2);
 
     let active_indices: Vec<u8> = title_set
         .titles
         .iter()
-        .flat_map(|title| title.audio_format_indices.iter().copied())
+        .flat_map(|title| title.track_type_low_bits_candidates.iter().copied())
         .collect();
     assert_eq!(active_indices, vec![0, 2]);
 }
@@ -620,12 +620,12 @@ trait TitleSetKindForTest {
     fn to_string_for_test(&self) -> &'static str;
 }
 
-impl TitleSetKindForTest for dvda_phase1_bundle::tui::dvda::TitleSetKind {
+impl TitleSetKindForTest for dvda_phase1::tui::dvda::TitleSetKind {
     fn to_string_for_test(&self) -> &'static str {
         match self {
-            dvda_phase1_bundle::tui::dvda::TitleSetKind::Audio => "audio",
-            dvda_phase1_bundle::tui::dvda::TitleSetKind::Video => "video",
-            dvda_phase1_bundle::tui::dvda::TitleSetKind::Unknown => "unknown",
+            dvda_phase1::tui::dvda::TitleSetKind::Audio => "audio",
+            dvda_phase1::tui::dvda::TitleSetKind::Video => "video",
+            dvda_phase1::tui::dvda::TitleSetKind::Unknown => "unknown",
         }
     }
 }

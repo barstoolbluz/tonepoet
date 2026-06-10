@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use dvda_phase1_bundle::tui::dvda::{parse_dvda_volume, DirectoryDvdaVolume};
+use dvda_phase1::tui::dvda::{parse_dvda_volume, DirectoryDvdaVolume};
 
 #[derive(Clone, Debug)]
 struct FixtureExpectation {
@@ -132,7 +132,7 @@ fn parses_phase0_fixture_directories() {
 
         for ts in &disc.title_sets {
             // Skip video title sets — they don't have audio format entries
-            if ts.kind != dvda_phase1_bundle::tui::dvda::model::TitleSetKind::Audio {
+            if ts.kind != dvda_phase1::tui::dvda::model::TitleSetKind::Audio {
                 continue;
             }
             assert_eq!(
@@ -154,7 +154,7 @@ fn parses_phase0_fixture_directories() {
             for title in &ts.titles {
                 assert!(!title.chapters.is_empty(), "{} ATS {} title {} has no chapters/tracks", fixture.name, ts.number, title.title_nr);
                 assert!(
-                    !title.audio_format_indices.is_empty(),
+                    !title.track_type_low_bits_candidates.is_empty(),
                     "{} ATS {} title {} did not expose an active audio-format index",
                     fixture.name,
                     ts.number,
@@ -162,15 +162,6 @@ fn parses_phase0_fixture_directories() {
                 );
                 for chapter in &title.chapters {
                     assert!(!chapter.sector_ranges.is_empty(), "{} ATS {} title {} track {} has no sector ranges", fixture.name, ts.number, title.title_nr, chapter.track_nr);
-                    assert!(
-                        chapter.audio_format_index.is_some(),
-                        "{} ATS {} title {} track {} did not expose active audio-format index from track_type 0x{:02x}",
-                        fixture.name,
-                        ts.number,
-                        title.title_nr,
-                        chapter.track_nr,
-                        chapter.track_type
-                    );
                 }
             }
         }
@@ -187,7 +178,7 @@ fn parses_phase0_fixture_directories() {
     }
 }
 
-fn assert_samg_repeated_copies_are_valid(fixture_name: &str, disc: &dvda_phase1_bundle::tui::dvda::DvdaDisc) {
+fn assert_samg_repeated_copies_are_valid(fixture_name: &str, disc: &dvda_phase1::tui::dvda::DvdaDisc) {
     let samg = disc
         .samg
         .as_ref()
@@ -205,7 +196,7 @@ fn assert_samg_repeated_copies_are_valid(fixture_name: &str, disc: &dvda_phase1_
     );
 }
 
-fn assert_aott_entries_resolve(fixture_name: &str, disc: &dvda_phase1_bundle::tui::dvda::DvdaDisc) {
+fn assert_aott_entries_resolve(fixture_name: &str, disc: &dvda_phase1::tui::dvda::DvdaDisc) {
     let mut refs = BTreeSet::new();
     for entry in &disc.amg.audio_title_table {
         if !entry.playback_type.is_audio {
@@ -237,7 +228,7 @@ fn assert_aott_entries_resolve(fixture_name: &str, disc: &dvda_phase1_bundle::tu
     }
 }
 
-fn assert_mgletsgetiton_multi_format_ats(disc: &dvda_phase1_bundle::tui::dvda::DvdaDisc) {
+fn assert_mgletsgetiton_multi_format_ats(disc: &dvda_phase1::tui::dvda::DvdaDisc) {
     let ats1 = disc
         .title_sets
         .iter()
@@ -246,7 +237,7 @@ fn assert_mgletsgetiton_multi_format_ats(disc: &dvda_phase1_bundle::tui::dvda::D
 
     let mut active_indices = BTreeSet::new();
     for title in &ats1.titles {
-        for index in &title.audio_format_indices {
+        for index in &title.track_type_low_bits_candidates {
             active_indices.insert(*index);
         }
     }
