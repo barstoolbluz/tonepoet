@@ -286,6 +286,14 @@ impl ConversionProcessor {
             }
         }
 
+        // Move finished items from the active queue to the completed list so
+        // completed_items() / failed_items() report correctly. The shared
+        // scheduler sets status via find_item_mut but doesn't call next_item.
+        {
+            let mut q = queue.write().await;
+            q.settle_finished();
+        }
+
         Ok(())
     }
 }
