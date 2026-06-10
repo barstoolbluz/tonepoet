@@ -877,11 +877,7 @@ async fn validate_encoded_output_with_tool_limits(
         return Ok(None);
     };
 
-    if matches!(
-        target_format,
-        tonepoet_pipeline::AudioFormat::Dsf | tonepoet_pipeline::AudioFormat::Dff
-    ) || !target_format.is_pcm_lossless()
-    {
+    if !requires_lossless_post_encode_sample_validation(target_format) {
         return Ok(Some(expected));
     }
 
@@ -917,6 +913,13 @@ async fn validate_encoded_output_with_tool_limits(
     }
 
     Ok(Some(actual))
+}
+
+fn requires_lossless_post_encode_sample_validation(target_format: &tonepoet_pipeline::AudioFormat) -> bool {
+    !matches!(
+        target_format,
+        tonepoet_pipeline::AudioFormat::Dsf | tonepoet_pipeline::AudioFormat::Dff
+    ) && target_format.is_pcm_lossless()
 }
 
 fn encoded_output_sample_tolerance(probe: &RealizedProbe) -> u64 {
@@ -1990,9 +1993,33 @@ async fn convert_one_track_work(
                 );
                 Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
             } else {
+                let post_encode_expected_samples = match post_encode_expected_samples_for_track(
+                    &track,
+                    &realized_input,
+                    &req.settings.target_format,
+                    &runner,
+                    &cancel,
+                    tool_concurrency_limits.as_ref(),
+                )
+                .await
+                {
+                    Ok(samples) => samples,
+                    Err(err) => {
+                        let commands = command_from_convert_error(&err);
+                        let record = failed_track_record(
+                            &track,
+                            Some(realized_input),
+                            Some(staged_path),
+                            commands,
+                            err.to_string(),
+                        );
+                        return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
+                    }
+                };
+
                 let actual_samples = match validate_encoded_output_with_tool_limits(
                     &staged_path,
-                    track.expected_samples,
+                    post_encode_expected_samples,
                     &req.settings.target_format,
                     &runner,
                     &cancel,
@@ -2038,7 +2065,7 @@ async fn convert_one_track_work(
                     track_id: track.id.clone(),
                     staged_path,
                     final_path,
-                    samples: actual_samples.or(track.expected_samples),
+                    samples: actual_samples.or(post_encode_expected_samples).or(track.expected_samples),
                     metadata_satisfaction: executed.metadata_satisfaction,
                     metadata_required: executed.metadata_required,
                 };
@@ -2058,6 +2085,72 @@ async fn convert_one_track_work(
             Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
         }
     }
+}
+
+async fn post_encode_expected_samples_for_track(
+    track: &PreparedTrack,
+    realized_input: &Path,
+    target_format: &tonepoet_pipeline::AudioFormat,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<Option<u64>, ConvertError> {
+    if !requires_lossless_post_encode_sample_validation(target_format) {
+        return Ok(track.expected_samples);
+    }
+
+    if !matches!(track.source_ref, TrackSourceRef::DvdaTrack { .. }) {
+        return Ok(track.expected_samples);
+    }
+
+    let probe = probe_realized_segment_with_tool_limits(
+        realized_input,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    .map_err(|err| {
+        ConvertError::TrackValidation(format!(
+            "DVD-Audio post-encode sample reference probe failed for realized WAV {}: {err}",
+            realized_input.display()
+        ))
+    })?;
+
+    let actual_samples = probe.samples.ok_or_else(|| {
+        ConvertError::TrackValidation(format!(
+            "DVD-Audio post-encode sample reference probe returned no sample count for realized WAV {}",
+            realized_input.display()
+        ))
+    })?;
+
+    match track.expected_samples {
+        Some(pts_samples) if pts_samples != actual_samples => {
+            log::warn!(
+                "DVD-Audio post-encode validation will use realized WAV samples as reference: track={}, PTS-derived_samples={}, realized_samples={}, drift_samples={}",
+                track.id.source_ordinal,
+                pts_samples,
+                actual_samples,
+                pts_samples.abs_diff(actual_samples)
+            );
+        }
+        Some(pts_samples) => {
+            log::info!(
+                "DVD-Audio post-encode validation will use realized WAV samples as reference: track={}, PTS-derived_samples={}, realized_samples=0 drift",
+                track.id.source_ordinal,
+                pts_samples
+            );
+        }
+        None => {
+            log::info!(
+                "DVD-Audio post-encode validation will use realized WAV samples as reference: track={}, realized_samples={}",
+                track.id.source_ordinal,
+                actual_samples
+            );
+        }
+    }
+
+    Ok(Some(actual_samples))
 }
 
 #[allow(dead_code)]
@@ -7729,9 +7822,33 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
                 );
                 Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
             } else {
+                let post_encode_expected_samples = match post_encode_expected_samples_for_track(
+                    &realized.track,
+                    &realized.realized_path,
+                    &realized.req.settings.target_format,
+                    &runner,
+                    &realized.cancel,
+                    tool_concurrency_limits.as_ref(),
+                )
+                .await
+                {
+                    Ok(samples) => samples,
+                    Err(err) => {
+                        let commands = command_from_convert_error(&err);
+                        let record = failed_track_record(
+                            &realized.track,
+                            Some(realized.realized_path),
+                            Some(staged_path),
+                            commands,
+                            err.to_string(),
+                        );
+                        return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
+                    }
+                };
+
                 let actual_samples = match validate_encoded_output_with_tool_limits(
                     &staged_path,
-                    realized.track.expected_samples,
+                    post_encode_expected_samples,
                     &realized.req.settings.target_format,
                     &runner,
                     &realized.cancel,
@@ -7776,7 +7893,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
                     track_id: realized.track.id.clone(),
                     staged_path,
                     final_path: realized.final_path,
-                    samples: actual_samples.or(realized.track.expected_samples),
+                    samples: actual_samples.or(post_encode_expected_samples).or(realized.track.expected_samples),
                     metadata_satisfaction: executed.metadata_satisfaction,
                     metadata_required: executed.metadata_required,
                     planned_command_hash: executed.command_hash,
@@ -13418,6 +13535,85 @@ mod validate_encoded_output_tests {
             },
         });
         runner
+    }
+
+    fn dvda_validation_test_track(expected_samples: Option<u64>) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: Some(1),
+                track_number: 1,
+            },
+            source_ref: TrackSourceRef::DvdaTrack {
+                volume_source: DvdaVolumeSourceRef::Directory {
+                    root: PathBuf::from("/dvd"),
+                },
+                group_nr: 1,
+                title_set_nr: Some(1),
+                title_nr: Some(1),
+                title_ordinal: Some(1),
+                group_track_ordinal: 1,
+                ats_track_nr: Some(1),
+                samg_track_nr: None,
+                samg_ordinal: None,
+                sector_address_space: DvdaSectorAddressSpace::AtsAobRelative,
+                first_pts: 0,
+                len_in_pts: 59_490_000,
+                track_type: Some(0x01),
+                index_start: None,
+                downmix_matrix: None,
+                title_table_offset: None,
+                title_len_in_pts: None,
+                title_track_count_declared: None,
+                title_index_count_declared: None,
+                audio_format_index: Some(0),
+                expected_sample_rate: Some(192_000),
+                expected_channel_count: Some(2),
+                expected_bit_depth: Some(24),
+                expected_channel_assignment_code: Some(0),
+                expected_group1_sample_rate: Some(192_000),
+                expected_group2_sample_rate: None,
+                expected_group1_bit_depth: Some(24),
+                expected_group2_bit_depth: None,
+                expected_group1_channel_count: Some(2),
+                expected_group2_channel_count: None,
+                sector_ranges: Vec::new(),
+                aob_files: Vec::new(),
+            },
+            metadata: TrackMetadata::default(),
+            expected_samples,
+            sample_rate: Some(192_000),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(192_000),
+                Some(24),
+                Some(SourceAudioCoding::DvdaUnknown),
+            ),
+            bit_depth: Some(24),
+        }
+    }
+
+    #[tokio::test]
+    async fn dvda_post_encode_reference_uses_realized_wav_samples() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let realized = temp.path().join("track.wav");
+        std::fs::write(&realized, b"fake-wav").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(192_000, 126_911_360));
+        let cancel = CancellationToken::new();
+        let track = dvda_validation_test_track(Some(126_912_000));
+
+        let result = post_encode_expected_samples_for_track(
+            &track,
+            &realized,
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("DVD-Audio reference probe should pass");
+
+        assert_eq!(result, Some(126_911_360));
+        assert_eq!(runner.transcript().len(), 1);
     }
 
     #[tokio::test]
