@@ -520,6 +520,28 @@ impl ConversionQueue {
     }
 
     /// Clear all terminal items (Completed, Failed, Partial, Cancelled)
+    /// Move items in terminal states from the active queue to the completed
+    /// list. The shared pipeline scheduler updates item status in-place via
+    /// `find_item_mut` but does not call `next_item`, so finished items stay
+    /// in `self.items`. This method settles them so `completed_items()`,
+    /// `failed_items()`, etc. report correctly.
+    pub fn settle_finished(&mut self) {
+        let mut i = 0;
+        while i < self.items.len() {
+            if self.items[i].is_finished() {
+                let item = self.items.remove(i).unwrap();
+                self.completed.push(item);
+            } else {
+                i += 1;
+            }
+        }
+        if let Some(ref current) = self.current {
+            if current.is_finished() {
+                self.completed.push(self.current.take().unwrap());
+            }
+        }
+    }
+
     pub fn clear_finished(&mut self) {
         let is_terminal = |item: &ConversionItem| {
             matches!(
