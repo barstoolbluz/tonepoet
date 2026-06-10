@@ -4080,6 +4080,7 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                         sacd_area: None,
                         dvda_group: None,
                         dvda_group_selection: DvdaGroupSelection::Default,
+                        dvda_assume_decrypted: false,
                         cue_sidecar: CueSidecarPolicy::PreferSidecar,
                         track_selection: TrackSelection::Set(selected_numbers),
                     },

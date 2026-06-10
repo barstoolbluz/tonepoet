@@ -4301,6 +4301,7 @@ FILE "album.flac" WAVE
                 sacd_area: Some(SacdArea::Stereo),
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
+                dvda_assume_decrypted: false,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -5373,9 +5374,20 @@ fn append_source_blocking_lines(log: &mut String, source: &PreparedSource) {
         return;
     }
 
-    push_kv_line(log, "Copy protection", "CPPM blocked");
+    if cppm {
+        push_kv_line(log, "Copy protection", "CPPM blocked");
+    } else {
+        push_kv_line(
+            log,
+            "Copy protection",
+            "DVDAUDIO.MKB present; AOB probe did not detect encrypted audio data",
+        );
+    }
     if let Some(source) = extra.get("dvda_copy_protection_source") {
         push_kv_line(log, "Copy protection evidence", source);
+    }
+    if let Some(policy) = extra.get("dvda_mkb_aob_probe_policy") {
+        push_kv_line(log, "MKB handling", policy);
     }
     if let Some(policy) = extra.get("dvda_copy_protection_policy") {
         push_kv_line(log, "Copy protection policy", policy);
@@ -10701,6 +10713,7 @@ mod conversion_log_tests {
                 sacd_area: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
+                dvda_assume_decrypted: false,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -11636,6 +11649,7 @@ mod naming_template_tests {
                 sacd_area: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
+                dvda_assume_decrypted: false,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -12163,6 +12177,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 sacd_area: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
+                dvda_assume_decrypted: false,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },

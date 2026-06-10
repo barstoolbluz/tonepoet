@@ -4632,6 +4632,7 @@ mod tests {
                 sacd_area: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
+                dvda_assume_decrypted: false,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection,
             },

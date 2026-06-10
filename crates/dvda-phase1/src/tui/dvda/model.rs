@@ -42,7 +42,14 @@ pub struct CopyProtectionInfo {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyProtectionSource {
+    /// `DVDAUDIO.MKB` is present, but no AOB readability probe has refined the result.
     MkbPresence,
+    /// `DVDAUDIO.MKB` is present and an AOB probe found readable MPEG-PS data.
+    MkbPresentAobProbeReadable,
+    /// `DVDAUDIO.MKB` is present and an AOB probe did not find readable MPEG-PS data.
+    AobProbeNoMpegPs,
+    /// User or caller explicitly declared the AOB data already decrypted.
+    AssumeDecryptedOverride,
     NotDetected,
 }
 

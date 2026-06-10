@@ -89,6 +89,11 @@ pub struct SourceOptions {
     /// carried only one group number. New code should set `dvda_group_selection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dvda_group: Option<u8>,
+    /// Treat a DVD-Audio source with `DVDAUDIO.MKB` metadata as already decrypted.
+    /// This is an explicit caller override for edge cases where the first-AOB
+    /// probe cannot classify the payload but the user knows the AOB sectors are readable.
+    #[serde(default)]
+    pub dvda_assume_decrypted: bool,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -264,6 +269,11 @@ pub struct RedactedSourceOptions {
     pub dvda_group_selection: DvdaGroupSelection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dvda_group: Option<u8>,
+    /// Treat a DVD-Audio source with `DVDAUDIO.MKB` metadata as already decrypted.
+    /// This is an explicit caller override for edge cases where the first-AOB
+    /// probe cannot classify the payload but the user knows the AOB sectors are readable.
+    #[serde(default)]
+    pub dvda_assume_decrypted: bool,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -283,6 +293,7 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
                 sacd_area: req.source.sacd_area,
                 dvda_group_selection: req.source.effective_dvda_group_selection(),
                 dvda_group: req.source.dvda_group,
+                dvda_assume_decrypted: req.source.dvda_assume_decrypted,
                 cue_sidecar: req.source.cue_sidecar,
                 track_selection: req.source.track_selection.clone(),
             },
@@ -558,7 +569,9 @@ pub enum DvdaCopyProtectionScheme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DvdaCopyProtectionEvidenceSource {
     DvdaudioMkb,
+    AobMpegPsProbe,
     ParserDiagnostic,
+    UserOverride,
     Unknown,
 }
 

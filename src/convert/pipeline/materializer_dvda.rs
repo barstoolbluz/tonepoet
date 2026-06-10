@@ -21,7 +21,7 @@ use super::tool::ToolRunner;
 use super::types::*;
 use crate::tui::dvda::{
     parse_dvda_volume, AobFileEntry, AudioAttributes, AudioChapter, AudioTitle,
-    ChannelAssignment, ChannelFormat, CopyProtectionSource, DirectoryDvdaVolume, DvdaDisc, DvdaError, DvdaGroup,
+    refine_copy_protection_from_aob_probe, ChannelAssignment, ChannelFormat, CopyProtectionSource, DirectoryDvdaVolume, DvdaDisc, DvdaError, DvdaGroup,
     DvdaFile, DvdaVolume, GroupCorrelation, Iso9660DvdaVolume, IsoUdfDvdaVolume, SamgTrack, SamgTrackRef,
     SamgZone, TitleRef, TitleRefKind, TitleSet,
 };
@@ -145,14 +145,16 @@ fn materialize_prepared_source<V: DvdaVolume + ?Sized>(
         return Err(MaterializeError::Cancelled);
     }
 
-    let disc = parse_dvda_volume(volume).map_err(dvda_error_to_materialize)?;
+    let mut disc = parse_dvda_volume(volume).map_err(dvda_error_to_materialize)?;
+    refine_copy_protection_from_aob_probe(volume, &mut disc, req.source.dvda_assume_decrypted)
+        .map_err(dvda_error_to_materialize)?;
 
     let group_selection = req.source.effective_dvda_group_selection();
     let groups = select_groups(&disc, group_selection)?;
     let mut tracks = prepared_tracks_for_groups(volume_source, &disc, &groups, cancel)?;
     tracks = apply_track_selection(tracks, &req.source.track_selection)?;
 
-    if disc.copy_protection.mkb_present || disc.copy_protection.cppm_detected {
+    if disc.copy_protection.cppm_detected {
         let block = dvda_copy_protection_block(&disc);
         mark_tracks_blocked_for_copy_protection(&mut tracks, &block);
         let source = prepared_source(req, &disc, &groups, group_selection, tracks);
@@ -198,6 +200,9 @@ fn prepared_source(
 fn dvda_copy_protection_block(disc: &DvdaDisc) -> DvdaCopyProtectionBlock {
     let evidence_source = match disc.copy_protection.source {
         CopyProtectionSource::MkbPresence => DvdaCopyProtectionEvidenceSource::DvdaudioMkb,
+        CopyProtectionSource::MkbPresentAobProbeReadable => DvdaCopyProtectionEvidenceSource::AobMpegPsProbe,
+        CopyProtectionSource::AobProbeNoMpegPs => DvdaCopyProtectionEvidenceSource::AobMpegPsProbe,
+        CopyProtectionSource::AssumeDecryptedOverride => DvdaCopyProtectionEvidenceSource::UserOverride,
         CopyProtectionSource::NotDetected => DvdaCopyProtectionEvidenceSource::Unknown,
     };
     let evidence_filename = if disc.copy_protection.mkb_present {
@@ -1343,7 +1348,7 @@ fn album_metadata(
     insert_nonempty(&mut extra, "dvda_mkb_present", disc.copy_protection.mkb_present.to_string());
     insert_nonempty(&mut extra, "dvda_cppm_detected", disc.copy_protection.cppm_detected.to_string());
     insert_nonempty(&mut extra, "dvda_copy_protection_source", format!("{:?}", disc.copy_protection.source));
-    if disc.copy_protection.mkb_present || disc.copy_protection.cppm_detected {
+    if disc.copy_protection.cppm_detected {
         insert_nonempty(&mut extra, "dvda_copy_protection_policy", "DetectExplainSkip".to_string());
         insert_nonempty(&mut extra, "dvda_cppm_decryption_supported", "false".to_string());
         insert_nonempty(
@@ -2098,6 +2103,7 @@ mod tests {
             sacd_area: None,
             dvda_group_selection: DvdaGroupSelection::Default,
             dvda_group: Some(4),
+            dvda_assume_decrypted: false,
             cue_sidecar: CueSidecarPolicy::PreferSidecar,
             track_selection: TrackSelection::All,
         };
@@ -2240,6 +2246,7 @@ mod tests {
                 sacd_area: None,
                 dvda_group_selection: group_selection,
                 dvda_group: None,
+                dvda_assume_decrypted: false,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
