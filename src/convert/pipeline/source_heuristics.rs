@@ -225,9 +225,9 @@ fn extract_four_digit_year(date: &str) -> Option<String> {
 
 /// Format source spec from bit depth and sample rate.
 /// `(Some(24), 96000)` → `"24-96"`, `(Some(16), 44100)` → `"16-44.1"`
-fn format_source_spec(bit_depth: Option<u32>, sample_rate: u32) -> String {
+fn format_source_spec(bit_depth: Option<u32>, sample_rate: Option<u32>) -> String {
     let depth = bit_depth.unwrap_or(24);
-    let rate_khz = sample_rate as f64 / 1000.0;
+    let rate_khz = sample_rate.unwrap_or(96000) as f64 / 1000.0;
     if rate_khz == rate_khz.floor() {
         format!("{}-{}", depth, rate_khz as u32)
     } else {

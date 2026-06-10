@@ -50,8 +50,9 @@ impl super::stages::Materializer for SingleFileMaterializer {
             source_ref: TrackSourceRef::StagedFile(req.container.clone()),
             metadata,
             expected_samples: probe.expected_samples,
-            sample_rate: probe.sample_rate,
+            sample_rate: Some(probe.sample_rate),
             bit_depth: probe.bit_depth,
+            source_audio: SourceAudioDescriptor::default(),
         };
 
         let tracks = apply_track_selection(vec![track], &req.source.track_selection)?;

@@ -805,6 +805,8 @@ fn build_pipeline_request_template(
                 .as_ref()
                 .map(|p| SecretString::new(p.clone())),
             sacd_area,
+            dvda_group: None,
+            dvda_group_selection: DvdaGroupSelection::Default,
             cue_sidecar: cue_policy,
             track_selection,
         },

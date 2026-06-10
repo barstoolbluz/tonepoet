@@ -4078,6 +4078,8 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                     source: SourceOptions {
                         archive_password: None,
                         sacd_area: None,
+                        dvda_group: None,
+                        dvda_group_selection: DvdaGroupSelection::Default,
                         cue_sidecar: CueSidecarPolicy::PreferSidecar,
                         track_selection: TrackSelection::Set(selected_numbers),
                     },

@@ -16,9 +16,9 @@ use tonepoet_pipeline::{
 
 use crate::convert::formats::{AacProfile, Mp3BitrateMode, QualitySettings, WavPackMode};
 use crate::convert::pipeline::{
-    CueSidecarPolicy, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
-    OverwritePolicy, PipelineRequest, PublishPolicy, SecretString, SourceOptions, StagePolicy,
-    StageRequirement, TrackSelection,
+    CueSidecarPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy, NamingCollisionPolicy,
+    NamingPolicy, OverwritePolicy, PipelineRequest, PublishPolicy, SecretString, SourceOptions,
+    StagePolicy, StageRequirement, TrackSelection,
 };
 use crate::convert::{ConversionError, ConversionItem, ConversionResult};
 
@@ -100,6 +100,8 @@ pub fn build_pipeline_request_from_settings(
                 .as_ref()
                 .map(|password| SecretString::new(password.clone())),
             sacd_area: None,
+            dvda_group: None,
+            dvda_group_selection: DvdaGroupSelection::Default,
             cue_sidecar: cue_policy,
             track_selection: TrackSelection::All,
         },

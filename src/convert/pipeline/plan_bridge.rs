@@ -508,7 +508,7 @@ pub fn source_info_for_realized_track(
     let sample_rate_hz = dsd_metadata
         .as_ref()
         .map(|metadata| metadata.sample_rate_hz)
-        .or_else(|| (track.sample_rate > 0).then_some(track.sample_rate));
+        .or(track.sample_rate);
     let channels = dsd_metadata.as_ref().map(|metadata| metadata.channels);
     let duration = dsd_metadata
         .as_ref()

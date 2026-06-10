@@ -299,15 +299,14 @@ pub struct AudioTitle {
     /// `audio_title_info_t.title_nr` field references.
     pub title_ordinal: u8,
     pub title_table_offset: u32,
-    /// Uniform low three bits observed in this title's raw `track_type` bytes,
-    /// when all chapters share the same value. This is a diagnostic hint only:
-    /// real discs have shown that these bits do not reliably identify an ATS
-    /// audio-format table entry.
-    pub uniform_track_type_low_bits_candidate: Option<u8>,
-    /// Distinct low-three-bit values observed in raw `track_type` bytes, in
-    /// first-seen order. These values are intentionally not named audio-format
-    /// indices; Phase 3 must identify the stream format from AOB packet data.
-    pub track_type_low_bits_candidates: Vec<u8>,
+    /// Active ATS audio-format table index when every chapter/track in the title
+    /// resolves to the same present format entry. Multi-format titles keep this
+    /// as `None` and expose all distinct indices in `audio_format_indices`.
+    pub audio_format_index: Option<u8>,
+    /// Distinct present audio-format table indices referenced by the title's
+    /// chapter/track records, in first-seen order. This is what future
+    /// materializer code should use before falling back to raw `track_type`.
+    pub audio_format_indices: Vec<u8>,
     pub track_count_declared: u8,
     pub index_count_declared: u8,
     pub len_in_pts: u32,
@@ -322,14 +321,11 @@ pub struct AudioTitle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioChapter {
     pub track_nr: u8,
-    /// Raw ATS track-type byte. Keep this byte as parser evidence only. Its low
-    /// three bits are exposed below as a candidate diagnostic value, not as a
-    /// decoded audio-format table index.
+    /// Raw ATS track-type byte. The low three bits select one of the eight
+    /// `ats_audio_format` entries; the decoded, present entry is exposed as
+    /// `audio_format_index`.
     pub track_type: u8,
-    /// Low three bits of `track_type`, retained as a provisional diagnostic hint.
-    /// Do not use this as an audio-format selector; Phase 3 must prove format
-    /// identity from AOB packet headers.
-    pub track_type_low_bits_candidate: u8,
+    pub audio_format_index: Option<u8>,
     pub downmix_matrix: Option<u8>,
     pub index_start: u8,
     pub first_pts: u32,
@@ -417,21 +413,10 @@ pub struct DvdaGroup {
     pub correlation: GroupCorrelation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TitleRefKind {
-    /// A title reference from the AMG AOTT table. The reference value is an
-    /// AOTT/ATSI title ordinal, not a raw ATS PGC title number.
-    AottTitleOrdinal,
-    /// A fallback title reference synthesized from ATSI data when the AMG AOTT
-    /// table is absent. The reference value is the raw ATS PGC title number.
-    AtsPgcTitleNr,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TitleRef {
     pub title_set_nr: u8,
     pub title_nr: u8,
-    pub kind: TitleRefKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,14 +488,14 @@ pub fn sample_rate_from_code(code: u8) -> Option<u32> {
 }
 
 
-/// Return the low three bits of an ATS track-type byte as a diagnostic hint.
+/// Decode the active ATS audio-format table index from an ATS track-type byte.
 ///
-/// Some earlier parser notes treated these bits as an ATS audio-format table
-/// index. Real discs contradict that assumption: the value can stay at zero
-/// while the title uses another format entry. Keep this helper deliberately
-/// named as a candidate value so callers do not treat it as decode authority.
-pub fn track_type_low_bits_candidate(track_type: u8) -> u8 {
-    track_type & 0x07
+/// DVD-Audio ATSI exposes eight `ats_audio_format` entries. The track timestamp
+/// record's `track_type` byte carries the selected entry in its low three bits.
+/// Callers should still verify that the referenced format table entry is
+/// present before using it for extraction policy.
+pub fn audio_format_index_from_track_type(track_type: u8) -> Option<u8> {
+    Some(track_type & 0x07)
 }
 
 pub fn parse_channel_format(raw: [u8; 3]) -> ChannelFormat {
@@ -545,11 +530,7 @@ pub(crate) fn groups_from_disc_parts(
                 samg_tracks: Vec::new(),
                 correlation: GroupCorrelation::FromAmgAott,
             });
-            let title_ref = TitleRef {
-                title_set_nr: entry.title_set_nr,
-                title_nr: entry.title_nr,
-                kind: TitleRefKind::AottTitleOrdinal,
-            };
+            let title_ref = TitleRef { title_set_nr: entry.title_set_nr, title_nr: entry.title_nr };
             if !group.title_refs.contains(&title_ref) {
                 group.title_refs.push(title_ref);
             }
@@ -560,11 +541,7 @@ pub(crate) fn groups_from_disc_parts(
             for title in &ts.titles {
                 groups.insert(ordinal, DvdaGroup {
                     group_nr: ordinal,
-                    title_refs: vec![TitleRef {
-                        title_set_nr: ts.number,
-                        title_nr: title.title_nr,
-                        kind: TitleRefKind::AtsPgcTitleNr,
-                    }],
+                    title_refs: vec![TitleRef { title_set_nr: ts.number, title_nr: title.title_nr }],
                     samg_tracks: Vec::new(),
                     correlation: GroupCorrelation::FromAtsiFallback,
                 });
@@ -593,15 +570,4 @@ pub(crate) fn groups_from_disc_parts(
     }
 
     groups.into_values().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::track_type_low_bits_candidate;
-
-    #[test]
-    fn track_type_low_bits_are_exposed_only_as_candidate_bits() {
-        assert_eq!(track_type_low_bits_candidate(0x00), 0);
-        assert_eq!(track_type_low_bits_candidate(0xa5), 5);
-    }
 }

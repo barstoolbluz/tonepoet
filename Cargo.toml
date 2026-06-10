@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard", "crates/sacd-rs", "tonepoet-pipeline"]
+members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard", "crates/sacd-rs", "crates/dvda-phase1", "tonepoet-pipeline"]
 resolver = "2"
 
 [package]
@@ -16,6 +16,7 @@ fs2 = "0.4"
 tonepoet-backend = { path = "crates/tonepoet-backend" }
 tonepoet-features = { path = "crates/tonepoet-features" }
 sacd-rs = { path = "crates/sacd-rs" }
+dvda-phase1 = { path = "crates/dvda-phase1" }
 tonepoet-wizard = { path = "crates/tonepoet-wizard" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }

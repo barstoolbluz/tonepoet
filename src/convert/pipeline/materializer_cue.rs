@@ -194,8 +194,9 @@ impl Materializer for CueImageMaterializer {
                 },
                 metadata,
                 expected_samples: Some(samples),
-                sample_rate: probe.sample_rate,
+                sample_rate: Some(probe.sample_rate),
                 bit_depth: probe.bit_depth,
+                source_audio: SourceAudioDescriptor::default(),
             });
         }
 

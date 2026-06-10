@@ -17,6 +17,7 @@ pub mod errors;
 pub mod label_resolver;
 pub mod materializer_7z;
 pub mod materializer_cue;
+pub mod materializer_dvda;
 pub mod materializer_sacd;
 pub mod materializer_single;
 pub mod planned_adapter;

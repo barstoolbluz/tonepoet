@@ -1,18 +1,19 @@
 [package]
-name = "dvda-phase1-bundle"
+name = "dvda-phase1"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
+description = "DVD-Audio AMG, ATSI, SAMG, and AUDIO_TS volume parser used by tonepoet"
+license = "GPL-3.0-or-later"
 publish = false
 
-[workspace]
+[lib]
+name = "dvda_phase1"
+path = "src/lib.rs"
 
 [features]
 default = []
-iso-isomage = ["dep:isomage"]
+iso-isomage = []
 
 [dependencies]
 thiserror = "1"
-isomage = { version = "2.1", optional = true }
-
-[dev-dependencies]
-# The fixture tests are skipped automatically when tests/fixtures/dvda is absent.

@@ -12,6 +12,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tonepoet_pipeline::PipelineSettings;
 
+
+fn deserialize_optional_nonzero_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u32>::deserialize(deserializer)?;
+    Ok(value.filter(|hz| *hz != 0))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SecretString(String);
 
@@ -71,8 +80,84 @@ impl PipelineRequest {
 pub struct SourceOptions {
     pub archive_password: Option<SecretString>,
     pub sacd_area: Option<SacdArea>,
+    /// DVD-Audio group-selection policy. This is the active internal contract;
+    /// CLI wiring can map future flags onto this enum without changing the
+    /// materializer again.
+    #[serde(default)]
+    pub dvda_group_selection: DvdaGroupSelection,
+    /// Backward-compatible legacy field for older serialized requests that
+    /// carried only one group number. New code should set `dvda_group_selection`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvda_group: Option<u8>,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
+}
+
+impl SourceOptions {
+    #[must_use]
+    pub fn effective_dvda_group_selection(&self) -> DvdaGroupSelection {
+        match self.dvda_group_selection {
+            DvdaGroupSelection::Default => self
+                .dvda_group
+                .map(DvdaGroupSelection::Group)
+                .unwrap_or(DvdaGroupSelection::Default),
+            selection => selection,
+        }
+    }
+
+    #[must_use]
+    pub fn explicit_dvda_requested(&self) -> bool {
+        !matches!(
+            self.effective_dvda_group_selection(),
+            DvdaGroupSelection::Default
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DvdaGroupSelection {
+    /// Preserve Phase 2 default behavior: group 1 when present, otherwise the
+    /// first parsed audio group.
+    Default,
+    /// Materialize one explicit 1-based DVD-Audio group number.
+    Group(u8),
+    /// Materialize every parsed audio group into one prepared source.
+    All,
+    /// Pick the best structurally identified two-channel group, falling back to
+    /// `Default` when the IFO model cannot prove a stereo group.
+    PreferStereo,
+    /// Pick the best structurally identified group with more than two channels,
+    /// falling back to `Default` when no multichannel group is provable.
+    PreferMultichannel,
+    /// Pick the structurally proven group with the highest rate/depth profile,
+    /// falling back to `Default` when no group exposes comparable facts.
+    PreferHighestResolution,
+}
+
+impl Default for DvdaGroupSelection {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl DvdaGroupSelection {
+    #[must_use]
+    pub const fn is_default(self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Default => "default".to_string(),
+            Self::Group(group_nr) => format!("group:{group_nr}"),
+            Self::All => "all".to_string(),
+            Self::PreferStereo => "prefer_stereo".to_string(),
+            Self::PreferMultichannel => "prefer_multichannel".to_string(),
+            Self::PreferHighestResolution => "prefer_highest_resolution".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +260,10 @@ pub struct RedactedPipelineRequest {
 pub struct RedactedSourceOptions {
     pub archive_password: Option<String>,
     pub sacd_area: Option<SacdArea>,
+    #[serde(default)]
+    pub dvda_group_selection: DvdaGroupSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvda_group: Option<u8>,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -192,6 +281,8 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
                     .as_ref()
                     .map(|_| "<redacted>".to_string()),
                 sacd_area: req.source.sacd_area,
+                dvda_group_selection: req.source.effective_dvda_group_selection(),
+                dvda_group: req.source.dvda_group,
                 cue_sidecar: req.source.cue_sidecar,
                 track_selection: req.source.track_selection.clone(),
             },
@@ -242,7 +333,231 @@ pub enum TrackSourceRef {
         track_index: u32,
         area: SacdArea,
     },
+    DvdaTrack {
+        /// DVD-Audio volume backing this track. Phase 3 must open tracks through
+        /// this typed source rather than guessing whether sectors refer to a
+        /// directory tree, an ISO, or a staged AUDIO_TS copy.
+        volume_source: DvdaVolumeSourceRef,
+        group_nr: u8,
+        /// ATS number when this track came from an ATSI title/chapter. SAMG-only
+        /// tracks may not have a proven ATS mapping at Phase 2 materialization
+        /// time, so these fields are optional by design.
+        title_set_nr: Option<u8>,
+        /// Raw ATS PGC/title identifier from ATSI, when known.
+        title_nr: Option<u8>,
+        /// 1-based ATS title ordinal used by AMG/AOTT group references, when known.
+        title_ordinal: Option<u8>,
+        /// 1-based playback ordinal within the selected DVD-Audio group. This is
+        /// the only field that should be used for group-level sequencing and SAMG
+        /// correlation; ATS chapter numbers restart per title and must not be
+        /// treated as group track numbers.
+        group_track_ordinal: u32,
+        /// 1-based ATS-local chapter/track number when this track came from ATSI.
+        ats_track_nr: Option<u8>,
+        /// 1-based SAMG group track number when this track came from or was
+        /// correlated with AUDIO_PP.IFO.
+        samg_track_nr: Option<u8>,
+        /// SAMG flat track-list ordinal when the source reference came from or was
+        /// correlated with AUDIO_PP.IFO.
+        samg_ordinal: Option<u16>,
+        /// Names whether `sector_ranges` are relative to an ATS AOB address space
+        /// or absolute SAMG sector addresses. Phase 3 must dispatch on this
+        /// rather than assuming all ranges can be read from an ATS inventory.
+        sector_address_space: DvdaSectorAddressSpace,
+        /// First PTS reported by ATSI/SAMG for this track. Phase 3 readers use
+        /// this for packet-boundary validation, trimming, and diagnostics without
+        /// parsing string metadata.
+        #[serde(default)]
+        first_pts: u32,
+        /// Track duration in 90 kHz PTS ticks as reported by ATSI/SAMG.
+        #[serde(default)]
+        len_in_pts: u32,
+        /// Raw ATS track-type byte when the track came from ATSI. SAMG-only tracks
+        /// do not carry this field in AUDIO_PP.IFO, so the value is optional.
+        track_type: Option<u8>,
+        /// Starting ATS index number when the track came from ATSI. SAMG-only
+        /// tracks do not carry ATS index numbers.
+        index_start: Option<u8>,
+        /// ATS downmix matrix selector for this track, when present.
+        downmix_matrix: Option<u8>,
+        /// ATS PGC/title table byte offset captured for Phase 3 diagnostics and
+        /// cross-checking, when the source reference came from ATSI.
+        title_table_offset: Option<u32>,
+        /// ATS title duration in 90 kHz PTS ticks, when known.
+        title_len_in_pts: Option<u32>,
+        /// Declared ATS track count for the containing title, when known.
+        title_track_count_declared: Option<u8>,
+        /// Declared ATS index count for the containing title, when known.
+        title_index_count_declared: Option<u8>,
+        /// Active ATS audio-format table entry when Phase 2 can determine it
+        /// from structure alone. This is intentionally optional because real
+        /// discs do not reliably encode the format in `track_type`, and SAMG-only
+        /// records do not identify an ATS format table entry.
+        audio_format_index: Option<u8>,
+        sector_ranges: Vec<DvdaSectorRangeRef>,
+        aob_files: Vec<DvdaAobFileRef>,
+    },
 }
+
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DvdaVolumeSourceRef {
+    /// User supplied a DVD-Audio directory or an AUDIO_TS directory.
+    Directory { root: PathBuf },
+    /// User supplied an ISO image. The backend records the filesystem path that
+    /// proved DVD-Audio identity during detection/materialization. Phase 3 should
+    /// reopen the image through this backend rather than probing again.
+    Iso { path: PathBuf, backend: DvdaIsoBackend },
+    /// AUDIO_TS was copied into the staging area from another container. The
+    /// current Phase 2 ISO path does not use this, but the variant keeps future
+    /// extraction-based fallbacks explicit.
+    StagedAudioTs { original: PathBuf, root: PathBuf },
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DvdaIsoBackend {
+    /// DVD-Audio identity and materialization use the UDF filesystem.
+    Udf,
+    /// DVD-Audio identity and materialization use the ISO9660 bridge filesystem.
+    Iso9660Bridge,
+    /// DVD-Audio identity came only from an explicit raw AMG scan. This is a
+    /// diagnostic state; Phase 2 materialization requires a filesystem backend.
+    ExplicitRawMagicOnly,
+}
+
+impl DvdaVolumeSourceRef {
+    #[must_use]
+    pub fn root_or_image(&self) -> &PathBuf {
+        match self {
+            DvdaVolumeSourceRef::Directory { root } => root,
+            DvdaVolumeSourceRef::Iso { path, .. } => path,
+            DvdaVolumeSourceRef::StagedAudioTs { root, .. } => root,
+        }
+    }
+
+    #[must_use]
+    pub fn original_container(&self) -> &PathBuf {
+        match self {
+            DvdaVolumeSourceRef::Directory { root } => root,
+            DvdaVolumeSourceRef::Iso { path, .. } => path,
+            DvdaVolumeSourceRef::StagedAudioTs { original, .. } => original,
+        }
+    }
+
+    #[must_use]
+    pub fn staged_audio_ts_root(&self) -> Option<&PathBuf> {
+        match self {
+            DvdaVolumeSourceRef::StagedAudioTs { root, .. } => Some(root),
+            DvdaVolumeSourceRef::Directory { .. } | DvdaVolumeSourceRef::Iso { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DvdaSectorAddressSpace {
+    /// Sector numbers are relative to the beginning of the selected ATS AOB
+    /// logical address space and should be resolved through `aob_files`.
+    AtsAobRelative { title_set_nr: u8 },
+    /// Sector numbers came directly from SAMG absolute-sector fields. They are
+    /// sufficient for Phase 2 structure/provenance but require Phase 3 reader
+    /// support before audio can be realized.
+    SamgAbsolute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DvdaSectorRangeRef {
+    pub index_nr: u8,
+    /// First sector in the address space named by `DvdaTrack::sector_address_space`.
+    pub first: u32,
+    /// Inclusive last sector in the address space named by
+    /// `DvdaTrack::sector_address_space`.
+    pub last: u32,
+}
+
+impl DvdaSectorRangeRef {
+    #[must_use]
+    pub const fn block_count(&self) -> u32 {
+        if self.last < self.first {
+            0
+        } else {
+            self.last - self.first + 1
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DvdaAobFileRef {
+    pub title_set_nr: u8,
+    pub part_nr: u8,
+    pub file_name: String,
+    pub exists: bool,
+    pub byte_len: u64,
+    /// First sector contributed by this AOB part, relative to the ATS AOB
+    /// sector address space.
+    pub block_first: u32,
+    /// Inclusive last sector contributed by this AOB part, relative to the ATS
+    /// AOB sector address space.
+    pub block_last: u32,
+}
+
+impl DvdaAobFileRef {
+    #[must_use]
+    pub const fn contains(&self, block: u32) -> bool {
+        self.exists && block >= self.block_first && block <= self.block_last
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockedSource {
+    pub source: PreparedSource,
+    pub reason: SourceBlockReason,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceBlockReason {
+    DvdaCppm(DvdaCopyProtectionBlock),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DvdaCopyProtectionScheme {
+    Cppm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DvdaCopyProtectionEvidenceSource {
+    DvdaudioMkb,
+    ParserDiagnostic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DvdaCopyProtectionBlock {
+    pub scheme: DvdaCopyProtectionScheme,
+    pub evidence_source: DvdaCopyProtectionEvidenceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_filename: Option<String>,
+    pub mkb_present: bool,
+    pub cppm_detected: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+impl DvdaCopyProtectionBlock {
+    #[must_use]
+    pub fn log_label(&self) -> String {
+        let filename = self
+            .evidence_filename
+            .as_deref()
+            .unwrap_or("unknown source file");
+        format!(
+            "CPPM detected from {filename} (MKB present: {}, parser CPPM flag: {})",
+            self.mkb_present, self.cppm_detected
+        )
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CueSegmentCarrier {
@@ -284,6 +599,7 @@ pub enum SourceKind {
     SevenZip,
     CueImage,
     SacdIso,
+    DvdAudio,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -334,18 +650,165 @@ pub struct ExtractionProvenance {
     pub extracted_at: DateTime<Utc>,
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceAudioCoding {
+    Pcm,
+    Dsd,
+    DvdaUnknown,
+    Unknown,
+}
+
+impl Default for SourceAudioCoding {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelGroupDescriptor {
+    pub group_nr: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nonzero_u32"
+    )]
+    pub sample_rate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceAudioDescriptor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding: Option<SourceAudioCoding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_groups: Vec<ChannelGroupDescriptor>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nonzero_u32"
+    )]
+    pub primary_sample_rate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u32>,
+}
+
+impl Default for SourceAudioDescriptor {
+    fn default() -> Self {
+        Self {
+            coding: None,
+            channel_groups: Vec::new(),
+            primary_sample_rate: None,
+            bit_depth: None,
+        }
+    }
+}
+
+impl SourceAudioDescriptor {
+    #[must_use]
+    pub fn from_scalar(sample_rate: Option<u32>, bit_depth: Option<u32>, coding: Option<SourceAudioCoding>) -> Self {
+        Self {
+            coding,
+            channel_groups: Vec::new(),
+            primary_sample_rate: sample_rate.filter(|hz| *hz != 0),
+            bit_depth,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedTrack {
     pub id: TrackId,
     pub source_ref: TrackSourceRef,
     pub metadata: TrackMetadata,
     pub expected_samples: Option<u64>,
-    pub sample_rate: u32,
+    /// Primary scalar sample rate when the source can be represented by one
+    /// authoritative rate at materialization time. DVD-Audio tracks with
+    /// multiple possible IFO audio formats or split channel-group rates leave
+    /// this as `None` until Phase 3 packet inspection resolves the stream.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nonzero_u32"
+    )]
+    pub sample_rate: Option<u32>,
+    /// Typed source-domain audio facts. This prevents decode-boundary code from
+    /// having to recover rates, depths, coding, or DVD-A channel-group details
+    /// from string metadata.
+    #[serde(default)]
+    pub source_audio: SourceAudioDescriptor,
     /// Probed bit depth of the original source image/file when available. For
     /// CUE image tracks this remains the original image depth; it is not the
-    /// `pcm_s32le` depth of the staged segment WAV carrier.
+    /// `pcm_s32le` depth of the staged segment WAV carrier. For DVD-Audio this
+    /// mirrors `source_audio.bit_depth` only when one scalar bit depth is known.
     pub bit_depth: Option<u32>,
 }
+
+impl PreparedTrack {
+    /// Returns the scalar sample rate only when the materializer has one
+    /// authoritative rate for the whole prepared track. DVD-Audio tracks with
+    /// multiple IFO formats or split channel-group rates intentionally return
+    /// `None` until Phase 3 reads packet sub-headers.
+    #[must_use]
+    pub fn scalar_sample_rate(&self) -> Option<u32> {
+        self.sample_rate
+            .filter(|hz| *hz != 0)
+            .or_else(|| self.source_audio.primary_sample_rate.filter(|hz| *hz != 0))
+    }
+
+    /// Returns true when conversion logic may safely compare this track to a
+    /// scalar target rate. Callers that need DVD-A channel-group facts should
+    /// inspect `source_audio.channel_groups` instead.
+    #[must_use]
+    pub fn has_scalar_sample_rate(&self) -> bool {
+        self.scalar_sample_rate().is_some()
+    }
+
+    /// Returns the scalar rate or a caller-owned message explaining why the
+    /// rate is unavailable. This gives non-DVD-A callers an explicit migration
+    /// path without reintroducing numeric sentinels.
+    pub fn require_scalar_sample_rate(&self, context: &'static str) -> Result<u32, MissingSourceAudioFact> {
+        self.scalar_sample_rate().ok_or(MissingSourceAudioFact {
+            context,
+            track_id: self.id.clone(),
+            fact: "scalar sample rate",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSourceAudioFact {
+    pub context: &'static str,
+    pub track_id: TrackId,
+    pub fact: &'static str,
+}
+
+impl std::fmt::Display for MissingSourceAudioFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let disc = self
+            .track_id
+            .disc_number
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown-disc".to_string());
+
+        write!(
+            f,
+            "{} requires {} for track {}-{}-{}",
+            self.context,
+            self.fact,
+            self.track_id.source_ordinal,
+            disc,
+            self.track_id.track_number
+        )
+    }
+}
+
+impl std::error::Error for MissingSourceAudioFact {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedSource {
@@ -560,6 +1023,11 @@ pub struct PublishedEntry {
 pub enum TrackOutcome {
     Ok,
     Err(String),
+    /// The source structure was materialized, but this track must not enter
+    /// decode/encode stages. This is used for known blocked sources such as
+    /// CPPM-protected DVD-Audio discs so reports and logs can retain per-track
+    /// structure without retrying doomed realization paths.
+    Blocked(String),
 }
 
 
@@ -694,6 +1162,7 @@ pub enum BlockReason {
     TrackFailures,
     RequiredStageFailure(PipelineStage),
     MaterializeFailed,
+    EncryptedSource,
     PlanFailed,
     PublishFailed,
     DurableLogFailed,
@@ -824,5 +1293,72 @@ mod chunk_2_1_3_staging_cleanup_tests {
         drop(staging);
 
         assert!(staging_root.exists());
+    }
+}
+
+
+#[cfg(test)]
+mod prepared_track_sample_rate_contract {
+    use super::*;
+    fn track_json(sample_rate: &str, source_audio: &str) -> String {
+        format!(
+            r#"{{
+                "id": {{ "source_ordinal": 1, "disc_number": 1, "track_number": 1 }},
+                "source_ref": {{ "StagedFile": "track.wav" }},
+                "metadata": {{
+                    "title": null, "artist": null, "album_artist": null,
+                    "composer": null, "performer": null, "genre": null, "date": null,
+                    "track_number": null, "disc_number": null, "isrc": null,
+                    "publisher": null, "copyright": null, "comment": null,
+                    "pre_emphasis": false, "extra": {{}}
+                }},
+                "expected_samples": null,
+                "sample_rate": {sample_rate},
+                "source_audio": {source_audio},
+                "bit_depth": null
+            }}"#
+        )
+    }
+
+    #[test]
+    fn scalar_sample_rate_deserializes_legacy_numeric_value() {
+        let track: PreparedTrack = serde_json::from_str(&track_json(
+            "44100",
+            r#"{"primary_sample_rate":44100}"#,
+        ))
+        .expect("legacy scalar sample_rate should deserialize");
+        assert_eq!(track.scalar_sample_rate(), Some(44_100));
+    }
+
+    #[test]
+    fn scalar_sample_rate_deserializes_missing_as_unknown() {
+        let json = track_json("null", "{}");
+        let track: PreparedTrack = serde_json::from_str(&json)
+            .expect("unknown scalar sample_rate should deserialize");
+        assert_eq!(track.scalar_sample_rate(), None);
+        assert!(!track.has_scalar_sample_rate());
+    }
+
+    #[test]
+    fn scalar_sample_rate_treats_zero_as_unknown_for_backward_compatibility() {
+        let track: PreparedTrack = serde_json::from_str(&track_json(
+            "0",
+            r#"{"primary_sample_rate":0}"#,
+        ))
+        .expect("historic zero sentinel should deserialize");
+        assert_eq!(track.sample_rate, None);
+        assert_eq!(track.source_audio.primary_sample_rate, None);
+        assert_eq!(track.scalar_sample_rate(), None);
+    }
+
+    #[test]
+    fn scalar_sample_rate_can_fall_back_to_source_audio_descriptor() {
+        let track: PreparedTrack = serde_json::from_str(&track_json(
+            "null",
+            r#"{"primary_sample_rate":96000}"#,
+        ))
+        .expect("source_audio primary rate should deserialize");
+        assert_eq!(track.sample_rate, None);
+        assert_eq!(track.scalar_sample_rate(), Some(96_000));
     }
 }

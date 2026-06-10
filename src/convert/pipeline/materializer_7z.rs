@@ -89,8 +89,9 @@ impl super::stages::Materializer for SevenZipMaterializer {
                 source_ref: TrackSourceRef::StagedFile(path.clone()),
                 metadata,
                 expected_samples: probe.expected_samples,
-                sample_rate: probe.sample_rate,
+                sample_rate: Some(probe.sample_rate),
                 bit_depth: probe.bit_depth,
+                source_audio: SourceAudioDescriptor::default(),
             });
         }
 

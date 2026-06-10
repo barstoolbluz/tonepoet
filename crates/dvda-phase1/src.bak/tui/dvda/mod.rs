@@ -15,7 +15,7 @@ pub mod volume;
 pub use error::{DvdaError, Result};
 pub use model::*;
 pub use parser::parse_dvda_volume;
-pub use volume::{DirectoryDvdaVolume, DvdaFile, DvdaVolume, Iso9660DvdaVolume, IsoUdfDvdaVolume, UdfAudioTsFileInfo, UdfFileExtent, UdfFileStorageKind};
+pub use volume::{DirectoryDvdaVolume, DvdaFile, DvdaVolume};
 
 #[cfg(feature = "iso-isomage")]
 pub use volume::IsoDvdaVolume;

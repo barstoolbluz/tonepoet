@@ -102,7 +102,12 @@ impl Materializer for SacdIsoMaterializer {
                 // real encoded output instead of comparing against 2.8224 MHz
                 // SACD source-domain sample counts.
                 expected_samples: None,
-                sample_rate: SACD_SAMPLE_RATE_HZ,
+                sample_rate: Some(SACD_SAMPLE_RATE_HZ),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(SACD_SAMPLE_RATE_HZ),
+                    None,
+                    Some(SourceAudioCoding::Dsd),
+                ),
                 bit_depth: None,
             });
         }
@@ -575,7 +580,12 @@ pub(crate) mod test_support {
                 },
                 metadata: TrackMetadata::default(),
                 expected_samples: None,
-                sample_rate: SACD_SAMPLE_RATE_HZ,
+                sample_rate: Some(SACD_SAMPLE_RATE_HZ),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(SACD_SAMPLE_RATE_HZ),
+                    None,
+                    Some(SourceAudioCoding::Dsd),
+                ),
                 bit_depth: None,
             })
             .collect();

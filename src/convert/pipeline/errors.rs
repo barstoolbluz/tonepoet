@@ -7,7 +7,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use super::tool::{CommandRecord, ProcessExit};
-use super::types::SourceKind;
+use super::types::{BlockedSource, SourceKind};
 
 #[derive(Debug, Error)]
 pub enum RequestValidationError {
@@ -47,6 +47,11 @@ pub enum MaterializeError {
     Parse(String),
     #[error("source is encrypted")]
     Encrypted,
+    #[error("{message}")]
+    BlockedSource {
+        message: String,
+        blocked: Box<BlockedSource>,
+    },
     #[error("invalid track selection: {0}")]
     InvalidTrackSelection(String),
     #[error("materialization cancelled")]

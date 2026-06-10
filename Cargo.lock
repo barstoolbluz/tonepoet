@@ -450,6 +450,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dvda-phase1"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2397,6 +2404,7 @@ dependencies = [
  "crc32fast",
  "crossterm",
  "dirs",
+ "dvda-phase1",
  "encoding_rs",
  "env_logger 0.10.2",
  "ffmpeg-next",

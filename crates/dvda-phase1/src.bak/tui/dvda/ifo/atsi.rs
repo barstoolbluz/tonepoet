@@ -3,7 +3,7 @@
 use crate::tui::dvda::endian::{be_u16, be_u32, identifier, require_len, slice, u8_at};
 use crate::tui::dvda::error::{DvdaError, Result};
 use crate::tui::dvda::model::{
-    channel_assignment, parse_channel_format, track_type_low_bits_candidate, AobFileEntry,
+    audio_format_index_from_track_type, channel_assignment, parse_channel_format, AobFileEntry,
     AtsiHeader, AudioAttributes, AudioChapter, AudioCoding, AudioTitle, DiagnosticSeverity,
     DownmixChannelCoefficients, DownmixCoefficient, DownmixMatrix, DownmixPhase,
     DvdaDiagnostic, SectorRange, TitleSet, TitleSetKind, DVD_BLOCK_SIZE, DOWNMIX_SOURCE_CHANNELS,
@@ -66,7 +66,7 @@ pub fn parse_atsi(
 
     let audio_formats = parse_audio_formats(bytes)?;
     let downmix_matrices = parse_downmix_matrices(bytes)?;
-    let (audio_pgcit_offset, titles, format_diagnostics) = parse_audio_pgcit(bytes, &header, title_set_nr)?;
+    let (audio_pgcit_offset, titles, format_diagnostics) = parse_audio_pgcit(bytes, &header, title_set_nr, &audio_formats)?;
     diagnostics.extend(format_diagnostics);
     let aobs_last_sector = header
         .atsi_last_sector
@@ -149,6 +149,7 @@ fn parse_audio_pgcit(
     bytes: &[u8],
     header: &AtsiHeader,
     title_set_nr: u8,
+    audio_formats: &[AudioAttributes],
 ) -> Result<(usize, Vec<AudioTitle>, Vec<DvdaDiagnostic>)> {
     let pgcit_offset = if header.ats_pgcit != 0 {
         (header.ats_pgcit as usize)
@@ -189,11 +190,16 @@ fn parse_audio_pgcit(
             let downmix_matrix_raw = ts[1];
             let downmix_matrix = (downmix_matrix_raw < DOWNMIX_COUNT as u8).then_some(downmix_matrix_raw);
             let track_type = ts[0];
-            let track_type_low_bits_candidate = track_type_low_bits_candidate(track_type);
+            let audio_format_index = resolve_audio_format_index(
+                track_type,
+                audio_formats,
+                &mut diagnostics,
+                source_file_context(title_set_nr, title_nr, j + 1),
+            );
             chapters.push(AudioChapter {
                 track_nr: (j + 1).min(u8::MAX as usize) as u8,
                 track_type,
-                track_type_low_bits_candidate,
+                audio_format_index,
                 downmix_matrix,
                 index_start: ts[4],
                 first_pts: u32::from_be_bytes([ts[6], ts[7], ts[8], ts[9]]),
@@ -213,9 +219,9 @@ fn parse_audio_pgcit(
             assign_sector_range(&mut chapters, range);
         }
 
-        let track_type_low_bits_candidates = distinct_track_type_low_bits_candidates(&chapters);
-        let uniform_track_type_low_bits_candidate = if track_type_low_bits_candidates.len() == 1 {
-            Some(track_type_low_bits_candidates[0])
+        let audio_format_indices = distinct_audio_format_indices(&chapters);
+        let audio_format_index = if audio_format_indices.len() == 1 {
+            Some(audio_format_indices[0])
         } else {
             None
         };
@@ -225,8 +231,8 @@ fn parse_audio_pgcit(
             title_nr,
             title_ordinal: (i + 1).min(u8::MAX as usize) as u8,
             title_table_offset,
-            uniform_track_type_low_bits_candidate,
-            track_type_low_bits_candidates,
+            audio_format_index,
+            audio_format_indices,
             track_count_declared: tracks,
             index_count_declared: indexes,
             len_in_pts,
@@ -237,13 +243,50 @@ fn parse_audio_pgcit(
     Ok((pgcit_offset, titles, diagnostics))
 }
 
+fn source_file_context(title_set_nr: u8, title_nr: u8, track_nr: usize) -> String {
+    format!("ATS {title_set_nr:02} title {title_nr} track {track_nr}")
+}
 
-fn distinct_track_type_low_bits_candidates(chapters: &[AudioChapter]) -> Vec<u8> {
+fn resolve_audio_format_index(
+    track_type: u8,
+    audio_formats: &[AudioAttributes],
+    diagnostics: &mut Vec<DvdaDiagnostic>,
+    context: String,
+) -> Option<u8> {
+    let Some(index) = audio_format_index_from_track_type(track_type) else {
+        diagnostics.push(DvdaDiagnostic::warn(
+            "dvda.atsi.track_type_no_audio_format_index",
+            format!("{context}: track_type 0x{track_type:02x} does not encode an audio-format index"),
+        ));
+        return None;
+    };
+
+    match audio_formats.iter().find(|format| format.format_index == index) {
+        Some(format) if format.present => Some(index),
+        Some(_) => {
+            diagnostics.push(DvdaDiagnostic::warn(
+                "dvda.atsi.audio_format_not_present",
+                format!("{context}: track_type 0x{track_type:02x} references absent audio format {index}"),
+            ));
+            None
+        }
+        None => {
+            diagnostics.push(DvdaDiagnostic::warn(
+                "dvda.atsi.audio_format_index_out_of_range",
+                format!("{context}: track_type 0x{track_type:02x} references audio format {index}, outside parsed table"),
+            ));
+            None
+        }
+    }
+}
+
+fn distinct_audio_format_indices(chapters: &[AudioChapter]) -> Vec<u8> {
     let mut out = Vec::new();
     for chapter in chapters {
-        let candidate = chapter.track_type_low_bits_candidate;
-        if !out.contains(&candidate) {
-            out.push(candidate);
+        if let Some(index) = chapter.audio_format_index {
+            if !out.contains(&index) {
+                out.push(index);
+            }
         }
     }
     out

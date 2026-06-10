@@ -26,6 +26,7 @@ use super::errors::{
 use super::materializer_7z::SevenZipMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
+use super::materializer_dvda::{is_dvda_candidate, DvdaAudioMaterializer};
 use super::materializer_single::SingleFileMaterializer;
 use super::track_executor::{
     execute_planned_track_conversion, run_tool_command_with_concurrency,
@@ -100,9 +101,9 @@ pub fn validate_request(req: &PipelineRequest) -> Result<(), RequestValidationEr
     if !req.container.exists() {
         return Err(RequestValidationError::MissingContainer);
     }
-    if !req.container.is_file() {
+    if !req.container.is_file() && !req.container.is_dir() {
         return Err(RequestValidationError::InvalidOutputRoot(format!(
-            "container is not a regular file: {}",
+            "container is neither a regular file nor a directory: {}",
             req.container.display()
         )));
     }
@@ -166,6 +167,9 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
     if is_sacd_iso_candidate(req)? {
         return Ok(SourceKind::SacdIso);
     }
+    if is_dvda_candidate(req)? {
+        return Ok(SourceKind::DvdAudio);
+    }
     if !matches!(req.source.cue_sidecar, CueSidecarPolicy::IgnoreCue) && is_cue_image_candidate(req)? {
         return Ok(SourceKind::CueImage);
     }
@@ -200,6 +204,7 @@ pub fn materializer_for(kind: SourceKind) -> Result<Box<dyn Materializer>, Sourc
         SourceKind::SevenZip => Ok(Box::new(SevenZipMaterializer)),
         SourceKind::CueImage => Ok(Box::new(CueImageMaterializer)),
         SourceKind::SacdIso => Ok(Box::new(SacdIsoMaterializer)),
+        SourceKind::DvdAudio => Ok(Box::new(DvdaAudioMaterializer)),
     }
 }
 
@@ -328,6 +333,7 @@ async fn realize_track_with_tool_limits_and_stats(
             track_index,
             area,
         } => realize_sacd_track(iso, *track_index, *area, &req.settings.target_format, staging, cancel, progress_tracker).await,
+        TrackSourceRef::DvdaTrack { .. } => Err(ConvertError::UnsupportedTrackSource),
     }
 }
 
@@ -1697,6 +1703,25 @@ pub fn scheduled_worker_failure_output(
     }
 }
 
+fn blocked_track_records(source: &PreparedSource, reason: &str) -> Vec<TrackRecord> {
+    source
+        .tracks
+        .iter()
+        .map(|track| TrackRecord {
+            track_id: track.id.clone(),
+            outcome: TrackOutcome::Blocked(reason.to_string()),
+            source_ref: track.source_ref.clone(),
+            realized_input: None,
+            output_file: None,
+            commands: Vec::new(),
+            bytes_in: None,
+            bytes_out: None,
+            duration: None,
+            dsd_dst_stats: None,
+        })
+        .collect()
+}
+
 pub async fn convert_tracks(
     source: &PreparedSource,
     plan: &AlbumPlan,
@@ -1843,7 +1868,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
         }
     }
 
-    let failed = records.iter().any(|record| matches!(record.outcome, TrackOutcome::Err(_)));
+    let failed = records.iter().any(|record| !matches!(record.outcome, TrackOutcome::Ok));
     let record = convert_stage_record_for_tracks(
         &records,
         if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
@@ -2015,16 +2040,12 @@ async fn convert_one_track_work(
 
 #[allow(dead_code)]
 fn track_expected_duration(track: &PreparedTrack) -> Option<Duration> {
-    if track.sample_rate == 0 {
-        return None;
-    }
+    let sample_rate = track.scalar_sample_rate()?;
     let samples = track.expected_samples?;
     if samples == 0 {
         return None;
     }
-    Some(Duration::from_secs_f64(
-        samples as f64 / track.sample_rate as f64,
-    ))
+    Some(Duration::from_secs_f64(samples as f64 / sample_rate as f64))
 }
 fn total_expected_samples(source: &PreparedSource) -> Option<u64> {
     let mut total = 0_u64;
@@ -4163,6 +4184,8 @@ FILE "album.flac" WAVE
             source: SourceOptions {
                 archive_password: None,
                 sacd_area: Some(SacdArea::Stereo),
+                dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_group: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -5134,6 +5157,7 @@ fn build_conversion_log(
         "Catalog number",
         conversion_log_catalog_number(&source.album_metadata.extra),
     );
+    append_source_blocking_lines(&mut log, source);
     log.push('\n');
 
     append_provenance_section(&mut log, &source.provenance);
@@ -5220,6 +5244,31 @@ fn build_conversion_log(
     log
 }
 
+fn append_source_blocking_lines(log: &mut String, source: &PreparedSource) {
+    let extra = &source.album_metadata.extra;
+    let cppm = extra
+        .get("dvda_cppm_detected")
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let mkb = extra
+        .get("dvda_mkb_present")
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    if !cppm && !mkb {
+        return;
+    }
+
+    push_kv_line(log, "Copy protection", "CPPM blocked");
+    if let Some(source) = extra.get("dvda_copy_protection_source") {
+        push_kv_line(log, "Copy protection evidence", source);
+    }
+    if let Some(file) = extra.get("dvda_copy_protection_file") {
+        push_kv_line(log, "Copy protection source", file);
+    } else if mkb {
+        push_kv_line(log, "Copy protection source", "DVDAUDIO.MKB");
+    }
+}
+
 fn build_source_track_index<'a>(source: &'a PreparedSource) -> BTreeMap<u32, &'a PreparedTrack> {
     let mut tracks_by_ordinal = BTreeMap::new();
     for track in &source.tracks {
@@ -5258,19 +5307,16 @@ fn append_track_log(
             log.push_str("  Status: Failure\n");
             push_kv_line(log, "  Error", error);
         }
+        TrackOutcome::Blocked(reason) => {
+            log.push_str("  Status: Blocked\n");
+            push_kv_line(log, "  Block reason", reason);
+        }
     }
 
     if let Some(track) = prepared {
         push_optional_kv_line(log, "  Artist", track.metadata.artist.as_deref());
         push_optional_kv_line(log, "  Composer", track.metadata.composer.as_deref());
-        let mut source_audio = format_sample_rate(track.sample_rate);
-        if let Some(bit_depth) = track.bit_depth {
-            source_audio.push_str(&format!(", {bit_depth}-bit"));
-        }
-        if let Some(expected_samples) = track.expected_samples {
-            source_audio.push_str(&format!(", {expected_samples} expected samples"));
-        }
-        push_kv_line(log, "  Source audio", source_audio);
+        push_kv_line(log, "  Source audio", source_audio_description(track));
         push_kv_line(log, "  Conversion", conversion_summary(track, req));
     }
 
@@ -5707,7 +5753,7 @@ fn source_audio_matches_target_for_passthrough(
     let Some(target_rate) = resolved_target_rate_hz(track, settings) else {
         return false;
     };
-    if target_rate != track.sample_rate {
+    if track.scalar_sample_rate() != Some(target_rate) {
         return false;
     }
 
@@ -5835,25 +5881,27 @@ fn metadata_dimension_labels(value: PlannedMetadataSatisfaction) -> Vec<&'static
 }
 
 fn conversion_summary(track: &PreparedTrack, req: &PipelineRequest) -> String {
-    let source_rate = track.sample_rate;
+    let source_rate = track.scalar_sample_rate();
     let source_depth = track.bit_depth;
     let source_format = source_track_format_label(track);
-    let target_rate = resolved_target_rate_hz(track, &req.settings).unwrap_or(source_rate);
+    let target_rate = resolved_target_rate_hz(track, &req.settings).or(source_rate);
     let target_depth = if req.settings.target_format.is_dsd() {
         None
     } else {
         resolved_target_bit_depth(track, req.settings.target_bit_depth)
     };
     let mut summary = format!(
-        "{} {} → {} {}",
+        "{} {} -> {} {}",
         stream_description(source_depth, source_rate, Some(&source_format)),
         source_format,
         target_stream_description(track, target_depth, target_rate, &req.settings),
         req.settings.target_format.display_name(),
     );
     let mut transforms = Vec::new();
-    if source_rate != target_rate {
-        transforms.push(format!("{} resampling", preferred_resampler_label(&req.settings)));
+    if let (Some(source_rate), Some(target_rate)) = (source_rate, target_rate) {
+        if source_rate != target_rate {
+            transforms.push(format!("{} resampling", preferred_resampler_label(&req.settings)));
+        }
     }
     if dither_applies(source_depth, target_depth, req.settings.dither_type) {
         transforms.push(format!("{} dither", dither_type_label(req.settings.dither_type)));
@@ -5866,15 +5914,17 @@ fn conversion_summary(track: &PreparedTrack, req: &PipelineRequest) -> String {
 
 fn stream_description(
     bit_depth: Option<u32>,
-    sample_rate: u32,
+    sample_rate: Option<u32>,
     dsd_format_hint: Option<&str>,
 ) -> String {
     if dsd_format_hint == Some("DSD") {
-        if let Some(rate) = DsdRate::from_hz(sample_rate) {
+        if let Some(rate) = sample_rate.and_then(DsdRate::from_hz) {
             return dsd_rate_label(rate).to_string();
         }
     }
-    let rate = format_sample_rate(sample_rate);
+    let rate = sample_rate
+        .map(format_sample_rate)
+        .unwrap_or_else(|| "unknown rate".to_string());
     match bit_depth {
         Some(bits) => format!("{bits}-bit/{rate}"),
         None => rate,
@@ -5884,7 +5934,7 @@ fn stream_description(
 fn target_stream_description(
     track: &PreparedTrack,
     bit_depth: Option<u32>,
-    sample_rate: u32,
+    sample_rate: Option<u32>,
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> String {
     if settings.target_format.is_dsd() {
@@ -5893,7 +5943,7 @@ fn target_stream_description(
             RateTarget::Source => source_track_dsd_rate(track),
             RateTarget::PcmHz(_) => None,
         }
-        .or_else(|| DsdRate::from_hz(sample_rate));
+        .or_else(|| sample_rate.and_then(DsdRate::from_hz));
         if let Some(rate) = target_dsd_rate {
             return dsd_rate_label(rate).to_string();
         }
@@ -5906,9 +5956,10 @@ fn resampling_applies_for_source(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
     source.tracks.iter().any(|track| {
-        resolved_target_rate_hz(track, settings)
-            .map(|target| target != track.sample_rate)
-            .unwrap_or(false)
+        match (track.scalar_sample_rate(), resolved_target_rate_hz(track, settings)) {
+            (Some(source_rate), Some(target_rate)) => source_rate != target_rate,
+            _ => false,
+        }
     })
 }
 
@@ -5958,12 +6009,10 @@ fn resolved_target_rate_hz(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> Option<u32> {
     match settings.target_sample_rate {
-        RateTarget::Source if !settings.target_format.is_dsd() => Some(
-            source_track_dsd_rate(track)
-                .map(DsdRate::default_pcm_target_hz)
-                .unwrap_or(track.sample_rate),
-        ),
-        RateTarget::Source => Some(track.sample_rate),
+        RateTarget::Source if !settings.target_format.is_dsd() => source_track_dsd_rate(track)
+            .map(DsdRate::default_pcm_target_hz)
+            .or_else(|| track.scalar_sample_rate()),
+        RateTarget::Source => track.scalar_sample_rate(),
         RateTarget::PcmHz(hz) => Some(hz),
         RateTarget::Dsd(rate) => Some(rate.hz()),
     }
@@ -5985,12 +6034,67 @@ fn source_is_dsd(source: &PreparedSource) -> bool {
 }
 
 fn source_track_dsd_rate(track: &PreparedTrack) -> Option<DsdRate> {
-    let rate = DsdRate::from_hz(track.sample_rate)?;
+    let rate = DsdRate::from_hz(track.scalar_sample_rate()?)?;
     if track.bit_depth.is_none() || matches!(track.source_ref, TrackSourceRef::SacdTrack { .. }) {
         Some(rate)
     } else {
         None
     }
+}
+
+fn source_audio_description(track: &PreparedTrack) -> String {
+    if !track.source_audio.channel_groups.is_empty() {
+        let coding = track
+            .source_audio
+            .coding
+            .map(source_audio_coding_label)
+            .unwrap_or("source");
+        let groups = track
+            .source_audio
+            .channel_groups
+            .iter()
+            .map(channel_group_description)
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut label = format!("{coding} [{groups}]");
+        if let Some(expected_samples) = track.expected_samples {
+            label.push_str(&format!(", {expected_samples} expected samples"));
+        }
+        return label;
+    }
+
+    let mut label = stream_description(track.bit_depth, track.scalar_sample_rate(), Some(&source_track_format_label(track)));
+    if let Some(expected_samples) = track.expected_samples {
+        label.push_str(&format!(", {expected_samples} expected samples"));
+    }
+    label
+}
+
+fn source_audio_coding_label(coding: SourceAudioCoding) -> &'static str {
+    match coding {
+        SourceAudioCoding::Pcm => "PCM",
+        SourceAudioCoding::Dsd => "DSD",
+        SourceAudioCoding::DvdaUnknown => "DVD-Audio",
+        SourceAudioCoding::Unknown => "source",
+    }
+}
+
+fn channel_group_description(group: &ChannelGroupDescriptor) -> String {
+    let rate = group
+        .sample_rate
+        .map(format_sample_rate)
+        .unwrap_or_else(|| "unknown rate".to_string());
+    let depth = group
+        .bit_depth
+        .map(|bits| format!("{bits}-bit"))
+        .unwrap_or_else(|| "unknown depth".to_string());
+    let channels = group
+        .assignment
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| group.channels.map(|count| format!("{count}ch")))
+        .unwrap_or_else(|| "unknown channels".to_string());
+    format!("group {}: {channels}, {depth}/{rate}", group.group_nr)
 }
 
 fn source_track_format_label(track: &PreparedTrack) -> String {
@@ -6010,6 +6114,7 @@ fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
         TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image,
         TrackSourceRef::ImageSegment { image, .. } => image,
         TrackSourceRef::SacdTrack { .. } => return Some("dsd".to_string()),
+        TrackSourceRef::DvdaTrack { .. } => return Some("dvda".to_string()),
     };
     path.extension()
         .and_then(|value| value.to_str())
@@ -6072,7 +6177,7 @@ fn target_sample_rate_setting_label(
                 .iter()
                 .filter_map(|track| {
                     resolved_target_rate_hz(track, settings)
-                        .filter(|target_rate| *target_rate != track.sample_rate)
+                        .filter(|target_rate| Some(*target_rate) != track.scalar_sample_rate())
                         .map(|target_rate| target_rate_setting_label_for_hz(target_rate, settings))
                 })
                 .collect::<BTreeSet<_>>();
@@ -6536,6 +6641,7 @@ fn block_reason_label(reason: &BlockReason) -> String {
             format!("required stage failed: {}", pipeline_stage_label(*stage))
         }
         BlockReason::MaterializeFailed => "materialize failed".to_string(),
+        BlockReason::EncryptedSource => "encrypted source".to_string(),
         BlockReason::PlanFailed => "output planning failed".to_string(),
         BlockReason::PublishFailed => "publish failed".to_string(),
         BlockReason::DurableLogFailed => "durable log failed".to_string(),
@@ -6578,6 +6684,7 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
         SourceKind::SevenZip => "SevenZip",
         SourceKind::CueImage => "CueImage",
         SourceKind::SacdIso => "SacdIso",
+        SourceKind::DvdAudio => "DvdAudio",
     }
 }
 
@@ -6614,6 +6721,42 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
             path_log_value(iso),
             area
         ),
+        TrackSourceRef::DvdaTrack {
+            volume_source,
+            group_nr,
+            title_set_nr,
+            title_ordinal,
+            group_track_ordinal,
+            ats_track_nr,
+            samg_track_nr,
+            samg_ordinal,
+            sector_address_space,
+            ..
+        } => match sector_address_space {
+            DvdaSectorAddressSpace::AtsAobRelative { .. } => format!(
+                "DVD-Audio group {group_nr} track {group_track_ordinal} ATS {} title {} chapter {} from {}",
+                title_set_nr
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                title_ordinal
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                ats_track_nr
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                path_log_value(volume_source.original_container())
+            ),
+            DvdaSectorAddressSpace::SamgAbsolute => format!(
+                "DVD-Audio group {group_nr} track {group_track_ordinal} SAMG track {} ordinal {} from {}",
+                samg_track_nr
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                samg_ordinal
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                path_log_value(volume_source.original_container())
+            ),
+        },
     }
 }
 
@@ -7251,6 +7394,31 @@ pub async fn prepare_pipeline_item_for_scheduler(
             stages.push(record);
             prepared
         }
+        Err(MaterializeError::BlockedSource { message, blocked }) => {
+            let blocked = *blocked;
+            let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(message.clone()));
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let failed = blocked_track_records(&blocked.source, &message);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed,
+                stages,
+                reason: BlockReason::EncryptedSource,
+            };
+            return ScheduledMaterialization::Finished(
+                finalize_report(
+                    &req,
+                    reporter,
+                    Some(blocked.source),
+                    None,
+                    None,
+                    None,
+                    outcome,
+                )
+                .await,
+            );
+        }
         Err(err) => {
             let reason = if matches!(err, MaterializeError::Cancelled) {
                 BlockReason::Cancelled
@@ -7638,7 +7806,7 @@ fn convert_result_from_scheduled_outputs(
         }
     }
 
-    let failed = records.iter().any(|record| matches!(record.outcome, TrackOutcome::Err(_)));
+    let failed = records.iter().any(|record| !matches!(record.outcome, TrackOutcome::Ok));
     let record = convert_stage_record_for_tracks(
         &records,
         if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
@@ -8067,6 +8235,32 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
             source = Some(prepared);
+        }
+        Err(MaterializeError::BlockedSource { message, blocked }) => {
+            let blocked = *blocked;
+            let record = stage_record(
+                PipelineStage::Materialize,
+                StageOutcome::Failed(message.clone()),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let failed = blocked_track_records(&blocked.source, &message);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed,
+                stages,
+                reason: BlockReason::EncryptedSource,
+            };
+            return finalize_report(
+                &req,
+                reporter,
+                Some(blocked.source),
+                plan,
+                artifacts,
+                published,
+                outcome,
+            )
+            .await;
         }
         Err(err) => {
             let reason = if matches!(err, MaterializeError::Cancelled) {
@@ -9013,7 +9207,11 @@ fn render_track_template(
     let catalog = catalog_value(&source.album_metadata.extra)
         .map(sanitize_component)
         .unwrap_or_default();
-    let sample_rate = sanitize_component(&format_sample_rate(track.sample_rate));
+    let sample_rate = track
+        .scalar_sample_rate()
+        .map(format_sample_rate)
+        .map(|value| sanitize_component(&value))
+        .unwrap_or_default();
     let bit_depth = track
         .bit_depth
         .map(|depth| depth.to_string())
@@ -9108,7 +9306,9 @@ fn render_folder_template(template: &str, source: &PreparedSource, format: &Plan
     let sample_rate = source
         .tracks
         .first()
-        .map(|track| sanitize_component(&format_sample_rate(track.sample_rate)))
+        .and_then(|track| track.scalar_sample_rate())
+        .map(format_sample_rate)
+        .map(|value| sanitize_component(&value))
         .unwrap_or_default();
     let bit_depth = source
         .tracks
@@ -10161,6 +10361,9 @@ fn build_manifest_for_album(
                         TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.clone(),
                         TrackSourceRef::ImageSegment { image, .. } => image.clone(),
                         TrackSourceRef::SacdTrack { iso, .. } => iso.clone(),
+                        TrackSourceRef::DvdaTrack { volume_source, .. } => {
+                            volume_source.original_container().clone()
+                        }
                     })
                     .unwrap_or_else(|| req.container.clone());
 
@@ -10290,7 +10493,12 @@ mod conversion_log_tests {
                         ..TrackMetadata::default()
                     },
                     expected_samples: Some(44_100),
-                    sample_rate: 44_100,
+                    sample_rate: Some(44_100),
+                    source_audio: SourceAudioDescriptor::from_scalar(
+                        Some(44_100),
+                        Some(24),
+                        Some(SourceAudioCoding::Pcm),
+                    ),
                     bit_depth: Some(24),
                 },
                 PreparedTrack {
@@ -10307,7 +10515,12 @@ mod conversion_log_tests {
                         ..TrackMetadata::default()
                     },
                     expected_samples: None,
-                    sample_rate: 96_000,
+                    sample_rate: Some(96_000),
+                    source_audio: SourceAudioDescriptor::from_scalar(
+                        Some(96_000),
+                        Some(24),
+                        Some(SourceAudioCoding::Pcm),
+                    ),
                     bit_depth: Some(24),
                 },
             ],
@@ -10337,6 +10550,8 @@ mod conversion_log_tests {
             source: SourceOptions {
                 archive_password: None,
                 sacd_area: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_group: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -10699,7 +10914,7 @@ mod conversion_log_tests {
 
         let mut dsd_source = log_test_source();
         dsd_source.kind = SourceKind::SacdIso;
-        dsd_source.tracks[0].sample_rate = 2_822_400;
+        dsd_source.tracks[0].sample_rate = Some(2_822_400);
         dsd_source.tracks[0].bit_depth = None;
         let mut dsd_req = log_test_request();
         dsd_req.settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
@@ -10715,7 +10930,7 @@ mod conversion_log_tests {
     fn pcm_to_dsd_settings_use_specific_filter_preset_label() {
         let mut source = log_test_source();
         source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
-        source.tracks[0].sample_rate = 88_200;
+        source.tracks[0].sample_rate = Some(88_200);
         source.tracks[0].bit_depth = Some(24);
 
         let mut req = log_test_request();
@@ -10804,7 +11019,7 @@ mod conversion_log_tests {
     fn passthrough_copy_tracks_get_pipeline_line_without_command_records() {
         let mut source = log_test_source();
         source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac"));
-        source.tracks[0].sample_rate = 44_100;
+        source.tracks[0].sample_rate = Some(44_100);
         source.tracks[0].bit_depth = Some(24);
 
         let mut req = log_test_request();
@@ -10832,7 +11047,7 @@ mod conversion_log_tests {
     fn empty_command_tracks_do_not_claim_passthrough_when_audio_changes() {
         let mut source = log_test_source();
         source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
-        source.tracks[0].sample_rate = 96_000;
+        source.tracks[0].sample_rate = Some(96_000);
         source.tracks[0].bit_depth = Some(24);
 
         let mut req = log_test_request();
@@ -10856,7 +11071,7 @@ mod conversion_log_tests {
     fn conversion_summary_shows_rate_depth_and_processing_changes() {
         let mut source = log_test_source();
         source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac"));
-        source.tracks[0].sample_rate = 96_000;
+        source.tracks[0].sample_rate = Some(96_000);
         source.tracks[0].bit_depth = Some(24);
         let mut req = log_test_request();
         req.settings.target_sample_rate = RateTarget::PcmHz(44_100);
@@ -10882,7 +11097,7 @@ mod conversion_log_tests {
     fn dsd_source_rate_target_source_logs_planner_default_pcm_rate() {
         let mut source = log_test_source();
         source.kind = SourceKind::SacdIso;
-        source.tracks[0].sample_rate = DsdRate::Dsd64.hz();
+        source.tracks[0].sample_rate = Some(DsdRate::Dsd64.hz());
         source.tracks[0].bit_depth = None;
         source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
             iso: PathBuf::from("/music/source.iso"),
@@ -10910,7 +11125,7 @@ mod conversion_log_tests {
     #[test]
     fn target_dsd_rates_are_logged_as_dsd_rate_labels() {
         let mut source = log_test_source();
-        source.tracks[0].sample_rate = 96_000;
+        source.tracks[0].sample_rate = Some(96_000);
         source.tracks[0].bit_depth = Some(24);
 
         let mut req = log_test_request();
@@ -10932,7 +11147,7 @@ mod conversion_log_tests {
     #[test]
     fn pcm_to_dsd64_target_summary_uses_dsd_rate_label_not_hz() {
         let mut source = log_test_source();
-        source.tracks[0].sample_rate = 96_000;
+        source.tracks[0].sample_rate = Some(96_000);
         source.tracks[0].bit_depth = Some(24);
         source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
 
@@ -11236,7 +11451,12 @@ mod naming_template_tests {
                     ..TrackMetadata::default()
                 },
                 expected_samples: Some(1000),
-                sample_rate: 44_100,
+                sample_rate: Some(44_100),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(44_100),
+                    Some(24),
+                    Some(SourceAudioCoding::Pcm),
+                ),
                 bit_depth: Some(24),
             }],
             album_metadata: AlbumMetadata {
@@ -11265,6 +11485,8 @@ mod naming_template_tests {
             source: SourceOptions {
                 archive_password: None,
                 sacd_area: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_group: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -11702,7 +11924,12 @@ mod title_extra_tests {
                     ..Default::default()
                 },
                 expected_samples: None,
-                sample_rate: 2_822_400,
+                sample_rate: Some(2_822_400),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(2_822_400),
+                    None,
+                    Some(SourceAudioCoding::Dsd),
+                ),
                 bit_depth: None,
             }],
             album_metadata: AlbumMetadata {
@@ -11785,6 +12012,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source: SourceOptions {
                 archive_password: None,
                 sacd_area: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_group: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -11836,7 +12065,12 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                     ..TrackMetadata::default()
                 },
                 expected_samples: Some(44_100),
-                sample_rate: 44_100,
+                sample_rate: Some(44_100),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(44_100),
+                    Some(16),
+                    Some(SourceAudioCoding::Pcm),
+                ),
                 bit_depth: Some(16),
             })
             .collect::<Vec<_>>();
