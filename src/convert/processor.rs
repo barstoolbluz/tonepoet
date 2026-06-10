@@ -32,9 +32,9 @@ use crate::convert::pipeline::{
 };
 #[cfg(test)]
 use crate::convert::pipeline::{
-    CueSidecarPolicy, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
-    OverwritePolicy, PreparedTrack, PublishPolicy, SourceOptions, StagePolicy, StageRequirement,
-    TrackId, TrackMetadata, TrackSelection,
+    CueSidecarPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy, NamingCollisionPolicy,
+    NamingPolicy, OverwritePolicy, PreparedTrack, PublishPolicy, SourceAudioDescriptor,
+    SourceOptions, StagePolicy, StageRequirement, TrackId, TrackMetadata, TrackSelection,
 };
 
 /// Configuration for the conversion processor.
@@ -1548,6 +1548,8 @@ mod tests {
             source: SourceOptions {
                 archive_password: None,
                 sacd_area: None,
+                dvda_group: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -1597,8 +1599,9 @@ mod tests {
                 ..TrackMetadata::default()
             },
             expected_samples: Some(44_100),
-            sample_rate: 44_100,
+            sample_rate: Some(44_100),
             bit_depth: Some(16),
+        source_audio: SourceAudioDescriptor::default(),
         }
     }
 

@@ -342,6 +342,7 @@ fn open_dvda_iso_volume_with_backend(
     }
 }
 
+#[derive(Debug)]
 struct PreparedDvdaVolume {
     source_ref: DvdaVolumeSourceRef,
     backend: PreparedDvdaVolumeBackend,
@@ -353,6 +354,7 @@ impl PreparedDvdaVolume {
     }
 }
 
+#[derive(Debug)]
 enum PreparedDvdaVolumeBackend {
     Directory(DirectoryDvdaVolume),
     IsoUdf(IsoUdfDvdaVolume),

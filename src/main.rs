@@ -1898,6 +1898,7 @@ mod pipeline_cli_tests {
             false,
             true,
             None,
+            None,
             false,
             false,
         )

@@ -68,6 +68,8 @@ mod tests {
             source: SourceOptions {
                 archive_password: Some(SecretString::new("hunter2")),
                 sacd_area: None,
+                dvda_group: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
                 cue_sidecar: CueSidecarPolicy::IgnoreCue,
                 track_selection: TrackSelection::All,
             },

@@ -823,9 +823,10 @@ mod tests {
     };
     use crate::convert::pipeline::tool::StubToolRunner;
     use crate::convert::pipeline::types::{
-        CueSidecarPolicy, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
-        OverwritePolicy, PipelineStage, PublishPolicy, SacdArea, SourceOptions, StagePolicy,
-        StageRequirement, TrackId, TrackMetadata, TrackSelection, TrackSourceRef,
+        CueSidecarPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy, NamingCollisionPolicy,
+        NamingPolicy, OverwritePolicy, PipelineStage, PublishPolicy, SacdArea,
+        SourceAudioDescriptor, SourceOptions, StagePolicy, StageRequirement, TrackId,
+        TrackMetadata, TrackSelection, TrackSourceRef,
     };
     use tempfile::TempDir;
     use tonepoet_pipeline::{AudioFormat, InputSource, OutputSink, PipelineSettings, ToolIdentifier};
@@ -873,6 +874,8 @@ mod tests {
             source: SourceOptions {
                 archive_password: None,
                 sacd_area: Some(SacdArea::Stereo),
+                dvda_group: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -922,8 +925,9 @@ mod tests {
                 ..TrackMetadata::default()
             },
             expected_samples: Some(1_000),
-            sample_rate: 2_822_400,
+            sample_rate: Some(2_822_400),
             bit_depth: None,
+        source_audio: SourceAudioDescriptor::default(),
         }
     }
 
@@ -1802,7 +1806,8 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
         tool_gate, BlockingToolRunner, ToolBehavior,
     };
     use crate::convert::pipeline::types::{
-        PipelineStage, TrackId, TrackMetadata, TrackOutcome, TrackRecord, TrackSourceRef,
+        PipelineStage, SourceAudioDescriptor, TrackId, TrackMetadata, TrackOutcome, TrackRecord,
+        TrackSourceRef,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1976,8 +1981,9 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                 ..TrackMetadata::default()
             },
             expected_samples: Some(44_100),
-            sample_rate: 44_100,
+            sample_rate: Some(44_100),
             bit_depth: Some(16),
+            source_audio: SourceAudioDescriptor::default(),
         }
     }
 

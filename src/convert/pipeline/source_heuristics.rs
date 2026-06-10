@@ -417,8 +417,9 @@ mod tests {
                     ..TrackMetadata::default()
                 },
                 expected_samples: None,
-                sample_rate: 96000,
+                sample_rate: Some(96000),
                 bit_depth: Some(24),
+            source_audio: SourceAudioDescriptor::default(),
             }],
             album_metadata: AlbumMetadata {
                 album: Some("Bloody Tourists (UK)".into()),
@@ -459,22 +460,22 @@ mod tests {
 
     #[test]
     fn source_spec_standard() {
-        assert_eq!(format_source_spec(Some(24), 96000), "24-96");
+        assert_eq!(format_source_spec(Some(24), Some(96000)), "24-96");
     }
 
     #[test]
     fn source_spec_cd_quality() {
-        assert_eq!(format_source_spec(Some(16), 44100), "16-44.1");
+        assert_eq!(format_source_spec(Some(16), Some(44100)), "16-44.1");
     }
 
     #[test]
     fn source_spec_hi_res() {
-        assert_eq!(format_source_spec(Some(24), 192000), "24-192");
+        assert_eq!(format_source_spec(Some(24), Some(192000)), "24-192");
     }
 
     #[test]
     fn source_spec_48k() {
-        assert_eq!(format_source_spec(Some(24), 48000), "24-48");
+        assert_eq!(format_source_spec(Some(24), Some(48000)), "24-48");
     }
 
     #[test]
@@ -514,8 +515,9 @@ mod tests {
                     ..TrackMetadata::default()
                 },
                 expected_samples: None,
-                sample_rate: 96000,
+                sample_rate: Some(96000),
                 bit_depth: Some(24),
+            source_audio: SourceAudioDescriptor::default(),
             }],
             album_metadata: AlbumMetadata {
                 album: Some("Album (UK)".into()),

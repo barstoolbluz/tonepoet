@@ -605,8 +605,9 @@ mod tests {
                 ..TrackMetadata::default()
             },
             expected_samples: None,
-            sample_rate: 44_100,
+            sample_rate: Some(44_100),
             bit_depth: Some(24),
+        source_audio: SourceAudioDescriptor::default(),
         };
 
         let tracks = vec![
@@ -648,8 +649,9 @@ mod tests {
                 ..TrackMetadata::default()
             },
             expected_samples: None,
-            sample_rate: 44_100,
+            sample_rate: Some(44_100),
             bit_depth: Some(24),
+        source_audio: SourceAudioDescriptor::default(),
         };
 
         let tracks = vec![make_track(1, "USSM17100001"), make_track(2, "USSM17100002")];

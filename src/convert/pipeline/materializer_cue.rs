@@ -2712,6 +2712,8 @@ FILE "album.flac" WAVE
             source: SourceOptions {
                 archive_password: None,
                 sacd_area: None,
+                dvda_group: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -3389,7 +3391,7 @@ TRACK XX AUDIO
         assert_eq!(source.album_metadata.date.as_deref(), Some("1973"));
 
         // Sample rate and bit depth propagated
-        assert_eq!(source.tracks[0].sample_rate, 44100);
+        assert_eq!(source.tracks[0].sample_rate, Some(44100));
         assert_eq!(source.tracks[0].bit_depth, Some(16));
         assert_eq!(source.tracks[0].expected_samples, Some(3_969_000));
     }
@@ -3906,7 +3908,7 @@ FILE "track2.flac" WAVE
         assert_cue_segment_carrier_ref(&source.tracks[1]);
         let boundaries = boundaries_for_cue(cue, total_samples, 96000, true);
         assert_eq!(boundaries[1].0, 5_760_000);
-        assert_eq!(source.tracks[0].sample_rate, 96000);
+        assert_eq!(source.tracks[0].sample_rate, Some(96000));
         assert_eq!(source.tracks[0].bit_depth, Some(24));
     }
 
@@ -3930,7 +3932,7 @@ FILE "track2.flac" WAVE
         assert_cue_segment_carrier_ref(&source.tracks[1]);
         let boundaries = boundaries_for_cue(cue, total_samples, 192000, true);
         assert_eq!(boundaries[1].0, 23_040_000);
-        assert_eq!(source.tracks[0].sample_rate, 192000);
+        assert_eq!(source.tracks[0].sample_rate, Some(192000));
     }
 
     // ── Category F: sample-count validation ──

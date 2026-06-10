@@ -655,11 +655,12 @@ mod tests {
         DsdPlannerSourceKind,
     };
     use crate::convert::pipeline::types::{
-        AlbumMetadata, CueSidecarPolicy, ExtractionProvenance, FailurePolicy, LogPolicy,
-        CueSegmentCarrier, PlannedMetadataSatisfaction, NamingCollisionPolicy, NamingPolicy, OverwritePolicy,
-        PipelineRequest, PreparedSource, PreparedTrack, PublishPolicy, SacdArea, SourceKind,
-        SourceOptions, StagePolicy, StageRequirement, TrackId, TrackMetadata, TrackSelection,
-        TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
+        AlbumMetadata, CueSidecarPolicy, DvdaGroupSelection, ExtractionProvenance, FailurePolicy,
+        LogPolicy, CueSegmentCarrier, PlannedMetadataSatisfaction, NamingCollisionPolicy,
+        NamingPolicy, OverwritePolicy, PipelineRequest, PreparedSource, PreparedTrack,
+        PublishPolicy, SacdArea, SourceAudioDescriptor, SourceKind, SourceOptions, StagePolicy,
+        StageRequirement, TrackId, TrackMetadata, TrackSelection, TrackSourceRef,
+        CUE_ARTWORK_PATH_EXTRA_KEY,
     };
 
     fn request(root: &Path) -> PipelineRequest {
@@ -670,6 +671,8 @@ mod tests {
             source: SourceOptions {
                 archive_password: None,
                 sacd_area: Some(SacdArea::Stereo),
+                dvda_group: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -719,8 +722,9 @@ mod tests {
                 ..TrackMetadata::default()
             },
             expected_samples: Some(1_000),
-            sample_rate: 2_822_400,
+            sample_rate: Some(2_822_400),
             bit_depth: None,
+        source_audio: SourceAudioDescriptor::default(),
         }
     }
 
@@ -850,7 +854,7 @@ mod tests {
         let input = temp.path().join("source.dsf");
         write_minimal_dsf(&input);
         let mut prepared = track(TrackSourceRef::StagedFile(input.clone()));
-        prepared.sample_rate = 0;
+        prepared.sample_rate = None;
         prepared.expected_samples = None;
 
         let metadata = dsd_source_metadata_from_path(&input)
@@ -1049,7 +1053,7 @@ mod tests {
         req.settings.metadata.preserve_artwork = true;
         req.settings.metadata.store_source_audio_md5 = true;
         let mut track = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
-        track.sample_rate = 44_100;
+        track.sample_rate = Some(44_100);
         track.bit_depth = Some(16);
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
@@ -1075,7 +1079,7 @@ mod tests {
         req.settings.metadata.transfer_tags = true;
         req.settings.metadata.preserve_artwork = true;
         let mut track = track(TrackSourceRef::StagedFile(input.clone()));
-        track.sample_rate = 44_100;
+        track.sample_rate = Some(44_100);
         track.bit_depth = Some(16);
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
@@ -1166,7 +1170,7 @@ mod tests {
             req.settings.metadata.transfer_tags = true;
             req.settings.metadata.preserve_artwork = true;
             let mut prepared = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
-            prepared.sample_rate = 44_100;
+            prepared.sample_rate = Some(44_100);
             prepared.bit_depth = Some(16);
 
             let planned = plan_request_for_track(
@@ -1205,7 +1209,7 @@ mod tests {
         req.settings.metadata.transfer_tags = true;
         req.settings.metadata.preserve_artwork = true;
         let mut prepared = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
-        prepared.sample_rate = 44_100;
+        prepared.sample_rate = Some(44_100);
         prepared.bit_depth = Some(16);
 
         let planned = plan_request_for_track(
