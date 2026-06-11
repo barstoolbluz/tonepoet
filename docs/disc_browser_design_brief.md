@@ -255,6 +255,21 @@ selected stream:
 - Format/rate/depth pills in the output pane work as normal
 - Queue button enqueues with the selected stream
 
+**Single-stream discs** (no picker needed):
+When a disc has only one audio stream (e.g., Hawks & Doves with one
+stereo group, or a stereo-only SACD), the stream picker adds friction
+for no reason. The UX should detect this and skip the selection step:
+- Info pane shows the stream summary but no "Audio Streams" pill
+  (or shows it disabled/greyed)
+- Context menu shows "Convert" directly, no "Convert Stream" submenu
+- Right-click → "Convert" goes straight to the Convert screen
+- Convert screen source pane shows the stream info but no Stream pill
+  (nothing to switch to)
+- The disc is treated like a regular file from an interaction standpoint
+
+The stream picker only appears when there are 2+ extractable audio
+streams. This keeps simple discs simple.
+
 **Direct convert** (no stream selection):
 - If user selects "Convert (default stream)" or drags an ISO to the
   Convert screen without choosing a stream, the materializer uses
