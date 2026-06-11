@@ -1172,9 +1172,7 @@ fn run_dvda_info(path: &std::path::Path) -> anyhow::Result<()> {
         let duration_str = tonepoet::disc::format_duration(duration_secs);
 
         let (codec_prefix, rate_str, depth_str, ch_str) = if let Some(ref p) = probe {
-            let ch_label = tonepoet::disc::channel_layout_label(
-                p.channel_assignment_code, p.channels,
-            );
+            let ch_label = p.channel_label.clone();
             (
                 format!("{} ", p.codec),
                 tonepoet::disc::format_rate(p.sample_rate),

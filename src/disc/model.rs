@@ -97,6 +97,7 @@ pub struct AobProbeResult {
     pub bit_depth: u32,
     pub channels: u8,
     pub channel_assignment_code: u8,
+    pub channel_label: String,
 }
 
 /// Unified browsable representation of an optical disc.

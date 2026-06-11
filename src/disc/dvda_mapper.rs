@@ -76,8 +76,7 @@ pub fn map_dvda_disc(
 
         // Resolve audio format: AOB probe (priority) → IFO/SAMG (fallback)
         let format = if let Some(probe) = probes.get(&group.group_nr) {
-            let ch_label =
-                labels::channel_layout_label(probe.channel_assignment_code, probe.channels);
+            let ch_label = probe.channel_label.clone();
             diagnostics.push(DiscDiagnostic {
                 severity: DiagnosticSeverity::Info,
                 scope: DiagnosticScope::Presentation(group_id.clone()),

@@ -122,11 +122,12 @@ pub fn probe_group_aob_format_with_path(
     // MLP major sync scan has enough data (some streams don't place the
     // major sync in the very first access unit frame).
     let reader = AobSectorReader::new(volume, &title_set.aobs);
-    let sector_data = reader
+    let from_aob = reader
         .read_blocks(first_sector, 8)
         .or_else(|_| reader.read_blocks(first_sector, 1))
-        .ok()
-        .or_else(|| {
+        .ok();
+    let cross_ats = from_aob.is_none();
+    let sector_data = from_aob.or_else(|| {
             // Title set has no AOBs (e.g., ATS 2 on discs where all audio
             // lives within ATS 1's AOB files). Compute the disc-absolute
             // sector from AOTT atsi_mat_sector + ATSI atstt_vobs, and read
@@ -181,12 +182,17 @@ pub fn probe_group_aob_format_with_path(
                         if let Some(pcm) = packet.sub_header.pcm.as_ref() {
                             if let (Some(rate), Some(bits)) = (pcm.group1_sample_rate, pcm.group1_bits) {
                                 if let Some(ca) = channel_assignment(pcm.channel_assignment) {
+                                    let ch_label = super::labels::channel_layout_label(
+                                        pcm.channel_assignment,
+                                        ca.group1_channels + ca.group2_channels,
+                                    );
                                     pcm_result = Some(AobProbeResult {
                                         codec: "LPCM",
                                         sample_rate: rate,
                                         bit_depth: bits,
                                         channels: ca.group1_channels + ca.group2_channels,
                                         channel_assignment_code: pcm.channel_assignment,
+                                        channel_label: ch_label,
                                     });
                                 }
                             }
@@ -207,12 +213,21 @@ pub fn probe_group_aob_format_with_path(
         DvdaSubstreamKind::Pcm => pcm_result,
         DvdaSubstreamKind::Mlp => {
             let info = probe_mlp_major_sync(&mlp_payload)?;
+            let ch_label = if cross_ats && info.num_substreams > 1 {
+                "Stereo (downmix)".to_string()
+            } else {
+                super::labels::channel_layout_label(
+                    info.channel_arrangement as u8,
+                    info.channel_count as u8,
+                )
+            };
             Some(AobProbeResult {
                 codec: "MLP",
                 sample_rate: info.group1_sample_rate,
                 bit_depth: info.group1_bits,
                 channels: info.channel_count as u8,
                 channel_assignment_code: info.channel_arrangement as u8,
+                channel_label: ch_label,
             })
         }
         _ => None,
