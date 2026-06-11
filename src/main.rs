@@ -1146,14 +1146,28 @@ fn run_dvda_info(path: &std::path::Path) -> anyhow::Result<()> {
 
     // Display each group
     for group in &disc.groups {
-        let (rate_str, depth_str, ch_str) = group_format_summary(&disc, group);
+        let probe = probe_group_aob_format(volume.as_ref(), &disc, group);
         let tracks = group_track_count(&disc, group);
         let duration_secs = group_duration_secs(&disc, group);
         let duration_str = format_duration(duration_secs);
 
+        let (codec_prefix, rate_str, depth_str, ch_str) = if let Some(ref p) = probe {
+            let ch_label = channel_label_from_code(p.channel_assignment_code, p.channels);
+            (
+                format!("{} ", p.codec),
+                format_sample_rate(p.sample_rate),
+                format!("{}-bit", p.bit_depth),
+                ch_label,
+            )
+        } else {
+            let (r, d, c) = group_format_summary(&disc, group);
+            (String::new(), r, d, c)
+        };
+
         println!(
-            "  Group {}: {}/{} {} ({} track{}, {})",
+            "  Group {}: {}{}/{} {} ({} track{}, {})",
             group.group_nr,
+            codec_prefix,
             rate_str,
             depth_str,
             ch_str,
@@ -1164,6 +1178,102 @@ fn run_dvda_info(path: &std::path::Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+struct AobProbeResult {
+    codec: &'static str,
+    sample_rate: u32,
+    bit_depth: u32,
+    channels: u8,
+    channel_assignment_code: u8,
+}
+
+/// Probe the first AOB sector of a group's first track to determine the actual
+/// codec (MLP vs LPCM) and audio format from the stream itself.
+/// Returns `None` if AOBs are unavailable, the group has no title_refs, or
+/// demuxing fails — the caller falls back to IFO/SAMG metadata.
+fn probe_group_aob_format(
+    volume: &dyn tonepoet::tui::dvda::DvdaVolume,
+    disc: &tonepoet::tui::dvda::DvdaDisc,
+    group: &tonepoet::tui::dvda::DvdaGroup,
+) -> Option<AobProbeResult> {
+    use tonepoet::convert::pipeline::{parse_private_stream_1_packets, DvdaSubstreamKind};
+    use tonepoet::convert::pipeline::probe_mlp_major_sync;
+    use tonepoet::tui::dvda::sector::AobSectorReader;
+    use tonepoet::tui::dvda::TitleRefKind;
+
+    // Resolve first title_ref → title_set → title → first chapter → first sector
+    let title_ref = group.title_refs.first()?;
+    let title_set = disc
+        .title_sets
+        .iter()
+        .find(|ts| ts.number == title_ref.title_set_nr)?;
+    let title = match title_ref.kind {
+        TitleRefKind::AottTitleOrdinal => title_set
+            .titles
+            .iter()
+            .find(|t| t.title_ordinal == title_ref.title_nr),
+        TitleRefKind::AtsPgcTitleNr => title_set
+            .titles
+            .iter()
+            .find(|t| t.title_nr == title_ref.title_nr),
+    }?;
+    let chapter = title.chapters.first()?;
+    let first_sector = chapter.sector_ranges.first()?.first;
+
+    // Read one sector from the AOB
+    let reader = AobSectorReader::new(volume, &title_set.aobs);
+    let sector_data = reader.read_blocks(first_sector, 1).ok()?;
+
+    // Demux the sector
+    let packets = parse_private_stream_1_packets(&sector_data).ok()?;
+    let packet = packets.first()?;
+
+    match packet.sub_header.kind() {
+        DvdaSubstreamKind::Pcm => {
+            let pcm = packet.sub_header.pcm.as_ref()?;
+            let rate = pcm.group1_sample_rate?;
+            let bits = pcm.group1_bits?;
+            let ca = tonepoet::tui::dvda::channel_assignment(pcm.channel_assignment)?;
+            Some(AobProbeResult {
+                codec: "LPCM",
+                sample_rate: rate,
+                bit_depth: bits,
+                channels: ca.group1_channels + ca.group2_channels,
+                channel_assignment_code: pcm.channel_assignment,
+            })
+        }
+        DvdaSubstreamKind::Mlp => {
+            let info = probe_mlp_major_sync(packet.payload)?;
+            Some(AobProbeResult {
+                codec: "MLP",
+                sample_rate: info.group1_sample_rate,
+                bit_depth: info.group1_bits,
+                channels: info.channel_count as u8,
+                channel_assignment_code: info.channel_arrangement as u8,
+            })
+        }
+        DvdaSubstreamKind::Unknown(_) => None,
+    }
+}
+
+/// Derive a channel layout label from a DVD-Audio channel assignment code.
+fn channel_label_from_code(code: u8, total_channels: u8) -> String {
+    if let Some(ca) = tonepoet::tui::dvda::channel_assignment(code) {
+        let total = ca.group1_channels + ca.group2_channels;
+        let has_lfe = ca.group2.contains(&"LFE");
+        if total == 1 {
+            "Mono".to_string()
+        } else if total == 2 && !has_lfe {
+            "Stereo".to_string()
+        } else if has_lfe {
+            format!("{}.1", total - 1)
+        } else {
+            format!("{}.0", total)
+        }
+    } else {
+        format!("{}ch", total_channels)
+    }
 }
 
 /// Derive sample rate, bit depth, and channel layout strings for a group.
@@ -1249,19 +1359,7 @@ fn group_format_summary(
     };
 
     let ch_str = match best_assignment {
-        Some(ca) => {
-            let total = ca.group1_channels + ca.group2_channels;
-            let has_lfe = ca.group2.contains(&"LFE");
-            if total == 1 {
-                "Mono".to_string()
-            } else if total == 2 && !has_lfe {
-                "Stereo".to_string()
-            } else if has_lfe {
-                format!("{}.1", total - 1)
-            } else {
-                format!("{}.0", total)
-            }
-        }
+        Some(ca) => channel_label_from_code(ca.code, ca.group1_channels + ca.group2_channels),
         None => "Unknown".to_string(),
     };
 

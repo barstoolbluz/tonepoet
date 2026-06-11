@@ -230,6 +230,16 @@ pub fn inspect_mlp_file_with_options(
     inspect_mlp_reader(&mut reader, expectation, options)
 }
 
+/// Probe raw MLP payload bytes (from the first sector of a track) for a major
+/// sync header. Returns format info if found, `None` if the payload is too
+/// short or lacks a major sync. Intended for lightweight disc-info probing.
+pub fn probe_mlp_major_sync(mlp_payload: &[u8]) -> Option<MlpMajorSyncInfo> {
+    if !frame_has_major_sync(mlp_payload) {
+        return None;
+    }
+    parse_mlp_major_sync(&mlp_payload[MLP_MAJOR_SYNC_OFFSET..], 0).ok()
+}
+
 #[cfg(test)]
 fn inspect_mlp_bytes_with_options(
     bytes: &[u8],

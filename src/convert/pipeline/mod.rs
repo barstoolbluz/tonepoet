@@ -56,6 +56,9 @@ pub use stages::*;
 pub use tool::*;
 pub use types::*;
 
+// Re-export DVD-Audio probe items for dvda-info CLI subcommand.
+pub use dvda_demux::{parse_private_stream_1_packets, DvdaSubstreamKind};
+pub use dvda_mlp::{probe_mlp_major_sync, MlpMajorSyncInfo};
 
 #[cfg(test)]
 mod tests {
