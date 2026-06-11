@@ -107,6 +107,10 @@ pub enum TuiButton {
     SourceExpandButton,
     // Convert screen: "analyze" pill on source pane → runs audio analysis.
     SourceAnalyzeButton,
+    // Convert screen: stream pill left arrow (previous presentation).
+    SourceStreamPrev,
+    // Convert screen: stream pill right arrow (next presentation).
+    SourceStreamNext,
     // Convert screen: "enqueue" pill → :commit (queue only).
     SourceEnqueueButton,
     // Convert screen: "enqueue + start" pill → :Commit (queue + start).
@@ -295,6 +299,8 @@ impl TuiButton {
             | Self::SourceBrowseButton
             | Self::SourceExpandButton
             | Self::SourceAnalyzeButton
+            | Self::SourceStreamPrev
+            | Self::SourceStreamNext
             | Self::SourceEnqueueButton
             | Self::SourceEnqueueStartButton
             | Self::TemplateBuildFolderButton

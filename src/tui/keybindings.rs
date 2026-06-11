@@ -309,6 +309,22 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             open_convert_cursor_metadata_editor(app);
         }
 
+        // Source pane: stream pill cycling (Left/Right) for multi-presentation discs.
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Source
+                && !app.convert.is_collapsed(ConvertFocus::Source)
+                && matches!(&app.convert.source.mode, SourceMode::MultiTrack { disc_contents: Some(ref dc), .. } if dc.presentations.len() >= 2) =>
+        {
+            cycle_stream_pill(app, false);
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Source
+                && !app.convert.is_collapsed(ConvertFocus::Source)
+                && matches!(&app.convert.source.mode, SourceMode::MultiTrack { disc_contents: Some(ref dc), .. } if dc.presentations.len() >= 2) =>
+        {
+            cycle_stream_pill(app, true);
+        }
+
         // Format pane navigation.
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format
@@ -11097,6 +11113,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 let cmd = super::command::Command::Analyze { force: false };
                 super::command::execute_command(app, cmd, tx);
             }
+            TuiButton::SourceStreamPrev => {
+                cycle_stream_pill(app, false);
+            }
+            TuiButton::SourceStreamNext => {
+                cycle_stream_pill(app, true);
+            }
             TuiButton::SourceEnqueueButton => {
                 let cmd = super::command::Command::Commit { start: false };
                 super::command::execute_command(app, cmd, tx);
@@ -11723,6 +11745,51 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 // Handled in dedicated mouse/overlay handlers; no-op here.
             }
         }
+    }
+}
+
+/// Cycle the Convert screen's stream pill to the previous or next presentation.
+fn cycle_stream_pill(app: &mut super::app::AppState, forward: bool) {
+    use super::app::SourceMode;
+
+    // Clone disc_contents and selected_presentation_id out of the current mode
+    // before dropping the borrow (we need &mut app for set_source_mode).
+    let (contents, current_id) = match &app.convert.source.mode {
+        SourceMode::MultiTrack {
+            disc_contents: Some(dc),
+            selected_presentation_id,
+            ..
+        } if dc.presentations.len() >= 2 => {
+            ((**dc).clone(), selected_presentation_id.clone())
+        }
+        _ => return,
+    };
+
+    let current_index = current_id
+        .and_then(|id| contents.presentations.iter().position(|p| p.id == id))
+        .unwrap_or(0);
+
+    let count = contents.presentations.len();
+    let new_index = if forward {
+        (current_index + 1) % count
+    } else {
+        (current_index + count - 1) % count
+    };
+
+    if new_index == current_index {
+        return;
+    }
+
+    let label = contents
+        .presentations
+        .get(new_index)
+        .map(|p| p.label.clone())
+        .unwrap_or_default();
+
+    if let Err(e) = super::disc_browser_actions::switch_disc_presentation(app, contents, new_index) {
+        app.set_status(format!("Stream switch failed: {}", e));
+    } else {
+        app.set_status(format!("Stream: {}", label));
     }
 }
 

@@ -152,6 +152,8 @@ pub fn draw_source_pane(
             scroll,
             cursor,
             selected,
+            disc_contents,
+            selected_presentation_id,
             ..
         } => render_multi_track(
             border_color,
@@ -167,6 +169,8 @@ pub fn draw_source_pane(
             *cursor,
             selected,
             area.height,
+            disc_contents.as_deref(),
+            selected_presentation_id.as_ref(),
         ),
         SourceMode::Batch {
             paths,
@@ -788,6 +792,8 @@ fn render_multi_track<'a>(
     cursor: usize,
     selected: &[bool],
     pane_height: u16,
+    disc_contents: Option<&crate::disc::DiscContents>,
+    selected_presentation_id: Option<&crate::disc::PresentationId>,
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -800,7 +806,31 @@ fn render_multi_track<'a>(
             Style::default().fg(Color::White),
         ),
     ];
-    if let Some(area) = area_label {
+    let has_stream_pill = disc_contents
+        .map(|dc| dc.presentations.len() >= 2)
+        .unwrap_or(false);
+
+    if has_stream_pill {
+        // Find the label for the currently selected presentation
+        let current_label = disc_contents
+            .and_then(|dc| {
+                selected_presentation_id.and_then(|sel_id| {
+                    dc.presentations
+                        .iter()
+                        .find(|p| &p.id == sel_id)
+                        .map(|p| p.label.as_str())
+                })
+            })
+            .or(area_label)
+            .unwrap_or("Unknown");
+        header_spans.push(Span::styled(
+            format!("  [◀ {} ▶]", current_label),
+            Style::default()
+                .fg(super::theme::PILL_ACTIVE_FG)
+                .bg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+    } else if let Some(area) = area_label {
         header_spans.push(Span::styled(
             format!("  [{}]", area),
             Style::default().fg(Color::Cyan),

@@ -1023,6 +1023,11 @@ impl SourceMode {
                     }
 
                     let track_count = tracks.len();
+                    let disc_model = crate::disc::sacd_mapper::map_sacd_disc(
+                        &sacd,
+                        sidecar.as_ref(),
+                        &path,
+                    );
                     return Self::MultiTrack {
                         path,
                         info,
@@ -1035,7 +1040,7 @@ impl SourceMode {
                         scroll: 0,
                         cursor: 0,
                         selected: vec![true; track_count],
-                        disc_contents: None,
+                        disc_contents: Some(Box::new(disc_model)),
                         selected_presentation_id: Some(crate::disc::PresentationId::SacdArea(
                             if area_label == "Stereo" {
                                 crate::disc::SacdAreaId::Stereo

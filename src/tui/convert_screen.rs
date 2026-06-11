@@ -184,6 +184,26 @@ fn register_source_buttons(app: &mut AppState, area: Rect) {
             }
         }
     }
+
+    // Stream pill click targets on the header line for multi-presentation discs.
+    if let super::app::SourceMode::MultiTrack {
+        disc_contents: Some(ref dc),
+        ..
+    } = app.convert.source.mode
+    {
+        if dc.presentations.len() >= 2 {
+            let header_y = area.y + 1;
+            let third = inner_w / 3;
+            buttons.record_button(
+                TuiButton::SourceStreamPrev,
+                Rect::new(area.x + 1 + inner_w - third * 2, header_y, third, 1),
+            );
+            buttons.record_button(
+                TuiButton::SourceStreamNext,
+                Rect::new(area.x + 1 + inner_w - third, header_y, third, 1),
+            );
+        }
+    }
 }
 
 fn register_metadata_buttons(app: &mut AppState, area: Rect) {

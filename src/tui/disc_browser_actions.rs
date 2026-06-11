@@ -365,18 +365,14 @@ pub fn handle_disc_browser_key(app: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// Load one presentation into the Convert screen using `SourceMode::MultiTrack`.
-pub fn load_disc_presentation_for_convert(
+/// Switch the Convert screen to a different disc presentation, rebuilding
+/// the source mode and cascading format defaults. Does not change the
+/// active screen or dismiss overlays.
+pub fn switch_disc_presentation(
     app: &mut AppState,
     contents: DiscContents,
     presentation_index: usize,
 ) -> Result<(), String> {
-    let presentation = contents
-        .presentations
-        .get(presentation_index)
-        .ok_or_else(|| format!("No disc stream at index {}", presentation_index + 1))?
-        .clone();
-
     let mut metadata = metadata_for_disc(&contents);
     if metadata.album.is_none() && !contents.label.trim().is_empty() {
         metadata.album = Some(contents.label.clone());
@@ -388,10 +384,27 @@ pub fn load_disc_presentation_for_convert(
     app.convert.metadata.genre = metadata.genre.clone();
     app.convert.metadata.year = metadata.year.clone();
 
-    let source_path = contents.source_path.clone();
     let source = source_mode_for_presentation(contents, presentation_index, metadata)?;
     app.convert.set_source_mode(source);
     app.convert.apply_source_defaults();
+    Ok(())
+}
+
+/// Load one presentation into the Convert screen using `SourceMode::MultiTrack`.
+pub fn load_disc_presentation_for_convert(
+    app: &mut AppState,
+    contents: DiscContents,
+    presentation_index: usize,
+) -> Result<(), String> {
+    let presentation = contents
+        .presentations
+        .get(presentation_index)
+        .ok_or_else(|| format!("No disc stream at index {}", presentation_index + 1))?
+        .clone();
+    let source_path = contents.source_path.clone();
+
+    switch_disc_presentation(app, contents, presentation_index)?;
+
     app.current_screen = AppScreen::Convert;
     app.active_overlay = ActiveOverlay::None;
     app.browse.return_target = crate::tui::browse::BrowseReturnTarget::None;
