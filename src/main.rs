@@ -127,6 +127,15 @@ enum Commands {
         /// Disable feature generation (log/CUE sidecars)
         #[arg(long)]
         no_features: bool,
+
+        // ---- DVD-Audio flags ----
+        /// DVD-Audio group/stream selection (1-9, all, stereo, multichannel, hires)
+        #[arg(long = "dvda-group")]
+        dvda_group: Option<String>,
+
+        /// Treat DVD-Audio disc as already decrypted (skip CPPM probe)
+        #[arg(long = "dvda-assume-decrypted")]
+        dvda_assume_decrypted: bool,
     },
 
     /// Launch full interactive TUI
@@ -162,6 +171,13 @@ enum Commands {
         /// Show config file path
         #[arg(long)]
         path: bool,
+    },
+
+    /// Probe a DVD-Audio ISO or directory and print disc structure
+    DvdaInfo {
+        /// Path to a DVD-Audio ISO image or a directory containing AUDIO_TS/
+        #[arg(required = true)]
+        path: PathBuf,
     },
 
     /// Tag audio files or an SACD ISO from MusicBrainz, headless.
@@ -258,6 +274,8 @@ async fn main() -> anyhow::Result<()> {
             folder_naming,
             no_metadata,
             no_features,
+            dvda_group,
+            dvda_assume_decrypted,
         } => {
             run_convert(
                 paths,
@@ -285,6 +303,8 @@ async fn main() -> anyhow::Result<()> {
                 folder_naming,
                 no_metadata,
                 no_features,
+                dvda_group,
+                dvda_assume_decrypted,
                 &config,
             )
             .await?;
@@ -297,6 +317,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Config { show, reset, path } => {
             run_config(show, reset, path, &config)?;
+        }
+        Commands::DvdaInfo { path } => {
+            run_dvda_info(&path)?;
         }
         Commands::TagsMb {
             paths,
@@ -379,6 +402,26 @@ fn parse_replaygain_mode(s: &str) -> Option<tonepoet::convert::simple_wizard::Re
     }
 }
 
+fn parse_dvda_group(s: &str) -> tonepoet::convert::pipeline::DvdaGroupSelection {
+    use tonepoet::convert::pipeline::DvdaGroupSelection;
+    match s.to_lowercase().as_str() {
+        "all" => DvdaGroupSelection::All,
+        "stereo" => DvdaGroupSelection::PreferStereo,
+        "multichannel" | "multi" | "mc" => DvdaGroupSelection::PreferMultichannel,
+        "hires" | "highres" => DvdaGroupSelection::PreferHighestResolution,
+        other => match other.parse::<u8>() {
+            Ok(n) if n >= 1 => DvdaGroupSelection::Group(n),
+            _ => {
+                eprintln!(
+                    "Warning: unknown --dvda-group value '{}', using default",
+                    s
+                );
+                DvdaGroupSelection::Default
+            }
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_convert(
     paths: Vec<PathBuf>,
@@ -406,6 +449,8 @@ async fn run_convert(
     folder_naming: Option<String>,
     no_metadata: bool,
     no_features: bool,
+    dvda_group: Option<String>,
+    dvda_assume_decrypted: bool,
     config: &TonepoetConfig,
 ) -> anyhow::Result<()> {
     // Load preset if specified
@@ -530,6 +575,8 @@ async fn run_convert(
         folder_naming.as_deref(),
         no_metadata,
         no_features,
+        dvda_group.as_deref(),
+        dvda_assume_decrypted,
     );
 
     // Build processor
@@ -754,6 +801,8 @@ fn build_pipeline_request_template(
     folder_naming: Option<&str>,
     no_metadata: bool,
     no_features: bool,
+    dvda_group: Option<&str>,
+    dvda_assume_decrypted: bool,
 ) -> Option<tonepoet::convert::pipeline::PipelineRequest> {
     use std::collections::BTreeSet;
     use tonepoet::convert::pipeline::*;
@@ -768,7 +817,9 @@ fn build_pipeline_request_template(
         || naming.is_some()
         || folder_naming.is_some()
         || no_metadata
-        || no_features;
+        || no_features
+        || dvda_group.is_some()
+        || dvda_assume_decrypted;
 
     if !has_pipeline_flags {
         return None;
@@ -819,8 +870,10 @@ fn build_pipeline_request_template(
                 .map(|p| SecretString::new(p.clone())),
             sacd_area,
             dvda_group: None,
-            dvda_group_selection: DvdaGroupSelection::Default,
-            dvda_assume_decrypted: false,
+            dvda_group_selection: dvda_group
+                .map(parse_dvda_group)
+                .unwrap_or(DvdaGroupSelection::Default),
+            dvda_assume_decrypted,
             cue_sidecar: cue_policy,
             track_selection,
         },
@@ -999,6 +1052,328 @@ async fn run_wizard(_config: &TonepoetConfig) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_dvda_info(path: &std::path::Path) -> anyhow::Result<()> {
+    use tonepoet::tui::dvda::*;
+
+    if !path.exists() {
+        anyhow::bail!("Path does not exist: {}", path.display());
+    }
+
+    // Open volume: directory or ISO (try UDF first, then ISO9660)
+    let volume: Box<dyn DvdaVolume> = if path.is_dir() {
+        // Check for AUDIO_TS.IFO in common locations
+        let candidates = [
+            path.join("AUDIO_TS").join("AUDIO_TS.IFO"),
+            path.join("audio_ts").join("audio_ts.ifo"),
+            path.join("AUDIO_TS.IFO"),
+            path.join("audio_ts.ifo"),
+        ];
+        let has_amg = candidates.iter().any(|c| c.exists());
+        if !has_amg {
+            anyhow::bail!(
+                "Not a DVD-Audio directory: no AUDIO_TS.IFO found in {}",
+                path.display()
+            );
+        }
+        Box::new(DirectoryDvdaVolume::new(path.to_path_buf()))
+    } else {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !ext.eq_ignore_ascii_case("iso") {
+            anyhow::bail!(
+                "Expected a .iso file or directory, got: {}",
+                path.display()
+            );
+        }
+        if let Ok(vol) = IsoUdfDvdaVolume::open(path) {
+            Box::new(vol)
+        } else if let Ok(vol) = Iso9660DvdaVolume::open(path) {
+            Box::new(vol)
+        } else {
+            anyhow::bail!(
+                "Could not open {} as a DVD-Audio ISO (neither UDF nor ISO9660 readable)",
+                path.display()
+            );
+        }
+    };
+
+    // Parse disc structure
+    let mut disc = parse_dvda_volume(volume.as_ref())
+        .map_err(|e| anyhow::anyhow!("DVD-Audio parse failed: {}", e))?;
+
+    // Refine copy protection with AOB probe
+    let _ = refine_copy_protection_from_aob_probe(volume.as_ref(), &mut disc, false);
+
+    // Display header
+    let filename = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_else(|| path.to_str().unwrap_or("?"));
+
+    let total_groups = disc.groups.len();
+    let total_tracks: usize = disc.groups.iter().map(|g| group_track_count(&disc, g)).sum();
+
+    println!("{}", filename);
+    println!(
+        "DVD-Audio · {} group{} · {} track{}",
+        total_groups,
+        if total_groups == 1 { "" } else { "s" },
+        total_tracks,
+        if total_tracks == 1 { "" } else { "s" },
+    );
+
+    // Copy protection
+    let cp = &disc.copy_protection;
+    let cp_status = match &cp.source {
+        CopyProtectionSource::MkbPresence => {
+            if cp.mkb_present {
+                "MKB present (no AOB probe)"
+            } else {
+                "None"
+            }
+        }
+        CopyProtectionSource::MkbPresentAobProbeReadable => "MKB present, AOBs readable",
+        CopyProtectionSource::AobProbeNoMpegPs => "MKB present, AOBs NOT readable (CPPM encrypted)",
+        CopyProtectionSource::AssumeDecryptedOverride => "MKB present, assumed decrypted (override)",
+        CopyProtectionSource::NotDetected => "None",
+    };
+    println!("Copy protection: {}", cp_status);
+    println!();
+
+    // Display each group
+    for group in &disc.groups {
+        let (rate_str, depth_str, ch_str) = group_format_summary(&disc, group);
+        let tracks = group_track_count(&disc, group);
+        let duration_secs = group_duration_secs(&disc, group);
+        let duration_str = format_duration(duration_secs);
+
+        println!(
+            "  Group {}: {}/{} {} ({} track{}, {})",
+            group.group_nr,
+            rate_str,
+            depth_str,
+            ch_str,
+            tracks,
+            if tracks == 1 { "" } else { "s" },
+            duration_str,
+        );
+    }
+
+    Ok(())
+}
+
+/// Derive sample rate, bit depth, and channel layout strings for a group.
+fn group_format_summary(
+    disc: &tonepoet::tui::dvda::DvdaDisc,
+    group: &tonepoet::tui::dvda::DvdaGroup,
+) -> (String, String, String) {
+    use tonepoet::tui::dvda::*;
+
+    let mut rates: Vec<u32> = Vec::new();
+    let mut depths: Vec<u8> = Vec::new();
+    let mut best_assignment: Option<&ChannelAssignment> = None;
+
+    // Walk title_refs → title_set → audio_formats
+    for title_ref in &group.title_refs {
+        let Some(ts) = disc.title_sets.iter().find(|ts| ts.number == title_ref.title_set_nr) else {
+            continue;
+        };
+        let present: Vec<&AudioAttributes> =
+            ts.audio_formats.iter().filter(|a| a.present).collect();
+        // Only observe single-present-format title sets (same as group_audio_profile)
+        if let [attr] = present.as_slice() {
+            let cf = &attr.channel_format;
+            if let Some(r) = cf.group1_sample_rate.or(cf.group2_sample_rate) {
+                if !rates.contains(&r) {
+                    rates.push(r);
+                }
+            }
+            if let Some(d) = cf.group1_bits.or(cf.group2_bits) {
+                if !depths.contains(&d) {
+                    depths.push(d);
+                }
+            }
+            if let Some(ref ca) = attr.channel_assignment {
+                best_assignment = Some(ca);
+            }
+        }
+        // Multi-format title sets: skip here, fall through to SAMG
+    }
+
+    // Walk SAMG tracks when title_refs didn't resolve format info
+    // (SAMG-only groups or multi-format title sets)
+    if rates.is_empty() && depths.is_empty() && best_assignment.is_none() {
+        if let Some(samg) = disc.samg.as_ref() {
+            for samg_ref in &group.samg_tracks {
+                if let Some(track) = samg.tracks.iter().find(|t| {
+                    t.ordinal == samg_ref.samg_ordinal
+                        && t.group_nr == samg_ref.group_nr
+                        && t.track_nr == samg_ref.track_nr
+                }) {
+                    let cf = &track.channel_format;
+                    if let Some(r) = cf.group1_sample_rate.or(cf.group2_sample_rate) {
+                        if !rates.contains(&r) {
+                            rates.push(r);
+                        }
+                    }
+                    if let Some(d) = cf.group1_bits.or(cf.group2_bits) {
+                        if !depths.contains(&d) {
+                            depths.push(d);
+                        }
+                    }
+                    if let Some(ref ca) = track.channel_assignment {
+                        best_assignment = Some(ca);
+                    }
+                }
+            }
+        }
+    }
+
+    let rate_str = match rates.len() {
+        0 => "Unknown".to_string(),
+        1 => format_sample_rate(rates[0]),
+        _ => rates.iter().map(|r| format_sample_rate(*r)).collect::<Vec<_>>().join("/"),
+    };
+
+    let depth_str = match depths.len() {
+        0 => "Unknown".to_string(),
+        1 => format!("{}-bit", depths[0]),
+        _ => {
+            let parts: Vec<String> = depths.iter().map(|d| d.to_string()).collect();
+            format!("{}-bit", parts.join("/"))
+        }
+    };
+
+    let ch_str = match best_assignment {
+        Some(ca) => {
+            let total = ca.group1_channels + ca.group2_channels;
+            let has_lfe = ca.group2.contains(&"LFE");
+            if total == 1 {
+                "Mono".to_string()
+            } else if total == 2 && !has_lfe {
+                "Stereo".to_string()
+            } else if has_lfe {
+                format!("{}.1", total - 1)
+            } else {
+                format!("{}.0", total)
+            }
+        }
+        None => "Unknown".to_string(),
+    };
+
+    (rate_str, depth_str, ch_str)
+}
+
+fn group_track_count(
+    disc: &tonepoet::tui::dvda::DvdaDisc,
+    group: &tonepoet::tui::dvda::DvdaGroup,
+) -> usize {
+    use tonepoet::tui::dvda::TitleRefKind;
+
+    if !group.title_refs.is_empty() {
+        let mut count = 0usize;
+        for title_ref in &group.title_refs {
+            let Some(ts) = disc.title_sets.iter().find(|ts| ts.number == title_ref.title_set_nr)
+            else {
+                continue;
+            };
+            let title = match title_ref.kind {
+                TitleRefKind::AottTitleOrdinal => {
+                    ts.titles.iter().find(|t| t.title_ordinal == title_ref.title_nr)
+                }
+                TitleRefKind::AtsPgcTitleNr => {
+                    ts.titles.iter().find(|t| t.title_nr == title_ref.title_nr)
+                }
+            };
+            if let Some(t) = title {
+                count += t.chapters.len();
+            }
+        }
+        if count > 0 {
+            return count;
+        }
+    }
+    // SAMG-only or fallback
+    if !group.samg_tracks.is_empty() {
+        return group.samg_tracks.len();
+    }
+    // Last resort: AOTT table
+    disc.amg
+        .audio_title_table
+        .iter()
+        .find(|e| e.ordinal == u16::from(group.group_nr))
+        .map(|e| usize::from(e.track_count))
+        .unwrap_or(0)
+}
+
+fn group_duration_secs(
+    disc: &tonepoet::tui::dvda::DvdaDisc,
+    group: &tonepoet::tui::dvda::DvdaGroup,
+) -> f64 {
+    use tonepoet::tui::dvda::TitleRefKind;
+    const PTS_PER_SEC: f64 = 90_000.0;
+
+    let mut total_pts: u64 = 0;
+
+    if !group.title_refs.is_empty() {
+        for title_ref in &group.title_refs {
+            let Some(ts) = disc.title_sets.iter().find(|ts| ts.number == title_ref.title_set_nr)
+            else {
+                continue;
+            };
+            let title = match title_ref.kind {
+                TitleRefKind::AottTitleOrdinal => {
+                    ts.titles.iter().find(|t| t.title_ordinal == title_ref.title_nr)
+                }
+                TitleRefKind::AtsPgcTitleNr => {
+                    ts.titles.iter().find(|t| t.title_nr == title_ref.title_nr)
+                }
+            };
+            if let Some(t) = title {
+                for ch in &t.chapters {
+                    total_pts += u64::from(ch.len_in_pts);
+                }
+            }
+        }
+        if total_pts > 0 {
+            return total_pts as f64 / PTS_PER_SEC;
+        }
+    }
+
+    // SAMG fallback
+    if let Some(samg) = disc.samg.as_ref() {
+        for samg_ref in &group.samg_tracks {
+            if let Some(track) = samg.tracks.iter().find(|t| {
+                t.ordinal == samg_ref.samg_ordinal
+                    && t.group_nr == samg_ref.group_nr
+                    && t.track_nr == samg_ref.track_nr
+            }) {
+                total_pts += u64::from(track.len_in_pts);
+            }
+        }
+    }
+
+    total_pts as f64 / PTS_PER_SEC
+}
+
+fn format_sample_rate(rate: u32) -> String {
+    if rate % 1000 == 0 {
+        format!("{}kHz", rate / 1000)
+    } else {
+        let khz = rate as f64 / 1000.0;
+        format!("{}kHz", khz)
+    }
+}
+
+fn format_duration(secs: f64) -> String {
+    let total = secs.round() as u64;
+    let m = total / 60;
+    let s = total % 60;
+    format!("{}:{:02}", m, s)
 }
 
 fn run_check_tools() {
@@ -1758,6 +2133,8 @@ mod pipeline_cli_tests {
             None,
             false,
             false,
+            None,
+            false,
         );
         assert!(result.is_none());
     }
@@ -1780,6 +2157,8 @@ mod pipeline_cli_tests {
             None,
             None,
             false,
+            false,
+            None,
             false,
         )
         .unwrap();
@@ -1806,6 +2185,8 @@ mod pipeline_cli_tests {
             None,
             None,
             false,
+            false,
+            None,
             false,
         )
         .unwrap();
@@ -1834,6 +2215,8 @@ mod pipeline_cli_tests {
             None,
             false,
             false,
+            None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1860,6 +2243,8 @@ mod pipeline_cli_tests {
             None,
             None,
             false,
+            false,
+            None,
             false,
         )
         .unwrap();
@@ -1888,6 +2273,8 @@ mod pipeline_cli_tests {
             None,
             false,
             false,
+            None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1914,6 +2301,8 @@ mod pipeline_cli_tests {
             None,
             None,
             false,
+            false,
+            None,
             false,
         )
         .unwrap();
@@ -1942,6 +2331,8 @@ mod pipeline_cli_tests {
             None,
             false,
             false,
+            None,
+            false,
         )
         .unwrap();
         assert_eq!(req.naming.template, "{nn} - {title}");
@@ -1966,6 +2357,8 @@ mod pipeline_cli_tests {
             None,
             true,
             true,
+            None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1997,11 +2390,207 @@ mod pipeline_cli_tests {
             None,
             false,
             true,
+            None,
+            false,
         )
         .unwrap();
         assert_eq!(
             req.stages.replaygain,
             tonepoet::convert::pipeline::StageRequirement::Disabled
+        );
+    }
+
+    #[test]
+    fn dvda_group_flag_triggers_pipeline_request() {
+        let req = build_pipeline_request_template(
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Some("stereo"),
+            false,
+        );
+        assert!(req.is_some());
+        let req = req.unwrap();
+        assert_eq!(
+            req.source.dvda_group_selection,
+            tonepoet::convert::pipeline::DvdaGroupSelection::PreferStereo
+        );
+    }
+
+    #[test]
+    fn dvda_assume_decrypted_flag_triggers_pipeline_request() {
+        let req = build_pipeline_request_template(
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+        );
+        assert!(req.is_some());
+        assert!(req.unwrap().source.dvda_assume_decrypted);
+    }
+
+    #[test]
+    fn dvda_group_numeric_maps_to_group() {
+        let req = build_pipeline_request_template(
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Some("2"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            req.source.dvda_group_selection,
+            tonepoet::convert::pipeline::DvdaGroupSelection::Group(2)
+        );
+    }
+
+    #[test]
+    fn dvda_group_all_maps_correctly() {
+        let req = build_pipeline_request_template(
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Some("all"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            req.source.dvda_group_selection,
+            tonepoet::convert::pipeline::DvdaGroupSelection::All
+        );
+    }
+}
+
+#[cfg(test)]
+mod dvda_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parse_dvda_group_stereo() {
+        use tonepoet::convert::pipeline::DvdaGroupSelection;
+        assert_eq!(parse_dvda_group("stereo"), DvdaGroupSelection::PreferStereo);
+    }
+
+    #[test]
+    fn parse_dvda_group_multichannel_aliases() {
+        use tonepoet::convert::pipeline::DvdaGroupSelection;
+        assert_eq!(
+            parse_dvda_group("multichannel"),
+            DvdaGroupSelection::PreferMultichannel
+        );
+        assert_eq!(
+            parse_dvda_group("multi"),
+            DvdaGroupSelection::PreferMultichannel
+        );
+        assert_eq!(
+            parse_dvda_group("mc"),
+            DvdaGroupSelection::PreferMultichannel
+        );
+    }
+
+    #[test]
+    fn parse_dvda_group_hires_aliases() {
+        use tonepoet::convert::pipeline::DvdaGroupSelection;
+        assert_eq!(
+            parse_dvda_group("hires"),
+            DvdaGroupSelection::PreferHighestResolution
+        );
+        assert_eq!(
+            parse_dvda_group("highres"),
+            DvdaGroupSelection::PreferHighestResolution
+        );
+    }
+
+    #[test]
+    fn parse_dvda_group_all() {
+        use tonepoet::convert::pipeline::DvdaGroupSelection;
+        assert_eq!(parse_dvda_group("all"), DvdaGroupSelection::All);
+    }
+
+    #[test]
+    fn parse_dvda_group_numeric() {
+        use tonepoet::convert::pipeline::DvdaGroupSelection;
+        assert_eq!(parse_dvda_group("1"), DvdaGroupSelection::Group(1));
+        assert_eq!(parse_dvda_group("9"), DvdaGroupSelection::Group(9));
+    }
+
+    #[test]
+    fn parse_dvda_group_zero_falls_back() {
+        use tonepoet::convert::pipeline::DvdaGroupSelection;
+        assert_eq!(parse_dvda_group("0"), DvdaGroupSelection::Default);
+    }
+
+    #[test]
+    fn parse_dvda_group_unknown_falls_back() {
+        use tonepoet::convert::pipeline::DvdaGroupSelection;
+        assert_eq!(parse_dvda_group("nonsense"), DvdaGroupSelection::Default);
+    }
+
+    #[test]
+    fn parse_dvda_group_case_insensitive() {
+        use tonepoet::convert::pipeline::DvdaGroupSelection;
+        assert_eq!(
+            parse_dvda_group("STEREO"),
+            DvdaGroupSelection::PreferStereo
+        );
+        assert_eq!(parse_dvda_group("ALL"), DvdaGroupSelection::All);
+        assert_eq!(
+            parse_dvda_group("MultiChannel"),
+            DvdaGroupSelection::PreferMultichannel
         );
     }
 }
