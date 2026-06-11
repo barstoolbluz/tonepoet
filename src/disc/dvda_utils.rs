@@ -213,8 +213,10 @@ pub fn probe_group_aob_format_with_path(
         DvdaSubstreamKind::Pcm => pcm_result,
         DvdaSubstreamKind::Mlp => {
             let info = probe_mlp_major_sync(&mlp_payload)?;
-            let ch_label = if cross_ats && info.num_substreams > 1 {
-                "Stereo (downmix)".to_string()
+            let ch_label = if let Some(source_label) =
+                detect_stereo_downmix_source(disc, group, cross_ats, info.channel_count)
+            {
+                format!("Stereo (derived from {})", source_label)
             } else {
                 super::labels::channel_layout_label(
                     info.channel_arrangement as u8,
@@ -459,4 +461,85 @@ pub fn build_dvda_tracks(disc: &DvdaDisc, group: &DvdaGroup) -> Vec<super::model
     }
 
     tracks
+}
+
+/// Detect whether a group is an authored stereo presentation of a multichannel
+/// source. Returns `Some(source_layout_label)` (e.g., `Some("5.1")`) when the
+/// evidence is strong, `None` otherwise.
+///
+/// The heuristic checks for the AOB-less-ATS pattern: the group's title set has
+/// no AOB files, the resolved MLP stream is multichannel, and a sibling group
+/// with matching track count and near-matching duration owns the AOBs.
+fn detect_stereo_downmix_source(
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    cross_ats: bool,
+    mlp_channel_count: u32,
+) -> Option<String> {
+    if !cross_ats || mlp_channel_count <= 2 {
+        return None;
+    }
+
+    let my_tracks = group_track_count(disc, group);
+    let my_duration = group_duration_secs(disc, group);
+    if my_tracks == 0 {
+        return None;
+    }
+
+    // Find a sibling group whose title set owns AOB files, with matching
+    // track count and near-matching duration.
+    for sibling in &disc.groups {
+        if sibling.group_nr == group.group_nr {
+            continue;
+        }
+
+        // Check sibling's title set has existing AOBs
+        let sibling_has_aobs = sibling.title_refs.iter().any(|tr| {
+            disc.title_sets
+                .iter()
+                .find(|ts| ts.number == tr.title_set_nr)
+                .map(|ts| ts.aobs.iter().any(|a| a.exists))
+                .unwrap_or(false)
+        });
+        if !sibling_has_aobs {
+            continue;
+        }
+
+        let sib_tracks = group_track_count(disc, sibling);
+        let sib_duration = group_duration_secs(disc, sibling);
+
+        if sib_tracks != my_tracks || !durations_near_match(my_duration, sib_duration) {
+            continue;
+        }
+
+        // Sibling matches. Get its channel layout from IFO audio_formats.
+        for tr in &sibling.title_refs {
+            if let Some(ts) = disc.title_sets.iter().find(|ts| ts.number == tr.title_set_nr) {
+                let present: Vec<_> = ts.audio_formats.iter().filter(|a| a.present).collect();
+                if let [attr] = present.as_slice() {
+                    if let Some(ref ca) = attr.channel_assignment {
+                        let total = ca.group1_channels + ca.group2_channels;
+                        if total > 2 {
+                            return Some(super::labels::channel_layout_label(ca.code, total));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sibling matched structurally but IFO format couldn't resolve.
+        // Use the probed MLP channel count as fallback.
+        return Some(super::labels::channel_layout_label(
+            0xFF, // unknown code — falls back to "{N}ch"
+            mlp_channel_count as u8,
+        ));
+    }
+
+    None
+}
+
+fn durations_near_match(a: f64, b: f64) -> bool {
+    let diff = (a - b).abs();
+    let max_dur = a.max(b);
+    diff <= max_dur * 0.01 || diff <= 30.0
 }
