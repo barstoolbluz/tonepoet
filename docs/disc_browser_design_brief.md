@@ -7,8 +7,9 @@ lets users inspect optical disc ISOs (DVD-Audio, DVD-Video, Blu-ray, SACD),
 see what presentations/groups/tracks are available, and select what to
 extract — before queuing for conversion.
 
-This brief covers DVD-Audio group selection (immediate need) and lays the
-architectural foundation for DVD-Video and Blu-ray support (future).
+This brief covers DVD-Audio group selection and SACD area selection
+(both immediate — extraction already works for both formats) and lays
+the architectural foundation for DVD-Video and Blu-ray support (future).
 
 ---
 
