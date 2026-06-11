@@ -749,6 +749,10 @@ pub enum SourceMode {
         cursor: usize,
         /// Per-track selection (all true initially).
         selected: Vec<bool>,
+        /// Full parsed disc model for selected disc-stream sources.
+        disc_contents: Option<Box<crate::disc::DiscContents>>,
+        /// Selected presentation id to bridge UI stream selection into pipeline source options.
+        selected_presentation_id: Option<crate::disc::PresentationId>,
     },
     /// A multi-file batch loaded for review. The cursor indexes into
     /// `paths` for the "currently previewed" file, whose probe result
@@ -937,6 +941,19 @@ impl SourceMode {
         metadata: SourceMetadata,
         probe_notice: Option<String>,
     ) -> Self {
+        // DVD-Audio ISO/directory detection. The default path uses stream 0
+        // and preserves the presentation id for conversion option mapping.
+        if crate::disc::dvda_utils::is_dvda_source(&path) {
+            if let Ok(contents) = crate::disc::dvda_utils::map_dvda_source(&path) {
+                if !contents.presentations.is_empty() {
+                    let meta = crate::tui::disc_browser::metadata_for_disc(&contents);
+                    if let Ok(mode) = crate::tui::disc_browser::source_mode_for_presentation(contents, 0, meta) {
+                        return mode;
+                    }
+                }
+            }
+        }
+
         // SACD ISO detection
         if crate::tui::sacd::is_sacd_iso(&path) {
             if let Ok(sacd) = crate::tui::sacd::parse_sacd_iso(&path) {
@@ -1018,6 +1035,14 @@ impl SourceMode {
                         scroll: 0,
                         cursor: 0,
                         selected: vec![true; track_count],
+                        disc_contents: None,
+                        selected_presentation_id: Some(crate::disc::PresentationId::SacdArea(
+                            if area_label == "Stereo" {
+                                crate::disc::SacdAreaId::Stereo
+                            } else {
+                                crate::disc::SacdAreaId::MultiChannel
+                            },
+                        )),
                     };
                 }
             }
@@ -1068,6 +1093,8 @@ impl SourceMode {
                     scroll: 0,
                     cursor: 0,
                     selected: vec![true; track_count],
+                    disc_contents: None,
+                    selected_presentation_id: None,
                 };
             }
         }
@@ -2420,6 +2447,8 @@ pub enum ActiveOverlay {
     BatchList {
         scroll: usize,
     },
+    /// Modal browser for DVD-Audio/SACD presentations.
+    DiscBrowser(Box<crate::tui::disc_browser::DiscBrowserState>),
     /// Context menu triggered by right-click or `m` keybinding.
     /// Stack-based cascade model: each level appears as a panel to the
     /// right of its parent (hexload-tui pattern, generalized to N
@@ -3363,6 +3392,10 @@ pub struct AppState {
     /// clicks don't trigger false double-clicks on different entries.
     pub last_browse_click: Option<(std::path::PathBuf, std::time::Instant)>,
 
+    /// Last Audio Streams overlay row click: (presentation index, click time).
+    /// Used for double-click-to-convert on stream rows.
+    pub last_disc_browser_stream_click: Option<(usize, std::time::Instant)>,
+
     /// Pending rename action: a same-path click outside the double-click window
     /// schedules a rename for `deadline`. A subsequent click before the deadline
     /// cancels the pending rename (e.g. to allow the second click to complete a
@@ -3481,6 +3514,7 @@ impl AppState {
             pending_ctdb_repair: None,
             auto_repair_on_ctdb_complete: false,
             last_browse_click: None,
+            last_disc_browser_stream_click: None,
             pending_browse_rename: None,
             recent,
             bookmarks,
@@ -5572,6 +5606,8 @@ mod source_default_reset_tests {
             scroll: 0,
             cursor: 0,
             selected: vec![true],
+            disc_contents: None,
+            selected_presentation_id: None,
         });
         convert.apply_source_defaults();
 

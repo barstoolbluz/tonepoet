@@ -225,7 +225,20 @@ fn friendly_codec_name(name: &str) -> String {
 }
 
 /// Probe an audio file using ffmpeg-next (in-process, no subprocess)
+
+fn probe_dvda_disc(path: &Path) -> Result<SourceInfo, String> {
+    let contents = crate::disc::dvda_utils::map_dvda_source(path)?;
+    let presentation = contents
+        .presentations
+        .first()
+        .ok_or_else(|| format!("DVD-Audio disc has no audio streams: {}", path.display()))?;
+    Ok(crate::tui::disc_browser::source_info_for_presentation(&contents, presentation))
+}
+
 pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
+    if crate::disc::dvda_utils::is_dvda_source(path) {
+        return probe_dvda_disc(path);
+    }
     // SACD ISOs are ScarletBook-format DSD streams that ffmpeg can't open
     // (it'll either error out on the unrecognised container or mis-detect
     // the leading bytes as ISO9660). Branch up-front: if magic bytes are

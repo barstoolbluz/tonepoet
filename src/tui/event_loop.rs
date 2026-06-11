@@ -457,6 +457,51 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
+        AppMessage::DiscProbeComplete { path, fingerprint, result } => {
+            app.browse.disc_probe_pending.remove(&path);
+            match (fingerprint, *result) {
+                (Some(fingerprint), Ok(contents)) => {
+                    if crate::tui::disc_browser::disc_probe_fingerprint(&path)
+                        .map(|current| current == fingerprint)
+                        .unwrap_or(false)
+                    {
+                        app.browse.disc_probe_cache.insert(
+                            path.clone(),
+                            crate::tui::disc_browser::DiscProbeCacheEntry::from_success(fingerprint, contents),
+                        );
+                        if let Some(followup) = app.browse.disc_probe_followup.remove(&path) {
+                            super::disc_browser_actions::handle_disc_probe_followup(app, &path, followup);
+                        }
+                    }
+                }
+                (Some(fingerprint), Err(error)) => {
+                    if crate::tui::disc_browser::disc_probe_fingerprint(&path)
+                        .map(|current| current == fingerprint)
+                        .unwrap_or(false)
+                    {
+                        app.browse.disc_probe_cache.insert(
+                            path.clone(),
+                            crate::tui::disc_browser::DiscProbeCacheEntry::from_error(fingerprint, error.clone()),
+                        );
+                    }
+                    app.browse.disc_probe_followup.remove(&path);
+                    app.set_status(format!("Disc analysis failed: {error}"));
+                }
+                (None, Err(error)) => {
+                    app.browse.disc_probe_cache.remove(&path);
+                    app.browse.disc_probe_followup.remove(&path);
+                    app.set_status(format!("Disc analysis failed: {error}"));
+                }
+                (None, Ok(contents)) => {
+                    if let Ok(fingerprint) = crate::tui::disc_browser::disc_probe_fingerprint(&path) {
+                        app.browse.disc_probe_cache.insert(
+                            path.clone(),
+                            crate::tui::disc_browser::DiscProbeCacheEntry::from_success(fingerprint, contents),
+                        );
+                    }
+                }
+            }
+        }
         AppMessage::DirStatsComplete { path, stats } => {
             app.browse.dir_stats_pending.remove(&path);
             app.browse
@@ -674,7 +719,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         AppMessage::DirScanComplete {
             path,
             parent_entry,
-            dirs,
+            mut dirs,
             files,
             error,
         } => {
@@ -696,7 +741,8 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             // Success — clear the scan handle.
             app.browse.scan_pending = None;
 
-            // Populate raw scan results.
+            // Populate raw scan results. Classify DVD-Audio directories before publishing.
+            app.browse.classify_scanned_directory_entries(&mut dirs);
             app.browse.parent_entry = parent_entry;
             app.browse.all_dirs = dirs;
             app.browse.all_files = files;
@@ -718,6 +764,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
 
             // Probe the newly selected entry.
             app.browse.probe_current_with_db(tx, Some(&app.db));
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         AppMessage::MetadataWriteComplete {
             path,

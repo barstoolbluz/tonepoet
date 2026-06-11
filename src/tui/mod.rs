@@ -10,6 +10,8 @@ pub mod bookmarks;
 pub mod bookmarks_overlay;
 pub mod browse;
 pub mod button_map;
+pub mod disc_browser;
+pub mod disc_browser_actions;
 pub mod command;
 pub mod context_menu;
 pub mod convert_actions;

@@ -91,6 +91,15 @@ pub enum AppMessage {
         /// Owned cached-info on success; error string on failure.
         result: Box<Result<crate::tui::browse::CachedInfo, String>>,
     },
+    /// Result of an asynchronous optical-disc probe launched by the Browse
+    /// info pane or the Audio Streams action. The payload uses the unified
+    /// DiscContents model shared by DVD-Audio and SACD, plus an optional
+    /// fingerprint captured before parsing for stale-result rejection.
+    DiscProbeComplete {
+        path: std::path::PathBuf,
+        fingerprint: Option<crate::tui::disc_browser::DiscProbeFingerprint>,
+        result: Box<Result<crate::disc::DiscContents, String>>,
+    },
     /// Result of an asynchronous directory-stats computation launched by
     /// `BrowseState::probe_current` for a directory entry. The main loop
     /// updates `dir_stats_cache` and removes the path from `dir_stats_pending`.

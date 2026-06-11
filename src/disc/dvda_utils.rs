@@ -1,13 +1,82 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use crate::convert::pipeline::{
     parse_private_stream_1_packets, probe_mlp_major_sync, DvdaSubstreamKind,
 };
 use crate::tui::dvda::sector::AobSectorReader;
 use crate::tui::dvda::{
-    channel_assignment, AudioAttributes, ChannelAssignment, DvdaDisc, DvdaGroup, DvdaVolume,
-    TitleRefKind,
+    channel_assignment, parse_dvda_volume, AudioAttributes, ChannelAssignment,
+    DirectoryDvdaVolume, DvdaDisc, DvdaGroup, DvdaVolume, IsoUdfDvdaVolume, TitleRefKind,
 };
 
+use super::dvda_mapper::map_dvda_disc;
 use super::model::{AobProbeResult, AudioPresentationFormat, FormatProvenance};
+use super::model::DiscContents;
+
+
+/// Return true when `path` is a DVD-Audio ISO image.
+///
+/// This is a bounded classification helper for the browse scan path. It rejects
+/// non-ISO and implausibly-small files before opening the DVD-Audio volume
+/// abstraction and checking only the canonical `AUDIO_TS/AUDIO_TS.IFO` member.
+/// It does not parse the disc or probe AOB audio streams.
+pub fn is_dvda_iso(path: &Path) -> bool {
+    let is_iso = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("iso"))
+        .unwrap_or(false);
+    if !is_iso || !path.is_file() {
+        return false;
+    }
+    if std::fs::metadata(path).map(|m| m.len() < 32 * 2048).unwrap_or(true) {
+        return false;
+    }
+
+    IsoUdfDvdaVolume::open(path)
+        .and_then(|volume| volume.open_audio_ts_file("AUDIO_TS.IFO").map(|_| ()))
+        .is_ok()
+}
+
+/// Return true when `path` is a filesystem DVD-Audio directory.
+pub fn is_dvda_directory(path: &Path) -> bool {
+    path.is_dir() && path.join("AUDIO_TS").join("AUDIO_TS.IFO").is_file()
+}
+
+/// Return true for any browsable DVD-Audio source supported by the parser.
+pub fn is_dvda_source(path: &Path) -> bool {
+    is_dvda_directory(path) || is_dvda_iso(path)
+}
+
+/// Parse a DVD-Audio ISO or directory and map it to `DiscContents`.
+///
+/// This is intentionally for the async `spawn_blocking` probe path, not browse
+/// classification or rendering: it parses the disc and probes AOB sectors.
+pub fn map_dvda_source(path: &Path) -> Result<DiscContents, String> {
+    if is_dvda_directory(path) {
+        let volume = DirectoryDvdaVolume::new(path);
+        return map_dvda_volume(&volume, path);
+    }
+
+    let volume = IsoUdfDvdaVolume::open(path)
+        .map_err(|e| format!("DVD-Audio ISO open failed for '{}': {e}", path.display()))?;
+    map_dvda_volume(&volume, path)
+}
+
+fn map_dvda_volume(volume: &dyn DvdaVolume, path: &Path) -> Result<DiscContents, String> {
+    let disc = parse_dvda_volume(volume)
+        .map_err(|e| format!("DVD-Audio parse failed for '{}': {e}", path.display()))?;
+
+    let mut probes = BTreeMap::new();
+    for group in &disc.groups {
+        if let Some(probe) = probe_group_aob_format(volume, &disc, group) {
+            probes.insert(group.group_nr, probe);
+        }
+    }
+
+    Ok(map_dvda_disc(&disc, &probes, path))
+}
 
 /// Probe the first AOB sector of a group's first track to determine the actual
 /// codec (MLP vs LPCM) and audio format from the stream itself.

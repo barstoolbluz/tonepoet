@@ -177,6 +177,8 @@ pub enum TuiButton {
     BrowseInfoAnalyze,
     // Browse info pane: edit tags pill (click → open metadata editor).
     BrowseInfoEditTags,
+    // Browse info pane: open the unified disc stream browser overlay.
+    BrowseInfoAudioStreams,
     // Browse list: "search" label in border (click → toggle search panel).
     BrowseSearchToggle,
     // Browse search panel: toggle pills.
@@ -184,6 +186,12 @@ pub enum TuiButton {
     BrowseSearchMode,
     BrowseSearchSort,
     BrowseSearchAudioOnly,
+
+    // Disc browser overlay.
+    DiscBrowserStream(usize),
+    DiscBrowserExpand(usize),
+    DiscBrowserConvert,
+    DiscBrowserClose,
 
     // Template builder: open pills on output options pane.
     TemplateBuildFolderButton,
@@ -228,6 +236,10 @@ impl TuiButton {
             | Self::CuePreviewBottom
             | Self::CuePreviewEditCommit
             | Self::CuePreviewEditCancel
+            | Self::DiscBrowserStream(_)
+            | Self::DiscBrowserExpand(_)
+            | Self::DiscBrowserConvert
+            | Self::DiscBrowserClose
             | Self::TemplateBuilderToken(_)
             | Self::TemplateBuilderSavedItem(_)
             | Self::TemplateBuilderApply
@@ -307,6 +319,7 @@ impl TuiButton {
             | Self::BrowseInfoMeta(_)
             | Self::BrowseInfoAnalyze
             | Self::BrowseInfoEditTags
+            | Self::BrowseInfoAudioStreams
             | Self::BrowseSearchToggle
             | Self::BrowseSearchRecursive
             | Self::BrowseSearchMode

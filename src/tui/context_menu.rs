@@ -72,6 +72,12 @@ pub enum ContextAction {
     ConvertLastUsed,
     /// Queue with a named preset.
     ConvertWithPreset(String),
+    /// Convert the default disc stream without going through generic file handling.
+    ConvertDiscDefault,
+    /// Open the unified Audio Streams overlay for a disc source.
+    BrowseDiscStreams,
+    /// Convert one specific disc presentation.
+    ConvertDiscStream(crate::disc::PresentationId),
     /// Open the selected file/directory (same as Enter on browse).
     OpenEntry,
     /// Toggle the current entry's selection.
@@ -466,13 +472,23 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             ));
         }
         EntryKind::SacdIso => {
-            // C5 surfaces ScarletBook metadata in a read-only editor;
-            // convert/export wiring lands in C7 (needs audio extraction).
-            // Tagging + Utilities re-enabled in C-2d: `:tags-mb` on a
-            // Browse-selected SACD ISO now auto-opens the editor and
-            // dispatches the TOC path. `has_cue = false` because SACDs
-            // use sidecar XML, not `.cue` — the "Get tags from CUE"
-            // item wouldn't apply anyway.
+            items.push(item("Browse Audio Streams...", ContextAction::BrowseDiscStreams));
+            if let Some(contents) = app
+                .browse
+                .disc_probe_cache
+                .get(&entry.path)
+                .and_then(|cache| cache.contents_if_current(&entry.path))
+            {
+                let children: Vec<_> = contents
+                    .presentations
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, p)| item(&format!("Stream {}: {}", idx + 1, p.label), ContextAction::ConvertDiscStream(p.id.clone())))
+                    .collect();
+                if !children.is_empty() {
+                    items.push(ContextMenuEntry::Submenu { label: "Convert Stream".to_string(), children });
+                }
+            }
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(separator());
             items.push(item("Select", ContextAction::Select));
@@ -484,10 +500,39 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_utilities_submenu(app));
             items.push(separator());
             items.push(build_file_ops_submenu(false));
-            items.push(item(
-                "Copy path",
-                ContextAction::CopyPath(entry.path.clone()),
-            ));
+            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+        }
+        EntryKind::DvdAudioIso | EntryKind::DvdAudioDir => {
+            items.push(item("Convert (default stream)", ContextAction::ConvertDiscDefault));
+            items.push(item("Browse Audio Streams...", ContextAction::BrowseDiscStreams));
+            if let Some(contents) = app
+                .browse
+                .disc_probe_cache
+                .get(&entry.path)
+                .and_then(|cache| cache.contents_if_current(&entry.path))
+            {
+                let children: Vec<_> = contents
+                    .presentations
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, p)| item(&format!("Stream {}: {}", idx + 1, p.label), ContextAction::ConvertDiscStream(p.id.clone())))
+                    .collect();
+                if !children.is_empty() {
+                    items.push(ContextMenuEntry::Submenu { label: "Convert Stream".to_string(), children });
+                }
+            }
+            items.push(separator());
+            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(separator());
+            items.push(build_tagging_submenu(false));
+            items.push(build_utilities_submenu(app));
+            items.push(separator());
+            items.push(build_file_ops_submenu(false));
+            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::Directory => {
             items.push(build_convert_submenu(app));
@@ -703,6 +748,9 @@ pub fn execute_context_action(
     tx: &mpsc::Sender<AppMessage>,
     invert: bool,
 ) {
+    if super::disc_browser_actions::handle_disc_context_action(app, &action, tx) {
+        return;
+    }
     match action {
         // ── Browse: Convert actions ─────────────────────────────────
         ContextAction::ConvertCustom => {
@@ -1334,6 +1382,11 @@ pub fn execute_context_action(
                 app.browse.probe_current_with_db(tx, Some(&app.db));
             }
         }
+        // Disc-specific actions are handled by disc_browser_actions before
+        // this match (early return at the top of this function).
+        ContextAction::ConvertDiscDefault
+        | ContextAction::BrowseDiscStreams
+        | ContextAction::ConvertDiscStream(_) => {}
     }
 }
 

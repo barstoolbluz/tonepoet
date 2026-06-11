@@ -630,6 +630,7 @@ fn render_entry_line(
         match &entry.kind {
             EntryKind::ParentDir => Style::default().fg(theme::TEXT_MUTED),
             EntryKind::Directory => Style::default().fg(theme::BLUE),
+            EntryKind::DvdAudioDir => Style::default().fg(theme::PURPLE),
             EntryKind::AudioFile(_) => {
                 if is_selected {
                     Style::default()
@@ -640,7 +641,7 @@ fn render_entry_line(
                 }
             }
             EntryKind::Archive => Style::default().fg(theme::AMBER),
-            EntryKind::SacdIso => Style::default().fg(theme::PURPLE),
+            EntryKind::SacdIso | EntryKind::DvdAudioIso => Style::default().fg(theme::PURPLE),
             EntryKind::OtherFile => Style::default().fg(theme::TEXT_DIM),
         }
     };
@@ -741,6 +742,8 @@ struct InfoContent {
     analyze_pill_row: Option<usize>,
     /// Line index of the edit tags pill (if present).
     edit_tags_pill_row: Option<usize>,
+    /// Line index of the Audio Streams pill (if present).
+    audio_streams_pill_row: Option<usize>,
 }
 
 fn draw_browse_info(
@@ -781,6 +784,7 @@ fn draw_browse_info(
     let content_width = w.saturating_sub(2);
     let analyze_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoAnalyze);
     let edit_tags_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoEditTags);
+    let audio_streams_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoAudioStreams);
     let info = if let Some(entry) = browse.selected_entry() {
         entry_info_lines(
             entry,
@@ -788,6 +792,7 @@ fn draw_browse_info(
             content_width,
             analyze_hovered,
             edit_tags_hovered,
+            audio_streams_hovered,
         )
     } else {
         InfoContent {
@@ -795,6 +800,7 @@ fn draw_browse_info(
             meta_field_rows: Vec::new(),
             analyze_pill_row: None,
             edit_tags_pill_row: None,
+            audio_streams_pill_row: None,
         }
     };
 
@@ -848,9 +854,19 @@ fn draw_browse_info(
             );
         }
     }
+    if let Some(row) = info.audio_streams_pill_row {
+        if row < content_height {
+            buttons.record_button(
+                TuiButton::BrowseInfoAudioStreams,
+                Rect::new(area.x + 1, info_y_start + row as u16, (w - 2) as u16, 1),
+            );
+        }
+    }
 }
 
 /// Truncate a string to fit within `max_chars` columns, adding ellipsis if needed.
+pub(crate) fn truncate_for_disc_overlay(s: &str, max_chars: usize) -> String { truncate_to(s, max_chars) }
+
 fn truncate_to(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
     if count <= max_chars || max_chars < 2 {
@@ -870,6 +886,7 @@ fn entry_info_lines(
     content_width: usize,
     analyze_hovered: bool,
     edit_tags_hovered: bool,
+    audio_streams_hovered: bool,
 ) -> InfoContent {
     // Maximum width for free-form text values: subtract the 3-space indent
     let max_value_chars = content_width.saturating_sub(3);
@@ -881,6 +898,7 @@ fn entry_info_lines(
     // returns early), but the pattern generalises if more arms grow
     // pill rendering.
     let mut sacd_edit_tags_row: Option<usize> = None;
+    let mut audio_streams_pill_row: Option<usize> = None;
 
     // Blank
     lines.push(vec![]);
@@ -1227,6 +1245,7 @@ fn entry_info_lines(
                     meta_field_rows,
                     analyze_pill_row: Some(analyze_row_unprobed),
                     edit_tags_pill_row: Some(et_row),
+                    audio_streams_pill_row,
                 };
             }
 
@@ -1256,7 +1275,83 @@ fn entry_info_lines(
                 meta_field_rows,
                 analyze_pill_row: Some(analyze_row),
                 edit_tags_pill_row: Some(edit_tags_row),
+                audio_streams_pill_row,
             };
+        }
+        EntryKind::DvdAudioIso | EntryKind::DvdAudioDir => {
+            lines.push(vec![
+                Span::styled("   kind    ", theme::muted()),
+                Span::styled(
+                    if matches!(entry.kind, EntryKind::DvdAudioDir) { "DVD-Audio directory" } else { "DVD-Audio ISO" },
+                    theme::bold(theme::PURPLE),
+                ),
+            ]);
+            if let Some(contents) = browse
+                .disc_probe_cache
+                .get(&entry.path)
+                .and_then(|cache| cache.contents_if_current(&entry.path))
+            {
+                lines.push(vec![
+                    Span::styled("   streams ", theme::muted()),
+                    Span::styled(crate::tui::disc_browser::disc_summary(contents.as_ref()), theme::text()),
+                ]);
+                lines.push(vec![
+                    Span::styled("   copy protection", theme::muted()),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate_to(&contents.copy_protection.description, max_value_chars.saturating_sub(18)),
+                        theme::text(),
+                    ),
+                ]);
+                lines.push(vec![]);
+                for (idx, presentation) in contents.presentations.iter().enumerate().take(6) {
+                    lines.push(vec![
+                        Span::styled("   ", theme::muted()),
+                        Span::styled(
+                            truncate_to(&crate::tui::disc_browser::presentation_summary(idx, presentation), max_value_chars),
+                            theme::text(),
+                        ),
+                    ]);
+                }
+                if contents.presentations.len() > 6 {
+                    lines.push(vec![Span::styled(
+                        format!("   … {} more audio streams", contents.presentations.len() - 6),
+                        theme::muted(),
+                    )]);
+                }
+                if contents.presentations.len() >= 2 {
+                    lines.push(vec![]);
+                    let row = lines.len();
+                    let label = " audio streams ";
+                    let width = label.chars().count();
+                    let pad = content_width.saturating_sub(width + 3);
+                    let bg = if audio_streams_hovered { theme::BLUE } else { theme::PURPLE };
+                    lines.push(vec![
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(
+                            label,
+                            Style::default()
+                                .fg(theme::PILL_ACTIVE_FG)
+                                .bg(bg)
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        ),
+                    ]);
+                    audio_streams_pill_row = Some(row);
+                }
+            } else if let Some(error) = browse
+                .disc_probe_cache
+                .get(&entry.path)
+                .and_then(|cache| cache.error_if_current(&entry.path))
+            {
+                lines.push(vec![
+                    Span::styled("   status  ", theme::muted()),
+                    Span::styled(truncate_to(error, max_value_chars.saturating_sub(10)), Style::default().fg(theme::RED)),
+                ]);
+                lines.push(vec![Span::styled("   size    ", theme::muted()), Span::styled(size_str(entry.size), theme::text())]);
+            } else {
+                lines.push(vec![Span::styled("   status  ", theme::muted()), Span::styled("Analyzing disc…", theme::muted())]);
+                lines.push(vec![Span::styled("   size    ", theme::muted()), Span::styled(size_str(entry.size), theme::text())]);
+            }
         }
         EntryKind::Archive => {
             lines.push(vec![
@@ -1351,6 +1446,32 @@ fn entry_info_lines(
                     }
                 }
 
+                if let Some(contents) = browse
+                    .disc_probe_cache
+                    .get(&entry.path)
+                    .and_then(|cache| cache.contents_if_current(&entry.path))
+                {
+                    if contents.presentations.len() >= 2 {
+                        lines.push(vec![]);
+                        let row = lines.len();
+                        let label = " audio streams ";
+                        let width = label.chars().count();
+                        let pad = content_width.saturating_sub(width + 3);
+                        let bg = if audio_streams_hovered { theme::BLUE } else { theme::PURPLE };
+                        lines.push(vec![
+                            Span::raw(" ".repeat(pad)),
+                            Span::styled(
+                                label,
+                                Style::default()
+                                    .fg(theme::PILL_ACTIVE_FG)
+                                    .bg(bg)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ),
+                        ]);
+                        audio_streams_pill_row = Some(row);
+                    }
+                }
+                // SACD stream summary uses the shared DiscContents cache when available.
                 // Edit-tags pill — parity with the AudioFile arm so
                 // SACD ISOs have a clickable mouse path to the
                 // metadata editor (keyboard via :tags, context menu
@@ -1439,6 +1560,7 @@ fn entry_info_lines(
         meta_field_rows,
         analyze_pill_row: None,
         edit_tags_pill_row: sacd_edit_tags_row,
+        audio_streams_pill_row,
     }
 }
 

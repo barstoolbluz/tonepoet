@@ -64,6 +64,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             (KeyCode::Char('1'), KeyModifiers::NONE) => {
                 app.current_screen = AppScreen::Browse;
                 app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 return;
             }
             (KeyCode::Char('2'), KeyModifiers::NONE) => {
@@ -123,6 +124,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 app.current_screen = AppScreen::from_config_name(&app.config.ui.default_screen);
                 if app.current_screen == AppScreen::Browse {
                     app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
                 return;
             }
@@ -135,6 +137,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 app.current_screen = AppScreen::from_config_name(&app.config.ui.default_screen);
                 if app.current_screen == AppScreen::Browse {
                     app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
                 return;
             }
@@ -153,6 +156,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                     app.current_screen = origin;
                     if origin == AppScreen::Browse {
                         app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                     }
                     app.set_status("cancelled");
                     return;
@@ -771,6 +775,8 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                     EntryKind::AudioFile(_)
                     | EntryKind::Archive
                     | EntryKind::SacdIso
+                    | EntryKind::DvdAudioIso
+                    | EntryKind::DvdAudioDir
                     | EntryKind::OtherFile => {
                         // Toggle selection — converting is via context menu or :queue.
                         app.browse.toggle_selection();
@@ -871,6 +877,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 
     if selection_may_have_changed {
         app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
     }
 }
 
@@ -1005,27 +1012,33 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
         (KeyCode::Enter, _) => {
             app.browse.close_filter_input(true);
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         (KeyCode::Esc, _) => {
             app.browse.close_filter_input(false);
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         // List navigation while filter input is open
         (KeyCode::Up, _) => {
             app.browse.move_up();
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         (KeyCode::Down, _) => {
             app.browse.move_down();
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         (KeyCode::PageUp, _) => {
             app.browse.page_up();
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         (KeyCode::PageDown, _) => {
             app.browse.page_down();
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         // Everything else: feed to the text input, then re-apply view
         _ => {
@@ -1033,6 +1046,7 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                 if handle_text_input_key(input, &key) {
                     app.browse.update_filter_from_input();
                     app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
             }
         }
@@ -1420,6 +1434,9 @@ fn handle_wizard_key(app: &mut AppState, key: KeyEvent) {
 fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     let overlay = app.active_overlay.clone();
     match overlay {
+        ActiveOverlay::DiscBrowser(_) => {
+            super::disc_browser_actions::handle_disc_browser_key(app, key);
+        }
         ActiveOverlay::Confirmation { action, .. } => {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -9865,6 +9882,7 @@ fn do_file_op(
     do_file_op_inner(app, sources, dest, force, is_move);
     app.browse.refresh();
     app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
 }
 
 /// Perform a copy or move without tx (when called from command.rs with
@@ -10115,6 +10133,7 @@ pub(super) fn commit_browse_rename(
                 app.browse.ensure_visible();
             }
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             app.set_status(format!("renamed: {} → {}", old_name, new_name));
         }
         Err(e) => {
@@ -10275,6 +10294,7 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Se
             let display = path.display().to_string();
             app.browse.navigate_to(path);
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             app.set_status(format!("cd: {}", display));
         }
         _ => {}
@@ -10428,6 +10448,7 @@ fn execute_confirm_action(
             app.browse.clear_multi_selection();
             app.browse.refresh();
             app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             let mut parts = vec![format!("trashed {} item(s)", trashed)];
             if errors > 0 {
                 parts.push(format!("{} errors", errors));
@@ -10650,6 +10671,37 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // FormatSettings: dedicated handler for pill clicks inside the overlay.
     if matches!(app.active_overlay, ActiveOverlay::FormatSettings { .. }) {
         handle_format_settings_mouse(app, mouse, tx);
+        return;
+    }
+
+    if matches!(app.active_overlay, ActiveOverlay::DiscBrowser(_)) {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            if let Some(button) = app.button_map.find_button_at(mouse.column, mouse.row) {
+                let now = std::time::Instant::now();
+                let click_count = match button {
+                    TuiButton::DiscBrowserStream(index) => {
+                        let is_double = app
+                            .last_disc_browser_stream_click
+                            .as_ref()
+                            .filter(|(prior, _)| *prior == index)
+                            .map(|(_, t)| now.duration_since(*t).as_millis() < 500)
+                            .unwrap_or(false);
+                        if is_double {
+                            app.last_disc_browser_stream_click = None;
+                            2
+                        } else {
+                            app.last_disc_browser_stream_click = Some((index, now));
+                            1
+                        }
+                    }
+                    _ => {
+                        app.last_disc_browser_stream_click = None;
+                        1
+                    }
+                };
+                super::disc_browser_actions::handle_disc_browser_button_click(app, &button, click_count, tx);
+            }
+        }
         return;
     }
 
@@ -10914,6 +10966,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // Check button map — skip screen-specific buttons if they belong
     // to a different screen (stale button_map from the previous frame).
     if let Some(button) = clicked_button {
+        if super::disc_browser_actions::handle_disc_browser_button(app, &button, tx) {
+            return;
+        }
         if let Some(btn_screen) = button.screen() {
             if btn_screen != app.current_screen {
                 return; // Stale button from a previous screen's render.
@@ -10953,6 +11008,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 1 => {
                     app.current_screen = AppScreen::Browse;
                     app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
                 2 => app.current_screen = AppScreen::Library,
                 3 => app.current_screen = AppScreen::Convert,
@@ -11029,6 +11085,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
                 app.current_screen = AppScreen::Browse;
                 app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             }
             TuiButton::SourceExpandButton => {
                 // Open the BatchList overlay if a batch is loaded.
@@ -11426,6 +11483,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     }
                     app.pending_browse_rename = None;
                     app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 } else {
                     // ── Plain click: select vs schedule-rename vs fresh ──
                     //
@@ -11455,11 +11513,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                                 app.browse.multi_selected.clear();
                                 app.browse.enter_selected();
                                 app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                             }
                             // Files: double-click toggles selection (like Ctrl+click).
                             _ => {
                                 app.browse.toggle_selection();
                                 app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                             }
                         }
                     } else {
@@ -11492,6 +11552,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         app.last_browse_click = Some((clicked_path.clone(), now));
                         app.browse.multi_select_anchor = Some(clicked_path);
                         app.browse.probe_current_with_db(tx, Some(&app.db));
+                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                     }
                 }
             }
@@ -11520,6 +11581,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseInfoEditTags => {
                 open_metadata_editor(app);
+            }
+            TuiButton::BrowseInfoAudioStreams => {
+                super::disc_browser_actions::open_selected_disc_browser(app, tx);
             }
             TuiButton::BrowseSearchToggle => {
                 if app.browse.search.active {
@@ -11651,8 +11715,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsSoxChebyshev(_)
             | TuiButton::FormatSettingsSoxAliasing(_)
             | TuiButton::FormatSettingsSoxSincPhase(_)
-            | TuiButton::FormatSettingsSoxrChebyshev(_) => {
-                // Handled in dedicated mouse handlers; no-op here.
+            | TuiButton::FormatSettingsSoxrChebyshev(_)
+            | TuiButton::DiscBrowserStream(_)
+            | TuiButton::DiscBrowserExpand(_)
+            | TuiButton::DiscBrowserConvert
+            | TuiButton::DiscBrowserClose => {
+                // Handled in dedicated mouse/overlay handlers; no-op here.
             }
         }
     }

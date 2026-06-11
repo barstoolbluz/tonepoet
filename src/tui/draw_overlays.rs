@@ -176,6 +176,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
                 &mut app.button_map,
             );
         }
+        ActiveOverlay::DiscBrowser(ref state) => {
+            crate::tui::disc_browser::draw_disc_browser(f, state, &mut app.button_map);
+        }
         ActiveOverlay::FormatSettings {
             ref kind,
             focus,
