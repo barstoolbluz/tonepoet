@@ -105,8 +105,28 @@ pub fn probe_group_aob_format(
     let chapter = title.chapters.first()?;
     let first_sector = chapter.sector_ranges.first()?.first;
 
+    // Try reading from this title set's AOBs first. If the title set has no
+    // AOBs of its own (e.g., ATS 2 on discs where all audio lives in ATS 1's
+    // AOB files), fall back to ATS 1's AOB inventory. The codec identification
+    // (MLP vs LPCM) from a cross-ATS fallback probe is reliable; the channel
+    // layout may reflect the wrong presentation when both ATS share sector 0.
     let reader = AobSectorReader::new(volume, &title_set.aobs);
-    let sector_data = reader.read_blocks(first_sector, 1).ok()?;
+    let sector_data = reader
+        .read_blocks(first_sector, 1)
+        .or_else(|_| {
+            disc.title_sets
+                .iter()
+                .find(|ts| ts.number == 1)
+                .map(|ts1| AobSectorReader::new(volume, &ts1.aobs))
+                .and_then(|r| r.read_blocks(first_sector, 1).ok())
+                .ok_or_else(|| {
+                    dvda_phase1::DvdaError::parse(
+                        "AOB block read",
+                        "no fallback ATS 1 AOBs",
+                    )
+                })
+        })
+        .ok()?;
 
     let packets = parse_private_stream_1_packets(&sector_data).ok()?;
     let packet = packets.first()?;
