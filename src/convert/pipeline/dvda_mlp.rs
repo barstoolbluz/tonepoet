@@ -231,13 +231,25 @@ pub fn inspect_mlp_file_with_options(
 }
 
 /// Probe raw MLP payload bytes (from the first sector of a track) for a major
-/// sync header. Returns format info if found, `None` if the payload is too
-/// short or lacks a major sync. Intended for lightweight disc-info probing.
+/// sync header. Scans through access unit frames within the payload until a
+/// major sync is found. Returns format info if found, `None` if the payload
+/// is too short or lacks a major sync. Intended for lightweight disc-info probing.
 pub fn probe_mlp_major_sync(mlp_payload: &[u8]) -> Option<MlpMajorSyncInfo> {
-    if !frame_has_major_sync(mlp_payload) {
-        return None;
+    let mut offset = 0usize;
+    while offset + 2 <= mlp_payload.len() {
+        let frame = &mlp_payload[offset..];
+        if frame_has_major_sync(frame) {
+            return parse_mlp_major_sync(&frame[MLP_MAJOR_SYNC_OFFSET..], offset as u64).ok();
+        }
+        // Advance to the next access unit frame using the 2-byte length word.
+        let raw = u16::from_be_bytes([frame[0], frame[1]]);
+        let frame_len = usize::from(raw & MLP_FRAME_SIZE_MASK) * 2;
+        if frame_len == 0 {
+            break;
+        }
+        offset += frame_len;
     }
-    parse_mlp_major_sync(&mlp_payload[MLP_MAJOR_SYNC_OFFSET..], 0).ok()
+    None
 }
 
 #[cfg(test)]

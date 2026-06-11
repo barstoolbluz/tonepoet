@@ -70,7 +70,7 @@ fn map_dvda_volume(volume: &dyn DvdaVolume, path: &Path) -> Result<DiscContents,
 
     let mut probes = BTreeMap::new();
     for group in &disc.groups {
-        if let Some(probe) = probe_group_aob_format(volume, &disc, group) {
+        if let Some(probe) = probe_group_aob_format_with_path(volume, &disc, group, Some(path)) {
             probes.insert(group.group_nr, probe);
         }
     }
@@ -86,6 +86,19 @@ pub fn probe_group_aob_format(
     volume: &dyn DvdaVolume,
     disc: &DvdaDisc,
     group: &DvdaGroup,
+) -> Option<AobProbeResult> {
+    probe_group_aob_format_with_path(volume, disc, group, None)
+}
+
+/// Probe with an optional source path for cross-ATS raw ISO sector reads.
+/// When the title set has no AOB files and `source_path` points to an ISO,
+/// compute the disc-absolute sector from AOTT + ATSI metadata and read
+/// directly from the ISO file.
+pub fn probe_group_aob_format_with_path(
+    volume: &dyn DvdaVolume,
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    source_path: Option<&Path>,
 ) -> Option<AobProbeResult> {
     let title_ref = group.title_refs.first()?;
     let title_set = disc
@@ -105,48 +118,95 @@ pub fn probe_group_aob_format(
     let chapter = title.chapters.first()?;
     let first_sector = chapter.sector_ranges.first()?.first;
 
-    // Try reading from this title set's AOBs first. If the title set has no
-    // AOBs of its own (e.g., ATS 2 on discs where all audio lives in ATS 1's
-    // AOB files), fall back to ATS 1's AOB inventory. The codec identification
-    // (MLP vs LPCM) from a cross-ATS fallback probe is reliable; the channel
-    // layout may reflect the wrong presentation when both ATS share sector 0.
+    // Try reading from this title set's AOBs. Read up to 8 sectors so the
+    // MLP major sync scan has enough data (some streams don't place the
+    // major sync in the very first access unit frame).
     let reader = AobSectorReader::new(volume, &title_set.aobs);
     let sector_data = reader
-        .read_blocks(first_sector, 1)
-        .or_else(|_| {
-            disc.title_sets
+        .read_blocks(first_sector, 8)
+        .or_else(|_| reader.read_blocks(first_sector, 1))
+        .ok()
+        .or_else(|| {
+            // Title set has no AOBs (e.g., ATS 2 on discs where all audio
+            // lives within ATS 1's AOB files). Compute the disc-absolute
+            // sector from AOTT atsi_mat_sector + ATSI atstt_vobs, and read
+            // directly from the ISO.
+            let iso_path = source_path?;
+            if !iso_path.is_file() {
+                return None;
+            }
+            let aott_entry = disc
+                .amg
+                .audio_title_table
                 .iter()
-                .find(|ts| ts.number == 1)
-                .map(|ts1| AobSectorReader::new(volume, &ts1.aobs))
-                .and_then(|r| r.read_blocks(first_sector, 1).ok())
-                .ok_or_else(|| {
-                    dvda_phase1::DvdaError::parse(
-                        "AOB block read",
-                        "no fallback ATS 1 AOBs",
-                    )
-                })
-        })
-        .ok()?;
+                .find(|e| e.title_set_nr == title_ref.title_set_nr)?;
+            let disc_lba = u64::from(aott_entry.atsi_mat_sector)
+                + u64::from(title_set.header.atstt_vobs)
+                + u64::from(first_sector);
+            let byte_offset = disc_lba * 2048;
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(iso_path).ok()?;
+            let file_len = file.metadata().ok()?.len();
+            if byte_offset + 2048 > file_len {
+                return None;
+            }
+            file.seek(SeekFrom::Start(byte_offset)).ok()?;
+            // Read up to 512 sectors (~1 MB) — the MLP major sync may not
+            // appear in the first access unit of a cross-ATS stream.
+            let probe_sectors = 512u64;
+            let read_len = (probe_sectors * 2048).min(file_len - byte_offset) as usize;
+            let mut buf = vec![0u8; read_len];
+            file.read_exact(&mut buf).ok()?;
+            Some(buf)
+        })?;
 
-    let packets = parse_private_stream_1_packets(&sector_data).ok()?;
-    let packet = packets.first()?;
+    // Demux sectors and probe. For multi-sector reads (cross-ATS fallback),
+    // demux each 2048-byte sector independently and concatenate MLP payloads
+    // to find the major sync which may span multiple sectors.
+    let sector_count = sector_data.len() / 2048;
+    let mut codec_kind = None;
+    let mut pcm_result = None;
+    let mut mlp_payload = Vec::new();
 
-    match packet.sub_header.kind() {
-        DvdaSubstreamKind::Pcm => {
-            let pcm = packet.sub_header.pcm.as_ref()?;
-            let rate = pcm.group1_sample_rate?;
-            let bits = pcm.group1_bits?;
-            let ca = channel_assignment(pcm.channel_assignment)?;
-            Some(AobProbeResult {
-                codec: "LPCM",
-                sample_rate: rate,
-                bit_depth: bits,
-                channels: ca.group1_channels + ca.group2_channels,
-                channel_assignment_code: pcm.channel_assignment,
-            })
+    for i in 0..sector_count {
+        let sector = &sector_data[i * 2048..(i + 1) * 2048];
+        let packets = match parse_private_stream_1_packets(sector) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        for packet in &packets {
+            match packet.sub_header.kind() {
+                DvdaSubstreamKind::Pcm => {
+                    if pcm_result.is_none() {
+                        if let Some(pcm) = packet.sub_header.pcm.as_ref() {
+                            if let (Some(rate), Some(bits)) = (pcm.group1_sample_rate, pcm.group1_bits) {
+                                if let Some(ca) = channel_assignment(pcm.channel_assignment) {
+                                    pcm_result = Some(AobProbeResult {
+                                        codec: "LPCM",
+                                        sample_rate: rate,
+                                        bit_depth: bits,
+                                        channels: ca.group1_channels + ca.group2_channels,
+                                        channel_assignment_code: pcm.channel_assignment,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    codec_kind = Some(DvdaSubstreamKind::Pcm);
+                }
+                DvdaSubstreamKind::Mlp => {
+                    mlp_payload.extend_from_slice(packet.payload);
+                    codec_kind = Some(DvdaSubstreamKind::Mlp);
+                }
+                _ => {}
+            }
         }
+    }
+
+    match codec_kind? {
+        DvdaSubstreamKind::Pcm => pcm_result,
         DvdaSubstreamKind::Mlp => {
-            let info = probe_mlp_major_sync(packet.payload)?;
+            let info = probe_mlp_major_sync(&mlp_payload)?;
             Some(AobProbeResult {
                 codec: "MLP",
                 sample_rate: info.group1_sample_rate,
@@ -155,7 +215,7 @@ pub fn probe_group_aob_format(
                 channel_assignment_code: info.channel_arrangement as u8,
             })
         }
-        DvdaSubstreamKind::Unknown(_) => None,
+        _ => None,
     }
 }
 

@@ -1164,8 +1164,8 @@ fn run_dvda_info(path: &std::path::Path) -> anyhow::Result<()> {
 
     // Display each group
     for group in &disc.groups {
-        let probe = tonepoet::disc::dvda_utils::probe_group_aob_format(
-            volume.as_ref(), &disc, group,
+        let probe = tonepoet::disc::dvda_utils::probe_group_aob_format_with_path(
+            volume.as_ref(), &disc, group, Some(path),
         );
         let tracks = tonepoet::disc::dvda_utils::group_track_count(&disc, group);
         let duration_secs = tonepoet::disc::dvda_utils::group_duration_secs(&disc, group);
@@ -1271,10 +1271,11 @@ fn run_disc_info(path: &std::path::Path, raw: bool, verbose: bool) -> anyhow::Re
         // Probe AOBs for each group
         let mut probes = BTreeMap::new();
         for group in &dvda_disc.groups {
-            if let Some(probe) = disc::dvda_utils::probe_group_aob_format(
+            if let Some(probe) = disc::dvda_utils::probe_group_aob_format_with_path(
                 volume.as_ref(),
                 &dvda_disc,
                 group,
+                Some(path),
             ) {
                 probes.insert(group.group_nr, probe);
             }
