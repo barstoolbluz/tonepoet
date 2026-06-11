@@ -2,6 +2,7 @@ pub mod config;
 pub mod convert;
 pub mod ctdb_rs;
 pub mod db;
+pub mod disc;
 pub mod tui;
 
 /// Check whether a file path has an archive extension that may be

@@ -180,6 +180,21 @@ enum Commands {
         path: PathBuf,
     },
 
+    /// Probe an optical disc ISO and print structure (auto-detects DVD-Audio/SACD)
+    DiscInfo {
+        /// Path to a disc ISO image or directory
+        #[arg(required = true)]
+        path: PathBuf,
+
+        /// Show suppressed presentations (placeholders)
+        #[arg(long)]
+        raw: bool,
+
+        /// Show diagnostic details
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Tag audio files or an SACD ISO from MusicBrainz, headless.
     ///
     /// Computes a CD-equivalent TOC from the supplied paths, looks up
@@ -320,6 +335,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::DvdaInfo { path } => {
             run_dvda_info(&path)?;
+        }
+        Commands::DiscInfo { path, raw, verbose } => {
+            run_disc_info(&path, raw, verbose)?;
         }
         Commands::TagsMb {
             paths,
@@ -1115,7 +1133,7 @@ fn run_dvda_info(path: &std::path::Path) -> anyhow::Result<()> {
         .unwrap_or_else(|| path.to_str().unwrap_or("?"));
 
     let total_groups = disc.groups.len();
-    let total_tracks: usize = disc.groups.iter().map(|g| group_track_count(&disc, g)).sum();
+    let total_tracks: usize = disc.groups.iter().map(|g| tonepoet::disc::dvda_utils::group_track_count(&disc, g)).sum();
 
     println!("{}", filename);
     println!(
@@ -1146,22 +1164,34 @@ fn run_dvda_info(path: &std::path::Path) -> anyhow::Result<()> {
 
     // Display each group
     for group in &disc.groups {
-        let probe = probe_group_aob_format(volume.as_ref(), &disc, group);
-        let tracks = group_track_count(&disc, group);
-        let duration_secs = group_duration_secs(&disc, group);
-        let duration_str = format_duration(duration_secs);
+        let probe = tonepoet::disc::dvda_utils::probe_group_aob_format(
+            volume.as_ref(), &disc, group,
+        );
+        let tracks = tonepoet::disc::dvda_utils::group_track_count(&disc, group);
+        let duration_secs = tonepoet::disc::dvda_utils::group_duration_secs(&disc, group);
+        let duration_str = tonepoet::disc::format_duration(duration_secs);
 
         let (codec_prefix, rate_str, depth_str, ch_str) = if let Some(ref p) = probe {
-            let ch_label = channel_label_from_code(p.channel_assignment_code, p.channels);
+            let ch_label = tonepoet::disc::channel_layout_label(
+                p.channel_assignment_code, p.channels,
+            );
             (
                 format!("{} ", p.codec),
-                format_sample_rate(p.sample_rate),
+                tonepoet::disc::format_rate(p.sample_rate),
                 format!("{}-bit", p.bit_depth),
                 ch_label,
             )
         } else {
-            let (r, d, c) = group_format_summary(&disc, group);
-            (String::new(), r, d, c)
+            let resolved = tonepoet::disc::dvda_utils::resolve_group_format(&disc, group);
+            let rate = resolved.sample_rate
+                .map(tonepoet::disc::format_rate)
+                .unwrap_or_else(|| "Unknown".to_string());
+            let depth = resolved.bit_depth
+                .map(|d| format!("{}-bit", d))
+                .unwrap_or_else(|| "Unknown".to_string());
+            let ch = resolved.channel_layout
+                .unwrap_or_else(|| "Unknown".to_string());
+            (String::new(), rate, depth, ch)
         };
 
         println!(
@@ -1180,298 +1210,146 @@ fn run_dvda_info(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct AobProbeResult {
-    codec: &'static str,
-    sample_rate: u32,
-    bit_depth: u32,
-    channels: u8,
-    channel_assignment_code: u8,
-}
+fn run_disc_info(path: &std::path::Path, raw: bool, verbose: bool) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+    use tonepoet::disc;
 
-/// Probe the first AOB sector of a group's first track to determine the actual
-/// codec (MLP vs LPCM) and audio format from the stream itself.
-/// Returns `None` if AOBs are unavailable, the group has no title_refs, or
-/// demuxing fails — the caller falls back to IFO/SAMG metadata.
-fn probe_group_aob_format(
-    volume: &dyn tonepoet::tui::dvda::DvdaVolume,
-    disc: &tonepoet::tui::dvda::DvdaDisc,
-    group: &tonepoet::tui::dvda::DvdaGroup,
-) -> Option<AobProbeResult> {
-    use tonepoet::convert::pipeline::{parse_private_stream_1_packets, DvdaSubstreamKind};
-    use tonepoet::convert::pipeline::probe_mlp_major_sync;
-    use tonepoet::tui::dvda::sector::AobSectorReader;
-    use tonepoet::tui::dvda::TitleRefKind;
-
-    // Resolve first title_ref → title_set → title → first chapter → first sector
-    let title_ref = group.title_refs.first()?;
-    let title_set = disc
-        .title_sets
-        .iter()
-        .find(|ts| ts.number == title_ref.title_set_nr)?;
-    let title = match title_ref.kind {
-        TitleRefKind::AottTitleOrdinal => title_set
-            .titles
-            .iter()
-            .find(|t| t.title_ordinal == title_ref.title_nr),
-        TitleRefKind::AtsPgcTitleNr => title_set
-            .titles
-            .iter()
-            .find(|t| t.title_nr == title_ref.title_nr),
-    }?;
-    let chapter = title.chapters.first()?;
-    let first_sector = chapter.sector_ranges.first()?.first;
-
-    // Read one sector from the AOB
-    let reader = AobSectorReader::new(volume, &title_set.aobs);
-    let sector_data = reader.read_blocks(first_sector, 1).ok()?;
-
-    // Demux the sector
-    let packets = parse_private_stream_1_packets(&sector_data).ok()?;
-    let packet = packets.first()?;
-
-    match packet.sub_header.kind() {
-        DvdaSubstreamKind::Pcm => {
-            let pcm = packet.sub_header.pcm.as_ref()?;
-            let rate = pcm.group1_sample_rate?;
-            let bits = pcm.group1_bits?;
-            let ca = tonepoet::tui::dvda::channel_assignment(pcm.channel_assignment)?;
-            Some(AobProbeResult {
-                codec: "LPCM",
-                sample_rate: rate,
-                bit_depth: bits,
-                channels: ca.group1_channels + ca.group2_channels,
-                channel_assignment_code: pcm.channel_assignment,
-            })
-        }
-        DvdaSubstreamKind::Mlp => {
-            let info = probe_mlp_major_sync(packet.payload)?;
-            Some(AobProbeResult {
-                codec: "MLP",
-                sample_rate: info.group1_sample_rate,
-                bit_depth: info.group1_bits,
-                channels: info.channel_count as u8,
-                channel_assignment_code: info.channel_arrangement as u8,
-            })
-        }
-        DvdaSubstreamKind::Unknown(_) => None,
+    if !path.exists() {
+        anyhow::bail!("Path does not exist: {}", path.display());
     }
-}
 
-/// Derive a channel layout label from a DVD-Audio channel assignment code.
-fn channel_label_from_code(code: u8, total_channels: u8) -> String {
-    if let Some(ca) = tonepoet::tui::dvda::channel_assignment(code) {
-        let total = ca.group1_channels + ca.group2_channels;
-        let has_lfe = ca.group2.contains(&"LFE");
-        if total == 1 {
-            "Mono".to_string()
-        } else if total == 2 && !has_lfe {
-            "Stereo".to_string()
-        } else if has_lfe {
-            format!("{}.1", total - 1)
+    // Auto-detect format: try SACD first (cheap), then DVD-Audio
+    let contents = if tonepoet::tui::sacd::is_sacd_iso(path) {
+        // SACD path
+        let metadata = tonepoet::tui::sacd::parse_sacd_iso(path)
+            .map_err(|e| anyhow::anyhow!("SACD parse failed: {}", e))?;
+        let sidecar = tonepoet::tui::sacd_sidecar::find_sidecar_for_iso(path)
+            .and_then(|p| tonepoet::tui::sacd_sidecar::parse_sidecar(&p).ok());
+        disc::sacd_mapper::map_sacd_disc(&metadata, sidecar.as_ref(), path)
+    } else {
+        // Try DVD-Audio
+        use tonepoet::tui::dvda::*;
+
+        let volume: Box<dyn DvdaVolume> = if path.is_dir() {
+            let candidates = [
+                path.join("AUDIO_TS").join("AUDIO_TS.IFO"),
+                path.join("audio_ts").join("audio_ts.ifo"),
+                path.join("AUDIO_TS.IFO"),
+                path.join("audio_ts.ifo"),
+            ];
+            if !candidates.iter().any(|c| c.exists()) {
+                anyhow::bail!(
+                    "Unrecognized disc format: no AUDIO_TS.IFO found in {}",
+                    path.display()
+                );
+            }
+            Box::new(DirectoryDvdaVolume::new(path.to_path_buf()))
         } else {
-            format!("{}.0", total)
-        }
-    } else {
-        format!("{}ch", total_channels)
-    }
-}
-
-/// Derive sample rate, bit depth, and channel layout strings for a group.
-fn group_format_summary(
-    disc: &tonepoet::tui::dvda::DvdaDisc,
-    group: &tonepoet::tui::dvda::DvdaGroup,
-) -> (String, String, String) {
-    use tonepoet::tui::dvda::*;
-
-    let mut rates: Vec<u32> = Vec::new();
-    let mut depths: Vec<u8> = Vec::new();
-    let mut best_assignment: Option<&ChannelAssignment> = None;
-
-    // Walk title_refs → title_set → audio_formats
-    for title_ref in &group.title_refs {
-        let Some(ts) = disc.title_sets.iter().find(|ts| ts.number == title_ref.title_set_nr) else {
-            continue;
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !ext.eq_ignore_ascii_case("iso") {
+                anyhow::bail!(
+                    "Unrecognized disc format: {}",
+                    path.display()
+                );
+            }
+            if let Ok(vol) = IsoUdfDvdaVolume::open(path) {
+                Box::new(vol)
+            } else if let Ok(vol) = Iso9660DvdaVolume::open(path) {
+                Box::new(vol)
+            } else {
+                anyhow::bail!(
+                    "Could not open {} as a disc ISO (not SACD, not DVD-Audio)",
+                    path.display()
+                );
+            }
         };
-        let present: Vec<&AudioAttributes> =
-            ts.audio_formats.iter().filter(|a| a.present).collect();
-        // Only observe single-present-format title sets (same as group_audio_profile)
-        if let [attr] = present.as_slice() {
-            let cf = &attr.channel_format;
-            if let Some(r) = cf.group1_sample_rate.or(cf.group2_sample_rate) {
-                if !rates.contains(&r) {
-                    rates.push(r);
-                }
-            }
-            if let Some(d) = cf.group1_bits.or(cf.group2_bits) {
-                if !depths.contains(&d) {
-                    depths.push(d);
-                }
-            }
-            if let Some(ref ca) = attr.channel_assignment {
-                best_assignment = Some(ca);
+
+        let mut dvda_disc = parse_dvda_volume(volume.as_ref())
+            .map_err(|e| anyhow::anyhow!("DVD-Audio parse failed: {}", e))?;
+        let _ = refine_copy_protection_from_aob_probe(volume.as_ref(), &mut dvda_disc, false);
+
+        // Probe AOBs for each group
+        let mut probes = BTreeMap::new();
+        for group in &dvda_disc.groups {
+            if let Some(probe) = disc::dvda_utils::probe_group_aob_format(
+                volume.as_ref(),
+                &dvda_disc,
+                group,
+            ) {
+                probes.insert(group.group_nr, probe);
             }
         }
-        // Multi-format title sets: skip here, fall through to SAMG
-    }
 
-    // Walk SAMG tracks when title_refs didn't resolve format info
-    // (SAMG-only groups or multi-format title sets)
-    if rates.is_empty() && depths.is_empty() && best_assignment.is_none() {
-        if let Some(samg) = disc.samg.as_ref() {
-            for samg_ref in &group.samg_tracks {
-                if let Some(track) = samg.tracks.iter().find(|t| {
-                    t.ordinal == samg_ref.samg_ordinal
-                        && t.group_nr == samg_ref.group_nr
-                        && t.track_nr == samg_ref.track_nr
-                }) {
-                    let cf = &track.channel_format;
-                    if let Some(r) = cf.group1_sample_rate.or(cf.group2_sample_rate) {
-                        if !rates.contains(&r) {
-                            rates.push(r);
-                        }
-                    }
-                    if let Some(d) = cf.group1_bits.or(cf.group2_bits) {
-                        if !depths.contains(&d) {
-                            depths.push(d);
-                        }
-                    }
-                    if let Some(ref ca) = track.channel_assignment {
-                        best_assignment = Some(ca);
-                    }
-                }
-            }
-        }
-    }
-
-    let rate_str = match rates.len() {
-        0 => "Unknown".to_string(),
-        1 => format_sample_rate(rates[0]),
-        _ => rates.iter().map(|r| format_sample_rate(*r)).collect::<Vec<_>>().join("/"),
+        disc::dvda_mapper::map_dvda_disc(&dvda_disc, &probes, path)
     };
 
-    let depth_str = match depths.len() {
-        0 => "Unknown".to_string(),
-        1 => format!("{}-bit", depths[0]),
-        _ => {
-            let parts: Vec<String> = depths.iter().map(|d| d.to_string()).collect();
-            format!("{}-bit", parts.join("/"))
-        }
-    };
+    // Display
+    println!("{}", contents.label);
+    println!(
+        "{} · {} presentation{} · {} track{}",
+        contents.format.name(),
+        contents.presentations.len(),
+        if contents.presentations.len() == 1 { "" } else { "s" },
+        contents.presentations.iter().map(|p| p.tracks.len()).sum::<usize>(),
+        if contents.presentations.iter().map(|p| p.tracks.len()).sum::<usize>() == 1 { "" } else { "s" },
+    );
+    println!("Copy protection: {}", contents.copy_protection.description);
+    println!();
 
-    let ch_str = match best_assignment {
-        Some(ca) => channel_label_from_code(ca.code, ca.group1_channels + ca.group2_channels),
-        None => "Unknown".to_string(),
-    };
+    for pres in &contents.presentations {
+        let duration = disc::format_duration(pres.total_duration_secs);
+        println!(
+            "  {}: {} ({} track{}, {})",
+            match &pres.id {
+                disc::PresentationId::DvdAudioGroup(n) => format!("Group {}", n),
+                disc::PresentationId::SacdArea(a) => match a {
+                    disc::SacdAreaId::Stereo => "Stereo".to_string(),
+                    disc::SacdAreaId::MultiChannel => "Multichannel".to_string(),
+                },
+            },
+            pres.label,
+            pres.tracks.len(),
+            if pres.tracks.len() == 1 { "" } else { "s" },
+            duration,
+        );
+    }
 
-    (rate_str, depth_str, ch_str)
-}
-
-fn group_track_count(
-    disc: &tonepoet::tui::dvda::DvdaDisc,
-    group: &tonepoet::tui::dvda::DvdaGroup,
-) -> usize {
-    use tonepoet::tui::dvda::TitleRefKind;
-
-    if !group.title_refs.is_empty() {
-        let mut count = 0usize;
-        for title_ref in &group.title_refs {
-            let Some(ts) = disc.title_sets.iter().find(|ts| ts.number == title_ref.title_set_nr)
-            else {
-                continue;
+    if raw && !contents.suppressed.is_empty() {
+        println!();
+        println!("Suppressed:");
+        for sup in &contents.suppressed {
+            let id_label = match &sup.id {
+                disc::PresentationId::DvdAudioGroup(n) => format!("Group {}", n),
+                disc::PresentationId::SacdArea(a) => match a {
+                    disc::SacdAreaId::Stereo => "Stereo".to_string(),
+                    disc::SacdAreaId::MultiChannel => "Multichannel".to_string(),
+                },
             };
-            let title = match title_ref.kind {
-                TitleRefKind::AottTitleOrdinal => {
-                    ts.titles.iter().find(|t| t.title_ordinal == title_ref.title_nr)
-                }
-                TitleRefKind::AtsPgcTitleNr => {
-                    ts.titles.iter().find(|t| t.title_nr == title_ref.title_nr)
-                }
+            println!(
+                "  {}: {} track{}, {} — {}",
+                id_label,
+                sup.track_count,
+                if sup.track_count == 1 { "" } else { "s" },
+                disc::format_duration(sup.duration_secs),
+                sup.reason,
+            );
+        }
+    }
+
+    if verbose && !contents.diagnostics.is_empty() {
+        println!();
+        println!("Diagnostics:");
+        for diag in &contents.diagnostics {
+            let severity = match diag.severity {
+                disc::DiagnosticSeverity::Info => "info",
+                disc::DiagnosticSeverity::Warning => "warn",
+                disc::DiagnosticSeverity::Error => "error",
             };
-            if let Some(t) = title {
-                count += t.chapters.len();
-            }
-        }
-        if count > 0 {
-            return count;
-        }
-    }
-    // SAMG-only or fallback
-    if !group.samg_tracks.is_empty() {
-        return group.samg_tracks.len();
-    }
-    // Last resort: AOTT table
-    disc.amg
-        .audio_title_table
-        .iter()
-        .find(|e| e.ordinal == u16::from(group.group_nr))
-        .map(|e| usize::from(e.track_count))
-        .unwrap_or(0)
-}
-
-fn group_duration_secs(
-    disc: &tonepoet::tui::dvda::DvdaDisc,
-    group: &tonepoet::tui::dvda::DvdaGroup,
-) -> f64 {
-    use tonepoet::tui::dvda::TitleRefKind;
-    const PTS_PER_SEC: f64 = 90_000.0;
-
-    let mut total_pts: u64 = 0;
-
-    if !group.title_refs.is_empty() {
-        for title_ref in &group.title_refs {
-            let Some(ts) = disc.title_sets.iter().find(|ts| ts.number == title_ref.title_set_nr)
-            else {
-                continue;
-            };
-            let title = match title_ref.kind {
-                TitleRefKind::AottTitleOrdinal => {
-                    ts.titles.iter().find(|t| t.title_ordinal == title_ref.title_nr)
-                }
-                TitleRefKind::AtsPgcTitleNr => {
-                    ts.titles.iter().find(|t| t.title_nr == title_ref.title_nr)
-                }
-            };
-            if let Some(t) = title {
-                for ch in &t.chapters {
-                    total_pts += u64::from(ch.len_in_pts);
-                }
-            }
-        }
-        if total_pts > 0 {
-            return total_pts as f64 / PTS_PER_SEC;
+            println!("  [{}] {}", severity, diag.message);
         }
     }
 
-    // SAMG fallback
-    if let Some(samg) = disc.samg.as_ref() {
-        for samg_ref in &group.samg_tracks {
-            if let Some(track) = samg.tracks.iter().find(|t| {
-                t.ordinal == samg_ref.samg_ordinal
-                    && t.group_nr == samg_ref.group_nr
-                    && t.track_nr == samg_ref.track_nr
-            }) {
-                total_pts += u64::from(track.len_in_pts);
-            }
-        }
-    }
-
-    total_pts as f64 / PTS_PER_SEC
-}
-
-fn format_sample_rate(rate: u32) -> String {
-    if rate % 1000 == 0 {
-        format!("{}kHz", rate / 1000)
-    } else {
-        let khz = rate as f64 / 1000.0;
-        format!("{}kHz", khz)
-    }
-}
-
-fn format_duration(secs: f64) -> String {
-    let total = secs.round() as u64;
-    let m = total / 60;
-    let s = total % 60;
-    format!("{}:{:02}", m, s)
+    Ok(())
 }
 
 fn run_check_tools() {
