@@ -336,11 +336,12 @@ async fn realize_track_with_tool_limits_and_stats(
             track_index,
             area,
         } => realize_sacd_track(iso, *track_index, *area, &req.settings.target_format, staging, cancel, progress_tracker).await,
-        TrackSourceRef::DvdaTrack { .. } => {
+        TrackSourceRef::DvdaTrack { dvda_downmix_policy, .. } => {
             let expected_audio = DvdaSourceAudioExpectation::from_prepared_track_and_source(prepared_track, src);
             let audio_policy = DvdaRealizationAudioPolicy::new(
                 bit_depth_target_label(req.settings.target_bit_depth).to_string(),
                 prepared_track.and_then(|track| resolved_target_bit_depth(track, req.settings.target_bit_depth)),
+                *dvda_downmix_policy,
             );
             realize_dvda_track(
                 src,
@@ -4302,6 +4303,7 @@ FILE "album.flac" WAVE
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
                 dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -6871,6 +6873,19 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
         } => match sector_address_space {
             DvdaSectorAddressSpace::AtsAobRelative { .. } => format!(
                 "DVD-Audio group {group_nr} track {group_track_ordinal} ATS {} title {} chapter {} from {}",
+                title_set_nr
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                title_ordinal
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                ats_track_nr
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                path_log_value(volume_source.original_container())
+            ),
+            DvdaSectorAddressSpace::DiscAbsolute { .. } => format!(
+                "DVD-Audio group {group_nr} track {group_track_ordinal} disc-absolute ATS {} title {} chapter {} from {}",
                 title_set_nr
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
@@ -10714,6 +10729,7 @@ mod conversion_log_tests {
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
                 dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -11650,6 +11666,7 @@ mod naming_template_tests {
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
                 dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -12178,6 +12195,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_group: None,
                 dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -13571,12 +13589,13 @@ mod validate_encoded_output_tests {
                 ats_track_nr: Some(1),
                 samg_track_nr: None,
                 samg_ordinal: None,
-                sector_address_space: DvdaSectorAddressSpace::AtsAobRelative,
+                sector_address_space: DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
                 first_pts: 0,
                 len_in_pts: 59_490_000,
                 track_type: Some(0x01),
                 index_start: None,
                 downmix_matrix: None,
+                dvda_downmix_policy: DvdaDownmixPolicy::None,
                 title_table_offset: None,
                 title_len_in_pts: None,
                 title_track_count_declared: None,

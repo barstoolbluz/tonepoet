@@ -193,6 +193,7 @@ pub fn probe_group_aob_format_with_path(
                                         channels: ca.group1_channels + ca.group2_channels,
                                         channel_assignment_code: pcm.channel_assignment,
                                         channel_label: ch_label,
+                                        stereo_downmix_source_label: None,
                                     });
                                 }
                             }
@@ -213,9 +214,9 @@ pub fn probe_group_aob_format_with_path(
         DvdaSubstreamKind::Pcm => pcm_result,
         DvdaSubstreamKind::Mlp => {
             let info = probe_mlp_major_sync(&mlp_payload)?;
-            let ch_label = if let Some(source_label) =
-                detect_stereo_downmix_source(disc, group, cross_ats, info.channel_count)
-            {
+            let stereo_downmix_source_label =
+                detect_stereo_downmix_source(disc, group, cross_ats, info.channel_count);
+            let ch_label = if let Some(source_label) = stereo_downmix_source_label.as_deref() {
                 format!("Stereo (derived from {})", source_label)
             } else {
                 super::labels::channel_layout_label(
@@ -230,6 +231,7 @@ pub fn probe_group_aob_format_with_path(
                 channels: info.channel_count as u8,
                 channel_assignment_code: info.channel_arrangement as u8,
                 channel_label: ch_label,
+                stereo_downmix_source_label,
             })
         }
         _ => None,

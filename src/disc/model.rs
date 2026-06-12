@@ -98,6 +98,10 @@ pub struct AobProbeResult {
     pub channels: u8,
     pub channel_assignment_code: u8,
     pub channel_label: String,
+    /// Source layout label when this probe detected an authored stereo
+    /// presentation derived from a multichannel carrier. `channels` remains the
+    /// carrier channel count from the actual probed stream.
+    pub stereo_downmix_source_label: Option<String>,
 }
 
 /// Unified browsable representation of an optical disc.

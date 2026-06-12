@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
 use tonepoet::config::TonepoetConfig;
+use tonepoet::convert::pipeline::DvdaDownmixPolicy;
 use tonepoet::convert::{
     formats::{
         AacProfile, AudioFormat, ConversionOptions, FileFormat, FormatDetector, Mp3BitrateMode,
@@ -13,7 +14,7 @@ use tonepoet::convert::{
     ProgressUpdate,
 };
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "tonepoet", about = "Audio conversion toolkit")]
 struct Cli {
     #[command(subcommand)]
@@ -24,7 +25,7 @@ struct Cli {
     verbose: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Convert audio files, directories, or archives
     Convert {
@@ -136,6 +137,14 @@ enum Commands {
         /// Treat DVD-Audio disc as already decrypted (skip CPPM probe)
         #[arg(long = "dvda-assume-decrypted")]
         dvda_assume_decrypted: bool,
+
+        /// DVD-Audio downmix policy (auto, none, foo-compat, ffmpeg)
+        #[arg(
+            long = "dvda-downmix",
+            value_name = "auto|none|foo-compat|ffmpeg",
+            value_parser = parse_dvda_downmix_policy
+        )]
+        dvda_downmix: Option<DvdaDownmixPolicy>,
     },
 
     /// Launch full interactive TUI
@@ -291,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
             no_features,
             dvda_group,
             dvda_assume_decrypted,
+            dvda_downmix,
         } => {
             run_convert(
                 paths,
@@ -320,6 +330,7 @@ async fn main() -> anyhow::Result<()> {
                 no_features,
                 dvda_group,
                 dvda_assume_decrypted,
+                dvda_downmix,
                 &config,
             )
             .await?;
@@ -440,6 +451,21 @@ fn parse_dvda_group(s: &str) -> tonepoet::convert::pipeline::DvdaGroupSelection 
     }
 }
 
+fn parse_dvda_downmix_policy(s: &str) -> Result<DvdaDownmixPolicy, String> {
+    let normalized = s.to_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "auto" => Ok(DvdaDownmixPolicy::Auto),
+        "none" | "native" | "raw" | "off" => Ok(DvdaDownmixPolicy::None),
+        "foo" | "foo-compat" | "foo-input-dvda" | "foo-input-dvda-compatible" => {
+            Ok(DvdaDownmixPolicy::FooInputDvdaCompatible)
+        }
+        "ffmpeg" | "ffmpeg-default" | "ac2" | "ac-2" => Ok(DvdaDownmixPolicy::FfmpegDefault),
+        _ => Err(format!(
+            "invalid DVD-Audio downmix policy '{s}'; expected one of: auto, none, foo-compat, ffmpeg"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_convert(
     paths: Vec<PathBuf>,
@@ -469,6 +495,7 @@ async fn run_convert(
     no_features: bool,
     dvda_group: Option<String>,
     dvda_assume_decrypted: bool,
+    dvda_downmix: Option<DvdaDownmixPolicy>,
     config: &TonepoetConfig,
 ) -> anyhow::Result<()> {
     // Load preset if specified
@@ -595,6 +622,7 @@ async fn run_convert(
         no_features,
         dvda_group.as_deref(),
         dvda_assume_decrypted,
+        dvda_downmix,
     );
 
     // Build processor
@@ -821,6 +849,7 @@ fn build_pipeline_request_template(
     no_features: bool,
     dvda_group: Option<&str>,
     dvda_assume_decrypted: bool,
+    dvda_downmix: Option<DvdaDownmixPolicy>,
 ) -> Option<tonepoet::convert::pipeline::PipelineRequest> {
     use std::collections::BTreeSet;
     use tonepoet::convert::pipeline::*;
@@ -837,7 +866,8 @@ fn build_pipeline_request_template(
         || no_metadata
         || no_features
         || dvda_group.is_some()
-        || dvda_assume_decrypted;
+        || dvda_assume_decrypted
+        || dvda_downmix.is_some();
 
     if !has_pipeline_flags {
         return None;
@@ -892,6 +922,7 @@ fn build_pipeline_request_template(
                 .map(parse_dvda_group)
                 .unwrap_or(DvdaGroupSelection::Default),
             dvda_assume_decrypted,
+            dvda_downmix_policy: dvda_downmix.unwrap_or(DvdaDownmixPolicy::Auto),
             cue_sidecar: cue_policy,
             track_selection,
         },
@@ -2110,6 +2141,7 @@ mod pipeline_cli_tests {
             false,
             None,
             false,
+            None,
         );
         assert!(result.is_none());
     }
@@ -2135,6 +2167,7 @@ mod pipeline_cli_tests {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(matches!(req.source.track_selection,
@@ -2163,6 +2196,7 @@ mod pipeline_cli_tests {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -2192,6 +2226,7 @@ mod pipeline_cli_tests {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2221,6 +2256,7 @@ mod pipeline_cli_tests {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2250,6 +2286,7 @@ mod pipeline_cli_tests {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2279,6 +2316,7 @@ mod pipeline_cli_tests {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2308,6 +2346,7 @@ mod pipeline_cli_tests {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(req.naming.template, "{nn} - {title}");
@@ -2334,6 +2373,7 @@ mod pipeline_cli_tests {
             true,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2367,6 +2407,7 @@ mod pipeline_cli_tests {
             true,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2396,6 +2437,7 @@ mod pipeline_cli_tests {
             false,
             Some("stereo"),
             false,
+            None,
         );
         assert!(req.is_some());
         let req = req.unwrap();
@@ -2426,9 +2468,71 @@ mod pipeline_cli_tests {
             false,
             None,
             true,
+            None,
         );
         assert!(req.is_some());
         assert!(req.unwrap().source.dvda_assume_decrypted);
+    }
+
+    #[test]
+    fn dvda_downmix_flag_triggers_pipeline_request() {
+        let req = build_pipeline_request_template(
+            &None,
+            &default_options(),
+            AudioFormat::Flac,
+            false,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            None,
+            false,
+            Some(DvdaDownmixPolicy::FooInputDvdaCompatible),
+        );
+        assert!(req.is_some());
+        assert_eq!(
+            req.unwrap().source.dvda_downmix_policy,
+            tonepoet::convert::pipeline::DvdaDownmixPolicy::FooInputDvdaCompatible
+        );
+    }
+
+
+    #[test]
+    fn dvda_downmix_clap_rejects_unknown_values() {
+        let err = Cli::try_parse_from([
+            "tonepoet",
+            "convert",
+            "disc.iso",
+            "--dvda-downmix",
+            "surprise",
+        ])
+        .expect_err("unknown DVD-Audio downmix values must fail clap parsing");
+        assert!(err.to_string().contains("invalid DVD-Audio downmix policy"));
+    }
+
+    #[test]
+    fn dvda_downmix_clap_accepts_documented_values() {
+        let cli = Cli::try_parse_from([
+            "tonepoet",
+            "convert",
+            "disc.iso",
+            "--dvda-downmix",
+            "ffmpeg",
+        ])
+        .expect("documented DVD-Audio downmix value should parse");
+
+        let Commands::Convert { dvda_downmix, .. } = cli.command else {
+            panic!("expected convert command");
+        };
+        assert_eq!(dvda_downmix, Some(DvdaDownmixPolicy::FfmpegDefault));
     }
 
     #[test]
@@ -2452,6 +2556,7 @@ mod pipeline_cli_tests {
             false,
             Some("2"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2481,6 +2586,7 @@ mod pipeline_cli_tests {
             false,
             Some("all"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(

@@ -94,6 +94,10 @@ pub struct SourceOptions {
     /// probe cannot classify the payload but the user knows the AOB sectors are readable.
     #[serde(default)]
     pub dvda_assume_decrypted: bool,
+    /// DVD-Audio downmix policy requested by the caller. `Auto` preserves native
+    /// output except for structurally identified authored stereo presentations.
+    #[serde(default)]
+    pub dvda_downmix_policy: DvdaDownmixPolicy,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -115,7 +119,8 @@ impl SourceOptions {
         !matches!(
             self.effective_dvda_group_selection(),
             DvdaGroupSelection::Default
-        )
+        ) || self.dvda_assume_decrypted
+            || !matches!(self.dvda_downmix_policy, DvdaDownmixPolicy::Auto)
     }
 }
 
@@ -163,6 +168,83 @@ impl DvdaGroupSelection {
             Self::PreferHighestResolution => "prefer_highest_resolution".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DvdaDownmixPolicy {
+    /// Preserve existing behavior except for authored stereo presentations that
+    /// the materializer can identify from structure. This is the source-option
+    /// default, not a realized track policy.
+    Auto,
+    /// Extract all channels as-is. Also used as the backward-compatible default
+    /// for older serialized `TrackSourceRef::DvdaTrack` values.
+    None,
+    /// Apply the foo_input_dvda-compatible conservative stereo matrix.
+    FooInputDvdaCompatible,
+    /// Ask ffmpeg to choose its default stereo rematrixing with `-ac 2`.
+    FfmpegDefault,
+}
+
+impl Default for DvdaDownmixPolicy {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl DvdaDownmixPolicy {
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::FooInputDvdaCompatible | Self::FfmpegDefault)
+    }
+
+    #[must_use]
+    pub const fn output_channel_count(self) -> Option<u32> {
+        if self.is_active() {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn realized_default() -> Self {
+        Self::None
+    }
+
+    #[must_use]
+    pub const fn cache_tag(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::None => 1,
+            Self::FooInputDvdaCompatible => 2,
+            Self::FfmpegDefault => 3,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::FooInputDvdaCompatible => "foo_input_dvda_compatible",
+            Self::FfmpegDefault => "ffmpeg_default",
+        }
+    }
+
+    #[must_use]
+    pub const fn behavior(self) -> &'static str {
+        match self {
+            Self::Auto => "resolve per track during DVD-Audio materialization",
+            Self::None => "extract native channel count without downmix DSP",
+            Self::FooInputDvdaCompatible => "apply foo_input_dvda-compatible conservative stereo downmix during realization",
+            Self::FfmpegDefault => "ask ffmpeg to apply its default stereo rematrixing during realization",
+        }
+    }
+}
+
+fn default_realized_dvda_downmix_policy() -> DvdaDownmixPolicy {
+    DvdaDownmixPolicy::realized_default()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +356,8 @@ pub struct RedactedSourceOptions {
     /// probe cannot classify the payload but the user knows the AOB sectors are readable.
     #[serde(default)]
     pub dvda_assume_decrypted: bool,
+    #[serde(default)]
+    pub dvda_downmix_policy: DvdaDownmixPolicy,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -294,6 +378,7 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
                 dvda_group_selection: req.source.effective_dvda_group_selection(),
                 dvda_group: req.source.dvda_group,
                 dvda_assume_decrypted: req.source.dvda_assume_decrypted,
+                dvda_downmix_policy: req.source.dvda_downmix_policy,
                 cue_sidecar: req.source.cue_sidecar,
                 track_selection: req.source.track_selection.clone(),
             },
@@ -391,6 +476,10 @@ pub enum TrackSourceRef {
         index_start: Option<u8>,
         /// ATS downmix matrix selector for this track, when present.
         downmix_matrix: Option<u8>,
+        /// Realized downmix policy selected for this track. Missing values from
+        /// older manifests preserve the native all-channel behavior.
+        #[serde(default = "default_realized_dvda_downmix_policy")]
+        dvda_downmix_policy: DvdaDownmixPolicy,
         /// ATS PGC/title table byte offset captured for Phase 3 diagnostics and
         /// cross-checking, when the source reference came from ATSI.
         title_table_offset: Option<u32>,
@@ -500,6 +589,10 @@ pub enum DvdaSectorAddressSpace {
     /// Sector numbers are relative to the beginning of the selected ATS AOB
     /// logical address space and should be resolved through `aob_files`.
     AtsAobRelative { title_set_nr: u8 },
+    /// Sector numbers are absolute logical block addresses on the original disc.
+    /// This is used for AOB-less ATS presentations whose PGC sector ranges must
+    /// be resolved from AMG/AOTT + ATSI base-sector metadata.
+    DiscAbsolute { title_set_nr: u8 },
     /// Sector numbers came directly from SAMG absolute-sector fields. Realization
     /// resolves these through raw ISO sector reads because copied directory trees
     /// do not preserve disc logical sector addresses.

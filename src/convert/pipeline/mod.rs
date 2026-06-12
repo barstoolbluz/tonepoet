@@ -78,6 +78,8 @@ mod tests {
                 sacd_area: None,
                 dvda_group: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
                 cue_sidecar: CueSidecarPolicy::IgnoreCue,
                 track_selection: TrackSelection::All,
             },
