@@ -505,7 +505,7 @@ pub fn source_mode_for_presentation(
         .map(|track| MultiTrackEntry {
             number: track.number,
             title: track.title.clone(),
-            performer: None,
+            performer: track.performer.clone(),
             duration_display: track.duration_secs.map(duration_display),
         })
         .collect();
@@ -520,7 +520,7 @@ pub fn source_mode_for_presentation(
         tracks,
         area_label: Some(presentation.label.clone()),
         album_title: Some(contents.label.clone()),
-        album_artist: None,
+        album_artist: contents.album_artist.clone(),
         probe_notice: None,
         scroll: 0,
         cursor: 0,
@@ -557,6 +557,9 @@ pub fn metadata_for_disc(contents: &DiscContents) -> SourceMetadata {
     if !contents.label.trim().is_empty() {
         metadata.album = Some(contents.label.clone());
     }
+    metadata.artist = contents.album_artist.clone();
+    metadata.genre = contents.genre.clone();
+    metadata.year = contents.year.clone();
     metadata
 }
 

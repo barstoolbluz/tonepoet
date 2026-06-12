@@ -45,6 +45,7 @@ pub struct AudioPresentationFormat {
 pub struct DiscTrack {
     pub number: u32,
     pub title: Option<String>,
+    pub performer: Option<String>,
     pub duration_secs: Option<f64>,
     pub format_note: Option<String>,
 }
@@ -114,4 +115,7 @@ pub struct DiscContents {
     pub suppressed: Vec<SuppressedPresentation>,
     pub copy_protection: CopyProtectionSummary,
     pub diagnostics: Vec<DiscDiagnostic>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
+    pub year: Option<String>,
 }

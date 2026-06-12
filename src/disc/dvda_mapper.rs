@@ -129,6 +129,9 @@ pub fn map_dvda_disc(
         suppressed,
         copy_protection,
         diagnostics,
+        album_artist: None,
+        genre: None,
+        year: None,
     }
 }
 

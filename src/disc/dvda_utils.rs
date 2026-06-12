@@ -455,6 +455,7 @@ pub fn build_dvda_tracks(disc: &DvdaDisc, group: &DvdaGroup) -> Vec<super::model
                 tracks.push(super::model::DiscTrack {
                     number: u32::from(ch.track_nr),
                     title: None,
+                    performer: None,
                     duration_secs: Some(f64::from(ch.len_in_pts) / PTS_PER_SEC),
                     format_note: None,
                 });

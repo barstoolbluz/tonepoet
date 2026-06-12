@@ -33,6 +33,29 @@ pub fn map_sacd_disc(
         DiscFormat::Sacd,
     );
 
+    // Album metadata: sidecar first, TOC fallback
+    let sidecar_first_track = sidecar
+        .and_then(|s| s.tracks.first());
+    let album_artist = sidecar_first_track
+        .and_then(|t| t.meta.get("ARTIST"))
+        .cloned()
+        .or_else(|| metadata.album_artist().map(|s| s.to_string()));
+    let genre = sidecar_first_track
+        .and_then(|t| t.meta.get("GENRE"))
+        .cloned()
+        .or_else(|| {
+            metadata.master_toc.disc_genres.first()
+                .or(metadata.master_toc.album_genres.first())
+                .map(|g| g.name().to_string())
+        });
+    let year = sidecar_first_track
+        .and_then(|t| t.meta.get("DATE"))
+        .cloned()
+        .or_else(|| {
+            metadata.master_toc.disc_date.as_ref()
+                .map(|d| d.year.to_string())
+        });
+
     let mut presentations = Vec::new();
     let mut diagnostics = Vec::new();
 
@@ -58,6 +81,9 @@ pub fn map_sacd_disc(
             description: "None".to_string(),
         },
         diagnostics,
+        album_artist,
+        genre,
+        year,
     }
 }
 
@@ -101,13 +127,18 @@ fn map_area(
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            // Sidecar title takes priority over TOC title
-            let title = sidecar_tracks
+            // Sidecar title/performer take priority over TOC
+            let sidecar_track = sidecar_tracks
                 .as_ref()
-                .and_then(|st| st.get(i))
+                .and_then(|st| st.get(i));
+            let title = sidecar_track
                 .and_then(|t| t.meta.get("TITLE"))
                 .cloned()
                 .or_else(|| entry.text.title.clone());
+            let performer = sidecar_track
+                .and_then(|t| t.meta.get("ARTIST"))
+                .cloned()
+                .or_else(|| entry.text.performer.clone());
 
             let format_note = if is_dst {
                 Some("DST encoded".to_string())
@@ -118,6 +149,7 @@ fn map_area(
             DiscTrack {
                 number: (i + 1) as u32,
                 title,
+                performer,
                 duration_secs: Some(entry.duration.total_seconds()),
                 format_note,
             }
