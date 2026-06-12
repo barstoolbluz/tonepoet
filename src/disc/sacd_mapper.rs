@@ -25,17 +25,19 @@ pub fn map_sacd_disc(
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
-    let album_title = metadata.album_title().map(|s| s.to_string());
+    // Album metadata: sidecar first, TOC fallback
+    let sidecar_first_track = sidecar
+        .and_then(|s| s.tracks.first());
+    let album_title = sidecar_first_track
+        .and_then(|t| t.meta.get("ALBUM"))
+        .cloned()
+        .or_else(|| metadata.album_title().map(|s| s.to_string()));
     let label = labels::disc_label(
         album_title.as_deref(),
         "",
         file_stem,
         DiscFormat::Sacd,
     );
-
-    // Album metadata: sidecar first, TOC fallback
-    let sidecar_first_track = sidecar
-        .and_then(|s| s.tracks.first());
     let album_artist = sidecar_first_track
         .and_then(|t| t.meta.get("ARTIST"))
         .cloned()
@@ -81,6 +83,7 @@ pub fn map_sacd_disc(
             description: "None".to_string(),
         },
         diagnostics,
+        album_title,
         album_artist,
         genre,
         year,

@@ -519,7 +519,7 @@ pub fn source_mode_for_presentation(
         metadata,
         tracks,
         area_label: Some(presentation.label.clone()),
-        album_title: Some(contents.label.clone()),
+        album_title: contents.album_title.clone(),
         album_artist: contents.album_artist.clone(),
         probe_notice: None,
         scroll: 0,
@@ -554,9 +554,7 @@ pub fn source_info_for_presentation(
 /// Build a metadata object from disc-level labels without inventing track tags.
 pub fn metadata_for_disc(contents: &DiscContents) -> SourceMetadata {
     let mut metadata = SourceMetadata::default();
-    if !contents.label.trim().is_empty() {
-        metadata.album = Some(contents.label.clone());
-    }
+    metadata.album = contents.album_title.clone();
     metadata.artist = contents.album_artist.clone();
     metadata.genre = contents.genre.clone();
     metadata.year = contents.year.clone();

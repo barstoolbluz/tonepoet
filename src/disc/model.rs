@@ -115,6 +115,7 @@ pub struct DiscContents {
     pub suppressed: Vec<SuppressedPresentation>,
     pub copy_protection: CopyProtectionSummary,
     pub diagnostics: Vec<DiscDiagnostic>,
+    pub album_title: Option<String>,
     pub album_artist: Option<String>,
     pub genre: Option<String>,
     pub year: Option<String>,
