@@ -865,6 +865,7 @@ fn draw_browse_info(
 }
 
 /// Truncate a string to fit within `max_chars` columns, adding ellipsis if needed.
+#[allow(dead_code)]
 pub(crate) fn truncate_for_disc_overlay(s: &str, max_chars: usize) -> String { truncate_to(s, max_chars) }
 
 fn truncate_to(s: &str, max_chars: usize) -> String {

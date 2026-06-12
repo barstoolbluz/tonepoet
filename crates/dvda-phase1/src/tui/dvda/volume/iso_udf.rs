@@ -270,6 +270,7 @@ struct LongAd {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct Partition {
     number: u16,
     start_sector: u32,
@@ -284,6 +285,7 @@ struct LogicalVolume {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct UdfNode {
     file_type: u8,
     len: u64,

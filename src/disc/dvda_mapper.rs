@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::tui::dvda::{CopyProtectionSource, DvdaDisc, DvdaVolume};
+use crate::tui::dvda::{CopyProtectionSource, DvdaDisc};
 
 use super::diagnostics::{DiagnosticScope, DiagnosticSeverity, DiscDiagnostic};
 use super::dvda_utils;

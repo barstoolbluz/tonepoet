@@ -80,6 +80,7 @@ pub enum MlpInspectError {
         declared_bytes: usize,
         bytes_read: usize,
     },
+    #[allow(dead_code)]
     FrameTooShortForMajorSync { offset: u64, frame_bytes: usize },
     MajorSyncTooShort { offset: u64, available: usize },
     MajorSyncBitRead { offset: u64, field: &'static str },

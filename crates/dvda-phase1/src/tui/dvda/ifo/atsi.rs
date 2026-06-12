@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::tui::dvda::endian::{be_u16, be_u32, identifier, require_len, slice, u8_at};
+use crate::tui::dvda::endian::{be_u32, identifier, require_len, slice, u8_at};
 use crate::tui::dvda::error::{DvdaError, Result};
 use crate::tui::dvda::model::{
     channel_assignment, parse_channel_format, track_type_low_bits_candidate, AobFileEntry,
@@ -166,7 +166,7 @@ fn parse_audio_pgcit(
     let pgcit_data = slice(bytes, pgcit_offset, bounded_len, "audio_pgcit bounded data")?;
 
     let mut titles = Vec::with_capacity(nr_of_titles as usize);
-    let mut diagnostics = Vec::new();
+    let diagnostics = Vec::new();
     for i in 0..nr_of_titles as usize {
         let idx_off = AUDIO_PGCIT_SIZE + i * ATS_TITLE_IDX_SIZE;
         let idx = slice(pgcit_data, idx_off, ATS_TITLE_IDX_SIZE, format!("ats_title_idx[{i}]"))?;

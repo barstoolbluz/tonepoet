@@ -505,6 +505,7 @@ impl LpcmParams {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(super) fn wave_channel_order_label(self) -> String {
         layout_for_assignment_code(self.channel_assignment_code)
             .map(|layout| layout.wave_order_label())

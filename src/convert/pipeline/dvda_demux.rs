@@ -188,6 +188,7 @@ impl From<io::Error> for DvdaDemuxError {
     }
 }
 
+#[allow(dead_code)]
 pub fn extract_mlp_from_sector<W: Write>(
     sector: &[u8],
     out: &mut W,
@@ -205,6 +206,7 @@ pub fn extract_mlp_from_sector<W: Write>(
     out.write_all(&pending).map_err(DvdaDemuxError::Write)
 }
 
+#[allow(dead_code)]
 pub fn demux_private_stream_1_packets<F>(
     sector: &[u8],
     stats: &mut DvdaDemuxStats,

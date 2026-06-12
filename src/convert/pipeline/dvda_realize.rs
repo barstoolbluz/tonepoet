@@ -17,7 +17,7 @@ use super::dvda_channel_layout::{
 };
 use super::dvda_demux::{
     parse_private_stream_1_packets, record_private_stream_1_packets, DvdaDemuxError,
-    DvdaDemuxStats, DvdaPs1Packet, DvdaSubHeader, DvdaSubstreamKind,
+    DvdaDemuxStats, DvdaPs1Packet, DvdaSubstreamKind,
     MLP_EXTRA_HEADER_LENGTH, MLP_STREAM_ID, PCM_EXTRA_HEADER_LENGTH, PCM_STREAM_ID,
     DVD_SECTOR_SIZE,
 };
@@ -349,6 +349,7 @@ impl DvdaRealizationAudioPolicy {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(super) fn unknown() -> Self {
         Self {
             final_encode_bit_depth_policy: "unknown".to_string(),

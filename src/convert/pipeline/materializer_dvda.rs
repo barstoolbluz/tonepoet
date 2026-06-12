@@ -29,7 +29,9 @@ use crate::tui::dvda::{
 
 const DVDA_AMG_MAGIC: &[u8] = b"DVDAUDIO-AMG";
 const PTS_PER_SECOND: u64 = 90_000;
+#[allow(dead_code)]
 const DVD_SECTOR_SIZE_U64: u64 = 2048;
+#[allow(dead_code)]
 const DVD_SECTOR_SIZE_USIZE: usize = 2048;
 const RAW_DVDA_MAGIC_SCAN_CHUNK: usize = 1024 * 1024;
 
@@ -504,6 +506,7 @@ fn has_extension(path: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn select_group<'a>(
     disc: &'a DvdaDisc,
     requested: Option<u8>,
@@ -1442,6 +1445,7 @@ enum AudioFormatResolution {
     SamgTrackRecord,
 }
 
+#[allow(dead_code)]
 fn audio_facts_for_title_set(title_set: &TitleSet) -> AudioFacts<'_> {
     let present: Vec<&AudioAttributes> = present_audio_formats(title_set);
 
@@ -1670,6 +1674,7 @@ fn expected_samples_from_pts_len(len_in_pts: u32, sample_rate: u32) -> Option<u6
     }
 }
 
+#[allow(dead_code)]
 fn sector_range_ref(range: &crate::tui::dvda::SectorRange) -> DvdaSectorRangeRef {
     DvdaSectorRangeRef {
         index_nr: range.index_nr,
