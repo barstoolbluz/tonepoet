@@ -2583,7 +2583,9 @@ fn cue_referenced_audio_paths(cue_paths: &[PathBuf]) -> Vec<PathBuf> {
     referenced
 }
 
-pub(crate) fn materializable_cue_referenced_audio_paths_for_queue(cue_path: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn materializable_cue_referenced_audio_paths_for_queue(
+    cue_path: &Path,
+) -> Result<Vec<PathBuf>, String> {
     let sheet = crate::tui::cue_parser::parse_cue_file(cue_path)
         .map_err(|err| format!("failed to parse CUE: {err}"))?;
     let parent = cue_path
@@ -2637,7 +2639,19 @@ pub(crate) fn materializable_cue_referenced_audio_paths_for_queue(cue_path: &Pat
     }
 
     validate_queue_cue_index_order(&resolved_tracks)?;
-    Ok(referenced)
+
+    let shared_images: Vec<PathBuf> = referenced
+        .into_iter()
+        .filter(|candidate| {
+            resolved_tracks
+                .iter()
+                .filter(|(_, resolved_path, _)| same_path_for_queue(resolved_path, candidate))
+                .count()
+                > 1
+        })
+        .collect();
+
+    Ok(shared_images)
 }
 
 fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Result<(), String> {
@@ -3106,6 +3120,8 @@ mod tests {
             r#"FILE "disc/image.flac" WAVE
   TRACK 01 AUDIO
     INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:12:00
 "#,
         )
         .unwrap();
@@ -3129,6 +3145,8 @@ mod tests {
             r#"FILE "../external.flac" WAVE
   TRACK 01 AUDIO
     INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:12:00
 "#,
         )
         .unwrap();
@@ -3174,6 +3192,8 @@ mod tests {
             r#"FILE "disc/image.wav" WAVE
   TRACK 01 AUDIO
     INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:12:00
 "#,
         )
         .unwrap();
@@ -3223,6 +3243,188 @@ mod tests {
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
         assert!(path_list_contains(&expanded, &cue));
         assert!(path_list_contains(&expanded, &image));
+    }
+
+
+    #[test]
+    fn materializable_cue_returns_no_suppression_for_per_track_stem_matched_audio() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        let track1 = td.path().join("01.flac");
+        let track2 = td.path().join("02.opus");
+        std::fs::write(&track1, b"not real flac").unwrap();
+        std::fs::write(&track2, b"not real opus").unwrap();
+        std::fs::write(
+            &cue,
+            r#"FILE "01.wav" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+FILE "02.wav" WAVE
+  TRACK 02 AUDIO
+    INDEX 01 00:00:00
+"#,
+        )
+        .unwrap();
+
+        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+            .expect("per-track CUE should be materializer-compatible");
+        assert!(referenced.is_empty());
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &cue));
+        assert!(path_list_contains(&expanded, &track1));
+        assert!(path_list_contains(&expanded, &track2));
+    }
+
+    #[test]
+    fn materializable_cue_returns_no_suppression_for_frostbite_style_split_pregap() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("Frostbite.cue");
+        let track1 = td.path().join("01 - If You Love Me Like You Say.flac");
+        let track2 = td.path().join("02 - Blue Monday Hangover.flac");
+        std::fs::write(&track1, b"not real flac").unwrap();
+        std::fs::write(&track2, b"not real flac").unwrap();
+        std::fs::write(
+            &cue,
+            r#"FILE "01 - If You Love Me Like You Say.wav" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 00 04:06:70
+FILE "02 - Blue Monday Hangover.wav" WAVE
+    INDEX 01 00:00:00
+"#,
+        )
+        .unwrap();
+
+        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+            .expect("Frostbite-style per-track CUE should be materializer-compatible");
+        assert!(referenced.is_empty());
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &cue));
+        assert!(path_list_contains(&expanded, &track1));
+        assert!(path_list_contains(&expanded, &track2));
+    }
+
+    #[test]
+    fn materializable_cue_returns_single_image_stem_matched_audio_for_suppression() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        let image = td.path().join("album.flac");
+        std::fs::write(&image, b"not real flac").unwrap();
+        std::fs::write(
+            &cue,
+            r#"FILE "album.wav" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:12:00
+"#,
+        )
+        .unwrap();
+
+        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+            .expect("single-image CUE should be materializer-compatible");
+        assert_eq!(referenced.len(), 1);
+        assert!(path_list_contains(&referenced, &image));
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &image));
+    }
+
+    #[test]
+    fn materializable_cue_returns_each_shared_multi_image_audio_for_suppression() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        let side_a = td.path().join("side-a.flac");
+        let side_b = td.path().join("side-b.wv");
+        std::fs::write(&side_a, b"not real flac").unwrap();
+        std::fs::write(&side_b, b"not real wavpack").unwrap();
+        std::fs::write(
+            &cue,
+            r#"FILE "side-a.wav" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:12:00
+  TRACK 03 AUDIO
+    INDEX 01 07:24:00
+FILE "side-b.wav" WAVE
+  TRACK 04 AUDIO
+    INDEX 01 00:00:00
+  TRACK 05 AUDIO
+    INDEX 01 04:00:00
+  TRACK 06 AUDIO
+    INDEX 01 08:00:00
+"#,
+        )
+        .unwrap();
+
+        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+            .expect("multi-image CUE should be materializer-compatible");
+        assert_eq!(referenced.len(), 2);
+        assert!(path_list_contains(&referenced, &side_a));
+        assert!(path_list_contains(&referenced, &side_b));
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &side_a));
+        assert!(!path_list_contains(&expanded, &side_b));
+    }
+
+    #[test]
+    fn materializable_cue_suppresses_only_shared_audio_in_mixed_layout() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        let main = td.path().join("album-main.flac");
+        let bonus = td.path().join("09 - Bonus Track.flac");
+        let live = td.path().join("10 - Live Version.aac");
+        std::fs::write(&main, b"not real flac").unwrap();
+        std::fs::write(&bonus, b"not real flac").unwrap();
+        std::fs::write(&live, b"not real aac").unwrap();
+        std::fs::write(
+            &cue,
+            r#"FILE "album-main.wav" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+  TRACK 03 AUDIO
+    INDEX 01 06:00:00
+  TRACK 04 AUDIO
+    INDEX 01 09:00:00
+  TRACK 05 AUDIO
+    INDEX 01 12:00:00
+  TRACK 06 AUDIO
+    INDEX 01 15:00:00
+  TRACK 07 AUDIO
+    INDEX 01 18:00:00
+  TRACK 08 AUDIO
+    INDEX 01 21:00:00
+FILE "09 - Bonus Track.wav" WAVE
+  TRACK 09 AUDIO
+    INDEX 01 00:00:00
+FILE "10 - Live Version.wav" WAVE
+  TRACK 10 AUDIO
+    INDEX 01 00:00:00
+"#,
+        )
+        .unwrap();
+
+        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+            .expect("mixed-layout CUE should be materializer-compatible");
+        assert_eq!(referenced.len(), 1);
+        assert!(path_list_contains(&referenced, &main));
+        assert!(!path_list_contains(&referenced, &bonus));
+        assert!(!path_list_contains(&referenced, &live));
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &main));
+        assert!(path_list_contains(&expanded, &bonus));
+        assert!(path_list_contains(&expanded, &live));
     }
 
 }
