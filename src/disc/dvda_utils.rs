@@ -10,7 +10,8 @@ use crate::tui::dvda::{
     DirectoryDvdaVolume, DvdaDisc, DvdaGroup, DvdaVolume, IsoUdfDvdaVolume, TitleRefKind,
 };
 
-use super::dvda_mapper::map_dvda_disc;
+use super::dvda_mapper::map_dvda_disc_with_metabase;
+use crate::tui::dvda_metabase::{self, DvdaMetabase};
 use super::model::{AobProbeResult, AudioPresentationFormat, FormatProvenance};
 use super::model::DiscContents;
 
@@ -68,6 +69,18 @@ fn map_dvda_volume(volume: &dyn DvdaVolume, path: &Path) -> Result<DiscContents,
     let disc = parse_dvda_volume(volume)
         .map_err(|e| format!("DVD-Audio parse failed for '{}': {e}", path.display()))?;
 
+    let loaded_metabase = match dvda_metabase::load_metabase(volume, path) {
+        Ok(metabase) => metabase,
+        Err(e) => {
+            log::warn!(
+                "DVD-Audio metabase load failed for '{}': {}",
+                path.display(),
+                e
+            );
+            None
+        }
+    };
+
     let mut probes = BTreeMap::new();
     for group in &disc.groups {
         if let Some(probe) = probe_group_aob_format_with_path(volume, &disc, group, Some(path)) {
@@ -75,7 +88,7 @@ fn map_dvda_volume(volume: &dyn DvdaVolume, path: &Path) -> Result<DiscContents,
         }
     }
 
-    Ok(map_dvda_disc(&disc, &probes, path))
+    Ok(map_dvda_disc_with_metabase(&disc, &probes, loaded_metabase.as_ref().map(|loaded| &loaded.metabase), path))
 }
 
 /// Probe the first AOB sector of a group's first track to determine the actual
@@ -430,37 +443,27 @@ pub fn resolve_group_format(disc: &DvdaDisc, group: &DvdaGroup) -> AudioPresenta
 
 /// Build per-track DiscTrack entries for a DVD-Audio group.
 pub fn build_dvda_tracks(disc: &DvdaDisc, group: &DvdaGroup) -> Vec<super::model::DiscTrack> {
+    build_dvda_tracks_with_metabase(disc, group, None)
+}
+
+/// Build per-track DiscTrack entries, preferring foo_input_dvda metabase tags
+/// where the `{titleset}.{title}.{track}` id matches the parsed disc address.
+pub fn build_dvda_tracks_with_metabase(
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    metabase: Option<&DvdaMetabase>,
+) -> Vec<super::model::DiscTrack> {
     const PTS_PER_SEC: f64 = 90_000.0;
     let mut tracks = Vec::new();
 
-    for title_ref in &group.title_refs {
-        let Some(ts) = disc
-            .title_sets
-            .iter()
-            .find(|ts| ts.number == title_ref.title_set_nr)
-        else {
-            continue;
-        };
-        let title = match title_ref.kind {
-            TitleRefKind::AottTitleOrdinal => ts
-                .titles
-                .iter()
-                .find(|t| t.title_ordinal == title_ref.title_nr),
-            TitleRefKind::AtsPgcTitleNr => {
-                ts.titles.iter().find(|t| t.title_nr == title_ref.title_nr)
-            }
-        };
-        if let Some(t) = title {
-            for ch in &t.chapters {
-                tracks.push(super::model::DiscTrack {
-                    number: u32::from(ch.track_nr),
-                    title: None,
-                    performer: None,
-                    duration_secs: Some(f64::from(ch.len_in_pts) / PTS_PER_SEC),
-                    format_note: None,
-                });
-            }
-        }
+    for addr in dvda_metabase::group_track_addrs(disc, group) {
+        tracks.push(super::model::DiscTrack {
+            number: u32::from(addr.track),
+            title: dvda_metabase::track_value(metabase, &addr.id, &["TITLE"]),
+            performer: dvda_metabase::track_value(metabase, &addr.id, &["ARTIST", "PERFORMER"]),
+            duration_secs: Some(f64::from(addr.len_in_pts) / PTS_PER_SEC),
+            format_note: None,
+        });
     }
 
     tracks

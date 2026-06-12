@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::tui::dvda::{CopyProtectionSource, DvdaDisc};
+use crate::tui::dvda_metabase::{self, DvdaMetabase};
 
 use super::diagnostics::{DiagnosticScope, DiagnosticSeverity, DiscDiagnostic};
 use super::dvda_utils;
@@ -21,13 +22,44 @@ pub fn map_dvda_disc(
     probes: &BTreeMap<u8, AobProbeResult>,
     source_path: &Path,
 ) -> DiscContents {
+    let loaded_metabase = match dvda_metabase::load_metabase_for_source_path(source_path) {
+        Ok(metabase) => metabase,
+        Err(e) => {
+            log::warn!(
+                "DVD-Audio metabase load failed for '{}': {}",
+                source_path.display(),
+                e
+            );
+            None
+        }
+    };
+
+    map_dvda_disc_with_metabase(
+        disc,
+        probes,
+        loaded_metabase.as_ref().map(|loaded| &loaded.metabase),
+        source_path,
+    )
+}
+
+pub fn map_dvda_disc_with_metabase(
+    disc: &DvdaDisc,
+    probes: &BTreeMap<u8, AobProbeResult>,
+    metabase: Option<&DvdaMetabase>,
+    source_path: &Path,
+) -> DiscContents {
     let file_stem = source_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
+    let album_title = dvda_metabase::album_value(metabase, &["ALBUM"]);
+    let album_artist = dvda_metabase::album_value(metabase, &["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"]);
+    let genre = dvda_metabase::album_value(metabase, &["GENRE"]);
+    let year = dvda_metabase::album_value(metabase, &["DATE", "YEAR"]);
+
     let label = labels::disc_label(
-        None,
+        album_title.as_deref(),
         &disc.amg.provider_identifier,
         file_stem,
         DiscFormat::DvdAudio,
@@ -110,7 +142,7 @@ pub fn map_dvda_disc(
         };
 
         let pres_label = labels::presentation_label(&format);
-        let tracks = dvda_utils::build_dvda_tracks(disc, group);
+        let tracks = dvda_utils::build_dvda_tracks_with_metabase(disc, group, metabase);
 
         presentations.push(DiscPresentation {
             id: group_id,
@@ -129,10 +161,10 @@ pub fn map_dvda_disc(
         suppressed,
         copy_protection,
         diagnostics,
-        album_title: None,
-        album_artist: None,
-        genre: None,
-        year: None,
+        album_title,
+        album_artist,
+        genre,
+        year,
     }
 }
 

@@ -2,6 +2,7 @@
 
 pub mod accuraterip;
 pub mod dvda;
+pub mod dvda_metabase;
 pub mod analyze;
 pub mod app;
 pub mod archive_listing;

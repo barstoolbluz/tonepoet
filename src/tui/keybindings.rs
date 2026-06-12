@@ -2938,18 +2938,44 @@ pub(super) fn metadata_editor_save(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     if state.read_only {
-        app.set_status("read-only editor — cannot save (SACD ISO)");
+        if state.sacd_sidecar_path.is_some() && state.sacd_area_kind.is_none() {
+            app.set_status("read-only editor — cannot save (DVD-Audio metabase)");
+        } else {
+            app.set_status("read-only editor — cannot save (SACD ISO)");
+        }
         return;
     }
     if !state.dirty {
         app.set_status("No changes to save");
         return;
     }
-    // SACD save: route to the XML sidecar writer instead of the
-    // normal lofty / per-file path. The sidecar path was captured
-    // on editor open; the area kind tells us which tracks within
-    // the sidecar to update.
+    // Disc-image save: route XML-backed editors away from the lofty / per-file path.
     if let Some(sidecar_path) = state.sacd_sidecar_path.clone() {
+        if state.sacd_area_kind.is_none() {
+            match save_dvda_metabase(state, &sidecar_path) {
+                Ok(kind) => {
+                    state.dirty = false;
+                    for e in state.entries.iter_mut() {
+                        e.per_file_originals = e.per_file_values.clone();
+                        e.original = e.value.clone();
+                    }
+                    let verb = match kind {
+                        SacdSaveKind::Created => "created",
+                        SacdSaveKind::Updated => "updated",
+                    };
+                    let file_name = sidecar_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| sidecar_path.display().to_string());
+                    app.set_status(format!("DVD-Audio metabase {}: {}", verb, file_name));
+                }
+                Err(reason) => {
+                    app.set_status(format!("DVD-Audio metabase save failed: {}", reason));
+                }
+            }
+            return;
+        }
+
         match save_sacd_sidecar(state, &sidecar_path) {
             Ok(outcome) => {
                 state.dirty = false;
@@ -4129,9 +4155,17 @@ pub fn open_metadata_editor(app: &mut AppState) {
             open_metadata_editor_for_sacd(app, sel[0].clone());
             return;
         }
+        if crate::disc::dvda_utils::is_dvda_source(&sel[0]) {
+            open_metadata_editor_for_dvda(app, sel[0].clone());
+            return;
+        }
         if sel[0].is_dir() {
             if let Some(iso) = find_single_sacd_in_dir(&sel[0]) {
                 open_metadata_editor_for_sacd(app, iso);
+                return;
+            }
+            if let Some(source) = find_single_dvda_source_in_dir(&sel[0]) {
+                open_metadata_editor_for_dvda(app, source);
                 return;
             }
         }
@@ -4365,6 +4399,463 @@ pub fn open_metadata_editor(app: &mut AppState) {
         sacd_stereo_durations: None,
         sacd_multi_channel_durations: None,
     }));
+}
+
+
+/// Open the metadata editor against a DVD-Audio ISO or AUDIO_TS directory.
+/// The editor writes foo_input_dvda-compatible `{STORE_ID}.xml` files.
+pub(super) fn open_metadata_editor_for_dvda(app: &mut AppState, source_path: std::path::PathBuf) {
+    open_metadata_editor_for_dvda_with_group(app, source_path, None, None);
+}
+
+#[allow(dead_code)]
+pub(super) fn open_metadata_editor_for_dvda_group(
+    app: &mut AppState,
+    source_path: std::path::PathBuf,
+    group_nr: u8,
+) {
+    open_metadata_editor_for_dvda_with_group(app, source_path, Some(group_nr), None);
+}
+
+fn open_metadata_editor_for_dvda_at_track(
+    app: &mut AppState,
+    source_path: std::path::PathBuf,
+    initial_track: Option<usize>,
+) {
+    open_metadata_editor_for_dvda_with_group(app, source_path, None, initial_track);
+}
+
+fn open_metadata_editor_for_dvda_with_group(
+    app: &mut AppState,
+    source_path: std::path::PathBuf,
+    group_nr: Option<u8>,
+    initial_track: Option<usize>,
+) {
+    let (disc, store_id, metabase_path, metabase, parse_note) =
+        match load_dvda_metabase_context(&source_path) {
+            Ok(v) => v,
+            Err(e) => {
+                app.set_status(e);
+                return;
+            }
+        };
+
+    match build_dvda_editor_state(
+        &source_path,
+        &disc,
+        &store_id,
+        metabase_path.as_ref(),
+        metabase.as_ref(),
+        group_nr,
+    ) {
+        Ok((mut state, group_label, n_tracks)) => {
+            if let Some(track_index) = initial_track {
+                focus_metadata_editor_on_track(&mut state, track_index);
+            }
+            let src = if metabase.is_some() {
+                "metabase+IFO"
+            } else if parse_note.is_some() {
+                "IFO (metabase malformed)"
+            } else {
+                "IFO"
+            };
+            let mode = if state.read_only { "read-only" } else { "writable" };
+            let choices = super::dvda_metabase::available_groups(&disc);
+            let choice_note = if choices.len() > 1 {
+                format!(
+                    "; switch with :dvda-group <n> [{}]",
+                    super::dvda_metabase::group_choice_hint(&disc),
+                )
+            } else {
+                String::new()
+            };
+            app.set_status(format!(
+                "DVD-Audio editor opened ({}, {} tracks, {}, {}){}",
+                group_label, n_tracks, src, mode, choice_note,
+            ));
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(Box::new(state));
+        }
+        Err(msg) => app.set_status(msg),
+    }
+}
+
+fn load_dvda_metabase_context(
+    source_path: &std::path::Path,
+) -> Result<(
+    crate::tui::dvda::DvdaDisc,
+    String,
+    Option<std::path::PathBuf>,
+    Option<super::dvda_metabase::DvdaMetabase>,
+    Option<String>,
+), String> {
+    if crate::disc::dvda_utils::is_dvda_directory(source_path) {
+        let volume = crate::tui::dvda::DirectoryDvdaVolume::new(source_path);
+        return load_dvda_metabase_context_from_volume(&volume, source_path);
+    }
+    let volume = crate::tui::dvda::IsoUdfDvdaVolume::open(source_path)
+        .map_err(|e| format!("DVD-Audio ISO open failed for '{}': {}", source_path.display(), e))?;
+    load_dvda_metabase_context_from_volume(&volume, source_path)
+}
+
+fn load_dvda_metabase_context_from_volume(
+    volume: &dyn crate::tui::dvda::DvdaVolume,
+    source_path: &std::path::Path,
+) -> Result<(
+    crate::tui::dvda::DvdaDisc,
+    String,
+    Option<std::path::PathBuf>,
+    Option<super::dvda_metabase::DvdaMetabase>,
+    Option<String>,
+), String> {
+    let disc = crate::tui::dvda::parse_dvda_volume(volume)
+        .map_err(|e| format!("DVD-Audio parse failed for '{}': {}", source_path.display(), e))?;
+    let store_id = super::dvda_metabase::compute_store_id(volume)
+        .ok_or_else(|| "DVD-Audio: could not read AUDIO_TS.IFO for metabase store id".to_string())?;
+    let metabase_path = super::dvda_metabase::find_metabase(source_path, &store_id);
+    let mut parse_note = None;
+    let metabase = metabase_path
+        .as_ref()
+        .and_then(|p| match super::dvda_metabase::parse_metabase(p) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                parse_note = Some(e.to_string());
+                log::warn!("DVD-Audio metabase parse failed for '{}': {}", p.display(), e);
+                None
+            }
+        });
+    Ok((disc, store_id, metabase_path, metabase, parse_note))
+}
+
+pub fn build_dvda_editor_state(
+    source_path: &std::path::Path,
+    disc: &crate::tui::dvda::DvdaDisc,
+    store_id: &str,
+    existing_metabase_path: Option<&std::path::PathBuf>,
+    metabase: Option<&super::dvda_metabase::DvdaMetabase>,
+    selected_group_nr: Option<u8>,
+) -> Result<(super::app::MetadataEditorState, String, usize), String> {
+    use lofty::tag::ItemKey;
+    use super::probe::TagEntry;
+
+    let group = super::dvda_metabase::select_group(disc, selected_group_nr)
+        .map_err(|e| e.to_string())?;
+    let track_addrs = super::dvda_metabase::group_track_addrs(disc, group);
+    let n_tracks = track_addrs.len();
+    if n_tracks == 0 {
+        return Err("DVD-Audio group has zero tracks".to_string());
+    }
+
+    let paths = vec![source_path.to_path_buf(); n_tracks];
+    let mut entries: Vec<TagEntry> = Vec::new();
+
+    let push_album = |entries: &mut Vec<TagEntry>, display_key: &str, item_key: ItemKey, value: String| {
+        if value.trim().is_empty() {
+            return;
+        }
+        let vals = vec![value.clone(); n_tracks];
+        entries.push(TagEntry {
+            display_key: display_key.to_string(),
+            item_key,
+            value: value.clone(),
+            original: value,
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vals.clone(),
+            per_file_originals: vals,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    };
+
+    let push_per_track = |entries: &mut Vec<TagEntry>, display_key: &str, item_key: ItemKey, values: Vec<String>| {
+        if values.iter().all(|s| s.trim().is_empty()) {
+            return;
+        }
+        let all_same = values.windows(2).all(|w| w[0] == w[1]);
+        let value = if all_same {
+            values.first().cloned().unwrap_or_default()
+        } else {
+            "<multiple values>".to_string()
+        };
+        entries.push(TagEntry {
+            display_key: display_key.to_string(),
+            item_key,
+            value: value.clone(),
+            original: value,
+            is_binary: false,
+            is_mixed: !all_same,
+            per_file_originals: values.clone(),
+            per_file_values: values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    };
+
+    let group_value = group.group_nr.to_string();
+    push_album(
+        &mut entries,
+        "DVDA_GROUP",
+        ItemKey::Unknown("DVDA_GROUP".to_string()),
+        group_value,
+    );
+
+    for (display_key, item_key, aliases) in [
+        ("ALBUM", ItemKey::AlbumTitle, vec!["ALBUM"]),
+        ("ALBUMARTIST", ItemKey::AlbumArtist, vec!["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"]),
+        ("DATE", ItemKey::Year, vec!["DATE", "YEAR"]),
+        ("GENRE", ItemKey::Genre, vec!["GENRE"]),
+        ("CATALOGNUMBER", ItemKey::CatalogNumber, vec!["CATALOGNUMBER", "DISCOGS_CATALOG"]),
+        ("PUBLISHER", ItemKey::Unknown("PUBLISHER".to_string()), vec!["PUBLISHER", "LABEL"]),
+        ("MUSICBRAINZ_ALBUMID", ItemKey::MusicBrainzReleaseId, vec!["MUSICBRAINZ_ALBUMID"]),
+        ("MUSICBRAINZ_ALBUMARTISTID", ItemKey::MusicBrainzReleaseArtistId, vec!["MUSICBRAINZ_ALBUMARTISTID"]),
+        ("MUSICBRAINZ_RELEASEGROUPID", ItemKey::MusicBrainzReleaseGroupId, vec!["MUSICBRAINZ_RELEASEGROUPID"]),
+        ("ORIGINALDATE", ItemKey::OriginalReleaseDate, vec!["ORIGINALDATE"]),
+        ("RELEASECOUNTRY", ItemKey::Unknown("RELEASECOUNTRY".to_string()), vec!["RELEASECOUNTRY"]),
+    ] {
+        if let Some(v) = super::dvda_metabase::album_value(metabase, &aliases) {
+            push_album(&mut entries, display_key, item_key, v);
+        }
+    }
+
+    let track_numbers: Vec<String> = track_addrs
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            super::dvda_metabase::track_value(metabase, &a.id, &["TRACKNUMBER"])
+                .unwrap_or_else(|| (i + 1).to_string())
+        })
+        .collect();
+    push_per_track(&mut entries, "TRACKNUMBER", ItemKey::TrackNumber, track_numbers);
+
+    for (display_key, item_key) in [
+        ("TITLE", ItemKey::TrackTitle),
+        ("ARTIST", ItemKey::TrackArtist),
+        ("PERFORMER", ItemKey::Performer),
+        ("COMPOSER", ItemKey::Composer),
+        ("LYRICIST", ItemKey::Lyricist),
+        ("ARRANGER", ItemKey::Arranger),
+        ("ISRC", ItemKey::Isrc),
+        ("MUSICBRAINZ_TRACKID", ItemKey::MusicBrainzRecordingId),
+        ("MUSICBRAINZ_RELEASETRACKID", ItemKey::MusicBrainzTrackId),
+        ("MUSICBRAINZ_ARTISTID", ItemKey::MusicBrainzArtistId),
+    ] {
+        let values: Vec<String> = track_addrs
+            .iter()
+            .map(|a| super::dvda_metabase::track_value(metabase, &a.id, &[display_key]).unwrap_or_default())
+            .collect();
+        push_per_track(&mut entries, display_key, item_key, values);
+    }
+
+    let file_labels: Vec<String> = track_addrs
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            super::dvda_metabase::track_value(metabase, &a.id, &["TRACKNUMBER"])
+                .unwrap_or_else(|| format!("{:>02}", i + 1))
+        })
+        .collect();
+
+    let (writable, target_path) = match existing_metabase_path {
+        Some(p) => {
+            let w = is_path_writable(p);
+            (w, if w { Some(p.clone()) } else { None })
+        }
+        None => {
+            let candidate = super::dvda_metabase::expected_sidecar_path_for_source(source_path, store_id);
+            let parent_writable = candidate
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(is_dir_writable)
+                .unwrap_or(false);
+            (parent_writable, if parent_writable { candidate } else { None })
+        }
+    };
+
+    Ok((
+        super::app::MetadataEditorState {
+            paths,
+            entries,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: super::app::MetadataEditorPhase::Editing,
+            dirty: false,
+            deleted: Vec::new(),
+            file_labels,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: !writable,
+            sacd_sidecar_path: target_path,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+        },
+        super::dvda_metabase::group_label(disc, group),
+        n_tracks,
+    ))
+}
+
+fn find_single_dvda_source_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut found: Option<std::path::PathBuf> = None;
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !crate::disc::dvda_utils::is_dvda_source(&path) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(path);
+    }
+    found
+}
+
+pub(super) fn dvda_group_from_editor_state(state: &super::app::MetadataEditorState) -> Option<u8> {
+    state
+        .entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("DVDA_GROUP"))
+        .and_then(|entry| {
+            entry
+                .per_file_values
+                .first()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| (!entry.value.trim().is_empty()).then_some(&entry.value))
+        })
+        .and_then(|value| value.trim().parse::<u8>().ok())
+}
+
+pub(super) fn metadata_editor_is_dvda_source(state: &super::app::MetadataEditorState) -> bool {
+    if dvda_group_from_editor_state(state).is_none() {
+        return false;
+    }
+
+    let Some(first_path) = state.paths.first() else {
+        return false;
+    };
+    if !crate::disc::dvda_utils::is_dvda_source(first_path) {
+        return false;
+    }
+
+    state.paths.iter().all(|p| p == first_path)
+}
+
+pub fn save_dvda_metabase(
+    state: &super::app::MetadataEditorState,
+    metabase_path: &std::path::Path,
+) -> Result<SacdSaveKind, String> {
+    let source_path = state
+        .paths
+        .first()
+        .ok_or_else(|| "editor has no DVD-Audio source path".to_string())?
+        .clone();
+    let (disc, store_id, _existing_path, _existing_metabase, _parse_note) =
+        load_dvda_metabase_context(&source_path)?;
+    let selected_group_nr = dvda_group_from_editor_state(state);
+    let group = super::dvda_metabase::select_group(&disc, selected_group_nr)
+        .map_err(|e| e.to_string())?;
+    let track_ids = super::dvda_metabase::group_track_ids(&disc, group);
+    if track_ids.len() != state.paths.len() {
+        return Err(format!(
+            "DVD-Audio group has {} track(s) but editor has {}; refusing to map",
+            track_ids.len(),
+            state.paths.len(),
+        ));
+    }
+
+    let kind = if metabase_path.exists() {
+        SacdSaveKind::Updated
+    } else {
+        SacdSaveKind::Created
+    };
+    let mut metabase = if metabase_path.exists() {
+        super::dvda_metabase::parse_metabase(metabase_path)
+            .map_err(|e| format!("re-read metabase: {}", e))?
+    } else {
+        super::dvda_metabase::seed_from_disc(&disc, &store_id)
+    };
+
+    let seeded = super::dvda_metabase::seed_from_disc(&disc, &store_id);
+    for id in &track_ids {
+        if super::dvda_metabase::track(&metabase, id).is_none() {
+            if let Some(track) = seeded.tracks.iter().find(|t| &t.id == id) {
+                metabase.tracks.push(track.clone());
+            }
+        }
+    }
+
+    for (entry_idx, entry) in state.entries.iter().enumerate() {
+        let entry_deleted = state.deleted.contains(&entry_idx);
+        let Some(sidecar_key) = editor_key_to_sidecar_key(&entry.display_key) else {
+            continue;
+        };
+        if is_album_level_sidecar_key(sidecar_key) {
+            if entry.is_mixed && !entry_deleted {
+                return Err(format!(
+                    "album-level field {} has mixed values; cannot save",
+                    entry.display_key
+                ));
+            }
+            let new_val = if entry_deleted { String::new() } else { entry.value.clone() };
+            for id in &track_ids {
+                if let Some(track) = super::dvda_metabase::track_mut(&mut metabase, id) {
+                    if new_val.is_empty() {
+                        track.meta.remove(sidecar_key);
+                    } else {
+                        track.meta.insert(sidecar_key.to_string(), new_val.clone());
+                    }
+                }
+            }
+        } else {
+            for (i, id) in track_ids.iter().enumerate() {
+                let new_val = if entry_deleted {
+                    String::new()
+                } else {
+                    entry.per_file_values.get(i).cloned().unwrap_or_default()
+                };
+                if let Some(track) = super::dvda_metabase::track_mut(&mut metabase, id) {
+                    if new_val.is_empty() {
+                        track.meta.remove(sidecar_key);
+                    } else {
+                        track.meta.insert(sidecar_key.to_string(), new_val);
+                    }
+                }
+            }
+        }
+    }
+
+    super::dvda_metabase::write_metabase(&metabase, metabase_path)
+        .map_err(|e| format!("write: {}", e))?;
+    Ok(kind)
+}
+
+/// Rebuild the DVD-Audio metadata editor for a user-selected group.
+pub(super) fn switch_dvda_editor_group(
+    state: &mut super::app::MetadataEditorState,
+    source_path: &std::path::Path,
+    group_nr: u8,
+) -> Result<String, String> {
+    let (disc, store_id, metabase_path, metabase, _parse_note) =
+        load_dvda_metabase_context(source_path)?;
+    let (mut new_state, group_label, n_tracks) = build_dvda_editor_state(
+        source_path,
+        &disc,
+        &store_id,
+        metabase_path.as_ref(),
+        metabase.as_ref(),
+        Some(group_nr),
+    )?;
+    new_state.cursor = state.cursor.min(new_state.entries.len().saturating_sub(1));
+    new_state.scroll = 0;
+    *state = new_state;
+    Ok(format!("{} ({} tracks)", group_label, n_tracks))
 }
 
 /// Open the metadata editor against a SACD ISO. Parses the ISO,
@@ -9505,6 +9996,10 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
 
     if super::sacd::is_sacd_iso(&path) {
         open_metadata_editor_for_sacd_at_track(app, path, initial_track);
+        return;
+    }
+    if crate::disc::dvda_utils::is_dvda_source(&path) {
+        open_metadata_editor_for_dvda_at_track(app, path, initial_track);
         return;
     }
 

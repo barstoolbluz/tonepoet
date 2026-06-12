@@ -429,6 +429,8 @@ pub enum Command {
     /// preserved on a best-effort basis (per-track values for
     /// fields the new area also has, by track index).
     SacdSwitchArea(SacdAreaTarget),
+    /// Switch a DVD-Audio metadata editor to an explicit audio group.
+    DvdaSwitchGroup(u8),
     /// Mark the current browse selection as the bit-compare reference.
     MarkCompareRef,
     /// Run bit comparison: current selection vs stored reference.
@@ -525,6 +527,20 @@ pub fn parse_command(input: &str) -> Command {
                 }
             };
             Command::SacdSwitchArea(target)
+        }
+        "dvda-group" | "dvd-audio-group" => {
+            let trimmed = args.trim();
+            let Ok(group_nr) = trimmed.parse::<u8>() else {
+                return Command::Unknown(
+                    "usage: :dvda-group <group-number>".to_string(),
+                );
+            };
+            if group_nr == 0 {
+                return Command::Unknown(
+                    "usage: :dvda-group <group-number> (group numbers start at 1)".to_string(),
+                );
+            }
+            Command::DvdaSwitchGroup(group_nr)
         }
         "e" | "edit" => {
             // `:e <N>` (positive integer) targets a line in the parked
@@ -2191,6 +2207,45 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
+        Command::DvdaSwitchGroup(group_nr) => {
+            let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
+                parked
+            } else if matches!(
+                app.active_overlay,
+                super::app::ActiveOverlay::MetadataEditor(_)
+            ) {
+                let prev =
+                    std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+                if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
+                    s
+                } else {
+                    unreachable!()
+                }
+            } else {
+                app.set_status(":dvda-group only works in the metadata editor");
+                return;
+            };
+            let source_path = match state.paths.first().cloned() {
+                Some(p) if crate::disc::dvda_utils::is_dvda_source(&p) => p,
+                _ => {
+                    app.set_status(":dvda-group: editor is not on a DVD-Audio source");
+                    app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+            };
+            if state.dirty {
+                app.set_status(
+                    ":dvda-group: editor has unsaved edits — save (:w) or discard (:q!) first",
+                );
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            match super::keybindings::switch_dvda_editor_group(&mut state, &source_path, group_nr) {
+                Ok(label) => app.set_status(format!(":dvda-group → {}", label)),
+                Err(reason) => app.set_status(reason),
+            }
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+        }
         Command::TagsCueSidecar => {
             let Some(mut state) = app.pending_metadata_editor.take() else {
                 app.set_status(":tags-cue-sidecar only works in the metadata editor");
@@ -2262,14 +2317,18 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 && app.pending_metadata_editor.is_none()
             {
                 let sel = collect_selection_for_file_ops(app);
-                // Look for SACD ISOs in the selection. When the
-                // selection is a directory, scan one level deep for
-                // ISOs inside it (right-click on a folder containing
-                // an ISO is the common case).
+                // Look for SACD ISO or DVD-Audio sources in the selection. When the
+                // selection is a directory, scan one level deep for disc images or an
+                // AUDIO_TS-bearing child directory.
                 let mut sacd_isos: Vec<std::path::PathBuf> = Vec::new();
+                let mut dvda_sources: Vec<std::path::PathBuf> = Vec::new();
                 let mut has_audio = false;
                 for path in &sel {
                     if path.is_dir() {
+                        if crate::disc::dvda_utils::is_dvda_directory(path) {
+                            dvda_sources.push(path.clone());
+                            continue;
+                        }
                         if let Ok(entries) = std::fs::read_dir(path) {
                             for entry in entries.flatten() {
                                 let p = entry.path();
@@ -2277,6 +2336,8 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                     && super::sacd::is_sacd_iso(&p)
                                 {
                                     sacd_isos.push(p);
+                                } else if crate::disc::dvda_utils::is_dvda_source(&p) {
+                                    dvda_sources.push(p);
                                 } else if matches!(
                                     super::browse::classify_file(&p),
                                     super::browse::EntryKind::AudioFile(_)
@@ -2289,6 +2350,8 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         && super::sacd::is_sacd_iso(path)
                     {
                         sacd_isos.push(path.clone());
+                    } else if crate::disc::dvda_utils::is_dvda_source(path) {
+                        dvda_sources.push(path.clone());
                     } else if matches!(
                         super::browse::classify_file(path),
                         super::browse::EntryKind::AudioFile(_)
@@ -2297,23 +2360,27 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     }
                 }
 
-                if sacd_isos.len() > 1 {
-                    app.set_status(":tags-mb: multiple SACD ISOs selected — select one at a time");
+                let disc_count = sacd_isos.len() + dvda_sources.len();
+                if disc_count > 1 {
+                    app.set_status(":tags-mb: multiple disc sources selected — select one at a time");
                     return;
                 }
-                if !sacd_isos.is_empty() && has_audio {
+                if disc_count > 0 && has_audio {
                     app.set_status(
-                        ":tags-mb: mixed selection (SACD ISO + audio files) — select one type",
+                        ":tags-mb: mixed selection (disc source + audio files) — select one type",
                     );
                     return;
                 }
                 if let Some(iso) = sacd_isos.into_iter().next() {
                     super::keybindings::open_metadata_editor_for_sacd(app, iso);
-                    // If parse failed (or any reason left the editor
-                    // unset), the open helper already set a clear
-                    // status; surface it instead of letting the
-                    // Browse fallthrough overwrite with a less
-                    // specific hint.
+                    if !matches!(
+                        app.active_overlay,
+                        super::app::ActiveOverlay::MetadataEditor(_),
+                    ) {
+                        return;
+                    }
+                } else if let Some(source) = dvda_sources.into_iter().next() {
+                    super::keybindings::open_metadata_editor_for_dvda(app, source);
                     if !matches!(
                         app.active_overlay,
                         super::app::ActiveOverlay::MetadataEditor(_),
@@ -4368,6 +4435,29 @@ pub fn sacd_durations_to_sectors(durations: &[f64]) -> Vec<u32> {
     sectors
 }
 
+fn dvda_source_to_cd_sectors(
+    path: &std::path::Path,
+    group_nr: Option<u8>,
+) -> Result<Vec<u32>, String> {
+    let disc = if crate::disc::dvda_utils::is_dvda_directory(path) {
+        let volume = crate::tui::dvda::DirectoryDvdaVolume::new(path);
+        crate::tui::dvda::parse_dvda_volume(&volume)
+            .map_err(|e| format!("DVD-Audio parse failed for '{}': {}", path.display(), e))?
+    } else {
+        let volume = crate::tui::dvda::IsoUdfDvdaVolume::open(path)
+            .map_err(|e| format!("DVD-Audio ISO open failed for '{}': {}", path.display(), e))?;
+        crate::tui::dvda::parse_dvda_volume(&volume)
+            .map_err(|e| format!("DVD-Audio parse failed for '{}': {}", path.display(), e))?
+    };
+    let group = super::dvda_metabase::select_group(&disc, group_nr)
+        .map_err(|e| e.to_string())?;
+    let durations = super::dvda_metabase::group_track_pts(&disc, group);
+    if durations.is_empty() {
+        return Err("DVD-Audio: selected group has zero tracks".to_string());
+    }
+    Ok(super::dvda_metabase::pts_durations_to_cd_sectors(&durations))
+}
+
 /// Common spawn point for the unified `:tags-mb` TOC flow. All three
 /// entry points (Browse audio-file selection, SACD editor in-place,
 /// regular file editor in-place) compute their own sectors and
@@ -4509,6 +4599,24 @@ fn try_dispatch_in_editor_tags_mb(
             return Some(true);
         };
         let sectors = sacd_durations_to_sectors(durations);
+        let seed = seed_sacd_mb_query(&state_owned);
+        (sectors, seed)
+    } else if super::keybindings::metadata_editor_is_dvda_source(&state_owned) {
+        let first_path = state_owned.paths[0].clone();
+        if !state_owned.paths.iter().all(|p| p == &first_path) {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(":tags-mb: DVD-Audio editor paths do not share one source".to_string());
+            return Some(true);
+        }
+        let group_nr = super::keybindings::dvda_group_from_editor_state(&state_owned);
+        let sectors = match dvda_source_to_cd_sectors(&first_path, group_nr) {
+            Ok(sectors) => sectors,
+            Err(e) => {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+                app.set_status(format!(":tags-mb: {}", e));
+                return Some(true);
+            }
+        };
         let seed = seed_sacd_mb_query(&state_owned);
         (sectors, seed)
     } else {

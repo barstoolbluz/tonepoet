@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+#[path = "materializer_dvda_metabase.rs"]
+mod materializer_dvda_metabase;
+
+use self::materializer_dvda_metabase::DvdaTrackMetadataKeys;
 use super::errors::{MaterializeError, SourceDetectError};
 use super::reporter::PipelineReporter;
 use super::stages::Materializer;
@@ -26,6 +30,7 @@ use crate::tui::dvda::{
     DvdaFile, DvdaVolume, GroupCorrelation, Iso9660DvdaVolume, IsoUdfDvdaVolume, SamgTrack, SamgTrackRef,
     SamgZone, TitleRef, TitleRefKind, TitleSet,
 };
+use crate::tui::dvda_metabase::{DvdaMetabase, LoadedDvdaMetabase};
 
 const DVDA_AMG_MAGIC: &[u8] = b"DVDAUDIO-AMG";
 const PTS_PER_SECOND: u64 = 90_000;
@@ -152,6 +157,9 @@ fn materialize_prepared_source(
     refine_copy_protection_from_aob_probe(volume, &mut disc, req.source.dvda_assume_decrypted)
         .map_err(dvda_error_to_materialize)?;
 
+    let loaded_metabase = materializer_dvda_metabase::load_for_materializer(volume, &req.container)?;
+    let metabase = loaded_metabase.as_ref().map(|loaded| &loaded.metabase);
+
     let group_selection = req.source.effective_dvda_group_selection();
     let groups = select_groups(&disc, group_selection)?;
     let mut tracks = prepared_tracks_for_groups(
@@ -160,6 +168,7 @@ fn materialize_prepared_source(
         &disc,
         &groups,
         req.source.dvda_downmix_policy,
+        metabase,
         cancel,
     )?;
     tracks = apply_track_selection(tracks, &req.source.track_selection)?;
@@ -167,7 +176,15 @@ fn materialize_prepared_source(
     if disc.copy_protection.cppm_detected {
         let block = dvda_copy_protection_block(&disc);
         mark_tracks_blocked_for_copy_protection(&mut tracks, &block);
-        let source = prepared_source(req, &disc, &groups, group_selection, tracks);
+        let source = prepared_source(
+            req,
+            &disc,
+            &groups,
+            group_selection,
+            tracks,
+            metabase,
+            loaded_metabase.as_ref(),
+        );
         let message = format!("DVD-Audio source is encrypted: {}", block.log_label());
         return Err(MaterializeError::BlockedSource {
             message: message.clone(),
@@ -179,7 +196,15 @@ fn materialize_prepared_source(
         });
     }
 
-    Ok(prepared_source(req, &disc, &groups, group_selection, tracks))
+    Ok(prepared_source(
+        req,
+        &disc,
+        &groups,
+        group_selection,
+        tracks,
+        metabase,
+        loaded_metabase.as_ref(),
+    ))
 }
 
 fn prepared_source(
@@ -188,10 +213,22 @@ fn prepared_source(
     groups: &[&DvdaGroup],
     group_selection: DvdaGroupSelection,
     tracks: Vec<PreparedTrack>,
+    metabase: Option<&DvdaMetabase>,
+    loaded_metabase: Option<&LoadedDvdaMetabase>,
 ) -> PreparedSource {
-    let album_metadata = album_metadata(disc, groups, group_selection, tracks.len() as u32);
+    let album_metadata = album_metadata(
+        disc,
+        groups,
+        group_selection,
+        tracks.len() as u32,
+        metabase,
+        loaded_metabase,
+    );
     let mut tool_versions = BTreeMap::new();
     tool_versions.insert("dvda-phase1".to_string(), "in-process".to_string());
+    if loaded_metabase.is_some() {
+        tool_versions.insert("dvda-metabase".to_string(), "foo_input_dvda-compatible".to_string());
+    }
 
     PreparedSource {
         container: req.container.clone(),
@@ -965,6 +1002,7 @@ fn prepared_tracks_for_groups(
     disc: &DvdaDisc,
     groups: &[&DvdaGroup],
     requested_downmix_policy: DvdaDownmixPolicy,
+    metabase: Option<&DvdaMetabase>,
     cancel: &CancellationToken,
 ) -> Result<Vec<PreparedTrack>, MaterializeError> {
     let mut tracks = Vec::new();
@@ -983,6 +1021,7 @@ fn prepared_tracks_for_groups(
             group,
             requested_downmix_policy,
             disc_info_downmix_source_label.as_deref(),
+            metabase,
             &mut tracks,
             cancel,
         )?;
@@ -1001,6 +1040,7 @@ fn append_tracks_for_group(
     group: &DvdaGroup,
     requested_downmix_policy: DvdaDownmixPolicy,
     disc_info_downmix_source_label: Option<&str>,
+    metabase: Option<&DvdaMetabase>,
     tracks: &mut Vec<PreparedTrack>,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
@@ -1022,6 +1062,7 @@ fn append_tracks_for_group(
                 title,
                 requested_downmix_policy,
                 disc_info_downmix_source_label,
+                metabase,
                 tracks,
                 start_len,
             )?;
@@ -1056,6 +1097,7 @@ fn append_title_tracks(
     title: &AudioTitle,
     requested_downmix_policy: DvdaDownmixPolicy,
     disc_info_downmix_source_label: Option<&str>,
+    metabase: Option<&DvdaMetabase>,
     tracks: &mut Vec<PreparedTrack>,
     group_start_len: usize,
 ) -> Result<(), MaterializeError> {
@@ -1085,6 +1127,7 @@ fn append_title_tracks(
     } else {
         Vec::new()
     };
+    let group_total_tracks = ats_group_track_count(disc, group);
 
     for chapter in &title.chapters {
         if chapter.sector_ranges.is_empty() {
@@ -1134,6 +1177,8 @@ fn append_title_tracks(
                 audio_facts,
                 aob_inventory_covers_track,
                 source_ordinal,
+                group_total_tracks,
+                metabase,
             ),
             expected_samples: audio_facts
                 .sample_rate
@@ -1695,11 +1740,41 @@ fn aob_file_ref(entry: &AobFileEntry) -> DvdaAobFileRef {
     }
 }
 
+
+fn ats_group_track_count(disc: &DvdaDisc, group: &DvdaGroup) -> u32 {
+    let mut count = 0_u32;
+    for title_ref in &group.title_refs {
+        let Some(title_set) = disc
+            .title_sets
+            .iter()
+            .find(|title_set| title_set.number == title_ref.title_set_nr)
+        else {
+            continue;
+        };
+        let title = match title_ref.kind {
+            TitleRefKind::AottTitleOrdinal => title_set
+                .titles
+                .iter()
+                .find(|title| title.title_ordinal == title_ref.title_nr),
+            TitleRefKind::AtsPgcTitleNr => title_set
+                .titles
+                .iter()
+                .find(|title| title.title_nr == title_ref.title_nr),
+        };
+        if let Some(title) = title {
+            count = count.saturating_add(title.chapters.len() as u32);
+        }
+    }
+    count
+}
+
 fn album_metadata(
     disc: &DvdaDisc,
     groups: &[&DvdaGroup],
     group_selection: DvdaGroupSelection,
     total_tracks: u32,
+    metabase: Option<&DvdaMetabase>,
+    loaded_metabase: Option<&LoadedDvdaMetabase>,
 ) -> AlbumMetadata {
     let mut extra = BTreeMap::new();
     let selected_group_numbers = groups
@@ -1744,7 +1819,7 @@ fn album_metadata(
         disc.supplemental_video_ifo_present.to_string(),
     );
 
-    AlbumMetadata {
+    let base = AlbumMetadata {
         album: None,
         album_artist: None,
         genre: None,
@@ -1753,7 +1828,8 @@ fn album_metadata(
         total_discs: None,
         disc_number: disc_number(disc),
         extra,
-    }
+    };
+    materializer_dvda_metabase::overlay_album_metadata(base, metabase, loaded_metabase)
 }
 
 fn track_metadata(
@@ -1765,6 +1841,8 @@ fn track_metadata(
     audio_facts: AudioFacts<'_>,
     aob_inventory_covers_track: bool,
     source_ordinal: u32,
+    total_tracks: u32,
+    metabase: Option<&DvdaMetabase>,
 ) -> TrackMetadata {
     let mut extra = BTreeMap::new();
     insert_nonempty(&mut extra, "dvda_group", group.group_nr.to_string());
@@ -1810,7 +1888,7 @@ fn track_metadata(
         insert_audio_attributes(&mut extra, attr);
     }
 
-    TrackMetadata {
+    let base = TrackMetadata {
         title: None,
         artist: None,
         album_artist: None,
@@ -1826,7 +1904,28 @@ fn track_metadata(
         comment: None,
         pre_emphasis: false,
         extra,
-    }
+    };
+
+    materializer_dvda_metabase::overlay_track_metadata(
+        base,
+        &DvdaTrackMetadataKeys {
+            group_nr: group.group_nr,
+            titleset: title_set.number,
+            title: title.title_ordinal,
+            track: chapter.track_nr,
+            source_ordinal,
+            track_number: source_ordinal,
+            total_tracks,
+            sample_rate: audio_facts.sample_rate,
+            bit_depth: audio_facts.bit_depth.map(u32::from),
+            channel_count: expected_channel_count_for_facts(audio_facts).map(|c| c as u8),
+            codec: audio_facts.attr.map(|_| "DVD-Audio".to_string()),
+            channel_layout: audio_facts
+                .channel_assignment
+                .map(channel_layout),
+        },
+        metabase,
+    )
 }
 
 fn samg_track_metadata(
