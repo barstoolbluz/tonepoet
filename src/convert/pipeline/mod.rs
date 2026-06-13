@@ -20,44 +20,47 @@ pub(crate) mod dvda_mlp;
 pub(crate) mod dvda_realize;
 pub mod errors;
 pub mod label_resolver;
+pub mod manifest;
+pub mod manifest_builder;
 pub mod materializer_7z;
 pub mod materializer_cue;
 pub mod materializer_dvda;
 pub mod materializer_sacd;
 pub mod materializer_single;
-pub mod planned_adapter;
-pub mod plan_bridge;
-pub mod scheduler;
-pub mod track_executor;
-pub mod unified_request;
-pub mod manifest;
-pub mod manifest_builder;
 pub mod orchestrator_rerun_gate;
-pub mod rerun;
-pub mod transactional_state;
+pub mod plan_bridge;
+pub mod planned_adapter;
 pub mod progress;
 pub mod reporter;
+pub mod rerun;
+pub mod scheduler;
 pub mod source_heuristics;
 pub mod stages;
 pub mod tool;
+pub mod track_executor;
+pub mod transactional_state;
 pub mod types;
+pub mod unified_request;
 
 pub use errors::*;
 pub use label_resolver::*;
 pub use materializer_single::*;
-pub use planned_adapter::*;
 pub use plan_bridge::*;
-pub use scheduler::*;
-pub use track_executor::*;
-pub use unified_request::*;
+pub use planned_adapter::*;
 pub use progress::*;
 pub use reporter::*;
+pub use scheduler::*;
 pub use stages::*;
 pub use tool::*;
+pub use track_executor::*;
 pub use types::*;
+pub use unified_request::*;
 
 // Re-export DVD-Audio probe items for dvda-info CLI subcommand.
-pub use dvda_demux::{parse_private_stream_1_packets, DvdaSubstreamKind};
+pub use dvda_demux::{
+    parse_private_stream_1_packets, parse_private_stream_1_packets_with_mode, DvdaSubHeaderMode,
+    DvdaSubstreamKind,
+};
 pub use dvda_mlp::{probe_mlp_major_sync, MlpMajorSyncInfo};
 
 #[cfg(test)]
@@ -122,7 +125,11 @@ mod tests {
                 disc_number: None,
                 track_number: ordinal,
             },
-            outcome: if ok { TrackOutcome::Ok } else { TrackOutcome::Err("encode failed".into()) },
+            outcome: if ok {
+                TrackOutcome::Ok
+            } else {
+                TrackOutcome::Err("encode failed".into())
+            },
             source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("/s/{ordinal}.flac"))),
             realized_input: None,
             output_file: None,
@@ -146,7 +153,10 @@ mod tests {
     fn redacted_request_hides_password() {
         let req = sample_request();
         let redacted = RedactedPipelineRequest::from(&req);
-        assert_eq!(redacted.source.archive_password.as_deref(), Some("<redacted>"));
+        assert_eq!(
+            redacted.source.archive_password.as_deref(),
+            Some("<redacted>")
+        );
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(!json.contains("hunter2"));
     }
@@ -158,7 +168,13 @@ mod tests {
             vec![],
             FailurePolicy::FailAlbumOnAnyTrackFailure,
         );
-        assert!(matches!(out, AlbumOutcome::Blocked { reason: BlockReason::TrackFailures, .. }));
+        assert!(matches!(
+            out,
+            AlbumOutcome::Blocked {
+                reason: BlockReason::TrackFailures,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

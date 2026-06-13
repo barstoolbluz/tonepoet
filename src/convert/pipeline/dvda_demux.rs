@@ -40,6 +40,21 @@ impl DvdaSubstreamKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DvdaSubHeaderMode {
+    /// DVD-Audio AOB Private Stream 1 layout: byte 3 is extra_header_length.
+    DvdAudio,
+    /// DVD-Video VOB LPCM layout: bytes 2..3 are the first access unit pointer
+    /// and LPCM payload starts after the fixed 7-byte private header.
+    DvdVideo,
+}
+
+impl Default for DvdaSubHeaderMode {
+    fn default() -> Self {
+        Self::DvdAudio
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DvdaPcmSubHeader {
     pub first_audio_frame: u16,
     pub group1_bits_code: u8,
@@ -99,20 +114,41 @@ pub struct DvdaDemuxStats {
 
 #[derive(Debug)]
 pub enum DvdaDemuxError {
-    SectorSize { actual: usize },
+    SectorSize {
+        actual: usize,
+    },
     MissingPackHeader,
-    PackHeaderTruncated { stuffing: usize },
-    PesPacketTruncated { offset: usize, length: usize },
-    PrivateStreamHeaderTruncated { offset: usize, pes_end: usize },
-    DvdaSubHeaderMissing { offset: usize, available: usize },
+    PackHeaderTruncated {
+        stuffing: usize,
+    },
+    PesPacketTruncated {
+        offset: usize,
+        length: usize,
+    },
+    PrivateStreamHeaderTruncated {
+        offset: usize,
+        pes_end: usize,
+    },
+    DvdaSubHeaderMissing {
+        offset: usize,
+        available: usize,
+    },
     DvdaSubHeaderTruncated {
         offset: usize,
         header_length: usize,
         available: usize,
     },
-    MlpSubHeaderTooShort { offset: usize, extra_header_length: u8 },
-    PcmSubHeaderTooShort { offset: usize, extra_header_length: u8 },
-    UnexpectedSubstream { stream_id: u8 },
+    MlpSubHeaderTooShort {
+        offset: usize,
+        extra_header_length: u8,
+    },
+    PcmSubHeaderTooShort {
+        offset: usize,
+        extra_header_length: u8,
+    },
+    UnexpectedSubstream {
+        stream_id: u8,
+    },
     PacketHandler(String),
     Write(io::Error),
 }
@@ -200,7 +236,9 @@ pub fn extract_mlp_from_sector<W: Write>(
             pending.extend_from_slice(packet.payload);
             Ok(())
         }
-        DvdaSubstreamKind::Pcm => Err(DvdaDemuxError::UnexpectedSubstream { stream_id: PCM_STREAM_ID }),
+        DvdaSubstreamKind::Pcm => Err(DvdaDemuxError::UnexpectedSubstream {
+            stream_id: PCM_STREAM_ID,
+        }),
         DvdaSubstreamKind::Unknown(_) => Ok(()),
     })?;
     out.write_all(&pending).map_err(DvdaDemuxError::Write)
@@ -235,9 +273,20 @@ pub fn record_private_stream_1_packets(stats: &mut DvdaDemuxStats, packets: &[Dv
     }
 }
 
-pub fn parse_private_stream_1_packets(sector: &[u8]) -> Result<Vec<DvdaPs1Packet<'_>>, DvdaDemuxError> {
+pub fn parse_private_stream_1_packets(
+    sector: &[u8],
+) -> Result<Vec<DvdaPs1Packet<'_>>, DvdaDemuxError> {
+    parse_private_stream_1_packets_with_mode(sector, DvdaSubHeaderMode::DvdAudio)
+}
+
+pub fn parse_private_stream_1_packets_with_mode(
+    sector: &[u8],
+    mode: DvdaSubHeaderMode,
+) -> Result<Vec<DvdaPs1Packet<'_>>, DvdaDemuxError> {
     if sector.len() != DVD_SECTOR_SIZE {
-        return Err(DvdaDemuxError::SectorSize { actual: sector.len() });
+        return Err(DvdaDemuxError::SectorSize {
+            actual: sector.len(),
+        });
     }
     if sector[..PACK_START_CODE.len()] != PACK_START_CODE {
         return Err(DvdaDemuxError::MissingPackHeader);
@@ -259,12 +308,13 @@ pub fn parse_private_stream_1_packets(sector: &[u8]) -> Result<Vec<DvdaPs1Packet
 
         let stream_id = sector[offset + 3];
         let pes_length = u16::from_be_bytes([sector[offset + 4], sector[offset + 5]]) as usize;
-        let pes_end = offset.checked_add(6).and_then(|v| v.checked_add(pes_length)).ok_or(
-            DvdaDemuxError::PesPacketTruncated {
+        let pes_end = offset
+            .checked_add(6)
+            .and_then(|v| v.checked_add(pes_length))
+            .ok_or(DvdaDemuxError::PesPacketTruncated {
                 offset,
                 length: pes_length,
-            },
-        )?;
+            })?;
         if pes_end > sector.len() {
             return Err(DvdaDemuxError::PesPacketTruncated {
                 offset,
@@ -273,7 +323,9 @@ pub fn parse_private_stream_1_packets(sector: &[u8]) -> Result<Vec<DvdaPs1Packet
         }
 
         if stream_id == PRIVATE_STREAM_1 {
-            packets.push(parse_private_stream_1_packet(sector, offset, pes_end)?);
+            packets.push(parse_private_stream_1_packet(
+                sector, offset, pes_end, mode,
+            )?);
         }
 
         offset = pes_end;
@@ -286,6 +338,7 @@ fn parse_private_stream_1_packet(
     sector: &[u8],
     pes_offset: usize,
     pes_end: usize,
+    mode: DvdaSubHeaderMode,
 ) -> Result<DvdaPs1Packet<'_>, DvdaDemuxError> {
     if pes_offset + 9 > pes_end {
         return Err(DvdaDemuxError::PrivateStreamHeaderTruncated {
@@ -317,7 +370,8 @@ fn parse_private_stream_1_packet(
         });
     }
 
-    let sub_header = parse_sub_header(&sector[sub_header_offset..pes_end], sub_header_offset)?;
+    let sub_header =
+        parse_sub_header(&sector[sub_header_offset..pes_end], sub_header_offset, mode)?;
     let body_offset = sub_header_offset + sub_header.total_header_length;
     let payload = if body_offset < pes_end {
         &sector[body_offset..pes_end]
@@ -325,7 +379,10 @@ fn parse_private_stream_1_packet(
         &[]
     };
 
-    Ok(DvdaPs1Packet { sub_header, payload })
+    Ok(DvdaPs1Packet {
+        sub_header,
+        payload,
+    })
 }
 
 fn record_sub_header(stats: &mut DvdaDemuxStats, sub_header: DvdaSubHeader, payload_len: usize) {
@@ -342,15 +399,12 @@ fn record_sub_header(stats: &mut DvdaDemuxStats, sub_header: DvdaSubHeader, payl
             stats.cci_change_count = stats.cci_change_count.saturating_add(1);
         }
         if previous.extra_header_length != sub_header.extra_header_length {
-            stats.extra_header_length_change_count = stats
-                .extra_header_length_change_count
-                .saturating_add(1);
+            stats.extra_header_length_change_count =
+                stats.extra_header_length_change_count.saturating_add(1);
         }
         let expected_cyclic = previous.cyclic.wrapping_add(1);
         if sub_header.cyclic != previous.cyclic && sub_header.cyclic != expected_cyclic {
-            stats.cyclic_discontinuity_count = stats
-                .cyclic_discontinuity_count
-                .saturating_add(1);
+            stats.cyclic_discontinuity_count = stats.cyclic_discontinuity_count.saturating_add(1);
         }
     }
 
@@ -359,18 +413,16 @@ fn record_sub_header(stats: &mut DvdaDemuxStats, sub_header: DvdaSubHeader, payl
             stats.mlp_packets = stats.mlp_packets.saturating_add(1);
             stats.mlp_payload_bytes = stats.mlp_payload_bytes.saturating_add(payload_len as u64);
             if sub_header.extra_header_length != MLP_EXTRA_HEADER_LENGTH {
-                stats.nonstandard_mlp_extra_header_packets = stats
-                    .nonstandard_mlp_extra_header_packets
-                    .saturating_add(1);
+                stats.nonstandard_mlp_extra_header_packets =
+                    stats.nonstandard_mlp_extra_header_packets.saturating_add(1);
             }
         }
         DvdaSubstreamKind::Pcm => {
             stats.pcm_packets = stats.pcm_packets.saturating_add(1);
             stats.pcm_payload_bytes = stats.pcm_payload_bytes.saturating_add(payload_len as u64);
             if sub_header.extra_header_length != PCM_EXTRA_HEADER_LENGTH {
-                stats.nonstandard_pcm_extra_header_packets = stats
-                    .nonstandard_pcm_extra_header_packets
-                    .saturating_add(1);
+                stats.nonstandard_pcm_extra_header_packets =
+                    stats.nonstandard_pcm_extra_header_packets.saturating_add(1);
             }
             if let Some(pcm) = sub_header.pcm {
                 if stats.first_pcm_sub_header.is_none() {
@@ -378,7 +430,8 @@ fn record_sub_header(stats: &mut DvdaDemuxStats, sub_header: DvdaSubHeader, payl
                 }
                 if let Some(previous) = stats.last_pcm_sub_header {
                     if pcm_format_without_pointer(previous) != pcm_format_without_pointer(pcm) {
-                        stats.pcm_format_change_count = stats.pcm_format_change_count.saturating_add(1);
+                        stats.pcm_format_change_count =
+                            stats.pcm_format_change_count.saturating_add(1);
                     }
                 }
                 stats.last_pcm_sub_header = Some(pcm);
@@ -390,7 +443,19 @@ fn record_sub_header(stats: &mut DvdaDemuxStats, sub_header: DvdaSubHeader, payl
     stats.last_sub_header = Some(sub_header);
 }
 
-fn pcm_format_without_pointer(pcm: DvdaPcmSubHeader) -> (u8, u8, u8, u8, Option<u32>, Option<u32>, Option<u32>, Option<u32>, u8) {
+fn pcm_format_without_pointer(
+    pcm: DvdaPcmSubHeader,
+) -> (
+    u8,
+    u8,
+    u8,
+    u8,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    u8,
+) {
     (
         pcm.group1_bits_code,
         pcm.group2_bits_code,
@@ -404,7 +469,21 @@ fn pcm_format_without_pointer(pcm: DvdaPcmSubHeader) -> (u8, u8, u8, u8, Option<
     )
 }
 
-fn parse_sub_header(bytes: &[u8], offset: usize) -> Result<DvdaSubHeader, DvdaDemuxError> {
+fn parse_sub_header(
+    bytes: &[u8],
+    offset: usize,
+    mode: DvdaSubHeaderMode,
+) -> Result<DvdaSubHeader, DvdaDemuxError> {
+    match mode {
+        DvdaSubHeaderMode::DvdAudio => parse_dvd_audio_sub_header(bytes, offset),
+        DvdaSubHeaderMode::DvdVideo => parse_dvd_video_sub_header(bytes, offset),
+    }
+}
+
+fn parse_dvd_audio_sub_header(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<DvdaSubHeader, DvdaDemuxError> {
     if bytes.len() < 4 {
         return Err(DvdaDemuxError::DvdaSubHeaderMissing {
             offset,
@@ -429,7 +508,7 @@ fn parse_sub_header(bytes: &[u8], offset: usize) -> Result<DvdaSubHeader, DvdaDe
         DvdaSubstreamKind::Mlp => (bytes.get(8).copied(), None),
         DvdaSubstreamKind::Pcm => {
             if extra_header_length >= PCM_EXTRA_HEADER_LENGTH {
-                let pcm = parse_pcm_sub_header(bytes);
+                let pcm = parse_dvd_audio_pcm_sub_header(bytes);
                 (Some(pcm.cci), Some(pcm))
             } else {
                 (None, None)
@@ -448,7 +527,47 @@ fn parse_sub_header(bytes: &[u8], offset: usize) -> Result<DvdaSubHeader, DvdaDe
     })
 }
 
-fn parse_pcm_sub_header(bytes: &[u8]) -> DvdaPcmSubHeader {
+fn parse_dvd_video_sub_header(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<DvdaSubHeader, DvdaDemuxError> {
+    const DVD_VIDEO_LPCM_TOTAL_HEADER_LENGTH: usize = 7;
+    const DVD_VIDEO_LPCM_EXTRA_HEADER_LENGTH: u8 = 3;
+
+    if bytes.len() < DVD_VIDEO_LPCM_TOTAL_HEADER_LENGTH {
+        return Err(DvdaDemuxError::DvdaSubHeaderMissing {
+            offset,
+            available: bytes.len(),
+        });
+    }
+
+    let stream_id = bytes[0];
+    let cyclic = bytes[1];
+    let (cci, pcm) = match DvdaSubstreamKind::from_stream_id(stream_id) {
+        DvdaSubstreamKind::Pcm => {
+            if let Some(pcm) = parse_dvd_video_pcm_sub_header(bytes) {
+                (Some(pcm.cci), Some(pcm))
+            } else {
+                (None, None)
+            }
+        }
+        // DVD-Video mode is only selected for VOB LPCM evidence. Unknown and
+        // MLP sub-stream IDs remain parseable for diagnostics/filtering, but we
+        // do not reinterpret bytes[3] as a DVD-Audio extra-header length here.
+        DvdaSubstreamKind::Mlp | DvdaSubstreamKind::Unknown(_) => (None, None),
+    };
+
+    Ok(DvdaSubHeader {
+        stream_id,
+        cyclic,
+        extra_header_length: DVD_VIDEO_LPCM_EXTRA_HEADER_LENGTH,
+        total_header_length: DVD_VIDEO_LPCM_TOTAL_HEADER_LENGTH,
+        cci,
+        pcm,
+    })
+}
+
+fn parse_dvd_audio_pcm_sub_header(bytes: &[u8]) -> DvdaPcmSubHeader {
     let first_audio_frame = u16::from_be_bytes([bytes[4], bytes[5]]);
     let bits_byte = bytes[7];
     let rate_byte = bytes[8];
@@ -472,12 +591,62 @@ fn parse_pcm_sub_header(bytes: &[u8]) -> DvdaPcmSubHeader {
     }
 }
 
+fn parse_dvd_video_pcm_sub_header(bytes: &[u8]) -> Option<DvdaPcmSubHeader> {
+    if bytes.len() < 7 {
+        return None;
+    }
+
+    let first_access_unit_pointer = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let format = bytes[5];
+    let bits_code = format >> 6;
+    let sample_rate_code = (format >> 4) & 0x03;
+    let channel_count = (format & 0x07).saturating_add(1);
+    let channel_assignment = dvd_video_lpcm_channel_assignment_for_count(channel_count)?;
+    let group1_bits = decode_pcm_bits_code(bits_code)?;
+    let group1_sample_rate = decode_dvd_video_lpcm_sample_rate_code(sample_rate_code)?;
+
+    Some(DvdaPcmSubHeader {
+        first_audio_frame: first_access_unit_pointer,
+        group1_bits_code: bits_code,
+        group2_bits_code: 0,
+        group1_sample_rate_code: sample_rate_code,
+        group2_sample_rate_code: 0,
+        group1_bits: Some(group1_bits),
+        group2_bits: None,
+        group1_sample_rate: Some(group1_sample_rate),
+        group2_sample_rate: None,
+        channel_assignment,
+        cci: bytes[6],
+    })
+}
+
+fn dvd_video_lpcm_channel_assignment_for_count(channel_count: u8) -> Option<u8> {
+    match channel_count {
+        1 => Some(0),
+        2 => Some(1),
+        3 => Some(7),
+        4 => Some(3),
+        5 => Some(10),
+        6 => Some(12),
+        _ => None,
+    }
+}
+
 #[must_use]
 pub const fn decode_pcm_bits_code(code: u8) -> Option<u32> {
     match code {
         0 => Some(16),
         1 => Some(20),
         2 => Some(24),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub const fn decode_dvd_video_lpcm_sample_rate_code(code: u8) -> Option<u32> {
+    match code {
+        0x0 => Some(48_000),
+        0x1 => Some(96_000),
         _ => None,
     }
 }
@@ -499,14 +668,17 @@ pub const fn decode_pcm_sample_rate_code(code: u8) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn sector_with_private_stream(substream_id: u8, payload: &[u8], stuffing: u8) -> [u8; DVD_SECTOR_SIZE] {
+    fn sector_with_private_stream(
+        substream_id: u8,
+        payload: &[u8],
+        stuffing: u8,
+    ) -> [u8; DVD_SECTOR_SIZE] {
         let mut sector = [0_u8; DVD_SECTOR_SIZE];
         sector[..4].copy_from_slice(&PACK_START_CODE);
         sector[13] = stuffing & 0x07;
 
         let pes_offset = 14 + usize::from(stuffing & 0x07);
-        sector[pes_offset..pes_offset + 4]
-            .copy_from_slice(&[0x00, 0x00, 0x01, PRIVATE_STREAM_1]);
+        sector[pes_offset..pes_offset + 4].copy_from_slice(&[0x00, 0x00, 0x01, PRIVATE_STREAM_1]);
         sector[pes_offset + 6] = 0x80;
         sector[pes_offset + 7] = 0x80;
         sector[pes_offset + 8] = 0;
@@ -532,7 +704,8 @@ mod tests {
         };
 
         let pes_payload_len = 3 + sub_header.len() + payload.len();
-        sector[pes_offset + 4..pes_offset + 6].copy_from_slice(&(pes_payload_len as u16).to_be_bytes());
+        sector[pes_offset + 4..pes_offset + 6]
+            .copy_from_slice(&(pes_payload_len as u16).to_be_bytes());
 
         let sub_offset = pes_offset + 9;
         sector[sub_offset..sub_offset + sub_header.len()].copy_from_slice(&sub_header);
@@ -540,8 +713,6 @@ mod tests {
         sector[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
         sector
     }
-
-
 
     fn new_pack_sector() -> [u8; DVD_SECTOR_SIZE] {
         let mut sector = [0_u8; DVD_SECTOR_SIZE];
@@ -566,6 +737,11 @@ mod tests {
         sub_header[10] = 0;
         sub_header[12] = 0;
         sub_header
+    }
+
+    fn dvd_video_pcm_sub_header_with(first_access_unit_pointer: u16, format_byte: u8) -> Vec<u8> {
+        let [fau_hi, fau_lo] = first_access_unit_pointer.to_be_bytes();
+        vec![PCM_STREAM_ID, 0x04, fau_hi, fau_lo, 0x03, format_byte, 0x7F]
     }
 
     fn write_private_stream_packet(
@@ -598,7 +774,8 @@ mod tests {
         sector[offset + 7] = 0x80;
         sector[offset + 8] = pes_header_data.len() as u8;
         let header_offset = offset + 9;
-        sector[header_offset..header_offset + pes_header_data.len()].copy_from_slice(pes_header_data);
+        sector[header_offset..header_offset + pes_header_data.len()]
+            .copy_from_slice(pes_header_data);
         let body_offset = header_offset + pes_header_data.len();
         sector[body_offset..body_offset + body.len()].copy_from_slice(body);
         offset + 6 + pes_length
@@ -618,7 +795,6 @@ mod tests {
         offset + 6 + payload.len()
     }
 
-
     struct AobFixture {
         name: &'static str,
         first_cyclic: u8,
@@ -626,13 +802,41 @@ mod tests {
     }
 
     const AOB_MLP_FIXTURES: &[AobFixture] = &[
-        AobFixture { name: "ap_eye_in_the_sky_first_16_sectors.bin", first_cyclic: 0, payload_bytes: 32_059 },
-        AobFixture { name: "ap_friendly_card_first_16_sectors.bin", first_cyclic: 0, payload_bytes: 32_059 },
-        AobFixture { name: "ap_i_robot_first_16_sectors.bin", first_cyclic: 0, payload_bytes: 32_059 },
-        AobFixture { name: "hdad2009_first_16_sectors.bin", first_cyclic: 0, payload_bytes: 32_059 },
-        AobFixture { name: "hawks_and_doves_first_16_sectors.bin", first_cyclic: 32, payload_bytes: 32_059 },
-        AobFixture { name: "mgletsgetiton_first_16_sectors.bin", first_cyclic: 32, payload_bytes: 32_059 },
-        AobFixture { name: "talking_heads_77_first_16_sectors.bin", first_cyclic: 32, payload_bytes: 32_059 },
+        AobFixture {
+            name: "ap_eye_in_the_sky_first_16_sectors.bin",
+            first_cyclic: 0,
+            payload_bytes: 32_059,
+        },
+        AobFixture {
+            name: "ap_friendly_card_first_16_sectors.bin",
+            first_cyclic: 0,
+            payload_bytes: 32_059,
+        },
+        AobFixture {
+            name: "ap_i_robot_first_16_sectors.bin",
+            first_cyclic: 0,
+            payload_bytes: 32_059,
+        },
+        AobFixture {
+            name: "hdad2009_first_16_sectors.bin",
+            first_cyclic: 0,
+            payload_bytes: 32_059,
+        },
+        AobFixture {
+            name: "hawks_and_doves_first_16_sectors.bin",
+            first_cyclic: 32,
+            payload_bytes: 32_059,
+        },
+        AobFixture {
+            name: "mgletsgetiton_first_16_sectors.bin",
+            first_cyclic: 32,
+            payload_bytes: 32_059,
+        },
+        AobFixture {
+            name: "talking_heads_77_first_16_sectors.bin",
+            first_cyclic: 32,
+            payload_bytes: 32_059,
+        },
     ];
 
     #[test]
@@ -669,19 +873,66 @@ mod tests {
             }
 
             assert_eq!(stats.sectors_seen, 16, "{} sector count", fixture.name);
-            assert_eq!(stats.private_stream_1_packets, 16, "{} PS1 packet count", fixture.name);
+            assert_eq!(
+                stats.private_stream_1_packets, 16,
+                "{} PS1 packet count",
+                fixture.name
+            );
             assert_eq!(stats.mlp_packets, 16, "{} MLP packet count", fixture.name);
             assert_eq!(stats.pcm_packets, 0, "{} LPCM packet count", fixture.name);
-            assert_eq!(stats.mlp_payload_bytes, fixture.payload_bytes, "{} payload bytes", fixture.name);
-            assert_eq!(payload.len() as u64, fixture.payload_bytes, "{} payload vector length", fixture.name);
-            assert_eq!(stats.nonstandard_mlp_extra_header_packets, 0, "{} should use canonical real-disc MLP extra headers", fixture.name);
-            assert_eq!(stats.extra_header_length_change_count, 0, "{} should have stable MLP extra headers", fixture.name);
-            assert_eq!(stats.cyclic_discontinuity_count, 0, "{} should have contiguous cyclic counters", fixture.name);
-            assert_eq!(stats.first_sub_header.expect("first header").extra_header_length, MLP_EXTRA_HEADER_LENGTH);
-            assert_eq!(stats.first_sub_header.expect("first header").total_header_length, 4 + usize::from(MLP_EXTRA_HEADER_LENGTH));
-            assert_eq!(cyclic_values.first().copied(), Some(fixture.first_cyclic), "{} first cyclic", fixture.name);
+            assert_eq!(
+                stats.mlp_payload_bytes, fixture.payload_bytes,
+                "{} payload bytes",
+                fixture.name
+            );
+            assert_eq!(
+                payload.len() as u64,
+                fixture.payload_bytes,
+                "{} payload vector length",
+                fixture.name
+            );
+            assert_eq!(
+                stats.nonstandard_mlp_extra_header_packets, 0,
+                "{} should use canonical real-disc MLP extra headers",
+                fixture.name
+            );
+            assert_eq!(
+                stats.extra_header_length_change_count, 0,
+                "{} should have stable MLP extra headers",
+                fixture.name
+            );
+            assert_eq!(
+                stats.cyclic_discontinuity_count, 0,
+                "{} should have contiguous cyclic counters",
+                fixture.name
+            );
+            assert_eq!(
+                stats
+                    .first_sub_header
+                    .expect("first header")
+                    .extra_header_length,
+                MLP_EXTRA_HEADER_LENGTH
+            );
+            assert_eq!(
+                stats
+                    .first_sub_header
+                    .expect("first header")
+                    .total_header_length,
+                4 + usize::from(MLP_EXTRA_HEADER_LENGTH)
+            );
+            assert_eq!(
+                cyclic_values.first().copied(),
+                Some(fixture.first_cyclic),
+                "{} first cyclic",
+                fixture.name
+            );
             for pair in cyclic_values.windows(2) {
-                assert_eq!(pair[1], pair[0].wrapping_add(1), "{} cyclic sequence", fixture.name);
+                assert_eq!(
+                    pair[1],
+                    pair[0].wrapping_add(1),
+                    "{} cyclic sequence",
+                    fixture.name
+                );
             }
         }
     }
@@ -700,8 +951,14 @@ mod tests {
         assert_eq!(stats.private_stream_1_packets, 1);
         assert_eq!(stats.mlp_packets, 1);
         assert_eq!(stats.mlp_payload_bytes, payload.len() as u64);
-        assert_eq!(stats.first_sub_header.expect("sub-header").stream_id, MLP_STREAM_ID);
-        assert_eq!(stats.last_sub_header.expect("last sub-header").stream_id, MLP_STREAM_ID);
+        assert_eq!(
+            stats.first_sub_header.expect("sub-header").stream_id,
+            MLP_STREAM_ID
+        );
+        assert_eq!(
+            stats.last_sub_header.expect("last sub-header").stream_id,
+            MLP_STREAM_ID
+        );
         assert_eq!(stats.nonstandard_mlp_extra_header_packets, 0);
     }
 
@@ -726,7 +983,10 @@ mod tests {
         assert_eq!(seen, payload);
         assert_eq!(stats.pcm_packets, 1);
         assert_eq!(stats.pcm_payload_bytes, payload.len() as u64);
-        assert_eq!(stats.first_pcm_sub_header.expect("pcm").channel_assignment, 0);
+        assert_eq!(
+            stats.first_pcm_sub_header.expect("pcm").channel_assignment,
+            0
+        );
     }
 
     #[test]
@@ -765,12 +1025,16 @@ mod tests {
         let mut out = Vec::new();
         let mut stats = DvdaDemuxStats::default();
 
-        let err = extract_mlp_from_sector(&sector, &mut out, &mut stats).expect_err("MLP-only extractor rejects LPCM");
+        let err = extract_mlp_from_sector(&sector, &mut out, &mut stats)
+            .expect_err("MLP-only extractor rejects LPCM");
 
-        assert!(matches!(err, DvdaDemuxError::UnexpectedSubstream { stream_id: PCM_STREAM_ID }));
+        assert!(matches!(
+            err,
+            DvdaDemuxError::UnexpectedSubstream {
+                stream_id: PCM_STREAM_ID
+            }
+        ));
     }
-
-
 
     #[test]
     fn demuxes_multiple_pes_packets_in_one_sector() {
@@ -793,7 +1057,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stats = DvdaDemuxStats::default();
-        extract_mlp_from_sector(&sector, &mut out, &mut stats).expect("multi-PES sector should demux");
+        extract_mlp_from_sector(&sector, &mut out, &mut stats)
+            .expect("multi-PES sector should demux");
 
         assert_eq!(out, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
         assert_eq!(stats.private_stream_1_packets, 2);
@@ -815,7 +1080,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stats = DvdaDemuxStats::default();
-        extract_mlp_from_sector(&sector, &mut out, &mut stats).expect("system header should be skipped");
+        extract_mlp_from_sector(&sector, &mut out, &mut stats)
+            .expect("system header should be skipped");
 
         assert_eq!(out, vec![0xC0, 0xFF, 0xEE]);
         assert_eq!(stats.private_stream_1_packets, 1);
@@ -826,7 +1092,11 @@ mod tests {
     fn demuxes_multiple_private_stream_1_packets_in_one_sector() {
         let mut sector = new_pack_sector();
         let mut offset = 14;
-        for (cyclic, payload) in [(0_u8, &[0x10_u8][..]), (1_u8, &[0x20, 0x21][..]), (2_u8, &[0x30][..])] {
+        for (cyclic, payload) in [
+            (0_u8, &[0x10_u8][..]),
+            (1_u8, &[0x20, 0x21][..]),
+            (2_u8, &[0x30][..]),
+        ] {
             offset = write_private_stream_packet(
                 &mut sector,
                 offset,
@@ -837,7 +1107,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stats = DvdaDemuxStats::default();
-        extract_mlp_from_sector(&sector, &mut out, &mut stats).expect("all PS1 packets should demux");
+        extract_mlp_from_sector(&sector, &mut out, &mut stats)
+            .expect("all PS1 packets should demux");
 
         assert_eq!(out, vec![0x10, 0x20, 0x21, 0x30]);
         assert_eq!(stats.private_stream_1_packets, 3);
@@ -859,7 +1130,77 @@ mod tests {
         let err = extract_mlp_from_sector(&sector, &mut Vec::new(), &mut DvdaDemuxStats::default())
             .expect_err("PES header length that points beyond PES end should fail");
 
-        assert!(matches!(err, DvdaDemuxError::PrivateStreamHeaderTruncated { .. }));
+        assert!(matches!(
+            err,
+            DvdaDemuxError::PrivateStreamHeaderTruncated { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_dvd_video_lpcm_fixed_header_with_variable_fau_pointer() {
+        let mut sector = new_pack_sector();
+        write_private_stream_packet(
+            &mut sector,
+            14,
+            &dvd_video_pcm_sub_header_with(0x0058, 0x81),
+            &[0x55, 0x66],
+        );
+
+        let packets =
+            parse_private_stream_1_packets_with_mode(&sector, DvdaSubHeaderMode::DvdVideo)
+                .expect("DVD-Video LPCM packet should demux with DVD-Video mode");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload, &[0x55, 0x66]);
+        let header = packets[0].sub_header;
+        assert_eq!(header.extra_header_length, 3);
+        assert_eq!(header.total_header_length, 7);
+        let pcm = header.pcm.expect("DVD-Video LPCM fields should parse");
+        assert_eq!(pcm.first_audio_frame, 0x0058);
+        assert_eq!(pcm.group1_bits, Some(24));
+        assert_eq!(pcm.group1_sample_rate, Some(48_000));
+        assert_eq!(pcm.channel_assignment, 1);
+        assert_eq!(pcm.cci, 0x7F);
+    }
+
+    #[test]
+    fn dvd_video_lpcm_mode_ignores_byte_three_as_length() {
+        let mut sector = new_pack_sector();
+        write_private_stream_packet(
+            &mut sector,
+            14,
+            &dvd_video_pcm_sub_header_with(0x0190, 0x91),
+            &[0xAA],
+        );
+
+        let packets =
+            parse_private_stream_1_packets_with_mode(&sector, DvdaSubHeaderMode::DvdVideo)
+                .expect("DVD-Video LPCM packet should not treat FAU low byte as header length");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload, &[0xAA]);
+        let header = packets[0].sub_header;
+        assert_eq!(header.extra_header_length, 3);
+        assert_eq!(header.total_header_length, 7);
+        let pcm = header.pcm.expect("DVD-Video LPCM fields should parse");
+        assert_eq!(pcm.first_audio_frame, 0x0190);
+        assert_eq!(pcm.group1_bits, Some(24));
+        assert_eq!(pcm.group1_sample_rate, Some(96_000));
+        assert_eq!(pcm.channel_assignment, 1);
+    }
+
+    #[test]
+    fn dvd_audio_mode_does_not_guess_dvd_video_lpcm_from_payload() {
+        let mut sector = new_pack_sector();
+        write_private_stream_packet(
+            &mut sector,
+            14,
+            &dvd_video_pcm_sub_header_with(0x0058, 0x81),
+            &[0x55, 0x66],
+        );
+
+        let err = parse_private_stream_1_packets(&sector).expect_err(
+            "default DVD-Audio mode must keep interpreting byte 3 as extra_header_length",
+        );
+        assert!(matches!(err, DvdaDemuxError::DvdaSubHeaderTruncated { .. }));
     }
 
     #[test]
@@ -877,7 +1218,13 @@ mod tests {
             .expect("MLP sub-header with longer extra header should demux");
         assert_eq!(mlp_out, vec![0x99]);
         assert_eq!(mlp_stats.nonstandard_mlp_extra_header_packets, 1);
-        assert_eq!(mlp_stats.first_sub_header.expect("header").total_header_length, 4 + usize::from(MLP_EXTRA_HEADER_LENGTH + 1));
+        assert_eq!(
+            mlp_stats
+                .first_sub_header
+                .expect("header")
+                .total_header_length,
+            4 + usize::from(MLP_EXTRA_HEADER_LENGTH + 1)
+        );
         assert_eq!(mlp_stats.first_sub_header.expect("header").cci, Some(0x5A));
 
         let mut pcm_sector = new_pack_sector();
@@ -896,19 +1243,20 @@ mod tests {
         .expect("PCM sub-header with longer extra header should demux");
         assert_eq!(pcm_payload, vec![0x55, 0x66]);
         assert_eq!(pcm_stats.nonstandard_pcm_extra_header_packets, 1);
-        assert_eq!(pcm_stats.first_sub_header.expect("header").total_header_length, 14);
+        assert_eq!(
+            pcm_stats
+                .first_sub_header
+                .expect("header")
+                .total_header_length,
+            14
+        );
     }
-
 
     #[test]
     fn mlp_extractor_skips_unknown_dvda_substream_by_default() {
         let mut sector = new_pack_sector();
-        let offset = write_private_stream_packet(
-            &mut sector,
-            14,
-            &[0xA7, 3, 0, 2, 0, 0],
-            &[0xDE, 0xAD],
-        );
+        let offset =
+            write_private_stream_packet(&mut sector, 14, &[0xA7, 3, 0, 2, 0, 0], &[0xDE, 0xAD]);
         write_private_stream_packet(
             &mut sector,
             offset,
@@ -924,7 +1272,13 @@ mod tests {
         assert_eq!(out, vec![0xF8, 0x72]);
         assert_eq!(stats.private_stream_1_packets, 2);
         assert_eq!(stats.mlp_packets, 1);
-        assert_eq!(stats.first_sub_header.expect("first recognized header").stream_id, MLP_STREAM_ID);
+        assert_eq!(
+            stats
+                .first_sub_header
+                .expect("first recognized header")
+                .stream_id,
+            MLP_STREAM_ID
+        );
     }
 
     #[test]
@@ -961,7 +1315,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stats = DvdaDemuxStats::default();
-        extract_mlp_from_sector(&sector, &mut out, &mut stats).expect("zero-payload MLP packet should demux");
+        extract_mlp_from_sector(&sector, &mut out, &mut stats)
+            .expect("zero-payload MLP packet should demux");
 
         assert!(out.is_empty());
         assert_eq!(stats.private_stream_1_packets, 1);
@@ -982,7 +1337,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stats = DvdaDemuxStats::default();
-        extract_mlp_from_sector(&sector, &mut out, &mut stats).expect("trailing padding should be ignored");
+        extract_mlp_from_sector(&sector, &mut out, &mut stats)
+            .expect("trailing padding should be ignored");
 
         assert_eq!(out, vec![0xDE, 0xAD]);
         assert_eq!(stats.private_stream_1_packets, 1);
@@ -1013,7 +1369,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stats = DvdaDemuxStats::default();
-        extract_mlp_from_sector(&sector, &mut out, &mut stats).expect("padding stream should be skipped");
+        extract_mlp_from_sector(&sector, &mut out, &mut stats)
+            .expect("padding stream should be skipped");
 
         assert!(out.is_empty());
         assert_eq!(stats.private_stream_1_packets, 0);
@@ -1035,14 +1392,18 @@ mod tests {
 
         let mut callbacks = 0_u32;
         let mut emitted = Vec::new();
-        let err = demux_private_stream_1_packets(&sector, &mut DvdaDemuxStats::default(), |packet| {
-            callbacks += 1;
-            emitted.extend_from_slice(packet.payload);
-            Ok(())
-        })
-        .expect_err("later malformed PES should fail the whole sector before callbacks run");
+        let err =
+            demux_private_stream_1_packets(&sector, &mut DvdaDemuxStats::default(), |packet| {
+                callbacks += 1;
+                emitted.extend_from_slice(packet.payload);
+                Ok(())
+            })
+            .expect_err("later malformed PES should fail the whole sector before callbacks run");
 
-        assert!(matches!(err, DvdaDemuxError::PrivateStreamHeaderTruncated { .. }));
+        assert!(matches!(
+            err,
+            DvdaDemuxError::PrivateStreamHeaderTruncated { .. }
+        ));
         assert_eq!(callbacks, 0);
         assert!(emitted.is_empty());
     }
@@ -1056,13 +1417,23 @@ mod tests {
             &mlp_sub_header_with(0, MLP_EXTRA_HEADER_LENGTH, 0),
             &[0xAA, 0xBB],
         );
-        write_private_stream_packet(&mut sector, offset, &pcm_sub_header_with(PCM_EXTRA_HEADER_LENGTH), &[0xCC]);
+        write_private_stream_packet(
+            &mut sector,
+            offset,
+            &pcm_sub_header_with(PCM_EXTRA_HEADER_LENGTH),
+            &[0xCC],
+        );
 
         let mut out = Vec::new();
         let err = extract_mlp_from_sector(&sector, &mut out, &mut DvdaDemuxStats::default())
             .expect_err("MLP-only extractor should reject mixed LPCM sector atomically");
 
-        assert!(matches!(err, DvdaDemuxError::UnexpectedSubstream { stream_id: PCM_STREAM_ID }));
+        assert!(matches!(
+            err,
+            DvdaDemuxError::UnexpectedSubstream {
+                stream_id: PCM_STREAM_ID
+            }
+        ));
         assert!(out.is_empty());
     }
 
@@ -1187,17 +1558,28 @@ mod tests {
             })
         }));
 
-        assert!(result.is_ok(), "demuxer panicked while parsing fuzzed sector");
+        assert!(
+            result.is_ok(),
+            "demuxer panicked while parsing fuzzed sector"
+        );
         if result.expect("checked panic").is_err() {
-            assert_eq!(callback_count, 0, "callback ran before a parse error was reported");
-            assert!(emitted.is_empty(), "payload was emitted before a parse error was reported");
+            assert_eq!(
+                callback_count, 0,
+                "callback ran before a parse error was reported"
+            );
+            assert!(
+                emitted.is_empty(),
+                "payload was emitted before a parse error was reported"
+            );
         }
     }
 
     #[test]
     fn random_sector_fuzz_does_not_panic_or_emit_on_parse_error() {
         for seed in 0..4096_u64 {
-            let sector = fill_random_sector(0xDADA_0000_0000_0000 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let sector = fill_random_sector(
+                0xDADA_0000_0000_0000 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
             assert_demux_no_panic_and_atomic_on_parse_error(&sector);
         }
     }
@@ -1205,9 +1587,10 @@ mod tests {
     #[test]
     fn structured_pes_fuzz_does_not_panic_or_emit_on_parse_error() {
         for seed in 0..4096_u64 {
-            let sector = structured_fuzz_sector(0xA0B0_C0D0_E0F0_0000 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let sector = structured_fuzz_sector(
+                0xA0B0_C0D0_E0F0_0000 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03),
+            );
             assert_demux_no_panic_and_atomic_on_parse_error(&sector);
         }
     }
-
 }

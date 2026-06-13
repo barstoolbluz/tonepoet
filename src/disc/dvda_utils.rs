@@ -2,19 +2,20 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::convert::pipeline::{
-    parse_private_stream_1_packets, probe_mlp_major_sync, DvdaSubstreamKind,
+    parse_private_stream_1_packets_with_mode, probe_mlp_major_sync, DvdaSubHeaderMode,
+    DvdaSubstreamKind,
 };
 use crate::tui::dvda::sector::AobSectorReader;
 use crate::tui::dvda::{
-    channel_assignment, parse_dvda_volume, AudioAttributes, ChannelAssignment,
-    DirectoryDvdaVolume, DvdaDisc, DvdaGroup, DvdaVolume, IsoUdfDvdaVolume, TitleRefKind,
+    channel_assignment, parse_dvda_volume, AudioAttributes, AudioChapter, AudioTitle,
+    ChannelAssignment, DirectoryDvdaVolume, DvdaDisc, DvdaGroup, DvdaVolume, IsoUdfDvdaVolume,
+    SamgTrack, SamgZone, TitleRefKind,
 };
 
 use super::dvda_mapper::map_dvda_disc_with_metabase;
-use crate::tui::dvda_metabase::{self, DvdaMetabase};
-use super::model::{AobProbeResult, AudioPresentationFormat, FormatProvenance};
 use super::model::DiscContents;
-
+use super::model::{AobProbeResult, AudioPresentationFormat, FormatProvenance};
+use crate::tui::dvda_metabase::{self, DvdaMetabase};
 
 /// Return true when `path` is a DVD-Audio ISO image.
 ///
@@ -31,7 +32,10 @@ pub fn is_dvda_iso(path: &Path) -> bool {
     if !is_iso || !path.is_file() {
         return false;
     }
-    if std::fs::metadata(path).map(|m| m.len() < 32 * 2048).unwrap_or(true) {
+    if std::fs::metadata(path)
+        .map(|m| m.len() < 32 * 2048)
+        .unwrap_or(true)
+    {
         return false;
     }
 
@@ -88,7 +92,98 @@ fn map_dvda_volume(volume: &dyn DvdaVolume, path: &Path) -> Result<DiscContents,
         }
     }
 
-    Ok(map_dvda_disc_with_metabase(&disc, &probes, loaded_metabase.as_ref().map(|loaded| &loaded.metabase), path))
+    Ok(map_dvda_disc_with_metabase(
+        &disc,
+        &probes,
+        loaded_metabase.as_ref().map(|loaded| &loaded.metabase),
+        path,
+    ))
+}
+
+fn samg_sector_block_count(track: &SamgTrack) -> u64 {
+    if track.abs_last_sector < track.abs_first_sector {
+        0
+    } else {
+        u64::from(track.abs_last_sector) - u64::from(track.abs_first_sector) + 1
+    }
+}
+
+fn chapter_sector_span(chapter: &AudioChapter) -> Option<(u32, u32, u64)> {
+    let first = chapter
+        .sector_ranges
+        .iter()
+        .map(|range| range.first)
+        .min()?;
+    let last = chapter.sector_ranges.iter().map(|range| range.last).max()?;
+    let blocks = chapter
+        .sector_ranges
+        .iter()
+        .map(|range| u64::from(range.block_count()))
+        .sum();
+    Some((first, last, blocks))
+}
+
+fn samg_disc_absolute_base_for_title(disc: &DvdaDisc, title: &AudioTitle) -> Option<u32> {
+    let samg = disc.samg.as_ref()?;
+    if title.chapters.is_empty() {
+        return None;
+    }
+    let chapter_spans: Option<Vec<_>> = title.chapters.iter().map(chapter_sector_span).collect();
+    let chapter_spans = chapter_spans?;
+
+    let mut tracks_by_group: BTreeMap<u8, Vec<&SamgTrack>> = BTreeMap::new();
+    for track in samg
+        .tracks
+        .iter()
+        .filter(|track| matches!(track.zone, SamgZone::Vob))
+    {
+        tracks_by_group
+            .entry(track.group_nr)
+            .or_default()
+            .push(track);
+    }
+
+    for tracks in tracks_by_group.values_mut() {
+        tracks.sort_by_key(|track| (track.track_nr, track.ordinal));
+        if tracks.len() != chapter_spans.len() {
+            continue;
+        }
+        let mut base: Option<u32> = None;
+        let mut matched = true;
+        for (track, (chapter_first, chapter_last, chapter_blocks)) in
+            tracks.iter().zip(chapter_spans.iter().copied())
+        {
+            if samg_sector_block_count(track) != chapter_blocks {
+                matched = false;
+                break;
+            }
+            let Some(candidate_base) = track.abs_first_sector.checked_sub(chapter_first) else {
+                matched = false;
+                break;
+            };
+            let Some(expected_last) = candidate_base.checked_add(chapter_last) else {
+                matched = false;
+                break;
+            };
+            if track.abs_last_sector != expected_last {
+                matched = false;
+                break;
+            }
+            if let Some(existing_base) = base {
+                if existing_base != candidate_base {
+                    matched = false;
+                    break;
+                }
+            } else {
+                base = Some(candidate_base);
+            }
+        }
+        if matched {
+            return base;
+        }
+    }
+
+    None
 }
 
 /// Probe the first AOB sector of a group's first track to determine the actual
@@ -105,8 +200,8 @@ pub fn probe_group_aob_format(
 
 /// Probe with an optional source path for cross-ATS raw ISO sector reads.
 /// When the title set has no AOB files and `source_path` points to an ISO,
-/// compute the disc-absolute sector from AOTT + ATSI metadata and read
-/// directly from the ISO file.
+/// prefer a SAMG VOB-derived disc-absolute base, fall back to AMG/AOTT + ATSI
+/// metadata, and read directly from the ISO file.
 pub fn probe_group_aob_format_with_path(
     volume: &dyn DvdaVolume,
     disc: &DvdaDisc,
@@ -140,15 +235,21 @@ pub fn probe_group_aob_format_with_path(
         .or_else(|_| reader.read_blocks(first_sector, 1))
         .ok();
     let cross_ats = from_aob.is_none();
+    let mut demux_mode = DvdaSubHeaderMode::DvdAudio;
     let sector_data = from_aob.or_else(|| {
-            // Title set has no AOBs (e.g., ATS 2 on discs where all audio
-            // lives within ATS 1's AOB files). Compute the disc-absolute
-            // sector from AOTT atsi_mat_sector + ATSI atstt_vobs, and read
-            // directly from the ISO.
-            let iso_path = source_path?;
-            if !iso_path.is_file() {
-                return None;
-            }
+        // Title set has no AOBs. Prefer SAMG VOB absolute sectors when
+        // they correlate exactly with the ATS chapter sector ranges; this
+        // avoids probing an unrelated AOB/VOB area when AOTT offsets are
+        // relative to another filesystem structure.
+        let iso_path = source_path?;
+        if !iso_path.is_file() {
+            return None;
+        }
+        let samg_disc_absolute_base = samg_disc_absolute_base_for_title(disc, title);
+        if samg_disc_absolute_base.is_some() {
+            demux_mode = DvdaSubHeaderMode::DvdVideo;
+        }
+        let disc_absolute_base = samg_disc_absolute_base.or_else(|| {
             let aott_entry = disc
                 .amg
                 .audio_title_table
@@ -163,25 +264,27 @@ pub fn probe_group_aob_format_with_path(
                         .iter()
                         .find(|e| e.title_set_nr == title_ref.title_set_nr)
                 })?;
-            let disc_lba = u64::from(aott_entry.atsi_mat_sector)
-                + u64::from(title_set.header.atstt_vobs)
-                + u64::from(first_sector);
-            let byte_offset = disc_lba * 2048;
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = std::fs::File::open(iso_path).ok()?;
-            let file_len = file.metadata().ok()?.len();
-            if byte_offset + 2048 > file_len {
-                return None;
-            }
-            file.seek(SeekFrom::Start(byte_offset)).ok()?;
-            // Read up to 512 sectors (~1 MB) — the MLP major sync may not
-            // appear in the first access unit of a cross-ATS stream.
-            let probe_sectors = 512u64;
-            let read_len = (probe_sectors * 2048).min(file_len - byte_offset) as usize;
-            let mut buf = vec![0u8; read_len];
-            file.read_exact(&mut buf).ok()?;
-            Some(buf)
+            aott_entry
+                .atsi_mat_sector
+                .checked_add(title_set.header.atstt_vobs)
         })?;
+        let disc_lba = u64::from(disc_absolute_base) + u64::from(first_sector);
+        let byte_offset = disc_lba * 2048;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(iso_path).ok()?;
+        let file_len = file.metadata().ok()?.len();
+        if byte_offset + 2048 > file_len {
+            return None;
+        }
+        file.seek(SeekFrom::Start(byte_offset)).ok()?;
+        // Read up to 512 sectors (~1 MB) — the MLP major sync may not
+        // appear in the first access unit of a cross-ATS stream.
+        let probe_sectors = 512u64;
+        let read_len = (probe_sectors * 2048).min(file_len - byte_offset) as usize;
+        let mut buf = vec![0u8; read_len];
+        file.read_exact(&mut buf).ok()?;
+        Some(buf)
+    })?;
 
     // Demux sectors and probe. For multi-sector reads (cross-ATS fallback),
     // demux each 2048-byte sector independently and concatenate MLP payloads
@@ -193,7 +296,7 @@ pub fn probe_group_aob_format_with_path(
 
     for i in 0..sector_count {
         let sector = &sector_data[i * 2048..(i + 1) * 2048];
-        let packets = match parse_private_stream_1_packets(sector) {
+        let packets = match parse_private_stream_1_packets_with_mode(sector, demux_mode) {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -202,7 +305,9 @@ pub fn probe_group_aob_format_with_path(
                 DvdaSubstreamKind::Pcm => {
                     if pcm_result.is_none() {
                         if let Some(pcm) = packet.sub_header.pcm.as_ref() {
-                            if let (Some(rate), Some(bits)) = (pcm.group1_sample_rate, pcm.group1_bits) {
+                            if let (Some(rate), Some(bits)) =
+                                (pcm.group1_sample_rate, pcm.group1_bits)
+                            {
                                 if let Some(ca) = channel_assignment(pcm.channel_assignment) {
                                     let ch_label = super::labels::channel_layout_label(
                                         pcm.channel_assignment,
@@ -529,7 +634,11 @@ fn detect_stereo_downmix_source(
 
         // Sibling matches. Get its channel layout from IFO audio_formats.
         for tr in &sibling.title_refs {
-            if let Some(ts) = disc.title_sets.iter().find(|ts| ts.number == tr.title_set_nr) {
+            if let Some(ts) = disc
+                .title_sets
+                .iter()
+                .find(|ts| ts.number == tr.title_set_nr)
+            {
                 let present: Vec<_> = ts.audio_formats.iter().filter(|a| a.present).collect();
                 if let [attr] = present.as_slice() {
                     if let Some(ref ca) = attr.channel_assignment {

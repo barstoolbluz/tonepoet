@@ -16,14 +16,12 @@ use super::dvda_channel_layout::{
     DvdaChannelOrderPolicy,
 };
 use super::dvda_demux::{
-    parse_private_stream_1_packets, record_private_stream_1_packets, DvdaDemuxError,
-    DvdaDemuxStats, DvdaPs1Packet, DvdaSubstreamKind,
-    MLP_EXTRA_HEADER_LENGTH, MLP_STREAM_ID, PCM_EXTRA_HEADER_LENGTH, PCM_STREAM_ID,
-    DVD_SECTOR_SIZE,
+    parse_private_stream_1_packets, parse_private_stream_1_packets_with_mode,
+    record_private_stream_1_packets, DvdaDemuxError, DvdaDemuxStats, DvdaPs1Packet,
+    DvdaSubHeaderMode, DvdaSubstreamKind, DVD_SECTOR_SIZE, MLP_EXTRA_HEADER_LENGTH, MLP_STREAM_ID,
+    PCM_EXTRA_HEADER_LENGTH, PCM_STREAM_ID,
 };
-use super::dvda_lpcm::{
-    DvdAudioLpcmDecoder, LpcmDecodeStats, LpcmParams, LpcmStreamExpectation,
-};
+use super::dvda_lpcm::{DvdAudioLpcmDecoder, LpcmDecodeStats, LpcmParams, LpcmStreamExpectation};
 use super::dvda_mlp::{
     inspect_mlp_file, probe_mlp_major_sync, MlpStreamExpectation, MlpStreamInspection,
 };
@@ -34,13 +32,11 @@ use super::track_executor::{run_tool_command_with_concurrency, ToolConcurrencyLi
 use super::types::{
     DvdaAobFileRef, DvdaDownmixPolicy, DvdaElementaryStreamKind, DvdaIsoBackend,
     DvdaSectorAddressSpace, DvdaSectorRangeRef, DvdaVolumeSourceRef, PreparedTrack,
-    SourceAudioDescriptor, StagingDir,
-    TrackSourceRef,
+    SourceAudioDescriptor, StagingDir, TrackSourceRef,
 };
 use crate::tui::dvda::sector::AobSectorReader;
 use crate::tui::dvda::{
-    AobFileEntry, DirectoryDvdaVolume, DvdaFile, DvdaVolume, Iso9660DvdaVolume,
-    IsoUdfDvdaVolume,
+    AobFileEntry, DirectoryDvdaVolume, DvdaFile, DvdaVolume, Iso9660DvdaVolume, IsoUdfDvdaVolume,
 };
 
 const PTS_PER_SECOND: u128 = 90_000;
@@ -78,7 +74,8 @@ pub(super) async fn realize_dvda_track(
         return Err(ConvertError::Realize("cancelled".to_string()));
     }
 
-    let track = DvdaTrackRealizeInput::try_from_source(src, expected_audio, audio_policy.downmix_policy)?;
+    let track =
+        DvdaTrackRealizeInput::try_from_source(src, expected_audio, audio_policy.downmix_policy)?;
     if audio_policy.downmix_policy != track.dvda_downmix_policy {
         audio_policy.downmix_policy = track.dvda_downmix_policy;
     }
@@ -94,10 +91,36 @@ pub(super) async fn realize_dvda_track(
     let cache_source_wav_expectation = track.source_wav_expectation();
     let base_wav_expectation = track.wav_expectation();
     if base_wav_expectation.can_validate_existing_cache() {
-        if let Some(probe) = dvda_wav_is_ready(&out_path, base_wav_expectation, runner, cancel, tool_concurrency_limits).await? {
+        if let Some(probe) = dvda_wav_is_ready(
+            &out_path,
+            base_wav_expectation,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?
+        {
             let realization_metadata = DvdaRealizationMetadata::from_track_cache_hit(&track);
-            log_dvda_audio_format_record(&out_path, &track, cache_source_wav_expectation, base_wav_expectation, &probe, &audio_policy, realization_metadata, "cache-hit");
-            write_dvda_audio_format_manifest(&out_path, &track, cache_source_wav_expectation, base_wav_expectation, &probe, &audio_policy, realization_metadata, "cache-hit")?;
+            log_dvda_audio_format_record(
+                &out_path,
+                &track,
+                cache_source_wav_expectation,
+                base_wav_expectation,
+                &probe,
+                &audio_policy,
+                realization_metadata,
+                "cache-hit",
+            );
+            write_dvda_audio_format_manifest(
+                &out_path,
+                &track,
+                cache_source_wav_expectation,
+                base_wav_expectation,
+                &probe,
+                &audio_policy,
+                realization_metadata,
+                "cache-hit",
+            )?;
             return Ok(out_path);
         }
     } else if out_path.exists() {
@@ -117,10 +140,17 @@ pub(super) async fn realize_dvda_track(
             heartbeat::run_with_heartbeat(
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        extract_track_audio_payload(&track_for_extract, &staging_root, lpcm_channel_order_policy, &cancel_for_extract)
+                        extract_track_audio_payload(
+                            &track_for_extract,
+                            &staging_root,
+                            lpcm_channel_order_policy,
+                            &cancel_for_extract,
+                        )
                     })
                     .await
-                    .map_err(|err| ConvertError::Realize(format!("DVD-Audio extraction task failed: {err}")))?
+                    .map_err(|err| {
+                        ConvertError::Realize(format!("DVD-Audio extraction task failed: {err}"))
+                    })?
                 },
                 tracker,
                 "dvda-audio-extraction",
@@ -129,21 +159,31 @@ pub(super) async fn realize_dvda_track(
             )
             .await?
         }
-        None => {
-            tokio::task::spawn_blocking(move || {
-                extract_track_audio_payload(&track_for_extract, &staging_root, lpcm_channel_order_policy, &cancel_for_extract)
-            })
-            .await
-            .map_err(|err| ConvertError::Realize(format!("DVD-Audio extraction task failed: {err}")))??
-        }
+        None => tokio::task::spawn_blocking(move || {
+            extract_track_audio_payload(
+                &track_for_extract,
+                &staging_root,
+                lpcm_channel_order_policy,
+                &cancel_for_extract,
+            )
+        })
+        .await
+        .map_err(|err| {
+            ConvertError::Realize(format!("DVD-Audio extraction task failed: {err}"))
+        })??,
     };
 
     let source_wav_expectation = extracted.source_wav_expectation(&track);
-    let final_wav_expectation = source_wav_expectation.with_downmix_policy(audio_policy.downmix_policy);
+    let final_wav_expectation =
+        source_wav_expectation.with_downmix_policy(audio_policy.downmix_policy);
     let realization_metadata = extracted.realization_metadata(&track);
 
     let final_probe = match extracted {
-        ExtractedDvdaAudio::Mlp { mlp_path, inspection, .. } => {
+        ExtractedDvdaAudio::Mlp {
+            mlp_path,
+            inspection,
+            ..
+        } => {
             let mut mlp_guard = DvdaTempPathGuard::new(mlp_path);
             if let Some(inspection) = &inspection {
                 log::info!(
@@ -214,8 +254,26 @@ pub(super) async fn realize_dvda_track(
         }
     };
 
-    log_dvda_audio_format_record(&out_path, &track, source_wav_expectation, final_wav_expectation, &final_probe, &audio_policy, realization_metadata, "fresh-decode");
-    write_dvda_audio_format_manifest(&out_path, &track, source_wav_expectation, final_wav_expectation, &final_probe, &audio_policy, realization_metadata, "fresh-decode")?;
+    log_dvda_audio_format_record(
+        &out_path,
+        &track,
+        source_wav_expectation,
+        final_wav_expectation,
+        &final_probe,
+        &audio_policy,
+        realization_metadata,
+        "fresh-decode",
+    );
+    write_dvda_audio_format_manifest(
+        &out_path,
+        &track,
+        source_wav_expectation,
+        final_wav_expectation,
+        &final_probe,
+        &audio_policy,
+        realization_metadata,
+        "fresh-decode",
+    )?;
     Ok(out_path)
 }
 
@@ -324,7 +382,9 @@ impl DvdaSourceAudioExpectation {
             group2_bit_depth: self.group2_bit_depth.or(fallback.group2_bit_depth),
             group1_channel_count: self.group1_channel_count.or(fallback.group1_channel_count),
             group2_channel_count: self.group2_channel_count.or(fallback.group2_channel_count),
-            channel_assignment_code: self.channel_assignment_code.or(fallback.channel_assignment_code),
+            channel_assignment_code: self
+                .channel_assignment_code
+                .or(fallback.channel_assignment_code),
         }
     }
 }
@@ -348,7 +408,9 @@ impl DvdaRealizationAudioPolicy {
             final_encode_bit_depth_policy,
             final_encode_bit_depth,
             downmix_policy,
-            lpcm_channel_order_policy: DvdaChannelOrderPolicy::from_env_var(DVDA_LPCM_CHANNEL_ORDER_ENV),
+            lpcm_channel_order_policy: DvdaChannelOrderPolicy::from_env_var(
+                DVDA_LPCM_CHANNEL_ORDER_ENV,
+            ),
         }
     }
 
@@ -359,7 +421,9 @@ impl DvdaRealizationAudioPolicy {
             final_encode_bit_depth_policy: "unknown".to_string(),
             final_encode_bit_depth: None,
             downmix_policy: DvdaDownmixPolicy::Auto,
-            lpcm_channel_order_policy: DvdaChannelOrderPolicy::from_env_var(DVDA_LPCM_CHANNEL_ORDER_ENV),
+            lpcm_channel_order_policy: DvdaChannelOrderPolicy::from_env_var(
+                DVDA_LPCM_CHANNEL_ORDER_ENV,
+            ),
         }
     }
 }
@@ -381,7 +445,10 @@ fn channel_count_from_source_audio(source_audio: &SourceAudioDescriptor) -> Opti
     (total > 0).then_some(total)
 }
 
-fn source_audio_group_sample_rate(source_audio: &SourceAudioDescriptor, group_nr: u8) -> Option<u32> {
+fn source_audio_group_sample_rate(
+    source_audio: &SourceAudioDescriptor,
+    group_nr: u8,
+) -> Option<u32> {
     source_audio
         .channel_groups
         .iter()
@@ -399,7 +466,10 @@ fn source_audio_group_bit_depth(source_audio: &SourceAudioDescriptor, group_nr: 
         .filter(|value| *value != 0)
 }
 
-fn source_audio_group_channel_count(source_audio: &SourceAudioDescriptor, group_nr: u8) -> Option<u32> {
+fn source_audio_group_channel_count(
+    source_audio: &SourceAudioDescriptor,
+    group_nr: u8,
+) -> Option<u32> {
     source_audio
         .channel_groups
         .iter()
@@ -408,7 +478,6 @@ fn source_audio_group_channel_count(source_audio: &SourceAudioDescriptor, group_
         .map(u32::from)
         .filter(|value| *value != 0)
 }
-
 
 fn source_audio_channel_order_label(source_audio: &SourceAudioDescriptor) -> Option<String> {
     let group1 = source_audio
@@ -514,7 +583,11 @@ impl DvdaTrackRealizeInput {
                 "DVD-Audio track has no sector ranges".to_string(),
             ));
         }
-        if matches!(sector_address_space, DvdaSectorAddressSpace::AtsAobRelative { .. }) && aob_files.is_empty() {
+        if matches!(
+            sector_address_space,
+            DvdaSectorAddressSpace::AtsAobRelative { .. }
+        ) && aob_files.is_empty()
+        {
             return Err(ConvertError::TrackValidation(
                 "DVD-Audio ATS-relative track has no AOB file inventory".to_string(),
             ));
@@ -564,7 +637,9 @@ impl DvdaTrackRealizeInput {
             expected_sample_rate: expected_audio.sample_rate,
             expected_channel_count: expected_audio.channel_count,
             expected_bit_depth: expected_audio.bit_depth,
-            expected_channel_assignment_code: expected_audio.channel_assignment_code.or(*expected_channel_assignment_code),
+            expected_channel_assignment_code: expected_audio
+                .channel_assignment_code
+                .or(*expected_channel_assignment_code),
             expected_group1_sample_rate: expected_audio.group1_sample_rate,
             expected_group2_sample_rate: expected_audio.group2_sample_rate,
             expected_group1_bit_depth: expected_audio.group1_bit_depth,
@@ -705,7 +780,10 @@ impl ExtractedDvdaAudio {
         let base = track.source_wav_expectation();
         match self {
             Self::Mlp { inspection, .. } => {
-                let Some(info) = inspection.as_ref().and_then(|inspection| inspection.first_major_sync) else {
+                let Some(info) = inspection
+                    .as_ref()
+                    .and_then(|inspection| inspection.first_major_sync)
+                else {
                     return base;
                 };
                 base.with_stream_facts(StreamDerivedAudioFacts {
@@ -730,12 +808,24 @@ impl ExtractedDvdaAudio {
 
     fn realization_metadata(&self, track: &DvdaTrackRealizeInput) -> DvdaRealizationMetadata {
         match self {
-            Self::Mlp { inspection, packet_stats, .. } => {
-                DvdaRealizationMetadata::from_mlp_track_and_packet_stats(track, packet_stats, inspection.as_ref())
-            }
-            Self::Lpcm { stats, packet_stats, .. } => {
-                DvdaRealizationMetadata::from_lpcm_track_and_packet_stats(track, packet_stats, stats)
-            }
+            Self::Mlp {
+                inspection,
+                packet_stats,
+                ..
+            } => DvdaRealizationMetadata::from_mlp_track_and_packet_stats(
+                track,
+                packet_stats,
+                inspection.as_ref(),
+            ),
+            Self::Lpcm {
+                stats,
+                packet_stats,
+                ..
+            } => DvdaRealizationMetadata::from_lpcm_track_and_packet_stats(
+                track,
+                packet_stats,
+                stats,
+            ),
         }
     }
 }
@@ -753,13 +843,14 @@ struct StreamDerivedAudioFacts {
 enum ExpectedElementaryStreamKind {
     Mlp,
     Lpcm,
+    DvdVideoLpcm,
 }
 
 impl ExpectedElementaryStreamKind {
     const fn stream_id(self) -> u8 {
         match self {
             Self::Mlp => MLP_STREAM_ID,
-            Self::Lpcm => PCM_STREAM_ID,
+            Self::Lpcm | Self::DvdVideoLpcm => PCM_STREAM_ID,
         }
     }
 
@@ -767,7 +858,26 @@ impl ExpectedElementaryStreamKind {
         match self {
             Self::Mlp => "MLP",
             Self::Lpcm => "LPCM",
+            Self::DvdVideoLpcm => "DVD-Video LPCM",
         }
+    }
+
+    const fn demux_mode(self) -> DvdaSubHeaderMode {
+        match self {
+            Self::DvdVideoLpcm => DvdaSubHeaderMode::DvdVideo,
+            Self::Mlp | Self::Lpcm => DvdaSubHeaderMode::DvdAudio,
+        }
+    }
+
+    const fn canonical_lpcm(self) -> Self {
+        match self {
+            Self::DvdVideoLpcm => Self::Lpcm,
+            other => other,
+        }
+    }
+
+    const fn is_lpcm(self) -> bool {
+        matches!(self, Self::Lpcm | Self::DvdVideoLpcm)
     }
 }
 
@@ -776,14 +886,21 @@ impl From<DvdaElementaryStreamKind> for ExpectedElementaryStreamKind {
         match kind {
             DvdaElementaryStreamKind::Mlp => Self::Mlp,
             DvdaElementaryStreamKind::Lpcm => Self::Lpcm,
+            DvdaElementaryStreamKind::DvdVideoLpcm => Self::DvdVideoLpcm,
         }
     }
 }
 
-fn materialized_stream_hint_for_track(track: &DvdaTrackRealizeInput) -> Option<ExpectedElementaryStreamKind> {
+fn materialized_stream_hint_for_track(
+    track: &DvdaTrackRealizeInput,
+) -> Option<ExpectedElementaryStreamKind> {
     match track.sector_address_space {
-        DvdaSectorAddressSpace::DiscAbsolute { .. } => track.elementary_stream_kind_hint.map(Into::into),
-        DvdaSectorAddressSpace::AtsAobRelative { .. } | DvdaSectorAddressSpace::SamgAbsolute => None,
+        DvdaSectorAddressSpace::DiscAbsolute { .. } => {
+            track.elementary_stream_kind_hint.map(Into::into)
+        }
+        DvdaSectorAddressSpace::AtsAobRelative { .. } | DvdaSectorAddressSpace::SamgAbsolute => {
+            None
+        }
     }
 }
 
@@ -797,7 +914,9 @@ fn classify_sector_elementary_stream(
     for packet in packets {
         let packet_kind = match packet.sub_header.kind() {
             DvdaSubstreamKind::Mlp => ExpectedElementaryStreamKind::Mlp,
-            DvdaSubstreamKind::Pcm => ExpectedElementaryStreamKind::Lpcm,
+            DvdaSubstreamKind::Pcm => current_track_kind
+                .filter(|kind| kind.is_lpcm())
+                .unwrap_or(ExpectedElementaryStreamKind::Lpcm),
             DvdaSubstreamKind::Unknown(stream_id) => {
                 if strict_parser {
                     return Err(DvdaDemuxError::UnexpectedSubstream { stream_id });
@@ -810,7 +929,7 @@ fn classify_sector_elementary_stream(
         };
 
         if let Some(existing) = sector_kind {
-            if existing != packet_kind {
+            if existing.canonical_lpcm() != packet_kind.canonical_lpcm() {
                 return Err(DvdaDemuxError::PacketHandler(format!(
                     "sector {logical_sector} contains both {} and {} Private Stream 1 packets",
                     existing.label(),
@@ -823,7 +942,7 @@ fn classify_sector_elementary_stream(
     }
 
     if let (Some(existing), Some(sector_kind)) = (current_track_kind, sector_kind) {
-        if existing != sector_kind {
+        if existing.canonical_lpcm() != sector_kind.canonical_lpcm() {
             return Err(DvdaDemuxError::PacketHandler(format!(
                 "track contains both {} and {} Private Stream 1 packets; first mismatch at sector {logical_sector}",
                 existing.label(),
@@ -909,7 +1028,9 @@ impl<'a> TrackSectorReader<'a> {
     fn open_disc_absolute_iso(source_ref: &DvdaVolumeSourceRef) -> Result<Self, ConvertError> {
         let source = match source_ref {
             DvdaVolumeSourceRef::Iso { path, .. } => path.clone(),
-            DvdaVolumeSourceRef::StagedAudioTs { original, .. } if original.is_file() => original.clone(),
+            DvdaVolumeSourceRef::StagedAudioTs { original, .. } if original.is_file() => {
+                original.clone()
+            }
             DvdaVolumeSourceRef::StagedAudioTs { original, .. } => {
                 return Err(ConvertError::TrackValidation(format!(
                     "DVD-Audio disc-absolute sector reads require the original ISO image; staged source original {} is not a readable file",
@@ -930,14 +1051,21 @@ impl<'a> TrackSectorReader<'a> {
                 source.display()
             ))
         })?;
-        let file_len = file.metadata().map_err(|err| {
-            ConvertError::Realize(format!(
-                "failed to stat DVD-Audio ISO for disc-absolute sector reads {}: {err}",
-                source.display()
-            ))
-        })?.len();
+        let file_len = file
+            .metadata()
+            .map_err(|err| {
+                ConvertError::Realize(format!(
+                    "failed to stat DVD-Audio ISO for disc-absolute sector reads {}: {err}",
+                    source.display()
+                ))
+            })?
+            .len();
 
-        Ok(Self::DiscAbsoluteIso { file, file_len, source })
+        Ok(Self::DiscAbsoluteIso {
+            file,
+            file_len,
+            source,
+        })
     }
 
     fn read_blocks_into(
@@ -950,9 +1078,18 @@ impl<'a> TrackSectorReader<'a> {
             Self::AtsRelative(reader) => reader
                 .read_blocks_into(block_first, block_count, out)
                 .map_err(|err| ConvertError::Realize(err.to_string())),
-            Self::DiscAbsoluteIso { file, file_len, source } => {
-                read_disc_absolute_blocks_from_iso(file, *file_len, source, block_first, block_count, out)
-            }
+            Self::DiscAbsoluteIso {
+                file,
+                file_len,
+                source,
+            } => read_disc_absolute_blocks_from_iso(
+                file,
+                *file_len,
+                source,
+                block_first,
+                block_count,
+                out,
+            ),
         }
     }
 }
@@ -1023,10 +1160,10 @@ fn packet_kind_matches_hint(packet: DvdaPs1Packet<'_>, hint: ExpectedElementaryS
         (ExpectedElementaryStreamKind::Mlp, DvdaSubstreamKind::Mlp) => {
             packet.sub_header.extra_header_length >= MLP_EXTRA_HEADER_LENGTH
         }
-        (ExpectedElementaryStreamKind::Lpcm, DvdaSubstreamKind::Pcm) => {
-            packet.sub_header.extra_header_length >= PCM_EXTRA_HEADER_LENGTH
-                && packet.sub_header.pcm.is_some()
-        }
+        (
+            ExpectedElementaryStreamKind::Lpcm | ExpectedElementaryStreamKind::DvdVideoLpcm,
+            DvdaSubstreamKind::Pcm,
+        ) => packet.sub_header.pcm.is_some(),
         _ => false,
     }
 }
@@ -1055,12 +1192,52 @@ fn packets_matching_stream_hint<'sector>(
     selected
 }
 
+fn disc_absolute_hint_allows_sparse_raw_sector(
+    track: &DvdaTrackRealizeInput,
+    stream_kind_hint: Option<ExpectedElementaryStreamKind>,
+) -> bool {
+    stream_kind_hint.is_some()
+        && matches!(
+            track.sector_address_space,
+            DvdaSectorAddressSpace::DiscAbsolute { .. }
+        )
+}
+
+fn parse_track_sector_private_stream_1_packets<'sector>(
+    track: &DvdaTrackRealizeInput,
+    stream_kind_hint: Option<ExpectedElementaryStreamKind>,
+    sector: &'sector [u8],
+    logical_sector: u32,
+) -> Result<Option<Vec<DvdaPs1Packet<'sector>>>, ConvertError> {
+    let mode = stream_kind_hint
+        .map(ExpectedElementaryStreamKind::demux_mode)
+        .unwrap_or_default();
+    match parse_private_stream_1_packets_with_mode(sector, mode) {
+        Ok(packets) => Ok(Some(packets)),
+        Err(DvdaDemuxError::MissingPackHeader)
+            if disc_absolute_hint_allows_sparse_raw_sector(track, stream_kind_hint) =>
+        {
+            log::debug!(
+                "DVD-Audio disc-absolute extraction skipped non-MPEG-PS/raw VOB sector {logical_sector} after locking onto {}",
+                stream_kind_hint.expect("hint checked").label()
+            );
+            Ok(None)
+        }
+        Err(err) => Err(ConvertError::Realize(format!(
+            "DVD-Audio MPEG-PS demux failed at logical sector {logical_sector}: {err}"
+        ))),
+    }
+}
+
 fn infer_disc_absolute_stream_hint(
     track: &DvdaTrackRealizeInput,
     sector_reader: &mut TrackSectorReader<'_>,
     cancel: &CancellationToken,
 ) -> Result<Option<ExpectedElementaryStreamKind>, ConvertError> {
-    if !matches!(track.sector_address_space, DvdaSectorAddressSpace::DiscAbsolute { .. }) {
+    if !matches!(
+        track.sector_address_space,
+        DvdaSectorAddressSpace::DiscAbsolute { .. }
+    ) {
         return Ok(None);
     }
 
@@ -1205,16 +1382,33 @@ fn extract_track_audio_payload(
                 )));
             }
 
-            for (idx, sector) in sector_buf[..bytes_read].chunks_exact(DVD_SECTOR_SIZE).enumerate() {
+            for (idx, sector) in sector_buf[..bytes_read]
+                .chunks_exact(DVD_SECTOR_SIZE)
+                .enumerate()
+            {
                 let logical_sector = next_sector + idx as u32;
-                let raw_packets = parse_private_stream_1_packets(sector).map_err(|err| {
-                    ConvertError::Realize(format!(
-                        "DVD-Audio MPEG-PS demux failed at logical sector {logical_sector}: {err}"
-                    ))
-                })?;
+                let Some(raw_packets) = parse_track_sector_private_stream_1_packets(
+                    track,
+                    stream_kind_hint,
+                    sector,
+                    logical_sector,
+                )?
+                else {
+                    continue;
+                };
+                if raw_packets.is_empty()
+                    && disc_absolute_hint_allows_sparse_raw_sector(track, stream_kind_hint)
+                {
+                    log::debug!(
+                        "DVD-Audio disc-absolute extraction skipped VOB sector {logical_sector} with no Private Stream 1 packets after locking onto {}",
+                        stream_kind_hint.expect("hint checked").label()
+                    );
+                    continue;
+                }
                 let filtered_packets;
                 let packets = if let Some(hint) = stream_kind_hint {
-                    filtered_packets = packets_matching_stream_hint(&raw_packets, hint, logical_sector);
+                    filtered_packets =
+                        packets_matching_stream_hint(&raw_packets, hint, logical_sector);
                     filtered_packets.as_slice()
                 } else {
                     raw_packets.as_slice()
@@ -1252,7 +1446,10 @@ fn extract_track_audio_payload(
                         })?;
                         stream_kind = Some(ExpectedElementaryStreamKind::Mlp);
                     }
-                    Some(ExpectedElementaryStreamKind::Lpcm) => {
+                    Some(
+                        ExpectedElementaryStreamKind::Lpcm
+                        | ExpectedElementaryStreamKind::DvdVideoLpcm,
+                    ) => {
                         if lpcm_writer.is_none() {
                             let (path, file) = create_unique_dvda_temp_file(
                                 &elementary_dir,
@@ -1278,7 +1475,7 @@ fn extract_track_audio_payload(
                                 "DVD-Audio LPCM sector-local commit failed at logical sector {logical_sector}: {err}"
                             ))
                         })?;
-                        stream_kind = Some(ExpectedElementaryStreamKind::Lpcm);
+                        stream_kind = sector_kind;
                     }
                     None => {}
                 }
@@ -1302,7 +1499,10 @@ fn extract_track_audio_payload(
                 guard.remove_now()?;
             }
             let mut mlp_guard = mlp_guard.ok_or_else(|| {
-                ConvertError::TrackValidation("DVD-Audio MLP packets were seen but no elementary temp file was created".to_string())
+                ConvertError::TrackValidation(
+                    "DVD-Audio MLP packets were seen but no elementary temp file was created"
+                        .to_string(),
+                )
             })?;
             let mlp_path = mlp_guard.path().to_path_buf();
 
@@ -1323,7 +1523,7 @@ fn extract_track_audio_payload(
                 packet_stats: stats,
             })
         }
-        Some(ExpectedElementaryStreamKind::Lpcm) => {
+        Some(ExpectedElementaryStreamKind::Lpcm | ExpectedElementaryStreamKind::DvdVideoLpcm) => {
             if let Some(writer) = lpcm_writer.as_mut() {
                 writer.flush()?;
             }
@@ -1333,7 +1533,10 @@ fn extract_track_audio_payload(
                 guard.remove_now()?;
             }
             let mut raw_guard = raw_guard.ok_or_else(|| {
-                ConvertError::TrackValidation("DVD-Audio LPCM packets were seen but no raw PCM temp file was created".to_string())
+                ConvertError::TrackValidation(
+                    "DVD-Audio LPCM packets were seen but no raw PCM temp file was created"
+                        .to_string(),
+                )
             })?;
             let raw_path = raw_guard.path().to_path_buf();
 
@@ -1343,13 +1546,22 @@ fn extract_track_audio_payload(
                 ));
             }
 
-            validate_packet_stream_expectations(&stats, track, ExpectedElementaryStreamKind::Lpcm)?;
+            validate_packet_stream_expectations(
+                &stats,
+                track,
+                stream_kind.unwrap_or(ExpectedElementaryStreamKind::Lpcm),
+            )?;
 
             let decoder = lpcm_decoder.ok_or_else(|| {
-                ConvertError::TrackValidation("DVD-Audio LPCM packets were seen but decoder was not initialized".to_string())
+                ConvertError::TrackValidation(
+                    "DVD-Audio LPCM packets were seen but decoder was not initialized".to_string(),
+                )
             })?;
             let params = decoder.params().ok_or_else(|| {
-                ConvertError::TrackValidation("DVD-Audio LPCM packets were seen but stream parameters were not resolved".to_string())
+                ConvertError::TrackValidation(
+                    "DVD-Audio LPCM packets were seen but stream parameters were not resolved"
+                        .to_string(),
+                )
             })?;
             let lpcm_stats = decoder.finish().map_err(|err| {
                 ConvertError::TrackValidation(format!("DVD-Audio LPCM unpacking failed: {err}"))
@@ -1420,19 +1632,20 @@ fn validate_packet_stream_expectations(
             if stats.nonstandard_mlp_extra_header_packets != 0 {
                 metadata_findings.push(format!(
                     "{} MLP packets used extra_header_length other than the DVD-Audio MLP value {}",
-                    stats.nonstandard_mlp_extra_header_packets,
-                    MLP_EXTRA_HEADER_LENGTH
+                    stats.nonstandard_mlp_extra_header_packets, MLP_EXTRA_HEADER_LENGTH
                 ));
             }
         }
-        ExpectedElementaryStreamKind::Lpcm => {
+        ExpectedElementaryStreamKind::Lpcm | ExpectedElementaryStreamKind::DvdVideoLpcm => {
             if stats.mlp_packets != 0 {
                 return Err(ConvertError::TrackValidation(format!(
                     "DVD-Audio packet stream contains {} MLP packets in an LPCM realization path",
                     stats.mlp_packets
                 )));
             }
-            if stats.nonstandard_pcm_extra_header_packets != 0 {
+            if expected_kind != ExpectedElementaryStreamKind::DvdVideoLpcm
+                && stats.nonstandard_pcm_extra_header_packets != 0
+            {
                 metadata_findings.push(format!(
                     "{} LPCM packets used extra_header_length other than the DVD-Audio LPCM value {}",
                     stats.nonstandard_pcm_extra_header_packets,
@@ -1467,7 +1680,9 @@ fn validate_packet_stream_expectations(
         ));
     }
 
-    if let (Some(track_type), Some(audio_format_index)) = (track.track_type, track.audio_format_index) {
+    if let (Some(track_type), Some(audio_format_index)) =
+        (track.track_type, track.audio_format_index)
+    {
         let candidate_index = track_type & 0x07;
         if candidate_index != audio_format_index {
             hard_findings.push(format!(
@@ -1504,7 +1719,6 @@ fn validate_packet_stream_expectations(
         track.expected_group2_bit_depth,
         track.expected_group2_channel_count
     );
-
 
     if let Some(matrix) = track.downmix_matrix {
         log::info!(
@@ -1555,7 +1769,6 @@ fn validate_packet_stream_expectations(
 
     Ok(())
 }
-
 
 fn channel_layout_label_for_code(code: u8) -> String {
     layout_for_assignment_code(code)
@@ -1696,7 +1909,11 @@ fn inspect_extracted_mlp_payload(
     let inspection = match inspect_mlp_file(path, track.mlp_expectation()) {
         Ok(inspection) => inspection,
         Err(err) if strict || err.is_audio_fact_mismatch() => {
-            let mode = if strict { "strict mode" } else { "audio-fact validation" };
+            let mode = if strict {
+                "strict mode"
+            } else {
+                "audio-fact validation"
+            };
             return Err(ConvertError::TrackValidation(format!(
                 "DVD-Audio MLP frame inspection failed in {mode} for {}: {err}",
                 path.display()
@@ -1752,7 +1969,6 @@ fn mlp_inspection_is_strict() -> bool {
         .unwrap_or(false)
 }
 
-
 fn validate_mlp_ifo_cross_checks(
     path: &Path,
     inspection: &MlpStreamInspection,
@@ -1770,7 +1986,10 @@ fn validate_mlp_ifo_cross_checks(
     };
 
     let mut findings = Vec::new();
-    if let Some(expected_assignment) = track.expected_channel_assignment_code.filter(|_| !track.dvda_downmix_policy.is_active()) {
+    if let Some(expected_assignment) = track
+        .expected_channel_assignment_code
+        .filter(|_| !track.dvda_downmix_policy.is_active())
+    {
         match u8::try_from(info.channel_arrangement) {
             Ok(actual_assignment) => {
                 if let Some(finding) = compare_channel_assignment_layouts(
@@ -1864,13 +2083,22 @@ async fn decode_mlp_to_wav(
     }
 
     let parent = out_path.parent().ok_or_else(|| {
-        ConvertError::TrackValidation(format!("DVD-Audio output has no parent path: {}", out_path.display()))
+        ConvertError::TrackValidation(format!(
+            "DVD-Audio output has no parent path: {}",
+            out_path.display()
+        ))
     })?;
     fs::create_dir_all(parent)?;
 
     let (tmp_wav, tmp_file) = create_unique_dvda_temp_file(
         parent,
-        &format!(".{}.", out_path.file_name().and_then(|name| name.to_str()).unwrap_or("dvda-output.wav")),
+        &format!(
+            ".{}.",
+            out_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("dvda-output.wav")
+        ),
         ".tmp.wav",
     )?;
     let mut tmp_wav_guard = DvdaTempPathGuard::new(tmp_wav);
@@ -1928,7 +2156,14 @@ async fn decode_mlp_to_wav(
         )));
     }
 
-    let probe = validate_dvda_wav(tmp_wav_guard.path(), expectation, runner, cancel, tool_concurrency_limits).await?;
+    let probe = validate_dvda_wav(
+        tmp_wav_guard.path(),
+        expectation,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await?;
     atomically_replace_dvda_output(tmp_wav_guard.path(), out_path)?;
     tmp_wav_guard.disarm();
     Ok(probe)
@@ -1953,13 +2188,22 @@ async fn mux_s32le_to_wav(
     }
 
     let parent = out_path.parent().ok_or_else(|| {
-        ConvertError::TrackValidation(format!("DVD-Audio output has no parent path: {}", out_path.display()))
+        ConvertError::TrackValidation(format!(
+            "DVD-Audio output has no parent path: {}",
+            out_path.display()
+        ))
     })?;
     fs::create_dir_all(parent)?;
 
     let (tmp_wav, tmp_file) = create_unique_dvda_temp_file(
         parent,
-        &format!(".{}.", out_path.file_name().and_then(|name| name.to_str()).unwrap_or("dvda-output.wav")),
+        &format!(
+            ".{}.",
+            out_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("dvda-output.wav")
+        ),
         ".tmp.wav",
     )?;
     let mut tmp_wav_guard = DvdaTempPathGuard::new(tmp_wav);
@@ -2039,12 +2283,18 @@ async fn mux_s32le_to_wav(
         )));
     }
 
-    let probe = validate_dvda_wav(tmp_wav_guard.path(), expectation, runner, cancel, tool_concurrency_limits).await?;
+    let probe = validate_dvda_wav(
+        tmp_wav_guard.path(),
+        expectation,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await?;
     atomically_replace_dvda_output(tmp_wav_guard.path(), out_path)?;
     tmp_wav_guard.disarm();
     Ok(probe)
 }
-
 
 struct DvdaOutputLock {
     path: PathBuf,
@@ -2213,10 +2463,7 @@ fn recover_stale_dvda_temp_artifacts(dir: &Path) -> Result<(), ConvertError> {
             continue;
         }
         if file_age_seconds(&metadata)? >= threshold {
-            log::warn!(
-                "removing stale DVD-Audio temp artifact {}",
-                path.display()
-            );
+            log::warn!("removing stale DVD-Audio temp artifact {}", path.display());
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -2463,7 +2710,6 @@ fn validate_dvda_wav_probe_with_mode(
     Ok(())
 }
 
-
 fn validate_dvda_wav_channel_layout(
     path: &Path,
     probe: &DvdaWavProbe,
@@ -2493,7 +2739,10 @@ fn validate_dvda_wav_channel_layout(
     }
 
     let expected_alias = layout.ffmpeg_input_layout_for_policy(expectation.channel_order_policy);
-    let probe_layout = probe.channel_layout.as_deref().map(normalized_ffmpeg_channel_layout);
+    let probe_layout = probe
+        .channel_layout
+        .as_deref()
+        .map(normalized_ffmpeg_channel_layout);
     match (expected_alias, probe_layout.as_deref()) {
         (Some(alias), Some(actual)) => {
             let normalized_alias = normalized_ffmpeg_channel_layout(alias);
@@ -2627,14 +2876,36 @@ impl DvdaWavExpectation {
             sample_rate: facts.sample_rate.or(self.sample_rate),
             channel_count: facts.channel_count.or(self.channel_count),
             source_bit_depth: facts.bit_depth.or(self.source_bit_depth),
-            channel_assignment_code: facts.channel_assignment_code.or(self.channel_assignment_code),
+            channel_assignment_code: facts
+                .channel_assignment_code
+                .or(self.channel_assignment_code),
             channel_order_policy: self.channel_order_policy,
         };
 
-        log_active_fact_resolution("sample rate", self.sample_rate, facts.sample_rate, facts.evidence_source);
-        log_active_fact_resolution("channel count", self.channel_count, facts.channel_count, facts.evidence_source);
-        log_active_fact_resolution("bit depth", self.source_bit_depth, facts.bit_depth, facts.evidence_source);
-        log_active_fact_resolution("channel assignment", self.channel_assignment_code.map(u32::from), facts.channel_assignment_code.map(u32::from), facts.evidence_source);
+        log_active_fact_resolution(
+            "sample rate",
+            self.sample_rate,
+            facts.sample_rate,
+            facts.evidence_source,
+        );
+        log_active_fact_resolution(
+            "channel count",
+            self.channel_count,
+            facts.channel_count,
+            facts.evidence_source,
+        );
+        log_active_fact_resolution(
+            "bit depth",
+            self.source_bit_depth,
+            facts.bit_depth,
+            facts.evidence_source,
+        );
+        log_active_fact_resolution(
+            "channel assignment",
+            self.channel_assignment_code.map(u32::from),
+            facts.channel_assignment_code.map(u32::from),
+            facts.evidence_source,
+        );
 
         merged
     }
@@ -2968,7 +3239,13 @@ fn write_dvda_audio_format_manifest(
     })?;
     let (tmp_path, mut tmp_file) = create_unique_dvda_temp_file(
         manifest_parent,
-        &format!(".{}.", manifest_path.file_name().and_then(|name| name.to_str()).unwrap_or("dvda-audio-format.json")),
+        &format!(
+            ".{}.",
+            manifest_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("dvda-audio-format.json")
+        ),
         ".tmp.json",
     )?;
     let mut tmp_guard = DvdaTempPathGuard::new(tmp_path);
@@ -3025,14 +3302,19 @@ fn dvda_support_boundaries_json(
     })
 }
 
-fn sample_count_audit(expectation: DvdaWavExpectation, probe: &DvdaWavProbe) -> DvdaSampleCountAudit {
+fn sample_count_audit(
+    expectation: DvdaWavExpectation,
+    probe: &DvdaWavProbe,
+) -> DvdaSampleCountAudit {
     let mode = DvdaDurationValidationMode::from_env();
     let expected_samples = expectation
         .sample_rate
         .filter(|_| expectation.len_in_pts > 0)
         .map(|sample_rate| pts_to_samples(expectation.len_in_pts, sample_rate));
     let actual_samples = probe.samples;
-    let drift_samples = expected_samples.zip(actual_samples).map(|(expected, actual)| actual.abs_diff(expected));
+    let drift_samples = expected_samples
+        .zip(actual_samples)
+        .map(|(expected, actual)| actual.abs_diff(expected));
     let allowed_samples = expectation
         .sample_rate
         .filter(|_| expectation.len_in_pts > 0)
@@ -3046,7 +3328,10 @@ fn sample_count_audit(expectation: DvdaWavExpectation, probe: &DvdaWavProbe) -> 
     }
 }
 
-fn sample_count_audit_json(expectation: DvdaWavExpectation, probe: &DvdaWavProbe) -> serde_json::Value {
+fn sample_count_audit_json(
+    expectation: DvdaWavExpectation,
+    probe: &DvdaWavProbe,
+) -> serde_json::Value {
     let audit = sample_count_audit(expectation, probe);
     serde_json::json!({
         "expected_samples": audit.expected_samples,
@@ -3059,7 +3344,6 @@ fn sample_count_audit_json(expectation: DvdaWavExpectation, probe: &DvdaWavProbe
         "sample_rate_source": if expectation.sample_rate.is_some() { "IFO or stream-derived expectation" } else { "unknown" }
     })
 }
-
 
 fn channel_order_manifest_json(
     expectation: DvdaWavExpectation,
@@ -3154,12 +3438,14 @@ fn dvda_sector_ranges_json(track: &DvdaTrackRealizeInput) -> Vec<serde_json::Val
     track
         .sector_ranges
         .iter()
-        .map(|range| serde_json::json!({
-            "index_nr": range.index_nr,
-            "first": range.first,
-            "last": range.last,
-            "sector_count": range.block_count()
-        }))
+        .map(|range| {
+            serde_json::json!({
+                "index_nr": range.index_nr,
+                "first": range.first,
+                "last": range.last,
+                "sector_count": range.block_count()
+            })
+        })
         .collect()
 }
 
@@ -3290,7 +3576,6 @@ fn optional_u32_label(value: Option<u32>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-
 fn optional_u8_label(value: Option<u8>) -> String {
     value
         .map(|value| value.to_string())
@@ -3303,7 +3588,12 @@ fn optional_u64_label(value: Option<u64>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn log_active_fact_resolution(label: &str, base: Option<u32>, stream: Option<u32>, evidence_source: &str) {
+fn log_active_fact_resolution(
+    label: &str,
+    base: Option<u32>,
+    stream: Option<u32>,
+    evidence_source: &str,
+) {
     match (base, stream) {
         (None, Some(value)) => log::info!(
             "DVD-Audio active {label} resolved from {evidence_source}: {value}"
@@ -3341,7 +3631,8 @@ async fn probe_dvda_wav(
             "-select_streams".into(),
             "a:0".into(),
             "-show_entries".into(),
-            "stream=codec_name,sample_rate,channels,channel_layout,duration_ts,time_base,duration".into(),
+            "stream=codec_name,sample_rate,channels,channel_layout,duration_ts,time_base,duration"
+                .into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -3354,23 +3645,29 @@ async fn probe_dvda_wav(
         timeout: Duration::from_secs(120),
     };
 
-    let output = match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await {
-        Ok(output) => output,
-        Err(ToolRunnerError::Cancelled { .. }) => {
-            return Err(ConvertError::Realize("cancelled".to_string()));
-        }
-        Err(err) => return Err(ConvertError::Tool(err)),
-    };
+    let output =
+        match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await
+        {
+            Ok(output) => output,
+            Err(ToolRunnerError::Cancelled { .. }) => {
+                return Err(ConvertError::Realize("cancelled".to_string()));
+            }
+            Err(err) => return Err(ConvertError::Tool(err)),
+        };
 
     parse_dvda_wav_probe(&output.stdout_tail)
 }
 
 fn parse_dvda_wav_probe(json: &str) -> Result<DvdaWavProbe, ConvertError> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|err| {
-        ConvertError::TrackValidation(format!("ffprobe JSON parse failed for DVD-Audio WAV: {err}"))
+        ConvertError::TrackValidation(format!(
+            "ffprobe JSON parse failed for DVD-Audio WAV: {err}"
+        ))
     })?;
     let stream = value.pointer("/streams/0").ok_or_else(|| {
-        ConvertError::TrackValidation("ffprobe returned no audio stream for DVD-Audio WAV".to_string())
+        ConvertError::TrackValidation(
+            "ffprobe returned no audio stream for DVD-Audio WAV".to_string(),
+        )
     })?;
 
     let codec_name = stream
@@ -3535,27 +3832,31 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::env;
 
+    use super::super::dvda_mlp::{MlpMajorSyncInfo, MLP_STREAM_TYPE};
     use super::super::materializer_dvda::DvdaAudioMaterializer;
     use super::super::stages::Materializer;
     use super::super::tool::RealToolRunner;
-    use super::super::dvda_mlp::{MlpMajorSyncInfo, MLP_STREAM_TYPE};
     use super::super::types::{
         ChannelGroupDescriptor, CueSidecarPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy,
-        NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PublishPolicy,
-        SourceAudioCoding, SourceAudioDescriptor, SourceOptions, StagePolicy, StageRequirement,
-        TrackSelection, PreparedTrack,
+        NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PreparedTrack,
+        PublishPolicy, SourceAudioCoding, SourceAudioDescriptor, SourceOptions, StagePolicy,
+        StageRequirement, TrackSelection,
     };
 
     const DVDA_CORPUS_DIR_ENV: &str = "TONEPOET_DVDA_PHASE3_CORPUS_DIR";
     const DVDA_CORPUS_STRICT_ENV: &str = "TONEPOET_DVDA_PHASE3_CORPUS_STRICT";
     const DVDA_EXTENDED_CORPUS_STRICT_ENV: &str = "TONEPOET_DVDA_PHASE3_EXTENDED_CORPUS_STRICT";
-    const DVDA_REQUIRE_MULTIFORMAT_ATS_CORPUS_ENV: &str = "TONEPOET_DVDA_PHASE3_REQUIRE_MULTIFORMAT_ATS_CORPUS";
-    const DVDA_REQUIRE_SAMG_ABSOLUTE_CORPUS_ENV: &str = "TONEPOET_DVDA_PHASE3_REQUIRE_SAMG_ABSOLUTE_CORPUS";
+    const DVDA_REQUIRE_MULTIFORMAT_ATS_CORPUS_ENV: &str =
+        "TONEPOET_DVDA_PHASE3_REQUIRE_MULTIFORMAT_ATS_CORPUS";
+    const DVDA_REQUIRE_SAMG_ABSOLUTE_CORPUS_ENV: &str =
+        "TONEPOET_DVDA_PHASE3_REQUIRE_SAMG_ABSOLUTE_CORPUS";
     const DEFAULT_DVDA_CORPUS_DIR: &str = "/mnt/scratch/dev/dawdiolab/test-isos";
 
     fn sample_dvda_track_source() -> TrackSourceRef {
         TrackSourceRef::DvdaTrack {
-            volume_source: DvdaVolumeSourceRef::Directory { root: PathBuf::from("/tmp/disc") },
+            volume_source: DvdaVolumeSourceRef::Directory {
+                root: PathBuf::from("/tmp/disc"),
+            },
             sector_address_space: DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
             elementary_stream_kind_hint: None,
             group_nr: 1,
@@ -3587,7 +3888,11 @@ mod tests {
             expected_group2_bit_depth: None,
             expected_group1_channel_count: Some(2),
             expected_group2_channel_count: None,
-            sector_ranges: vec![DvdaSectorRangeRef { index_nr: 1, first: 10, last: 20 }],
+            sector_ranges: vec![DvdaSectorRangeRef {
+                index_nr: 1,
+                first: 10,
+                last: 20,
+            }],
             aob_files: vec![DvdaAobFileRef {
                 title_set_nr: 1,
                 part_nr: 1,
@@ -3638,12 +3943,8 @@ mod tests {
         expected_tracks: 10,
     };
 
-    const PHASE3_CORPUS_DISCS: [CorpusDisc; 4] = [
-        HDAD2009,
-        AP_I_ROBOT,
-        AP_FRIENDLY_CARD,
-        AP_EYE_IN_THE_SKY,
-    ];
+    const PHASE3_CORPUS_DISCS: [CorpusDisc; 4] =
+        [HDAD2009, AP_I_ROBOT, AP_FRIENDLY_CARD, AP_EYE_IN_THE_SKY];
 
     #[test]
     fn pts_to_samples_rounds_to_nearest_sample() {
@@ -3734,8 +4035,6 @@ mod tests {
 
         assert!(err.to_string().contains("channel count mismatch"));
     }
-
-
 
     #[test]
     fn wav_validation_accepts_matching_standard_channel_layout() {
@@ -3849,8 +4148,6 @@ mod tests {
             .expect("unknown IFO sample rate should skip duration validation");
     }
 
-
-
     #[test]
     fn wav_validation_phase3_mode_allows_one_second_sample_drift() {
         let probe = DvdaWavProbe {
@@ -3877,7 +4174,6 @@ mod tests {
         )
         .expect("Phase 3 tolerance should allow less than one second of sample drift");
     }
-
 
     #[test]
     fn wav_validation_near_exact_mode_rejects_more_than_one_sample_drift() {
@@ -3959,7 +4255,11 @@ mod tests {
             channel_layout: Some("stereo".to_string()),
             samples: Some(192_000),
         };
-        let policy = DvdaRealizationAudioPolicy::new("16-bit PCM".to_string(), Some(16), DvdaDownmixPolicy::None);
+        let policy = DvdaRealizationAudioPolicy::new(
+            "16-bit PCM".to_string(),
+            Some(16),
+            DvdaDownmixPolicy::None,
+        );
 
         let track = sample_dvda_track_realize_input();
         let metadata = DvdaRealizationMetadata {
@@ -3991,58 +4291,176 @@ mod tests {
             lpcm: None,
         };
 
-        write_dvda_audio_format_manifest(&wav_path, &track, expectation, expectation, &probe, &policy, metadata, "unit-test")
-            .expect("audio-format manifest write succeeds");
+        write_dvda_audio_format_manifest(
+            &wav_path,
+            &track,
+            expectation,
+            expectation,
+            &probe,
+            &policy,
+            metadata,
+            "unit-test",
+        )
+        .expect("audio-format manifest write succeeds");
 
         let manifest_path = dvda_audio_format_manifest_path(&wav_path);
         let manifest = fs::read_to_string(&manifest_path).expect("manifest should be readable");
         let json: serde_json::Value = serde_json::from_str(&manifest).expect("manifest JSON");
-        assert_eq!(json.pointer("/source/bit_depth").and_then(|value| value.as_u64()), Some(24));
-        assert_eq!(json.pointer("/carrier/codec").and_then(|value| value.as_str()), Some("pcm_s32le"));
-        assert_eq!(json.pointer("/carrier/bit_depth").and_then(|value| value.as_u64()), Some(32));
-        assert_eq!(json.pointer("/final_encode/resolved_bit_depth").and_then(|value| value.as_u64()), Some(16));
-        assert_eq!(json.pointer("/packet_metadata/first_cci").and_then(|value| value.as_u64()), Some(0));
-        assert_eq!(json.pointer("/packet_metadata/cci_change_count").and_then(|value| value.as_u64()), Some(0));
-        assert_eq!(json.pointer("/downmix/ifo_matrix").and_then(|value| value.as_u64()), Some(3));
-        assert_eq!(json.pointer("/downmix/applied_during_realization").and_then(|value| value.as_bool()), Some(false));
-        assert_eq!(json.pointer("/source/channel_order/realized_lpcm_policy").and_then(|value| value.as_str()), Some("preserve-dvd-audio-source-order"));
-        assert_eq!(json.pointer("/source/channel_order/dvd_audio_source_order").and_then(|value| value.as_str()), Some("L,R"));
-        assert_eq!(json.pointer("/carrier/channel_order").and_then(|value| value.as_str()), Some("L,R"));
-        assert_eq!(json.pointer("/schema").and_then(|value| value.as_str()), Some("tonepoet.dvda.realized_audio_format.v6"));
-        assert_eq!(json.pointer("/support_boundaries/multi_format_ats/corpus_proof_required").and_then(|value| value.as_str()), Some("TONEPOET_DVDA_PHASE3_REQUIRE_MULTIFORMAT_ATS_CORPUS=1"));
-        assert_eq!(json.pointer("/support_boundaries/samg_absolute/directory_tree_supported").and_then(|value| value.as_bool()), Some(false));
-        assert_eq!(json.pointer("/volume/kind").and_then(|value| value.as_str()), Some("directory"));
-        assert_eq!(json.pointer("/track/group_nr").and_then(|value| value.as_u64()), Some(1));
-        assert_eq!(json.pointer("/track/title_nr").and_then(|value| value.as_u64()), Some(2));
-        assert_eq!(json.pointer("/track/group_track_ordinal").and_then(|value| value.as_u64()), Some(6));
-        assert_eq!(json.pointer("/sectors/ranges/0/first").and_then(|value| value.as_u64()), Some(10));
-        assert_eq!(json.pointer("/sectors/ranges/0/last").and_then(|value| value.as_u64()), Some(20));
-        assert_eq!(json.pointer("/sectors/aob_parts_touched/0/part_nr").and_then(|value| value.as_u64()), Some(1));
-        assert_eq!(json.pointer("/sectors/aob_parts_touched/0/touched_sector_count").and_then(|value| value.as_u64()), Some(11));
-        assert_eq!(json.pointer("/demux/mlp_packets").and_then(|value| value.as_u64()), Some(7));
-        assert_eq!(json.pointer("/demux/mlp_payload_bytes").and_then(|value| value.as_u64()), Some(12_345));
-        assert_eq!(json.pointer("/mlp/frame_count").and_then(|value| value.as_u64()), Some(100));
-        assert_eq!(json.pointer("/decoded/sample_rate").and_then(|value| value.as_u64()), Some(192_000));
-        assert_eq!(json.pointer("/duration_validation/expected_samples").and_then(|value| value.as_u64()), Some(192_000));
-        assert_eq!(json.pointer("/duration_validation/actual_samples").and_then(|value| value.as_u64()), Some(192_000));
-        assert_eq!(json.pointer("/duration_validation/drift_samples").and_then(|value| value.as_u64()), Some(0));
+        assert_eq!(
+            json.pointer("/source/bit_depth")
+                .and_then(|value| value.as_u64()),
+            Some(24)
+        );
+        assert_eq!(
+            json.pointer("/carrier/codec")
+                .and_then(|value| value.as_str()),
+            Some("pcm_s32le")
+        );
+        assert_eq!(
+            json.pointer("/carrier/bit_depth")
+                .and_then(|value| value.as_u64()),
+            Some(32)
+        );
+        assert_eq!(
+            json.pointer("/final_encode/resolved_bit_depth")
+                .and_then(|value| value.as_u64()),
+            Some(16)
+        );
+        assert_eq!(
+            json.pointer("/packet_metadata/first_cci")
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            json.pointer("/packet_metadata/cci_change_count")
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            json.pointer("/downmix/ifo_matrix")
+                .and_then(|value| value.as_u64()),
+            Some(3)
+        );
+        assert_eq!(
+            json.pointer("/downmix/applied_during_realization")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/source/channel_order/realized_lpcm_policy")
+                .and_then(|value| value.as_str()),
+            Some("preserve-dvd-audio-source-order")
+        );
+        assert_eq!(
+            json.pointer("/source/channel_order/dvd_audio_source_order")
+                .and_then(|value| value.as_str()),
+            Some("L,R")
+        );
+        assert_eq!(
+            json.pointer("/carrier/channel_order")
+                .and_then(|value| value.as_str()),
+            Some("L,R")
+        );
+        assert_eq!(
+            json.pointer("/schema").and_then(|value| value.as_str()),
+            Some("tonepoet.dvda.realized_audio_format.v6")
+        );
+        assert_eq!(
+            json.pointer("/support_boundaries/multi_format_ats/corpus_proof_required")
+                .and_then(|value| value.as_str()),
+            Some("TONEPOET_DVDA_PHASE3_REQUIRE_MULTIFORMAT_ATS_CORPUS=1")
+        );
+        assert_eq!(
+            json.pointer("/support_boundaries/samg_absolute/directory_tree_supported")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/volume/kind")
+                .and_then(|value| value.as_str()),
+            Some("directory")
+        );
+        assert_eq!(
+            json.pointer("/track/group_nr")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            json.pointer("/track/title_nr")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            json.pointer("/track/group_track_ordinal")
+                .and_then(|value| value.as_u64()),
+            Some(6)
+        );
+        assert_eq!(
+            json.pointer("/sectors/ranges/0/first")
+                .and_then(|value| value.as_u64()),
+            Some(10)
+        );
+        assert_eq!(
+            json.pointer("/sectors/ranges/0/last")
+                .and_then(|value| value.as_u64()),
+            Some(20)
+        );
+        assert_eq!(
+            json.pointer("/sectors/aob_parts_touched/0/part_nr")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            json.pointer("/sectors/aob_parts_touched/0/touched_sector_count")
+                .and_then(|value| value.as_u64()),
+            Some(11)
+        );
+        assert_eq!(
+            json.pointer("/demux/mlp_packets")
+                .and_then(|value| value.as_u64()),
+            Some(7)
+        );
+        assert_eq!(
+            json.pointer("/demux/mlp_payload_bytes")
+                .and_then(|value| value.as_u64()),
+            Some(12_345)
+        );
+        assert_eq!(
+            json.pointer("/mlp/frame_count")
+                .and_then(|value| value.as_u64()),
+            Some(100)
+        );
+        assert_eq!(
+            json.pointer("/decoded/sample_rate")
+                .and_then(|value| value.as_u64()),
+            Some(192_000)
+        );
+        assert_eq!(
+            json.pointer("/duration_validation/expected_samples")
+                .and_then(|value| value.as_u64()),
+            Some(192_000)
+        );
+        assert_eq!(
+            json.pointer("/duration_validation/actual_samples")
+                .and_then(|value| value.as_u64()),
+            Some(192_000)
+        );
+        assert_eq!(
+            json.pointer("/duration_validation/drift_samples")
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
     }
 
     #[test]
     fn dvd_audio_temp_files_are_randomized_within_the_requested_directory() {
         let temp = tempfile::tempdir().expect("DVD-Audio temp dir");
-        let (first_path, first_file) = create_unique_dvda_temp_file(
-            temp.path(),
-            ".dvda-track.",
-            ".tmp.mlp",
-        )
-        .expect("first unique temp file");
-        let (second_path, second_file) = create_unique_dvda_temp_file(
-            temp.path(),
-            ".dvda-track.",
-            ".tmp.mlp",
-        )
-        .expect("second unique temp file");
+        let (first_path, first_file) =
+            create_unique_dvda_temp_file(temp.path(), ".dvda-track.", ".tmp.mlp")
+                .expect("first unique temp file");
+        let (second_path, second_file) =
+            create_unique_dvda_temp_file(temp.path(), ".dvda-track.", ".tmp.mlp")
+                .expect("second unique temp file");
 
         drop(first_file);
         drop(second_file);
@@ -4057,12 +4475,8 @@ mod tests {
     #[test]
     fn dvd_audio_temp_guard_removes_active_artifact_on_error_path() {
         let temp = tempfile::tempdir().expect("DVD-Audio temp dir");
-        let (path, file) = create_unique_dvda_temp_file(
-            temp.path(),
-            ".dvda-track.",
-            ".tmp.mlp",
-        )
-        .expect("unique temp file");
+        let (path, file) = create_unique_dvda_temp_file(temp.path(), ".dvda-track.", ".tmp.mlp")
+            .expect("unique temp file");
         drop(file);
 
         {
@@ -4076,12 +4490,8 @@ mod tests {
     #[test]
     fn dvd_audio_temp_guard_disarm_transfers_cleanup_responsibility() {
         let temp = tempfile::tempdir().expect("DVD-Audio temp dir");
-        let (path, file) = create_unique_dvda_temp_file(
-            temp.path(),
-            ".dvda-track.",
-            ".tmp.wav",
-        )
-        .expect("unique temp file");
+        let (path, file) = create_unique_dvda_temp_file(temp.path(), ".dvda-track.", ".tmp.wav")
+            .expect("unique temp file");
         drop(file);
 
         {
@@ -4167,8 +4577,14 @@ mod tests {
         };
 
         assert_eq!(channel_count_from_source_audio(&source_audio), Some(6));
-        assert_eq!(source_audio_group_sample_rate(&source_audio, 1), Some(192_000));
-        assert_eq!(source_audio_group_sample_rate(&source_audio, 2), Some(96_000));
+        assert_eq!(
+            source_audio_group_sample_rate(&source_audio, 1),
+            Some(192_000)
+        );
+        assert_eq!(
+            source_audio_group_sample_rate(&source_audio, 2),
+            Some(96_000)
+        );
         assert_eq!(source_audio_group_bit_depth(&source_audio, 1), Some(24));
         assert_eq!(source_audio_group_channel_count(&source_audio, 2), Some(4));
     }
@@ -4176,7 +4592,9 @@ mod tests {
     #[test]
     fn dvda_track_realize_input_carries_ifo_bit_depth() {
         let source = TrackSourceRef::DvdaTrack {
-            volume_source: DvdaVolumeSourceRef::Directory { root: PathBuf::from("/tmp/disc") },
+            volume_source: DvdaVolumeSourceRef::Directory {
+                root: PathBuf::from("/tmp/disc"),
+            },
             sector_address_space: DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
             elementary_stream_kind_hint: None,
             group_nr: 1,
@@ -4208,7 +4626,11 @@ mod tests {
             expected_group2_bit_depth: None,
             expected_group1_channel_count: Some(2),
             expected_group2_channel_count: None,
-            sector_ranges: vec![DvdaSectorRangeRef { index_nr: 1, first: 0, last: 0 }],
+            sector_ranges: vec![DvdaSectorRangeRef {
+                index_nr: 1,
+                first: 0,
+                last: 0,
+            }],
             aob_files: vec![DvdaAobFileRef {
                 title_set_nr: 1,
                 part_nr: 1,
@@ -4273,8 +4695,9 @@ mod tests {
             ..DvdaDemuxStats::default()
         };
 
-        let err = validate_packet_stream_expectations(&stats, &input, ExpectedElementaryStreamKind::Mlp)
-            .expect_err("audio-format index mismatch should fail by default");
+        let err =
+            validate_packet_stream_expectations(&stats, &input, ExpectedElementaryStreamKind::Mlp)
+                .expect_err("audio-format index mismatch should fail by default");
         assert!(format!("{err}").contains("audio-fact validation failed"));
     }
 
@@ -4331,8 +4754,6 @@ mod tests {
         assert!(format!("{err}").contains("audio-fact validation failed"));
     }
 
-
-
     #[test]
     fn realization_audio_policy_controls_effective_downmix_policy() {
         let mut source = sample_dvda_track_source();
@@ -4356,7 +4777,10 @@ mod tests {
         .expect("realization audio policy should provide the effective realized downmix policy");
 
         assert_eq!(input.expected_channel_count, Some(2));
-        assert_eq!(input.dvda_downmix_policy, DvdaDownmixPolicy::FooInputDvdaCompatible);
+        assert_eq!(
+            input.dvda_downmix_policy,
+            DvdaDownmixPolicy::FooInputDvdaCompatible
+        );
         assert_eq!(input.mlp_expectation().channel_count, None);
         assert_eq!(input.wav_expectation().channel_count, Some(2));
     }
@@ -4402,11 +4826,14 @@ mod tests {
                 evidence_source: "MLP major-sync",
             });
         assert_eq!(source.channel_count, Some(6));
-        assert_eq!(source.with_downmix_policy(input.dvda_downmix_policy).channel_count, Some(2));
+        assert_eq!(
+            source
+                .with_downmix_policy(input.dvda_downmix_policy)
+                .channel_count,
+            Some(2)
+        );
 
-        let mlp_source_channel_count = inspection
-            .first_major_sync
-            .map(|info| info.channel_count);
+        let mlp_source_channel_count = inspection.first_major_sync.map(|info| info.channel_count);
         assert_eq!(mlp_source_channel_count, Some(6));
         let mut ffmpeg_args = Vec::new();
         append_downmix_ffmpeg_args(
@@ -4415,9 +4842,10 @@ mod tests {
             mlp_source_channel_count,
         )
         .expect("forced foo-compatible downmix must validate against the MLP carrier, not stereo presentation facts");
-        assert!(ffmpeg_args.iter().any(|arg| arg == FOO_INPUT_DVDA_COMPATIBLE_PAN_FILTER));
+        assert!(ffmpeg_args
+            .iter()
+            .any(|arg| arg == FOO_INPUT_DVDA_COMPATIBLE_PAN_FILTER));
     }
-
 
     #[test]
     fn foo_compatible_downmix_ffmpeg_args_use_explicit_pan_filter() {
@@ -4457,12 +4885,8 @@ mod tests {
     #[test]
     fn ffmpeg_default_downmix_ffmpeg_args_use_ac_2() {
         let mut args = vec!["-map".to_string(), "0:a:0".to_string()];
-        append_downmix_ffmpeg_args(
-            &mut args,
-            DvdaDownmixPolicy::FfmpegDefault,
-            Some(6),
-        )
-        .expect("ffmpeg default downmix should not require a 5.1-specific pan matrix");
+        append_downmix_ffmpeg_args(&mut args, DvdaDownmixPolicy::FfmpegDefault, Some(6))
+            .expect("ffmpeg default downmix should not require a 5.1-specific pan matrix");
 
         assert_eq!(
             args,
@@ -4523,13 +4947,19 @@ mod tests {
             carrier.channel_count,
         )
         .expect("forced foo-compatible downmix must validate against inspected MLP carrier channels, not IFO presentation channels");
-        assert_eq!(args, vec!["-af".to_string(), FOO_INPUT_DVDA_COMPATIBLE_PAN_FILTER.to_string()]);
+        assert_eq!(
+            args,
+            vec![
+                "-af".to_string(),
+                FOO_INPUT_DVDA_COMPATIBLE_PAN_FILTER.to_string()
+            ]
+        );
 
-        let final_expectation = carrier.with_downmix_policy(DvdaDownmixPolicy::FooInputDvdaCompatible);
+        let final_expectation =
+            carrier.with_downmix_policy(DvdaDownmixPolicy::FooInputDvdaCompatible);
         assert_eq!(final_expectation.channel_count, Some(2));
         assert_eq!(final_expectation.channel_assignment_code, None);
     }
-
 
     #[test]
     fn samg_absolute_realize_input_allows_empty_aob_inventory() {
@@ -4569,7 +4999,11 @@ mod tests {
             expected_group2_bit_depth: None,
             expected_group1_channel_count: Some(2),
             expected_group2_channel_count: None,
-            sector_ranges: vec![DvdaSectorRangeRef { index_nr: 1, first: 64, last: 65 }],
+            sector_ranges: vec![DvdaSectorRangeRef {
+                index_nr: 1,
+                first: 64,
+                last: 65,
+            }],
             aob_files: Vec::new(),
         };
 
@@ -4580,7 +5014,10 @@ mod tests {
         )
         .expect("disc-absolute tracks should not require ATS AOB inventory");
 
-        assert_eq!(input.sector_address_space, DvdaSectorAddressSpace::SamgAbsolute);
+        assert_eq!(
+            input.sector_address_space,
+            DvdaSectorAddressSpace::SamgAbsolute
+        );
         assert!(input.aob_files.is_empty());
     }
 
@@ -4666,7 +5103,9 @@ mod tests {
 
     #[tokio::test]
     async fn phase3_corpus_extracts_an_aob_boundary_crossing_track() {
-        if !tool_available_or_skip(HDAD2009, "ffmpeg") || !tool_available_or_skip(HDAD2009, "ffprobe") {
+        if !tool_available_or_skip(HDAD2009, "ffmpeg")
+            || !tool_available_or_skip(HDAD2009, "ffprobe")
+        {
             return;
         }
 
@@ -4702,7 +5141,11 @@ mod tests {
                     )
                 });
 
-            if let Some(track) = prepared.tracks.iter().find(|track| track_crosses_aob_part_boundary(track)) {
+            if let Some(track) = prepared
+                .tracks
+                .iter()
+                .find(|track| track_crosses_aob_part_boundary(track))
+            {
                 validate_phase3_corpus_track(disc, track);
                 let expectation = DvdaSourceAudioExpectation::from_prepared_track_and_source(
                     Some(track),
@@ -4725,7 +5168,11 @@ mod tests {
                         disc.label, track.ordinal
                     )
                 });
-                assert!(wav_path.is_file(), "{} boundary-crossing WAV exists", disc.label);
+                assert!(
+                    wav_path.is_file(),
+                    "{} boundary-crossing WAV exists",
+                    disc.label
+                );
                 let probe = probe_dvda_wav(&wav_path, &runner, &cancel, None)
                     .await
                     .unwrap_or_else(|err| {
@@ -4764,7 +5211,6 @@ mod tests {
         .await;
     }
 
-
     async fn exercise_extended_corpus_track<F>(
         coverage_label: &'static str,
         strict_env: &'static str,
@@ -4778,7 +5224,8 @@ mod tests {
             return;
         }
 
-        let Some(iso_paths) = find_all_corpus_isos_or_skip_extended(coverage_label, strict_env) else {
+        let Some(iso_paths) = find_all_corpus_isos_or_skip_extended(coverage_label, strict_env)
+        else {
             return;
         };
 
@@ -4856,8 +5303,14 @@ mod tests {
                     Some("pcm_s32le"),
                     "DVD-Audio extended corpus {coverage_label} WAV codec"
                 );
-                assert!(probe.sample_rate > 0, "DVD-Audio extended corpus {coverage_label} sample rate");
-                assert!(probe.channels > 0, "DVD-Audio extended corpus {coverage_label} channel count");
+                assert!(
+                    probe.sample_rate > 0,
+                    "DVD-Audio extended corpus {coverage_label} sample rate"
+                );
+                assert!(
+                    probe.channels > 0,
+                    "DVD-Audio extended corpus {coverage_label} channel count"
+                );
                 assert!(
                     probe.samples.unwrap_or_default() > 0,
                     "DVD-Audio extended corpus {coverage_label} decoded sample count"
@@ -4888,8 +5341,15 @@ mod tests {
         }
 
         matches!(
-            track.metadata.extra.get("dvda_audio_format_resolution").map(String::as_str),
-            Some("track_type_audio_format_index" | "multiple_present_formats_unknown_until_aob_demux")
+            track
+                .metadata
+                .extra
+                .get("dvda_audio_format_resolution")
+                .map(String::as_str),
+            Some(
+                "track_type_audio_format_index"
+                    | "multiple_present_formats_unknown_until_aob_demux"
+            )
         )
     }
 
@@ -4947,11 +5407,31 @@ mod tests {
             iso_path.display()
         );
         let track = prepared.tracks.first().expect("selected track exists");
-        assert_eq!(track.sample_rate, Some(192_000), "{} IFO sample rate", disc.label);
-        assert_eq!(track.source_audio.primary_sample_rate, Some(192_000), "{} typed source sample rate", disc.label);
+        assert_eq!(
+            track.sample_rate,
+            Some(192_000),
+            "{} IFO sample rate",
+            disc.label
+        );
+        assert_eq!(
+            track.source_audio.primary_sample_rate,
+            Some(192_000),
+            "{} typed source sample rate",
+            disc.label
+        );
         assert_eq!(track.bit_depth, Some(24), "{} IFO bit depth", disc.label);
-        assert_eq!(track.source_audio.bit_depth, Some(24), "{} typed source bit depth", disc.label);
-        assert_eq!(source_audio_channels(track), Some(2), "{} IFO channel count", disc.label);
+        assert_eq!(
+            track.source_audio.bit_depth,
+            Some(24),
+            "{} typed source bit depth",
+            disc.label
+        );
+        assert_eq!(
+            source_audio_channels(track),
+            Some(2),
+            "{} IFO channel count",
+            disc.label
+        );
 
         let TrackSourceRef::DvdaTrack {
             sector_address_space,
@@ -4971,30 +5451,85 @@ mod tests {
             ..
         } = &track.source_ref
         else {
-            panic!("{} track 1 should materialize as TrackSourceRef::DvdaTrack", disc.label);
+            panic!(
+                "{} track 1 should materialize as TrackSourceRef::DvdaTrack",
+                disc.label
+            );
         };
         assert!(
-            matches!(sector_address_space, DvdaSectorAddressSpace::AtsAobRelative { .. }),
+            matches!(
+                sector_address_space,
+                DvdaSectorAddressSpace::AtsAobRelative { .. }
+            ),
             "{} track 1 should use ATS-relative AOB sector reads",
             disc.label
         );
-        assert!(!sector_ranges.is_empty(), "{} track 1 sector ranges", disc.label);
-        assert!(!aob_files.is_empty(), "{} track 1 AOB inventory", disc.label);
-        assert!(*len_in_pts > 0, "{} track 1 should carry PTS duration", disc.label);
-        assert_eq!(*expected_sample_rate, Some(192_000), "{} source-ref expected sample rate", disc.label);
-        assert_eq!(*expected_channel_count, Some(2), "{} source-ref expected channel count", disc.label);
-        assert_eq!(*expected_bit_depth, Some(24), "{} source-ref expected bit depth", disc.label);
+        assert!(
+            !sector_ranges.is_empty(),
+            "{} track 1 sector ranges",
+            disc.label
+        );
+        assert!(
+            !aob_files.is_empty(),
+            "{} track 1 AOB inventory",
+            disc.label
+        );
+        assert!(
+            *len_in_pts > 0,
+            "{} track 1 should carry PTS duration",
+            disc.label
+        );
+        assert_eq!(
+            *expected_sample_rate,
+            Some(192_000),
+            "{} source-ref expected sample rate",
+            disc.label
+        );
+        assert_eq!(
+            *expected_channel_count,
+            Some(2),
+            "{} source-ref expected channel count",
+            disc.label
+        );
+        assert_eq!(
+            *expected_bit_depth,
+            Some(24),
+            "{} source-ref expected bit depth",
+            disc.label
+        );
 
-        let expectation = DvdaSourceAudioExpectation::from_prepared_track_and_source(Some(&track), &track.source_ref);
-        let wav_path = realize_dvda_track(&track.source_ref, expectation, DvdaRealizationAudioPolicy::unknown(), &staging, &runner, &cancel, None, None)
-            .await
-            .unwrap_or_else(|err| panic!("{} track 1 MLP to WAV realization failed: {err}", disc.label));
+        let expectation = DvdaSourceAudioExpectation::from_prepared_track_and_source(
+            Some(&track),
+            &track.source_ref,
+        );
+        let wav_path = realize_dvda_track(
+            &track.source_ref,
+            expectation,
+            DvdaRealizationAudioPolicy::unknown(),
+            &staging,
+            &runner,
+            &cancel,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "{} track 1 MLP to WAV realization failed: {err}",
+                disc.label
+            )
+        });
         assert!(wav_path.is_file(), "{} realized WAV exists", disc.label);
 
         let probe = probe_dvda_wav(&wav_path, &runner, &cancel, None)
             .await
             .unwrap_or_else(|err| panic!("{} realized WAV probe failed: {err}", disc.label));
-        assert_eq!(probe.codec_name.as_deref(), Some("pcm_s32le"), "{} WAV codec", disc.label);
+        assert_eq!(
+            probe.codec_name.as_deref(),
+            Some("pcm_s32le"),
+            "{} WAV codec",
+            disc.label
+        );
         assert_eq!(probe.sample_rate, 192_000, "{} WAV sample rate", disc.label);
         assert_eq!(probe.channels, 2, "{} WAV channels", disc.label);
 
@@ -5008,11 +5543,27 @@ mod tests {
             disc.label
         );
 
-        let expectation = DvdaSourceAudioExpectation::from_prepared_track_and_source(Some(&track), &track.source_ref);
-        let second_wav_path = realize_dvda_track(&track.source_ref, expectation, DvdaRealizationAudioPolicy::unknown(), &staging, &runner, &cancel, None, None)
-            .await
-            .unwrap_or_else(|err| panic!("{} second realization failed: {err}", disc.label));
-        assert_eq!(second_wav_path, wav_path, "{} realization should reuse the staged WAV", disc.label);
+        let expectation = DvdaSourceAudioExpectation::from_prepared_track_and_source(
+            Some(&track),
+            &track.source_ref,
+        );
+        let second_wav_path = realize_dvda_track(
+            &track.source_ref,
+            expectation,
+            DvdaRealizationAudioPolicy::unknown(),
+            &staging,
+            &runner,
+            &cancel,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{} second realization failed: {err}", disc.label));
+        assert_eq!(
+            second_wav_path, wav_path,
+            "{} realization should reuse the staged WAV",
+            disc.label
+        );
     }
 
     async fn run_phase3_corpus_all_tracks_for_disc(disc: CorpusDisc) {
@@ -5107,7 +5658,11 @@ mod tests {
         }
     }
 
-    fn dvda_corpus_request(container: PathBuf, output_root: PathBuf, log_root: PathBuf) -> PipelineRequest {
+    fn dvda_corpus_request(
+        container: PathBuf,
+        output_root: PathBuf,
+        log_root: PathBuf,
+    ) -> PipelineRequest {
         let mut selected_tracks = BTreeSet::new();
         selected_tracks.insert(1);
         dvda_corpus_request_for_selection(
@@ -5170,11 +5725,14 @@ mod tests {
         }
     }
 
-    fn validate_phase3_corpus_track(
-        disc: CorpusDisc,
-        track: &super::super::types::PreparedTrack,
-    ) {
-        assert_eq!(track.sample_rate, Some(192_000), "{} track {} IFO sample rate", disc.label, track.ordinal);
+    fn validate_phase3_corpus_track(disc: CorpusDisc, track: &super::super::types::PreparedTrack) {
+        assert_eq!(
+            track.sample_rate,
+            Some(192_000),
+            "{} track {} IFO sample rate",
+            disc.label,
+            track.ordinal
+        );
         assert_eq!(
             track.source_audio.primary_sample_rate,
             Some(192_000),
@@ -5182,7 +5740,13 @@ mod tests {
             disc.label,
             track.ordinal
         );
-        assert_eq!(track.bit_depth, Some(24), "{} track {} IFO bit depth", disc.label, track.ordinal);
+        assert_eq!(
+            track.bit_depth,
+            Some(24),
+            "{} track {} IFO bit depth",
+            disc.label,
+            track.ordinal
+        );
         assert_eq!(
             track.source_audio.bit_depth,
             Some(24),
@@ -5190,7 +5754,13 @@ mod tests {
             disc.label,
             track.ordinal
         );
-        assert_eq!(source_audio_channels(track), Some(2), "{} track {} IFO channel count", disc.label, track.ordinal);
+        assert_eq!(
+            source_audio_channels(track),
+            Some(2),
+            "{} track {} IFO channel count",
+            disc.label,
+            track.ordinal
+        );
 
         let TrackSourceRef::DvdaTrack {
             sector_address_space,
@@ -5216,24 +5786,98 @@ mod tests {
             );
         };
         assert!(
-            matches!(sector_address_space, DvdaSectorAddressSpace::AtsAobRelative { .. }),
+            matches!(
+                sector_address_space,
+                DvdaSectorAddressSpace::AtsAobRelative { .. }
+            ),
             "{} track {} should use ATS-relative AOB sector reads",
             disc.label,
             track.ordinal
         );
-        assert!(!sector_ranges.is_empty(), "{} track {} sector ranges", disc.label, track.ordinal);
-        assert!(!aob_files.is_empty(), "{} track {} AOB inventory", disc.label, track.ordinal);
-        assert!(*len_in_pts > 0, "{} track {} should carry PTS duration", disc.label, track.ordinal);
-        assert_eq!(*expected_sample_rate, Some(192_000), "{} track {} source-ref expected sample rate", disc.label, track.ordinal);
-        assert_eq!(*expected_channel_count, Some(2), "{} track {} source-ref expected channel count", disc.label, track.ordinal);
-        assert_eq!(*expected_bit_depth, Some(24), "{} track {} source-ref expected bit depth", disc.label, track.ordinal);
-        assert!(expected_channel_assignment_code.is_some(), "{} track {} source-ref channel assignment code", disc.label, track.ordinal);
-        assert_eq!(*expected_group1_sample_rate, Some(192_000), "{} track {} source-ref group 1 sample rate", disc.label, track.ordinal);
-        assert_eq!(*expected_group1_bit_depth, Some(24), "{} track {} source-ref group 1 bit depth", disc.label, track.ordinal);
-        assert_eq!(*expected_group1_channel_count, Some(2), "{} track {} source-ref group 1 channels", disc.label, track.ordinal);
-        assert!(expected_group2_sample_rate.is_none(), "{} track {} source-ref group 2 sample rate should be absent for stereo corpus", disc.label, track.ordinal);
-        assert!(expected_group2_bit_depth.is_none(), "{} track {} source-ref group 2 bit depth should be absent for stereo corpus", disc.label, track.ordinal);
-        assert!(expected_group2_channel_count.is_none(), "{} track {} source-ref group 2 channels should be absent for stereo corpus", disc.label, track.ordinal);
+        assert!(
+            !sector_ranges.is_empty(),
+            "{} track {} sector ranges",
+            disc.label,
+            track.ordinal
+        );
+        assert!(
+            !aob_files.is_empty(),
+            "{} track {} AOB inventory",
+            disc.label,
+            track.ordinal
+        );
+        assert!(
+            *len_in_pts > 0,
+            "{} track {} should carry PTS duration",
+            disc.label,
+            track.ordinal
+        );
+        assert_eq!(
+            *expected_sample_rate,
+            Some(192_000),
+            "{} track {} source-ref expected sample rate",
+            disc.label,
+            track.ordinal
+        );
+        assert_eq!(
+            *expected_channel_count,
+            Some(2),
+            "{} track {} source-ref expected channel count",
+            disc.label,
+            track.ordinal
+        );
+        assert_eq!(
+            *expected_bit_depth,
+            Some(24),
+            "{} track {} source-ref expected bit depth",
+            disc.label,
+            track.ordinal
+        );
+        assert!(
+            expected_channel_assignment_code.is_some(),
+            "{} track {} source-ref channel assignment code",
+            disc.label,
+            track.ordinal
+        );
+        assert_eq!(
+            *expected_group1_sample_rate,
+            Some(192_000),
+            "{} track {} source-ref group 1 sample rate",
+            disc.label,
+            track.ordinal
+        );
+        assert_eq!(
+            *expected_group1_bit_depth,
+            Some(24),
+            "{} track {} source-ref group 1 bit depth",
+            disc.label,
+            track.ordinal
+        );
+        assert_eq!(
+            *expected_group1_channel_count,
+            Some(2),
+            "{} track {} source-ref group 1 channels",
+            disc.label,
+            track.ordinal
+        );
+        assert!(
+            expected_group2_sample_rate.is_none(),
+            "{} track {} source-ref group 2 sample rate should be absent for stereo corpus",
+            disc.label,
+            track.ordinal
+        );
+        assert!(
+            expected_group2_bit_depth.is_none(),
+            "{} track {} source-ref group 2 bit depth should be absent for stereo corpus",
+            disc.label,
+            track.ordinal
+        );
+        assert!(
+            expected_group2_channel_count.is_none(),
+            "{} track {} source-ref group 2 channels should be absent for stereo corpus",
+            disc.label,
+            track.ordinal
+        );
     }
 
     fn validate_phase3_corpus_wav_probe(
@@ -5241,16 +5885,36 @@ mod tests {
         track: &super::super::types::PreparedTrack,
         probe: &DvdaWavProbe,
     ) {
-        assert_eq!(probe.codec_name.as_deref(), Some("pcm_s32le"), "{} track {} WAV codec", disc.label, track.ordinal);
-        assert_eq!(probe.sample_rate, 192_000, "{} track {} WAV sample rate", disc.label, track.ordinal);
-        assert_eq!(probe.channels, 2, "{} track {} WAV channels", disc.label, track.ordinal);
+        assert_eq!(
+            probe.codec_name.as_deref(),
+            Some("pcm_s32le"),
+            "{} track {} WAV codec",
+            disc.label,
+            track.ordinal
+        );
+        assert_eq!(
+            probe.sample_rate, 192_000,
+            "{} track {} WAV sample rate",
+            disc.label, track.ordinal
+        );
+        assert_eq!(
+            probe.channels, 2,
+            "{} track {} WAV channels",
+            disc.label, track.ordinal
+        );
 
         let TrackSourceRef::DvdaTrack { len_in_pts, .. } = &track.source_ref else {
-            panic!("{} track {} should materialize as TrackSourceRef::DvdaTrack", disc.label, track.ordinal);
+            panic!(
+                "{} track {} should materialize as TrackSourceRef::DvdaTrack",
+                disc.label, track.ordinal
+            );
         };
-        let actual_samples = probe
-            .samples
-            .unwrap_or_else(|| panic!("{} track {} ffprobe should report WAV duration", disc.label, track.ordinal));
+        let actual_samples = probe.samples.unwrap_or_else(|| {
+            panic!(
+                "{} track {} ffprobe should report WAV duration",
+                disc.label, track.ordinal
+            )
+        });
         let expected_samples = pts_to_samples(*len_in_pts, 192_000);
         assert!(
             actual_samples.abs_diff(expected_samples) <= 192_000,
@@ -5307,7 +5971,11 @@ mod tests {
         }
     }
 
-    fn tool_available_or_skip_extended(label: &'static str, strict_env: &'static str, tool: &str) -> bool {
+    fn tool_available_or_skip_extended(
+        label: &'static str,
+        strict_env: &'static str,
+        tool: &str,
+    ) -> bool {
         if executable_on_path(tool) {
             true
         } else {
@@ -5370,7 +6038,11 @@ mod tests {
         }
     }
 
-    fn skip_or_panic_extended(label: &'static str, strict_env: &'static str, reason: String) -> bool {
+    fn skip_or_panic_extended(
+        label: &'static str,
+        strict_env: &'static str,
+        reason: String,
+    ) -> bool {
         if extended_corpus_strict(strict_env) {
             panic!("DVD-Audio extended corpus test for {label} cannot run: {reason}");
         }
@@ -5482,9 +6154,15 @@ mod tests {
 
     fn skip_or_panic(disc: CorpusDisc, reason: String) -> bool {
         if corpus_strict() {
-            panic!("DVD-Audio Phase 3 corpus test for {} cannot run: {reason}", disc.label);
+            panic!(
+                "DVD-Audio Phase 3 corpus test for {} cannot run: {reason}",
+                disc.label
+            );
         }
-        eprintln!("skipping DVD-Audio Phase 3 corpus test for {}: {reason}", disc.label);
+        eprintln!(
+            "skipping DVD-Audio Phase 3 corpus test for {}: {reason}",
+            disc.label
+        );
         false
     }
 
@@ -5495,7 +6173,13 @@ mod tests {
     fn corpus_slug(label: &str) -> String {
         label
             .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
             .collect()
     }
 
@@ -5552,9 +6236,11 @@ mod tests {
         })();
 
         assert!(result.is_err());
-        assert!(out.is_empty(), "mixed-sector semantic failure must not commit payload bytes");
+        assert!(
+            out.is_empty(),
+            "mixed-sector semantic failure must not commit payload bytes"
+        );
     }
-
 
     #[test]
     fn materialized_disc_absolute_stream_hint_takes_precedence_over_per_track_probe() {
@@ -5569,6 +6255,32 @@ mod tests {
 
         input.sector_address_space = DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 };
         assert_eq!(materialized_stream_hint_for_track(&input), None);
+    }
+
+    #[test]
+    fn hinted_disc_absolute_missing_pack_sector_is_skipped() {
+        let mut input = sample_dvda_track_realize_input();
+        input.sector_address_space = DvdaSectorAddressSpace::DiscAbsolute { title_set_nr: 2 };
+        input.elementary_stream_kind_hint = Some(DvdaElementaryStreamKind::Mlp);
+        let sector = [0_u8; DVD_SECTOR_SIZE];
+
+        let packets = parse_track_sector_private_stream_1_packets(
+            &input,
+            Some(ExpectedElementaryStreamKind::Mlp),
+            &sector,
+            1_684_955,
+        )
+        .expect(
+            "hinted disc-absolute non-pack sectors should be treated as sparse raw VOB padding",
+        );
+        assert!(packets.is_none());
+
+        input.sector_address_space = DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 };
+        let err = parse_track_sector_private_stream_1_packets(&input, None, &sector, 42)
+            .expect_err("normal ATS-relative sectors must still reject missing pack headers");
+        assert!(err
+            .to_string()
+            .contains("does not start with MPEG-PS pack header"));
     }
 
     #[test]
@@ -5616,7 +6328,10 @@ mod tests {
 
         let packets = packets_matching_stream_hint(&packets, ExpectedElementaryStreamKind::Mlp, 42);
         assert_eq!(packets.len(), 1);
-        assert!(matches!(packets[0].sub_header.kind(), DvdaSubstreamKind::Mlp));
+        assert!(matches!(
+            packets[0].sub_header.kind(),
+            DvdaSubstreamKind::Mlp
+        ));
 
         let mut out = Vec::new();
         let sector_kind = classify_sector_elementary_stream(
@@ -5660,7 +6375,9 @@ mod tests {
         })();
 
         assert!(result.is_err());
-        assert!(out.is_empty(), "cross-sector semantic failure must not commit payload bytes");
+        assert!(
+            out.is_empty(),
+            "cross-sector semantic failure must not commit payload bytes"
+        );
     }
-
 }

@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 mod materializer_dvda_metabase;
 
 use self::materializer_dvda_metabase::DvdaTrackMetadataKeys;
+#[cfg(test)]
+use super::dvda_demux::DVD_SECTOR_SIZE;
 use super::errors::{MaterializeError, SourceDetectError};
 use super::reporter::PipelineReporter;
 use super::stages::Materializer;
@@ -25,10 +27,11 @@ use super::tool::ToolRunner;
 use super::types::*;
 use crate::disc::dvda_utils::probe_group_aob_format_with_path;
 use crate::tui::dvda::{
-    parse_dvda_volume, AobFileEntry, AudioAttributes, AudioChapter, AudioTitle,
-    refine_copy_protection_from_aob_probe, ChannelAssignment, ChannelFormat, CopyProtectionSource, DirectoryDvdaVolume, DvdaDisc, DvdaError, DvdaGroup,
-    DvdaFile, DvdaVolume, GroupCorrelation, Iso9660DvdaVolume, IsoUdfDvdaVolume, SamgTrack, SamgTrackRef,
-    SamgZone, TitleRef, TitleRefKind, TitleSet,
+    parse_dvda_volume, refine_copy_protection_from_aob_probe, AobFileEntry, AudioAttributes,
+    AudioChapter, AudioTitle, ChannelAssignment, ChannelFormat, CopyProtectionSource,
+    DirectoryDvdaVolume, DvdaDisc, DvdaError, DvdaFile, DvdaGroup, DvdaVolume, GroupCorrelation,
+    Iso9660DvdaVolume, IsoUdfDvdaVolume, SamgTrack, SamgTrackRef, SamgZone, TitleRef, TitleRefKind,
+    TitleSet,
 };
 use crate::tui::dvda_metabase::{self, DvdaMetabase, LoadedDvdaMetabase};
 
@@ -36,8 +39,8 @@ const DVDA_AMG_MAGIC: &[u8] = b"DVDAUDIO-AMG";
 const PTS_PER_SECOND: u64 = 90_000;
 #[allow(dead_code)]
 const DVD_SECTOR_SIZE_U64: u64 = 2048;
-#[allow(dead_code)]
-const DVD_SECTOR_SIZE_USIZE: usize = 2048;
+#[cfg(test)]
+const DVD_SECTOR_SIZE_USIZE: usize = DVD_SECTOR_SIZE;
 const RAW_DVDA_MAGIC_SCAN_CHUNK: usize = 1024 * 1024;
 
 pub struct DvdaAudioMaterializer;
@@ -157,7 +160,8 @@ fn materialize_prepared_source(
     refine_copy_protection_from_aob_probe(volume, &mut disc, req.source.dvda_assume_decrypted)
         .map_err(dvda_error_to_materialize)?;
 
-    let loaded_metabase = materializer_dvda_metabase::load_for_materializer(volume, &req.container)?;
+    let loaded_metabase =
+        materializer_dvda_metabase::load_for_materializer(volume, &req.container)?;
     let metabase = loaded_metabase.as_ref().map(|loaded| &loaded.metabase);
 
     let group_selection = req.source.effective_dvda_group_selection();
@@ -228,7 +232,10 @@ fn prepared_source(
     let mut tool_versions = BTreeMap::new();
     tool_versions.insert("dvda-phase1".to_string(), "in-process".to_string());
     if loaded_metabase.is_some() {
-        tool_versions.insert("dvda-metabase".to_string(), "foo_input_dvda-compatible".to_string());
+        tool_versions.insert(
+            "dvda-metabase".to_string(),
+            "foo_input_dvda-compatible".to_string(),
+        );
     }
 
     PreparedSource {
@@ -248,9 +255,13 @@ fn prepared_source(
 fn dvda_copy_protection_block(disc: &DvdaDisc) -> DvdaCopyProtectionBlock {
     let evidence_source = match disc.copy_protection.source {
         CopyProtectionSource::MkbPresence => DvdaCopyProtectionEvidenceSource::DvdaudioMkb,
-        CopyProtectionSource::MkbPresentAobProbeReadable => DvdaCopyProtectionEvidenceSource::AobMpegPsProbe,
+        CopyProtectionSource::MkbPresentAobProbeReadable => {
+            DvdaCopyProtectionEvidenceSource::AobMpegPsProbe
+        }
         CopyProtectionSource::AobProbeNoMpegPs => DvdaCopyProtectionEvidenceSource::AobMpegPsProbe,
-        CopyProtectionSource::AssumeDecryptedOverride => DvdaCopyProtectionEvidenceSource::UserOverride,
+        CopyProtectionSource::AssumeDecryptedOverride => {
+            DvdaCopyProtectionEvidenceSource::UserOverride
+        }
         CopyProtectionSource::NotDetected => DvdaCopyProtectionEvidenceSource::Unknown,
     };
     let evidence_filename = if disc.copy_protection.mkb_present {
@@ -278,13 +289,19 @@ fn dvda_copy_protection_block(disc: &DvdaDisc) -> DvdaCopyProtectionBlock {
     }
 }
 
-fn mark_tracks_blocked_for_copy_protection(tracks: &mut [PreparedTrack], block: &DvdaCopyProtectionBlock) {
+fn mark_tracks_blocked_for_copy_protection(
+    tracks: &mut [PreparedTrack],
+    block: &DvdaCopyProtectionBlock,
+) {
     for track in tracks {
-        track.metadata.extra.insert("tonepoet_blocked".to_string(), "true".to_string());
         track
             .metadata
             .extra
-            .insert("tonepoet_block_reason".to_string(), "copy_protection".to_string());
+            .insert("tonepoet_blocked".to_string(), "true".to_string());
+        track.metadata.extra.insert(
+            "tonepoet_block_reason".to_string(),
+            "copy_protection".to_string(),
+        );
         track.metadata.extra.insert(
             "dvda_copy_protection_scheme".to_string(),
             "CPPM".to_string(),
@@ -314,11 +331,14 @@ fn mark_tracks_blocked_for_copy_protection(tracks: &mut [PreparedTrack], block: 
     }
 }
 
-
-fn open_dvda_volume_for_request(req: &PipelineRequest) -> Result<PreparedDvdaVolume, MaterializeError> {
-    let detection = detect_dvda_source(req).map_err(|err| MaterializeError::Parse(format!(
-        "DVD-Audio source detection failed before materialization: {err}"
-    )))?;
+fn open_dvda_volume_for_request(
+    req: &PipelineRequest,
+) -> Result<PreparedDvdaVolume, MaterializeError> {
+    let detection = detect_dvda_source(req).map_err(|err| {
+        MaterializeError::Parse(format!(
+            "DVD-Audio source detection failed before materialization: {err}"
+        ))
+    })?;
     open_dvda_volume_with_detection(&req.container, detection)
 }
 
@@ -374,7 +394,9 @@ fn open_dvda_iso_volume_with_backend(
     match backend {
         DvdaIsoBackend::Udf => {
             let volume = IsoUdfDvdaVolume::open(path).map_err(dvda_error_to_materialize)?;
-            if !file_in_volume_starts_with_magic(&volume, "AUDIO_TS.IFO", DVDA_AMG_MAGIC).map_err(dvda_error_to_materialize)? {
+            if !file_in_volume_starts_with_magic(&volume, "AUDIO_TS.IFO", DVDA_AMG_MAGIC)
+                .map_err(dvda_error_to_materialize)?
+            {
                 return Err(MaterializeError::Parse(format!(
                     "UDF AUDIO_TS/AUDIO_TS.IFO does not start with DVDAUDIO-AMG: {}",
                     path.display()
@@ -390,7 +412,9 @@ fn open_dvda_iso_volume_with_backend(
         }
         DvdaIsoBackend::Iso9660Bridge => {
             let volume = Iso9660DvdaVolume::open(path).map_err(dvda_error_to_materialize)?;
-            if !file_in_volume_starts_with_magic(&volume, "AUDIO_TS.IFO", DVDA_AMG_MAGIC).map_err(dvda_error_to_materialize)? {
+            if !file_in_volume_starts_with_magic(&volume, "AUDIO_TS.IFO", DVDA_AMG_MAGIC)
+                .map_err(dvda_error_to_materialize)?
+            {
                 return Err(MaterializeError::Parse(format!(
                     "ISO9660 AUDIO_TS/AUDIO_TS.IFO does not start with DVDAUDIO-AMG: {}",
                     path.display()
@@ -473,7 +497,9 @@ fn file_in_volume_starts_with_magic<V: DvdaVolume + ?Sized>(
         Err(err) => return Err(err),
     };
     let mut buf = vec![0_u8; magic.len()];
-    let read = file.read(&mut buf).map_err(|source| DvdaError::io(name, source))?;
+    let read = file
+        .read(&mut buf)
+        .map_err(|source| DvdaError::io(name, source))?;
     Ok(read == magic.len() && buf == magic)
 }
 
@@ -534,7 +560,9 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn has_extension(path: &Path, ext: &str) -> bool {
@@ -585,10 +613,10 @@ fn select_groups<'a>(
         }
         DvdaGroupSelection::All => Ok(disc.groups.iter().collect()),
         DvdaGroupSelection::PreferStereo => Ok(vec![
-            preferred_stereo_group(disc).unwrap_or(default_group(disc)?),
+            preferred_stereo_group(disc).unwrap_or(default_group(disc)?)
         ]),
         DvdaGroupSelection::PreferMultichannel => Ok(vec![
-            preferred_multichannel_group(disc).unwrap_or(default_group(disc)?),
+            preferred_multichannel_group(disc).unwrap_or(default_group(disc)?)
         ]),
         DvdaGroupSelection::PreferHighestResolution => Ok(vec![
             preferred_highest_resolution_group(disc).unwrap_or(default_group(disc)?),
@@ -601,7 +629,9 @@ fn default_group(disc: &DvdaDisc) -> Result<&DvdaGroup, MaterializeError> {
         .iter()
         .find(|group| group.group_nr == 1)
         .or_else(|| disc.groups.first())
-        .ok_or_else(|| MaterializeError::Parse("DVD-Audio disc exposes no audio groups".to_string()))
+        .ok_or_else(|| {
+            MaterializeError::Parse("DVD-Audio disc exposes no audio groups".to_string())
+        })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -617,10 +647,8 @@ impl GroupAudioProfile {
             self.max_channels,
             assignment.and_then(|value| format.total_channels(Some(value))),
         );
-        self.primary_sample_rate = max_option(
-            self.primary_sample_rate,
-            primary_sample_rate(format),
-        );
+        self.primary_sample_rate =
+            max_option(self.primary_sample_rate, primary_sample_rate(format));
         self.bit_depth = max_option(self.bit_depth, primary_bit_depth(format));
     }
 
@@ -646,8 +674,8 @@ fn preferred_stereo_group<'a>(disc: &'a DvdaDisc) -> Option<&'a DvdaGroup> {
         .iter()
         .filter_map(|group| {
             let profile = group_audio_profile(disc, group);
-            let is_stereo_presentation = profile.max_channels == Some(2)
-                || group_is_authored_stereo_downmix(disc, group);
+            let is_stereo_presentation =
+                profile.max_channels == Some(2) || group_is_authored_stereo_downmix(disc, group);
             is_stereo_presentation.then_some((group, profile.ranking_key()))
         })
         .max_by_key(|(_, key)| *key)
@@ -788,7 +816,11 @@ fn authored_stereo_downmix_source_label(
 
         let sibling_profile = group_audio_profile(disc, sibling);
         if matches!(sibling_profile.max_channels, Some(channels) if channels > 2) {
-            return Some(multichannel_group_label(disc, sibling, sibling_profile.max_channels));
+            return Some(multichannel_group_label(
+                disc,
+                sibling,
+                sibling_profile.max_channels,
+            ));
         }
     }
 
@@ -834,12 +866,135 @@ fn existing_aob_file_refs(title_set: &TitleSet) -> Vec<DvdaAobFileRef> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct SamgSectorCorrelation<'a> {
+    disc_absolute_base: u32,
+    tracks: Vec<&'a SamgTrack>,
+}
+
+impl<'a> SamgSectorCorrelation<'a> {
+    fn track_for_chapter_index(&self, chapter_index: usize) -> Option<&'a SamgTrack> {
+        self.tracks.get(chapter_index).copied()
+    }
+
+    fn elementary_stream_kind_hint(&self) -> Option<DvdaElementaryStreamKind> {
+        if self
+            .tracks
+            .iter()
+            .all(|track| matches!(track.zone, SamgZone::Vob))
+        {
+            Some(DvdaElementaryStreamKind::DvdVideoLpcm)
+        } else {
+            None
+        }
+    }
+}
+
+fn title_chapter_sector_span(chapter: &AudioChapter) -> Option<(u32, u32, u64)> {
+    let first = chapter
+        .sector_ranges
+        .iter()
+        .map(|range| range.first)
+        .min()?;
+    let last = chapter.sector_ranges.iter().map(|range| range.last).max()?;
+    Some((first, last, sector_block_count(chapter)))
+}
+
+fn find_samg_sector_correlation<'a>(
+    disc: &'a DvdaDisc,
+    title: &AudioTitle,
+) -> Option<SamgSectorCorrelation<'a>> {
+    let samg = disc.samg.as_ref()?;
+    if title.chapters.is_empty() {
+        return None;
+    }
+
+    let chapter_spans: Option<Vec<_>> = title
+        .chapters
+        .iter()
+        .map(title_chapter_sector_span)
+        .collect();
+    let chapter_spans = chapter_spans?;
+
+    let mut tracks_by_group: BTreeMap<u8, Vec<&SamgTrack>> = BTreeMap::new();
+    for track in samg
+        .tracks
+        .iter()
+        .filter(|track| matches!(track.zone, SamgZone::Vob))
+    {
+        tracks_by_group
+            .entry(track.group_nr)
+            .or_default()
+            .push(track);
+    }
+
+    for tracks in tracks_by_group.values_mut() {
+        tracks.sort_by_key(|track| (track.track_nr, track.ordinal));
+        if tracks.len() != chapter_spans.len() {
+            continue;
+        }
+
+        let mut base: Option<u32> = None;
+        let mut matched = true;
+        for (track, (chapter_first, chapter_last, chapter_blocks)) in
+            tracks.iter().zip(chapter_spans.iter().copied())
+        {
+            if samg_sector_block_count(track) != chapter_blocks {
+                matched = false;
+                break;
+            }
+            let Some(candidate_base) = track.abs_first_sector.checked_sub(chapter_first) else {
+                matched = false;
+                break;
+            };
+            let Some(expected_last) = candidate_base.checked_add(chapter_last) else {
+                matched = false;
+                break;
+            };
+            if track.abs_last_sector != expected_last {
+                matched = false;
+                break;
+            }
+            if let Some(existing_base) = base {
+                if existing_base != candidate_base {
+                    matched = false;
+                    break;
+                }
+            } else {
+                base = Some(candidate_base);
+            }
+        }
+
+        if matched {
+            return Some(SamgSectorCorrelation {
+                disc_absolute_base: base?,
+                tracks: tracks.clone(),
+            });
+        }
+    }
+
+    None
+}
+
 fn title_disc_absolute_sector_base(
     disc: &DvdaDisc,
     group: &DvdaGroup,
     title_ref: &TitleRef,
     title_set: &TitleSet,
+    title: &AudioTitle,
+    samg_sector_correlation: Option<&SamgSectorCorrelation<'_>>,
 ) -> Option<u32> {
+    if let Some(correlation) = samg_sector_correlation {
+        log::info!(
+            "DVD-Audio ATS {} group {} title {} uses SAMG-derived disc-absolute base {} for AOB-less VOB sharing",
+            title_set.number,
+            group.group_nr,
+            title.title_ordinal,
+            correlation.disc_absolute_base
+        );
+        return Some(correlation.disc_absolute_base);
+    }
+
     let aott_entry = disc
         .amg
         .audio_title_table
@@ -1018,17 +1173,18 @@ fn prepared_tracks_for_groups(
         } else {
             None
         };
-        let disc_info_downmix_source_label = if matches!(requested_downmix_policy, DvdaDownmixPolicy::Auto) {
-            disc_info_probe.as_ref().and_then(|probe| {
-                if probe.codec.eq_ignore_ascii_case("MLP") && probe.channels > 2 {
-                    probe.stereo_downmix_source_label.clone()
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
+        let disc_info_downmix_source_label =
+            if matches!(requested_downmix_policy, DvdaDownmixPolicy::Auto) {
+                disc_info_probe.as_ref().and_then(|probe| {
+                    if probe.codec.eq_ignore_ascii_case("MLP") && probe.channels > 2 {
+                        probe.stereo_downmix_source_label.clone()
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
         let disc_absolute_stream_kind_hint = group_uses_disc_absolute
             .then(|| {
                 disc_info_probe
@@ -1128,12 +1284,24 @@ fn append_title_tracks(
 ) -> Result<(), MaterializeError> {
     let title_set_has_existing_aobs = title_set_has_existing_aobs(title_set);
     let relative_aob_files = existing_aob_file_refs(title_set);
+    let samg_sector_correlation = if title_set_has_existing_aobs {
+        None
+    } else {
+        find_samg_sector_correlation(disc, title)
+    };
     let disc_absolute_base = if title_set_has_existing_aobs {
         None
     } else {
-        Some(title_disc_absolute_sector_base(disc, group, title_ref, title_set).ok_or_else(|| {
+        Some(title_disc_absolute_sector_base(
+            disc,
+            group,
+            title_ref,
+            title_set,
+            title,
+            samg_sector_correlation.as_ref(),
+        ).ok_or_else(|| {
             MaterializeError::Parse(format!(
-                "DVD-Audio ATS {} has no existing AOB files and no AMG/AOTT sector base for group {} title {}",
+                "DVD-Audio ATS {} has no existing AOB files and no AMG/AOTT or SAMG sector base for group {} title {}",
                 title_set.number, group.group_nr, title.title_ordinal
             ))
         })?)
@@ -1152,14 +1320,20 @@ fn append_title_tracks(
     } else {
         Vec::new()
     };
-    let track_stream_kind_hint = if matches!(sector_address_space, DvdaSectorAddressSpace::DiscAbsolute { .. }) {
-        disc_absolute_stream_kind_hint
+    let track_stream_kind_hint = if matches!(
+        sector_address_space,
+        DvdaSectorAddressSpace::DiscAbsolute { .. }
+    ) {
+        samg_sector_correlation
+            .as_ref()
+            .and_then(SamgSectorCorrelation::elementary_stream_kind_hint)
+            .or(disc_absolute_stream_kind_hint)
     } else {
         None
     };
     let group_total_tracks = ats_group_track_count(disc, group);
 
-    for chapter in &title.chapters {
+    for (chapter_index, chapter) in title.chapters.iter().enumerate() {
         if chapter.sector_ranges.is_empty() {
             return Err(MaterializeError::Parse(format!(
                 "DVD-Audio ATS {} title {} track {} has no sector ranges",
@@ -1170,9 +1344,15 @@ fn append_title_tracks(
 
         let source_ordinal = tracks.len() as u32 + 1;
         let group_track_ordinal = group_track_ordinal_from_lengths(tracks.len(), group_start_len)?;
-        let audio_facts = audio_facts_for_title_chapter(title_set, chapter);
+        let correlated_samg_track = samg_sector_correlation
+            .as_ref()
+            .and_then(|correlation| correlation.track_for_chapter_index(chapter_index));
+        let audio_facts = correlated_samg_track
+            .map(audio_facts_for_samg_track)
+            .unwrap_or_else(|| audio_facts_for_title_chapter(title_set, chapter));
         let source_audio = source_audio_descriptor_for_facts(audio_facts);
-        let aob_inventory_covers_track = title_set_has_existing_aobs && sector_ranges_are_covered(chapter, &aob_files);
+        let aob_inventory_covers_track =
+            title_set_has_existing_aobs && sector_ranges_are_covered(chapter, &aob_files);
         let sector_ranges = sector_ranges_for_address_space(chapter, disc_absolute_base)?;
         let dvda_downmix_policy = resolve_dvda_track_downmix_policy(
             requested_downmix_policy,
@@ -1197,6 +1377,7 @@ fn append_title_tracks(
                 sector_ranges,
                 dvda_downmix_policy,
                 track_stream_kind_hint,
+                correlated_samg_track,
                 aob_files.clone(),
             ),
             metadata: track_metadata(
@@ -1263,6 +1444,7 @@ fn ats_track_source_ref(
     sector_ranges: Vec<DvdaSectorRangeRef>,
     dvda_downmix_policy: DvdaDownmixPolicy,
     elementary_stream_kind_hint: Option<DvdaElementaryStreamKind>,
+    correlated_samg_track: Option<&SamgTrack>,
     aob_files: Vec<DvdaAobFileRef>,
 ) -> TrackSourceRef {
     TrackSourceRef::DvdaTrack {
@@ -1273,8 +1455,12 @@ fn ats_track_source_ref(
         title_ordinal: Some(title.title_ordinal),
         group_track_ordinal,
         ats_track_nr: Some(chapter.track_nr),
-        samg_track_nr: matching_samg_track_nr(group, group_track_ordinal),
-        samg_ordinal: matching_samg_ordinal(group, group_track_ordinal),
+        samg_track_nr: correlated_samg_track
+            .map(|track| track.track_nr)
+            .or_else(|| matching_samg_track_nr(group, group_track_ordinal)),
+        samg_ordinal: correlated_samg_track
+            .map(|track| track.ordinal)
+            .or_else(|| matching_samg_ordinal(group, group_track_ordinal)),
         sector_address_space,
         elementary_stream_kind_hint,
         first_pts: chapter.first_pts,
@@ -1357,7 +1543,9 @@ fn prepared_track_from_samg_track(
             expected_sample_rate: audio_facts.sample_rate,
             expected_channel_count: expected_channel_count_for_facts(audio_facts),
             expected_bit_depth: audio_facts.bit_depth.map(u32::from),
-            expected_channel_assignment_code: expected_channel_assignment_code_for_facts(audio_facts),
+            expected_channel_assignment_code: expected_channel_assignment_code_for_facts(
+                audio_facts,
+            ),
             expected_group1_sample_rate: expected_group1_sample_rate_for_facts(audio_facts),
             expected_group2_sample_rate: expected_group2_sample_rate_for_facts(audio_facts),
             expected_group1_bit_depth: expected_group1_bit_depth_for_facts(audio_facts),
@@ -1371,7 +1559,13 @@ fn prepared_track_from_samg_track(
             }],
             aob_files: Vec::new(),
         },
-        metadata: samg_track_metadata(group, samg_track, audio_facts, source_ordinal, group_track_ordinal),
+        metadata: samg_track_metadata(
+            group,
+            samg_track,
+            audio_facts,
+            source_ordinal,
+            group_track_ordinal,
+        ),
         expected_samples: audio_facts
             .sample_rate
             .and_then(|rate| expected_samples_from_pts_len(samg_track.len_in_pts, rate)),
@@ -1407,7 +1601,10 @@ fn find_samg_track<'a>(
         })
 }
 
-fn group_track_ordinal_from_lengths(current_len: usize, group_start_len: usize) -> Result<u32, MaterializeError> {
+fn group_track_ordinal_from_lengths(
+    current_len: usize,
+    group_start_len: usize,
+) -> Result<u32, MaterializeError> {
     let local_index = current_len.checked_sub(group_start_len).ok_or_else(|| {
         MaterializeError::Parse("DVD-Audio group-track ordinal underflow".to_string())
     })?;
@@ -1442,7 +1639,10 @@ fn find_title_set(disc: &DvdaDisc, title_set_nr: u8) -> Result<&TitleSet, Materi
         })
 }
 
-fn find_title<'a>(title_set: &'a TitleSet, title_ref: &TitleRef) -> Result<&'a AudioTitle, MaterializeError> {
+fn find_title<'a>(
+    title_set: &'a TitleSet,
+    title_ref: &TitleRef,
+) -> Result<&'a AudioTitle, MaterializeError> {
     title_set
         .titles
         .iter()
@@ -1550,8 +1750,12 @@ fn audio_facts_for_title_chapter<'a>(
                 .iter()
                 .copied()
                 .find(|attr| attr.format_index == candidate)
-                .map(|attr| audio_facts_from_attr(attr, AudioFormatResolution::TrackTypeAudioFormatIndex))
-                .unwrap_or_else(|| unknown_audio_facts(AudioFormatResolution::MultiplePresentFormats))
+                .map(|attr| {
+                    audio_facts_from_attr(attr, AudioFormatResolution::TrackTypeAudioFormatIndex)
+                })
+                .unwrap_or_else(|| {
+                    unknown_audio_facts(AudioFormatResolution::MultiplePresentFormats)
+                })
         }
     }
 }
@@ -1564,7 +1768,10 @@ fn present_audio_formats(title_set: &TitleSet) -> Vec<&AudioAttributes> {
         .collect()
 }
 
-fn audio_facts_from_attr(attr: &AudioAttributes, resolution: AudioFormatResolution) -> AudioFacts<'_> {
+fn audio_facts_from_attr(
+    attr: &AudioAttributes,
+    resolution: AudioFormatResolution,
+) -> AudioFacts<'_> {
     AudioFacts {
         format_index: Some(attr.format_index),
         attr: Some(attr),
@@ -1608,15 +1815,21 @@ fn expected_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> 
 }
 
 fn expected_channel_assignment_code_for_facts(audio_facts: AudioFacts<'_>) -> Option<u8> {
-    audio_facts.channel_format.map(|format| format.assignment_code)
+    audio_facts
+        .channel_format
+        .map(|format| format.assignment_code)
 }
 
 fn expected_group1_sample_rate_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
-    audio_facts.channel_format.and_then(|format| format.group1_sample_rate)
+    audio_facts
+        .channel_format
+        .and_then(|format| format.group1_sample_rate)
 }
 
 fn expected_group2_sample_rate_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
-    audio_facts.channel_format.and_then(|format| format.group2_sample_rate)
+    audio_facts
+        .channel_format
+        .and_then(|format| format.group2_sample_rate)
 }
 
 fn expected_group1_bit_depth_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
@@ -1634,15 +1847,15 @@ fn expected_group2_bit_depth_for_facts(audio_facts: AudioFacts<'_>) -> Option<u3
 }
 
 fn expected_group1_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
-    audio_facts
-        .channel_assignment
-        .and_then(|assignment| (assignment.group1_channels > 0).then_some(u32::from(assignment.group1_channels)))
+    audio_facts.channel_assignment.and_then(|assignment| {
+        (assignment.group1_channels > 0).then_some(u32::from(assignment.group1_channels))
+    })
 }
 
 fn expected_group2_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
-    audio_facts
-        .channel_assignment
-        .and_then(|assignment| (assignment.group2_channels > 0).then_some(u32::from(assignment.group2_channels)))
+    audio_facts.channel_assignment.and_then(|assignment| {
+        (assignment.group2_channels > 0).then_some(u32::from(assignment.group2_channels))
+    })
 }
 
 fn source_audio_descriptor_for_facts(audio_facts: AudioFacts<'_>) -> SourceAudioDescriptor {
@@ -1735,7 +1948,9 @@ fn audio_format_resolution_label(resolution: AudioFormatResolution) -> &'static 
         AudioFormatResolution::NoPresentFormat => "no_present_format",
         AudioFormatResolution::SinglePresentFormat => "single_present_format",
         AudioFormatResolution::TrackTypeAudioFormatIndex => "track_type_audio_format_index",
-        AudioFormatResolution::MultiplePresentFormats => "multiple_present_formats_unknown_until_aob_demux",
+        AudioFormatResolution::MultiplePresentFormats => {
+            "multiple_present_formats_unknown_until_aob_demux"
+        }
         AudioFormatResolution::SamgTrackRecord => "samg_track_record",
     }
 }
@@ -1773,7 +1988,6 @@ fn aob_file_ref(entry: &AobFileEntry) -> DvdaAobFileRef {
         block_last: entry.block_last,
     }
 }
-
 
 fn ats_group_track_count(disc: &DvdaDisc, group: &DvdaGroup) -> u32 {
     let mut count = 0_u32;
@@ -1819,7 +2033,11 @@ fn album_metadata(
         .join(",");
     insert_nonempty(&mut extra, "dvda_group_selection", group_selection.label());
     insert_nonempty(&mut extra, "dvda_selected_groups", selected_group_numbers);
-    insert_nonempty(&mut extra, "dvda_selected_group_count", groups.len().to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_selected_group_count",
+        groups.len().to_string(),
+    );
     if let [group] = groups {
         insert_nonempty(&mut extra, "dvda_group", group.group_nr.to_string());
         insert_nonempty(
@@ -1828,17 +2046,57 @@ fn album_metadata(
             group_correlation_label(&group.correlation).to_string(),
         );
     }
-    insert_nonempty(&mut extra, "dvda_group_count", disc.groups.len().to_string());
-    insert_nonempty(&mut extra, "dvda_audio_title_sets", disc.amg.audio_title_sets.to_string());
-    insert_nonempty(&mut extra, "dvda_video_title_sets", disc.amg.video_title_sets.to_string());
-    insert_nonempty(&mut extra, "dvda_provider_identifier", disc.amg.provider_identifier.clone());
-    insert_nonempty(&mut extra, "dvda_specification_version", format!("0x{:02x}", disc.amg.specification_version));
-    insert_nonempty(&mut extra, "dvda_mkb_present", disc.copy_protection.mkb_present.to_string());
-    insert_nonempty(&mut extra, "dvda_cppm_detected", disc.copy_protection.cppm_detected.to_string());
-    insert_nonempty(&mut extra, "dvda_copy_protection_source", format!("{:?}", disc.copy_protection.source));
+    insert_nonempty(
+        &mut extra,
+        "dvda_group_count",
+        disc.groups.len().to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_audio_title_sets",
+        disc.amg.audio_title_sets.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_video_title_sets",
+        disc.amg.video_title_sets.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_provider_identifier",
+        disc.amg.provider_identifier.clone(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_specification_version",
+        format!("0x{:02x}", disc.amg.specification_version),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_mkb_present",
+        disc.copy_protection.mkb_present.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_cppm_detected",
+        disc.copy_protection.cppm_detected.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_copy_protection_source",
+        format!("{:?}", disc.copy_protection.source),
+    );
     if disc.copy_protection.cppm_detected {
-        insert_nonempty(&mut extra, "dvda_copy_protection_policy", "DetectExplainSkip".to_string());
-        insert_nonempty(&mut extra, "dvda_cppm_decryption_supported", "false".to_string());
+        insert_nonempty(
+            &mut extra,
+            "dvda_copy_protection_policy",
+            "DetectExplainSkip".to_string(),
+        );
+        insert_nonempty(
+            &mut extra,
+            "dvda_cppm_decryption_supported",
+            "false".to_string(),
+        );
         insert_nonempty(
             &mut extra,
             "dvda_copy_protection_skip_reason",
@@ -1846,7 +2104,11 @@ fn album_metadata(
         );
     }
     if disc.copy_protection.mkb_present {
-        insert_nonempty(&mut extra, "dvda_copy_protection_file", "DVDAUDIO.MKB".to_string());
+        insert_nonempty(
+            &mut extra,
+            "dvda_copy_protection_file",
+            "DVDAUDIO.MKB".to_string(),
+        );
     }
     insert_nonempty(
         &mut extra,
@@ -1864,11 +2126,8 @@ fn album_metadata(
         disc_number: disc_number(disc),
         extra,
     };
-    let mut album = materializer_dvda_metabase::overlay_album_metadata(
-        base,
-        metabase,
-        loaded_metabase,
-    );
+    let mut album =
+        materializer_dvda_metabase::overlay_album_metadata(base, metabase, loaded_metabase);
 
     // foo_input_dvda stores album-like values per track, and one XML can contain
     // multiple DVD-Audio presentations. Scope album values to the selected
@@ -1899,10 +2158,13 @@ fn overlay_selected_track_album_values(
     ) {
         album.album_artist = Some(value);
     }
-    if let Some(value) = dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["GENRE"]) {
+    if let Some(value) = dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["GENRE"])
+    {
         album.genre = Some(value);
     }
-    if let Some(value) = dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["DATE", "YEAR"]) {
+    if let Some(value) =
+        dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["DATE", "YEAR"])
+    {
         album.date = Some(value);
     }
 }
@@ -1946,20 +2208,56 @@ fn track_metadata(
 ) -> TrackMetadata {
     let mut extra = BTreeMap::new();
     insert_nonempty(&mut extra, "dvda_group", group.group_nr.to_string());
-    insert_nonempty(&mut extra, "dvda_group_correlation", group_correlation_label(&group.correlation).to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_group_correlation",
+        group_correlation_label(&group.correlation).to_string(),
+    );
     insert_nonempty(&mut extra, "dvda_origin", "atsi".to_string());
-    insert_nonempty(&mut extra, "dvda_sector_address_space", "ats_aob_relative".to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_sector_address_space",
+        "ats_aob_relative".to_string(),
+    );
     insert_nonempty(&mut extra, "dvda_title_set", title_set.number.to_string());
     insert_nonempty(&mut extra, "dvda_title_nr", title.title_nr.to_string());
-    insert_nonempty(&mut extra, "dvda_title_ordinal", title.title_ordinal.to_string());
-    insert_nonempty(&mut extra, "dvda_group_track_ordinal", group_track_ordinal.to_string());
-    insert_nonempty(&mut extra, "dvda_ats_track_nr", chapter.track_nr.to_string());
-    insert_nonempty(&mut extra, "dvda_track_type", format!("0x{:02x}", chapter.track_type));
-    insert_nonempty(&mut extra, "dvda_index_start", chapter.index_start.to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_title_ordinal",
+        title.title_ordinal.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_group_track_ordinal",
+        group_track_ordinal.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_ats_track_nr",
+        chapter.track_nr.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_track_type",
+        format!("0x{:02x}", chapter.track_type),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_index_start",
+        chapter.index_start.to_string(),
+    );
     insert_nonempty(&mut extra, "dvda_first_pts", chapter.first_pts.to_string());
     insert_nonempty(&mut extra, "dvda_len_pts", chapter.len_in_pts.to_string());
-    insert_nonempty(&mut extra, "dvda_sector_range_count", chapter.sector_ranges.len().to_string());
-    insert_nonempty(&mut extra, "dvda_sector_blocks", sector_block_count(chapter).to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_sector_range_count",
+        chapter.sector_ranges.len().to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_sector_blocks",
+        sector_block_count(chapter).to_string(),
+    );
     insert_nonempty(
         &mut extra,
         "dvda_aob_inventory_covers_track",
@@ -2020,9 +2318,7 @@ fn track_metadata(
             bit_depth: audio_facts.bit_depth.map(u32::from),
             channel_count: expected_channel_count_for_facts(audio_facts).map(|c| c as u8),
             codec: audio_facts.attr.map(|_| "DVD-Audio".to_string()),
-            channel_layout: audio_facts
-                .channel_assignment
-                .map(channel_layout),
+            channel_layout: audio_facts.channel_assignment.map(channel_layout),
         },
         metabase,
     )
@@ -2037,20 +2333,52 @@ fn samg_track_metadata(
 ) -> TrackMetadata {
     let mut extra = BTreeMap::new();
     insert_nonempty(&mut extra, "dvda_group", group.group_nr.to_string());
-    insert_nonempty(&mut extra, "dvda_group_correlation", group_correlation_label(&group.correlation).to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_group_correlation",
+        group_correlation_label(&group.correlation).to_string(),
+    );
     insert_nonempty(&mut extra, "dvda_origin", "samg".to_string());
-    insert_nonempty(&mut extra, "dvda_sector_address_space", "samg_absolute".to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_sector_address_space",
+        "samg_absolute".to_string(),
+    );
     insert_nonempty(&mut extra, "dvda_samg_ordinal", track.ordinal.to_string());
     insert_nonempty(&mut extra, "dvda_samg_group", track.group_nr.to_string());
-    insert_nonempty(&mut extra, "dvda_group_track_ordinal", group_track_ordinal.to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_group_track_ordinal",
+        group_track_ordinal.to_string(),
+    );
     insert_nonempty(&mut extra, "dvda_samg_track_nr", track.track_nr.to_string());
-    insert_nonempty(&mut extra, "dvda_samg_zone", samg_zone_label(&track.zone).to_string());
-    insert_nonempty(&mut extra, "dvda_samg_flags", format!("0x{:02x}", track.flags));
+    insert_nonempty(
+        &mut extra,
+        "dvda_samg_zone",
+        samg_zone_label(&track.zone).to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_samg_flags",
+        format!("0x{:02x}", track.flags),
+    );
     insert_nonempty(&mut extra, "dvda_first_pts", track.first_pts.to_string());
     insert_nonempty(&mut extra, "dvda_len_pts", track.len_in_pts.to_string());
-    insert_nonempty(&mut extra, "dvda_first_sector", track.abs_first_sector.to_string());
-    insert_nonempty(&mut extra, "dvda_last_sector", track.abs_last_sector.to_string());
-    insert_nonempty(&mut extra, "dvda_samg_abs_first_sector_dup", track.abs_first_sector_dup.to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_first_sector",
+        track.abs_first_sector.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_last_sector",
+        track.abs_last_sector.to_string(),
+    );
+    insert_nonempty(
+        &mut extra,
+        "dvda_samg_abs_first_sector_dup",
+        track.abs_first_sector_dup.to_string(),
+    );
     insert_nonempty(
         &mut extra,
         "dvda_sector_blocks",
@@ -2061,11 +2389,7 @@ fn samg_track_metadata(
         "dvda_aob_inventory_covers_track",
         "false".to_string(),
     );
-    insert_nonempty(
-        &mut extra,
-        "dvda_audio_format_known",
-        "false".to_string(),
-    );
+    insert_nonempty(&mut extra, "dvda_audio_format_known", "false".to_string());
     insert_nonempty(
         &mut extra,
         "dvda_audio_format_resolution",
@@ -2097,8 +2421,16 @@ fn samg_track_metadata(
 }
 
 fn insert_audio_attributes(extra: &mut BTreeMap<String, String>, attr: &AudioAttributes) {
-    insert_nonempty(extra, "dvda_audio_type_raw", format!("0x{:04x}", attr.audio_type_raw));
-    insert_channel_format(extra, &attr.channel_format, attr.channel_assignment.as_ref());
+    insert_nonempty(
+        extra,
+        "dvda_audio_type_raw",
+        format!("0x{:04x}", attr.audio_type_raw),
+    );
+    insert_channel_format(
+        extra,
+        &attr.channel_format,
+        attr.channel_assignment.as_ref(),
+    );
 }
 
 fn insert_channel_format(
@@ -2124,7 +2456,11 @@ fn insert_channel_format(
         format.assignment_code.to_string(),
     );
     if let Some(assignment) = assignment {
-        insert_nonempty(extra, "dvda_channel_count", channel_count(assignment).to_string());
+        insert_nonempty(
+            extra,
+            "dvda_channel_count",
+            channel_count(assignment).to_string(),
+        );
         insert_nonempty(extra, "dvda_channel_layout", channel_layout(assignment));
     }
 }
@@ -2205,7 +2541,9 @@ fn apply_track_selection(
             }
             Ok(tracks
                 .into_iter()
-                .filter(|track| track.id.source_ordinal >= *start && track.id.source_ordinal <= *end)
+                .filter(|track| {
+                    track.id.source_ordinal >= *start && track.id.source_ordinal <= *end
+                })
                 .collect())
         }
         TrackSelection::Set(indices) => {
@@ -2278,13 +2616,12 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::dvda::{
+        AmgInfo, AmgPointers, AtsiHeader, AudioCoding, CopyProtectionInfo, CopyProtectionSource,
+        SamgCopyValidation, SamgInfo, TitleSetKind,
+    };
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
-    use crate::tui::dvda::{
-        AmgInfo, AmgPointers, AudioCoding, AtsiHeader, CopyProtectionInfo,
-        CopyProtectionSource, SamgCopyValidation, SamgInfo, TitleSetKind,
-    };
-
 
     const NO_CHANNELS: &[&str] = &[];
     const STEREO_CHANNELS: &[&str] = &["L", "R"];
@@ -2340,7 +2677,10 @@ mod tests {
         title_set_with_number_and_audio_formats(1, audio_formats)
     }
 
-    fn title_set_with_number_and_audio_formats(number: u8, audio_formats: Vec<AudioAttributes>) -> TitleSet {
+    fn title_set_with_number_and_audio_formats(
+        number: u8,
+        audio_formats: Vec<AudioAttributes>,
+    ) -> TitleSet {
         TitleSet {
             number,
             source_file: "ATS_01_0.IFO".to_string(),
@@ -2515,7 +2855,12 @@ mod tests {
         }
     }
 
-    fn aob_entry_for_test(title_set_nr: u8, exists: bool, block_first: u32, block_last: u32) -> AobFileEntry {
+    fn aob_entry_for_test(
+        title_set_nr: u8,
+        exists: bool,
+        block_first: u32,
+        block_last: u32,
+    ) -> AobFileEntry {
         AobFileEntry {
             title_set_nr,
             part_nr: 1,
@@ -2626,7 +2971,6 @@ mod tests {
         }
     }
 
-
     fn disc_with_group_profiles_for_test() -> DvdaDisc {
         let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
         disc.samg = None;
@@ -2637,29 +2981,51 @@ mod tests {
             ),
             title_set_with_number_and_audio_formats(
                 2,
-                vec![audio_attr_with_channels(1, Some(192_000), Some(24), Some(2))],
+                vec![audio_attr_with_channels(
+                    1,
+                    Some(192_000),
+                    Some(24),
+                    Some(2),
+                )],
             ),
             title_set_with_number_and_audio_formats(
                 3,
-                vec![audio_attr_with_channels(1, Some(176_400), Some(24), Some(6))],
+                vec![audio_attr_with_channels(
+                    1,
+                    Some(176_400),
+                    Some(24),
+                    Some(6),
+                )],
             ),
         ];
         disc.groups = vec![
             DvdaGroup {
                 group_nr: 1,
-                title_refs: vec![TitleRef { title_set_nr: 1, title_nr: 1, kind: TitleRefKind::AottTitleOrdinal }],
+                title_refs: vec![TitleRef {
+                    title_set_nr: 1,
+                    title_nr: 1,
+                    kind: TitleRefKind::AottTitleOrdinal,
+                }],
                 samg_tracks: Vec::new(),
                 correlation: GroupCorrelation::FromAmgAott,
             },
             DvdaGroup {
                 group_nr: 2,
-                title_refs: vec![TitleRef { title_set_nr: 2, title_nr: 1, kind: TitleRefKind::AottTitleOrdinal }],
+                title_refs: vec![TitleRef {
+                    title_set_nr: 2,
+                    title_nr: 1,
+                    kind: TitleRefKind::AottTitleOrdinal,
+                }],
                 samg_tracks: Vec::new(),
                 correlation: GroupCorrelation::FromAmgAott,
             },
             DvdaGroup {
                 group_nr: 3,
-                title_refs: vec![TitleRef { title_set_nr: 3, title_nr: 1, kind: TitleRefKind::AottTitleOrdinal }],
+                title_refs: vec![TitleRef {
+                    title_set_nr: 3,
+                    title_nr: 1,
+                    kind: TitleRefKind::AottTitleOrdinal,
+                }],
                 samg_tracks: Vec::new(),
                 correlation: GroupCorrelation::FromAmgAott,
             },
@@ -2671,8 +3037,14 @@ mod tests {
     fn group_selection_supports_default_group_exact_group_and_all_groups() {
         let disc = disc_with_group_profiles_for_test();
 
-        assert_eq!(select_groups(&disc, DvdaGroupSelection::Default).unwrap()[0].group_nr, 1);
-        assert_eq!(select_groups(&disc, DvdaGroupSelection::Group(2)).unwrap()[0].group_nr, 2);
+        assert_eq!(
+            select_groups(&disc, DvdaGroupSelection::Default).unwrap()[0].group_nr,
+            1
+        );
+        assert_eq!(
+            select_groups(&disc, DvdaGroupSelection::Group(2)).unwrap()[0].group_nr,
+            2
+        );
         assert_eq!(
             select_groups(&disc, DvdaGroupSelection::All)
                 .unwrap()
@@ -2691,7 +3063,10 @@ mod tests {
     fn group_selection_prefers_stereo_multichannel_and_highest_resolution() {
         let disc = disc_with_group_profiles_for_test();
 
-        assert_eq!(select_groups(&disc, DvdaGroupSelection::PreferStereo).unwrap()[0].group_nr, 2);
+        assert_eq!(
+            select_groups(&disc, DvdaGroupSelection::PreferStereo).unwrap()[0].group_nr,
+            2
+        );
         assert_eq!(
             select_groups(&disc, DvdaGroupSelection::PreferMultichannel).unwrap()[0].group_nr,
             3,
@@ -2727,7 +3102,6 @@ mod tests {
             "an explicit ffmpeg override must not be replaced by the automatic detector"
         );
     }
-
 
     #[test]
     fn authored_stereo_downmix_detection_allows_stereo_presentation_facts() {
@@ -2785,13 +3159,12 @@ mod tests {
         assert_eq!(
             resolve_dvda_track_downmix_policy(
                 DvdaDownmixPolicy::Auto,
-                authored_stereo_downmix_source_label(&disc, stereo_group, stereo_title_set).as_deref(),
+                authored_stereo_downmix_source_label(&disc, stereo_group, stereo_title_set)
+                    .as_deref(),
             ),
             DvdaDownmixPolicy::FooInputDvdaCompatible
         );
     }
-
-
 
     #[test]
     fn authored_stereo_downmix_detection_treats_missing_aob_entries_as_aobless() {
@@ -2906,7 +3279,10 @@ mod tests {
             cue_sidecar: CueSidecarPolicy::PreferSidecar,
             track_selection: TrackSelection::All,
         };
-        assert_eq!(options.effective_dvda_group_selection(), DvdaGroupSelection::Group(4));
+        assert_eq!(
+            options.effective_dvda_group_selection(),
+            DvdaGroupSelection::Group(4)
+        );
         assert!(options.explicit_dvda_requested());
     }
 
@@ -2943,7 +3319,6 @@ mod tests {
 
         let _ = fs::remove_file(path);
     }
-
 
     #[test]
     fn auto_detection_rejects_stray_raw_magic_without_audio_ts_path() {
@@ -2995,7 +3370,10 @@ mod tests {
         fs::write(&path, bytes).expect("write ISO fixture");
 
         let req = dvda_detection_request(path.clone(), None);
-        assert_eq!(detect_dvda_source(&req).expect("DVD-Audio detection"), DvdaDetection::Iso9660BridgePath);
+        assert_eq!(
+            detect_dvda_source(&req).expect("DVD-Audio detection"),
+            DvdaDetection::Iso9660BridgePath
+        );
         assert!(is_dvda_candidate(&req).expect("DVD-Audio candidate detection"));
 
         let _ = fs::remove_file(path);
@@ -3015,12 +3393,13 @@ mod tests {
                 backend: DvdaIsoBackend::Iso9660Bridge,
             }
         );
-        assert!(file_in_volume_starts_with_magic(&volume, "AUDIO_TS.IFO", DVDA_AMG_MAGIC)
-            .expect("IFO magic through materialization backend"));
+        assert!(
+            file_in_volume_starts_with_magic(&volume, "AUDIO_TS.IFO", DVDA_AMG_MAGIC)
+                .expect("IFO magic through materialization backend")
+        );
 
         let _ = fs::remove_file(path);
     }
-
 
     fn temp_test_path(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -3029,7 +3408,6 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!("tonepoet_{nonce}_{name}"))
     }
-
 
     fn dvda_detection_request(path: PathBuf, explicit_group: Option<u8>) -> PipelineRequest {
         let root = std::env::temp_dir().join("tonepoet-dvda-detect-tests");
@@ -3121,7 +3499,8 @@ mod tests {
             }
         }
 
-        let ifo = &mut image[DVD_SECTOR_SIZE_USIZE * 20..DVD_SECTOR_SIZE_USIZE * 20 + DVDA_AMG_MAGIC.len()];
+        let ifo = &mut image
+            [DVD_SECTOR_SIZE_USIZE * 20..DVD_SECTOR_SIZE_USIZE * 20 + DVDA_AMG_MAGIC.len()];
         ifo.copy_from_slice(DVDA_AMG_MAGIC);
         image
     }
@@ -3145,12 +3524,14 @@ mod tests {
 
     #[test]
     fn track_selection_filters_by_source_ordinal() {
-        let tracks = vec![dummy_track(1), dummy_track(2), dummy_track(3), dummy_track(4)];
-        let selected = apply_track_selection(
-            tracks,
-            &TrackSelection::Range { start: 2, end: 3 },
-        )
-        .expect("valid range");
+        let tracks = vec![
+            dummy_track(1),
+            dummy_track(2),
+            dummy_track(3),
+            dummy_track(4),
+        ];
+        let selected = apply_track_selection(tracks, &TrackSelection::Range { start: 2, end: 3 })
+            .expect("valid range");
         assert_eq!(
             selected
                 .iter()
@@ -3165,8 +3546,11 @@ mod tests {
         let mut set = BTreeSet::new();
         set.insert(1);
         set.insert(4);
-        let err = apply_track_selection(vec![dummy_track(1), dummy_track(2)], &TrackSelection::Set(set))
-            .expect_err("selection should reject out-of-range ordinal");
+        let err = apply_track_selection(
+            vec![dummy_track(1), dummy_track(2)],
+            &TrackSelection::Set(set),
+        )
+        .expect_err("selection should reject out-of-range ordinal");
         assert!(matches!(err, MaterializeError::InvalidTrackSelection(_)));
     }
 
@@ -3197,10 +3581,14 @@ mod tests {
         assert!(sector_ranges_are_covered(&chapter, &[present_aob]));
     }
 
-
     #[test]
     fn atsi_track_source_ref_carries_typed_decode_boundary_fields() {
-        let title_set = title_set_with_audio_formats(vec![audio_attr_with_channels(2, Some(96_000), Some(24), Some(2))]);
+        let title_set = title_set_with_audio_formats(vec![audio_attr_with_channels(
+            2,
+            Some(96_000),
+            Some(24),
+            Some(2),
+        )]);
         let title = AudioTitle {
             title_set_nr: 1,
             title_nr: 0x83,
@@ -3258,6 +3646,7 @@ mod tests {
             DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
             chapter.sector_ranges.iter().map(sector_range_ref).collect(),
             DvdaDownmixPolicy::None,
+            None,
             None,
             aob_files,
         );
@@ -3324,7 +3713,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn samg_correlation_uses_group_track_ordinal_not_ats_chapter_number() {
         let title_set = title_set_with_audio_formats(vec![audio_attr(0, Some(96_000), Some(24))]);
@@ -3369,7 +3757,9 @@ mod tests {
             correlation: GroupCorrelation::MixedAmgAndSamg,
         };
         let source_ref = ats_track_source_ref(
-            &DvdaVolumeSourceRef::Directory { root: PathBuf::from("/tmp/dvda") },
+            &DvdaVolumeSourceRef::Directory {
+                root: PathBuf::from("/tmp/dvda"),
+            },
             &group,
             &title_set,
             &title,
@@ -3379,6 +3769,7 @@ mod tests {
             DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
             chapter.sector_ranges.iter().map(sector_range_ref).collect(),
             DvdaDownmixPolicy::None,
+            None,
             None,
             vec![aob_file_ref_for_test(true, 10, 20)],
         );
@@ -3398,6 +3789,68 @@ mod tests {
             }
             _ => panic!("expected DVD-Audio source ref"),
         }
+    }
+
+    #[test]
+    fn samg_sector_correlation_derives_base_and_lpcm_hint_for_vob_tracks() {
+        let mut title = audio_title_for_test(2, 1, 180_000);
+        title.chapters = vec![
+            chapter_with_sector_range(0, 45_280),
+            chapter_with_sector_range(45_281, 119_152),
+        ];
+        title.chapters[1].track_nr = 2;
+
+        let mut track1 = samg_track_for_test();
+        track1.ordinal = 1;
+        track1.group_nr = 2;
+        track1.track_nr = 1;
+        track1.zone = SamgZone::Vob;
+        track1.channel_assignment = Some(ChannelAssignment {
+            code: 1,
+            group1: STEREO_CHANNELS,
+            group2: NO_CHANNELS,
+            group1_channels: 2,
+            group2_channels: 0,
+        });
+        track1.abs_first_sector = 1_703_445;
+        track1.abs_first_sector_dup = 1_703_445;
+        track1.abs_last_sector = 1_748_725;
+
+        let mut track2 = track1.clone();
+        track2.ordinal = 2;
+        track2.track_nr = 2;
+        track2.abs_first_sector = 1_748_726;
+        track2.abs_first_sector_dup = 1_748_726;
+        track2.abs_last_sector = 1_822_597;
+
+        let mut disc = disc_with_samg_track_for_test(track1);
+        disc.samg
+            .as_mut()
+            .expect("SAMG fixture")
+            .tracks
+            .push(track2);
+
+        let correlation = find_samg_sector_correlation(&disc, &title)
+            .expect("SAMG VOB sectors should correlate with ATS chapter sectors");
+        assert_eq!(correlation.disc_absolute_base, 1_703_445);
+        assert_eq!(
+            correlation.elementary_stream_kind_hint(),
+            Some(DvdaElementaryStreamKind::DvdVideoLpcm)
+        );
+        assert_eq!(
+            correlation
+                .track_for_chapter_index(0)
+                .expect("track 1")
+                .track_nr,
+            1
+        );
+        assert_eq!(
+            correlation
+                .track_for_chapter_index(1)
+                .expect("track 2")
+                .track_nr,
+            2
+        );
     }
 
     #[test]
@@ -3421,7 +3874,10 @@ mod tests {
         assert_eq!(facts.format_index, None);
         assert_eq!(facts.sample_rate, None);
         assert_eq!(facts.bit_depth, None);
-        assert_eq!(facts.resolution, AudioFormatResolution::MultiplePresentFormats);
+        assert_eq!(
+            facts.resolution,
+            AudioFormatResolution::MultiplePresentFormats
+        );
         assert!(facts.attr.is_none());
     }
 
@@ -3451,7 +3907,10 @@ mod tests {
         assert_eq!(facts.format_index, Some(2));
         assert_eq!(facts.sample_rate, Some(192_000));
         assert_eq!(facts.bit_depth, Some(24));
-        assert_eq!(facts.resolution, AudioFormatResolution::TrackTypeAudioFormatIndex);
+        assert_eq!(
+            facts.resolution,
+            AudioFormatResolution::TrackTypeAudioFormatIndex
+        );
     }
 
     #[test]
@@ -3501,7 +3960,14 @@ mod tests {
         assert_eq!(prepared.scalar_sample_rate(), Some(48_000));
         assert_eq!(prepared.bit_depth, Some(24));
         assert_eq!(prepared.expected_samples, Some(48_000));
-        assert_eq!(prepared.metadata.extra.get("dvda_origin").map(String::as_str), Some("samg"));
+        assert_eq!(
+            prepared
+                .metadata
+                .extra
+                .get("dvda_origin")
+                .map(String::as_str),
+            Some("samg")
+        );
         assert_eq!(
             prepared
                 .metadata
@@ -3566,7 +4032,7 @@ mod tests {
                 assert_eq!(title_table_offset, None);
                 assert_eq!(title_len_in_pts, None);
                 assert_eq!(title_track_count_declared, None);
-                        assert_eq!(title_index_count_declared, None);
+                assert_eq!(title_index_count_declared, None);
                 assert_eq!(expected_sample_rate, Some(48_000));
                 assert_eq!(expected_channel_count, None);
                 assert_eq!(expected_bit_depth, Some(24));
@@ -3643,10 +4109,7 @@ mod tests {
 
     fn prepared_track_with_extra_album(source_ordinal: u32, album: Option<&str>) -> PreparedTrack {
         let mut extra = BTreeMap::new();
-        extra.insert(
-            "dvda_track_id".to_string(),
-            format!("1.1.{source_ordinal}"),
-        );
+        extra.insert("dvda_track_id".to_string(), format!("1.1.{source_ordinal}"));
         if let Some(album) = album {
             extra.insert("dvda_metabase_album".to_string(), album.to_string());
         }
@@ -3657,7 +4120,9 @@ mod tests {
                 disc_number: None,
                 track_number: source_ordinal,
             },
-            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("track-{source_ordinal}.wav"))),
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "track-{source_ordinal}.wav"
+            ))),
             metadata: TrackMetadata {
                 extra,
                 ..TrackMetadata::default()
@@ -3740,9 +4205,7 @@ mod tests {
             None
         );
     }
-
 }
-
 
 #[cfg(test)]
 #[path = "materializer_dvda_fixture_tests.rs"]

@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tonepoet_pipeline::PipelineSettings;
 
-
 fn deserialize_optional_nonzero_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -237,8 +236,12 @@ impl DvdaDownmixPolicy {
         match self {
             Self::Auto => "resolve per track during DVD-Audio materialization",
             Self::None => "extract native channel count without downmix DSP",
-            Self::FooInputDvdaCompatible => "apply foo_input_dvda-compatible conservative stereo downmix during realization",
-            Self::FfmpegDefault => "ask ffmpeg to apply its default stereo rematrixing during realization",
+            Self::FooInputDvdaCompatible => {
+                "apply foo_input_dvda-compatible conservative stereo downmix during realization"
+            }
+            Self::FfmpegDefault => {
+                "ask ffmpeg to apply its default stereo rematrixing during realization"
+            }
         }
     }
 }
@@ -504,38 +507,73 @@ pub enum TrackSourceRef {
         /// IFO-derived scalar sample rate used to validate decoded DVD-Audio WAV output.
         /// This remains optional for multi-format ATS records where Phase 2 cannot
         /// identify a single active audio-format table entry from structure alone.
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_sample_rate: Option<u32>,
         /// IFO-derived total channel count used to validate decoded DVD-Audio WAV output.
         /// This remains optional when the IFO record does not expose a channel assignment.
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_channel_count: Option<u32>,
         /// IFO-derived source bit depth. DVD-Audio MLP is decoded to `pcm_s32le`
         /// for the pipeline carrier, so this records the source-depth assertion
         /// rather than the WAV container sample format.
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_bit_depth: Option<u32>,
         /// IFO channel-assignment code from the active ATS/SAMG audio-format record.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_channel_assignment_code: Option<u8>,
         /// IFO group-format details from the active ATS/SAMG audio-format record.
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_group1_sample_rate: Option<u32>,
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_group2_sample_rate: Option<u32>,
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_group1_bit_depth: Option<u32>,
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_group2_bit_depth: Option<u32>,
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_group1_channel_count: Option<u32>,
-        #[serde(default, deserialize_with = "deserialize_optional_nonzero_u32", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonzero_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
         expected_group2_channel_count: Option<u32>,
         sector_ranges: Vec<DvdaSectorRangeRef>,
         aob_files: Vec<DvdaAobFileRef>,
     },
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DvdaVolumeSourceRef {
@@ -544,13 +582,15 @@ pub enum DvdaVolumeSourceRef {
     /// User supplied an ISO image. The backend records the filesystem path that
     /// proved DVD-Audio identity during detection/materialization. Phase 3 should
     /// reopen the image through this backend rather than probing again.
-    Iso { path: PathBuf, backend: DvdaIsoBackend },
+    Iso {
+        path: PathBuf,
+        backend: DvdaIsoBackend,
+    },
     /// AUDIO_TS was copied into the staging area from another container. The
     /// current Phase 2 ISO path does not use this, but the variant keeps future
     /// extraction-based fallbacks explicit.
     StagedAudioTs { original: PathBuf, root: PathBuf },
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DvdaIsoBackend {
@@ -596,6 +636,10 @@ impl DvdaVolumeSourceRef {
 pub enum DvdaElementaryStreamKind {
     Mlp,
     Lpcm,
+    /// LPCM carried in DVD-Video VOB Private Stream 1 packets. Unlike DVD-Audio
+    /// LPCM, byte 3 is part of the first-access-unit pointer, not an
+    /// extra-header length.
+    DvdVideoLpcm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -604,8 +648,9 @@ pub enum DvdaSectorAddressSpace {
     /// logical address space and should be resolved through `aob_files`.
     AtsAobRelative { title_set_nr: u8 },
     /// Sector numbers are absolute logical block addresses on the original disc.
-    /// This is used for AOB-less ATS presentations whose PGC sector ranges must
-    /// be resolved from AMG/AOTT + ATSI base-sector metadata.
+    /// This is used for AOB-less ATS presentations whose PGC sector ranges are
+    /// resolved from verified SAMG VOB evidence when available, with legacy
+    /// AMG/AOTT + ATSI metadata retained only as a fallback.
     DiscAbsolute { title_set_nr: u8 },
     /// Sector numbers came directly from SAMG absolute-sector fields. Realization
     /// resolves these through raw ISO sector reads because copied directory trees
@@ -729,7 +774,6 @@ impl DvdaCopyProtectionBlock {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CueSegmentCarrier {
     PcmS32LeWav,
@@ -821,7 +865,6 @@ pub struct ExtractionProvenance {
     pub extracted_at: DateTime<Utc>,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceAudioCoding {
     Pcm,
@@ -882,7 +925,11 @@ impl Default for SourceAudioDescriptor {
 
 impl SourceAudioDescriptor {
     #[must_use]
-    pub fn from_scalar(sample_rate: Option<u32>, bit_depth: Option<u32>, coding: Option<SourceAudioCoding>) -> Self {
+    pub fn from_scalar(
+        sample_rate: Option<u32>,
+        bit_depth: Option<u32>,
+        coding: Option<SourceAudioCoding>,
+    ) -> Self {
         Self {
             coding,
             channel_groups: Vec::new(),
@@ -943,7 +990,10 @@ impl PreparedTrack {
     /// Returns the scalar rate or a caller-owned message explaining why the
     /// rate is unavailable. This gives non-DVD-A callers an explicit migration
     /// path without reintroducing numeric sentinels.
-    pub fn require_scalar_sample_rate(&self, context: &'static str) -> Result<u32, MissingSourceAudioFact> {
+    pub fn require_scalar_sample_rate(
+        &self,
+        context: &'static str,
+    ) -> Result<u32, MissingSourceAudioFact> {
         self.scalar_sample_rate().ok_or(MissingSourceAudioFact {
             context,
             track_id: self.id.clone(),
@@ -970,11 +1020,7 @@ impl std::fmt::Display for MissingSourceAudioFact {
         write!(
             f,
             "{} requires {} for track {}-{}-{}",
-            self.context,
-            self.fact,
-            self.track_id.source_ordinal,
-            disc,
-            self.track_id.track_number
+            self.context, self.fact, self.track_id.source_ordinal, disc, self.track_id.track_number
         )
     }
 }
@@ -1048,14 +1094,19 @@ impl PlannedMetadataSatisfaction {
         Self {
             source_tags_transferred: self.source_tags_transferred || other.source_tags_transferred,
             artwork_transferred: self.artwork_transferred || other.artwork_transferred,
-            source_audio_md5_written: self.source_audio_md5_written || other.source_audio_md5_written,
-            authoritative_tags_applied: self.authoritative_tags_applied || other.authoritative_tags_applied,
+            source_audio_md5_written: self.source_audio_md5_written
+                || other.source_audio_md5_written,
+            authoritative_tags_applied: self.authoritative_tags_applied
+                || other.authoritative_tags_applied,
         }
     }
 
     #[must_use]
     pub const fn any(self) -> bool {
-        self.source_tags_transferred || self.artwork_transferred || self.source_audio_md5_written || self.authoritative_tags_applied
+        self.source_tags_transferred
+            || self.artwork_transferred
+            || self.source_audio_md5_written
+            || self.authoritative_tags_applied
     }
 }
 
@@ -1087,7 +1138,10 @@ mod metadata_satisfaction_serde_tests {
 
         let json = serde_json::to_value(value).expect("serialize metadata satisfaction");
 
-        assert_eq!(json["authoritative_tags_applied"], serde_json::Value::Bool(true));
+        assert_eq!(
+            json["authoritative_tags_applied"],
+            serde_json::Value::Bool(true)
+        );
         assert!(json.get("authoritative_tags_written").is_none());
     }
 }
@@ -1201,7 +1255,6 @@ pub enum TrackOutcome {
     Blocked(String),
 }
 
-
 /// DSD/DST operation counters carried through reports and durable logs.
 ///
 /// The app fills this from sacd-rs extraction reports when available and from
@@ -1270,10 +1323,18 @@ impl DsdDstPipelineStats {
         self.crc_passed = self.crc_passed.saturating_add(other.crc_passed);
         self.crc_failed = self.crc_failed.saturating_add(other.crc_failed);
         self.crc_missing = self.crc_missing.saturating_add(other.crc_missing);
-        self.dst_passthrough_frames = self.dst_passthrough_frames.saturating_add(other.dst_passthrough_frames);
-        self.dst_decoded_frames = self.dst_decoded_frames.saturating_add(other.dst_decoded_frames);
-        self.dst_reencoded_frames = self.dst_reencoded_frames.saturating_add(other.dst_reencoded_frames);
-        self.dst_raw_fallback_frames = self.dst_raw_fallback_frames.saturating_add(other.dst_raw_fallback_frames);
+        self.dst_passthrough_frames = self
+            .dst_passthrough_frames
+            .saturating_add(other.dst_passthrough_frames);
+        self.dst_decoded_frames = self
+            .dst_decoded_frames
+            .saturating_add(other.dst_decoded_frames);
+        self.dst_reencoded_frames = self
+            .dst_reencoded_frames
+            .saturating_add(other.dst_reencoded_frames);
+        self.dst_raw_fallback_frames = self
+            .dst_raw_fallback_frames
+            .saturating_add(other.dst_raw_fallback_frames);
         self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
         self.bytes_written = self.bytes_written.saturating_add(other.bytes_written);
         if self.first_error_frame.is_none() {
@@ -1467,7 +1528,6 @@ mod chunk_2_1_3_staging_cleanup_tests {
     }
 }
 
-
 #[cfg(test)]
 mod prepared_track_sample_rate_contract {
     use super::*;
@@ -1493,30 +1553,26 @@ mod prepared_track_sample_rate_contract {
 
     #[test]
     fn scalar_sample_rate_deserializes_legacy_numeric_value() {
-        let track: PreparedTrack = serde_json::from_str(&track_json(
-            "44100",
-            r#"{"primary_sample_rate":44100}"#,
-        ))
-        .expect("legacy scalar sample_rate should deserialize");
+        let track: PreparedTrack =
+            serde_json::from_str(&track_json("44100", r#"{"primary_sample_rate":44100}"#))
+                .expect("legacy scalar sample_rate should deserialize");
         assert_eq!(track.scalar_sample_rate(), Some(44_100));
     }
 
     #[test]
     fn scalar_sample_rate_deserializes_missing_as_unknown() {
         let json = track_json("null", "{}");
-        let track: PreparedTrack = serde_json::from_str(&json)
-            .expect("unknown scalar sample_rate should deserialize");
+        let track: PreparedTrack =
+            serde_json::from_str(&json).expect("unknown scalar sample_rate should deserialize");
         assert_eq!(track.scalar_sample_rate(), None);
         assert!(!track.has_scalar_sample_rate());
     }
 
     #[test]
     fn scalar_sample_rate_treats_zero_as_unknown_for_backward_compatibility() {
-        let track: PreparedTrack = serde_json::from_str(&track_json(
-            "0",
-            r#"{"primary_sample_rate":0}"#,
-        ))
-        .expect("historic zero sentinel should deserialize");
+        let track: PreparedTrack =
+            serde_json::from_str(&track_json("0", r#"{"primary_sample_rate":0}"#))
+                .expect("historic zero sentinel should deserialize");
         assert_eq!(track.sample_rate, None);
         assert_eq!(track.source_audio.primary_sample_rate, None);
         assert_eq!(track.scalar_sample_rate(), None);
@@ -1524,11 +1580,9 @@ mod prepared_track_sample_rate_contract {
 
     #[test]
     fn scalar_sample_rate_can_fall_back_to_source_audio_descriptor() {
-        let track: PreparedTrack = serde_json::from_str(&track_json(
-            "null",
-            r#"{"primary_sample_rate":96000}"#,
-        ))
-        .expect("source_audio primary rate should deserialize");
+        let track: PreparedTrack =
+            serde_json::from_str(&track_json("null", r#"{"primary_sample_rate":96000}"#))
+                .expect("source_audio primary rate should deserialize");
         assert_eq!(track.sample_rate, None);
         assert_eq!(track.scalar_sample_rate(), Some(96_000));
     }
