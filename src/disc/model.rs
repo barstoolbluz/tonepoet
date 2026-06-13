@@ -72,6 +72,10 @@ pub struct DiscPresentation {
     pub format: AudioPresentationFormat,
     pub tracks: Vec<DiscTrack>,
     pub total_duration_secs: f64,
+    pub album_title: Option<String>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
+    pub year: Option<String>,
 }
 
 /// A parser-discovered candidate excluded from the curated presentation list.

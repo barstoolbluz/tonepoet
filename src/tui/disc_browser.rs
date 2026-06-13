@@ -519,8 +519,8 @@ pub fn source_mode_for_presentation(
         metadata,
         tracks,
         area_label: Some(presentation.label.clone()),
-        album_title: contents.album_title.clone(),
-        album_artist: contents.album_artist.clone(),
+        album_title: presentation.album_title.clone().or_else(|| contents.album_title.clone()),
+        album_artist: presentation.album_artist.clone().or_else(|| contents.album_artist.clone()),
         probe_notice: None,
         scroll: 0,
         cursor: 0,
@@ -553,11 +553,27 @@ pub fn source_info_for_presentation(
 
 /// Build a metadata object from disc-level labels without inventing track tags.
 pub fn metadata_for_disc(contents: &DiscContents) -> SourceMetadata {
+    metadata_for_disc_presentation(contents, None)
+}
+
+pub fn metadata_for_disc_presentation(
+    contents: &DiscContents,
+    presentation: Option<&DiscPresentation>,
+) -> SourceMetadata {
     let mut metadata = SourceMetadata::default();
-    metadata.album = contents.album_title.clone();
-    metadata.artist = contents.album_artist.clone();
-    metadata.genre = contents.genre.clone();
-    metadata.year = contents.year.clone();
+    // Per-presentation metadata takes priority over disc-level.
+    metadata.album = presentation
+        .and_then(|p| p.album_title.clone())
+        .or_else(|| contents.album_title.clone());
+    metadata.artist = presentation
+        .and_then(|p| p.album_artist.clone())
+        .or_else(|| contents.album_artist.clone());
+    metadata.genre = presentation
+        .and_then(|p| p.genre.clone())
+        .or_else(|| contents.genre.clone());
+    metadata.year = presentation
+        .and_then(|p| p.year.clone())
+        .or_else(|| contents.year.clone());
     metadata
 }
 

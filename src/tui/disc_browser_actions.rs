@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::disc::{DiscContents, PresentationId};
 use crate::tui::app::{ActiveOverlay, AppScreen, AppState, SourceMode};
 use crate::tui::button_map::TuiButton;
-use crate::tui::disc_browser::{metadata_for_disc, source_mode_for_presentation, DiscBrowserState, DiscProbeFollowup};
+use crate::tui::disc_browser::{metadata_for_disc_presentation, source_mode_for_presentation, DiscBrowserState, DiscProbeFollowup};
 use crate::tui::message::AppMessage;
 
 /// Open the Audio Streams overlay for the currently highlighted browse entry.
@@ -373,7 +373,8 @@ pub fn switch_disc_presentation(
     contents: DiscContents,
     presentation_index: usize,
 ) -> Result<(), String> {
-    let mut metadata = metadata_for_disc(&contents);
+    let presentation = contents.presentations.get(presentation_index);
+    let mut metadata = metadata_for_disc_presentation(&contents, presentation);
     if metadata.album.is_none() && !contents.label.trim().is_empty() {
         metadata.album = Some(contents.label.clone());
     }

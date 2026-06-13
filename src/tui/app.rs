@@ -2733,6 +2733,27 @@ pub enum MetadataEditorPhase {
     Saving,
 }
 
+/// One presentation tab inside a disc-backed metadata editor.
+///
+/// The active tab is also mirrored into `MetadataEditorState`'s legacy
+/// top-level fields (`paths`, `entries`, `file_labels`, `deleted`, and
+/// `dirty`) so the existing editor code keeps working. Call
+/// `sync_active_presentation` before save/populate operations that must
+/// observe the latest active-tab edits.
+#[derive(Debug, Clone)]
+pub struct PresentationTab {
+    pub id: crate::disc::model::PresentationId,
+    pub label: String,
+    pub paths: Vec<std::path::PathBuf>,
+    pub entries: Vec<crate::tui::probe::TagEntry>,
+    pub file_labels: Vec<String>,
+    pub deleted: Vec<usize>,
+    pub dirty: bool,
+    pub sacd_area_kind: Option<crate::tui::sacd::AreaKind>,
+    pub sacd_stereo_durations: Option<Vec<f64>>,
+    pub sacd_multi_channel_durations: Option<Vec<f64>>,
+}
+
 /// State for the metadata editor overlay.
 #[derive(Debug, Clone)]
 pub struct MetadataEditorState {
@@ -2801,6 +2822,220 @@ pub struct MetadataEditorState {
     /// editor is currently surfacing — the sibling-area mirror
     /// (future C-2c) needs both available.
     pub sacd_multi_channel_durations: Option<Vec<f64>>,
+    /// Disc-backed editor tabs. Empty for plain file editors and
+    /// single-presentation disc editors. When non-empty, the active tab is
+    /// mirrored into the legacy top-level editor fields for rendering and
+    /// editing.
+    pub presentation_tabs: Vec<PresentationTab>,
+    /// Active index into `presentation_tabs`. Ignored when the tab vector is
+    /// empty.
+    pub active_tab: usize,
+}
+
+impl MetadataEditorState {
+    pub fn has_presentation_tabs(&self) -> bool {
+        self.presentation_tabs.len() > 1
+    }
+
+    pub fn active_presentation_label(&self) -> Option<&str> {
+        self.presentation_tabs
+            .get(self.active_tab)
+            .map(|tab| tab.label.as_str())
+    }
+
+    pub fn any_presentation_dirty(&self) -> bool {
+        self.dirty || self.presentation_tabs.iter().any(|tab| tab.dirty)
+    }
+
+    pub fn sync_active_presentation(&mut self) {
+        let Some(tab) = self.presentation_tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        tab.paths = self.paths.clone();
+        tab.entries = self.entries.clone();
+        tab.file_labels = self.file_labels.clone();
+        tab.deleted = self.deleted.clone();
+        tab.dirty = self.dirty;
+        tab.sacd_area_kind = self.sacd_area_kind.clone();
+        tab.sacd_stereo_durations = self.sacd_stereo_durations.clone();
+        tab.sacd_multi_channel_durations = self.sacd_multi_channel_durations.clone();
+    }
+
+    pub fn switch_presentation_tab(&mut self, next: usize) -> bool {
+        if next >= self.presentation_tabs.len() || next == self.active_tab {
+            return false;
+        }
+        self.sync_active_presentation();
+        let tab = self.presentation_tabs[next].clone();
+        self.active_tab = next;
+        self.paths = tab.paths;
+        self.entries = tab.entries;
+        self.file_labels = tab.file_labels;
+        self.deleted = tab.deleted;
+        self.dirty = tab.dirty;
+        self.sacd_area_kind = tab.sacd_area_kind;
+        self.sacd_stereo_durations = tab.sacd_stereo_durations;
+        self.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
+        self.cursor = self.cursor.min(self.entries.len());
+        self.scroll = 0;
+        self.last_click = None;
+        self.edit_input = None;
+        self.add_key_input = None;
+        self.detail_field_idx = 0;
+        self.detail_cursor = 0;
+        self.detail_scroll = 0;
+        self.detail_edit = None;
+        self.phase = MetadataEditorPhase::Editing;
+        true
+    }
+
+    pub fn next_presentation_tab(&mut self) -> bool {
+        if self.presentation_tabs.len() <= 1 {
+            return false;
+        }
+        let next = (self.active_tab + 1) % self.presentation_tabs.len();
+        self.switch_presentation_tab(next)
+    }
+
+    pub fn previous_presentation_tab(&mut self) -> bool {
+        if self.presentation_tabs.len() <= 1 {
+            return false;
+        }
+        let next = if self.active_tab == 0 {
+            self.presentation_tabs.len() - 1
+        } else {
+            self.active_tab - 1
+        };
+        self.switch_presentation_tab(next)
+    }
+
+    pub fn mark_all_presentations_saved(&mut self) {
+        self.sync_active_presentation();
+        for tab in &mut self.presentation_tabs {
+            tab.dirty = false;
+            for entry in &mut tab.entries {
+                entry.per_file_originals = entry.per_file_values.clone();
+                entry.original = entry.value.clone();
+                entry.mb_proposed_value = None;
+                entry.mb_proposed_per_file = None;
+            }
+            tab.deleted.clear();
+        }
+        if let Some(tab) = self.presentation_tabs.get(self.active_tab).cloned() {
+            self.entries = tab.entries;
+            self.deleted = tab.deleted;
+            self.dirty = false;
+        } else {
+            self.dirty = false;
+            self.deleted.clear();
+            for entry in &mut self.entries {
+                entry.per_file_originals = entry.per_file_values.clone();
+                entry.original = entry.value.clone();
+                entry.mb_proposed_value = None;
+                entry.mb_proposed_per_file = None;
+            }
+        }
+    }
+
+    pub fn apply_active_musicbrainz_values_to_matching_presentations(&mut self) -> usize {
+        if self.presentation_tabs.len() <= 1 {
+            return 0;
+        }
+        self.sync_active_presentation();
+        let Some(active) = self.presentation_tabs.get(self.active_tab).cloned() else {
+            return 0;
+        };
+        let track_count = active.paths.len();
+        let mut changed_tabs = 0usize;
+        for (idx, tab) in self.presentation_tabs.iter_mut().enumerate() {
+            if idx == self.active_tab || tab.paths.len() != track_count {
+                continue;
+            }
+            let copied = copy_musicbrainz_entries_preserving_originals(
+                &active.entries,
+                &mut tab.entries,
+                track_count,
+            );
+            if copied == 0 {
+                continue;
+            }
+            tab.deleted.clear();
+            tab.dirty = true;
+            changed_tabs += 1;
+        }
+        if let Some(tab) = self.presentation_tabs.get(self.active_tab).cloned() {
+            self.entries = tab.entries;
+            self.paths = tab.paths;
+            self.file_labels = tab.file_labels;
+            self.deleted = tab.deleted;
+            self.dirty = tab.dirty;
+        }
+        changed_tabs
+    }
+}
+
+fn copy_musicbrainz_entries_preserving_originals(
+    src_entries: &[crate::tui::probe::TagEntry],
+    dst_entries: &mut Vec<crate::tui::probe::TagEntry>,
+    track_count: usize,
+) -> usize {
+    let mut copied = 0usize;
+    for src in src_entries {
+        if !entry_was_populated_from_musicbrainz(src) {
+            continue;
+        }
+
+        let idx = dst_entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case(&src.display_key));
+        match idx {
+            Some(i) => {
+                let dst = &mut dst_entries[i];
+                dst.item_key = src.item_key.clone();
+                dst.value = src.value.clone();
+                dst.is_binary = src.is_binary;
+                dst.is_mixed = src.is_mixed;
+                dst.per_file_values = normalize_entry_values_for_track_count(src, track_count);
+                dst.mb_proposed_value = Some(src.value.clone());
+                dst.mb_proposed_per_file = Some(dst.per_file_values.clone());
+                if dst.per_file_originals.len() != dst.per_file_values.len() {
+                    dst.per_file_originals.resize(dst.per_file_values.len(), String::new());
+                }
+            }
+            None => {
+                let values = normalize_entry_values_for_track_count(src, track_count);
+                let mut entry = src.clone();
+                entry.per_file_values = values.clone();
+                entry.per_file_originals = vec![String::new(); values.len()];
+                entry.value = src.value.clone();
+                entry.original = String::new();
+                entry.mb_proposed_value = Some(src.value.clone());
+                entry.mb_proposed_per_file = Some(values);
+                dst_entries.push(entry);
+            }
+        }
+        copied += 1;
+    }
+    copied
+}
+
+fn entry_was_populated_from_musicbrainz(entry: &crate::tui::probe::TagEntry) -> bool {
+    entry.mb_proposed_value.is_some() || entry.mb_proposed_per_file.is_some()
+}
+
+fn normalize_entry_values_for_track_count(
+    src: &crate::tui::probe::TagEntry,
+    track_count: usize,
+) -> Vec<String> {
+    if src.per_file_values.len() == track_count {
+        src.per_file_values.clone()
+    } else if src.per_file_values.len() == 1 {
+        vec![src.per_file_values[0].clone(); track_count]
+    } else {
+        (0..track_count)
+            .map(|i| src.per_file_values.get(i).cloned().unwrap_or_default())
+            .collect()
+    }
 }
 
 /// State cached on `MetadataEditorState::mb_back` to support the
@@ -3223,6 +3458,9 @@ pub enum ConfirmAction {
     /// discarding any edits. Carries the cached review state so the
     /// per-track edits are preserved on re-entry.
     GnudbBack(Box<GnudbReviewState>),
+    /// Copy the active tab's just-populated MusicBrainz values to every
+    /// other presentation tab that has the same track count.
+    ApplyMbToAllPresentations(Box<MetadataEditorState>),
     RemoveSelected,
     ClearCompleted,
     ClearFinished,
@@ -5653,5 +5891,198 @@ mod mb_select_state_tests {
         let s = MbSelectState::new(vec![], vec![]);
         assert_eq!(s.releases.len(), 0);
         assert_eq!(s.selected, 0);
+    }
+}
+
+#[cfg(test)]
+mod metadata_presentation_tab_tests {
+    use super::*;
+    use crate::disc::model::PresentationId;
+    use crate::tui::probe::TagEntry;
+    use lofty::tag::ItemKey;
+
+    fn tag(display_key: &str, value: &str, per_file_values: Vec<&str>) -> TagEntry {
+        TagEntry {
+            display_key: display_key.to_string(),
+            item_key: ItemKey::TrackTitle,
+            value: value.to_string(),
+            original: value.to_string(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: per_file_values.iter().map(|v| (*v).to_string()).collect(),
+            per_file_originals: per_file_values.iter().map(|v| (*v).to_string()).collect(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    fn mb_tag(display_key: &str, value: &str, per_file_values: Vec<&str>) -> TagEntry {
+        let mut entry = tag(display_key, value, per_file_values);
+        entry.mb_proposed_value = Some(entry.value.clone());
+        entry.mb_proposed_per_file = Some(entry.per_file_values.clone());
+        entry
+    }
+
+    fn tab(id: PresentationId, label: &str, entries: Vec<TagEntry>, n_paths: usize) -> PresentationTab {
+        PresentationTab {
+            id,
+            label: label.to_string(),
+            paths: (0..n_paths)
+                .map(|idx| std::path::PathBuf::from(format!("/disc/track{:02}.flac", idx + 1)))
+                .collect(),
+            entries,
+            file_labels: (0..n_paths).map(|idx| format!("Track {:02}", idx + 1)).collect(),
+            deleted: Vec::new(),
+            dirty: false,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+        }
+    }
+
+    fn state_with_tabs(tabs: Vec<PresentationTab>, active_tab: usize) -> MetadataEditorState {
+        let active = tabs[active_tab].clone();
+        MetadataEditorState {
+            paths: active.paths,
+            entries: active.entries,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: active.dirty,
+            deleted: active.deleted,
+            file_labels: active.file_labels,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: active.sacd_area_kind,
+            sacd_stereo_durations: active.sacd_stereo_durations,
+            sacd_multi_channel_durations: active.sacd_multi_channel_durations,
+            presentation_tabs: tabs,
+            active_tab,
+        }
+    }
+
+    #[test]
+    fn switching_tabs_persists_active_edits_and_restores_target_state() {
+        let tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "old mch", vec!["old mch"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(3),
+                "Group 3",
+                vec![tag("TITLE", "old stereo", vec!["old stereo"])],
+                1,
+            ),
+        ];
+        let mut state = state_with_tabs(tabs, 0);
+        state.entries[0].value = "edited mch".to_string();
+        state.entries[0].per_file_values = vec!["edited mch".to_string()];
+        state.dirty = true;
+
+        assert!(state.switch_presentation_tab(1));
+        assert_eq!(state.presentation_tabs[0].entries[0].value, "edited mch");
+        assert!(state.presentation_tabs[0].dirty);
+        assert_eq!(state.entries[0].value, "old stereo");
+
+        assert!(state.switch_presentation_tab(0));
+        assert_eq!(state.entries[0].value, "edited mch");
+    }
+
+    #[test]
+    fn apply_active_musicbrainz_values_copies_only_matching_track_counts() {
+        let tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![mb_tag("TITLE", "MB title", vec!["MB 01", "MB 02"])],
+                2,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(3),
+                "Group 3",
+                vec![tag("TITLE", "old stereo", vec!["old 01", "old 02"])],
+                2,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(4),
+                "Group 4",
+                vec![tag("TITLE", "bonus", vec!["bonus 01"])],
+                1,
+            ),
+        ];
+        let mut state = state_with_tabs(tabs, 0);
+
+        let copied = state.apply_active_musicbrainz_values_to_matching_presentations();
+
+        assert_eq!(copied, 1);
+        assert_eq!(
+            state.presentation_tabs[1].entries[0].per_file_values,
+            vec!["MB 01".to_string(), "MB 02".to_string()]
+        );
+        assert_eq!(
+            state.presentation_tabs[1].entries[0].per_file_originals,
+            vec!["old 01".to_string(), "old 02".to_string()]
+        );
+        assert!(state.presentation_tabs[1].dirty);
+        assert_eq!(state.presentation_tabs[2].entries[0].value, "bonus");
+    }
+
+    #[test]
+    fn apply_active_musicbrainz_values_preserves_internal_and_non_mb_fields() {
+        let tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![
+                    tag("DVDA_GROUP", "1", vec!["1", "1"]),
+                    mb_tag("TITLE", "MB title", vec!["MB 01", "MB 02"]),
+                    tag("COMMENT", "active note", vec!["active 01", "active 02"]),
+                ],
+                2,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(3),
+                "Group 3",
+                vec![
+                    tag("DVDA_GROUP", "3", vec!["3", "3"]),
+                    tag("TITLE", "old stereo", vec!["old 01", "old 02"]),
+                    tag("COMMENT", "destination note", vec!["dest 01", "dest 02"]),
+                ],
+                2,
+            ),
+        ];
+        let mut state = state_with_tabs(tabs, 0);
+
+        let copied = state.apply_active_musicbrainz_values_to_matching_presentations();
+
+        assert_eq!(copied, 1);
+        let dest_entries = &state.presentation_tabs[1].entries;
+        let by_key = |key: &str| {
+            dest_entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case(key))
+                .expect(key)
+        };
+
+        assert_eq!(by_key("TITLE").per_file_values, vec!["MB 01".to_string(), "MB 02".to_string()]);
+        assert_eq!(by_key("DVDA_GROUP").value, "3");
+        assert_eq!(by_key("DVDA_GROUP").per_file_values, vec!["3".to_string(), "3".to_string()]);
+        assert_eq!(by_key("COMMENT").value, "destination note");
+        assert_eq!(
+            by_key("COMMENT").per_file_values,
+            vec!["dest 01".to_string(), "dest 02".to_string()]
+        );
     }
 }

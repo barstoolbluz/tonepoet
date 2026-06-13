@@ -3127,6 +3127,17 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
 ///   2. Single non-SACD file: `" Metadata: <name> "`.
 ///   3. Multi-file non-SACD edit: `" Metadata: <N> files "`.
 pub(super) fn editor_title(state: &super::app::MetadataEditorState) -> String {
+    if state.has_presentation_tabs() {
+        let src_name = state
+            .paths
+            .first()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let label = state.active_presentation_label().unwrap_or("presentation");
+        let ro = if state.read_only { " · read-only" } else { "" };
+        return format!(" Metadata: {}  [{}{}] ", src_name, label, ro);
+    }
     if let Some(area) = state.sacd_area_kind {
         // SACD editor: paths are the ISO repeated per virtual track;
         // surface the disc name + which area is being edited.
@@ -3153,6 +3164,45 @@ pub(super) fn editor_title(state: &super::app::MetadataEditorState) -> String {
     }
 }
 
+fn draw_metadata_presentation_tabs(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    area: Rect,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut x = area.x + 1;
+    for (idx, tab) in state.presentation_tabs.iter().enumerate() {
+        let label = truncate_to_chars(&tab.label, 28);
+        let text = format!(" {}{} ", label, if tab.dirty { " *" } else { "" });
+        let width = text.chars().count() as u16;
+        if idx == state.active_tab {
+            spans.push(Span::styled(
+                text,
+                Style::default()
+                    .fg(theme::PILL_ACTIVE_FG)
+                    .bg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(text, Style::default().fg(theme::TEXT_DIM)));
+        }
+        if width > 0 {
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataEditorTab(idx),
+                Rect::new(x, area.y, width, 1),
+            );
+            x = x.saturating_add(width);
+        }
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(1);
+        if x >= area.x.saturating_add(area.width) {
+            break;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 /// Draw the full metadata editor overlay.
 fn draw_metadata_editor(
     f: &mut Frame,
@@ -3175,7 +3225,7 @@ fn draw_metadata_editor(
     f.render_widget(Clear, popup);
 
     let title = editor_title(state);
-    let border_color = if state.dirty {
+    let border_color = if state.any_presentation_dirty() {
         theme::AMBER
     } else {
         theme::CYAN
@@ -3196,18 +3246,39 @@ fn draw_metadata_editor(
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
+    let chunks = if state.has_presentation_tabs() {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner)
+    };
 
-    let content_h = chunks[0].height as usize;
-    let inner_w = chunks[0].width as usize;
+    let (tab_area, content_area, footer_area) = if state.has_presentation_tabs() {
+        (Some(chunks[0]), chunks[1], chunks[2])
+    } else {
+        (None, chunks[0], chunks[1])
+    };
+
+    if let Some(tab_area) = tab_area {
+        draw_metadata_presentation_tabs(f, state, tab_area, button_map);
+    }
+
+    let content_h = content_area.height as usize;
+    let inner_w = content_area.width as usize;
 
     // Detail edit mode: show per-file values for one field.
     if state.phase == MetadataEditorPhase::DetailEdit {
         draw_metadata_detail(
-            f, state, chunks[0], chunks[1], inner_w, content_h, button_map,
+            f, state, content_area, footer_area, inner_w, content_h, button_map,
         );
         return;
     }
@@ -3538,11 +3609,11 @@ fn draw_metadata_editor(
             // register but the click handler will reject by row range.
             if i >= scroll && i < scroll + content_h {
                 let visible_row = (i - scroll) as u16;
-                let view_screen_x = chunks[0].x + (key_chars + val_for_pill) as u16;
+                let view_screen_x = content_area.x + (key_chars + val_for_pill) as u16;
                 if view_w > 0 {
                     button_map.record_button(
                         super::button_map::TuiButton::MetadataEntryView(i),
-                        Rect::new(view_screen_x, chunks[0].y + visible_row, view_w as u16, 1),
+                        Rect::new(view_screen_x, content_area.y + visible_row, view_w as u16, 1),
                     );
                 }
                 if pill_w > 0 {
@@ -3550,7 +3621,7 @@ fn draw_metadata_editor(
                         super::button_map::TuiButton::MetadataEntryRevert(i),
                         Rect::new(
                             view_screen_x + view_w as u16,
-                            chunks[0].y + visible_row,
+                            content_area.y + visible_row,
                             pill_w as u16,
                             1,
                         ),
@@ -3608,7 +3679,7 @@ fn draw_metadata_editor(
 
     // Apply scroll.
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
-    f.render_widget(Paragraph::new(visible_lines), chunks[0]);
+    f.render_widget(Paragraph::new(visible_lines), content_area);
 
     // Footer: clickable pill-style buttons with key hints.
     let footer = match state.phase {
@@ -3667,7 +3738,7 @@ fn draw_metadata_editor(
     };
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
-        chunks[1],
+        footer_area,
     );
 }
 
@@ -5793,6 +5864,8 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: Vec::new(),
+            active_tab: 0,
         }
     }
 

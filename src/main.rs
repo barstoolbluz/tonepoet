@@ -1856,6 +1856,8 @@ fn build_audio_state_for_cli(
         sacd_area_kind: None,
         sacd_stereo_durations: None,
         sacd_multi_channel_durations: None,
+        presentation_tabs: Vec::new(),
+        active_tab: 0,
     })
 }
 

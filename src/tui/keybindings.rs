@@ -1460,19 +1460,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     execute_confirm_action(app, &action, tx);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    app.active_overlay = ActiveOverlay::None;
-                    // Restore any parked overlay the colon command
-                    // stashed before opening the confirmation. Today
-                    // only ConfirmAction::MbBack parks the editor;
-                    // future actions that park overlays get this
-                    // restore for free. Pending fields are left
-                    // untouched if active_overlay was already set
-                    // to something else by a future dispatch.
-                    if let Some(parked) = app.pending_metadata_editor.take() {
-                        if matches!(app.active_overlay, ActiveOverlay::None) {
-                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
-                        }
-                    }
+                    cancel_confirm_action(app, Some(&action));
                 }
                 _ => {}
             }
@@ -2945,7 +2933,8 @@ pub(super) fn metadata_editor_save(
         }
         return;
     }
-    if !state.dirty {
+    state.sync_active_presentation();
+    if !state.any_presentation_dirty() {
         app.set_status("No changes to save");
         return;
     }
@@ -2954,11 +2943,7 @@ pub(super) fn metadata_editor_save(
         if state.sacd_area_kind.is_none() {
             match save_dvda_metabase(state, &sidecar_path) {
                 Ok(kind) => {
-                    state.dirty = false;
-                    for e in state.entries.iter_mut() {
-                        e.per_file_originals = e.per_file_values.clone();
-                        e.original = e.value.clone();
-                    }
+                    state.mark_all_presentations_saved();
                     let verb = match kind {
                         SacdSaveKind::Created => "created",
                         SacdSaveKind::Updated => "updated",
@@ -2978,13 +2963,7 @@ pub(super) fn metadata_editor_save(
 
         match save_sacd_sidecar(state, &sidecar_path) {
             Ok(outcome) => {
-                state.dirty = false;
-                // Sync `original` snapshots so the next save shows
-                // no changes (matches lofty path's post-save state).
-                for e in state.entries.iter_mut() {
-                    e.per_file_originals = e.per_file_values.clone();
-                    e.original = e.value.clone();
-                }
+                state.mark_all_presentations_saved();
                 let verb = match outcome.kind {
                     SacdSaveKind::Created => "created",
                     SacdSaveKind::Updated => "updated",
@@ -2993,29 +2972,30 @@ pub(super) fn metadata_editor_save(
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| sidecar_path.display().to_string());
-                // Phase D: name the mirror outcome on hybrid SACDs so
-                // the user sees both areas got touched. Single-area
-                // SACDs and stereo-only saves keep the prior message.
-                let mirror = outcome.mirror;
-                let surfaced = match state.sacd_area_kind {
-                    Some(super::sacd::AreaKind::Stereo) => "stereo",
-                    Some(super::sacd::AreaKind::MultiChannel) => "MCH",
-                    None => "?",
-                };
-                let sibling = match state.sacd_area_kind {
-                    Some(super::sacd::AreaKind::Stereo) => "MCH",
-                    Some(super::sacd::AreaKind::MultiChannel) => "stereo",
-                    None => "?",
-                };
-                let area_note = if !mirror.sibling_present {
-                    format!("{} area only", surfaced)
-                } else if mirror.mirrored_count == mirror.sibling_total {
-                    format!("{} + {} areas", surfaced, sibling)
+                let area_note = if state.presentation_tabs.len() > 1 {
+                    format!("{} areas", state.presentation_tabs.len())
                 } else {
-                    format!(
-                        "{} + {}/{} {} tracks (count differs)",
-                        surfaced, mirror.mirrored_count, mirror.sibling_total, sibling,
-                    )
+                    let mirror = outcome.mirror;
+                    let surfaced = match state.sacd_area_kind {
+                        Some(super::sacd::AreaKind::Stereo) => "stereo",
+                        Some(super::sacd::AreaKind::MultiChannel) => "MCH",
+                        None => "?",
+                    };
+                    let sibling = match state.sacd_area_kind {
+                        Some(super::sacd::AreaKind::Stereo) => "MCH",
+                        Some(super::sacd::AreaKind::MultiChannel) => "stereo",
+                        None => "?",
+                    };
+                    if !mirror.sibling_present {
+                        format!("{} area only", surfaced)
+                    } else if mirror.mirrored_count == mirror.sibling_total {
+                        format!("{} + {} areas", surfaced, sibling)
+                    } else {
+                        format!(
+                            "{} + {}/{} {} tracks (count differs)",
+                            surfaced, mirror.mirrored_count, mirror.sibling_total, sibling,
+                        )
+                    }
                 };
                 app.set_status(format!(
                     "SACD sidecar {} ({}): {}",
@@ -3069,6 +3049,22 @@ pub(super) fn metadata_editor_save(
     });
 }
 
+pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
+    app: &mut AppState,
+    mut state: Box<super::app::MetadataEditorState>,
+) {
+    state.sync_active_presentation();
+    if state.has_presentation_tabs() {
+        app.pending_metadata_editor = Some(state.clone());
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: "Apply MusicBrainz tags to all matching presentations?".to_string(),
+            action: ConfirmAction::ApplyMbToAllPresentations(state),
+        };
+    } else {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+    }
+}
+
 fn handle_metadata_editor_key(
     app: &mut AppState,
     key: KeyEvent,
@@ -3093,11 +3089,38 @@ fn handle_metadata_editor_key(
                     return;
                 }
                 KeyCode::Esc => {
-                    if state.dirty {
+                    if state.any_presentation_dirty() {
                         // TODO: confirmation dialog for unsaved changes
                         // For now, just close.
                     }
                     app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Tab => {
+                    let changed = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        state.previous_presentation_tab()
+                    } else {
+                        state.next_presentation_tab()
+                    };
+                    if changed {
+                        if let Some(label) = state.active_presentation_label() {
+                            app.set_status(format!("metadata editor: {}", label));
+                        }
+                    }
+                }
+                KeyCode::BackTab => {
+                    if state.previous_presentation_tab() {
+                        if let Some(label) = state.active_presentation_label() {
+                            app.set_status(format!("metadata editor: {}", label));
+                        }
+                    }
+                }
+                KeyCode::Char(c) if key.modifiers.is_empty() && ('1'..='9').contains(&c) => {
+                    let idx = (c as u8 - b'1') as usize;
+                    if state.switch_presentation_tab(idx) {
+                        if let Some(label) = state.active_presentation_label() {
+                            app.set_status(format!("metadata editor: {}", label));
+                        }
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.cursor = state.cursor.saturating_sub(1);
@@ -4398,6 +4421,8 @@ pub fn open_metadata_editor(app: &mut AppState) {
         sacd_area_kind: None,
         sacd_stereo_durations: None,
         sacd_multi_channel_durations: None,
+        presentation_tabs: Vec::new(),
+        active_tab: 0,
     }));
 }
 
@@ -4440,9 +4465,12 @@ fn open_metadata_editor_for_dvda_with_group(
             }
         };
 
-    match build_dvda_editor_state(
+    let disc_contents = current_dvda_disc_contents(app, &source_path);
+
+    match build_dvda_multitab_editor_state(
         &source_path,
         &disc,
+        disc_contents.as_ref(),
         &store_id,
         metabase_path.as_ref(),
         metabase.as_ref(),
@@ -4460,15 +4488,7 @@ fn open_metadata_editor_for_dvda_with_group(
                 "IFO"
             };
             let mode = if state.read_only { "read-only" } else { "writable" };
-            let choices = super::dvda_metabase::available_groups(&disc);
-            let choice_note = if choices.len() > 1 {
-                format!(
-                    "; switch with :dvda-group <n> [{}]",
-                    super::dvda_metabase::group_choice_hint(&disc),
-                )
-            } else {
-                String::new()
-            };
+            let choice_note = dvda_editor_tab_choice_note(&state);
             app.set_status(format!(
                 "DVD-Audio editor opened ({}, {} tracks, {}, {}){}",
                 group_label, n_tracks, src, mode, choice_note,
@@ -4476,6 +4496,46 @@ fn open_metadata_editor_for_dvda_with_group(
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(Box::new(state));
         }
         Err(msg) => app.set_status(msg),
+    }
+}
+
+fn current_dvda_disc_contents(
+    app: &AppState,
+    source_path: &std::path::Path,
+) -> Option<crate::disc::model::DiscContents> {
+    if let super::app::SourceMode::MultiTrack {
+        path,
+        disc_contents: Some(contents),
+        ..
+    } = &app.convert.source.mode
+    {
+        if path.as_path() == source_path {
+            return Some((**contents).clone());
+        }
+    }
+
+    crate::disc::dvda_utils::map_dvda_source(source_path).ok()
+}
+
+fn dvda_editor_tab_choice_note(state: &super::app::MetadataEditorState) -> String {
+    if state.presentation_tabs.len() <= 1 {
+        return String::new();
+    }
+
+    let hint = state
+        .presentation_tabs
+        .iter()
+        .filter_map(|tab| match &tab.id {
+            crate::disc::model::PresentationId::DvdAudioGroup(_) => Some(tab.label.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if hint.is_empty() {
+        String::new()
+    } else {
+        format!("; switch with :dvda-group <n> [{}]", hint)
     }
 }
 
@@ -4526,9 +4586,157 @@ fn load_dvda_metabase_context_from_volume(
     Ok((disc, store_id, metabase_path, metabase, parse_note))
 }
 
+#[derive(Debug, Clone)]
+struct DvdaPresentationTabSpec {
+    group_nr: u8,
+    label: String,
+}
+
+fn dvda_presentation_tab_specs(
+    disc: &crate::tui::dvda::DvdaDisc,
+    disc_contents: Option<&crate::disc::model::DiscContents>,
+    available_groups: &[super::dvda_metabase::DvdaGroupSummary],
+) -> Vec<DvdaPresentationTabSpec> {
+    let mut specs = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    if let Some(contents) = disc_contents {
+        for presentation in &contents.presentations {
+            let group_nr = match &presentation.id {
+                crate::disc::model::PresentationId::DvdAudioGroup(group_nr) => *group_nr,
+                _ => continue,
+            };
+            if !available_groups.iter().any(|group| group.group_nr == group_nr) {
+                continue;
+            }
+            if !seen.insert(group_nr) {
+                continue;
+            }
+            specs.push(DvdaPresentationTabSpec {
+                group_nr,
+                label: dvda_presentation_tab_label(presentation, group_nr),
+            });
+        }
+    }
+
+    if !specs.is_empty() {
+        return specs;
+    }
+
+    available_groups
+        .iter()
+        .map(|summary| DvdaPresentationTabSpec {
+            group_nr: summary.group_nr,
+            label: dvda_fallback_group_label(disc, summary.group_nr),
+        })
+        .collect()
+}
+
+fn dvda_presentation_label_for_group(
+    disc: &crate::tui::dvda::DvdaDisc,
+    disc_contents: Option<&crate::disc::model::DiscContents>,
+    group_nr: u8,
+) -> String {
+    disc_contents
+        .and_then(|contents| {
+            contents.presentations.iter().find_map(|presentation| match &presentation.id {
+                crate::disc::model::PresentationId::DvdAudioGroup(n) if *n == group_nr => {
+                    Some(dvda_presentation_tab_label(presentation, group_nr))
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| dvda_fallback_group_label(disc, group_nr))
+}
+
+fn dvda_presentation_tab_label(
+    presentation: &crate::disc::model::DiscPresentation,
+    group_nr: u8,
+) -> String {
+    let detail = if presentation.label.trim().is_empty() {
+        dvda_audio_format_label(&presentation.format).unwrap_or_else(|| "audio presentation".to_string())
+    } else {
+        presentation.label.trim().to_string()
+    };
+
+    let lower = detail.to_ascii_lowercase();
+    let group_prefix = format!("group {}", group_nr).to_ascii_lowercase();
+    if lower.starts_with(&group_prefix) {
+        detail
+    } else {
+        format!("Group {}: {}", group_nr, detail)
+    }
+}
+
+fn dvda_fallback_group_label(disc: &crate::tui::dvda::DvdaDisc, group_nr: u8) -> String {
+    super::dvda_metabase::select_group(disc, Some(group_nr))
+        .map(|group| super::dvda_metabase::group_label(disc, group))
+        .unwrap_or_else(|_| format!("Group {}", group_nr))
+}
+
+fn dvda_audio_format_label(format: &crate::disc::model::AudioPresentationFormat) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(codec) = non_empty(&format.codec) {
+        parts.push(codec.to_string());
+    }
+
+    let mut rate_depth = String::new();
+    if let Some(sample_rate) = format.sample_rate {
+        rate_depth.push_str(&format_sample_rate_hz(sample_rate));
+    }
+    if let Some(bit_depth) = format.bit_depth {
+        if !rate_depth.is_empty() {
+            rate_depth.push('/');
+        }
+        rate_depth.push_str(&format!("{}-bit", bit_depth));
+    }
+    if !rate_depth.is_empty() {
+        parts.push(rate_depth);
+    }
+
+    if let Some(layout) = non_empty(&format.channel_layout) {
+        parts.push(layout.to_string());
+    } else if let Some(channels) = format.channels {
+        parts.push(format_channel_count(channels));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn non_empty(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn format_sample_rate_hz(sample_rate: u32) -> String {
+    if sample_rate % 1000 == 0 {
+        format!("{}kHz", sample_rate / 1000)
+    } else if sample_rate % 100 == 0 {
+        format!("{:.1}kHz", sample_rate as f64 / 1000.0)
+    } else {
+        format!("{}Hz", sample_rate)
+    }
+}
+
+fn format_channel_count(channels: u8) -> String {
+    match channels {
+        0 => "unknown channels".to_string(),
+        1 => "Mono".to_string(),
+        2 => "Stereo".to_string(),
+        6 => "5.1".to_string(),
+        8 => "7.1".to_string(),
+        n => format!("{} ch", n),
+    }
+}
+
 pub fn build_dvda_editor_state(
     source_path: &std::path::Path,
     disc: &crate::tui::dvda::DvdaDisc,
+    disc_contents: Option<&crate::disc::model::DiscContents>,
     store_id: &str,
     existing_metabase_path: Option<&std::path::PathBuf>,
     metabase: Option<&super::dvda_metabase::DvdaMetabase>,
@@ -4544,6 +4752,7 @@ pub fn build_dvda_editor_state(
     if n_tracks == 0 {
         return Err("DVD-Audio group has zero tracks".to_string());
     }
+    let group_track_ids: Vec<String> = track_addrs.iter().map(|addr| addr.id.clone()).collect();
 
     let paths = vec![source_path.to_path_buf(); n_tracks];
     let mut entries: Vec<TagEntry> = Vec::new();
@@ -4612,7 +4821,7 @@ pub fn build_dvda_editor_state(
         ("ORIGINALDATE", ItemKey::OriginalReleaseDate, vec!["ORIGINALDATE"]),
         ("RELEASECOUNTRY", ItemKey::Unknown("RELEASECOUNTRY".to_string()), vec!["RELEASECOUNTRY"]),
     ] {
-        if let Some(v) = super::dvda_metabase::album_value(metabase, &aliases) {
+        if let Some(v) = super::dvda_metabase::album_value_for_track_ids(metabase, &group_track_ids, &aliases) {
             push_album(&mut entries, display_key, item_key, v);
         }
     }
@@ -4695,10 +4904,89 @@ pub fn build_dvda_editor_state(
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: Vec::new(),
+            active_tab: 0,
         },
-        super::dvda_metabase::group_label(disc, group),
+        dvda_presentation_label_for_group(disc, disc_contents, group.group_nr),
         n_tracks,
     ))
+}
+
+pub fn build_dvda_multitab_editor_state(
+    source_path: &std::path::Path,
+    disc: &crate::tui::dvda::DvdaDisc,
+    disc_contents: Option<&crate::disc::model::DiscContents>,
+    store_id: &str,
+    existing_metabase_path: Option<&std::path::PathBuf>,
+    metabase: Option<&super::dvda_metabase::DvdaMetabase>,
+    selected_group_nr: Option<u8>,
+) -> Result<(super::app::MetadataEditorState, String, usize), String> {
+    let groups = super::dvda_metabase::available_groups(disc);
+    // `available_groups` supplies metabase track ids and validates non-empty groups.
+    // The user-visible tab source and labels come from DiscContents.presentations
+    // whenever that unified disc model is available.
+    let tab_specs = dvda_presentation_tab_specs(disc, disc_contents, &groups);
+
+    if tab_specs.len() <= 1 {
+        return build_dvda_editor_state(
+            source_path,
+            disc,
+            disc_contents,
+            store_id,
+            existing_metabase_path,
+            metabase,
+            selected_group_nr.or_else(|| tab_specs.first().map(|spec| spec.group_nr)),
+        );
+    }
+
+    let requested_group_nr = selected_group_nr
+        .or_else(|| super::dvda_metabase::select_group(disc, None).ok().map(|group| group.group_nr));
+    let default_group_nr = requested_group_nr
+        .filter(|group_nr| tab_specs.iter().any(|spec| spec.group_nr == *group_nr))
+        .unwrap_or(tab_specs[0].group_nr);
+    let mut tabs: Vec<super::app::PresentationTab> = Vec::new();
+    let mut states: Vec<(super::app::MetadataEditorState, String, usize, u8)> = Vec::new();
+
+    for spec in &tab_specs {
+        let (state, _label, n_tracks) = build_dvda_editor_state(
+            source_path,
+            disc,
+            disc_contents,
+            store_id,
+            existing_metabase_path,
+            metabase,
+            Some(spec.group_nr),
+        )?;
+        tabs.push(super::app::PresentationTab {
+            id: crate::disc::model::PresentationId::DvdAudioGroup(spec.group_nr),
+            label: spec.label.clone(),
+            paths: state.paths.clone(),
+            entries: state.entries.clone(),
+            file_labels: state.file_labels.clone(),
+            deleted: state.deleted.clone(),
+            dirty: state.dirty,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+        });
+        states.push((state, spec.label.clone(), n_tracks, spec.group_nr));
+    }
+
+    let active_idx = states
+        .iter()
+        .position(|(_, _, _, group_nr)| *group_nr == default_group_nr)
+        .unwrap_or(0);
+    let (mut state, label, n_tracks, _) = states.remove(active_idx);
+    state.presentation_tabs = tabs;
+    state.active_tab = active_idx;
+    if let Some(tab) = state.presentation_tabs.get(active_idx).cloned() {
+        state.paths = tab.paths;
+        state.entries = tab.entries;
+        state.file_labels = tab.file_labels;
+        state.deleted = tab.deleted;
+        state.dirty = tab.dirty;
+    }
+    Ok((state, label, n_tracks))
 }
 
 fn find_single_dvda_source_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -4762,10 +5050,29 @@ pub fn save_dvda_metabase(
     let group = super::dvda_metabase::select_group(&disc, selected_group_nr)
         .map_err(|e| e.to_string())?;
     let track_ids = super::dvda_metabase::group_track_ids(&disc, group);
-    if track_ids.len() != state.paths.len() {
+    let seeded = super::dvda_metabase::seed_from_disc(&disc, &store_id);
+
+    save_dvda_metabase_with_loaded_context(state, metabase_path, &seeded, track_ids, |group_nr| {
+        let group = super::dvda_metabase::select_group(&disc, Some(group_nr))
+            .map_err(|e| e.to_string())?;
+        Ok(super::dvda_metabase::group_track_ids(&disc, group))
+    })
+}
+
+fn save_dvda_metabase_with_loaded_context<F>(
+    state: &super::app::MetadataEditorState,
+    metabase_path: &std::path::Path,
+    seeded: &super::dvda_metabase::DvdaMetabase,
+    selected_track_ids: Vec<String>,
+    mut track_ids_for_group: F,
+) -> Result<SacdSaveKind, String>
+where
+    F: FnMut(u8) -> Result<Vec<String>, String>,
+{
+    if selected_track_ids.len() != state.paths.len() {
         return Err(format!(
             "DVD-Audio group has {} track(s) but editor has {}; refusing to map",
-            track_ids.len(),
+            selected_track_ids.len(),
             state.paths.len(),
         ));
     }
@@ -4779,20 +5086,80 @@ pub fn save_dvda_metabase(
         super::dvda_metabase::parse_metabase(metabase_path)
             .map_err(|e| format!("re-read metabase: {}", e))?
     } else {
-        super::dvda_metabase::seed_from_disc(&disc, &store_id)
+        seeded.clone()
     };
 
-    let seeded = super::dvda_metabase::seed_from_disc(&disc, &store_id);
-    for id in &track_ids {
-        if super::dvda_metabase::track(&metabase, id).is_none() {
+    if !state.presentation_tabs.is_empty() {
+        apply_dvda_presentation_tabs_to_metabase(
+            &mut metabase,
+            seeded,
+            &state.presentation_tabs,
+            |group_nr| track_ids_for_group(group_nr),
+        )?;
+        super::dvda_metabase::write_metabase(&metabase, metabase_path)
+            .map_err(|e| format!("write: {}", e))?;
+        return Ok(kind);
+    }
+
+    ensure_dvda_tracks_present(&mut metabase, seeded, &selected_track_ids);
+    apply_dvda_entries_to_metabase(&mut metabase, &selected_track_ids, &state.entries, &state.deleted)?;
+
+    super::dvda_metabase::write_metabase(&metabase, metabase_path)
+        .map_err(|e| format!("write: {}", e))?;
+    Ok(kind)
+}
+
+fn ensure_dvda_tracks_present(
+    metabase: &mut super::dvda_metabase::DvdaMetabase,
+    seeded: &super::dvda_metabase::DvdaMetabase,
+    track_ids: &[String],
+) {
+    for id in track_ids {
+        if super::dvda_metabase::track(metabase, id).is_none() {
             if let Some(track) = seeded.tracks.iter().find(|t| &t.id == id) {
                 metabase.tracks.push(track.clone());
             }
         }
     }
+}
 
-    for (entry_idx, entry) in state.entries.iter().enumerate() {
-        let entry_deleted = state.deleted.contains(&entry_idx);
+fn apply_dvda_presentation_tabs_to_metabase<F>(
+    metabase: &mut super::dvda_metabase::DvdaMetabase,
+    seeded: &super::dvda_metabase::DvdaMetabase,
+    tabs: &[super::app::PresentationTab],
+    mut track_ids_for_group: F,
+) -> Result<(), String>
+where
+    F: FnMut(u8) -> Result<Vec<String>, String>,
+{
+    for tab in tabs {
+        let group_nr = match &tab.id {
+            crate::disc::model::PresentationId::DvdAudioGroup(group_nr) => *group_nr,
+            _ => continue,
+        };
+        let tab_track_ids = track_ids_for_group(group_nr)?;
+        if tab_track_ids.len() != tab.paths.len() {
+            return Err(format!(
+                "DVD-Audio group {} has {} track(s) but editor tab has {}; refusing to map",
+                group_nr,
+                tab_track_ids.len(),
+                tab.paths.len(),
+            ));
+        }
+        ensure_dvda_tracks_present(metabase, seeded, &tab_track_ids);
+        apply_dvda_entries_to_metabase(metabase, &tab_track_ids, &tab.entries, &tab.deleted)?;
+    }
+    Ok(())
+}
+
+fn apply_dvda_entries_to_metabase(
+    metabase: &mut super::dvda_metabase::DvdaMetabase,
+    track_ids: &[String],
+    entries: &[super::probe::TagEntry],
+    deleted: &[usize],
+) -> Result<(), String> {
+    for (entry_idx, entry) in entries.iter().enumerate() {
+        let entry_deleted = deleted.contains(&entry_idx);
         let Some(sidecar_key) = editor_key_to_sidecar_key(&entry.display_key) else {
             continue;
         };
@@ -4804,8 +5171,8 @@ pub fn save_dvda_metabase(
                 ));
             }
             let new_val = if entry_deleted { String::new() } else { entry.value.clone() };
-            for id in &track_ids {
-                if let Some(track) = super::dvda_metabase::track_mut(&mut metabase, id) {
+            for id in track_ids {
+                if let Some(track) = super::dvda_metabase::track_mut(metabase, id) {
                     if new_val.is_empty() {
                         track.meta.remove(sidecar_key);
                     } else {
@@ -4820,7 +5187,7 @@ pub fn save_dvda_metabase(
                 } else {
                     entry.per_file_values.get(i).cloned().unwrap_or_default()
                 };
-                if let Some(track) = super::dvda_metabase::track_mut(&mut metabase, id) {
+                if let Some(track) = super::dvda_metabase::track_mut(metabase, id) {
                     if new_val.is_empty() {
                         track.meta.remove(sidecar_key);
                     } else {
@@ -4830,10 +5197,7 @@ pub fn save_dvda_metabase(
             }
         }
     }
-
-    super::dvda_metabase::write_metabase(&metabase, metabase_path)
-        .map_err(|e| format!("write: {}", e))?;
-    Ok(kind)
+    Ok(())
 }
 
 /// Rebuild the DVD-Audio metadata editor for a user-selected group.
@@ -4842,11 +5206,21 @@ pub(super) fn switch_dvda_editor_group(
     source_path: &std::path::Path,
     group_nr: u8,
 ) -> Result<String, String> {
+    if let Some(idx) = state.presentation_tabs.iter().position(|tab| {
+        matches!(&tab.id, crate::disc::model::PresentationId::DvdAudioGroup(n) if *n == group_nr)
+    }) {
+        state.switch_presentation_tab(idx);
+        let label = state.active_presentation_label().unwrap_or("DVD-Audio group").to_string();
+        return Ok(format!("{} ({} tracks)", label, state.paths.len()));
+    }
+
     let (disc, store_id, metabase_path, metabase, _parse_note) =
         load_dvda_metabase_context(source_path)?;
-    let (mut new_state, group_label, n_tracks) = build_dvda_editor_state(
+    let disc_contents = crate::disc::dvda_utils::map_dvda_source(source_path).ok();
+    let (mut new_state, group_label, n_tracks) = build_dvda_multitab_editor_state(
         source_path,
         &disc,
+        disc_contents.as_ref(),
         &store_id,
         metabase_path.as_ref(),
         metabase.as_ref(),
@@ -4898,7 +5272,7 @@ fn open_metadata_editor_for_sacd_at_track(
             }
         });
 
-    match build_sacd_editor_state(&iso_path, &md, sidecar.as_ref()) {
+    match build_sacd_multitab_editor_state(&iso_path, &md, sidecar.as_ref()) {
         Ok((mut state, area_label, n_tracks)) => {
             if let Some(track_index) = initial_track {
                 focus_metadata_editor_on_track(&mut state, track_index);
@@ -5347,9 +5721,82 @@ pub fn build_sacd_editor_state(
         sacd_area_kind: Some(area.header.kind),
         sacd_stereo_durations,
         sacd_multi_channel_durations,
+        presentation_tabs: Vec::new(),
+        active_tab: 0,
     };
 
     Ok((state, area_label, n_tracks))
+}
+
+pub fn build_sacd_multitab_editor_state(
+    iso_path: &std::path::Path,
+    md: &super::sacd::SacdMetadata,
+    sidecar: Option<&super::sacd_sidecar::SidecarMetadata>,
+) -> Result<(super::app::MetadataEditorState, &'static str, usize), String> {
+    let mut area_views: Vec<(super::sacd::AreaKind, super::sacd::SacdMetadata)> = Vec::new();
+    if md.stereo.is_some() {
+        let mut view = md.clone();
+        view.multi_channel = None;
+        area_views.push((super::sacd::AreaKind::Stereo, view));
+    }
+    if md.multi_channel.is_some() {
+        let mut view = md.clone();
+        view.stereo = None;
+        area_views.push((super::sacd::AreaKind::MultiChannel, view));
+    }
+
+    if area_views.len() <= 1 {
+        return build_sacd_editor_state(iso_path, md, sidecar);
+    }
+
+    let mut tabs: Vec<super::app::PresentationTab> = Vec::new();
+    let mut states: Vec<(super::app::MetadataEditorState, &'static str, usize)> = Vec::new();
+
+    for (kind, view) in area_views {
+        let (state, label, n_tracks) = build_sacd_editor_state(iso_path, &view, sidecar)?;
+        let (id, tab_label) = match kind {
+            super::sacd::AreaKind::Stereo => (
+                crate::disc::model::PresentationId::SacdArea(
+                    crate::disc::model::SacdAreaId::Stereo,
+                ),
+                "Stereo".to_string(),
+            ),
+            super::sacd::AreaKind::MultiChannel => (
+                crate::disc::model::PresentationId::SacdArea(
+                    crate::disc::model::SacdAreaId::MultiChannel,
+                ),
+                "Multichannel".to_string(),
+            ),
+        };
+        tabs.push(super::app::PresentationTab {
+            id,
+            label: tab_label,
+            paths: state.paths.clone(),
+            entries: state.entries.clone(),
+            file_labels: state.file_labels.clone(),
+            deleted: state.deleted.clone(),
+            dirty: state.dirty,
+            sacd_area_kind: state.sacd_area_kind.clone(),
+            sacd_stereo_durations: state.sacd_stereo_durations.clone(),
+            sacd_multi_channel_durations: state.sacd_multi_channel_durations.clone(),
+        });
+        states.push((state, label, n_tracks));
+    }
+
+    let (mut state, label, n_tracks) = states.remove(0);
+    state.presentation_tabs = tabs;
+    state.active_tab = 0;
+    if let Some(tab) = state.presentation_tabs.first().cloned() {
+        state.paths = tab.paths;
+        state.entries = tab.entries;
+        state.file_labels = tab.file_labels;
+        state.deleted = tab.deleted;
+        state.dirty = tab.dirty;
+        state.sacd_area_kind = tab.sacd_area_kind;
+        state.sacd_stereo_durations = tab.sacd_stereo_durations;
+        state.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
+    }
+    Ok((state, label, n_tracks))
 }
 
 /// Cheaply test whether `path` is writable: succeeds if we can open
@@ -5382,6 +5829,46 @@ pub(super) fn switch_sacd_editor_area(
     if state.sacd_area_kind.is_none() {
         return Err(":area: editor is not on a SACD ISO".to_string());
     }
+
+    if state.has_presentation_tabs() {
+        let want_kind = match target {
+            SacdAreaTarget::Stereo => AreaKind::Stereo,
+            SacdAreaTarget::MultiChannel => AreaKind::MultiChannel,
+            SacdAreaTarget::Toggle => match state.sacd_area_kind {
+                Some(AreaKind::Stereo) => AreaKind::MultiChannel,
+                Some(AreaKind::MultiChannel) => AreaKind::Stereo,
+                None => return Err(":area toggle: editor has no area kind".to_string()),
+            },
+        };
+        if Some(want_kind) == state.sacd_area_kind {
+            let label = match want_kind {
+                AreaKind::Stereo => "stereo",
+                AreaKind::MultiChannel => "multi-channel",
+            };
+            return Err(format!(":area: already on {}", label));
+        }
+        let needle = match want_kind {
+            AreaKind::Stereo => crate::disc::model::PresentationId::SacdArea(
+                crate::disc::model::SacdAreaId::Stereo,
+            ),
+            AreaKind::MultiChannel => crate::disc::model::PresentationId::SacdArea(
+                crate::disc::model::SacdAreaId::MultiChannel,
+            ),
+        };
+        let Some(idx) = state.presentation_tabs.iter().position(|tab| tab.id == needle) else {
+            let label = match want_kind {
+                AreaKind::Stereo => "stereo",
+                AreaKind::MultiChannel => "multi-channel",
+            };
+            return Err(format!(":area: this disc has no {} area", label));
+        };
+        state.switch_presentation_tab(idx);
+        return Ok(match want_kind {
+            AreaKind::Stereo => "stereo",
+            AreaKind::MultiChannel => "MCH",
+        });
+    }
+
     if state.dirty {
         return Err(":area: editor has unsaved edits — save or discard first".to_string());
     }
@@ -5654,6 +6141,59 @@ pub fn is_per_area_specific_key(display_key: &str) -> bool {
 /// any failure (parse, re-probe, mint, or write). The editor state
 /// isn't mutated; the caller resets `dirty` and snapshots `originals`
 /// after a successful write.
+
+fn apply_sacd_entries_to_sidecar(
+    sidecar: &mut super::sacd_sidecar::SidecarMetadata,
+    area_track_ids: &[u32],
+    entries: &[crate::tui::probe::TagEntry],
+    deleted: &[usize],
+) -> Result<(), String> {
+    for (entry_idx, entry) in entries.iter().enumerate() {
+        let Some(sidecar_key) = editor_key_to_sidecar_key(&entry.display_key) else {
+            continue;
+        };
+        let entry_deleted = deleted.contains(&entry_idx);
+        if is_album_level_sidecar_key(sidecar_key) {
+            if !entry_deleted && entry.is_mixed {
+                return Err(format!(
+                    "album-level field {} has mixed values; cannot save",
+                    entry.display_key
+                ));
+            }
+            let new_val = if entry_deleted {
+                String::new()
+            } else {
+                entry.value.clone()
+            };
+            for tid in area_track_ids {
+                if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *tid) {
+                    if new_val.is_empty() {
+                        track.meta.remove(sidecar_key);
+                    } else {
+                        track.meta.insert(sidecar_key.to_string(), new_val.clone());
+                    }
+                }
+            }
+        } else {
+            for (i, tid) in area_track_ids.iter().enumerate() {
+                let new_val = if entry_deleted {
+                    String::new()
+                } else {
+                    entry.per_file_values.get(i).cloned().unwrap_or_default()
+                };
+                if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *tid) {
+                    if new_val.is_empty() {
+                        track.meta.remove(sidecar_key);
+                    } else {
+                        track.meta.insert(sidecar_key.to_string(), new_val);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn save_sacd_sidecar(
     state: &super::app::MetadataEditorState,
     sidecar_path: &std::path::Path,
@@ -5665,11 +6205,7 @@ pub fn save_sacd_sidecar(
     } else {
         // Mint path: no XML yet. Re-probe the ISO for ScarletBook
         // data, seed an in-memory sidecar, and mint the canonical
-        // `<store id>` via MD5 of the master TOC region. The
-        // editor's per-track edits get applied below exactly as on
-        // the update path. `seed_sidecar_from_scarletbook` populates
-        // BOTH areas if the ISO has both, so the Phase D mirror
-        // loop below has sibling tracks to write to on mint too.
+        // `<store id>` via MD5 of the master TOC region.
         let iso_path = state
             .paths
             .first()
@@ -5683,16 +6219,58 @@ pub fn save_sacd_sidecar(
         (s, SacdSaveKind::Created)
     };
 
-    // Which 1-based area is the editor surfacing? Stereo → 1, MCH → 2.
+    if state.has_presentation_tabs() {
+        let mut updated_areas = 0usize;
+        for tab in &state.presentation_tabs {
+            let area_idx = match &tab.id {
+                crate::disc::model::PresentationId::SacdArea(
+                    crate::disc::model::SacdAreaId::Stereo,
+                ) => 1u8,
+                crate::disc::model::PresentationId::SacdArea(
+                    crate::disc::model::SacdAreaId::MultiChannel,
+                ) => 2u8,
+                _ => continue,
+            };
+            let area_track_ids: Vec<u32> = sidecar
+                .tracks_for_area(area_idx)
+                .iter()
+                .map(|t| t.id)
+                .collect();
+            if area_track_ids.len() != tab.paths.len() {
+                return Err(format!(
+                    "sidecar area {} has {} track(s) but presentation '{}' has {}; refusing to map",
+                    area_idx,
+                    area_track_ids.len(),
+                    tab.label,
+                    tab.paths.len(),
+                ));
+            }
+            apply_sacd_entries_to_sidecar(&mut sidecar, &area_track_ids, &tab.entries, &tab.deleted)?;
+            updated_areas += 1;
+        }
+        if updated_areas == 0 {
+            return Err("editor has no SACD presentation tabs".into());
+        }
+        super::sacd_sidecar::write_sidecar(sidecar_path, &sidecar)
+            .map_err(|e| format!("write: {}", e))?;
+        return Ok(SacdSaveOutcome {
+            kind,
+            mirror: MirrorOutcome {
+                sibling_present: updated_areas > 1,
+                sibling_total: 0,
+                mirrored_count: 0,
+            },
+        });
+    }
+
+    // Legacy single-area editor path: preserve the pre-existing invisible
+    // sibling-area mirror so single-tab callers remain compatible.
     let area_idx = match state.sacd_area_kind {
         Some(super::sacd::AreaKind::Stereo) => 1u8,
         Some(super::sacd::AreaKind::MultiChannel) => 2u8,
         None => return Err("editor has no SACD area kind".into()),
     };
 
-    // Collect the track IDs in the relevant area, in disc-order. We
-    // need owned IDs (not references) because we'll iterate
-    // `sidecar.tracks` mutably below.
     let area_track_ids: Vec<u32> = sidecar
         .tracks_for_area(area_idx)
         .iter()
@@ -5708,65 +6286,13 @@ pub fn save_sacd_sidecar(
         ));
     }
 
-    // Apply edits.
-    for entry in &state.entries {
-        let Some(sidecar_key) = editor_key_to_sidecar_key(&entry.display_key) else {
-            continue;
-        };
-        if is_album_level_sidecar_key(sidecar_key) {
-            // Replicate to every track in the area. We use
-            // entry.value (the displayed single value) when it's not
-            // <multiple values>; otherwise we'd lose information by
-            // collapsing — but album-level entries shouldn't be
-            // mixed in practice, so refuse to save in that case.
-            if entry.is_mixed {
-                return Err(format!(
-                    "album-level field {} has mixed values; cannot save",
-                    entry.display_key
-                ));
-            }
-            let new_val = entry.value.clone();
-            for tid in &area_track_ids {
-                if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *tid) {
-                    if new_val.is_empty() {
-                        track.meta.remove(sidecar_key);
-                    } else {
-                        track.meta.insert(sidecar_key.to_string(), new_val.clone());
-                    }
-                }
-            }
-        } else {
-            // Per-track: editor index i → sidecar id area_track_ids[i].
-            for (i, tid) in area_track_ids.iter().enumerate() {
-                let new_val = entry.per_file_values.get(i).cloned().unwrap_or_default();
-                if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *tid) {
-                    if new_val.is_empty() {
-                        track.meta.remove(sidecar_key);
-                    } else {
-                        track.meta.insert(sidecar_key.to_string(), new_val);
-                    }
-                }
-            }
-        }
-    }
+    apply_sacd_entries_to_sidecar(
+        &mut sidecar,
+        &area_track_ids,
+        &state.entries,
+        &state.deleted,
+    )?;
 
-    // Phase D: mirror per-track + album-level edits to the SIBLING
-    // area (stereo ↔ multi-channel) so a hybrid SACD's areas stay in
-    // lockstep on metadata, matching foobar2000's "link tags between
-    // areas" default. Per-area-specific keys (DR today, possibly
-    // more once DSD→PCM analysis lands) are excluded via
-    // `is_per_area_specific_key`. Per-track cross-area matching uses
-    // TRACKNUMBER, not sidecar id (id namespaces differ between
-    // areas). Album-level fields replicate to every sibling track.
-    //
-    // Sibling-absent (single-area SACD): zero iterations, mirror
-    // becomes a no-op.
-    //
-    // Track-count divergence between areas (rare — bonus tracks on
-    // one side): mirror only the tracknumbers that match, surface
-    // the partial coverage in the status message via
-    // `MirrorOutcome`. Refusal stays specific to active-area
-    // mismatch above.
     let sibling_area_idx = match area_idx {
         1 => 2u8,
         2 => 1u8,
@@ -5790,8 +6316,6 @@ pub fn save_sacd_sidecar(
             mirrored_count: 0,
         }
     } else {
-        // Build a normalized TRACKNUMBER → editor index lookup. Parse
-        // to u32 so zero-padded `"01"` matches unpadded `"1"`.
         let editor_tn_to_idx: std::collections::HashMap<u32, usize> = state
             .entries
             .iter()
@@ -5812,16 +6336,20 @@ pub fn save_sacd_sidecar(
             }
         }
 
-        for entry in &state.entries {
+        for (entry_idx, entry) in state.entries.iter().enumerate() {
             if is_per_area_specific_key(&entry.display_key) {
                 continue;
             }
             let Some(sidecar_key) = editor_key_to_sidecar_key(&entry.display_key) else {
                 continue;
             };
+            let entry_deleted = state.deleted.contains(&entry_idx);
             if is_album_level_sidecar_key(sidecar_key) {
-                // Already errored above on mixed album-level entries.
-                let new_val = entry.value.clone();
+                let new_val = if entry_deleted {
+                    String::new()
+                } else {
+                    entry.value.clone()
+                };
                 for (sib_tid, _) in &sibling_track_info {
                     if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *sib_tid) {
                         if new_val.is_empty() {
@@ -5837,11 +6365,15 @@ pub fn save_sacd_sidecar(
                     else {
                         continue;
                     };
-                    let new_val = entry
-                        .per_file_values
-                        .get(editor_idx)
-                        .cloned()
-                        .unwrap_or_default();
+                    let new_val = if entry_deleted {
+                        String::new()
+                    } else {
+                        entry
+                            .per_file_values
+                            .get(editor_idx)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
                     if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *sib_tid) {
                         if new_val.is_empty() {
                             track.meta.remove(sidecar_key);
@@ -8255,15 +8787,40 @@ fn handle_metadata_editor_mouse(
 
     // Region checks.
     let in_popup = mx >= popup_x && mx < popup_x + w && my >= popup_y && my < popup_y + h;
-    let in_content = mx >= inner_x
+    let _in_content = mx >= inner_x
         && mx < inner_x + inner_w
         && my >= content_y
         && my < content_y + content_h as u16;
-    let in_footer = mx >= inner_x && mx < inner_x + inner_w && my == footer_y;
+    let _in_footer = mx >= inner_x && mx < inner_x + inner_w && my == footer_y;
 
     let overlay = app.active_overlay.clone();
     if let ActiveOverlay::MetadataEditor(mut state) = overlay {
         let total_rows = state.entries.len() + 1;
+        let mut content_y = content_y;
+        let mut content_h = content_h;
+        if state.has_presentation_tabs() {
+            content_y = content_y.saturating_add(1);
+            content_h = content_h.saturating_sub(1);
+        }
+        let in_content = mx >= inner_x
+            && mx < inner_x + inner_w
+            && my >= content_y
+            && my < content_y + content_h as u16;
+        let in_footer = mx >= inner_x && mx < inner_x + inner_w && my == footer_y;
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(super::button_map::TuiButton::MetadataEditorTab(idx)) =
+                app.button_map.find_button_at(mx, my)
+            {
+                if state.switch_presentation_tab(idx) {
+                    if let Some(label) = state.active_presentation_label() {
+                        app.set_status(format!("metadata editor: {}", label));
+                    }
+                }
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+        }
 
         match mouse.kind {
             // Scroll wheel: navigate entries. Blocked during inline edit.
@@ -10051,6 +10608,8 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         sacd_area_kind: None,
         sacd_stereo_durations: None,
         sacd_multi_channel_durations: None,
+        presentation_tabs: Vec::new(),
+        active_tab: 0,
     };
     if let Some(track_index) = initial_track {
         focus_metadata_editor_on_track(&mut state, track_index);
@@ -10891,6 +11450,24 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
 
 // ── Helper functions ─────────────────────────────────────────────────
 
+fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
+    // Confirmation cancellation must behave the same for keyboard
+    // Esc/N and mouse No/Cancel clicks. Some confirmation flows park
+    // the editor in `pending_metadata_editor` before opening the
+    // dialog; clearing only `active_overlay` would strand and drop
+    // the populated editor on the next transition.
+    app.active_overlay = ActiveOverlay::None;
+    if let Some(parked) = app.pending_metadata_editor.take() {
+        if matches!(app.active_overlay, ActiveOverlay::None) {
+            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+        }
+    }
+
+    if matches!(action, Some(ConfirmAction::ApplyMbToAllPresentations(_))) {
+        app.set_status(":tags-mb: kept MusicBrainz values on active presentation".to_string());
+    }
+}
+
 fn execute_confirm_action(
     app: &mut AppState,
     action: &ConfirmAction,
@@ -10914,6 +11491,16 @@ fn execute_confirm_action(
             app.pending_metadata_editor = None;
             app.active_overlay = ActiveOverlay::GnudbReview(review.clone());
             app.set_status(":gnudb-back: review per-track values".to_string());
+        }
+        ConfirmAction::ApplyMbToAllPresentations(state) => {
+            app.pending_metadata_editor = None;
+            let mut state = (**state).clone();
+            let copied = state.apply_active_musicbrainz_values_to_matching_presentations();
+            app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+            app.set_status(format!(
+                ":tags-mb: applied MusicBrainz values to {} matching presentation(s)",
+                copied,
+            ));
         }
         ConfirmAction::RemoveSelected => {
             let removed = app.manager.remove_selected();
@@ -11464,7 +12051,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         return;
                     }
                     TuiButton::OverlayCancel => {
-                        app.active_overlay = ActiveOverlay::None;
+                        let action = match &app.active_overlay {
+                            ActiveOverlay::Confirmation { action, .. } => Some(action.clone()),
+                            _ => None,
+                        };
+                        cancel_confirm_action(app, action.as_ref());
                         return;
                     }
                     _ => {}
@@ -12152,7 +12743,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             TuiButton::OverlayCancel => {
-                app.active_overlay = ActiveOverlay::None;
+                let action = match &app.active_overlay {
+                    ActiveOverlay::Confirmation { action, .. } => Some(action.clone()),
+                    _ => None,
+                };
+                cancel_confirm_action(app, action.as_ref());
             }
             TuiButton::MetadataEntryRevert(idx) => {
                 if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
@@ -12236,7 +12831,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserStream(_)
             | TuiButton::DiscBrowserExpand(_)
             | TuiButton::DiscBrowserConvert
-            | TuiButton::DiscBrowserClose => {
+            | TuiButton::DiscBrowserClose
+            | TuiButton::MetadataEditorTab(_) => {
                 // Handled in dedicated mouse/overlay handlers; no-op here.
             }
         }
@@ -12297,7 +12893,88 @@ mod phase4_tests {
     use super::super::app::{MetadataEditorPhase, MetadataEditorState};
     use super::super::probe::TagEntry;
     use super::*;
+    use crate::config::TonepoetConfig;
     use lofty::tag::ItemKey;
+
+    fn dvd_audio_presentation(
+        group_nr: u8,
+        label: &str,
+        codec: Option<&str>,
+        sample_rate: Option<u32>,
+        bit_depth: Option<u32>,
+        channels: Option<u8>,
+        channel_layout: Option<&str>,
+    ) -> crate::disc::model::DiscPresentation {
+        crate::disc::model::DiscPresentation {
+            id: crate::disc::model::PresentationId::DvdAudioGroup(group_nr),
+            label: label.to_string(),
+            format: crate::disc::model::AudioPresentationFormat {
+                codec: codec.map(str::to_string),
+                sample_rate,
+                bit_depth,
+                channels,
+                channel_layout: channel_layout.map(str::to_string),
+                lossless: true,
+                provenance: crate::disc::model::FormatProvenance::AobProbe,
+            },
+            tracks: Vec::new(),
+            total_duration_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn dvda_tab_label_uses_disc_presentation_label_with_group_prefix() {
+        let presentation = dvd_audio_presentation(
+            1,
+            "MLP 96kHz/24-bit 5.1",
+            Some("MLP"),
+            Some(96_000),
+            Some(24),
+            Some(6),
+            Some("5.1"),
+        );
+
+        assert_eq!(
+            dvda_presentation_tab_label(&presentation, 1),
+            "Group 1: MLP 96kHz/24-bit 5.1"
+        );
+    }
+
+    #[test]
+    fn dvda_tab_label_does_not_duplicate_existing_group_prefix() {
+        let presentation = dvd_audio_presentation(
+            3,
+            "Group 3: LPCM 96kHz/24-bit Stereo",
+            Some("LPCM"),
+            Some(96_000),
+            Some(24),
+            Some(2),
+            Some("Stereo"),
+        );
+
+        assert_eq!(
+            dvda_presentation_tab_label(&presentation, 3),
+            "Group 3: LPCM 96kHz/24-bit Stereo"
+        );
+    }
+
+    #[test]
+    fn dvda_tab_label_falls_back_to_structured_format_fields() {
+        let presentation = dvd_audio_presentation(
+            2,
+            "",
+            Some("MLP"),
+            Some(88_200),
+            Some(24),
+            Some(2),
+            None,
+        );
+
+        assert_eq!(
+            dvda_presentation_tab_label(&presentation, 2),
+            "Group 2: MLP 88.2kHz/24-bit Stereo"
+        );
+    }
 
     fn entry(key: &str, item_key: ItemKey, vals: &[&str], origs: &[&str]) -> TagEntry {
         let v: Vec<String> = vals.iter().map(|s| s.to_string()).collect();
@@ -12348,7 +13025,379 @@ mod phase4_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: Vec::new(),
+            active_tab: 0,
         }
+    }
+
+    fn dvda_multitab_state(tabs: Vec<super::super::app::PresentationTab>) -> MetadataEditorState {
+        let first = tabs.first().expect("at least one tab").clone();
+        MetadataEditorState {
+            paths: first.paths.clone(),
+            entries: first.entries.clone(),
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: first.dirty,
+            deleted: first.deleted.clone(),
+            file_labels: first.file_labels.clone(),
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+            presentation_tabs: tabs,
+            active_tab: 0,
+        }
+    }
+
+    fn dvda_save_tab(group_nr: u8, entries: Vec<TagEntry>) -> super::super::app::PresentationTab {
+        super::super::app::PresentationTab {
+            id: crate::disc::model::PresentationId::DvdAudioGroup(group_nr),
+            label: format!("Group {}", group_nr),
+            paths: vec![
+                std::path::PathBuf::from(format!("/tmp/group-{}.aob", group_nr)),
+                std::path::PathBuf::from(format!("/tmp/group-{}.aob", group_nr)),
+            ],
+            entries,
+            file_labels: vec!["01".to_string(), "02".to_string()],
+            deleted: Vec::new(),
+            dirty: true,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+        }
+    }
+
+    fn dvda_metabase_track(
+        id: &str,
+        pairs: &[(&str, &str)],
+    ) -> crate::tui::dvda_metabase::DvdaMetabaseTrack {
+        let mut meta = std::collections::BTreeMap::new();
+        for (key, value) in pairs {
+            meta.insert((*key).to_string(), (*value).to_string());
+        }
+        crate::tui::dvda_metabase::DvdaMetabaseTrack {
+            id: id.to_string(),
+            meta,
+        }
+    }
+
+    #[test]
+    fn mouse_cancel_apply_mb_to_all_restores_parked_editor() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let tabs = vec![
+            dvda_save_tab(
+                1,
+                vec![entry(
+                    "TITLE",
+                    ItemKey::TrackTitle,
+                    &["Populated One", "Populated Two"],
+                    &["Old One", "Old Two"],
+                )],
+            ),
+            dvda_save_tab(
+                3,
+                vec![entry(
+                    "TITLE",
+                    ItemKey::TrackTitle,
+                    &["Stereo One", "Stereo Two"],
+                    &["Stereo Old One", "Stereo Old Two"],
+                )],
+            ),
+        ];
+        let state = Box::new(dvda_multitab_state(tabs));
+
+        reopen_metadata_editor_after_musicbrainz_population(&mut app, state);
+        assert!(matches!(app.active_overlay, ActiveOverlay::Confirmation { .. }));
+        assert!(app.pending_metadata_editor.is_some());
+
+        app.button_map
+            .record_button(TuiButton::OverlayCancel, Rect::new(10, 10, 8, 1));
+        let (tx, _rx) = mpsc::channel(1);
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 11,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert!(app.pending_metadata_editor.is_none());
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(restored) => {
+                assert_eq!(restored.presentation_tabs.len(), 2);
+                assert_eq!(restored.entries[0].per_file_values[0], "Populated One");
+            }
+            other => panic!("expected restored metadata editor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn save_dvda_metabase_writes_multi_tab_groups_round_trip() {
+        use crate::tui::dvda_metabase::{
+            parse_metabase, track_value, write_metabase, DvdaMetabase,
+        };
+
+        let mut metabase = DvdaMetabase {
+            store_id: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+            tracks: vec![
+                dvda_metabase_track(
+                    "1.1.1",
+                    &[
+                        ("ALBUM", "Old Surround"),
+                        ("TITLE", "Old Surround 1"),
+                        ("TRACKNUMBER", "1"),
+                        ("TOTALTRACKS", "2"),
+                        ("CUSTOM_KEEP", "surround foreign"),
+                    ],
+                ),
+                dvda_metabase_track(
+                    "1.1.2",
+                    &[
+                        ("ALBUM", "Old Surround"),
+                        ("TITLE", "Old Surround 2"),
+                        ("TRACKNUMBER", "2"),
+                        ("TOTALTRACKS", "2"),
+                    ],
+                ),
+                dvda_metabase_track(
+                    "2.1.1",
+                    &[
+                        ("ALBUM", "Old Stereo"),
+                        ("TITLE", "Old Stereo 1"),
+                        ("TRACKNUMBER", "1"),
+                        ("TOTALTRACKS", "2"),
+                        ("CUSTOM_KEEP", "stereo foreign"),
+                    ],
+                ),
+                dvda_metabase_track(
+                    "2.1.2",
+                    &[
+                        ("ALBUM", "Old Stereo"),
+                        ("TITLE", "Old Stereo 2"),
+                        ("TRACKNUMBER", "2"),
+                        ("TOTALTRACKS", "2"),
+                    ],
+                ),
+            ],
+        };
+        let seeded = metabase.clone();
+        let tabs = vec![
+            dvda_save_tab(
+                1,
+                vec![
+                    entry(
+                        "DVDA_GROUP",
+                        ItemKey::Unknown("DVDA_GROUP".to_string()),
+                        &["1", "1"],
+                        &["1", "1"],
+                    ),
+                    entry(
+                        "ALBUM",
+                        ItemKey::AlbumTitle,
+                        &["Surround Album", "Surround Album"],
+                        &["Old Surround", "Old Surround"],
+                    ),
+                    entry(
+                        "TITLE",
+                        ItemKey::TrackTitle,
+                        &["Surround One", "Surround Two"],
+                        &["Old Surround 1", "Old Surround 2"],
+                    ),
+                    entry(
+                        "ARTIST",
+                        ItemKey::TrackArtist,
+                        &["Surround Artist 1", "Surround Artist 2"],
+                        &["", ""],
+                    ),
+                ],
+            ),
+            dvda_save_tab(
+                3,
+                vec![
+                    entry(
+                        "DVDA_GROUP",
+                        ItemKey::Unknown("DVDA_GROUP".to_string()),
+                        &["3", "3"],
+                        &["3", "3"],
+                    ),
+                    entry(
+                        "ALBUM",
+                        ItemKey::AlbumTitle,
+                        &["Stereo Album", "Stereo Album"],
+                        &["Old Stereo", "Old Stereo"],
+                    ),
+                    entry(
+                        "TITLE",
+                        ItemKey::TrackTitle,
+                        &["Stereo One", "Stereo Two"],
+                        &["Old Stereo 1", "Old Stereo 2"],
+                    ),
+                    entry(
+                        "ARTIST",
+                        ItemKey::TrackArtist,
+                        &["Stereo Artist 1", "Stereo Artist 2"],
+                        &["", ""],
+                    ),
+                ],
+            ),
+        ];
+
+        apply_dvda_presentation_tabs_to_metabase(
+            &mut metabase,
+            &seeded,
+            &tabs,
+            |group_nr| match group_nr {
+                1 => Ok(vec!["1.1.1".to_string(), "1.1.2".to_string()]),
+                3 => Ok(vec!["2.1.1".to_string(), "2.1.2".to_string()]),
+                other => Err(format!("unexpected test group {}", other)),
+            },
+        )
+        .expect("apply DVD-Audio tabs");
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let xml_path = td.path().join("dvda.xml");
+        write_metabase(&metabase, &xml_path).expect("write metabase");
+        let reparsed = parse_metabase(&xml_path).expect("re-parse metabase");
+
+        let value = |id: &str, key: &str| track_value(Some(&reparsed), id, &[key]);
+
+        assert_eq!(value("1.1.1", "ALBUM").as_deref(), Some("Surround Album"));
+        assert_eq!(value("1.1.2", "ALBUM").as_deref(), Some("Surround Album"));
+        assert_eq!(value("2.1.1", "ALBUM").as_deref(), Some("Stereo Album"));
+        assert_eq!(value("2.1.2", "ALBUM").as_deref(), Some("Stereo Album"));
+
+        assert_eq!(value("1.1.1", "TITLE").as_deref(), Some("Surround One"));
+        assert_eq!(value("1.1.2", "TITLE").as_deref(), Some("Surround Two"));
+        assert_eq!(value("2.1.1", "TITLE").as_deref(), Some("Stereo One"));
+        assert_eq!(value("2.1.2", "TITLE").as_deref(), Some("Stereo Two"));
+
+        assert_eq!(value("1.1.1", "ARTIST").as_deref(), Some("Surround Artist 1"));
+        assert_eq!(value("2.1.1", "ARTIST").as_deref(), Some("Stereo Artist 1"));
+        assert_eq!(value("1.1.1", "CUSTOM_KEEP").as_deref(), Some("surround foreign"));
+        assert_eq!(value("2.1.1", "CUSTOM_KEEP").as_deref(), Some("stereo foreign"));
+        assert_eq!(value("1.1.1", "DVDA_GROUP"), None);
+        assert_eq!(value("2.1.1", "DVDA_GROUP"), None);
+    }
+
+    #[test]
+    fn save_dvda_metabase_loaded_context_writes_multi_tab_groups_round_trip() {
+        use crate::tui::dvda_metabase::{
+            parse_metabase, track_value, write_metabase, DvdaMetabase,
+        };
+
+        let existing = DvdaMetabase {
+            store_id: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+            tracks: vec![
+                dvda_metabase_track(
+                    "1.1.1",
+                    &[("ALBUM", "Old Surround"), ("TITLE", "Old Surround 1")],
+                ),
+                dvda_metabase_track(
+                    "1.1.2",
+                    &[("ALBUM", "Old Surround"), ("TITLE", "Old Surround 2")],
+                ),
+                dvda_metabase_track(
+                    "2.1.1",
+                    &[("ALBUM", "Old Stereo"), ("TITLE", "Old Stereo 1")],
+                ),
+                dvda_metabase_track(
+                    "2.1.2",
+                    &[("ALBUM", "Old Stereo"), ("TITLE", "Old Stereo 2")],
+                ),
+            ],
+        };
+        let seeded = existing.clone();
+        let tabs = vec![
+            dvda_save_tab(
+                1,
+                vec![
+                    entry(
+                        "DVDA_GROUP",
+                        ItemKey::Unknown("DVDA_GROUP".to_string()),
+                        &["1", "1"],
+                        &["1", "1"],
+                    ),
+                    entry(
+                        "ALBUM",
+                        ItemKey::AlbumTitle,
+                        &["Full Path Surround", "Full Path Surround"],
+                        &["Old Surround", "Old Surround"],
+                    ),
+                    entry(
+                        "TITLE",
+                        ItemKey::TrackTitle,
+                        &["Full Surround One", "Full Surround Two"],
+                        &["Old Surround 1", "Old Surround 2"],
+                    ),
+                ],
+            ),
+            dvda_save_tab(
+                3,
+                vec![
+                    entry(
+                        "DVDA_GROUP",
+                        ItemKey::Unknown("DVDA_GROUP".to_string()),
+                        &["3", "3"],
+                        &["3", "3"],
+                    ),
+                    entry(
+                        "ALBUM",
+                        ItemKey::AlbumTitle,
+                        &["Full Path Stereo", "Full Path Stereo"],
+                        &["Old Stereo", "Old Stereo"],
+                    ),
+                    entry(
+                        "TITLE",
+                        ItemKey::TrackTitle,
+                        &["Full Stereo One", "Full Stereo Two"],
+                        &["Old Stereo 1", "Old Stereo 2"],
+                    ),
+                ],
+            ),
+        ];
+        let state = dvda_multitab_state(tabs);
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let xml_path = td.path().join("dvda.xml");
+        write_metabase(&existing, &xml_path).expect("write existing metabase");
+
+        let kind = save_dvda_metabase_with_loaded_context(
+            &state,
+            &xml_path,
+            &seeded,
+            vec!["1.1.1".to_string(), "1.1.2".to_string()],
+            |group_nr| match group_nr {
+                1 => Ok(vec!["1.1.1".to_string(), "1.1.2".to_string()]),
+                3 => Ok(vec!["2.1.1".to_string(), "2.1.2".to_string()]),
+                other => Err(format!("unexpected test group {}", other)),
+            },
+        )
+        .expect("save DVD-Audio metabase through loaded-context save path");
+        assert_eq!(kind, SacdSaveKind::Updated);
+
+        let reparsed = parse_metabase(&xml_path).expect("re-parse metabase");
+        let value = |id: &str, key: &str| track_value(Some(&reparsed), id, &[key]);
+
+        assert_eq!(value("1.1.1", "ALBUM").as_deref(), Some("Full Path Surround"));
+        assert_eq!(value("1.1.2", "TITLE").as_deref(), Some("Full Surround Two"));
+        assert_eq!(value("2.1.1", "ALBUM").as_deref(), Some("Full Path Stereo"));
+        assert_eq!(value("2.1.2", "TITLE").as_deref(), Some("Full Stereo Two"));
+        assert_eq!(value("1.1.1", "DVDA_GROUP"), None);
+        assert_eq!(value("2.1.1", "DVDA_GROUP"), None);
     }
 
     /// CUE template for a 3-track image used across regen tests.
@@ -12838,6 +13887,8 @@ mod phase4_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: Vec::new(),
+            active_tab: 0,
         }
     }
 
@@ -13051,6 +14102,8 @@ mod phase4_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: Vec::new(),
+            active_tab: 0,
         };
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());
@@ -14661,6 +15714,74 @@ mod phase4_tests {
 <track id="3"><meta name="TITLE" value="MC-1"/><meta name="ALBUM" value="MCHAlbum"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
 <track id="4"><meta name="TITLE" value="MC-2"/><meta name="ALBUM" value="MCHAlbum"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
 </store></root>"#;
+
+    #[test]
+    fn save_sacd_sidecar_writes_multi_tab_areas_without_implicit_mirror() {
+        use crate::disc::model::{PresentationId, SacdAreaId};
+        use crate::tui::sacd_sidecar::parse_sidecar;
+
+        let md = synth_hybrid_sacd_metadata(Some("Album"), &["St-1", "St-2"], &["MC-1", "MC-2"]);
+        let td = tempfile::tempdir().expect("tempdir");
+        let xml_path = td.path().join("disc.xml");
+        std::fs::write(&xml_path, SAMPLE_HYBRID_2X2).unwrap();
+        let sidecar = parse_sidecar(&xml_path).expect("parse");
+        let iso_path = td.path().join("disc.iso");
+        std::fs::write(&iso_path, b"\0").unwrap();
+
+        let (mut state, _, _) = build_sacd_multitab_editor_state(&iso_path, &md, Some(&sidecar))
+            .expect("build multi-tab editor");
+        state.read_only = false;
+        state.sacd_sidecar_path = Some(xml_path.clone());
+
+        let stereo = state
+            .presentation_tabs
+            .iter_mut()
+            .find(|tab| matches!(&tab.id, PresentationId::SacdArea(SacdAreaId::Stereo)))
+            .expect("stereo tab");
+        let title = stereo
+            .entries
+            .iter_mut()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("stereo TITLE");
+        title.per_file_values[0] = "Stereo New".into();
+        title.value = "<multiple values>".into();
+        title.is_mixed = true;
+        stereo.dirty = true;
+
+        let mch = state
+            .presentation_tabs
+            .iter_mut()
+            .find(|tab| matches!(&tab.id, PresentationId::SacdArea(SacdAreaId::MultiChannel)))
+            .expect("multi-channel tab");
+        let title = mch
+            .entries
+            .iter_mut()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("MCH TITLE");
+        title.per_file_values[0] = "MCH New".into();
+        title.value = "<multiple values>".into();
+        title.is_mixed = true;
+        mch.dirty = true;
+
+        let outcome = super::save_sacd_sidecar(&state, &xml_path).expect("save");
+        assert!(outcome.mirror.sibling_present);
+        assert_eq!(outcome.mirror.sibling_total, 0);
+        assert_eq!(outcome.mirror.mirrored_count, 0);
+
+        let reparsed = parse_sidecar(&xml_path).expect("re-parse");
+        let title_for = |id| {
+            reparsed
+                .tracks
+                .iter()
+                .find(|track| track.id == id)
+                .and_then(|track| track.meta.get("TITLE"))
+                .map(String::as_str)
+        };
+        assert_eq!(title_for(1), Some("Stereo New"));
+        assert_eq!(title_for(2), Some("St-2"));
+        assert_eq!(title_for(3), Some("MCH New"));
+        assert_eq!(title_for(4), Some("MC-2"));
+    }
 
     #[test]
     fn save_sacd_sidecar_mirrors_album_level_edits_across_areas() {

@@ -4539,7 +4539,7 @@ fn try_dispatch_in_editor_tags_mb(
 ) -> Option<bool> {
     use super::app::ActiveOverlay;
 
-    let state_owned: Box<super::app::MetadataEditorState> =
+    let mut state_owned: Box<super::app::MetadataEditorState> =
         if let Some(parked) = app.pending_metadata_editor.take() {
             parked
         } else if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
@@ -4552,6 +4552,8 @@ fn try_dispatch_in_editor_tags_mb(
         } else {
             return None;
         };
+
+    state_owned.sync_active_presentation();
 
     // Direct-args path: skip TOC, fire a text search using the
     // user-supplied seed. Editor goes into `active_overlay` so the
@@ -5374,6 +5376,8 @@ mod sacd_seed_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: Vec::new(),
+            active_tab: 0,
         }
     }
 

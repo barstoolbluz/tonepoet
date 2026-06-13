@@ -53,6 +53,9 @@ pub fn map_dvda_disc_with_metabase(
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
+    // Disc-level album metadata: use whole-disc album_value. When groups have
+    // different ALBUM values this returns None, which is correct — the disc-level
+    // title is ambiguous. Per-presentation album metadata lives on DiscPresentation.
     let album_title = dvda_metabase::album_value(metabase, &["ALBUM"]);
     let album_artist = dvda_metabase::album_value(metabase, &["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"]);
     let genre = dvda_metabase::album_value(metabase, &["GENRE"]);
@@ -144,12 +147,22 @@ pub fn map_dvda_disc_with_metabase(
         let pres_label = labels::presentation_label(&format);
         let tracks = dvda_utils::build_dvda_tracks_with_metabase(disc, group, metabase);
 
+        // Per-presentation album metadata scoped to this group's tracks.
+        let group_track_ids = dvda_metabase::group_track_ids(disc, group);
+        let pres_album_value = |keys: &[&str]| -> Option<String> {
+            dvda_metabase::album_value_for_track_ids(metabase, &group_track_ids, keys)
+        };
+
         presentations.push(DiscPresentation {
             id: group_id,
             label: pres_label,
             format,
             tracks,
             total_duration_secs: duration,
+            album_title: pres_album_value(&["ALBUM"]),
+            album_artist: pres_album_value(&["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"]),
+            genre: pres_album_value(&["GENRE"]),
+            year: pres_album_value(&["DATE", "YEAR"]),
         });
     }
 

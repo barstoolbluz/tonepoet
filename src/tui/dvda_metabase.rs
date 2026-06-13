@@ -418,10 +418,48 @@ pub fn track_mut<'a>(metabase: &'a mut DvdaMetabase, id: &str) -> Option<&'a mut
     metabase.tracks.iter_mut().find(|track| track.id == id)
 }
 
+/// Return a uniform album-level value across all tracks in the metabase.
+///
+/// This is only appropriate for whole-disc reads. Multi-presentation callers
+/// should use `album_value_for_track_ids` so stereo and multichannel groups keep
+/// independent album-level metadata.
 pub fn album_value(metabase: Option<&DvdaMetabase>, keys: &[&str]) -> Option<String> {
-    let mut vals = Vec::new();
     let metabase = metabase?;
-    for tr in &metabase.tracks {
+    uniform_album_value_from_tracks(metabase.tracks.iter(), keys)
+}
+
+/// Return a uniform album-level value scoped to the supplied DVD-Audio track ids.
+///
+/// The foo_input_dvda metabase stores every group in one XML file. Album-like
+/// keys such as ALBUM, ALBUMARTIST, DATE, and MusicBrainz release ids therefore
+/// must be read only from the active group's `{titleset}.{title}.{track}` ids.
+/// Mixed values within the requested ids are reported as `None`, matching the
+/// existing whole-disc behavior without leaking values from sibling groups.
+pub fn album_value_for_track_ids(
+    metabase: Option<&DvdaMetabase>,
+    track_ids: &[String],
+    keys: &[&str],
+) -> Option<String> {
+    let metabase = metabase?;
+    if track_ids.is_empty() {
+        return None;
+    }
+    let wanted: BTreeSet<&str> = track_ids.iter().map(String::as_str).collect();
+    uniform_album_value_from_tracks(
+        metabase
+            .tracks
+            .iter()
+            .filter(|track| wanted.contains(track.id.as_str())),
+        keys,
+    )
+}
+
+fn uniform_album_value_from_tracks<'a, I>(tracks: I, keys: &[&str]) -> Option<String>
+where
+    I: IntoIterator<Item = &'a DvdaMetabaseTrack>,
+{
+    let mut vals = Vec::new();
+    for tr in tracks {
         for key in keys {
             if let Some(value) = meta_lookup(&tr.meta, key).filter(|v| !v.trim().is_empty()) {
                 vals.push(value.clone());
@@ -1084,6 +1122,68 @@ mod tests {
     fn catalog_path_requires_hex_store_id() {
         assert!(expected_catalog_path("not-a-store-id").is_none());
         assert!(expected_catalog_path(STORE).unwrap().ends_with("0123456789ABCDEF0123456789ABCDEF.xml"));
+    }
+
+    #[test]
+    fn album_value_for_track_ids_is_scoped_to_requested_group() {
+        let mut g1a = BTreeMap::new();
+        g1a.insert("ALBUM".to_string(), "Surround Album".to_string());
+        let mut g1b = BTreeMap::new();
+        g1b.insert("ALBUM".to_string(), "Surround Album".to_string());
+        let mut g3a = BTreeMap::new();
+        g3a.insert("ALBUM".to_string(), "Stereo Album".to_string());
+        let metabase = DvdaMetabase {
+            store_id: STORE.to_string(),
+            tracks: vec![
+                DvdaMetabaseTrack { id: "1.1.1".to_string(), meta: g1a },
+                DvdaMetabaseTrack { id: "1.1.2".to_string(), meta: g1b },
+                DvdaMetabaseTrack { id: "2.1.1".to_string(), meta: g3a },
+            ],
+        };
+
+        assert_eq!(
+            album_value(Some(&metabase), &["ALBUM"]),
+            None,
+            "global lookup must refuse mixed group-level values",
+        );
+        assert_eq!(
+            album_value_for_track_ids(
+                Some(&metabase),
+                &["1.1.1".to_string(), "1.1.2".to_string()],
+                &["ALBUM"],
+            )
+            .as_deref(),
+            Some("Surround Album"),
+        );
+        assert_eq!(
+            album_value_for_track_ids(Some(&metabase), &["2.1.1".to_string()], &["ALBUM"])
+                .as_deref(),
+            Some("Stereo Album"),
+        );
+    }
+
+    #[test]
+    fn album_value_for_track_ids_refuses_mixed_values_within_group() {
+        let mut a = BTreeMap::new();
+        a.insert("ALBUM".to_string(), "First".to_string());
+        let mut b = BTreeMap::new();
+        b.insert("ALBUM".to_string(), "Second".to_string());
+        let metabase = DvdaMetabase {
+            store_id: STORE.to_string(),
+            tracks: vec![
+                DvdaMetabaseTrack { id: "1.1.1".to_string(), meta: a },
+                DvdaMetabaseTrack { id: "1.1.2".to_string(), meta: b },
+            ],
+        };
+
+        assert_eq!(
+            album_value_for_track_ids(
+                Some(&metabase),
+                &["1.1.1".to_string(), "1.1.2".to_string()],
+                &["ALBUM"],
+            ),
+            None,
+        );
     }
 
     #[test]

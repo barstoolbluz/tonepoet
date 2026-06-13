@@ -1095,7 +1095,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             );
         }
         AppMessage::TagsFromMbComplete { outcome, ctx } => {
-            handle_tags_from_mb_complete(app, tx, outcome, ctx);
+            dispatch_tags_from_mb_complete(app, tx, outcome, ctx);
         }
         AppMessage::MbDetailPrefetchComplete { release_id, result } => {
             // Stamp the in-memory cache if the picker is still open,
@@ -1557,6 +1557,23 @@ fn handle_cue_mb_complete(
     app.set_status(summary);
 }
 
+/// Dispatch the `AppMessage::TagsFromMbComplete` arm from the real event-loop
+/// message matcher into the unified MusicBrainz completion handler.
+///
+/// Keeping this as a named production call site makes the async channel path
+/// explicit: `run_app` drains `rx`, `handle_message` matches
+/// `AppMessage::TagsFromMbComplete`, and this function hands the payload to
+/// `handle_tags_from_mb_complete`, whose success path eventually reopens the
+/// editor through the apply-to-all presentation prompt.
+fn dispatch_tags_from_mb_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    outcome: super::message::MbOutcome,
+    ctx: super::message::TagsMbContext,
+) {
+    handle_tags_from_mb_complete(app, tx, outcome, ctx);
+}
+
 /// Unified `:tags-mb` result handler. Routes both TOC (primary) and
 /// Search (fallback) outcomes through the same 0/1/N branching with
 /// behaviour parameterised by `TagsMbContext`:
@@ -1984,7 +2001,17 @@ pub(super) fn open_editor_with_mb_release(
     // guards single-image rips (where N>1 MB tracks ride in the
     // CUESHEET tag, not in N files) so they don't false-warn.
     let track_count_warning = super::musicbrainz::track_count_mismatch_message(&state, release);
+
+    // Keep the active tab snapshot current before and after MB population. For
+    // multi-presentation editors this preserves per-tab state and lets the
+    // apply-to-all confirmation copy only the MB-populated values from the
+    // active presentation into matching sibling presentations.
+    state.sync_active_presentation();
     super::musicbrainz::populate_editor_from_mb(&mut state, release);
+    state.phase = super::app::MetadataEditorPhase::Editing;
+    state.dirty = true;
+    state.sync_active_presentation();
+
     let label = if release.title.is_empty() {
         "(untitled)"
     } else {
@@ -1997,7 +2024,6 @@ pub(super) fn open_editor_with_mb_release(
     if let Some(warn) = track_count_warning {
         msg.push_str(&format!(" [{}]", warn));
     }
-    app.set_status(msg);
     // Cache release list for :mb-back when there's more than
     // one to choose from. Single-match has nothing to go back
     // to (re-opening the picker with one entry is pointless).
@@ -2008,7 +2034,13 @@ pub(super) fn open_editor_with_mb_release(
             selected,
         });
     }
-    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+
+    let has_presentation_tabs = state.has_presentation_tabs();
+    super::keybindings::reopen_metadata_editor_after_musicbrainz_population(app, state);
+    if has_presentation_tabs {
+        msg.push_str(" [apply to matching presentations?]");
+    }
+    app.set_status(msg);
 }
 
 /// Handle the result of a `:cue-fill` MusicBrainz lookup. Caches the response,
@@ -2126,5 +2158,310 @@ mod cue_proxy_batch_cursor_tests {
             batch_cursor_probe_kind(Path::new("/music/track.flac")),
             BatchCursorProbeKind::Audio
         );
+    }
+}
+
+
+#[cfg(test)]
+mod musicbrainz_completion_dispatch_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::disc::model::PresentationId;
+    use crate::tui::app::{ConfirmAction, MetadataEditorPhase, MetadataEditorState, PresentationTab};
+    use crate::tui::probe::TagEntry;
+    use lofty::tag::ItemKey;
+
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(4);
+        tx
+    }
+
+    fn paths(n: usize) -> Vec<std::path::PathBuf> {
+        (0..n)
+            .map(|idx| std::path::PathBuf::from(format!("/tmp/track{:02}.flac", idx + 1)))
+            .collect()
+    }
+
+    fn tag(display_key: &str, value: &str, n_paths: usize) -> TagEntry {
+        TagEntry {
+            display_key: display_key.to_string(),
+            item_key: ItemKey::TrackTitle,
+            value: value.to_string(),
+            original: value.to_string(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vec![value.to_string(); n_paths],
+            per_file_originals: vec![value.to_string(); n_paths],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    fn tab(id: PresentationId, label: &str, tab_paths: Vec<std::path::PathBuf>) -> PresentationTab {
+        let n_paths = tab_paths.len();
+        let group_value = match id {
+            PresentationId::DvdAudioGroup(group) => group.to_string(),
+            _ => String::new(),
+        };
+        PresentationTab {
+            id,
+            label: label.to_string(),
+            paths: tab_paths,
+            entries: vec![
+                tag("TITLE", label, n_paths),
+                tag("DVDA_GROUP", &group_value, n_paths),
+            ],
+            file_labels: (0..n_paths).map(|idx| format!("Track {:02}", idx + 1)).collect(),
+            deleted: Vec::new(),
+            dirty: false,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+        }
+    }
+
+    fn editor_with_tabs(active_tab: usize, n_paths: usize) -> Box<MetadataEditorState> {
+        let active_paths = paths(n_paths);
+        let tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1: MLP 96kHz/24-bit 5.1",
+                active_paths.clone(),
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(3),
+                "Group 3: LPCM 96kHz/24-bit stereo",
+                paths(n_paths),
+            ),
+        ];
+        let active = tabs[active_tab].clone();
+        Box::new(MetadataEditorState {
+            paths: active.paths,
+            entries: active.entries,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            dirty: active.dirty,
+            deleted: active.deleted,
+            file_labels: active.file_labels,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            sacd_area_kind: active.sacd_area_kind,
+            sacd_stereo_durations: active.sacd_stereo_durations,
+            sacd_multi_channel_durations: active.sacd_multi_channel_durations,
+            presentation_tabs: tabs,
+            active_tab,
+        })
+    }
+
+    fn release(id: &str, title: &str) -> crate::tui::musicbrainz::MbRelease {
+        crate::tui::musicbrainz::MbRelease {
+            release_id: id.to_string(),
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn lookup_outcome(
+        releases: Vec<crate::tui::musicbrainz::MbRelease>,
+    ) -> crate::tui::musicbrainz::MbLookupOutcome {
+        crate::tui::musicbrainz::MbLookupOutcome {
+            releases,
+            cache_response: None,
+        }
+    }
+
+    fn search_outcome(
+        releases: Vec<crate::tui::musicbrainz::MbRelease>,
+    ) -> crate::tui::musicbrainz::MbSearchOutcome {
+        crate::tui::musicbrainz::MbSearchOutcome {
+            releases,
+            cache_writes: Vec::new(),
+        }
+    }
+
+    fn ctx_for(paths: Vec<std::path::PathBuf>, editor_park: bool) -> crate::tui::message::TagsMbContext {
+        crate::tui::message::TagsMbContext {
+            paths,
+            editor_park,
+            fallback_seed: None,
+        }
+    }
+
+    fn assert_apply_all_confirmation(app: &AppState) -> &MetadataEditorState {
+        let ActiveOverlay::Confirmation { message, action } = &app.active_overlay else {
+            panic!("expected apply-to-all confirmation overlay, got {:?}", app.active_overlay);
+        };
+        assert_eq!(
+            message,
+            "Apply MusicBrainz tags to all matching presentations?"
+        );
+        let ConfirmAction::ApplyMbToAllPresentations(state) = action else {
+            panic!("expected ApplyMbToAllPresentations, got {:?}", action);
+        };
+        state.as_ref()
+    }
+
+    #[test]
+    fn tags_from_mb_complete_message_dispatch_sets_lookup_error_status() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let tx = tx();
+        let msg = AppMessage::TagsFromMbComplete {
+            outcome: crate::tui::message::MbOutcome::Toc {
+                outcome: Err("synthetic lookup failure".to_string()),
+                toc_string: "1+1".to_string(),
+            },
+            ctx: ctx_for(Vec::new(), false),
+        };
+
+        handle_message(&mut app, msg, &tx);
+
+        let status = app.status_message.as_ref().map(|(msg, _)| msg.as_str());
+        assert_eq!(
+            status,
+            Some(":tags-mb: TOC lookup failed: synthetic lookup failure")
+        );
+    }
+
+    #[test]
+    fn multi_match_completion_parks_open_editor_and_restores_it_on_cancel_path() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let tx = tx();
+        let editor = editor_with_tabs(0, 2);
+        let editor_paths = editor.paths.clone();
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+
+        handle_message(
+            &mut app,
+            AppMessage::TagsFromMbComplete {
+                outcome: crate::tui::message::MbOutcome::Toc {
+                    outcome: Ok(lookup_outcome(vec![
+                        release("", "Candidate A"),
+                        release("", "Candidate B"),
+                    ])),
+                    toc_string: "1+2".to_string(),
+                },
+                ctx: ctx_for(editor_paths.clone(), true),
+            },
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MbSelect(state) => {
+                assert_eq!(state.releases.len(), 2);
+                assert_eq!(state.paths, editor_paths);
+            }
+            other => panic!("expected MbSelect overlay, got {:?}", other),
+        }
+        assert!(
+            app.pending_metadata_editor.is_some(),
+            "the source editor must be parked while MbSelect is open"
+        );
+
+        restore_parked_editor(&mut app);
+
+        assert!(app.pending_metadata_editor.is_none());
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert_eq!(state.presentation_tabs.len(), 2);
+                assert_eq!(state.active_tab, 0);
+            }
+            other => panic!("expected parked editor to be restored, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn single_match_completion_from_message_opens_apply_all_confirmation() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let tx = tx();
+        let editor = editor_with_tabs(0, 2);
+        let editor_paths = editor.paths.clone();
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+
+        handle_message(
+            &mut app,
+            AppMessage::TagsFromMbComplete {
+                outcome: crate::tui::message::MbOutcome::Toc {
+                    outcome: Ok(lookup_outcome(vec![release("", "One Match Album")])),
+                    toc_string: "1+2".to_string(),
+                },
+                ctx: ctx_for(editor_paths, true),
+            },
+            &tx,
+        );
+
+        let state = assert_apply_all_confirmation(&app);
+        assert_eq!(state.presentation_tabs.len(), 2);
+        assert_eq!(state.active_tab, 0);
+        assert!(app.pending_metadata_editor.is_some());
+        let status = app.status_message.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status
+                .unwrap_or_default()
+                .contains("[apply to matching presentations?]")
+        );
+    }
+
+    #[test]
+    fn search_single_match_completion_uses_same_apply_all_handoff() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let tx = tx();
+        let editor = editor_with_tabs(0, 2);
+        let editor_paths = editor.paths.clone();
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+
+        handle_message(
+            &mut app,
+            AppMessage::TagsFromMbComplete {
+                outcome: crate::tui::message::MbOutcome::Search {
+                    outcome: Ok(search_outcome(vec![release("", "Search Match Album")])),
+                    query_label: "artist / album".to_string(),
+                },
+                ctx: ctx_for(editor_paths, true),
+            },
+            &tx,
+        );
+
+        let state = assert_apply_all_confirmation(&app);
+        assert_eq!(state.presentation_tabs.len(), 2);
+        assert_eq!(state.active_tab, 0);
+        assert!(app.pending_metadata_editor.is_some());
+    }
+
+    #[test]
+    fn picked_mb_select_release_uses_parked_editor_and_caches_picker_back_state() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let editor = editor_with_tabs(0, 2);
+        let editor_paths = editor.paths.clone();
+        app.pending_metadata_editor = Some(editor);
+        app.active_overlay = ActiveOverlay::MbSelect(Box::new(crate::tui::app::MbSelectState::new(
+            vec![release("", "Candidate A"), release("", "Candidate B")],
+            editor_paths.clone(),
+        )));
+
+        open_editor_with_mb_release(
+            &mut app,
+            vec![release("", "Candidate A"), release("", "Candidate B")],
+            1,
+            editor_paths,
+        );
+
+        let state = assert_apply_all_confirmation(&app);
+        let mb_back = state
+            .mb_back
+            .as_ref()
+            .expect("picker-selected releases should keep :mb-back state");
+        assert_eq!(mb_back.selected, 1);
+        assert_eq!(mb_back.releases.len(), 2);
+        assert_eq!(state.presentation_tabs.len(), 2);
     }
 }

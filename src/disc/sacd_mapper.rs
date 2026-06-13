@@ -63,13 +63,21 @@ pub fn map_sacd_disc(
 
     // Map stereo area
     if let Some(area) = &metadata.stereo {
-        let pres = map_area(area, AreaKind::Stereo, sidecar, 1, &mut diagnostics);
+        let mut pres = map_area(area, AreaKind::Stereo, sidecar, 1, &mut diagnostics);
+        pres.album_title = album_title.clone();
+        pres.album_artist = album_artist.clone();
+        pres.genre = genre.clone();
+        pres.year = year.clone();
         presentations.push(pres);
     }
 
     // Map multichannel area
     if let Some(area) = &metadata.multi_channel {
-        let pres = map_area(area, AreaKind::MultiChannel, sidecar, 2, &mut diagnostics);
+        let mut pres = map_area(area, AreaKind::MultiChannel, sidecar, 2, &mut diagnostics);
+        pres.album_title = album_title.clone();
+        pres.album_artist = album_artist.clone();
+        pres.genre = genre.clone();
+        pres.year = year.clone();
         presentations.push(pres);
     }
 
@@ -183,6 +191,10 @@ fn map_area(
         format,
         tracks,
         total_duration_secs: total_duration,
+        album_title: None,
+        album_artist: None,
+        genre: None,
+        year: None,
     }
 }
 
