@@ -452,6 +452,12 @@ pub struct SamgTrackRef {
 pub enum GroupCorrelation {
     FromAmgAott,
     FromAtsiFallback,
+    /// A PGC title that exists in an ATS PGCIT but is not referenced by any
+    /// `is_audio` AOTT entry. Common for stereo presentations on discs where
+    /// multichannel and stereo share the same ATS AOBs (e.g., Talking Heads
+    /// Rhino DVD-Audio reissues). IFO audio-format facts may not describe
+    /// this title accurately.
+    OrphanPgcTitle,
     SamgOnly,
     MixedAmgAndSamg,
 }
@@ -576,6 +582,39 @@ pub(crate) fn groups_from_disc_parts(
                     correlation: GroupCorrelation::FromAtsiFallback,
                 });
                 ordinal = ordinal.saturating_add(1);
+            }
+        }
+    }
+
+    // Surface orphan PGC titles: titles that exist in an ATS PGCIT but
+    // aren't referenced by any AOTT audio entry. Common on DVD-Audio discs
+    // where the stereo presentation is a second title in ATS 1 (e.g., all
+    // Talking Heads Rhino DVD-Audio reissues).
+    if !aott.is_empty() {
+        let mut next_group_nr = groups.keys().copied().max().unwrap_or(0).saturating_add(1);
+        for ts in title_sets {
+            for title in &ts.titles {
+                let already_referenced = groups.values().any(|group| {
+                    group.title_refs.iter().any(|tr| {
+                        tr.title_set_nr == ts.number && match tr.kind {
+                            TitleRefKind::AottTitleOrdinal => tr.title_nr == title.title_ordinal,
+                            TitleRefKind::AtsPgcTitleNr => tr.title_nr == title.title_nr,
+                        }
+                    })
+                });
+                if !already_referenced {
+                    groups.insert(next_group_nr, DvdaGroup {
+                        group_nr: next_group_nr,
+                        title_refs: vec![TitleRef {
+                            title_set_nr: ts.number,
+                            title_nr: title.title_ordinal,
+                            kind: TitleRefKind::AottTitleOrdinal,
+                        }],
+                        samg_tracks: Vec::new(),
+                        correlation: GroupCorrelation::OrphanPgcTitle,
+                    });
+                    next_group_nr = next_group_nr.saturating_add(1);
+                }
             }
         }
     }

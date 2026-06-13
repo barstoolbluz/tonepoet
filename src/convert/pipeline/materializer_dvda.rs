@@ -1350,6 +1350,19 @@ fn append_title_tracks(
         let audio_facts = correlated_samg_track
             .map(audio_facts_for_samg_track)
             .unwrap_or_else(|| audio_facts_for_title_chapter(title_set, chapter));
+        // Orphan PGC titles share a title set with another title whose audio
+        // format entry may describe a different channel layout (e.g., 5.1 vs
+        // stereo). Clear IFO-derived channel expectations so the MLP/LPCM
+        // stream self-describes its channel count during realization.
+        let audio_facts = if matches!(group.correlation, GroupCorrelation::OrphanPgcTitle) {
+            AudioFacts {
+                channel_assignment: None,
+                channel_format: None,
+                ..audio_facts
+            }
+        } else {
+            audio_facts
+        };
         let source_audio = source_audio_descriptor_for_facts(audio_facts);
         let aob_inventory_covers_track =
             title_set_has_existing_aobs && sector_ranges_are_covered(chapter, &aob_files);
@@ -2508,6 +2521,7 @@ fn group_correlation_label(correlation: &GroupCorrelation) -> &'static str {
     match correlation {
         GroupCorrelation::FromAmgAott => "amg_aott",
         GroupCorrelation::FromAtsiFallback => "atsi_fallback",
+        GroupCorrelation::OrphanPgcTitle => "orphan_pgc_title",
         GroupCorrelation::SamgOnly => "samg_only",
         GroupCorrelation::MixedAmgAndSamg => "mixed_amg_samg",
     }
