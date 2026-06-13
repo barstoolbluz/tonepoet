@@ -4038,6 +4038,26 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
     }
 }
 
+/// Merge Convert-screen multi-track state into pipeline source options.
+///
+/// `commit_batch()` may construct or attach a full `PipelineRequest` before
+/// `execute_commit()` can add UI-only state such as the selected DVD-Audio
+/// presentation. This helper is intentionally usable for both newly-created
+/// and already-prebuilt requests, so the final request that reaches the
+/// processor has the same source selection the user saw in the Convert screen.
+fn apply_multitrack_convert_state_to_source_options(
+    mode: &SourceMode,
+    source: &mut crate::convert::pipeline::SourceOptions,
+    selected_track_numbers: Option<&std::collections::BTreeSet<u32>>,
+) {
+    source.track_selection = match selected_track_numbers {
+        Some(numbers) => crate::convert::pipeline::TrackSelection::Set(numbers.clone()),
+        None => crate::convert::pipeline::TrackSelection::All,
+    };
+
+    super::disc_browser::apply_source_mode_disc_selection_to_source_options(mode, source);
+}
+
 /// Execute a `:commit` / `:Commit` command. Only valid on the Convert
 /// screen with a source file or batch loaded. Enqueues the batch (and
 /// optionally starts processing), then navigates away:
@@ -4151,14 +4171,15 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                     dvda_downmix_policy: DvdaDownmixPolicy::Auto,
                     cue_sidecar: CueSidecarPolicy::PreferSidecar,
                     track_selection: if has_deselected {
-                        TrackSelection::Set(selected_numbers)
+                        TrackSelection::Set(selected_numbers.clone())
                     } else {
                         TrackSelection::All
                     },
                 };
-                super::disc_browser::apply_source_mode_disc_selection_to_source_options(
+                apply_multitrack_convert_state_to_source_options(
                     &app.convert.source.mode,
                     &mut source,
+                    None,
                 );
 
                 let req = PipelineRequest {
@@ -4210,8 +4231,37 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
 
                 if let Ok(mut q) = app.manager.queue.try_write() {
                     for item in q.all_items_mut() {
-                        if item.input_path == *path && item.pipeline_request.is_none() {
+                        if item.input_path != *path {
+                            continue;
+                        }
+
+                        if let Some(existing_req) = item.pipeline_request.as_mut() {
+                            // `commit_batch()` may already have attached a full
+                            // PipelineRequest from the ordinary format/output pill
+                            // state. Do not leave that prebuilt request untouched:
+                            // build_pipeline_request() returns prebuilt requests as-is,
+                            // so a default SourceOptions here is exactly how a selected
+                            // DVD-Audio stream falls back to group 1 at materialization.
+                            existing_req.container = item.input_path.clone();
+                            existing_req.item_id = item.id.clone();
+                            existing_req.job_id = format!("job-{}", item.id);
+
+                            apply_multitrack_convert_state_to_source_options(
+                                &app.convert.source.mode,
+                                &mut existing_req.source,
+                                if has_deselected {
+                                    Some(&selected_numbers)
+                                } else {
+                                    None
+                                },
+                            );
+                            if let Some(ref pw) = item.archive_password {
+                                existing_req.source.archive_password =
+                                    Some(SecretString::new(pw.clone()));
+                            }
+                        } else {
                             let mut item_req = req.clone();
+                            item_req.container = item.input_path.clone();
                             item_req.item_id = item.id.clone();
                             item_req.job_id = format!("job-{}", item.id);
                             if let Some(ref pw) = item.archive_password {
@@ -5185,6 +5235,101 @@ pub fn apply_cue_changes(
 mod completion_tests {
     use super::*;
     use crate::tui::text_input::TextInputState;
+
+    fn test_source_options() -> crate::convert::pipeline::SourceOptions {
+        crate::convert::pipeline::SourceOptions {
+            archive_password: None,
+            sacd_area: None,
+            dvda_group: None,
+            dvda_group_selection: crate::convert::pipeline::DvdaGroupSelection::Default,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+            cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+            track_selection: crate::convert::pipeline::TrackSelection::All,
+        }
+    }
+
+    fn dvda_multitrack_mode(group: u8) -> SourceMode {
+        SourceMode::MultiTrack {
+            path: std::path::PathBuf::from("/tmp/disc.iso"),
+            info: None,
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            tracks: vec![crate::tui::app::MultiTrackEntry {
+                number: 1,
+                title: Some("Track 1".to_string()),
+                performer: None,
+                duration_display: None,
+            }],
+            area_label: Some(format!("Group {group}")),
+            album_title: None,
+            album_artist: None,
+            probe_notice: None,
+            scroll: 0,
+            cursor: 0,
+            selected: vec![true],
+            disc_contents: None,
+            selected_presentation_id: Some(crate::disc::PresentationId::DvdAudioGroup(group)),
+        }
+    }
+
+    #[test]
+    fn multitrack_commit_state_overwrites_prebuilt_default_dvda_group() {
+        let mode = dvda_multitrack_mode(3);
+        let mut source = test_source_options();
+
+        apply_multitrack_convert_state_to_source_options(&mode, &mut source, None);
+
+        assert_eq!(
+            source.effective_dvda_group_selection(),
+            crate::convert::pipeline::DvdaGroupSelection::Group(3)
+        );
+        assert!(matches!(
+            source.dvda_downmix_policy,
+            crate::convert::pipeline::DvdaDownmixPolicy::Auto
+        ));
+        assert!(matches!(
+            source.track_selection,
+            crate::convert::pipeline::TrackSelection::All
+        ));
+    }
+
+    #[test]
+    fn multitrack_commit_state_resets_stale_track_subset_when_all_tracks_selected() {
+        let mode = dvda_multitrack_mode(3);
+        let mut source = test_source_options();
+        source.track_selection = crate::convert::pipeline::TrackSelection::Set(
+            std::collections::BTreeSet::from([1]),
+        );
+
+        apply_multitrack_convert_state_to_source_options(&mode, &mut source, None);
+
+        assert!(matches!(
+            source.track_selection,
+            crate::convert::pipeline::TrackSelection::All
+        ));
+        assert_eq!(
+            source.effective_dvda_group_selection(),
+            crate::convert::pipeline::DvdaGroupSelection::Group(3)
+        );
+    }
+
+    #[test]
+    fn multitrack_commit_state_preserves_track_subset_and_dvda_group() {
+        let mode = dvda_multitrack_mode(3);
+        let mut source = test_source_options();
+        let selected = std::collections::BTreeSet::from([2, 4]);
+
+        apply_multitrack_convert_state_to_source_options(&mode, &mut source, Some(&selected));
+
+        assert_eq!(
+            source.effective_dvda_group_selection(),
+            crate::convert::pipeline::DvdaGroupSelection::Group(3)
+        );
+        match source.track_selection {
+            crate::convert::pipeline::TrackSelection::Set(actual) => assert_eq!(actual, selected),
+            other => panic!("expected selected track set, got {other:?}"),
+        }
+    }
 
     // ── compute_completion: command-name completion ──
 
