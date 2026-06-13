@@ -24,14 +24,17 @@ use super::dvda_demux::{
 use super::dvda_lpcm::{
     DvdAudioLpcmDecoder, LpcmDecodeStats, LpcmParams, LpcmStreamExpectation,
 };
-use super::dvda_mlp::{inspect_mlp_file, MlpStreamExpectation, MlpStreamInspection};
+use super::dvda_mlp::{
+    inspect_mlp_file, probe_mlp_major_sync, MlpStreamExpectation, MlpStreamInspection,
+};
 use super::errors::{ConvertError, ToolRunnerError};
 use super::progress::{heartbeat, OperationProgressTracker};
 use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::track_executor::{run_tool_command_with_concurrency, ToolConcurrencyLimits};
 use super::types::{
-    DvdaAobFileRef, DvdaDownmixPolicy, DvdaIsoBackend, DvdaSectorAddressSpace,
-    DvdaSectorRangeRef, DvdaVolumeSourceRef, PreparedTrack, SourceAudioDescriptor, StagingDir,
+    DvdaAobFileRef, DvdaDownmixPolicy, DvdaElementaryStreamKind, DvdaIsoBackend,
+    DvdaSectorAddressSpace, DvdaSectorRangeRef, DvdaVolumeSourceRef, PreparedTrack,
+    SourceAudioDescriptor, StagingDir,
     TrackSourceRef,
 };
 use crate::tui::dvda::sector::AobSectorReader;
@@ -42,6 +45,7 @@ use crate::tui::dvda::{
 
 const PTS_PER_SECOND: u128 = 90_000;
 const DVDA_READ_CHUNK_SECTORS: u32 = 256;
+const DVDA_DISC_ABSOLUTE_STREAM_PROBE_SECTORS: u32 = 512;
 const DVDA_FFMPEG_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const DVDA_STRICT_DURATION_ENV: &str = "TONEPOET_DVDA_PHASE3_STRICT_DURATION";
 const DVDA_NEAR_EXACT_DURATION_ENV: &str = "TONEPOET_DVDA_PHASE3_NEAR_EXACT_DURATION";
@@ -424,6 +428,7 @@ fn source_audio_channel_order_label(source_audio: &SourceAudioDescriptor) -> Opt
 struct DvdaTrackRealizeInput {
     volume_source: DvdaVolumeSourceRef,
     sector_address_space: DvdaSectorAddressSpace,
+    elementary_stream_kind_hint: Option<DvdaElementaryStreamKind>,
     group_nr: u8,
     group_track_ordinal: u32,
     title_set_nr: Option<u8>,
@@ -466,6 +471,7 @@ impl DvdaTrackRealizeInput {
         let TrackSourceRef::DvdaTrack {
             volume_source,
             sector_address_space,
+            elementary_stream_kind_hint,
             group_nr,
             group_track_ordinal,
             title_set_nr,
@@ -535,6 +541,7 @@ impl DvdaTrackRealizeInput {
         Ok(Self {
             volume_source: volume_source.clone(),
             sector_address_space: *sector_address_space,
+            elementary_stream_kind_hint: *elementary_stream_kind_hint,
             group_nr: *group_nr,
             group_track_ordinal: *group_track_ordinal,
             title_set_nr: *title_set_nr,
@@ -764,7 +771,21 @@ impl ExpectedElementaryStreamKind {
     }
 }
 
+impl From<DvdaElementaryStreamKind> for ExpectedElementaryStreamKind {
+    fn from(kind: DvdaElementaryStreamKind) -> Self {
+        match kind {
+            DvdaElementaryStreamKind::Mlp => Self::Mlp,
+            DvdaElementaryStreamKind::Lpcm => Self::Lpcm,
+        }
+    }
+}
 
+fn materialized_stream_hint_for_track(track: &DvdaTrackRealizeInput) -> Option<ExpectedElementaryStreamKind> {
+    match track.sector_address_space {
+        DvdaSectorAddressSpace::DiscAbsolute { .. } => track.elementary_stream_kind_hint.map(Into::into),
+        DvdaSectorAddressSpace::AtsAobRelative { .. } | DvdaSectorAddressSpace::SamgAbsolute => None,
+    }
+}
 
 fn classify_sector_elementary_stream(
     packets: &[DvdaPs1Packet<'_>],
@@ -997,6 +1018,128 @@ fn read_disc_absolute_blocks_from_iso(
     Ok(required)
 }
 
+fn packet_kind_matches_hint(packet: DvdaPs1Packet<'_>, hint: ExpectedElementaryStreamKind) -> bool {
+    match (hint, packet.sub_header.kind()) {
+        (ExpectedElementaryStreamKind::Mlp, DvdaSubstreamKind::Mlp) => {
+            packet.sub_header.extra_header_length >= MLP_EXTRA_HEADER_LENGTH
+        }
+        (ExpectedElementaryStreamKind::Lpcm, DvdaSubstreamKind::Pcm) => {
+            packet.sub_header.extra_header_length >= PCM_EXTRA_HEADER_LENGTH
+                && packet.sub_header.pcm.is_some()
+        }
+        _ => false,
+    }
+}
+
+fn packets_matching_stream_hint<'sector>(
+    packets: &[DvdaPs1Packet<'sector>],
+    hint: ExpectedElementaryStreamKind,
+    logical_sector: u32,
+) -> Vec<DvdaPs1Packet<'sector>> {
+    let selected: Vec<_> = packets
+        .iter()
+        .copied()
+        .filter(|packet| packet_kind_matches_hint(*packet, hint))
+        .collect();
+
+    if selected.len() != packets.len() {
+        let skipped = packets.len().saturating_sub(selected.len());
+        if skipped != 0 {
+            log::debug!(
+                "DVD-Audio disc-absolute demux skipped {skipped} foreign or malformed Private Stream 1 packet(s) at sector {logical_sector} after locking onto {}",
+                hint.label()
+            );
+        }
+    }
+
+    selected
+}
+
+fn infer_disc_absolute_stream_hint(
+    track: &DvdaTrackRealizeInput,
+    sector_reader: &mut TrackSectorReader<'_>,
+    cancel: &CancellationToken,
+) -> Result<Option<ExpectedElementaryStreamKind>, ConvertError> {
+    if !matches!(track.sector_address_space, DvdaSectorAddressSpace::DiscAbsolute { .. }) {
+        return Ok(None);
+    }
+
+    let mut sector_buf = vec![0_u8; DVD_SECTOR_SIZE * DVDA_READ_CHUNK_SECTORS as usize];
+    let mut mlp_payload = Vec::new();
+    let mut sectors_scanned = 0_u32;
+
+    for range in &track.sector_ranges {
+        if sectors_scanned >= DVDA_DISC_ABSOLUTE_STREAM_PROBE_SECTORS {
+            break;
+        }
+        if range.last < range.first {
+            return Err(ConvertError::TrackValidation(format!(
+                "DVD-Audio sector range {} has last sector {} before first sector {}",
+                range.index_nr, range.last, range.first
+            )));
+        }
+
+        let mut next_sector = range.first;
+        let mut sectors_remaining = range.block_count();
+        while sectors_remaining > 0 && sectors_scanned < DVDA_DISC_ABSOLUTE_STREAM_PROBE_SECTORS {
+            if cancel.is_cancelled() {
+                return Err(ConvertError::Realize("cancelled".to_string()));
+            }
+
+            let probe_remaining = DVDA_DISC_ABSOLUTE_STREAM_PROBE_SECTORS - sectors_scanned;
+            let chunk_sectors = sectors_remaining
+                .min(DVDA_READ_CHUNK_SECTORS)
+                .min(probe_remaining);
+            let chunk_bytes = chunk_sectors as usize * DVD_SECTOR_SIZE;
+            let bytes_read = sector_reader
+                .read_blocks_into(next_sector, chunk_sectors, &mut sector_buf[..chunk_bytes])
+                .map_err(|err| {
+                    ConvertError::Realize(format!(
+                        "DVD-Audio disc-absolute stream probe failed in range {} ({}..={}) at sector {next_sector} for {} sectors: {err}",
+                        range.index_nr, range.first, range.last, chunk_sectors
+                    ))
+                })?;
+            if bytes_read != chunk_bytes {
+                return Err(ConvertError::Realize(format!(
+                    "DVD-Audio disc-absolute stream probe short read in range {} ({}..={}) at sector {next_sector}: requested {} bytes ({} sectors), read {} bytes",
+                    range.index_nr, range.first, range.last, chunk_bytes, chunk_sectors, bytes_read
+                )));
+            }
+
+            for sector in sector_buf[..bytes_read].chunks_exact(DVD_SECTOR_SIZE) {
+                sectors_scanned = sectors_scanned.saturating_add(1);
+                let Ok(packets) = parse_private_stream_1_packets(sector) else {
+                    continue;
+                };
+                for packet in packets {
+                    if matches!(packet.sub_header.kind(), DvdaSubstreamKind::Mlp)
+                        && packet.sub_header.extra_header_length >= MLP_EXTRA_HEADER_LENGTH
+                    {
+                        mlp_payload.extend_from_slice(packet.payload);
+                    }
+                }
+                if probe_mlp_major_sync(&mlp_payload).is_some() {
+                    log::debug!(
+                        "DVD-Audio disc-absolute stream probe locked group {} track {} to MLP after scanning {} sector(s)",
+                        track.group_nr,
+                        track.group_track_ordinal,
+                        sectors_scanned
+                    );
+                    return Ok(Some(ExpectedElementaryStreamKind::Mlp));
+                }
+                if sectors_scanned >= DVDA_DISC_ABSOLUTE_STREAM_PROBE_SECTORS {
+                    break;
+                }
+            }
+
+            next_sector = next_sector.saturating_add(chunk_sectors);
+            sectors_remaining -= chunk_sectors;
+        }
+    }
+
+    Ok(None)
+}
+
 fn extract_track_audio_payload(
     track: &DvdaTrackRealizeInput,
     staging_root: &Path,
@@ -1006,6 +1149,17 @@ fn extract_track_audio_payload(
     let volume = open_realize_volume(&track.volume_source)?;
     let aob_entries = to_aob_entries(&track.aob_files);
     let mut sector_reader = TrackSectorReader::new(track, &volume, &aob_entries)?;
+    let stream_kind_hint = if let Some(hint) = materialized_stream_hint_for_track(track) {
+        log::debug!(
+            "DVD-Audio disc-absolute materialized stream hint applies to group {} track {}: {}",
+            track.group_nr,
+            track.group_track_ordinal,
+            hint.label()
+        );
+        Some(hint)
+    } else {
+        infer_disc_absolute_stream_hint(track, &mut sector_reader, cancel)?
+    };
 
     let elementary_dir = staging_root.join("dvda-elementary-audio");
     fs::create_dir_all(&elementary_dir)?;
@@ -1053,12 +1207,23 @@ fn extract_track_audio_payload(
 
             for (idx, sector) in sector_buf[..bytes_read].chunks_exact(DVD_SECTOR_SIZE).enumerate() {
                 let logical_sector = next_sector + idx as u32;
-                let packets = parse_private_stream_1_packets(sector).map_err(|err| {
+                let raw_packets = parse_private_stream_1_packets(sector).map_err(|err| {
                     ConvertError::Realize(format!(
                         "DVD-Audio MPEG-PS demux failed at logical sector {logical_sector}: {err}"
                     ))
                 })?;
-                let sector_kind = classify_sector_elementary_stream(&packets, stream_kind, logical_sector)
+                let filtered_packets;
+                let packets = if let Some(hint) = stream_kind_hint {
+                    filtered_packets = packets_matching_stream_hint(&raw_packets, hint, logical_sector);
+                    filtered_packets.as_slice()
+                } else {
+                    raw_packets.as_slice()
+                };
+                let sector_kind = classify_sector_elementary_stream(
+                    packets,
+                    stream_kind.or(stream_kind_hint),
+                    logical_sector,
+                )
                     .map_err(|err| {
                         ConvertError::Realize(format!(
                             "DVD-Audio MPEG-PS semantic validation failed at logical sector {logical_sector}: {err}"
@@ -1080,7 +1245,7 @@ fn extract_track_audio_payload(
                             mlp_writer = Some(BufWriter::new(file));
                         }
                         let writer = mlp_writer.as_mut().expect("MLP writer initialized");
-                        write_mlp_sector_payload(&packets, writer).map_err(|err| {
+                        write_mlp_sector_payload(packets, writer).map_err(|err| {
                             ConvertError::Realize(format!(
                                 "DVD-Audio MLP sector-local commit failed at logical sector {logical_sector}: {err}"
                             ))
@@ -1108,7 +1273,7 @@ fn extract_track_audio_payload(
                         }
                         let writer = lpcm_writer.as_mut().expect("LPCM writer initialized");
                         let decoder = lpcm_decoder.as_mut().expect("LPCM decoder initialized");
-                        decode_lpcm_sector_payload(&packets, decoder, writer).map_err(|err| {
+                        decode_lpcm_sector_payload(packets, decoder, writer).map_err(|err| {
                             ConvertError::Realize(format!(
                                 "DVD-Audio LPCM sector-local commit failed at logical sector {logical_sector}: {err}"
                             ))
@@ -1118,7 +1283,7 @@ fn extract_track_audio_payload(
                     None => {}
                 }
 
-                record_private_stream_1_packets(&mut stats, &packets);
+                record_private_stream_1_packets(&mut stats, packets);
             }
 
             next_sector = next_sector.saturating_add(chunk_sectors);
@@ -3392,6 +3557,7 @@ mod tests {
         TrackSourceRef::DvdaTrack {
             volume_source: DvdaVolumeSourceRef::Directory { root: PathBuf::from("/tmp/disc") },
             sector_address_space: DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
+            elementary_stream_kind_hint: None,
             group_nr: 1,
             title_set_nr: Some(1),
             title_nr: Some(2),
@@ -4012,6 +4178,7 @@ mod tests {
         let source = TrackSourceRef::DvdaTrack {
             volume_source: DvdaVolumeSourceRef::Directory { root: PathBuf::from("/tmp/disc") },
             sector_address_space: DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
+            elementary_stream_kind_hint: None,
             group_nr: 1,
             title_set_nr: Some(1),
             title_nr: Some(1),
@@ -4372,6 +4539,7 @@ mod tests {
                 backend: DvdaIsoBackend::Udf,
             },
             sector_address_space: DvdaSectorAddressSpace::SamgAbsolute,
+            elementary_stream_kind_hint: None,
             group_nr: 1,
             title_set_nr: None,
             title_nr: None,
@@ -5385,6 +5553,82 @@ mod tests {
 
         assert!(result.is_err());
         assert!(out.is_empty(), "mixed-sector semantic failure must not commit payload bytes");
+    }
+
+
+    #[test]
+    fn materialized_disc_absolute_stream_hint_takes_precedence_over_per_track_probe() {
+        let mut input = sample_dvda_track_realize_input();
+        input.sector_address_space = DvdaSectorAddressSpace::DiscAbsolute { title_set_nr: 2 };
+        input.elementary_stream_kind_hint = Some(DvdaElementaryStreamKind::Mlp);
+
+        assert_eq!(
+            materialized_stream_hint_for_track(&input),
+            Some(ExpectedElementaryStreamKind::Mlp)
+        );
+
+        input.sector_address_space = DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 };
+        assert_eq!(materialized_stream_hint_for_track(&input), None);
+    }
+
+    #[test]
+    fn disc_absolute_mlp_hint_filters_foreign_lpcm_before_commit() {
+        use super::super::dvda_demux::DvdaPcmSubHeader;
+
+        let mlp_payload = [0x11, 0x22, 0x33];
+        let bogus_lpcm_payload = [0x44, 0x55, 0x66];
+        let packets = [
+            DvdaPs1Packet {
+                sub_header: DvdaSubHeader {
+                    stream_id: MLP_STREAM_ID,
+                    cyclic: 0,
+                    extra_header_length: MLP_EXTRA_HEADER_LENGTH,
+                    total_header_length: 4 + usize::from(MLP_EXTRA_HEADER_LENGTH),
+                    cci: Some(0),
+                    pcm: None,
+                },
+                payload: &mlp_payload,
+            },
+            DvdaPs1Packet {
+                sub_header: DvdaSubHeader {
+                    stream_id: PCM_STREAM_ID,
+                    cyclic: 1,
+                    extra_header_length: PCM_EXTRA_HEADER_LENGTH,
+                    total_header_length: 4 + usize::from(PCM_EXTRA_HEADER_LENGTH),
+                    cci: Some(0),
+                    pcm: Some(DvdaPcmSubHeader {
+                        first_audio_frame: 0,
+                        group1_bits_code: 2,
+                        group2_bits_code: 0,
+                        group1_sample_rate_code: 2,
+                        group2_sample_rate_code: 0,
+                        group1_bits: Some(24),
+                        group2_bits: Some(16),
+                        group1_sample_rate: Some(192_000),
+                        group2_sample_rate: Some(48_000),
+                        channel_assignment: 85,
+                        cci: 0,
+                    }),
+                },
+                payload: &bogus_lpcm_payload,
+            },
+        ];
+
+        let packets = packets_matching_stream_hint(&packets, ExpectedElementaryStreamKind::Mlp, 42);
+        assert_eq!(packets.len(), 1);
+        assert!(matches!(packets[0].sub_header.kind(), DvdaSubstreamKind::Mlp));
+
+        let mut out = Vec::new();
+        let sector_kind = classify_sector_elementary_stream(
+            &packets,
+            Some(ExpectedElementaryStreamKind::Mlp),
+            42,
+        )
+        .expect("foreign LPCM packet should have been filtered before semantic validation");
+        assert_eq!(sector_kind, Some(ExpectedElementaryStreamKind::Mlp));
+
+        write_mlp_sector_payload(&packets, &mut out).expect("MLP payload commit");
+        assert_eq!(out, mlp_payload);
     }
 
     #[test]

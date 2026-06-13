@@ -735,27 +735,6 @@ fn resolve_dvda_track_downmix_policy(
     }
 }
 
-fn disc_info_stereo_downmix_source_label(
-    volume_source: &DvdaVolumeSourceRef,
-    volume: &dyn DvdaVolume,
-    disc: &DvdaDisc,
-    group: &DvdaGroup,
-) -> Option<String> {
-    let source_path = volume_source.original_container();
-    let source_path = source_path.is_file().then_some(source_path.as_path());
-    let probe = probe_group_aob_format_with_path(volume, disc, group, source_path)?;
-
-    // This is the same signal `disc-info` renders as
-    // "Stereo (derived from <source>)". `probe.channels` is intentionally the
-    // resolved MLP carrier channel count, not the IFO/SAMG presentation count,
-    // so a stereo-facing AOB-less ATS does not suppress auto downmix.
-    if probe.codec == "MLP" && probe.channels > 2 {
-        probe.stereo_downmix_source_label
-    } else {
-        None
-    }
-}
-
 fn group_is_authored_stereo_downmix(disc: &DvdaDisc, group: &DvdaGroup) -> bool {
     // Group selection runs before AOB probing in the materializer. Keep this
     // as a structural fallback for `PreferStereo`, but do not use it for the
@@ -826,6 +805,24 @@ fn group_has_existing_aobs(disc: &DvdaDisc, group: &DvdaGroup) -> bool {
 
 fn title_set_has_existing_aobs(title_set: &TitleSet) -> bool {
     title_set.aobs.iter().any(|aob| aob.exists)
+}
+
+fn group_uses_disc_absolute_addressing(disc: &DvdaDisc, group: &DvdaGroup) -> bool {
+    group.title_refs.iter().any(|title_ref| {
+        find_title_set(disc, title_ref.title_set_nr)
+            .map(|title_set| !title_set_has_existing_aobs(title_set))
+            .unwrap_or(false)
+    })
+}
+
+fn elementary_stream_kind_hint_from_codec(codec: &str) -> Option<DvdaElementaryStreamKind> {
+    if codec.eq_ignore_ascii_case("MLP") {
+        Some(DvdaElementaryStreamKind::Mlp)
+    } else if codec.eq_ignore_ascii_case("LPCM") {
+        Some(DvdaElementaryStreamKind::Lpcm)
+    } else {
+        None
+    }
 }
 
 fn existing_aob_file_refs(title_set: &TitleSet) -> Vec<DvdaAobFileRef> {
@@ -1011,17 +1008,41 @@ fn prepared_tracks_for_groups(
         if cancel.is_cancelled() {
             return Err(MaterializeError::Cancelled);
         }
-        let disc_info_downmix_source_label = if matches!(requested_downmix_policy, DvdaDownmixPolicy::Auto) {
-            disc_info_stereo_downmix_source_label(volume_source, volume, disc, group)
+        let group_uses_disc_absolute = group_uses_disc_absolute_addressing(disc, group);
+        let disc_info_probe = if group_uses_disc_absolute
+            || matches!(requested_downmix_policy, DvdaDownmixPolicy::Auto)
+        {
+            let source_path = volume_source.original_container();
+            let source_path = source_path.is_file().then_some(source_path.as_path());
+            probe_group_aob_format_with_path(volume, disc, group, source_path)
         } else {
             None
         };
+        let disc_info_downmix_source_label = if matches!(requested_downmix_policy, DvdaDownmixPolicy::Auto) {
+            disc_info_probe.as_ref().and_then(|probe| {
+                if probe.codec.eq_ignore_ascii_case("MLP") && probe.channels > 2 {
+                    probe.stereo_downmix_source_label.clone()
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let disc_absolute_stream_kind_hint = group_uses_disc_absolute
+            .then(|| {
+                disc_info_probe
+                    .as_ref()
+                    .and_then(|probe| elementary_stream_kind_hint_from_codec(probe.codec.as_ref()))
+            })
+            .flatten();
         append_tracks_for_group(
             volume_source,
             disc,
             group,
             requested_downmix_policy,
             disc_info_downmix_source_label.as_deref(),
+            disc_absolute_stream_kind_hint,
             metabase,
             &mut tracks,
             cancel,
@@ -1041,6 +1062,7 @@ fn append_tracks_for_group(
     group: &DvdaGroup,
     requested_downmix_policy: DvdaDownmixPolicy,
     disc_info_downmix_source_label: Option<&str>,
+    disc_absolute_stream_kind_hint: Option<DvdaElementaryStreamKind>,
     metabase: Option<&DvdaMetabase>,
     tracks: &mut Vec<PreparedTrack>,
     cancel: &CancellationToken,
@@ -1063,6 +1085,7 @@ fn append_tracks_for_group(
                 title,
                 requested_downmix_policy,
                 disc_info_downmix_source_label,
+                disc_absolute_stream_kind_hint,
                 metabase,
                 tracks,
                 start_len,
@@ -1098,6 +1121,7 @@ fn append_title_tracks(
     title: &AudioTitle,
     requested_downmix_policy: DvdaDownmixPolicy,
     disc_info_downmix_source_label: Option<&str>,
+    disc_absolute_stream_kind_hint: Option<DvdaElementaryStreamKind>,
     metabase: Option<&DvdaMetabase>,
     tracks: &mut Vec<PreparedTrack>,
     group_start_len: usize,
@@ -1127,6 +1151,11 @@ fn append_title_tracks(
         relative_aob_files
     } else {
         Vec::new()
+    };
+    let track_stream_kind_hint = if matches!(sector_address_space, DvdaSectorAddressSpace::DiscAbsolute { .. }) {
+        disc_absolute_stream_kind_hint
+    } else {
+        None
     };
     let group_total_tracks = ats_group_track_count(disc, group);
 
@@ -1167,6 +1196,7 @@ fn append_title_tracks(
                 sector_address_space,
                 sector_ranges,
                 dvda_downmix_policy,
+                track_stream_kind_hint,
                 aob_files.clone(),
             ),
             metadata: track_metadata(
@@ -1232,6 +1262,7 @@ fn ats_track_source_ref(
     sector_address_space: DvdaSectorAddressSpace,
     sector_ranges: Vec<DvdaSectorRangeRef>,
     dvda_downmix_policy: DvdaDownmixPolicy,
+    elementary_stream_kind_hint: Option<DvdaElementaryStreamKind>,
     aob_files: Vec<DvdaAobFileRef>,
 ) -> TrackSourceRef {
     TrackSourceRef::DvdaTrack {
@@ -1245,6 +1276,7 @@ fn ats_track_source_ref(
         samg_track_nr: matching_samg_track_nr(group, group_track_ordinal),
         samg_ordinal: matching_samg_ordinal(group, group_track_ordinal),
         sector_address_space,
+        elementary_stream_kind_hint,
         first_pts: chapter.first_pts,
         len_in_pts: chapter.len_in_pts,
         track_type: Some(chapter.track_type),
@@ -1310,6 +1342,7 @@ fn prepared_track_from_samg_track(
             samg_track_nr: Some(samg_track.track_nr),
             samg_ordinal: Some(samg_track.ordinal),
             sector_address_space: DvdaSectorAddressSpace::SamgAbsolute,
+            elementary_stream_kind_hint: None,
             first_pts: samg_track.first_pts,
             len_in_pts: samg_track.len_in_pts,
             track_type: None,
@@ -2404,6 +2437,7 @@ mod tests {
                 samg_track_nr: None,
                 samg_ordinal: None,
                 sector_address_space: DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
+                elementary_stream_kind_hint: None,
                 first_pts: 0,
                 len_in_pts: 90_000,
                 track_type: Some(0),
@@ -3224,6 +3258,7 @@ mod tests {
             DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
             chapter.sector_ranges.iter().map(sector_range_ref).collect(),
             DvdaDownmixPolicy::None,
+            None,
             aob_files,
         );
 
@@ -3344,6 +3379,7 @@ mod tests {
             DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
             chapter.sector_ranges.iter().map(sector_range_ref).collect(),
             DvdaDownmixPolicy::None,
+            None,
             vec![aob_file_ref_for_test(true, 10, 20)],
         );
 

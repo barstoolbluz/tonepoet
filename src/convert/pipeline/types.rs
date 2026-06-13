@@ -460,6 +460,13 @@ pub enum TrackSourceRef {
         /// or absolute SAMG sector addresses. Phase 3 must dispatch on this
         /// rather than assuming all ranges can be read from an ATS inventory.
         sector_address_space: DvdaSectorAddressSpace,
+        /// Materializer-proven elementary stream kind for AOB-less cross-ATS tracks.
+        /// This is group-scoped evidence stamped onto every track in the group so
+        /// realization workers do not have to rediscover an MLP/LPCM hint from each
+        /// track's own starting sector. Normal ATS-relative tracks leave this empty
+        /// and keep strict packet validation behavior unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elementary_stream_kind_hint: Option<DvdaElementaryStreamKind>,
         /// First PTS reported by ATSI/SAMG for this track. Phase 3 readers use
         /// this for packet-boundary validation, trimming, and diagnostics without
         /// parsing string metadata.
@@ -582,6 +589,13 @@ impl DvdaVolumeSourceRef {
             DvdaVolumeSourceRef::Directory { .. } | DvdaVolumeSourceRef::Iso { .. } => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DvdaElementaryStreamKind {
+    Mlp,
+    Lpcm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

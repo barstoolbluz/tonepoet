@@ -153,7 +153,16 @@ pub fn probe_group_aob_format_with_path(
                 .amg
                 .audio_title_table
                 .iter()
-                .find(|e| e.title_set_nr == title_ref.title_set_nr)?;
+                .find(|e| {
+                    e.ordinal == u16::from(group.group_nr)
+                        && e.title_set_nr == title_ref.title_set_nr
+                })
+                .or_else(|| {
+                    disc.amg
+                        .audio_title_table
+                        .iter()
+                        .find(|e| e.title_set_nr == title_ref.title_set_nr)
+                })?;
             let disc_lba = u64::from(aott_entry.atsi_mat_sector)
                 + u64::from(title_set.header.atstt_vobs)
                 + u64::from(first_sector);
