@@ -875,4 +875,32 @@ mod cache_tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+    #[test]
+    fn selected_dvd_audio_presentation_sets_explicit_group_selection() {
+        let mut options = crate::convert::pipeline::SourceOptions {
+            archive_password: None,
+            sacd_area: None,
+            dvda_group_selection: crate::convert::pipeline::DvdaGroupSelection::Default,
+            dvda_group: None,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+            cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+            track_selection: crate::convert::pipeline::TrackSelection::All,
+        };
+
+        apply_presentation_to_source_options(
+            &mut options,
+            &PresentationId::DvdAudioGroup(3),
+        );
+
+        assert_eq!(
+            options.dvda_group_selection,
+            crate::convert::pipeline::DvdaGroupSelection::Group(3)
+        );
+        assert_eq!(
+            options.effective_dvda_group_selection(),
+            crate::convert::pipeline::DvdaGroupSelection::Group(3)
+        );
+    }
+
 }

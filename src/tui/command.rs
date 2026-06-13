@@ -4102,17 +4102,21 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
         return;
     }
 
-    // For MultiTrack sources with deselected tracks, attach a PipelineRequest
-    // with TrackSelection::Set to the just-enqueued item.
+    // For MultiTrack sources, attach a PipelineRequest whenever the Convert
+    // screen carries state that the generic ConversionItem builder cannot infer:
+    // track deselection and/or the selected disc presentation. The latter is the
+    // DVD-Audio/SACD stream pill bridge; without it DVD-Audio falls back to group 1.
     if let SourceMode::MultiTrack {
         tracks,
         selected,
         path,
+        selected_presentation_id,
         ..
     } = &app.convert.source.mode
     {
         let has_deselected = selected.iter().any(|s| !s);
-        if has_deselected {
+        let has_disc_stream_selection = selected_presentation_id.is_some();
+        if has_deselected || has_disc_stream_selection {
             use std::collections::BTreeSet;
             let selected_numbers: BTreeSet<u32> = tracks
                 .iter()
@@ -4121,8 +4125,9 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                 .map(|(t, _)| t.number)
                 .collect();
 
-            if !selected_numbers.is_empty() {
-                // Build a minimal PipelineRequest with the track selection.
+            if has_disc_stream_selection || !selected_numbers.is_empty() {
+                // Build a minimal PipelineRequest with the track selection and
+                // selected presentation applied to SourceOptions.
                 use crate::convert::pipeline::*;
                 let output_root = options.output_dir.clone().unwrap_or_else(|| {
                     path.parent()
@@ -4137,21 +4142,31 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                     .unwrap_or_else(|| {
                         crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
                     });
+                let mut source = SourceOptions {
+                    archive_password: None,
+                    sacd_area: None,
+                    dvda_group: None,
+                    dvda_group_selection: DvdaGroupSelection::Default,
+                    dvda_assume_decrypted: false,
+                    dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                    cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                    track_selection: if has_deselected {
+                        TrackSelection::Set(selected_numbers)
+                    } else {
+                        TrackSelection::All
+                    },
+                };
+                super::disc_browser::apply_source_mode_disc_selection_to_source_options(
+                    &app.convert.source.mode,
+                    &mut source,
+                );
+
                 let req = PipelineRequest {
                     worker_count: None,
                     job_id: String::new(),
                     item_id: String::new(),
                     container: path.clone(),
-                    source: SourceOptions {
-                        archive_password: None,
-                        sacd_area: None,
-                        dvda_group: None,
-                        dvda_group_selection: DvdaGroupSelection::Default,
-                        dvda_assume_decrypted: false,
-                        dvda_downmix_policy: DvdaDownmixPolicy::Auto,
-                        cue_sidecar: CueSidecarPolicy::PreferSidecar,
-                        track_selection: TrackSelection::Set(selected_numbers),
-                    },
+                    source,
                     settings: pipeline_settings,
                     merge: options.merge_to_single,
                     output_root: output_root.clone(),
@@ -4175,7 +4190,11 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
                         write_json_log: false,
                     },
                     stages: StagePolicy {
-                        metadata: StageRequirement::Enabled,
+                        metadata: if options.preserve_metadata {
+                            StageRequirement::Enabled
+                        } else {
+                            StageRequirement::Disabled
+                        },
                         replaygain: if rg_enabled {
                             StageRequirement::Enabled
                         } else {

@@ -2534,8 +2534,17 @@ fn planner_metadata_already_satisfied(
                     // SOURCE_AUDIO_MD5 depends on parsed SourceInfo::audio_md5,
                     // not on source kind or path extension. Authoritative
                     // materializer tags remain source-level/orchestrator-owned.
+                    //
+                    // DVD-Audio metabase tags are not source-container tags. They
+                    // are materializer-authored tags resolved from a sidecar, so
+                    // the planner cannot satisfy them while encoding. Require the
+                    // orchestrator metadata stage whenever a realized DVD-Audio
+                    // track has authoritative materializer metadata to write.
+                    let authoritative_tags_required = source_level_required
+                        .authoritative_tags_applied
+                        || dvd_audio_artifact_has_authoritative_metadata(track, source);
                     let required = track.metadata_required.merge(PlannedMetadataSatisfaction {
-                        authoritative_tags_applied: source_level_required.authoritative_tags_applied,
+                        authoritative_tags_applied: authoritative_tags_required,
                         ..PlannedMetadataSatisfaction::none()
                     });
                     !required.any()
@@ -2548,6 +2557,23 @@ fn planner_metadata_already_satisfied(
         }
         AudioArtifacts::Merged(_) => false,
     }
+}
+
+fn dvd_audio_artifact_has_authoritative_metadata(
+    artifact: &TrackArtifact,
+    source: &PreparedSource,
+) -> bool {
+    if !matches!(source.kind, SourceKind::DvdAudio) {
+        return false;
+    }
+
+    source
+        .tracks
+        .iter()
+        .find(|track| track.id == artifact.track_id)
+        .is_some_and(|track| {
+            !authoritative_metadata_tags(&track.metadata, &source.album_metadata).is_empty()
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -12498,7 +12524,9 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             artifact.metadata_satisfaction = output.metadata_satisfaction;
         }
         let artifacts = ArtifactSet {
-            audio: AudioArtifacts::Tracks(vec![output.artifact.as_ref().expect("artifact").clone()]),
+            audio: AudioArtifacts::Tracks(vec![
+                output.artifact.as_ref().expect("artifact").clone(),
+            ]),
             sidecars: Vec::new(),
         };
         assert!(
@@ -12522,9 +12550,16 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         .await;
 
         assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
-        assert!(matches!(stage_outcome(&report, PipelineStage::Metadata), Some(StageOutcome::Ok)));
+        assert!(matches!(
+            stage_outcome(&report, PipelineStage::Metadata),
+            Some(StageOutcome::Ok)
+        ));
         let transcript = runner.transcript();
-        assert_eq!(transcript.len(), 2, "metadata stage first inspects existing native tags, then writes authoritative tags");
+        assert_eq!(
+            transcript.len(),
+            2,
+            "metadata stage first inspects existing native tags, then writes authoritative tags"
+        );
         assert_eq!(transcript[0].binary, ToolBinary::Metaflac);
         assert!(transcript[0].sanitized_args.iter().any(|arg| arg == "--export-tags-to=-"));
         assert_eq!(transcript[1].binary, ToolBinary::Metaflac);
@@ -12540,9 +12575,175 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             ("TOTALTRACKS", "3"),
             ("PERFORMER", "Sonny Rollins"),
         ] {
-            assert!(has_remove_tag(args, key), "metaflac removes stale {key} before setting it");
-            assert_eq!(tags.get(key).map(String::as_str), Some(value), "required tag {key} is written");
+            assert!(
+                has_remove_tag(args, key),
+                "metaflac removes stale {key} before setting it"
+            );
+            assert_eq!(
+                tags.get(key).map(String::as_str),
+                Some(value),
+                "required tag {key} is written"
+            );
         }
+    }
+
+
+    #[test]
+    fn dvd_audio_authoritative_metadata_prevents_empty_obligation_planner_skip() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = false;
+        fixture.album.req.settings.metadata.preserve_artwork = false;
+        fixture.album.req.settings.metadata.store_source_audio_md5 = false;
+        fixture.album.source.kind = SourceKind::DvdAudio;
+        fixture.album.source.provenance.source_kind = SourceKind::DvdAudio;
+        fixture.album.source.album_metadata = AlbumMetadata {
+            album: Some("Brothers in Arms (DVD-A) [ISO]".to_string()),
+            album_artist: Some("Dire Straits".to_string()),
+            genre: Some("Rock".to_string()),
+            date: Some("1985".to_string()),
+            total_tracks: 9,
+            ..AlbumMetadata::default()
+        };
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("So Far Away".to_string()),
+            artist: Some("Dire Straits".to_string()),
+            genre: Some("Rock".to_string()),
+            date: Some("1985".to_string()),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+
+        let scheduled = successful_output(&fixture, 0);
+        let artifact = scheduled.artifact.expect("successful artifact");
+        assert_eq!(artifact.metadata_required, PlannedMetadataSatisfaction::none());
+        assert_eq!(artifact.metadata_satisfaction, PlannedMetadataSatisfaction::none());
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+
+        assert!(
+            !planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "DVD-Audio sidecar/materializer tags must force the orchestrator metadata stage \
+             even when source-tag transfer has no planner obligation"
+        );
+    }
+
+    #[tokio::test]
+    async fn dvd_audio_sidecar_tags_run_metaflac_and_write_authoritative_tags() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = false;
+        fixture.album.req.settings.metadata.preserve_artwork = false;
+        fixture.album.req.settings.metadata.store_source_audio_md5 = false;
+        fixture.album.source.kind = SourceKind::DvdAudio;
+        fixture.album.source.provenance.source_kind = SourceKind::DvdAudio;
+        fixture.album.source.album_metadata = AlbumMetadata {
+            album: Some("Brothers in Arms (DVD-A) [ISO]".to_string()),
+            album_artist: Some("Dire Straits".to_string()),
+            genre: Some("Rock".to_string()),
+            date: Some("1985".to_string()),
+            total_tracks: 9,
+            ..AlbumMetadata::default()
+        };
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("So Far Away".to_string()),
+            artist: Some("Dire Straits".to_string()),
+            genre: Some("Rock".to_string()),
+            date: Some("1985".to_string()),
+            track_number: Some(1),
+            extra: BTreeMap::from([(
+                "dvda_track_id".to_string(),
+                "2.1.1".to_string(),
+            )]),
+            ..TrackMetadata::default()
+        };
+
+        let output = successful_output(&fixture, 0);
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![
+                output.artifact.as_ref().expect("artifact").clone(),
+            ]),
+            sidecars: Vec::new(),
+        };
+        assert!(
+            !planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "DVD-Audio metadata must not be skipped simply because the encode planner \
+             had no source-tag transfer obligation"
+        );
+
+        let runner = BlockingToolRunner::with_behaviors([
+            ToolBehavior::Succeed, // inspect existing native tags
+            ToolBehavior::Succeed, // write authoritative tags
+        ]);
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            vec![output],
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
+        assert!(matches!(
+            stage_outcome(&report, PipelineStage::Metadata),
+            Some(StageOutcome::Ok)
+        ));
+        let transcript = runner.transcript();
+        assert_eq!(
+            transcript.len(),
+            2,
+            "metadata stage first inspects existing native tags, then writes authoritative tags"
+        );
+        assert_eq!(transcript[0].binary, ToolBinary::Metaflac);
+        assert!(transcript[0].sanitized_args.iter().any(|arg| arg == "--export-tags-to=-"));
+        assert_eq!(transcript[1].binary, ToolBinary::Metaflac);
+        let args = &transcript[1].sanitized_args;
+        let tags = set_tag_values(args);
+        for (key, value) in [
+            ("TITLE", "So Far Away"),
+            ("ARTIST", "Dire Straits"),
+            ("ALBUM", "Brothers in Arms (DVD-A) [ISO]"),
+            ("DATE", "1985"),
+            ("GENRE", "Rock"),
+            ("TRACKNUMBER", "1"),
+            ("TOTALTRACKS", "9"),
+        ] {
+            assert!(
+                has_remove_tag(args, key),
+                "metaflac removes stale {key} before setting it"
+            );
+            assert_eq!(
+                tags.get(key).map(String::as_str),
+                Some(value),
+                "required tag {key} is written"
+            );
+        }
+        assert_eq!(
+            tags.get("TONEPOET_TRACK_DVDA_TRACK_ID").map(String::as_str),
+            Some("2.1.1"),
+            "DVD-Audio metabase/structure extras remain available as managed Tonepoet tags"
+        );
     }
 
 

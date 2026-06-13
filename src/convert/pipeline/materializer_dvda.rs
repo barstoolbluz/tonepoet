@@ -30,7 +30,7 @@ use crate::tui::dvda::{
     DvdaFile, DvdaVolume, GroupCorrelation, Iso9660DvdaVolume, IsoUdfDvdaVolume, SamgTrack, SamgTrackRef,
     SamgZone, TitleRef, TitleRefKind, TitleSet,
 };
-use crate::tui::dvda_metabase::{DvdaMetabase, LoadedDvdaMetabase};
+use crate::tui::dvda_metabase::{self, DvdaMetabase, LoadedDvdaMetabase};
 
 const DVDA_AMG_MAGIC: &[u8] = b"DVDAUDIO-AMG";
 const PTS_PER_SECOND: u64 = 90_000;
@@ -221,6 +221,7 @@ fn prepared_source(
         groups,
         group_selection,
         tracks.len() as u32,
+        &tracks,
         metabase,
         loaded_metabase,
     );
@@ -1773,6 +1774,7 @@ fn album_metadata(
     groups: &[&DvdaGroup],
     group_selection: DvdaGroupSelection,
     total_tracks: u32,
+    tracks: &[PreparedTrack],
     metabase: Option<&DvdaMetabase>,
     loaded_metabase: Option<&LoadedDvdaMetabase>,
 ) -> AlbumMetadata {
@@ -1829,7 +1831,72 @@ fn album_metadata(
         disc_number: disc_number(disc),
         extra,
     };
-    materializer_dvda_metabase::overlay_album_metadata(base, metabase, loaded_metabase)
+    let mut album = materializer_dvda_metabase::overlay_album_metadata(
+        base,
+        metabase,
+        loaded_metabase,
+    );
+
+    // foo_input_dvda stores album-like values per track, and one XML can contain
+    // multiple DVD-Audio presentations. Scope album values to the selected
+    // PreparedTracks so the standard ALBUM tag and folder template reflect the
+    // stream being converted instead of leaking a sibling group or falling back
+    // to the ISO/file stem.
+    overlay_selected_track_album_values(&mut album, metabase, tracks);
+
+    album
+}
+
+fn overlay_selected_track_album_values(
+    album: &mut AlbumMetadata,
+    metabase: Option<&DvdaMetabase>,
+    tracks: &[PreparedTrack],
+) {
+    let track_ids = selected_metabase_track_ids(tracks);
+
+    if let Some(value) = dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["ALBUM"])
+        .or_else(|| common_selected_track_extra_value(tracks, "dvda_metabase_album"))
+    {
+        album.album = Some(value);
+    }
+    if let Some(value) = dvda_metabase::album_value_for_track_ids(
+        metabase,
+        &track_ids,
+        &["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"],
+    ) {
+        album.album_artist = Some(value);
+    }
+    if let Some(value) = dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["GENRE"]) {
+        album.genre = Some(value);
+    }
+    if let Some(value) = dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["DATE", "YEAR"]) {
+        album.date = Some(value);
+    }
+}
+
+fn selected_metabase_track_ids(tracks: &[PreparedTrack]) -> Vec<String> {
+    tracks
+        .iter()
+        .filter_map(|track| track.metadata.extra.get("dvda_track_id"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn common_selected_track_extra_value(tracks: &[PreparedTrack], key: &str) -> Option<String> {
+    let mut values = tracks
+        .iter()
+        .filter_map(|track| track.metadata.extra.get(key))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+
+    let first = values.next()?.to_string();
+    if values.all(|value| value == first) {
+        Some(first)
+    } else {
+        None
+    }
 }
 
 fn track_metadata(
@@ -3536,6 +3603,106 @@ mod tests {
         assert_eq!(descriptor.primary_sample_rate, None);
         assert_eq!(descriptor.bit_depth, None);
         assert!(descriptor.channel_groups.is_empty());
+    }
+
+    fn prepared_track_with_extra_album(source_ordinal: u32, album: Option<&str>) -> PreparedTrack {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "dvda_track_id".to_string(),
+            format!("1.1.{source_ordinal}"),
+        );
+        if let Some(album) = album {
+            extra.insert("dvda_metabase_album".to_string(), album.to_string());
+        }
+
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal,
+                disc_number: None,
+                track_number: source_ordinal,
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("track-{source_ordinal}.wav"))),
+            metadata: TrackMetadata {
+                extra,
+                ..TrackMetadata::default()
+            },
+            expected_samples: None,
+            sample_rate: None,
+            source_audio: SourceAudioDescriptor::default(),
+            bit_depth: None,
+        }
+    }
+
+    #[test]
+    fn selected_track_album_overlay_scopes_metabase_album_to_selected_ids() {
+        let mut selected_meta = BTreeMap::new();
+        selected_meta.insert(
+            "ALBUM".to_string(),
+            "Brothers in Arms (DVD-A) [Multichannel ISO]".to_string(),
+        );
+        selected_meta.insert("ARTIST".to_string(), "Dire Straits".to_string());
+
+        let mut sibling_meta = BTreeMap::new();
+        sibling_meta.insert("ALBUM".to_string(), "Wrong sibling group".to_string());
+        sibling_meta.insert("ARTIST".to_string(), "Other Artist".to_string());
+
+        let metabase = DvdaMetabase {
+            store_id: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+            tracks: vec![
+                crate::tui::dvda_metabase::DvdaMetabaseTrack {
+                    id: "1.1.1".to_string(),
+                    meta: selected_meta.clone(),
+                },
+                crate::tui::dvda_metabase::DvdaMetabaseTrack {
+                    id: "1.1.2".to_string(),
+                    meta: selected_meta,
+                },
+                crate::tui::dvda_metabase::DvdaMetabaseTrack {
+                    id: "9.9.1".to_string(),
+                    meta: sibling_meta,
+                },
+            ],
+        };
+        let tracks = vec![
+            prepared_track_with_extra_album(1, None),
+            prepared_track_with_extra_album(2, None),
+        ];
+        let mut album = AlbumMetadata::default();
+
+        overlay_selected_track_album_values(&mut album, Some(&metabase), &tracks);
+
+        assert_eq!(
+            album.album.as_deref(),
+            Some("Brothers in Arms (DVD-A) [Multichannel ISO]")
+        );
+        assert_eq!(album.album_artist.as_deref(), Some("Dire Straits"));
+    }
+
+    #[test]
+    fn common_selected_track_extra_value_uses_selected_group_album_when_consistent() {
+        let tracks = vec![
+            prepared_track_with_extra_album(1, Some("Brothers in Arms (DVD-A) [Multichannel ISO]")),
+            prepared_track_with_extra_album(2, Some("Brothers in Arms (DVD-A) [Multichannel ISO]")),
+            prepared_track_with_extra_album(3, None),
+        ];
+
+        assert_eq!(
+            common_selected_track_extra_value(&tracks, "dvda_metabase_album").as_deref(),
+            Some("Brothers in Arms (DVD-A) [Multichannel ISO]")
+        );
+    }
+
+    #[test]
+    fn common_selected_track_extra_value_refuses_conflicting_album_values() {
+        let tracks = vec![
+            prepared_track_with_extra_album(1, Some("Album A")),
+            prepared_track_with_extra_album(2, Some("Album B")),
+        ];
+
+        assert_eq!(
+            common_selected_track_extra_value(&tracks, "dvda_metabase_album"),
+            None
+        );
     }
 
 }

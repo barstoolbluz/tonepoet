@@ -679,6 +679,7 @@ fn is_structured_track_key(key: &str) -> bool {
         normalize_meta_key(key).as_str(),
         "TITLE"
             | "ARTIST"
+            | "ALBUM"
             | "ALBUMARTIST"
             | "ALBUM ARTIST"
             | "COMPOSER"
@@ -1206,6 +1207,7 @@ mod tests {
         let mut meta = BTreeMap::new();
         meta.insert("TITLE".to_string(), "Song".to_string());
         meta.insert("ARTIST".to_string(), "Performer".to_string());
+        meta.insert("ALBUM".to_string(), "Selected Album".to_string());
         meta.insert("ALBUM ARTIST".to_string(), "Album Artist".to_string());
         meta.insert("DATE".to_string(), "1985".to_string());
         meta.insert("TRACKNUMBER".to_string(), "3/9".to_string());
@@ -1233,6 +1235,7 @@ mod tests {
             resolved.musicbrainz_release_track_id.as_deref(),
             Some("mb-release-track")
         );
+        assert!(!resolved.extra.contains_key("dvda_metabase_album"));
         assert_eq!(
             resolved.extra.get("dvda_metabase_dvda_titleset").map(String::as_str),
             Some("1")
