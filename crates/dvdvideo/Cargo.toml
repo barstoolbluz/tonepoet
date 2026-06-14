@@ -1,0 +1,9 @@
+[package]
+name = "dvdvideo"
+version = "0.1.0"
+edition = "2021"
+description = "DVD-Video disc reader for LPCM audio extraction"
+license = "MIT"
+
+[dependencies]
+# No dependencies — pure Rust, standalone

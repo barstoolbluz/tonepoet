@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard", "crates/sacd-rs", "crates/dvda-phase1", "tonepoet-pipeline"]
+members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard", "crates/sacd-rs", "crates/dvda-phase1", "crates/dvdvideo", "tonepoet-pipeline"]
 resolver = "2"
 
 [package]
