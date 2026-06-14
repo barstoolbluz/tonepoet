@@ -305,9 +305,11 @@ pub fn probe_group_aob_format_with_path(
                 DvdaSubstreamKind::Pcm => {
                     if pcm_result.is_none() {
                         if let Some(pcm) = packet.sub_header.pcm.as_ref() {
-                            if let (Some(rate), Some(bits)) =
-                                (pcm.group1_sample_rate, pcm.group1_bits)
-                            {
+                            let rate = pcm
+                                .group1_sample_rate
+                                .or(pcm.group2_sample_rate);
+                            let bits = pcm.group1_bits.or(pcm.group2_bits);
+                            if let (Some(rate), Some(bits)) = (rate, bits) {
                                 if let Some(ca) = channel_assignment(pcm.channel_assignment) {
                                     let ch_label = super::labels::channel_layout_label(
                                         pcm.channel_assignment,

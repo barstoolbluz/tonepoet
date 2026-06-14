@@ -37,6 +37,10 @@ use crate::tui::dvda_metabase::{self, DvdaMetabase, LoadedDvdaMetabase};
 
 const DVDA_AMG_MAGIC: &[u8] = b"DVDAUDIO-AMG";
 const PTS_PER_SECOND: u64 = 90_000;
+// ATS track-type bit 3 marks an alternate presentation in observed discs.
+// Its low three bits may still point at the primary IFO audio-format entry,
+// so do not trust IFO-derived audio expectations when this bit is set.
+const DVDA_TRACK_TYPE_ALTERNATE_PRESENTATION_BIT: u8 = 0x08;
 #[allow(dead_code)]
 const DVD_SECTOR_SIZE_U64: u64 = 2048;
 #[cfg(test)]
@@ -1350,16 +1354,12 @@ fn append_title_tracks(
         let audio_facts = correlated_samg_track
             .map(audio_facts_for_samg_track)
             .unwrap_or_else(|| audio_facts_for_title_chapter(title_set, chapter));
-        // Orphan PGC titles share a title set with another title whose audio
-        // format entry may describe a different channel layout (e.g., 5.1 vs
-        // stereo). Clear IFO-derived channel expectations so the MLP/LPCM
-        // stream self-describes its channel count during realization.
+        // Orphan PGC titles share a title set with another title whose IFO
+        // audio format entry may describe a completely different presentation
+        // (e.g., 5.1/96kHz vs stereo/88.2kHz). Clear all IFO-derived format
+        // expectations so MLP/LPCM stream self-describes during realization.
         let audio_facts = if matches!(group.correlation, GroupCorrelation::OrphanPgcTitle) {
-            AudioFacts {
-                channel_assignment: None,
-                channel_format: None,
-                ..audio_facts
-            }
+            unknown_audio_facts(AudioFormatResolution::MultiplePresentFormats)
         } else {
             audio_facts
         };
@@ -1752,6 +1752,10 @@ fn audio_facts_for_title_chapter<'a>(
     title_set: &'a TitleSet,
     chapter: &AudioChapter,
 ) -> AudioFacts<'a> {
+    if track_type_signals_alternate_presentation(chapter.track_type) {
+        return unknown_audio_facts(AudioFormatResolution::MultiplePresentFormats);
+    }
+
     let present: Vec<&'a AudioAttributes> = present_audio_formats(title_set);
 
     match present.as_slice() {
@@ -1771,6 +1775,10 @@ fn audio_facts_for_title_chapter<'a>(
                 })
         }
     }
+}
+
+fn track_type_signals_alternate_presentation(track_type: u8) -> bool {
+    (track_type & DVDA_TRACK_TYPE_ALTERNATE_PRESENTATION_BIT) != 0
 }
 
 fn present_audio_formats(title_set: &TitleSet) -> Vec<&AudioAttributes> {
@@ -3885,6 +3893,69 @@ mod tests {
             audio_attr(2, Some(192_000), Some(24)),
         ]);
         let facts = audio_facts_for_title_set(&title_set);
+        assert_eq!(facts.format_index, None);
+        assert_eq!(facts.sample_rate, None);
+        assert_eq!(facts.bit_depth, None);
+        assert_eq!(
+            facts.resolution,
+            AudioFormatResolution::MultiplePresentFormats
+        );
+        assert!(facts.attr.is_none());
+    }
+
+    #[test]
+    fn alternate_presentation_track_type_keeps_single_format_audio_facts_unknown() {
+        let title_set = title_set_with_audio_formats(vec![audio_attr(0, Some(96_000), Some(24))]);
+        let chapter = AudioChapter {
+            track_nr: 3,
+            track_type: 0x08,
+            track_type_low_bits_candidate: 0,
+            downmix_matrix: None,
+            index_start: 1,
+            first_pts: 0,
+            len_in_pts: 90_000,
+            sector_ranges: vec![crate::tui::dvda::SectorRange {
+                index_nr: 1,
+                first: 10,
+                last: 20,
+            }],
+        };
+
+        let facts = audio_facts_for_title_chapter(&title_set, &chapter);
+
+        assert_eq!(facts.format_index, None);
+        assert_eq!(facts.sample_rate, None);
+        assert_eq!(facts.bit_depth, None);
+        assert_eq!(
+            facts.resolution,
+            AudioFormatResolution::MultiplePresentFormats
+        );
+        assert!(facts.attr.is_none());
+    }
+
+    #[test]
+    fn alternate_presentation_track_type_does_not_match_primary_format_index() {
+        let title_set = title_set_with_audio_formats(vec![
+            audio_attr(0, Some(96_000), Some(24)),
+            audio_attr(2, Some(192_000), Some(24)),
+        ]);
+        let chapter = AudioChapter {
+            track_nr: 2,
+            track_type: 0x08,
+            track_type_low_bits_candidate: 0,
+            downmix_matrix: None,
+            index_start: 1,
+            first_pts: 0,
+            len_in_pts: 90_000,
+            sector_ranges: vec![crate::tui::dvda::SectorRange {
+                index_nr: 1,
+                first: 10,
+                last: 20,
+            }],
+        };
+
+        let facts = audio_facts_for_title_chapter(&title_set, &chapter);
+
         assert_eq!(facts.format_index, None);
         assert_eq!(facts.sample_rate, None);
         assert_eq!(facts.bit_depth, None);

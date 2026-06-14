@@ -331,6 +331,7 @@ impl DvdAudioLpcmDecoder {
             "IFO group 1 sample rate",
             "LPCM packet group 1 sample rate",
         )?
+        .or(header.group2_sample_rate)
         .ok_or(LpcmDecodeError::MissingSampleRate)?;
         let group2_rate = if group2_channels == 0 {
             None
@@ -353,6 +354,7 @@ impl DvdAudioLpcmDecoder {
             "IFO group 1 bit depth",
             "LPCM packet group 1 bit depth",
         )?
+        .or(header.group2_bits)
         .ok_or(LpcmDecodeError::MissingBitDepth)?;
         let group2_bits = if group2_channels == 0 {
             None
