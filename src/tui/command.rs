@@ -4508,16 +4508,25 @@ fn dvda_source_to_cd_sectors(
     path: &std::path::Path,
     group_nr: Option<u8>,
 ) -> Result<Vec<u32>, String> {
-    let disc = if crate::disc::dvda_utils::is_dvda_directory(path) {
-        let volume = crate::tui::dvda::DirectoryDvdaVolume::new(path);
-        crate::tui::dvda::parse_dvda_volume(&volume)
-            .map_err(|e| format!("DVD-Audio parse failed for '{}': {}", path.display(), e))?
-    } else {
-        let volume = crate::tui::dvda::IsoUdfDvdaVolume::open(path)
-            .map_err(|e| format!("DVD-Audio ISO open failed for '{}': {}", path.display(), e))?;
-        crate::tui::dvda::parse_dvda_volume(&volume)
-            .map_err(|e| format!("DVD-Audio parse failed for '{}': {}", path.display(), e))?
-    };
+    let volume: Box<dyn crate::tui::dvda::DvdaVolume> =
+        if crate::disc::dvda_utils::is_dvda_directory(path) {
+            Box::new(crate::tui::dvda::DirectoryDvdaVolume::new(path))
+        } else {
+            Box::new(
+                crate::tui::dvda::IsoUdfDvdaVolume::open(path)
+                    .map_err(|e| format!("DVD-Audio ISO open failed for '{}': {}", path.display(), e))?,
+            )
+        };
+    let disc = crate::tui::dvda::parse_dvda_volume(volume.as_ref())
+        .map_err(|e| format!("DVD-Audio parse failed for '{}': {}", path.display(), e))?;
+
+    // Always prefer the stereo group for MusicBrainz TOC lookup.
+    // DVD-Audio multichannel tracks often have different durations than
+    // the CD mastering, causing TOC mismatches. The stereo group's
+    // timing typically matches CD releases.
+    let group_nr = dvda_stereo_group_for_mb_toc(volume.as_ref(), &disc, path)
+        .or(group_nr);
+
     let group = super::dvda_metabase::select_group(&disc, group_nr)
         .map_err(|e| e.to_string())?;
     let durations = super::dvda_metabase::group_track_pts(&disc, group);
@@ -4525,6 +4534,33 @@ fn dvda_source_to_cd_sectors(
         return Err("DVD-Audio: selected group has zero tracks".to_string());
     }
     Ok(super::dvda_metabase::pts_durations_to_cd_sectors(&durations))
+}
+
+/// Find a stereo (2-channel) group for MusicBrainz TOC computation.
+/// Returns `Some(group_nr)` if a stereo group with tracks exists.
+fn dvda_stereo_group_for_mb_toc(
+    volume: &dyn crate::tui::dvda::DvdaVolume,
+    disc: &crate::tui::dvda::DvdaDisc,
+    source_path: &std::path::Path,
+) -> Option<u8> {
+    let source = if source_path.is_file() {
+        Some(source_path)
+    } else {
+        None
+    };
+    for group in &disc.groups {
+        if super::dvda_metabase::group_track_count(disc, group) == 0 {
+            continue;
+        }
+        if let Some(probe) = crate::disc::dvda_utils::probe_group_aob_format_with_path(
+            volume, disc, group, source,
+        ) {
+            if probe.channels == 2 {
+                return Some(group.group_nr);
+            }
+        }
+    }
+    None
 }
 
 /// Common spawn point for the unified `:tags-mb` TOC flow. All three
