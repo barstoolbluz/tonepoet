@@ -20,5 +20,7 @@ pub mod nav;
 
 pub use disc::DvdDisc;
 pub use error::{Error, Result};
-pub use ifo::{VmgIfo, VtsiMat, VtsIfo, DvdTitle, DvdChapter, Pgc};
+pub use ifo::{
+    AudioCodingMode, AudioStreamAttr, DvdChapter, DvdTitle, Pgc, VmgIfo, VtsIfo, VtsiMat,
+};
 pub use vob::DvdSubstream;

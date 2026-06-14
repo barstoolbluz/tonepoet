@@ -340,6 +340,171 @@ impl TtSrpt {
 }
 
 // ------------------------------------------------------------------
+// VTS audio stream attributes
+// ------------------------------------------------------------------
+
+const VTSI_AUDIO_STREAM_COUNT_OFFSET: usize = 0x0202;
+const VTSI_AUDIO_STREAM_ATTR_OFFSET: usize = 0x0204;
+const VTSI_AUDIO_STREAM_ATTR_LEN: usize = 8;
+const VTSI_MAX_AUDIO_STREAMS: usize = 8;
+
+/// Audio coding mode for a DVD-Video audio stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCodingMode {
+    Ac3,
+    Mpeg1,
+    Mpeg2Ext,
+    Lpcm,
+    Dts,
+    Unknown(u8),
+}
+
+impl AudioCodingMode {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Ac3,
+            2 => Self::Mpeg1,
+            3 => Self::Mpeg2Ext,
+            4 => Self::Lpcm,
+            6 => Self::Dts,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+/// Parsed audio stream attributes from VTSI_MAT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioStreamAttr {
+    /// Audio coding mode (AC-3, LPCM, DTS, etc.).
+    pub coding_mode: AudioCodingMode,
+    /// Multichannel extension flag.
+    pub multichannel_extension: bool,
+    /// Audio type (normal, visually impaired, director's comments).
+    pub audio_type: u8,
+    /// Sample frequency code: 0 = 48kHz, 1 = 96kHz.
+    pub sample_frequency_code: u8,
+    /// Sample frequency in Hz (48000 or 96000), if known.
+    pub sample_frequency: Option<u32>,
+    /// Quantization code (LPCM only): 0 = 16-bit, 1 = 20-bit, 2 = 24-bit.
+    pub quantization_code: u8,
+    /// Bit depth (16, 20, or 24), if LPCM and code is valid.
+    pub bit_depth: Option<u32>,
+    /// Number of audio channels (1-8).
+    pub channels: u8,
+    /// ISO 639 language code (e.g., "en", "ja").
+    pub language: Option<String>,
+    /// Stream index (0-7), corresponding to LPCM sub-stream IDs 0xA0-0xA7
+    /// or AC-3 sub-stream IDs 0x80-0x87.
+    pub stream_index: u8,
+}
+
+impl AudioStreamAttr {
+    fn parse(stream_index: u8, raw: [u8; VTSI_AUDIO_STREAM_ATTR_LEN]) -> Option<Self> {
+        // All-zero slots are common unused descriptors. Treating them as
+        // absent avoids manufacturing a false AC-3 stream with blank language.
+        if raw.iter().all(|&b| b == 0) {
+            return None;
+        }
+
+        let byte0 = raw[0];
+        let byte1 = raw[1];
+        let coding_mode = AudioCodingMode::from_code((byte0 >> 5) & 0x07);
+        let sample_frequency_code = byte0 & 0x03;
+        let quantization_code = (byte1 >> 6) & 0x03;
+
+        Some(Self {
+            coding_mode,
+            multichannel_extension: (byte0 & 0x10) != 0,
+            audio_type: (byte0 >> 2) & 0x03,
+            sample_frequency_code,
+            sample_frequency: match sample_frequency_code {
+                0 => Some(48_000),
+                1 => Some(96_000),
+                _ => None,
+            },
+            quantization_code,
+            bit_depth: match (coding_mode, quantization_code) {
+                (AudioCodingMode::Lpcm, 0) => Some(16),
+                (AudioCodingMode::Lpcm, 1) => Some(20),
+                (AudioCodingMode::Lpcm, 2) => Some(24),
+                _ => None,
+            },
+            channels: ((byte1 >> 3) & 0x07) + 1,
+            language: decode_iso639_language([raw[2], raw[3]]),
+            stream_index,
+        })
+    }
+}
+
+fn decode_iso639_language(bytes: [u8; 2]) -> Option<String> {
+    if bytes == [0, 0] {
+        return None;
+    }
+    if bytes.iter().all(u8::is_ascii_alphabetic) {
+        Some(String::from_utf8_lossy(&bytes).to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn parse_audio_stream_attrs(buf: &[u8]) -> Result<Vec<AudioStreamAttr>> {
+    // Exactly-legacy 0x200-byte VTSI_MAT buffers predate this extension
+    // parser in the vendored crate and remain accepted with no audio
+    // descriptors. Once extension bytes are present, however, treat the
+    // audio stream count and the declared descriptor list as all-or-nothing:
+    // returning a partial stream list from malformed metadata would make
+    // callers mistake truncation for a real, shorter declaration.
+    if buf.len() == 0x200 {
+        return Ok(Vec::new());
+    }
+    if buf.len() < VTSI_AUDIO_STREAM_ATTR_OFFSET {
+        return Err(Error::InvalidUdf(
+            "VTSI_MAT: truncated audio stream extension header",
+        ));
+    }
+
+    let declared_count = usize::from(read_u16(buf, VTSI_AUDIO_STREAM_COUNT_OFFSET)?);
+    if declared_count == 0 {
+        return Ok(Vec::new());
+    }
+    if declared_count > VTSI_MAX_AUDIO_STREAMS {
+        return Err(Error::InvalidUdf("VTSI_MAT: audio stream count exceeds 8"));
+    }
+
+    let descriptor_bytes = declared_count
+        .checked_mul(VTSI_AUDIO_STREAM_ATTR_LEN)
+        .ok_or(Error::InvalidUdf("VTSI_MAT: audio stream descriptor length overflow"))?;
+    let descriptor_end = VTSI_AUDIO_STREAM_ATTR_OFFSET
+        .checked_add(descriptor_bytes)
+        .ok_or(Error::InvalidUdf("VTSI_MAT: audio stream descriptor end overflow"))?;
+    if buf.len() < descriptor_end {
+        return Err(Error::InvalidUdf(
+            "VTSI_MAT: truncated audio stream descriptors",
+        ));
+    }
+
+    let mut audio_streams = Vec::with_capacity(declared_count);
+    for stream_index in 0..declared_count {
+        let base = VTSI_AUDIO_STREAM_ATTR_OFFSET + stream_index * VTSI_AUDIO_STREAM_ATTR_LEN;
+        let raw = [
+            buf[base],
+            buf[base + 1],
+            buf[base + 2],
+            buf[base + 3],
+            buf[base + 4],
+            buf[base + 5],
+            buf[base + 6],
+            buf[base + 7],
+        ];
+        if let Some(attr) = AudioStreamAttr::parse(stream_index as u8, raw) {
+            audio_streams.push(attr);
+        }
+    }
+
+    Ok(audio_streams)
+}
+
+// ------------------------------------------------------------------
 // VTSI_MAT — Video Title Set Information Management Table
 // ------------------------------------------------------------------
 
@@ -380,11 +545,20 @@ pub struct VtsiMat {
     pub vts_c_adt_sector: u32,
     /// Sector pointer to VTS_VOBU_ADMAP (title-set VOBU address map).
     pub vts_vobu_admap_sector: u32,
+    /// Parsed VTS audio stream attributes from the optional VTSI_MAT
+    /// extension region. Exactly-legacy 0x200-byte buffers yield an empty
+    /// list; declared but truncated descriptor regions are rejected. All-zero
+    /// descriptors are treated as unused slots and skipped.
+    pub audio_streams: Vec<AudioStreamAttr>,
 }
 
 impl VtsiMat {
     /// Parse a `VTS_xx_0.IFO` byte buffer. Buffer must cover at least
-    /// the VTSI_MAT region (the first 0x200 bytes).
+    /// the core VTSI_MAT region (the first 0x200 bytes). Audio stream
+    /// attributes are parsed when the optional bytes beyond 0x200 are
+    /// present. Older synthetic 0x200-byte fixtures produce an empty list;
+    /// malformed extension buffers that declare unavailable descriptors are
+    /// rejected rather than partially parsed.
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < 0x200 {
             return Err(Error::InvalidUdf("VTSI_MAT: buffer shorter than 0x200"));
@@ -392,6 +566,7 @@ impl VtsiMat {
         if &buf[0..12] != VTS_MAGIC {
             return Err(Error::InvalidUdf("VTSI_MAT: bad magic"));
         }
+        let audio_streams = parse_audio_stream_attrs(buf)?;
         Ok(Self {
             last_sector_title_set: read_u32(buf, 0x000C)?,
             last_sector_ifo: read_u32(buf, 0x001C)?,
@@ -408,7 +583,23 @@ impl VtsiMat {
             vtsm_vobu_admap_sector: read_u32(buf, 0x00DC)?,
             vts_c_adt_sector: read_u32(buf, 0x00E0)?,
             vts_vobu_admap_sector: read_u32(buf, 0x00E4)?,
+            audio_streams,
         })
+    }
+
+    /// Borrow all LPCM audio stream descriptors declared by this VTS.
+    pub fn lpcm_streams(&self) -> Vec<&AudioStreamAttr> {
+        self.audio_streams
+            .iter()
+            .filter(|stream| stream.coding_mode == AudioCodingMode::Lpcm)
+            .collect()
+    }
+
+    /// Return true when this VTS declares at least one LPCM audio stream.
+    pub fn has_lpcm(&self) -> bool {
+        self.audio_streams
+            .iter()
+            .any(|stream| stream.coding_mode == AudioCodingMode::Lpcm)
     }
 }
 
@@ -1111,6 +1302,9 @@ pub struct VtsIfo {
     pub pgcs: Vec<Pgc>,
     /// Cell address table.
     pub cell_adt: VtsCAdt,
+    /// Parsed VTS audio stream attributes, mirrored from [`VtsiMat`]
+    /// for callers that use `VtsIfo` as the high-level API surface.
+    pub audio_streams: Vec<AudioStreamAttr>,
     /// Raw VTSI_MAT (kept around so callers can reach sector pointers
     /// for the bits we don't materialise — VOBU_ADMAP, time map, etc.).
     pub mat: VtsiMat,
@@ -1208,12 +1402,15 @@ impl VtsIfo {
             });
         }
 
+        let audio_streams = mat.audio_streams.clone();
+
         Ok(Self {
             vts_number,
             title_count: title_count_u8,
             titles,
             pgcs: pgci.pgcs,
             cell_adt,
+            audio_streams,
             mat,
         })
     }
@@ -1364,6 +1561,19 @@ mod tests {
         b
     }
 
+    fn build_vtsi_mat_with_audio(entries: &[[u8; VTSI_AUDIO_STREAM_ATTR_LEN]]) -> Vec<u8> {
+        let mut b = build_vtsi_mat(1, 2, 3, 42);
+        b.resize(0x254, 0);
+        b[0x0080..0x0084].copy_from_slice(&0x0253u32.to_be_bytes());
+        b[VTSI_AUDIO_STREAM_COUNT_OFFSET..VTSI_AUDIO_STREAM_COUNT_OFFSET + 2]
+            .copy_from_slice(&(entries.len() as u16).to_be_bytes());
+        for (i, entry) in entries.iter().enumerate() {
+            let base = VTSI_AUDIO_STREAM_ATTR_OFFSET + i * VTSI_AUDIO_STREAM_ATTR_LEN;
+            b[base..base + VTSI_AUDIO_STREAM_ATTR_LEN].copy_from_slice(entry);
+        }
+        b
+    }
+
     #[test]
     fn vtsi_mat_parse_roundtrip() {
         let buf = build_vtsi_mat(1, 2, 3, 42);
@@ -1375,6 +1585,107 @@ mod tests {
         assert_eq!(mat.vts_ptt_srpt_sector, 1);
         assert_eq!(mat.vts_pgci_sector, 2);
         assert_eq!(mat.vts_c_adt_sector, 3);
+        assert!(mat.audio_streams.is_empty());
+        assert!(!mat.has_lpcm());
+        assert!(mat.lpcm_streams().is_empty());
+    }
+
+    #[test]
+    fn vtsi_mat_parses_lpcm_audio_stream_attr() {
+        let buf = build_vtsi_mat_with_audio(&[[0x84, 0x91, 0x65, 0x6e, 0, 0, 0, 0]]);
+        let mat = VtsiMat::parse(&buf).unwrap();
+
+        assert_eq!(mat.audio_streams.len(), 1);
+        let stream = &mat.audio_streams[0];
+        assert_eq!(stream.stream_index, 0);
+        assert_eq!(stream.coding_mode, AudioCodingMode::Lpcm);
+        assert!(!stream.multichannel_extension);
+        assert_eq!(stream.audio_type, 1);
+        assert_eq!(stream.sample_frequency_code, 0);
+        assert_eq!(stream.sample_frequency, Some(48_000));
+        assert_eq!(stream.quantization_code, 2);
+        assert_eq!(stream.bit_depth, Some(24));
+        assert_eq!(stream.channels, 3);
+        assert_eq!(stream.language.as_deref(), Some("en"));
+        assert!(mat.has_lpcm());
+        assert_eq!(mat.lpcm_streams().len(), 1);
+    }
+
+    #[test]
+    fn vtsi_mat_parses_ac3_audio_stream_attr() {
+        let buf = build_vtsi_mat_with_audio(&[[0x04, 0xc5, 0x65, 0x6e, 0, 0, 0, 0]]);
+        let mat = VtsiMat::parse(&buf).unwrap();
+
+        assert_eq!(mat.audio_streams.len(), 1);
+        let stream = &mat.audio_streams[0];
+        assert_eq!(stream.stream_index, 0);
+        assert_eq!(stream.coding_mode, AudioCodingMode::Ac3);
+        assert_eq!(stream.audio_type, 1);
+        assert_eq!(stream.sample_frequency_code, 0);
+        assert_eq!(stream.sample_frequency, Some(48_000));
+        assert_eq!(stream.quantization_code, 3);
+        assert_eq!(stream.bit_depth, None);
+        assert_eq!(stream.channels, 1);
+        assert_eq!(stream.language.as_deref(), Some("en"));
+        assert!(!mat.has_lpcm());
+        assert!(mat.lpcm_streams().is_empty());
+    }
+
+    #[test]
+    fn vtsi_mat_skips_zero_audio_stream_attr() {
+        let buf = build_vtsi_mat_with_audio(&[[0; VTSI_AUDIO_STREAM_ATTR_LEN]]);
+        let mat = VtsiMat::parse(&buf).unwrap();
+
+        assert!(mat.audio_streams.is_empty());
+        assert!(!mat.has_lpcm());
+    }
+
+    #[test]
+    fn vtsi_mat_accepts_legacy_0x200_buffer_without_audio_extension() {
+        let buf = build_vtsi_mat(1, 2, 3, 42);
+        assert_eq!(buf.len(), 0x200);
+
+        let mat = VtsiMat::parse(&buf).unwrap();
+        assert!(mat.audio_streams.is_empty());
+    }
+
+    #[test]
+    fn vtsi_mat_rejects_truncated_audio_extension_header() {
+        let mut buf = build_vtsi_mat(1, 2, 3, 42);
+        buf.resize(VTSI_AUDIO_STREAM_COUNT_OFFSET + 1, 0);
+
+        assert!(matches!(
+            VtsiMat::parse(&buf),
+            Err(Error::InvalidUdf("VTSI_MAT: truncated audio stream extension header"))
+        ));
+    }
+
+    #[test]
+    fn vtsi_mat_rejects_truncated_declared_audio_stream_attrs() {
+        let mut buf = build_vtsi_mat(1, 2, 3, 42);
+        buf.resize(VTSI_AUDIO_STREAM_ATTR_OFFSET + 4, 0);
+        buf[VTSI_AUDIO_STREAM_COUNT_OFFSET..VTSI_AUDIO_STREAM_COUNT_OFFSET + 2]
+            .copy_from_slice(&1u16.to_be_bytes());
+        buf[VTSI_AUDIO_STREAM_ATTR_OFFSET..VTSI_AUDIO_STREAM_ATTR_OFFSET + 4]
+            .copy_from_slice(&[0x84, 0x91, 0x65, 0x6e]);
+
+        assert!(matches!(
+            VtsiMat::parse(&buf),
+            Err(Error::InvalidUdf("VTSI_MAT: truncated audio stream descriptors"))
+        ));
+    }
+
+    #[test]
+    fn vtsi_mat_rejects_audio_stream_count_above_dvd_limit() {
+        let mut buf = build_vtsi_mat(1, 2, 3, 42);
+        buf.resize(0x254, 0);
+        buf[VTSI_AUDIO_STREAM_COUNT_OFFSET..VTSI_AUDIO_STREAM_COUNT_OFFSET + 2]
+            .copy_from_slice(&9u16.to_be_bytes());
+
+        assert!(matches!(
+            VtsiMat::parse(&buf),
+            Err(Error::InvalidUdf("VTSI_MAT: audio stream count exceeds 8"))
+        ));
     }
 
     // -------------------------------------------------------------
@@ -1817,6 +2128,12 @@ mod tests {
         // ---------- Sector 0: VTSI_MAT ----------
         let mat = build_vtsi_mat(1, 2, 3, 100);
         img[0..mat.len()].copy_from_slice(&mat);
+        img[0x0080..0x0084].copy_from_slice(&0x0253u32.to_be_bytes());
+        img[VTSI_AUDIO_STREAM_COUNT_OFFSET..VTSI_AUDIO_STREAM_COUNT_OFFSET + 2]
+            .copy_from_slice(&1u16.to_be_bytes());
+        let audio_attr_end = VTSI_AUDIO_STREAM_ATTR_OFFSET + VTSI_AUDIO_STREAM_ATTR_LEN;
+        img[VTSI_AUDIO_STREAM_ATTR_OFFSET..audio_attr_end]
+            .copy_from_slice(&[0x84, 0x91, 0x65, 0x6e, 0, 0, 0, 0]);
 
         // ---------- Sector 2: VTS_PGCI ----------
         // 1 PGC with 5 cells (and 3 programs: cells 1, 3, 5 are
@@ -1938,5 +2255,9 @@ mod tests {
         // C_ADT must give us first cell's sector range.
         assert_eq!(vts.cell_adt.lookup(1, 1), Some((1000, 1999)));
         assert_eq!(vts.cell_adt.lookup(1, 5), Some((5000, 5999)));
+        // VtsIfo exposes a pass-through copy of VTSI_MAT audio attributes.
+        assert_eq!(vts.audio_streams.len(), 1);
+        assert_eq!(vts.audio_streams[0].coding_mode, AudioCodingMode::Lpcm);
+        assert_eq!(vts.mat.audio_streams, vts.audio_streams);
     }
 }
