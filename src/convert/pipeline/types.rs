@@ -97,6 +97,24 @@ pub struct SourceOptions {
     /// output except for structurally identified authored stereo presentations.
     #[serde(default)]
     pub dvda_downmix_policy: DvdaDownmixPolicy,
+    /// DVD-Video VTS selection. `None` lets the materializer score all supported
+    /// VTS/title/stream candidates and choose the likely main program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvdv_vts: Option<u8>,
+    /// DVD-Video title number within the selected/scored VTS. `None` keeps title
+    /// selection in the main-program scorer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvdv_title: Option<u8>,
+    /// DVD-Video audio stream index from IFO attributes. `None` keeps stream
+    /// selection in the main-program scorer: chapter count and duration choose
+    /// the likely program, then stereo/lossless/codec quality break stream ties.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvdv_audio_stream: Option<u8>,
+    /// DVD-Video camera angle number (1-based). `None` means angle 1, matching
+    /// the DVD-Video default angle. Multi-angle/interleaved titles are filtered
+    /// through this policy rather than extracting every cell in the angle block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvdv_angle: Option<u8>,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -120,6 +138,14 @@ impl SourceOptions {
             DvdaGroupSelection::Default
         ) || self.dvda_assume_decrypted
             || !matches!(self.dvda_downmix_policy, DvdaDownmixPolicy::Auto)
+    }
+
+    #[must_use]
+    pub fn explicit_dvdv_requested(&self) -> bool {
+        self.dvdv_vts.is_some()
+            || self.dvdv_title.is_some()
+            || self.dvdv_audio_stream.is_some()
+            || self.dvdv_angle.is_some()
     }
 }
 
@@ -361,6 +387,14 @@ pub struct RedactedSourceOptions {
     pub dvda_assume_decrypted: bool,
     #[serde(default)]
     pub dvda_downmix_policy: DvdaDownmixPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvdv_vts: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvdv_title: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvdv_audio_stream: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvdv_angle: Option<u8>,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -382,6 +416,10 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
                 dvda_group: req.source.dvda_group,
                 dvda_assume_decrypted: req.source.dvda_assume_decrypted,
                 dvda_downmix_policy: req.source.dvda_downmix_policy,
+                dvdv_vts: req.source.dvdv_vts,
+                dvdv_title: req.source.dvdv_title,
+                dvdv_audio_stream: req.source.dvdv_audio_stream,
+                dvdv_angle: req.source.dvdv_angle,
                 cue_sidecar: req.source.cue_sidecar,
                 track_selection: req.source.track_selection.clone(),
             },
@@ -573,6 +611,99 @@ pub enum TrackSourceRef {
         sector_ranges: Vec<DvdaSectorRangeRef>,
         aob_files: Vec<DvdaAobFileRef>,
     },
+    DvdVideoTrack {
+        /// User-supplied DVD-Video source path. This can be an ISO image, a
+        /// mounted/copied DVD root containing `VIDEO_TS/`, or the `VIDEO_TS`
+        /// directory itself.
+        source: PathBuf,
+        /// VTS number (1-based).
+        vts_number: u8,
+        /// Title number within the VTS (1-based).
+        title_number: u8,
+        /// Selected camera angle number (1-based). Angle 1 is the DVD-Video
+        /// default; multi-angle cell blocks are filtered to this path.
+        angle_number: u8,
+        /// Chapter number (1-based).
+        chapter_number: u16,
+        /// DVD-Video audio stream index (0-7) from the VTS IFO stream table.
+        audio_stream_index: u8,
+        /// IFO coding mode for the selected audio stream.
+        audio_coding: DvdVideoAudioCoding,
+        /// Cell sector ranges for this chapter, relative to the concatenated
+        /// title-VOB address space (VTS_xx_1.VOB, VTS_xx_2.VOB, ...).
+        /// Ranges are inclusive and validated by the materializer.
+        cell_sectors: Vec<(u32, u32)>,
+        /// VOB file inventory for the selected VTS title VOBs. Cell sectors
+        /// must be resolved through this map, never by adding a VTSI_MAT
+        /// sector pointer to the relative cell sector.
+        vob_files: Vec<DvdVideoVobFileRef>,
+        /// IFO-derived sample rate in Hz when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_rate: Option<u32>,
+        /// LPCM bit depth when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bit_depth: Option<u32>,
+        /// Channel count when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channels: Option<u8>,
+    },
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DvdVideoVobFileRef {
+    /// VTS number owning this title VOB file.
+    pub vts_number: u8,
+    /// 1-based VOB part number from `VTS_xx_N.VOB`.
+    pub vob_index: u8,
+    pub file_name: String,
+    /// Filesystem path for directory-backed DVD-Video sources. ISO-backed
+    /// sources leave this as `None` and use `lba` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// Absolute ISO logical block address of this VOB file extent. Ignored for
+    /// directory-backed sources where `path` is set.
+    pub lba: u32,
+    pub byte_len: u64,
+    /// First sector contributed by this file, relative to the concatenated
+    /// title-VOB address space for the VTS.
+    pub block_first: u32,
+    /// Inclusive last sector contributed by this file, relative to the
+    /// concatenated title-VOB address space for the VTS.
+    pub block_last: u32,
+}
+
+impl DvdVideoVobFileRef {
+    #[must_use]
+    pub const fn contains(&self, block: u32) -> bool {
+        block >= self.block_first && block <= self.block_last
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DvdVideoAudioCoding {
+    Lpcm,
+    Ac3,
+    Dts,
+    Mpeg,
+}
+
+impl DvdVideoAudioCoding {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Lpcm => "LPCM",
+            Self::Ac3 => "AC-3",
+            Self::Dts => "DTS",
+            Self::Mpeg => "MPEG",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_lossless(self) -> bool {
+        matches!(self, Self::Lpcm)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,6 +946,7 @@ pub enum SourceKind {
     CueImage,
     SacdIso,
     DvdAudio,
+    DvdVideo,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -777,6 +777,76 @@ impl CellPlaybackInfo {
     }
 }
 
+impl CellPlaybackInfo {
+    /// DVD-Video C_PBI cell block mode, encoded in category byte bits 7..6.
+    #[must_use]
+    pub fn block_mode(self) -> CellBlockMode {
+        match (self.category_byte0 >> 6) & 0x03 {
+            0 => CellBlockMode::NotInBlock,
+            1 => CellBlockMode::FirstCellInBlock,
+            2 => CellBlockMode::CellInBlock,
+            3 => CellBlockMode::LastCellInBlock,
+            _ => unreachable!(),
+        }
+    }
+
+    /// DVD-Video C_PBI cell block type, encoded in category byte bits 5..4.
+    #[must_use]
+    pub fn block_type(self) -> CellBlockType {
+        match (self.category_byte0 >> 4) & 0x03 {
+            0 => CellBlockType::Normal,
+            1 => CellBlockType::Angle,
+            2 => CellBlockType::Reserved2,
+            3 => CellBlockType::Reserved3,
+            _ => unreachable!(),
+        }
+    }
+
+    #[must_use]
+    pub fn seamless_play(self) -> bool {
+        (self.category_byte0 & 0x08) != 0
+    }
+
+    #[must_use]
+    pub fn interleaved(self) -> bool {
+        (self.category_byte0 & 0x04) != 0
+    }
+
+    #[must_use]
+    pub fn stc_discontinuity(self) -> bool {
+        (self.category_byte0 & 0x02) != 0
+    }
+
+    #[must_use]
+    pub fn seamless_angle(self) -> bool {
+        (self.category_byte0 & 0x01) != 0
+    }
+
+    /// True when the cell belongs to an authored angle block. Interleaved cells
+    /// alone are not treated as safely extractable angle cells; callers should
+    /// reject or handle those with NAV/ILVU-aware logic.
+    #[must_use]
+    pub fn is_angle_block_cell(self) -> bool {
+        self.block_type() == CellBlockType::Angle
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellBlockMode {
+    NotInBlock,
+    FirstCellInBlock,
+    CellInBlock,
+    LastCellInBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellBlockType {
+    Normal,
+    Angle,
+    Reserved2,
+    Reserved3,
+}
+
 /// Per-cell position information (4 bytes per entry in C_POS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellPositionInfo {
@@ -1311,6 +1381,19 @@ pub struct VtsIfo {
 }
 
 impl VtsIfo {
+    /// Apply VMG `TT_SRPT` title metadata to this VTS. `VTS_xx_0.IFO` does not
+    /// carry the disc-global title search pointer angle counts, so callers that
+    /// parsed `VIDEO_TS.IFO` should enrich the VTS after `parse()`.
+    pub fn apply_vmg_title_entries(&mut self, entries: &[DvdTitleEntry]) {
+        for title in &mut self.titles {
+            if let Some(entry) = entries.iter().find(|entry| {
+                entry.vts_number == self.vts_number && entry.vts_title_number == title.number
+            }) {
+                title.angle_count = entry.angle_count.max(1);
+            }
+        }
+    }
+
     /// Build a `VtsIfo` from the full IFO byte buffer (the entire
     /// `VTS_xx_0.IFO`, which is `last_sector_ifo` + 1 sectors long).
     ///
@@ -1396,6 +1479,9 @@ impl VtsIfo {
             let chapter_count = chapters.len() as u16;
             titles.push(DvdTitle {
                 number: title_number,
+                // VTS_PTT_SRPT does not carry the VMG title-search-pointer
+                // angle count. `parse_vts_ifos_for_source()` enriches this
+                // with `apply_vmg_title_entries()` after parsing VIDEO_TS.IFO.
                 angle_count: 1,
                 chapter_count,
                 chapters,

@@ -204,7 +204,7 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Tag audio files or an SACD ISO from MusicBrainz, headless.
+    /// Tag audio files, an SACD ISO, or a DVD-Video source from MusicBrainz, headless.
     ///
     /// Computes a CD-equivalent TOC from the supplied paths, looks up
     /// matching MusicBrainz releases, populates per-track tags, and
@@ -213,7 +213,7 @@ enum Commands {
     /// Mirrors the in-editor `:tags-mb` flow with no interactive UI.
     TagsMb {
         /// Audio files (FLAC, WAV, etc.) — same album, same directory.
-        /// Or one SACD ISO file (writes the sidecar XML).
+        /// Or one SACD ISO file, DVD-Video ISO, or DVD-Video directory.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
@@ -923,6 +923,10 @@ fn build_pipeline_request_template(
                 .unwrap_or(DvdaGroupSelection::Default),
             dvda_assume_decrypted,
             dvda_downmix_policy: dvda_downmix.unwrap_or(DvdaDownmixPolicy::Auto),
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
             cue_sidecar: cue_policy,
             track_selection,
         },
@@ -1255,7 +1259,7 @@ fn run_disc_info(path: &std::path::Path, raw: bool, verbose: bool) -> anyhow::Re
         let sidecar = tonepoet::tui::sacd_sidecar::find_sidecar_for_iso(path)
             .and_then(|p| tonepoet::tui::sacd_sidecar::parse_sidecar(&p).ok());
         disc::sacd_mapper::map_sacd_disc(&metadata, sidecar.as_ref(), path)
-    } else {
+    } else if tonepoet::disc::dvda_utils::is_dvda_source(path) {
         // Try DVD-Audio
         use tonepoet::tui::dvda::*;
 
@@ -1311,6 +1315,11 @@ fn run_disc_info(path: &std::path::Path, raw: bool, verbose: bool) -> anyhow::Re
         }
 
         disc::dvda_mapper::map_dvda_disc(&dvda_disc, &probes, path)
+    } else if tonepoet::disc::dvdv_utils::is_dvdv_source(path) {
+        tonepoet::disc::dvdv_utils::map_dvdv_source(path)
+            .map_err(|e| anyhow::anyhow!("DVD-Video parse failed: {}", e))?
+    } else {
+        anyhow::bail!("Unrecognized disc format: {}", path.display());
     };
 
     // Display
@@ -1330,13 +1339,7 @@ fn run_disc_info(path: &std::path::Path, raw: bool, verbose: bool) -> anyhow::Re
         let duration = disc::format_duration(pres.total_duration_secs);
         println!(
             "  {}: {} ({} track{}, {})",
-            match &pres.id {
-                disc::PresentationId::DvdAudioGroup(n) => format!("Group {}", n),
-                disc::PresentationId::SacdArea(a) => match a {
-                    disc::SacdAreaId::Stereo => "Stereo".to_string(),
-                    disc::SacdAreaId::MultiChannel => "Multichannel".to_string(),
-                },
-            },
+            pres.id.compact_label(),
             pres.label,
             pres.tracks.len(),
             if pres.tracks.len() == 1 { "" } else { "s" },
@@ -1348,13 +1351,7 @@ fn run_disc_info(path: &std::path::Path, raw: bool, verbose: bool) -> anyhow::Re
         println!();
         println!("Suppressed:");
         for sup in &contents.suppressed {
-            let id_label = match &sup.id {
-                disc::PresentationId::DvdAudioGroup(n) => format!("Group {}", n),
-                disc::PresentationId::SacdArea(a) => match a {
-                    disc::SacdAreaId::Stereo => "Stereo".to_string(),
-                    disc::SacdAreaId::MultiChannel => "Multichannel".to_string(),
-                },
-            };
+            let id_label = sup.id.compact_label();
             println!(
                 "  {}: {} track{}, {} — {}",
                 id_label,
@@ -1545,7 +1542,7 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
 ///    --auto takes the top score.
 /// 5. Populate the state with MB values (`populate_editor_from_mb`).
 /// 6. Regenerate CUESHEET for single-image rips, then save via the
-///    shared `apply_audio_tag_changes` / `save_sacd_sidecar` helpers.
+///    shared audio/SACD helpers or a DVD-Video JSON metadata sidecar.
 ///
 /// Returns the process exit code: 0 ok, 1 no match, 2 ambiguous,
 /// 3 argument/IO error, 4 MB transport/parse error.
@@ -1584,6 +1581,13 @@ async fn run_tags_mb(
                 return 3;
             }
         },
+        PathKind::DvdVideoSource(ref source) => match build_dvdv_state_for_cli(source) {
+            Ok(s) => s,
+            Err(e) => {
+                err!("tags-mb: {}", e);
+                return 3;
+            }
+        },
         PathKind::Audio(ref audio_paths) => match build_audio_state_for_cli(audio_paths) {
             Ok(s) => s,
             Err(e) => {
@@ -1601,7 +1605,7 @@ async fn run_tags_mb(
 
     // ── lookup ─────────────────────────────────────────────────────
     let n_tracks = match kind {
-        PathKind::SacdIso(_) => state.paths.len(), // ISO replicated × n_tracks
+        PathKind::SacdIso(_) | PathKind::DvdVideoSource(_) => state.paths.len(), // disc source replicated × n_tracks
         PathKind::Audio(ref a) => a.len(),
     };
 
@@ -1728,6 +1732,18 @@ async fn run_tags_mb(
                 }
             }
         }
+        PathKind::DvdVideoSource(ref source) => {
+            match tonepoet::tui::command::save_dvdv_metadata_sidecar(source, &state) {
+                Ok(sidecar_path) => {
+                    say!("DVD-Video sidecar written: {}", sidecar_path.display());
+                    0
+                }
+                Err(e) => {
+                    err!("tags-mb: DVD-Video sidecar save failed: {}", e);
+                    3
+                }
+            }
+        }
         PathKind::Audio(ref audio_paths) => {
             let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> = state
                 .entries
@@ -1784,26 +1800,35 @@ async fn run_tags_mb(
 enum PathKind {
     Audio(Vec<PathBuf>),
     SacdIso(PathBuf),
+    DvdVideoSource(PathBuf),
 }
 
 fn classify_tags_mb_paths(paths: &[PathBuf]) -> Result<PathKind, String> {
     if paths.is_empty() {
         return Err("no paths supplied".to_string());
     }
-    let isos: Vec<&PathBuf> = paths
-        .iter()
-        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")))
-        .collect();
-    if !isos.is_empty() {
-        if paths.len() != 1 {
-            return Err("SACD ISO must be passed alone (no mixed paths)".to_string());
+
+    if paths.len() == 1 {
+        let path = paths[0].clone();
+        if !path.exists() {
+            return Err(format!("path not found: {}", path.display()));
         }
-        let iso = isos[0].clone();
-        if !iso.exists() {
-            return Err(format!("ISO not found: {}", iso.display()));
+        if path.is_dir() && tonepoet::disc::dvdv_utils::is_dvdv_directory(&path) {
+            return Ok(PathKind::DvdVideoSource(path));
         }
-        return Ok(PathKind::SacdIso(iso));
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")) {
+            if tonepoet::disc::dvdv_utils::is_dvdv_iso(&path) {
+                return Ok(PathKind::DvdVideoSource(path));
+            }
+            return Ok(PathKind::SacdIso(path));
+        }
+    } else if paths.iter().any(|p| {
+        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso"))
+            || (p.is_dir() && tonepoet::disc::dvdv_utils::is_dvdv_directory(p))
+    }) {
+        return Err("disc sources must be passed alone (no mixed paths)".to_string());
     }
+
     let mut dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for p in paths {
         if !p.exists() {
@@ -1873,6 +1898,48 @@ fn build_sacd_state_for_cli(
     let (state, _label, _n) = keybindings::build_sacd_editor_state(iso, &md, sidecar.as_ref())
         .map_err(|e| format!("build SACD editor state: {}", e))?;
     Ok(state)
+}
+
+fn build_dvdv_state_for_cli(
+    source: &std::path::Path,
+) -> Result<tonepoet::tui::app::MetadataEditorState, String> {
+    use tonepoet::tui::app;
+
+    let sectors = tonepoet::tui::command::dvdv_source_to_cd_sectors(source)?;
+    let n_tracks = sectors
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "DVD-Video MusicBrainz TOC has no tracks".to_string())?;
+
+    let sidecar_writable = tonepoet::tui::command::dvdv_metadata_sidecar_target_is_writable(source);
+    let sidecar_path = tonepoet::tui::command::dvdv_metadata_sidecar_path_for_source(source).ok();
+
+    Ok(app::MetadataEditorState {
+        paths: std::iter::repeat(source.to_path_buf()).take(n_tracks).collect(),
+        entries: Vec::new(),
+        cursor: 0,
+        scroll: 0,
+        last_click: None,
+        edit_input: None,
+        add_key_input: None,
+        phase: app::MetadataEditorPhase::Editing,
+        dirty: false,
+        deleted: Vec::new(),
+        file_labels: (1..=n_tracks).map(|i| format!("{:>02}", i)).collect(),
+        detail_field_idx: 0,
+        detail_cursor: 0,
+        detail_scroll: 0,
+        detail_edit: None,
+        mb_back: None,
+        gnudb_back: None,
+        read_only: !sidecar_writable,
+        sacd_sidecar_path: sidecar_path,
+        sacd_area_kind: None,
+        sacd_stereo_durations: None,
+        sacd_multi_channel_durations: None,
+        presentation_tabs: Vec::new(),
+        active_tab: 0,
+    })
 }
 
 /// Run the right MB lookup mode for the CLI args, disambiguate, and
@@ -1977,6 +2044,12 @@ async fn resolve_release(
             })?;
             tonepoet::tui::command::sacd_durations_to_sectors(durations)
         }
+        PathKind::DvdVideoSource(path) => {
+            tonepoet::tui::command::dvdv_source_to_cd_sectors(path).map_err(|e| {
+                eprintln!("tags-mb: DVD-Video TOC: {}", e);
+                3
+            })?
+        }
     };
     let toc_string = musicbrainz::build_mb_toc(&sectors).ok_or_else(|| {
         eprintln!("tags-mb: TOC too short");
@@ -2046,6 +2119,7 @@ mod tags_mb_cli_tests {
                 "expected Audio, got {:?}",
                 match other {
                     Ok(PathKind::SacdIso(_)) => "SacdIso".to_string(),
+                    Ok(PathKind::DvdVideoSource(_)) => "DvdVideoSource".to_string(),
                     Err(e) => format!("Err({})", e),
                     _ => "?".to_string(),
                 }

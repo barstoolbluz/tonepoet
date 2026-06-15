@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use super::diagnostics::DiscDiagnostic;
 
 /// Disc format identifier.
@@ -7,6 +9,7 @@ use super::diagnostics::DiscDiagnostic;
 pub enum DiscFormat {
     DvdAudio,
     Sacd,
+    DvdVideo,
 }
 
 impl DiscFormat {
@@ -14,6 +17,7 @@ impl DiscFormat {
         match self {
             Self::DvdAudio => "DVD-Audio",
             Self::Sacd => "SACD",
+            Self::DvdVideo => "DVD-Video",
         }
     }
 }
@@ -51,14 +55,92 @@ pub struct DiscTrack {
 }
 
 /// Format-specific presentation identifier.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum PresentationId {
     DvdAudioGroup(u8),
     SacdArea(SacdAreaId),
+    /// DVD-Video title/audio-stream identity. VTS is included deliberately:
+    /// a bare title number is ambiguous on real discs with multiple VTS sets,
+    /// and the stream index is needed to convert non-default audio tracks.
+    DvdVideoTitle {
+        vts_number: u8,
+        title_number: u8,
+        audio_stream_index: u8,
+    },
+}
+
+impl PresentationId {
+    /// Construct a DVD-Video presentation identity from authored VTS/title and
+    /// zero-based audio stream index values.
+    pub fn dvd_video(vts_number: u8, title_number: u8, audio_stream_index: u8) -> Self {
+        Self::DvdVideoTitle {
+            vts_number,
+            title_number,
+            audio_stream_index,
+        }
+    }
+
+    /// Return the authored DVD-Video identity tuple when this is a DVD-Video
+    /// presentation. The audio stream index remains zero-based because that is
+    /// the value carried into `SourceOptions` and the demux/materializer path.
+    pub fn dvd_video_parts(&self) -> Option<(u8, u8, u8)> {
+        match self {
+            Self::DvdVideoTitle {
+                vts_number,
+                title_number,
+                audio_stream_index,
+            } => Some((*vts_number, *title_number, *audio_stream_index)),
+            _ => None,
+        }
+    }
+
+    /// Stable, short user-facing label. DVD-Video stream numbers are displayed
+    /// one-based, while persisted/source-option state keeps the zero-based
+    /// stream index required by the demux layer.
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::DvdAudioGroup(n) => format!("DVD-Audio group {n}"),
+            Self::SacdArea(SacdAreaId::Stereo) => "SACD stereo area".to_string(),
+            Self::SacdArea(SacdAreaId::MultiChannel) => "SACD multichannel area".to_string(),
+            Self::DvdVideoTitle {
+                vts_number,
+                title_number,
+                audio_stream_index,
+            } => format!(
+                "DVD-Video VTS {vts_number} title {title_number} audio stream {}",
+                dvd_video_audio_stream_display_number(*audio_stream_index)
+            ),
+        }
+    }
+
+    /// Compact label used in dense CLI/table output.
+    pub fn compact_label(&self) -> String {
+        match self {
+            Self::DvdAudioGroup(n) => format!("Group {n}"),
+            Self::SacdArea(SacdAreaId::Stereo) => "Stereo".to_string(),
+            Self::SacdArea(SacdAreaId::MultiChannel) => "Multichannel".to_string(),
+            Self::DvdVideoTitle {
+                vts_number,
+                title_number,
+                audio_stream_index,
+            } => format!(
+                "VTS {vts_number} Title {title_number} Stream {}",
+                dvd_video_audio_stream_display_number(*audio_stream_index)
+            ),
+        }
+    }
+}
+
+/// Convert the persisted/materializer zero-based DVD-Video audio stream index to
+/// the one-based stream number shown to users.
+pub fn dvd_video_audio_stream_display_number(audio_stream_index: u8) -> u16 {
+    u16::from(audio_stream_index) + 1
 }
 
 /// SACD area identity within a PresentationId.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SacdAreaId {
     Stereo,
     MultiChannel,
@@ -123,4 +205,31 @@ pub struct DiscContents {
     pub album_artist: Option<String>,
     pub genre: Option<String>,
     pub year: Option<String>,
+}
+
+#[cfg(test)]
+mod presentation_id_tests {
+    use super::*;
+
+    #[test]
+    fn dvd_video_presentation_id_serializes_full_identity() {
+        let id = PresentationId::dvd_video(2, 7, 3);
+        let value = serde_json::to_value(id).expect("serialize DVD-Video presentation id");
+        assert_eq!(value["kind"], "dvd_video_title");
+        assert_eq!(value["value"]["vts_number"], 2);
+        assert_eq!(value["value"]["title_number"], 7);
+        assert_eq!(value["value"]["audio_stream_index"], 3);
+
+        let round_trip: PresentationId =
+            serde_json::from_value(value).expect("deserialize DVD-Video presentation id");
+        assert_eq!(round_trip, id);
+    }
+
+    #[test]
+    fn dvd_video_labels_display_one_based_stream_numbers() {
+        let id = PresentationId::dvd_video(1, 2, 0);
+        assert_eq!(id.display_label(), "DVD-Video VTS 1 title 2 audio stream 1");
+        assert_eq!(id.compact_label(), "VTS 1 Title 2 Stream 1");
+        assert_eq!(id.dvd_video_parts(), Some((1, 2, 0)));
+    }
 }

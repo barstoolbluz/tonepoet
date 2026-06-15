@@ -27,6 +27,8 @@ use super::materializer_7z::SevenZipMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
 use super::materializer_dvda::{is_dvda_candidate, DvdaAudioMaterializer};
+use super::materializer_dvdv::{is_dvdv_candidate, DvdVideoMaterializer};
+use super::dvdv_realize::realize_dvdv_track;
 use super::materializer_single::SingleFileMaterializer;
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
@@ -171,6 +173,9 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
     if is_dvda_candidate(req)? {
         return Ok(SourceKind::DvdAudio);
     }
+    if is_dvdv_candidate(req)? {
+        return Ok(SourceKind::DvdVideo);
+    }
     if !matches!(req.source.cue_sidecar, CueSidecarPolicy::IgnoreCue) && is_cue_image_candidate(req)? {
         return Ok(SourceKind::CueImage);
     }
@@ -206,6 +211,7 @@ pub fn materializer_for(kind: SourceKind) -> Result<Box<dyn Materializer>, Sourc
         SourceKind::CueImage => Ok(Box::new(CueImageMaterializer)),
         SourceKind::SacdIso => Ok(Box::new(SacdIsoMaterializer)),
         SourceKind::DvdAudio => Ok(Box::new(DvdaAudioMaterializer)),
+        SourceKind::DvdVideo => Ok(Box::new(DvdVideoMaterializer)),
     }
 }
 
@@ -336,6 +342,16 @@ async fn realize_track_with_tool_limits_and_stats(
             track_index,
             area,
         } => realize_sacd_track(iso, *track_index, *area, &req.settings.target_format, staging, cancel, progress_tracker).await,
+        TrackSourceRef::DvdVideoTrack { .. } => realize_dvdv_track(
+            src,
+            staging,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+            progress_tracker,
+        )
+        .await
+        .map(RealizedTrackInfo::without_stats),
         TrackSourceRef::DvdaTrack { dvda_downmix_policy, .. } => {
             let expected_audio = DvdaSourceAudioExpectation::from_prepared_track_and_source(prepared_track, src);
             let audio_policy = DvdaRealizationAudioPolicy::new(
@@ -4330,6 +4346,10 @@ FILE "album.flac" WAVE
                 dvda_group: None,
                 dvda_assume_decrypted: false,
                 dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -6279,6 +6299,7 @@ fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
         TrackSourceRef::ImageSegment { image, .. } => image,
         TrackSourceRef::SacdTrack { .. } => return Some("dsd".to_string()),
         TrackSourceRef::DvdaTrack { .. } => return Some("dvda".to_string()),
+        TrackSourceRef::DvdVideoTrack { .. } => return Some("dvdv".to_string()),
     };
     path.extension()
         .and_then(|value| value.to_str())
@@ -6849,6 +6870,7 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
         SourceKind::CueImage => "CueImage",
         SourceKind::SacdIso => "SacdIso",
         SourceKind::DvdAudio => "DvdAudio",
+        SourceKind::DvdVideo => "DvdVideo",
     }
 }
 
@@ -6884,6 +6906,21 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
             track_index + 1,
             path_log_value(iso),
             area
+        ),
+        TrackSourceRef::DvdVideoTrack {
+            source,
+            vts_number,
+            title_number,
+            angle_number,
+            chapter_number,
+            audio_stream_index,
+            audio_coding,
+            ..
+        } => format!(
+            "DVD-Video VTS {vts_number} title {title_number} angle {angle_number} chapter {chapter_number} stream {} ({}) from {}",
+            crate::disc::model::dvd_video_audio_stream_display_number(*audio_stream_index),
+            audio_coding.label(),
+            path_log_value(source)
         ),
         TrackSourceRef::DvdaTrack {
             volume_source,
@@ -10566,6 +10603,7 @@ fn build_manifest_for_album(
                         TrackSourceRef::DvdaTrack { volume_source, .. } => {
                             volume_source.original_container().clone()
                         }
+                        TrackSourceRef::DvdVideoTrack { source, .. } => source.clone(),
                     })
                     .unwrap_or_else(|| req.container.clone());
 
@@ -10756,6 +10794,10 @@ mod conversion_log_tests {
                 dvda_group: None,
                 dvda_assume_decrypted: false,
                 dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -11693,6 +11735,10 @@ mod naming_template_tests {
                 dvda_group: None,
                 dvda_assume_decrypted: false,
                 dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -12222,6 +12268,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 dvda_group: None,
                 dvda_assume_decrypted: false,
                 dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },

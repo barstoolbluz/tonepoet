@@ -18,6 +18,7 @@ pub(crate) mod dvda_demux;
 pub(crate) mod dvda_lpcm;
 pub(crate) mod dvda_mlp;
 pub(crate) mod dvda_realize;
+pub(crate) mod dvdv_realize;
 pub mod errors;
 pub mod label_resolver;
 pub mod manifest;
@@ -25,6 +26,7 @@ pub mod manifest_builder;
 pub mod materializer_7z;
 pub mod materializer_cue;
 pub mod materializer_dvda;
+pub mod materializer_dvdv;
 pub mod materializer_sacd;
 pub mod materializer_single;
 pub mod orchestrator_rerun_gate;
@@ -83,6 +85,10 @@ mod tests {
                 dvda_group_selection: DvdaGroupSelection::Default,
                 dvda_assume_decrypted: false,
                 dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::IgnoreCue,
                 track_selection: TrackSelection::All,
             },

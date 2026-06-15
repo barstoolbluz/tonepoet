@@ -502,7 +502,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_file_ops_submenu(false));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
-        EntryKind::DvdAudioIso | EntryKind::DvdAudioDir => {
+        EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir => {
             items.push(item("Convert (default stream)", ContextAction::ConvertDiscDefault));
             items.push(item("Browse Audio Streams...", ContextAction::BrowseDiscStreams));
             if let Some(contents) = app
@@ -523,6 +523,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             }
             items.push(separator());
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
+            items.push(item("Analyze", ContextAction::Analyze));
+            items.push(separator());
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
             items.push(item("Select Inverse", ContextAction::SelectInverse));
@@ -763,7 +765,7 @@ pub fn execute_context_action(
             let cmd = super::command::Command::Queue { preset: None };
             super::command::execute_command(app, cmd, tx);
             if app.current_screen == AppScreen::Convert {
-                super::command::execute_command(app, super::command::Command::Commit { start }, tx);
+                super::command::execute_commit_with_disc_selection_bridge(app, start, tx);
             }
         }
         ContextAction::ConvertWithPreset(name) => {
@@ -771,7 +773,7 @@ pub fn execute_context_action(
             let cmd = super::command::Command::Queue { preset: Some(name) };
             super::command::execute_command(app, cmd, tx);
             if app.current_screen == AppScreen::Convert {
-                super::command::execute_command(app, super::command::Command::Commit { start }, tx);
+                super::command::execute_commit_with_disc_selection_bridge(app, start, tx);
             }
         }
         ContextAction::Select => {
@@ -1288,12 +1290,10 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::CommitQueue => {
-            let cmd = super::command::Command::Commit { start: false };
-            super::command::execute_command(app, cmd, tx);
+            super::command::execute_commit_with_disc_selection_bridge(app, false, tx);
         }
         ContextAction::CommitAndStart => {
-            let cmd = super::command::Command::Commit { start: true };
-            super::command::execute_command(app, cmd, tx);
+            super::command::execute_commit_with_disc_selection_bridge(app, true, tx);
         }
         ContextAction::LoadPreset(name) => {
             let cmd = super::command::Command::Preset(name);

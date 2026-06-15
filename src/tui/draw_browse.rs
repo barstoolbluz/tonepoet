@@ -630,7 +630,7 @@ fn render_entry_line(
         match &entry.kind {
             EntryKind::ParentDir => Style::default().fg(theme::TEXT_MUTED),
             EntryKind::Directory => Style::default().fg(theme::BLUE),
-            EntryKind::DvdAudioDir => Style::default().fg(theme::PURPLE),
+            EntryKind::DvdAudioDir | EntryKind::DvdVideoDir => Style::default().fg(theme::PURPLE),
             EntryKind::AudioFile(_) => {
                 if is_selected {
                     Style::default()
@@ -641,7 +641,7 @@ fn render_entry_line(
                 }
             }
             EntryKind::Archive => Style::default().fg(theme::AMBER),
-            EntryKind::SacdIso | EntryKind::DvdAudioIso => Style::default().fg(theme::PURPLE),
+            EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdVideoIso => Style::default().fg(theme::PURPLE),
             EntryKind::OtherFile => Style::default().fg(theme::TEXT_DIM),
         }
     };
@@ -1279,11 +1279,11 @@ fn entry_info_lines(
                 audio_streams_pill_row,
             };
         }
-        EntryKind::DvdAudioIso | EntryKind::DvdAudioDir => {
+        EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir => {
             lines.push(vec![
                 Span::styled("   kind    ", theme::muted()),
                 Span::styled(
-                    if matches!(entry.kind, EntryKind::DvdAudioDir) { "DVD-Audio directory" } else { "DVD-Audio ISO" },
+                    if matches!(entry.kind, EntryKind::DvdVideoDir) { "DVD-Video directory" } else if matches!(entry.kind, EntryKind::DvdVideoIso) { "DVD-Video ISO" } else if matches!(entry.kind, EntryKind::DvdAudioDir) { "DVD-Audio directory" } else { "DVD-Audio ISO" },
                     theme::bold(theme::PURPLE),
                 ),
             ]);

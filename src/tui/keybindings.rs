@@ -793,6 +793,8 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                     | EntryKind::SacdIso
                     | EntryKind::DvdAudioIso
                     | EntryKind::DvdAudioDir
+                    | EntryKind::DvdVideoIso
+                    | EntryKind::DvdVideoDir
                     | EntryKind::OtherFile => {
                         // Toggle selection — converting is via context menu or :queue.
                         app.browse.toggle_selection();
@@ -5035,6 +5037,15 @@ pub(super) fn metadata_editor_is_dvda_source(state: &super::app::MetadataEditorS
     state.paths.iter().all(|p| p == first_path)
 }
 
+// TODO: DVD-Video metadata editor — full implementation pending
+pub(super) fn metadata_editor_is_dvdv_source(_state: &super::app::MetadataEditorState) -> bool {
+    false
+}
+
+pub(super) fn open_metadata_editor_for_dvdv(_app: &mut super::app::AppState, _source_path: std::path::PathBuf) {
+    // Stub — DVD-Video metadata editor not yet implemented
+}
+
 pub fn save_dvda_metabase(
     state: &super::app::MetadataEditorState,
     metabase_path: &std::path::Path,
@@ -5998,7 +6009,7 @@ fn is_path_writable(path: &std::path::Path) -> bool {
 /// Implementation: try to create a uniquely-named temp file in the
 /// directory, then immediately remove it. Both calls succeeding is
 /// the writability signal.
-fn is_dir_writable(dir: &std::path::Path) -> bool {
+pub(super) fn is_dir_writable(dir: &std::path::Path) -> bool {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -12206,12 +12217,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 cycle_stream_pill(app, true);
             }
             TuiButton::SourceEnqueueButton => {
-                let cmd = super::command::Command::Commit { start: false };
-                super::command::execute_command(app, cmd, tx);
+                super::command::execute_commit_with_disc_selection_bridge(app, false, tx);
             }
             TuiButton::SourceEnqueueStartButton => {
-                let cmd = super::command::Command::Commit { start: true };
-                super::command::execute_command(app, cmd, tx);
+                super::command::execute_commit_with_disc_selection_bridge(app, true, tx);
             }
             TuiButton::MetadataField(field) => {
                 use super::button_map::MetadataFieldKind::*;
@@ -12919,6 +12928,10 @@ mod phase4_tests {
             },
             tracks: Vec::new(),
             total_duration_secs: 0.0,
+            album_title: None,
+            album_artist: None,
+            genre: None,
+            year: None,
         }
     }
 

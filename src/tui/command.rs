@@ -1,12 +1,19 @@
 //! Vi-style command mode: parsing and execution
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use super::app::*;
 use super::message::AppMessage;
 use crate::convert::formats::AudioFormat;
 use crate::convert::simple_wizard::DitherType;
+
+const CD_FRAMES_PER_SECOND: f64 = 75.0;
+const CD_TOC_PREGAP_FRAMES: u32 = 150;
+
 
 /// Full list of command-mode tokens (including aliases) recognised by
 /// `parse_command`. Used by the tab-completion machinery.
@@ -256,7 +263,6 @@ pub enum SacdAreaTarget {
 }
 
 /// Parsed command from the command line
-#[derive(Debug)]
 pub enum Command {
     Quit,
     Write,
@@ -276,6 +282,14 @@ pub enum Command {
     /// enqueues AND starts processing, jumping to the Queue screen.
     Commit {
         start: bool,
+    },
+    /// Commit after applying a final transform to the pipeline source options.
+    CommitWithSourceOptionsTransform {
+        start: bool,
+        transform: Box<
+            dyn FnOnce(crate::convert::pipeline::SourceOptions) -> crate::convert::pipeline::SourceOptions
+                + Send,
+        >,
     },
     /// Toggle maximize/restore for the focused Convert pane.
     Maximize,
@@ -479,6 +493,131 @@ pub enum Command {
     /// Edit a text file (not .log files).
     EditFile(std::path::PathBuf),
     Unknown(String),
+
+}
+
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::Quit => f.write_str("Quit"),
+            Command::Write => f.write_str("Write"),
+            Command::WriteQuit => f.write_str("WriteQuit"),
+            Command::Edit(arg) => f.debug_tuple("Edit").field(arg).finish(),
+            Command::Output(arg) => f.debug_tuple("Output").field(arg).finish(),
+            Command::Cd(arg) => f.debug_tuple("Cd").field(arg).finish(),
+            Command::Queue { preset } => f.debug_struct("Queue").field("preset", preset).finish(),
+            Command::Commit { start } => f.debug_struct("Commit").field("start", start).finish(),
+            Command::CommitWithSourceOptionsTransform { start, .. } => f
+                .debug_struct("CommitWithSourceOptionsTransform")
+                .field("start", start)
+                .field("transform", &"<source-options-transform>")
+                .finish(),
+            Command::Maximize => f.write_str("Maximize"),
+            Command::Advanced => f.write_str("Advanced"),
+            Command::Go => f.write_str("Go"),
+            Command::Expand => f.write_str("Expand"),
+            Command::Batch(arg) => f.debug_tuple("Batch").field(arg).finish(),
+            Command::Preset(arg) => f.debug_tuple("Preset").field(arg).finish(),
+            Command::SaveAs(arg) => f.debug_tuple("SaveAs").field(arg).finish(),
+            Command::Presets => f.write_str("Presets"),
+            Command::Set(key, value) => f.debug_tuple("Set").field(key).field(value).finish(),
+            Command::Fx(args) => f.debug_tuple("Fx").field(args).finish(),
+            Command::Info => f.write_str("Info"),
+            Command::Tools => f.write_str("Tools"),
+            Command::Help => f.write_str("Help"),
+            Command::Sort(field, dir) => f.debug_tuple("Sort").field(field).field(dir).finish(),
+            Command::SortDir => f.write_str("SortDir"),
+            Command::Filter(arg) => f.debug_tuple("Filter").field(arg).finish(),
+            Command::Rename(arg) => f.debug_tuple("Rename").field(arg).finish(),
+            Command::Delete => f.write_str("Delete"),
+            Command::Copy { dest, force } => f
+                .debug_struct("Copy")
+                .field("dest", dest)
+                .field("force", force)
+                .finish(),
+            Command::Move { dest, force } => f
+                .debug_struct("Move")
+                .field("dest", dest)
+                .field("force", force)
+                .finish(),
+            Command::Browse => f.write_str("Browse"),
+            Command::Recent => f.write_str("Recent"),
+            Command::Bookmarks(arg) => f.debug_tuple("Bookmarks").field(arg).finish(),
+            Command::BulkRename => f.write_str("BulkRename"),
+            Command::Analyze { force } => f.debug_struct("Analyze").field("force", force).finish(),
+            Command::WriteDr => f.write_str("WriteDr"),
+            Command::WriteRgTrack => f.write_str("WriteRgTrack"),
+            Command::WriteRgAlbum => f.write_str("WriteRgAlbum"),
+            Command::ImportCue => f.write_str("ImportCue"),
+            Command::FixCaps => f.write_str("FixCaps"),
+            Command::Verify => f.write_str("Verify"),
+            Command::GenerateCue { single_image } => f
+                .debug_struct("GenerateCue")
+                .field("single_image", single_image)
+                .finish(),
+            Command::GenerateCueMb { single_image } => f
+                .debug_struct("GenerateCueMb")
+                .field("single_image", single_image)
+                .finish(),
+            Command::CueFill => f.write_str("CueFill"),
+            Command::CueView => f.write_str("CueView"),
+            Command::CueScrollTop => f.write_str("CueScrollTop"),
+            Command::CueScrollBottom => f.write_str("CueScrollBottom"),
+            Command::CueEditLine(line) => f.debug_tuple("CueEditLine").field(line).finish(),
+            Command::TagsFromMb { query, catno, year } => f
+                .debug_struct("TagsFromMb")
+                .field("query", query)
+                .field("catno", catno)
+                .field("year", year)
+                .finish(),
+            Command::MbRevert => f.write_str("MbRevert"),
+            Command::MbRestore => f.write_str("MbRestore"),
+            Command::MetaAdd => f.write_str("MetaAdd"),
+            Command::MetaDelete => f.write_str("MetaDelete"),
+            Command::MetaUndelete => f.write_str("MetaUndelete"),
+            Command::MetaDetail => f.write_str("MetaDetail"),
+            Command::TagsCueSidecar => f.write_str("TagsCueSidecar"),
+            Command::MbBack => f.write_str("MbBack"),
+            Command::GnudbBack => f.write_str("GnudbBack"),
+            Command::SacdSwitchArea(target) => f.debug_tuple("SacdSwitchArea").field(target).finish(),
+            Command::DvdaSwitchGroup(group) => f.debug_tuple("DvdaSwitchGroup").field(group).finish(),
+            Command::MarkCompareRef => f.write_str("MarkCompareRef"),
+            Command::BitCompare => f.write_str("BitCompare"),
+            Command::ClearCompareRef => f.write_str("ClearCompareRef"),
+            Command::ComparePaths { path1, path2 } => f
+                .debug_struct("ComparePaths")
+                .field("path1", path1)
+                .field("path2", path2)
+                .finish(),
+            Command::DetectPreemphasis => f.write_str("DetectPreemphasis"),
+            Command::TrainPreemphCorpus { path } => f
+                .debug_struct("TrainPreemphCorpus")
+                .field("path", path)
+                .finish(),
+            Command::CalibratePreemphasis { pe_dir, non_pe_dir } => f
+                .debug_struct("CalibratePreemphasis")
+                .field("pe_dir", pe_dir)
+                .field("non_pe_dir", non_pe_dir)
+                .finish(),
+            Command::Search { recursive } => f
+                .debug_struct("Search")
+                .field("recursive", recursive)
+                .finish(),
+            Command::Password => f.write_str("Password"),
+            Command::ContextMenu => f.write_str("ContextMenu"),
+            Command::AccurateRip { force } => f
+                .debug_struct("AccurateRip")
+                .field("force", force)
+                .finish(),
+            Command::ArFix => f.write_str("ArFix"),
+            Command::ArBatch => f.write_str("ArBatch"),
+            Command::Ctdb => f.write_str("Ctdb"),
+            Command::CtdbRepair => f.write_str("CtdbRepair"),
+            Command::ViewFile(path) => f.debug_tuple("ViewFile").field(path).finish(),
+            Command::EditFile(path) => f.debug_tuple("EditFile").field(path).finish(),
+            Command::Unknown(arg) => f.debug_tuple("Unknown").field(arg).finish(),
+        }
+    }
 }
 
 /// Parse a command string (without the leading ':')
@@ -1188,7 +1327,20 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             execute_queue(app, tx, preset);
         }
         Command::Commit { start } => {
-            execute_commit(app, tx, start);
+            if matches!(
+                &app.convert.source.mode,
+                SourceMode::MultiTrack {
+                    selected_presentation_id: Some(_),
+                    ..
+                }
+            ) {
+                execute_commit_with_disc_selection_bridge(app, start, tx);
+            } else {
+                execute_commit(app, tx, start);
+            }
+        }
+        Command::CommitWithSourceOptionsTransform { start, transform } => {
+            execute_commit_with_source_options_transform(app, tx, start, Some(transform));
         }
         Command::Maximize => {
             if app.current_screen == AppScreen::Convert {
@@ -2317,16 +2469,21 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 && app.pending_metadata_editor.is_none()
             {
                 let sel = collect_selection_for_file_ops(app);
-                // Look for SACD ISO or DVD-Audio sources in the selection. When the
-                // selection is a directory, scan one level deep for disc images or an
-                // AUDIO_TS-bearing child directory.
+                // Look for SACD ISO, DVD-Audio, or DVD-Video sources in the selection.
+                // When the selection is a directory, scan one level deep for disc images
+                // or authored-disc child directories.
                 let mut sacd_isos: Vec<std::path::PathBuf> = Vec::new();
                 let mut dvda_sources: Vec<std::path::PathBuf> = Vec::new();
+                let mut dvdv_sources: Vec<std::path::PathBuf> = Vec::new();
                 let mut has_audio = false;
                 for path in &sel {
                     if path.is_dir() {
                         if crate::disc::dvda_utils::is_dvda_directory(path) {
                             dvda_sources.push(path.clone());
+                            continue;
+                        }
+                        if is_dvdv_source_for_tags_mb(path) {
+                            dvdv_sources.push(path.clone());
                             continue;
                         }
                         if let Ok(entries) = std::fs::read_dir(path) {
@@ -2338,6 +2495,8 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                     sacd_isos.push(p);
                                 } else if crate::disc::dvda_utils::is_dvda_source(&p) {
                                     dvda_sources.push(p);
+                                } else if is_dvdv_source_for_tags_mb(&p) {
+                                    dvdv_sources.push(p);
                                 } else if matches!(
                                     super::browse::classify_file(&p),
                                     super::browse::EntryKind::AudioFile(_)
@@ -2352,6 +2511,8 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         sacd_isos.push(path.clone());
                     } else if crate::disc::dvda_utils::is_dvda_source(path) {
                         dvda_sources.push(path.clone());
+                    } else if is_dvdv_source_for_tags_mb(path) {
+                        dvdv_sources.push(path.clone());
                     } else if matches!(
                         super::browse::classify_file(path),
                         super::browse::EntryKind::AudioFile(_)
@@ -2360,7 +2521,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     }
                 }
 
-                let disc_count = sacd_isos.len() + dvda_sources.len();
+                let disc_count = sacd_isos.len() + dvda_sources.len() + dvdv_sources.len();
                 if disc_count > 1 {
                     app.set_status(":tags-mb: multiple disc sources selected — select one at a time");
                     return;
@@ -2381,6 +2542,14 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     }
                 } else if let Some(source) = dvda_sources.into_iter().next() {
                     super::keybindings::open_metadata_editor_for_dvda(app, source);
+                    if !matches!(
+                        app.active_overlay,
+                        super::app::ActiveOverlay::MetadataEditor(_),
+                    ) {
+                        return;
+                    }
+                } else if let Some(source) = dvdv_sources.into_iter().next() {
+                    super::keybindings::open_metadata_editor_for_dvdv(app, source);
                     if !matches!(
                         app.active_overlay,
                         super::app::ActiveOverlay::MetadataEditor(_),
@@ -4058,6 +4227,75 @@ fn apply_multitrack_convert_state_to_source_options(
     super::disc_browser::apply_source_mode_disc_selection_to_source_options(mode, source);
 }
 
+/// Apply the selected disc presentation stored in the Convert source mode to
+/// freshly-built pipeline source options.
+pub fn apply_convert_source_disc_selection_to_source_options(
+    mode: &SourceMode,
+    options: &mut crate::convert::pipeline::SourceOptions,
+) {
+    super::disc_browser::apply_source_mode_disc_selection_to_source_options(mode, options);
+}
+
+/// Return `options` with any Convert-screen disc-browser presentation selection
+/// applied.
+#[must_use]
+pub fn source_options_with_convert_source_disc_selection(
+    mode: &SourceMode,
+    mut options: crate::convert::pipeline::SourceOptions,
+) -> crate::convert::pipeline::SourceOptions {
+    apply_convert_source_disc_selection_to_source_options(mode, &mut options);
+    options
+}
+
+/// Apply the Convert-screen disc selection directly to a `PipelineRequest`.
+pub fn apply_convert_source_disc_selection_to_pipeline_request(
+    mode: &SourceMode,
+    request: &mut crate::convert::pipeline::PipelineRequest,
+) {
+    apply_convert_source_disc_selection_to_source_options(mode, &mut request.source);
+}
+
+/// Return `request` after applying the Convert-screen selected presentation to
+/// `request.source`.
+#[must_use]
+pub fn pipeline_request_with_convert_source_disc_selection(
+    mode: &SourceMode,
+    mut request: crate::convert::pipeline::PipelineRequest,
+) -> crate::convert::pipeline::PipelineRequest {
+    apply_convert_source_disc_selection_to_pipeline_request(mode, &mut request);
+    request
+}
+
+/// Apply the Convert-screen selected disc presentation at the queue/request
+/// boundary.
+pub fn execute_commit_with_disc_selection_bridge(
+    app: &mut AppState,
+    start: bool,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let mode = app.convert.source.mode.clone();
+    execute_command(
+        app,
+        Command::CommitWithSourceOptionsTransform {
+            start,
+            transform: Box::new(move |source_options| {
+                source_options_with_convert_source_disc_selection(&mode, source_options)
+            }),
+        },
+        tx,
+    );
+}
+
+/// Apply the Convert-screen selected disc presentation to a request at the
+/// queue/request boundary.
+#[must_use]
+pub fn commit_pipeline_request_with_convert_source_disc_selection(
+    mode: &SourceMode,
+    request: crate::convert::pipeline::PipelineRequest,
+) -> crate::convert::pipeline::PipelineRequest {
+    pipeline_request_with_convert_source_disc_selection(mode, request)
+}
+
 /// Execute a `:commit` / `:Commit` command. Only valid on the Convert
 /// screen with a source file or batch loaded. Enqueues the batch (and
 /// optionally starts processing), then navigates away:
@@ -4069,6 +4307,20 @@ fn apply_multitrack_convert_state_to_source_options(
 /// to all files in the commit — the whole point of reviewing once per
 /// batch.
 fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool) {
+    execute_commit_with_source_options_transform(app, tx, start, None);
+}
+
+fn execute_commit_with_source_options_transform(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    start: bool,
+    source_options_transform: Option<
+        Box<
+            dyn FnOnce(crate::convert::pipeline::SourceOptions) -> crate::convert::pipeline::SourceOptions
+                + Send,
+        >,
+    >,
+) {
     if app.current_screen != AppScreen::Convert {
         app.set_status(":commit only works on the Convert screen");
         return;
@@ -4122,155 +4374,147 @@ fn execute_commit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, start: bool
         return;
     }
 
-    // For MultiTrack sources, attach a PipelineRequest whenever the Convert
-    // screen carries state that the generic ConversionItem builder cannot infer:
-    // track deselection and/or the selected disc presentation. The latter is the
-    // DVD-Audio/SACD stream pill bridge; without it DVD-Audio falls back to group 1.
+    // Attach or update a PipelineRequest whenever the Convert screen carries
+    // source state the generic ConversionItem builder cannot infer, or when a
+    // caller supplied a SourceOptions transform. Build the normal SourceOptions
+    // once, apply the transform once, then reuse the transformed result for
+    // both newly-created and already-prebuilt requests.
+    let mut source_options_transform = source_options_transform;
+    let has_source_options_transform = source_options_transform.is_some();
+    let mut has_deselected_tracks = false;
+    let mut has_disc_stream_selection = false;
+    let mut selected_track_numbers = std::collections::BTreeSet::new();
+
     if let SourceMode::MultiTrack {
         tracks,
         selected,
-        path,
         selected_presentation_id,
         ..
     } = &app.convert.source.mode
     {
-        let has_deselected = selected.iter().any(|s| !s);
-        let has_disc_stream_selection = selected_presentation_id.is_some();
-        if has_deselected || has_disc_stream_selection {
-            use std::collections::BTreeSet;
-            let selected_numbers: BTreeSet<u32> = tracks
-                .iter()
-                .zip(selected.iter())
-                .filter(|(_, &sel)| sel)
-                .map(|(t, _)| t.number)
-                .collect();
+        has_deselected_tracks = selected.iter().any(|s| !s);
+        has_disc_stream_selection = selected_presentation_id.is_some();
+        selected_track_numbers = tracks
+            .iter()
+            .zip(selected.iter())
+            .filter(|(_, &sel)| sel)
+            .map(|(t, _)| t.number)
+            .collect();
+    }
 
-            if has_disc_stream_selection || !selected_numbers.is_empty() {
-                // Build a minimal PipelineRequest with the track selection and
-                // selected presentation applied to SourceOptions.
-                use crate::convert::pipeline::*;
-                let output_root = options.output_dir.clone().unwrap_or_else(|| {
-                    path.parent()
-                        .unwrap_or(std::path::Path::new("."))
-                        .to_path_buf()
-                });
-                let rg_enabled = options.calculate_replaygain;
+    if has_deselected_tracks || has_disc_stream_selection || has_source_options_transform {
+        use crate::convert::pipeline::*;
 
-                let pipeline_settings = options
-                    .pipeline_settings
-                    .clone()
-                    .unwrap_or_else(|| {
-                        crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
+        let mut source = SourceOptions {
+            archive_password: None,
+            sacd_area: None,
+            dvda_group: None,
+            dvda_group_selection: DvdaGroupSelection::Default,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+            cue_sidecar: CueSidecarPolicy::PreferSidecar,
+            track_selection: TrackSelection::All,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
+        };
+
+        if matches!(&app.convert.source.mode, SourceMode::MultiTrack { .. }) {
+            apply_multitrack_convert_state_to_source_options(
+                &app.convert.source.mode,
+                &mut source,
+                if has_deselected_tracks {
+                    Some(&selected_track_numbers)
+                } else {
+                    None
+                },
+            );
+        }
+
+        if let Some(transform) = source_options_transform.take() {
+            source = transform(source);
+        }
+
+        let rg_enabled = options.calculate_replaygain;
+        let pipeline_settings = options.pipeline_settings.clone().unwrap_or_else(|| {
+            crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
+        });
+
+        if let Ok(mut q) = app.manager.queue.try_write() {
+            for item in q.all_items_mut() {
+                if !batch.contains(&item.input_path) {
+                    continue;
+                }
+
+                let mut item_source = source.clone();
+                if let Some(ref pw) = item.archive_password {
+                    item_source.archive_password = Some(SecretString::new(pw.clone()));
+                }
+
+                if let Some(existing_req) = item.pipeline_request.as_mut() {
+                    // `commit_batch()` may already have attached a full
+                    // PipelineRequest from the ordinary format/output pill
+                    // state. Build the normal SourceOptions, apply the final
+                    // transform, and replace the prebuilt request's source so
+                    // the transform cannot be skipped on this path.
+                    existing_req.container = item.input_path.clone();
+                    existing_req.item_id = item.id.clone();
+                    existing_req.job_id = format!("job-{}", item.id);
+                    existing_req.source = item_source;
+                } else {
+                    let output_root = options.output_dir.clone().unwrap_or_else(|| {
+                        item.input_path
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .to_path_buf()
                     });
-                let mut source = SourceOptions {
-                    archive_password: None,
-                    sacd_area: None,
-                    dvda_group: None,
-                    dvda_group_selection: DvdaGroupSelection::Default,
-                    dvda_assume_decrypted: false,
-                    dvda_downmix_policy: DvdaDownmixPolicy::Auto,
-                    cue_sidecar: CueSidecarPolicy::PreferSidecar,
-                    track_selection: if has_deselected {
-                        TrackSelection::Set(selected_numbers.clone())
-                    } else {
-                        TrackSelection::All
-                    },
-                };
-                apply_multitrack_convert_state_to_source_options(
-                    &app.convert.source.mode,
-                    &mut source,
-                    None,
-                );
-
-                let req = PipelineRequest {
-                    worker_count: None,
-                    job_id: String::new(),
-                    item_id: String::new(),
-                    container: path.clone(),
-                    source,
-                    settings: pipeline_settings,
-                    merge: options.merge_to_single,
-                    output_root: output_root.clone(),
-                    naming: NamingPolicy {
-                        template: options
-                            .naming_template
-                            .clone()
-                            .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
-                        folder_template: options.folder_template.clone(),
-                        per_album_subdir: true,
-                        collision_policy: NamingCollisionPolicy::Fail,
-                    },
-                    publish: PublishPolicy {
-                        overwrite: OverwritePolicy::FailIfExists,
-                        same_filesystem_required: false,
-                        write_manifest: false,
-                    },
-                    log: LogPolicy {
-                        root: output_root.join(".tonepoet-logs"),
-                        write_for_blocked: true,
-                        write_json_log: false,
-                    },
-                    stages: StagePolicy {
-                        metadata: if options.preserve_metadata {
-                            StageRequirement::Enabled
-                        } else {
-                            StageRequirement::Disabled
+                    item.pipeline_request = Some(PipelineRequest {
+                        worker_count: None,
+                        job_id: format!("job-{}", item.id),
+                        item_id: item.id.clone(),
+                        container: item.input_path.clone(),
+                        source: item_source,
+                        settings: pipeline_settings.clone(),
+                        merge: options.merge_to_single,
+                        output_root: output_root.clone(),
+                        naming: NamingPolicy {
+                            template: options
+                                .naming_template
+                                .clone()
+                                .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
+                            folder_template: options.folder_template.clone(),
+                            per_album_subdir: true,
+                            collision_policy: NamingCollisionPolicy::Fail,
                         },
-                        replaygain: if rg_enabled {
-                            StageRequirement::Enabled
-                        } else {
-                            StageRequirement::Disabled
+                        publish: PublishPolicy {
+                            overwrite: OverwritePolicy::FailIfExists,
+                            same_filesystem_required: false,
+                            write_manifest: false,
                         },
-                        features: StageRequirement::Enabled,
-                        generate_cue: false,
-                    },
-                    failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
-                    container_extension: options.container_extension.clone(),
-                    container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
-                };
-
-                if let Ok(mut q) = app.manager.queue.try_write() {
-                    for item in q.all_items_mut() {
-                        if item.input_path != *path {
-                            continue;
-                        }
-
-                        if let Some(existing_req) = item.pipeline_request.as_mut() {
-                            // `commit_batch()` may already have attached a full
-                            // PipelineRequest from the ordinary format/output pill
-                            // state. Do not leave that prebuilt request untouched:
-                            // build_pipeline_request() returns prebuilt requests as-is,
-                            // so a default SourceOptions here is exactly how a selected
-                            // DVD-Audio stream falls back to group 1 at materialization.
-                            existing_req.container = item.input_path.clone();
-                            existing_req.item_id = item.id.clone();
-                            existing_req.job_id = format!("job-{}", item.id);
-
-                            apply_multitrack_convert_state_to_source_options(
-                                &app.convert.source.mode,
-                                &mut existing_req.source,
-                                if has_deselected {
-                                    Some(&selected_numbers)
-                                } else {
-                                    None
-                                },
-                            );
-                            if let Some(ref pw) = item.archive_password {
-                                existing_req.source.archive_password =
-                                    Some(SecretString::new(pw.clone()));
-                            }
-                        } else {
-                            let mut item_req = req.clone();
-                            item_req.container = item.input_path.clone();
-                            item_req.item_id = item.id.clone();
-                            item_req.job_id = format!("job-{}", item.id);
-                            if let Some(ref pw) = item.archive_password {
-                                item_req.source.archive_password =
-                                    Some(SecretString::new(pw.clone()));
-                            }
-                            item.pipeline_request = Some(item_req);
-                        }
-                    }
+                        log: LogPolicy {
+                            root: output_root.join(".tonepoet-logs"),
+                            write_for_blocked: true,
+                            write_json_log: false,
+                        },
+                        stages: StagePolicy {
+                            metadata: if options.preserve_metadata {
+                                StageRequirement::Enabled
+                            } else {
+                                StageRequirement::Disabled
+                            },
+                            replaygain: if rg_enabled {
+                                StageRequirement::Enabled
+                            } else {
+                                StageRequirement::Disabled
+                            },
+                            features: StageRequirement::Enabled,
+                            generate_cue: false,
+                        },
+                        failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+                        container_extension: options.container_extension.clone(),
+                        container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
+                    });
                 }
             }
         }
@@ -4493,15 +4737,197 @@ pub(super) fn seed_sacd_mb_query(state: &super::app::MetadataEditorState) -> Opt
 /// compilation is ~6.5M frames, well within u32, so this is purely
 /// defensive).
 pub fn sacd_durations_to_sectors(durations: &[f64]) -> Vec<u32> {
-    let mut sectors = Vec::with_capacity(durations.len() + 1);
-    let mut cur: u32 = 150;
+    durations_to_cd_sectors(durations.iter().copied())
+}
+
+/// Convert per-track durations in seconds to MusicBrainz-compatible CD-frame
+/// offsets: `[off1, off2, ..., offN, leadout]`, with `off1 = 150`.
+pub fn durations_to_cd_sectors<I>(durations: I) -> Vec<u32>
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut sectors = Vec::new();
+    let mut cur = CD_TOC_PREGAP_FRAMES;
     sectors.push(cur);
-    for &d in durations {
-        let frames = (d * 75.0).round().max(0.0) as u32;
+    for duration in durations {
+        let frames = (duration * CD_FRAMES_PER_SECOND).round().max(0.0) as u32;
         cur = cur.saturating_add(frames);
         sectors.push(cur);
     }
     sectors
+}
+
+/// Build a MusicBrainz-compatible synthetic CD TOC from a DVD-Video source.
+pub fn dvdv_source_to_cd_sectors(path: &Path) -> Result<Vec<u32>, String> {
+    let contents = crate::disc::dvdv_utils::map_dvdv_source(path)?;
+    let presentation_index = select_default_disc_presentation_index(&contents).ok_or_else(|| {
+        format!(
+            "DVD-Video source has no selectable presentations: {}",
+            path.display()
+        )
+    })?;
+    let presentation = contents.presentations.get(presentation_index).ok_or_else(|| {
+        format!(
+            "DVD-Video default presentation index vanished: {}",
+            path.display()
+        )
+    })?;
+    dvdv_presentation_to_cd_sectors(presentation)
+}
+
+/// Convert one mapped DVD-Video presentation to MusicBrainz CD-frame offsets.
+pub fn dvdv_presentation_to_cd_sectors(
+    presentation: &crate::disc::model::DiscPresentation,
+) -> Result<Vec<u32>, String> {
+    let mut durations = Vec::with_capacity(presentation.tracks.len());
+    for track in &presentation.tracks {
+        let duration = track.duration_secs.ok_or_else(|| {
+            format!(
+                "DVD-Video chapter {} has no PGC playback duration",
+                track.number
+            )
+        })?;
+        if !(duration.is_finite() && duration > 0.0) {
+            return Err(format!(
+                "DVD-Video chapter {} has invalid PGC playback duration: {}",
+                track.number, duration
+            ));
+        }
+        durations.push(duration);
+    }
+
+    if durations.is_empty() {
+        return Err("DVD-Video presentation has no chapter tracks".to_string());
+    }
+
+    let sectors = durations_to_cd_sectors(durations.into_iter());
+    if sectors.len() < 2 {
+        return Err("DVD-Video presentation is too short for a MusicBrainz TOC".to_string());
+    }
+    Ok(sectors)
+}
+
+/// Select the presentation that a generic default-stream or TOC operation
+/// should use for an already-mapped disc.
+pub fn select_default_disc_presentation_index(
+    contents: &crate::disc::model::DiscContents,
+) -> Option<usize> {
+    if contents.presentations.is_empty() {
+        return None;
+    }
+
+    if !matches!(contents.format, crate::disc::model::DiscFormat::DvdVideo) {
+        return Some(0);
+    }
+
+    contents
+        .presentations
+        .iter()
+        .enumerate()
+        .filter(|(_, presentation)| {
+            matches!(
+                presentation.id,
+                crate::disc::model::PresentationId::DvdVideoTitle { .. }
+            )
+        })
+        .max_by(|(_, left), (_, right)| {
+            dvdv_default_presentation_score(left).cmp(&dvdv_default_presentation_score(right))
+        })
+        .map(|(index, _)| index)
+}
+
+fn select_dvdv_toc_presentation(
+    contents: &crate::disc::model::DiscContents,
+) -> Option<&crate::disc::model::DiscPresentation> {
+    let index = select_default_disc_presentation_index(contents)?;
+    contents
+        .presentations
+        .get(index)
+        .filter(|presentation| dvdv_presentation_has_complete_positive_durations(presentation))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DvdvTocScore {
+    duration_complete: bool,
+    track_count: usize,
+    duration_frames: u64,
+    stereo: bool,
+    lossless: bool,
+    coding_rank: u8,
+    sample_rate: u32,
+    bit_depth: u32,
+    reverse_identity: ReverseDvdvIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ReverseDvdvIdentity {
+    vts_number: u8,
+    title_number: u8,
+    audio_stream_index: u8,
+}
+
+fn dvdv_default_presentation_score(
+    presentation: &crate::disc::model::DiscPresentation,
+) -> DvdvTocScore {
+    let (vts_number, title_number, audio_stream_index) = presentation
+        .id
+        .dvd_video_parts()
+        .unwrap_or((u8::MAX, u8::MAX, u8::MAX));
+
+    DvdvTocScore {
+        duration_complete: dvdv_presentation_has_complete_positive_durations(presentation),
+        track_count: presentation.tracks.len(),
+        duration_frames: (presentation.total_duration_secs.max(0.0) * CD_FRAMES_PER_SECOND)
+            .round() as u64,
+        stereo: presentation.format.channels == Some(2)
+            || presentation
+                .format
+                .channel_layout
+                .as_deref()
+                .is_some_and(|layout| layout.eq_ignore_ascii_case("stereo")),
+        lossless: presentation.format.lossless,
+        coding_rank: dvdv_codec_rank(presentation.format.codec.as_deref()),
+        sample_rate: presentation.format.sample_rate.unwrap_or(0),
+        bit_depth: presentation.format.bit_depth.unwrap_or(0),
+        reverse_identity: ReverseDvdvIdentity {
+            vts_number: u8::MAX.saturating_sub(vts_number),
+            title_number: u8::MAX.saturating_sub(title_number),
+            audio_stream_index: u8::MAX.saturating_sub(audio_stream_index),
+        },
+    }
+}
+
+fn dvdv_presentation_has_complete_positive_durations(
+    presentation: &crate::disc::model::DiscPresentation,
+) -> bool {
+    !presentation.tracks.is_empty()
+        && presentation
+            .tracks
+            .iter()
+            .all(|track| track.duration_secs.is_some_and(|d| d.is_finite() && d > 0.0))
+}
+
+fn dvdv_codec_rank(codec: Option<&str>) -> u8 {
+    match codec.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "lpcm" | "pcm" => 4,
+        "dts" => 3,
+        "ac-3" | "ac3" | "dolby digital" => 2,
+        "mpeg" | "mp2" | "mpa" => 1,
+        _ => 0,
+    }
+}
+
+fn is_dvdv_source_for_tags_mb(path: &Path) -> bool {
+    if path.is_dir() {
+        crate::disc::dvdv_utils::dvdv_directory_root(path).is_some()
+    } else if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+    {
+        crate::disc::dvdv_utils::map_dvdv_source(path).is_ok()
+    } else {
+        false
+    }
 }
 
 fn dvda_source_to_cd_sectors(
@@ -4561,6 +4987,323 @@ fn dvda_stereo_group_for_mb_toc(
         }
     }
     None
+}
+
+/// JSON metadata sidecar filename used for DVD-Video filesystem sources.
+pub const DVDV_METADATA_SIDECAR_NAME: &str = "tonepoet.dvdvideo.metadata.json";
+const DVDV_METADATA_SIDECAR_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DvdVideoMetadataSidecar {
+    pub schema_version: u32,
+    pub source: DvdVideoMetadataSource,
+    pub album: BTreeMap<String, String>,
+    pub tracks: Vec<DvdVideoMetadataTrack>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DvdVideoMetadataSource {
+    pub path: PathBuf,
+    pub sidecar_kind: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DvdVideoMetadataTrack {
+    pub number: usize,
+    pub label: String,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// Return the writable metadata sidecar target for a DVD-Video source.
+pub fn dvdv_metadata_sidecar_path_for_source(source: &Path) -> Result<PathBuf, String> {
+    if source.is_file() {
+        let file_name = source.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+            format!(
+                "DVD-Video source has no usable file name: {}",
+                source.display()
+            )
+        })?;
+        let parent = source.parent().unwrap_or_else(|| Path::new("."));
+        return Ok(parent.join(format!("{file_name}.dvdvideo.metadata.json")));
+    }
+
+    let root = crate::disc::dvdv_utils::dvdv_directory_root(source)
+        .ok_or_else(|| format!("Not a DVD-Video directory source: {}", source.display()))?;
+    Ok(root.join(DVDV_METADATA_SIDECAR_NAME))
+}
+
+/// True when the DVD-Video sidecar target can be created or replaced by the
+/// same publish strategy used by `save_dvdv_metadata_sidecar`.
+pub fn dvdv_metadata_sidecar_target_is_writable(source: &Path) -> bool {
+    let Ok(path) = dvdv_metadata_sidecar_path_for_source(source) else {
+        return false;
+    };
+    dvdv_metadata_sidecar_publish_target_is_writable(&path)
+}
+
+fn dvdv_metadata_sidecar_publish_target_is_writable(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if !super::keybindings::is_dir_writable(parent) {
+        return false;
+    }
+    if path.exists() {
+        OpenOptions::new().write(true).open(path).is_ok()
+    } else {
+        true
+    }
+}
+
+/// Persist headless DVD-Video MusicBrainz metadata as an atomic JSON sidecar.
+pub fn save_dvdv_metadata_sidecar(
+    source: &Path,
+    state: &super::app::MetadataEditorState,
+) -> Result<PathBuf, String> {
+    let sidecar = dvdv_metadata_sidecar_from_state(source, state)?;
+    let sidecar_path = dvdv_metadata_sidecar_path_for_source(source)?;
+    write_dvdv_metadata_sidecar_atomic(&sidecar_path, &sidecar)?;
+    Ok(sidecar_path)
+}
+
+pub fn dvdv_metadata_sidecar_from_state(
+    source: &Path,
+    state: &super::app::MetadataEditorState,
+) -> Result<DvdVideoMetadataSidecar, String> {
+    let n_tracks = state.paths.len();
+    if n_tracks == 0 {
+        return Err("DVD-Video metadata editor has no tracks".to_string());
+    }
+
+    let mut album = BTreeMap::new();
+    let mut tracks: Vec<DvdVideoMetadataTrack> = (0..n_tracks)
+        .map(|idx| DvdVideoMetadataTrack {
+            number: idx + 1,
+            label: state
+                .file_labels
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| format!("{:02}", idx + 1)),
+            tags: BTreeMap::new(),
+        })
+        .collect();
+
+    for (entry_idx, entry) in state.entries.iter().enumerate() {
+        if state.deleted.contains(&entry_idx) {
+            continue;
+        }
+        let Some(sidecar_key) = dvdv_editor_key_to_sidecar_key(&entry.display_key) else {
+            continue;
+        };
+        if dvdv_is_album_level_sidecar_key(sidecar_key) {
+            if entry.is_mixed {
+                return Err(format!(
+                    "album-level field {} has mixed values; cannot save DVD-Video sidecar",
+                    entry.display_key
+                ));
+            }
+            let value = entry.value.trim();
+            if !value.is_empty() {
+                album.insert(sidecar_key.to_string(), value.to_string());
+            }
+        } else {
+            for (idx, track) in tracks.iter_mut().enumerate() {
+                let value = entry
+                    .per_file_values
+                    .get(idx)
+                    .map(|value| value.trim())
+                    .unwrap_or_default();
+                if !value.is_empty() {
+                    track.tags.insert(sidecar_key.to_string(), value.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(DvdVideoMetadataSidecar {
+        schema_version: DVDV_METADATA_SIDECAR_SCHEMA_VERSION,
+        source: DvdVideoMetadataSource {
+            path: source.to_path_buf(),
+            sidecar_kind: "dvd_video".to_string(),
+        },
+        album,
+        tracks,
+    })
+}
+
+fn write_dvdv_metadata_sidecar_atomic(
+    path: &Path,
+    sidecar: &DvdVideoMetadataSidecar,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("DVD-Video sidecar path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("create DVD-Video sidecar directory {}: {e}", parent.display()))?;
+
+    let payload = serde_json::to_vec_pretty(sidecar)
+        .map_err(|e| format!("serialize DVD-Video metadata sidecar: {e}"))?;
+    let tmp = unique_sidecar_temp_path(path);
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| format!("create temporary DVD-Video sidecar {}: {e}", tmp.display()))?;
+        file.write_all(&payload)
+            .map_err(|e| format!("write temporary DVD-Video sidecar {}: {e}", tmp.display()))?;
+        file.write_all(b"\n")
+            .map_err(|e| format!("finish temporary DVD-Video sidecar {}: {e}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync temporary DVD-Video sidecar {}: {e}", tmp.display()))?;
+        drop(file);
+        atomic_replace_file(&tmp, path).map_err(|e| {
+            format!(
+                "atomically publish DVD-Video sidecar {}: {e}",
+                path.display()
+            )
+        })?;
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+fn atomic_replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    atomic_replace_file_impl(src, dst)
+}
+
+#[cfg(unix)]
+fn atomic_replace_file_impl(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::rename(src, dst)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file_impl(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::rename(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(first_err) if first_err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(first_err) if dst.exists() => {
+            let _ = first_err;
+        }
+        Err(first_err) => return Err(first_err),
+    }
+
+    let backup = unique_replace_backup_path(dst);
+    fs::rename(dst, &backup)?;
+    match fs::rename(src, dst) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(promote_err) => {
+            let restore_result = fs::rename(&backup, dst);
+            if let Err(restore_err) = restore_result {
+                return Err(io::Error::new(
+                    promote_err.kind(),
+                    format!(
+                        "failed to publish replacement '{}': {promote_err}; also failed to restore previous sidecar from '{}': {restore_err}",
+                        dst.display(),
+                        backup.display()
+                    ),
+                ));
+            }
+            Err(promote_err)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(dst: &Path) -> PathBuf {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dst
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dvdvideo-metadata");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(
+        ".{file_name}.replace-backup.{}.{}.tmp",
+        std::process::id(),
+        nanos
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_replace_file_impl(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::rename(src, dst)
+}
+
+fn unique_sidecar_temp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dvdvideo-metadata");
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        nanos + u128::from(counter)
+    ))
+}
+
+fn dvdv_editor_key_to_sidecar_key(display_key: &str) -> Option<&'static str> {
+    match display_key {
+        "ALBUM" => Some("ALBUM"),
+        "ALBUMARTIST" => Some("ALBUMARTIST"),
+        "DATE" => Some("DATE"),
+        "CATALOGNUMBER" => Some("CATALOGNUMBER"),
+        "GENRE" => Some("GENRE"),
+        "PUBLISHER" => Some("PUBLISHER"),
+        "TRACKNUMBER" => Some("TRACKNUMBER"),
+        "TITLE" => Some("TITLE"),
+        "ARTIST" => Some("ARTIST"),
+        "PERFORMER" => Some("PERFORMER"),
+        "COMPOSER" => Some("COMPOSER"),
+        "LYRICIST" => Some("LYRICIST"),
+        "ARRANGER" => Some("ARRANGER"),
+        "ISRC" => Some("ISRC"),
+        "MUSICBRAINZ_TRACKID" => Some("MUSICBRAINZ_TRACKID"),
+        "MUSICBRAINZ_RELEASETRACKID" => Some("MUSICBRAINZ_RELEASETRACKID"),
+        "MUSICBRAINZ_ARTISTID" => Some("MUSICBRAINZ_ARTISTID"),
+        "MUSICBRAINZ_ALBUMID" => Some("MUSICBRAINZ_ALBUMID"),
+        "MUSICBRAINZ_ALBUMARTISTID" => Some("MUSICBRAINZ_ALBUMARTISTID"),
+        "MUSICBRAINZ_RELEASEGROUPID" => Some("MUSICBRAINZ_RELEASEGROUPID"),
+        "ORIGINALDATE" => Some("ORIGINALDATE"),
+        "RELEASECOUNTRY" => Some("RELEASECOUNTRY"),
+        _ => None,
+    }
+}
+
+fn dvdv_is_album_level_sidecar_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ALBUM"
+            | "ALBUMARTIST"
+            | "DATE"
+            | "CATALOGNUMBER"
+            | "GENRE"
+            | "PUBLISHER"
+            | "MUSICBRAINZ_ALBUMID"
+            | "MUSICBRAINZ_ALBUMARTISTID"
+            | "MUSICBRAINZ_RELEASEGROUPID"
+            | "ORIGINALDATE"
+            | "RELEASECOUNTRY"
+    )
 }
 
 /// Common spawn point for the unified `:tags-mb` TOC flow. All three
@@ -4717,6 +5460,28 @@ fn try_dispatch_in_editor_tags_mb(
         }
         let group_nr = super::keybindings::dvda_group_from_editor_state(&state_owned);
         let sectors = match dvda_source_to_cd_sectors(&first_path, group_nr) {
+            Ok(sectors) => sectors,
+            Err(e) => {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+                app.set_status(format!(":tags-mb: {}", e));
+                return Some(true);
+            }
+        };
+        let seed = seed_sacd_mb_query(&state_owned);
+        (sectors, seed)
+    } else if super::keybindings::metadata_editor_is_dvdv_source(&state_owned) {
+        if state_owned.paths.is_empty() {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(":tags-mb: DVD-Video editor has no source".to_string());
+            return Some(true);
+        }
+        let first_path = state_owned.paths[0].clone();
+        if !state_owned.paths.iter().all(|p| p == &first_path) {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(":tags-mb: DVD-Video editor paths do not share one source".to_string());
+            return Some(true);
+        }
+        let sectors = match dvdv_source_to_cd_sectors(&first_path) {
             Ok(sectors) => sectors,
             Err(e) => {
                 app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);

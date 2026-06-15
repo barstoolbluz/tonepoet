@@ -457,6 +457,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dvdvideo"
+version = "0.1.0"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2405,6 +2409,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "dvda-phase1",
+ "dvdvideo",
  "encoding_rs",
  "env_logger 0.10.2",
  "ffmpeg-next",

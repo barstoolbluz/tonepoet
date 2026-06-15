@@ -957,6 +957,7 @@ fn build_initial_work(
         Some(SourceKind::CueImage) => WorkKind::MaterializeItem,
         Some(SourceKind::SacdIso) => WorkKind::MaterializeItem,
         Some(SourceKind::DvdAudio) => WorkKind::MaterializeItem,
+        Some(SourceKind::DvdVideo) => WorkKind::MaterializeItem,
         Some(SourceKind::SingleFile) => unreachable!("single files are submitted as immediate work units"),
         None => WorkKind::MaterializeItem,
     };
@@ -965,6 +966,7 @@ fn build_initial_work(
         Some(SourceKind::CueImage) => "cue-materialize",
         Some(SourceKind::SacdIso) => "sacd-materialize",
         Some(SourceKind::DvdAudio) => "dvda-materialize",
+        Some(SourceKind::DvdVideo) => "dvdv-materialize",
         Some(SourceKind::SingleFile) => unreachable!("single files are submitted as immediate work units"),
         None => "materialize",
     };
@@ -1081,7 +1083,8 @@ fn next_album_source_work(
             TrackSourceRef::CueSegmentCarrier { .. }
             | TrackSourceRef::ImageSegment { .. }
             | TrackSourceRef::SacdTrack { .. }
-            | TrackSourceRef::DvdaTrack { .. } => {
+            | TrackSourceRef::DvdaTrack { .. }
+            | TrackSourceRef::DvdVideoTrack { .. } => {
                 build_realize_work(
                     album,
                     track_index,
@@ -1126,6 +1129,7 @@ fn build_realize_work(
         | TrackSourceRef::ImageSegment { .. } => WorkKind::CueSplitTrack { track_id: track_id.clone() },
         TrackSourceRef::SacdTrack { .. } => WorkKind::SacdExtractTrack { track_id: track_id.clone() },
         TrackSourceRef::DvdaTrack { .. } => WorkKind::MaterializeItem, // Phase 3: DvdaExtractTrack
+        TrackSourceRef::DvdVideoTrack { .. } => WorkKind::MaterializeItem,
         TrackSourceRef::StagedFile(_) => WorkKind::EncodeTrack { track_id: track_id.clone() },
     };
     WorkUnit {
@@ -1558,6 +1562,12 @@ mod tests {
                 sacd_area: None,
                 dvda_group: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },

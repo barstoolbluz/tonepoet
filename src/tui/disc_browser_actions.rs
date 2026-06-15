@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use crate::disc::{DiscContents, PresentationId};
 use crate::tui::app::{ActiveOverlay, AppScreen, AppState, SourceMode};
 use crate::tui::button_map::TuiButton;
+use crate::tui::command::select_default_disc_presentation_index;
 use crate::tui::disc_browser::{metadata_for_disc_presentation, source_mode_for_presentation, DiscBrowserState, DiscProbeFollowup};
 use crate::tui::message::AppMessage;
 
@@ -80,7 +81,7 @@ pub fn open_disc_browser_from_contents(app: &mut AppState, contents: DiscContent
 /// This intentionally does not rely on the generic `ConvertCustom` path. For
 /// DVD-Audio, a valid conversion request must carry the selected
 /// `PresentationId` into `SourceOptions`, so the default action explicitly loads
-/// presentation 0 through the same DiscContents handoff used by the overlay.
+/// the scored default presentation through the same DiscContents handoff used by the overlay.
 /// When the cache is cold, it schedules the async disc probe and records a
 /// one-shot follow-up instead of synchronously parsing/probing from the context
 /// menu thread.
@@ -90,7 +91,7 @@ pub fn convert_default_disc_stream(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     if let Some(contents) = cached_disc_contents(app, path) {
-        if let Err(err) = load_disc_presentation_for_convert(app, contents.as_ref().clone(), 0) {
+        if let Err(err) = load_default_disc_presentation_for_convert(app, contents.as_ref().clone()) {
             app.set_status(format!("Default disc stream load failed: {err}"));
         }
         return;
@@ -122,7 +123,7 @@ pub fn handle_disc_probe_followup(
                 app.set_status("Default disc stream is not available after analysis");
                 return;
             };
-            if let Err(err) = load_disc_presentation_for_convert(app, contents.as_ref().clone(), 0) {
+            if let Err(err) = load_default_disc_presentation_for_convert(app, contents.as_ref().clone()) {
                 app.set_status(format!("Default disc stream load failed: {err}"));
             }
         }
@@ -392,6 +393,21 @@ pub fn switch_disc_presentation(
 }
 
 /// Load one presentation into the Convert screen using `SourceMode::MultiTrack`.
+/// Load the scored default presentation into the Convert screen.
+///
+/// This is used by both synchronous context-menu handling and async probe
+/// follow-up. It must not hard-code presentation 0 for DVD-Video, because the
+/// mapper exposes presentations in authored order while the materializer's
+/// automatic path scores the likely main program.
+pub fn load_default_disc_presentation_for_convert(
+    app: &mut AppState,
+    contents: DiscContents,
+) -> Result<(), String> {
+    let index = select_default_disc_presentation_index(&contents)
+        .ok_or_else(|| "Disc contains no selectable audio streams".to_string())?;
+    load_disc_presentation_for_convert(app, contents, index)
+}
+
 pub fn load_disc_presentation_for_convert(
     app: &mut AppState,
     contents: DiscContents,

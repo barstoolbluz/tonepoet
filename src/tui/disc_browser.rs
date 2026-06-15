@@ -47,23 +47,27 @@ impl FileProbeFingerprint {
 
 /// Metadata snapshot used to decide whether a cached disc parse is still valid.
 ///
-/// ISO files use the image file metadata. Directory DVD-Audio sources also carry
-/// the `AUDIO_TS/AUDIO_TS.IFO` metadata because the directory mtime alone is not
-/// a reliable proxy for disc-content changes.
+/// ISO files use the image file metadata. Directory DVD-Audio and DVD-Video
+/// sources also carry their marker IFO metadata because directory mtimes alone
+/// are not a reliable proxy for disc-content changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscProbeFingerprint {
     pub source: FileProbeFingerprint,
     pub is_dir: bool,
     pub dvda_audio_ts_ifo: Option<FileProbeFingerprint>,
+    pub dvdv_video_ts_ifo: Option<FileProbeFingerprint>,
 }
 
 impl DiscProbeFingerprint {
     /// Metadata most representative of disc-content identity. For ISO files this
-    /// is the image itself; for DVD-Audio directories this prefers
-    /// `AUDIO_TS/AUDIO_TS.IFO`, because directory mtimes do not reliably change
-    /// when the IFO is replaced in place.
+    /// is the image itself; for disc directories this prefers the format marker
+    /// IFO, because directory mtimes do not reliably change when an IFO is
+    /// replaced in place.
     pub fn primary_content(&self) -> &FileProbeFingerprint {
-        self.dvda_audio_ts_ifo.as_ref().unwrap_or(&self.source)
+        self.dvda_audio_ts_ifo
+            .as_ref()
+            .or(self.dvdv_video_ts_ifo.as_ref())
+            .unwrap_or(&self.source)
     }
 
     pub fn primary_len(&self) -> u64 {
@@ -162,11 +166,19 @@ pub fn disc_probe_fingerprint(path: &Path) -> Result<DiscProbeFingerprint, Strin
     } else {
         None
     };
+    let dvdv_video_ts_ifo = if is_dir {
+        crate::disc::dvdv_utils::directory_video_ts_file_path(path, "VIDEO_TS.IFO")
+            .and_then(|marker| fs::metadata(marker).ok())
+            .map(|m| FileProbeFingerprint::from_metadata(&m))
+    } else {
+        None
+    };
 
     Ok(DiscProbeFingerprint {
         source: FileProbeFingerprint::from_metadata(&metadata),
         is_dir,
         dvda_audio_ts_ifo,
+        dvdv_video_ts_ifo,
     })
 }
 
@@ -376,6 +388,9 @@ pub fn probe_disc_contents(path: &Path) -> Result<DiscContents, String> {
     if crate::disc::dvda_utils::is_dvda_source(path) {
         return crate::disc::dvda_utils::map_dvda_source(path);
     }
+    if crate::disc::dvdv_utils::is_dvdv_source(path) {
+        return crate::disc::dvdv_utils::map_dvdv_source(path);
+    }
     Err(format!("Not a supported browsable disc source: {}", path.display()))
 }
 
@@ -540,6 +555,7 @@ pub fn source_info_for_presentation(
         format_name: match contents.format {
             DiscFormat::DvdAudio => "DVD-Audio".to_string(),
             DiscFormat::Sacd => "SACD ISO".to_string(),
+            DiscFormat::DvdVideo => "DVD-Video".to_string(),
         },
         codec: fmt.codec.clone().unwrap_or_else(|| presentation.label.clone()),
         bit_depth: fmt.bit_depth,
@@ -579,13 +595,7 @@ pub fn metadata_for_disc_presentation(
 
 /// Convert a selected presentation id to a short user-facing label.
 pub fn presentation_id_label(id: &PresentationId) -> String {
-    match id {
-        PresentationId::DvdAudioGroup(n) => format!("DVD-Audio group {n}"),
-        PresentationId::SacdArea(SacdAreaId::Stereo) => "SACD stereo area".to_string(),
-        PresentationId::SacdArea(SacdAreaId::MultiChannel) => {
-            "SACD multichannel area".to_string()
-        }
-    }
+    id.display_label()
 }
 
 
@@ -595,7 +605,7 @@ pub fn presentation_id_label(id: &PresentationId) -> String {
 pub enum DiscProbeFollowup {
     /// Open the Audio Streams overlay once the selected disc probe completes.
     OpenDiscBrowser,
-    /// Load presentation 0 into the Convert screen.
+    /// Load the scored default presentation into the Convert screen.
     ConvertDefaultStream,
 }
 
@@ -610,6 +620,12 @@ pub fn apply_presentation_to_source_options(
         PresentationId::DvdAudioGroup(group) => {
             options.dvda_group_selection =
                 crate::convert::pipeline::DvdaGroupSelection::Group(*group);
+        }
+        PresentationId::DvdVideoTitle { vts_number, title_number, audio_stream_index } => {
+            options.dvdv_vts = Some(*vts_number);
+            options.dvdv_title = Some(*title_number);
+            options.dvdv_audio_stream = Some(*audio_stream_index);
+            options.dvdv_angle = Some(1);
         }
         PresentationId::SacdArea(SacdAreaId::Stereo) => {
             options.sacd_area = Some(crate::convert::pipeline::SacdArea::Stereo);
@@ -875,6 +891,54 @@ mod cache_tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+
+    #[test]
+    fn dvdv_directory_fingerprint_tracks_lowercase_video_ts_ifo() {
+        let root = unique_path("dvdv-dir-cache");
+        let video_ts = root.join("video_ts");
+        fs::create_dir_all(&video_ts).expect("create lowercase VIDEO_TS");
+        let ifo = video_ts.join("video_ts.ifo");
+        fs::write(&ifo, b"DVDVIDEO-VMG-v1").expect("write initial IFO");
+
+        let first = disc_probe_fingerprint(&root).expect("fingerprint DVD-Video dir");
+        assert!(first.is_dir);
+        assert!(first.dvdv_video_ts_ifo.is_some());
+
+        fs::write(&ifo, b"DVDVIDEO-VMG-v2-with-different-length").expect("replace IFO");
+        let second = disc_probe_fingerprint(&root).expect("fingerprint replaced DVD-Video dir");
+        assert_ne!(first, second);
+        assert_ne!(first.primary_len(), second.primary_len());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn selected_dvd_video_presentation_sets_vts_title_and_stream() {
+        let mut options = crate::convert::pipeline::SourceOptions {
+            archive_password: None,
+            sacd_area: None,
+            dvda_group_selection: crate::convert::pipeline::DvdaGroupSelection::Default,
+            dvda_group: None,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
+            cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+            track_selection: crate::convert::pipeline::TrackSelection::All,
+        };
+        apply_presentation_to_source_options(
+            &mut options,
+            &PresentationId::dvd_video(2, 7, 3),
+        );
+        assert_eq!(options.dvdv_vts, Some(2));
+        assert_eq!(options.dvdv_title, Some(7));
+        assert_eq!(options.dvdv_audio_stream, Some(3));
+        assert_eq!(options.dvdv_angle, Some(1));
+    }
+
     #[test]
     fn selected_dvd_audio_presentation_sets_explicit_group_selection() {
         let mut options = crate::convert::pipeline::SourceOptions {
@@ -884,6 +948,10 @@ mod cache_tests {
             dvda_group: None,
             dvda_assume_decrypted: false,
             dvda_downmix_policy: crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
         };
@@ -903,4 +971,83 @@ mod cache_tests {
         );
     }
 
+}
+
+
+#[cfg(test)]
+mod disc_selection_bridge_tests {
+    use super::*;
+    use crate::disc::model::{AudioPresentationFormat, CopyProtectionSummary, DiscFormat, DiscPresentation, DiscTrack, FormatProvenance, PresentationId};
+    use crate::convert::pipeline::{CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, SourceOptions, TrackSelection};
+    use std::path::PathBuf;
+
+    fn dvdv_contents() -> DiscContents {
+        DiscContents {
+            format: DiscFormat::DvdVideo,
+            label: "DVDV".to_string(),
+            source_path: PathBuf::from("disc.iso"),
+            presentations: vec![DiscPresentation {
+                id: PresentationId::dvd_video(2, 3, 1),
+                label: "VTS 02 Title 03 Stream 2".to_string(),
+                format: AudioPresentationFormat {
+                    codec: Some("LPCM".to_string()),
+                    sample_rate: Some(96_000),
+                    bit_depth: Some(24),
+                    channels: Some(2),
+                    channel_layout: Some("Stereo".to_string()),
+                    lossless: true,
+                    provenance: FormatProvenance::IfoAttributes,
+                },
+                tracks: vec![DiscTrack {
+                    number: 1,
+                    title: None,
+                    performer: None,
+                    duration_secs: Some(180.0),
+                    format_note: None,
+                }],
+                total_duration_secs: 180.0,
+                album_title: None,
+                album_artist: None,
+                genre: None,
+                year: None,
+            }],
+            suppressed: Vec::new(),
+            copy_protection: CopyProtectionSummary { description: String::new() },
+            diagnostics: Vec::new(),
+            album_title: None,
+            album_artist: None,
+            genre: None,
+            year: None,
+        }
+    }
+
+    #[test]
+    fn source_mode_disc_selection_bridge_applies_selected_presentation() {
+        let mode = source_mode_for_presentation(
+            dvdv_contents(),
+            0,
+            SourceMetadata::default(),
+        ).expect("source mode");
+        let mut options = SourceOptions {
+            archive_password: None,
+            sacd_area: None,
+            dvda_group_selection: DvdaGroupSelection::Default,
+            dvda_group: None,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
+            cue_sidecar: CueSidecarPolicy::PreferSidecar,
+            track_selection: TrackSelection::All,
+        };
+
+        apply_source_mode_disc_selection_to_source_options(&mode, &mut options);
+
+        assert_eq!(options.dvdv_vts, Some(2));
+        assert_eq!(options.dvdv_title, Some(3));
+        assert_eq!(options.dvdv_audio_stream, Some(1));
+        assert_eq!(options.dvdv_angle, Some(1));
+    }
 }

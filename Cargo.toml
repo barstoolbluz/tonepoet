@@ -17,6 +17,7 @@ tonepoet-backend = { path = "crates/tonepoet-backend" }
 tonepoet-features = { path = "crates/tonepoet-features" }
 sacd-rs = { path = "crates/sacd-rs" }
 dvda-phase1 = { path = "crates/dvda-phase1" }
+dvdvideo = { path = "crates/dvdvideo", default-features = false }
 tonepoet-wizard = { path = "crates/tonepoet-wizard" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }

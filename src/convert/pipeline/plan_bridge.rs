@@ -76,7 +76,10 @@ pub fn plan_request_for_track(
     // and source-audio MD5 storage from the materialized DSD carrier must be
     // disabled here, and those original SACD policies are treated as unsupported
     // rather than satisfied in metadata_obligations_for_request().
-    if matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. }) {
+    if matches!(
+        &track.source_ref,
+        TrackSourceRef::SacdTrack { .. } | TrackSourceRef::DvdVideoTrack { .. }
+    ) {
         settings.metadata.transfer_tags = false;
         settings.metadata.preserve_artwork = false;
     }
@@ -264,7 +267,7 @@ pub fn source_supports_source_tag_transfer(
     req: &PipelineRequest,
     source: &PreparedSource,
 ) -> bool {
-    !matches!(source.kind, SourceKind::SacdIso | SourceKind::CueImage)
+    !matches!(source.kind, SourceKind::SacdIso | SourceKind::CueImage | SourceKind::DvdVideo)
         && req.settings.target_format.supports_planner_source_tag_transfer()
 }
 
@@ -289,7 +292,7 @@ pub fn source_supports_source_artwork_preservation(
                 .settings
                 .target_format
                 .supports_cue_post_encode_artwork_embedding(),
-        SourceKind::SacdIso => false,
+        SourceKind::SacdIso | SourceKind::DvdVideo => false,
         _ => req.settings.target_format.supports_planner_embedded_artwork_transfer(),
     }
 }
@@ -320,7 +323,7 @@ pub fn orchestrator_metadata_stage_required(
 
 #[must_use]
 pub fn source_needs_authoritative_metadata(source: &PreparedSource) -> bool {
-    matches!(source.kind, SourceKind::CueImage | SourceKind::SacdIso)
+    matches!(source.kind, SourceKind::CueImage | SourceKind::SacdIso | SourceKind::DvdVideo)
         && prepared_source_has_metadata(source)
 }
 
@@ -478,6 +481,7 @@ pub fn source_info_for_realized_track(
 ) -> Result<SourceInfo, ConvertError> {
     let format = planner_format_from_path(realized_input).unwrap_or_else(|| match &track.source_ref {
         TrackSourceRef::SacdTrack { .. } => PlannerFormat::Dsf,
+        TrackSourceRef::DvdVideoTrack { .. } => PlannerFormat::Wav,
         _ => PlannerFormat::Flac,
     });
     let codec = codec_for_format(&format);
@@ -673,6 +677,12 @@ mod tests {
                 sacd_area: Some(SacdArea::Stereo),
                 dvda_group: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },

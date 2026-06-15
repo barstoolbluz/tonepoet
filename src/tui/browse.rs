@@ -68,6 +68,11 @@ pub enum EntryKind {
     DvdAudioIso,
     /// Filesystem DVD-Audio directory (contains AUDIO_TS/AUDIO_TS.IFO).
     DvdAudioDir,
+    /// DVD-Video ISO image. Hybrid DVD-Audio/DVD-Video ISOs remain DVD-Audio.
+    DvdVideoIso,
+    /// Filesystem DVD-Video directory (contains VIDEO_TS/VIDEO_TS.IFO and no
+    /// non-empty AUDIO_TS DVD-Audio root).
+    DvdVideoDir,
     /// Any other file
     OtherFile,
 }
@@ -188,7 +193,7 @@ impl FormatFilter {
     pub fn allows(&self, kind: &EntryKind) -> bool {
         match self {
             Self::Off => true,
-            Self::AudioOnly => matches!(kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir),
+            Self::AudioOnly => matches!(kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir),
             Self::Only(fmt) => matches!(kind, EntryKind::AudioFile(f) if f == fmt),
         }
     }
@@ -203,7 +208,7 @@ impl FormatFilter {
         match self {
             Self::Off => true,
             Self::AudioOnly => {
-                matches!(entry.kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir)
+                matches!(entry.kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir)
                     || is_cue_sheet_path(&entry.path)
             }
             Self::Only(fmt) => matches!(entry.kind, EntryKind::AudioFile(f) if f == *fmt),
@@ -440,8 +445,16 @@ impl BrowseEntry {
         matches!(self.kind, EntryKind::DvdAudioDir)
     }
 
+    pub fn is_dvdv_iso(&self) -> bool {
+        matches!(self.kind, EntryKind::DvdVideoIso)
+    }
+
+    pub fn is_dvdv_dir(&self) -> bool {
+        matches!(self.kind, EntryKind::DvdVideoDir)
+    }
+
     pub fn is_disc_source(&self) -> bool {
-        matches!(self.kind, EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir)
+        matches!(self.kind, EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir)
     }
 
     /// Probe-pipeline gate: entries this returns `true` for produce
@@ -465,10 +478,12 @@ impl BrowseEntry {
             EntryKind::ParentDir => String::new(),
             EntryKind::Directory => "dir".to_string(),
             EntryKind::DvdAudioDir => "dvda-dir".to_string(),
+            EntryKind::DvdVideoDir => "dvdv-dir".to_string(),
             EntryKind::AudioFile(fmt) => fmt.name().to_string(),
             EntryKind::Archive => archive_label(&self.path),
             EntryKind::SacdIso => "sacd".to_string(),
             EntryKind::DvdAudioIso => "dvda".to_string(),
+            EntryKind::DvdVideoIso => "dvdv".to_string(),
             EntryKind::OtherFile => self
                 .path
                 .extension()
@@ -574,6 +589,12 @@ pub struct BrowseState {
     /// Cache of DVD-Audio directory classifications keyed by path + IFO len + mtime.
     pub dvda_dir_classify_cache: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
 
+    /// Cache of DVD-Video ISO classifications keyed by path + len + mtime.
+    pub dvdv_iso_classify_cache: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+
+    /// Cache of DVD-Video directory classifications keyed by path + IFO len + mtime.
+    pub dvdv_dir_classify_cache: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+
     /// Async unified disc parse cache with fingerprinted success/error entries.
     pub disc_probe_cache: HashMap<PathBuf, DiscProbeCacheEntry>,
 
@@ -677,6 +698,8 @@ impl BrowseState {
             sacd_classify_cache: HashMap::new(),
             dvda_iso_classify_cache: HashMap::new(),
             dvda_dir_classify_cache: HashMap::new(),
+            dvdv_iso_classify_cache: HashMap::new(),
+            dvdv_dir_classify_cache: HashMap::new(),
             disc_probe_cache: HashMap::new(),
             disc_probe_pending: std::collections::HashSet::new(),
             disc_probe_followup: HashMap::new(),
@@ -1021,6 +1044,24 @@ impl BrowseState {
                 });
             if is_dvda {
                 entry.kind = EntryKind::DvdAudioIso;
+                continue;
+            }
+
+            // DVD-Video last: hybrids are intentionally excluded by dvdv_utils,
+            // so DVD-Audio wins when both AUDIO_TS and VIDEO_TS exist.
+            let is_dvdv = self
+                .dvdv_iso_classify_cache
+                .get(&entry.path)
+                .filter(|(cached, _)| *cached == fingerprint)
+                .map(|(_, verdict)| *verdict)
+                .unwrap_or_else(|| {
+                    let verdict = crate::disc::dvdv_utils::is_dvdv_iso(&entry.path);
+                    self.dvdv_iso_classify_cache
+                        .insert(entry.path.clone(), (fingerprint.clone(), verdict));
+                    verdict
+                });
+            if is_dvdv {
+                entry.kind = EntryKind::DvdVideoIso;
             }
         }
     }
@@ -1029,12 +1070,14 @@ impl BrowseState {
     pub(super) fn classify_dvda_directory_entries(&mut self) {
         for entry in self.all_dirs.iter_mut() {
             classify_dvda_directory_entry(entry, &mut self.dvda_dir_classify_cache);
+            classify_dvdv_directory_entry(entry, &mut self.dvdv_dir_classify_cache);
         }
     }
 
     pub(super) fn classify_scanned_directory_entries(&mut self, dirs: &mut [BrowseEntry]) {
         for entry in dirs.iter_mut() {
             classify_dvda_directory_entry(entry, &mut self.dvda_dir_classify_cache);
+            classify_dvdv_directory_entry(entry, &mut self.dvdv_dir_classify_cache);
         }
     }
 
@@ -2114,6 +2157,8 @@ fn scan_directory_blocking(
         } else if effective.is_dir() {
             if crate::disc::dvda_utils::is_dvda_directory(&path) {
                 EntryKind::DvdAudioDir
+            } else if crate::disc::dvdv_utils::is_dvdv_directory(&path) {
+                EntryKind::DvdVideoDir
             } else {
                 EntryKind::Directory
             }
@@ -2156,7 +2201,7 @@ fn entry_passes_view(
     // Format filter (only applies to non-directory entries). Use the
     // path-aware check so `.cue` stays visible as a convertible source under
     // AudioOnly without widening the filter to all `OtherFile` entries.
-    if !matches!(entry.kind, EntryKind::Directory | EntryKind::DvdAudioDir) && !format_filter.allows_entry(entry) {
+    if !matches!(entry.kind, EntryKind::Directory | EntryKind::DvdAudioDir | EntryKind::DvdVideoDir) && !format_filter.allows_entry(entry) {
         return false;
     }
     // Text filter (case-insensitive substring)
@@ -2217,7 +2262,7 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
         EntryKind::AudioFile(AudioFormat::Ac3) => 21,
         EntryKind::AudioFile(AudioFormat::Ape) => 22,
         EntryKind::AudioFile(AudioFormat::Lpcm) => 23,
-        EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir => 25,
+        EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir => 25,
         EntryKind::Archive => 25,
         EntryKind::OtherFile => 30,
     }
@@ -2822,8 +2867,38 @@ fn classify_dvda_directory_entry(
     }
 }
 
+fn classify_dvdv_directory_entry(
+    entry: &mut BrowseEntry,
+    cache: &mut HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+) {
+    if !matches!(entry.kind, EntryKind::Directory | EntryKind::DvdVideoDir) {
+        return;
+    }
+    let marker = crate::disc::dvdv_utils::directory_video_ts_file_path(&entry.path, "VIDEO_TS.IFO");
+    let fingerprint = marker
+        .as_ref()
+        .and_then(|marker| std::fs::metadata(marker).ok())
+        .map(|m| ClassificationFingerprint { len: m.len(), modified: m.modified().ok() })
+        .unwrap_or_else(|| ClassificationFingerprint::from_entry(entry));
+
+    let is_dvdv = cache
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::disc::dvdv_utils::is_dvdv_directory(&entry.path);
+            cache.insert(entry.path.clone(), (fingerprint.clone(), verdict));
+            verdict
+        });
+    if is_dvdv {
+        entry.kind = EntryKind::DvdVideoDir;
+    } else if matches!(entry.kind, EntryKind::DvdVideoDir) {
+        entry.kind = EntryKind::Directory;
+    }
+}
+
 fn is_audio_filter_visible_entry(entry: &BrowseEntry) -> bool {
-    matches!(entry.kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::Directory)
+    matches!(entry.kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir | EntryKind::Directory)
         || is_cue_sheet_path(&entry.path)
 }
 
@@ -2858,7 +2933,9 @@ fn is_queueable_file(path: &Path) -> bool {
                 // 7z archives are always queueable (pipeline supports them).
                 Some("7z") => true,
                 // ISOs are only queueable if they're SACD ISOs.
-                Some("iso") => crate::tui::sacd::is_sacd_iso(path) || crate::disc::dvda_utils::is_dvda_iso(path),
+                Some("iso") => crate::tui::sacd::is_sacd_iso(path)
+                    || crate::disc::dvda_utils::is_dvda_iso(path)
+                    || crate::disc::dvdv_utils::is_dvdv_iso(path),
                 // Other archive formats (zip, rar, tar, etc.) are not
                 // supported by the conversion pipeline.
                 _ => false,
