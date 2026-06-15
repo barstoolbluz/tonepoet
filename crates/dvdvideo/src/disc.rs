@@ -109,7 +109,26 @@ impl DvdDisc {
         // readable VIDEO_TS through the bridge.
         let udf_attempt = UdfVolume::open(&mut reader);
         match udf_attempt {
-            Ok(mut udf) => Self::from_udf(&mut udf),
+            Ok(mut udf) => {
+                match Self::from_udf(&mut udf) {
+                    Ok(disc) => {
+                        // Validate that the UDF-derived VMG IFO is readable.
+                        // Some ISOs have valid UDF anchors but broken VDS
+                        // metadata, causing UDF to succeed with wrong LBAs.
+                        // Fall back to ISO 9660 if the VMG magic is wrong.
+                        if let Some(vmg) = disc.vmgi() {
+                            if let Ok(buf) = read_sector_range(&mut udf.reader, vmg.lba, 1) {
+                                if buf.len() >= 12 && &buf[..12] == crate::ifo::VMG_MAGIC {
+                                    return Ok(disc);
+                                }
+                            }
+                        }
+                        // UDF gave bad VMG data — try ISO 9660
+                        Self::from_iso9660(udf.reader)
+                    }
+                    Err(_) => Self::from_iso9660(udf.reader),
+                }
+            }
             Err(_udf_err) => Self::from_iso9660(reader),
         }
     }
