@@ -218,69 +218,66 @@ fn realize_lpcm_with_dvdvideo_demuxer(
         &mut read_buffer,
         cancel,
         |relative_sector, sector| {
-            let selected_pes_packets = selected_private_stream_1_pes_packets(sector, target_substream);
-            if selected_pes_packets.is_empty() {
+            if !sector_has_selected_private_stream_1_pes_packet(sector, target_substream) {
                 return Ok(());
             }
 
-            for selected_pes in selected_pes_packets {
-                let mut filtered_sector = vec![0u8; sector.len()];
-                filtered_sector[selected_pes.start..selected_pes.end]
-                    .copy_from_slice(selected_pes.packet);
+            let packets = parse_private_stream_1_packets_with_mode(
+                sector,
+                DvdaSubHeaderMode::DvdVideo,
+            )
+            .map_err(|err| {
+                ConvertError::Realize(format!(
+                    "DVD-Video LPCM demux failed for selected substream 0x{target_substream:02X} at relative sector {relative_sector}: {err}"
+                ))
+            })?;
 
-                let packets = parse_private_stream_1_packets_with_mode(
-                    &filtered_sector,
-                    DvdaSubHeaderMode::DvdVideo,
-                )
-                .map_err(|err| {
-                    ConvertError::Realize(format!(
-                        "DVD-Video LPCM demux failed for selected substream 0x{target_substream:02X} at relative sector {relative_sector}: {err}"
-                    ))
-                })?;
-
-                let mut selected_pcm_packet_count = 0usize;
-                for packet in packets.iter() {
-                    if packet.sub_header.kind() != DvdaSubstreamKind::Pcm {
-                        return Err(ConvertError::TrackValidation(format!(
-                            "DVD-Video selected LPCM substream 0x{target_substream:02X} demuxed as non-PCM at relative sector {relative_sector}"
-                        )));
-                    }
-                    selected_pcm_packet_count += 1;
-
-                    if let Some(pcm) = packet.sub_header.pcm.as_ref() {
-                        if let Some(rate) = pcm.group1_sample_rate.or(pcm.group2_sample_rate) {
-                            if rate != sample_rate {
-                                return Err(ConvertError::TrackValidation(format!(
-                                    "DVD-Video LPCM stream sample-rate mismatch: IFO says {sample_rate}, packet says {rate}"
-                                )));
-                            }
-                        }
-                        if let Some(bits) = pcm.group1_bits.or(pcm.group2_bits) {
-                            if bits != bit_depth {
-                                return Err(ConvertError::TrackValidation(format!(
-                                    "DVD-Video LPCM stream bit-depth mismatch: IFO says {bit_depth}, packet says {bits}"
-                                )));
-                            }
-                        }
-                    }
-
-                    data_bytes_written = data_bytes_written
-                        .checked_add(write_dvdvideo_lpcm_payload_as_wav_samples(
-                            &mut output,
-                            &mut pending,
-                            packet.payload,
-                            channels,
-                            bit_depth,
-                        )?)
-                        .ok_or_else(|| ConvertError::Realize("DVD-Video LPCM WAV size overflow".to_string()))?;
-                }
-
-                if selected_pcm_packet_count == 0 {
+            let mut selected_pcm_packet_count = 0usize;
+            for packet in packets
+                .iter()
+                .filter(|packet| packet.sub_header.stream_id == target_substream)
+            {
+                if packet.sub_header.kind() != DvdaSubstreamKind::Pcm {
                     return Err(ConvertError::TrackValidation(format!(
-                        "DVD-Video selected LPCM substream 0x{target_substream:02X} at relative sector {relative_sector} produced no PCM packet"
+                        "DVD-Video selected LPCM substream 0x{target_substream:02X} demuxed as non-PCM at relative sector {relative_sector}"
                     )));
                 }
+                selected_pcm_packet_count += 1;
+
+                if let Some(pcm) = packet.sub_header.pcm.as_ref() {
+                    if let Some(rate) = pcm.group1_sample_rate.or(pcm.group2_sample_rate) {
+                        if rate != sample_rate {
+                            return Err(ConvertError::TrackValidation(format!(
+                                "DVD-Video LPCM stream sample-rate mismatch: IFO says {sample_rate}, packet says {rate}"
+                            )));
+                        }
+                    }
+                    if let Some(bits) = pcm.group1_bits.or(pcm.group2_bits) {
+                        if bits != bit_depth {
+                            return Err(ConvertError::TrackValidation(format!(
+                                "DVD-Video LPCM stream bit-depth mismatch: IFO says {bit_depth}, packet says {bits}"
+                            )));
+                        }
+                    }
+                }
+
+                data_bytes_written = data_bytes_written
+                    .checked_add(write_dvdvideo_lpcm_payload_as_wav_samples(
+                        &mut output,
+                        &mut pending,
+                        packet.payload,
+                        channels,
+                        bit_depth,
+                    )?)
+                    .ok_or_else(|| ConvertError::Realize("DVD-Video LPCM WAV size overflow".to_string()))?;
             }
+
+            if selected_pcm_packet_count == 0 {
+                return Err(ConvertError::TrackValidation(format!(
+                    "DVD-Video selected LPCM substream 0x{target_substream:02X} at relative sector {relative_sector} produced no PCM packet"
+                )));
+            }
+
             Ok(())
         },
     )?;
@@ -1035,6 +1032,13 @@ where
     Ok(())
 }
 
+fn sector_has_selected_private_stream_1_pes_packet(sector: &[u8], target_substream: u8) -> bool {
+    pes_packets(sector).any(|pes| {
+        pes.stream_id == 0xBD && pes.payload.first().copied() == Some(target_substream)
+    })
+}
+
+#[cfg(test)]
 fn selected_private_stream_1_pes_packets<'a>(
     sector: &'a [u8],
     target_substream: u8,
@@ -1106,9 +1110,6 @@ struct PesPayload<'a> {
 #[derive(Debug, Clone, Copy)]
 struct PesPacket<'a> {
     stream_id: u8,
-    start: usize,
-    end: usize,
-    packet: &'a [u8],
     payload: &'a [u8],
     mpeg2_header: Option<Mpeg2PesHeader>,
 }
@@ -1141,51 +1142,57 @@ struct CssScramblingEvidence {
     scrambling_control: u8,
 }
 
-fn pes_packets(sector: &[u8]) -> impl Iterator<Item = PesPacket<'_>> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
+fn pes_packets(sector: &[u8]) -> PesPackets<'_> {
+    PesPackets { sector, offset: 0 }
+}
 
-    while i + 4 <= sector.len() {
-        if !sector[i..].starts_with(&[0, 0, 1]) {
-            i += 1;
-            continue;
-        }
+struct PesPackets<'a> {
+    sector: &'a [u8],
+    offset: usize,
+}
 
-        let stream_id = sector[i + 3];
-        match ps_start_code_extent(sector, i, stream_id) {
-            PsStartCodeExtent::Skip { end } => {
-                i = end.max(i + 4);
+impl<'a> Iterator for PesPackets<'a> {
+    type Item = PesPacket<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.offset + 4 <= self.sector.len() {
+            let i = self.offset;
+            if !self.sector[i..].starts_with(&[0, 0, 1]) {
+                self.offset += 1;
                 continue;
             }
-            PsStartCodeExtent::Pes { data_start, packet_end } => {
-                if packet_end <= data_start {
-                    i += 4;
-                    continue;
-                }
 
-                if let Some((payload_start, mpeg2_header)) = pes_payload_start_offset(&sector[i..packet_end], stream_id) {
-                    let absolute_payload_start = i + payload_start;
-                    if absolute_payload_start <= packet_end {
-                        out.push(PesPacket {
-                            stream_id,
-                            start: i,
-                            end: packet_end,
-                            packet: &sector[i..packet_end],
-                            payload: &sector[absolute_payload_start..packet_end],
-                            mpeg2_header,
-                        });
+            let stream_id = self.sector[i + 3];
+            match ps_start_code_extent(self.sector, i, stream_id) {
+                PsStartCodeExtent::Skip { end } => {
+                    self.offset = end.max(i + 4);
+                }
+                PsStartCodeExtent::Pes { data_start, packet_end } => {
+                    self.offset = packet_end.max(i + 4);
+                    if packet_end <= data_start {
+                        continue;
+                    }
+
+                    let packet = &self.sector[i..packet_end];
+                    if let Some((payload_start, mpeg2_header)) = pes_payload_start_offset(packet, stream_id) {
+                        let absolute_payload_start = i + payload_start;
+                        if absolute_payload_start <= packet_end {
+                            return Some(PesPacket {
+                                stream_id,
+                                payload: &self.sector[absolute_payload_start..packet_end],
+                                mpeg2_header,
+                            });
+                        }
                     }
                 }
-
-                i = packet_end.max(i + 4);
-            }
-            PsStartCodeExtent::Malformed => {
-                i += 4;
+                PsStartCodeExtent::Malformed => {
+                    self.offset = i + 4;
+                }
             }
         }
-    }
 
-    out.into_iter()
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1747,7 +1754,6 @@ mod tests {
 
         let selected = selected_private_stream_1_pes_packets(&sector, 0xA0);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].start, pack.len() + system.len());
         assert_eq!(selected[0].payload, &[0xA0, 0x55, 0x66]);
     }
 
@@ -1765,6 +1771,16 @@ mod tests {
     }
 
     #[test]
+    fn selected_private_stream_packet_probe_matches_selected_packet_presence() {
+        let mut sector = vec![0u8; 2048];
+        let packet = mpeg2_private_stream_packet(&[0xA1, 0x33, 0x44]);
+        sector[64..64 + packet.len()].copy_from_slice(&packet);
+
+        assert!(sector_has_selected_private_stream_1_pes_packet(&sector, 0xA1));
+        assert!(!sector_has_selected_private_stream_1_pes_packet(&sector, 0xA0));
+    }
+
+    #[test]
     fn selected_private_stream_packets_keep_only_target_substream() {
         let mut sector = vec![0u8; 2048];
         let a0 = mpeg2_private_stream_packet(&[0xA0, 0x11, 0x22]);
@@ -1774,9 +1790,7 @@ mod tests {
 
         let selected = selected_private_stream_1_pes_packets(&sector, 0xA1);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].start, 128);
         assert_eq!(selected[0].payload[0], 0xA1);
-        assert_eq!(selected[0].packet, &a1[..]);
     }
 
     #[test]
@@ -1791,9 +1805,7 @@ mod tests {
 
         let selected = selected_private_stream_1_pes_packets(&sector, 0xA0);
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].start, 16);
         assert_eq!(selected[0].payload, &[0xA0, 0x01]);
-        assert_eq!(selected[1].start, 160);
         assert_eq!(selected[1].payload, &[0xA0, 0x02]);
     }
 
