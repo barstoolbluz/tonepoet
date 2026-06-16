@@ -1910,6 +1910,15 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     }
 
     let failed = records.iter().any(|record| !matches!(record.outcome, TrackOutcome::Ok));
+    if failed {
+        for (i, record) in records.iter().enumerate() {
+            match &record.outcome {
+                TrackOutcome::Ok => {}
+                TrackOutcome::Err(err) => log::warn!("convert stage track {i} failed: {err}"),
+                TrackOutcome::Blocked(reason) => log::warn!("convert stage track {i} blocked: {reason}"),
+            }
+        }
+    }
     let record = convert_stage_record_for_tracks(
         &records,
         if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
@@ -7180,6 +7189,10 @@ pub fn build_publish_plan(
     req: &PipelineRequest,
 ) -> Result<PublishPlan, PublishError> {
     let output_root = normalize_path(&req.output_root);
+    let source_audio_track_count = match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => tracks.len(),
+        AudioArtifacts::Merged(merged) => merged.source_tracks.len(),
+    };
     let mut entries = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -7224,7 +7237,11 @@ pub fn build_publish_plan(
     }
     let album_dir = infer_publish_album_dir(&entries, &output_root, req.naming.per_album_subdir)?;
 
-    Ok(PublishPlan { album_dir, entries })
+    Ok(PublishPlan {
+        album_dir,
+        entries,
+        source_audio_track_count,
+    })
 }
 
 /// Publish a whole album atomically by filling a temp directory beside the
@@ -7252,7 +7269,11 @@ pub fn publish_album_output(
         .map(sanitize_component)
         .unwrap_or_else(|| "album".to_string());
     let marker_path = final_parent.join(format!(".{album_name}.publish-in-progress"));
+    let incremental_marker_path = final_parent.join(format!(
+        ".{album_name}.incremental-publish-in-progress"
+    ));
     repair_interrupted_publish(&plan.album_dir, &marker_path)?;
+    repair_interrupted_incremental_publish(&plan.album_dir, &incremental_marker_path)?;
     cleanup_orphan_publish_temps(final_parent, &album_name)?;
 
     let temp_dir = unique_path(final_parent, &format!(".{album_name}.tmp"));
@@ -7309,6 +7330,20 @@ pub fn publish_album_output(
     if plan.album_dir.exists() {
         match policy.overwrite {
             OverwritePolicy::FailIfExists => {
+                if is_incremental_single_audio_publish(plan) {
+                    let manifest_path = publish_incremental_album_output(
+                        &temp_dir,
+                        plan,
+                        manifest,
+                        &incremental_marker_path,
+                    )?;
+                    drop(staging);
+                    return Ok(PublishedAlbum {
+                        album_dir: plan.album_dir.clone(),
+                        entries: published_entries,
+                        manifest_path,
+                    });
+                }
                 let _ = fs::remove_dir_all(&temp_dir);
                 return Err(PublishError::DestinationExists(
                     plan.album_dir.display().to_string(),
@@ -7399,6 +7434,612 @@ pub fn publish_album_output(
         entries: published_entries,
         manifest_path,
     })
+}
+
+fn is_incremental_single_audio_publish(plan: &PublishPlan) -> bool {
+    let audio_entry_count = plan
+        .entries
+        .iter()
+        .filter(|entry| matches!(&entry.role, PublishRole::Audio))
+        .count();
+
+    audio_entry_count == 1 && plan.source_audio_track_count == 1
+}
+
+fn publish_incremental_album_output(
+    temp_dir: &Path,
+    plan: &PublishPlan,
+    manifest: Option<&super::manifest::ConversionManifest>,
+    marker_path: &Path,
+) -> Result<Option<PathBuf>, PublishError> {
+    let mut incremental_entries = Vec::with_capacity(plan.entries.len());
+    let mut has_audio = false;
+
+    for entry in &plan.entries {
+        let rel = match entry.final_path.strip_prefix(&plan.album_dir) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => {
+                return cleanup_publish_temp(
+                    temp_dir,
+                    PublishError::PathOutsideOutputRoot(entry.final_path.display().to_string()),
+                );
+            }
+        };
+        if let Err(err) = reject_escaping_path(&rel) {
+            return cleanup_publish_temp(temp_dir, PublishError::PathOutsideOutputRoot(err));
+        }
+
+        let temp_entry_path = temp_dir.join(&rel);
+        if !temp_entry_path.exists() {
+            return cleanup_publish_temp(temp_dir, PublishError::StagingMissing);
+        }
+
+        match &entry.role {
+            PublishRole::Audio => {
+                has_audio = true;
+                if entry.final_path.exists() {
+                    return cleanup_publish_temp(
+                        temp_dir,
+                        PublishError::DestinationExists(entry.final_path.display().to_string()),
+                    );
+                }
+            }
+            PublishRole::Sidecar(_) => {
+                if entry.final_path.is_dir() {
+                    return cleanup_publish_temp(
+                        temp_dir,
+                        PublishError::DestinationExists(entry.final_path.display().to_string()),
+                    );
+                }
+            }
+        }
+
+        incremental_entries.push(IncrementalPublishEntry {
+            temp_path: temp_entry_path,
+            final_path: entry.final_path.clone(),
+            role: entry.role.clone(),
+        });
+    }
+
+    if !has_audio {
+        return cleanup_publish_temp(temp_dir, PublishError::StagingMissing);
+    }
+
+    let mut rollback = match IncrementalPublishRollback::new(marker_path, &plan.album_dir, temp_dir) {
+        Ok(rollback) => rollback,
+        Err(err) => return cleanup_publish_temp(temp_dir, err),
+    };
+    let publish_result = (|| -> Result<(), PublishError> {
+        // Publish sidecars before the audio file. If a diagnostic sidecar fails,
+        // the new track has not been exposed yet. The durable recovery marker is
+        // updated before each destination mutation, so a process crash leaves a
+        // replayable rollback plan that removes a partially exposed track and
+        // restores any sidecars/logs to their pre-publish bytes.
+        for entry in incremental_entries
+            .iter()
+            .filter(|entry| !matches!(&entry.role, PublishRole::Audio))
+        {
+            match &entry.role {
+                PublishRole::Sidecar(SidecarKind::ConversionLog) => {
+                    append_incremental_conversion_log(
+                        &entry.temp_path,
+                        &entry.final_path,
+                        &mut rollback,
+                    )?;
+                }
+                PublishRole::Sidecar(_) => {
+                    replace_incremental_sidecar_entry(
+                        &entry.temp_path,
+                        &entry.final_path,
+                        &mut rollback,
+                    )?;
+                }
+                PublishRole::Audio => unreachable!("audio entries are filtered out above"),
+            }
+        }
+
+        for entry in incremental_entries
+            .iter()
+            .filter(|entry| matches!(&entry.role, PublishRole::Audio))
+        {
+            publish_incremental_audio_entry(
+                &entry.temp_path,
+                &entry.final_path,
+                &mut rollback,
+            )?;
+        }
+
+        Ok(())
+    })();
+
+    if let Err(err) = publish_result {
+        if let Err(rollback_err) = rollback.rollback_best_effort() {
+            let _ = fs::remove_dir_all(temp_dir);
+            return Err(PublishError::RollbackFailed(format!(
+                "incremental publish failed with {err:?}; rollback failed with {rollback_err:?}; recovery marker left at {}",
+                marker_path.display()
+            )));
+        }
+        return cleanup_publish_temp(temp_dir, err);
+    }
+
+    if let Err(err) = rollback.commit() {
+        if let Err(rollback_err) = rollback.rollback_best_effort() {
+            let _ = fs::remove_dir_all(temp_dir);
+            return Err(PublishError::RollbackFailed(format!(
+                "incremental publish completed but recovery marker cleanup failed with {err:?}; rollback failed with {rollback_err:?}; recovery marker left at {}",
+                marker_path.display()
+            )));
+        }
+        return cleanup_publish_temp(temp_dir, err);
+    }
+    if let Err(err) = fs::remove_dir_all(temp_dir) {
+        log::warn!(
+            "incremental publish temp cleanup failed after successful publish: {}: {err}",
+            temp_dir.display()
+        );
+    }
+    sync_parent_dir_best_effort(&plan.album_dir);
+
+    Ok(write_incremental_manifest_nonfatal(plan, manifest))
+}
+
+#[derive(Debug)]
+struct IncrementalPublishEntry {
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    role: PublishRole,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct IncrementalPublishRecoveryMarker {
+    version: u8,
+    album_dir_name: String,
+    temp_dir_name: String,
+    actions: Vec<IncrementalRecoveryActionMarker>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum IncrementalRecoveryActionMarker {
+    RemoveCreatedFile { final_rel: PathBuf },
+    RestoreOriginalFile { final_rel: PathBuf, backup_rel: PathBuf },
+}
+
+#[derive(Debug)]
+enum IncrementalRollbackAction {
+    RemoveCreatedFile(PathBuf),
+    RestoreOriginalFile {
+        backup_path: PathBuf,
+        final_path: PathBuf,
+    },
+}
+
+#[derive(Debug)]
+struct IncrementalPublishRollback {
+    actions: Vec<IncrementalRollbackAction>,
+    durable_actions: Vec<IncrementalRecoveryActionMarker>,
+    marker_path: PathBuf,
+    album_dir: PathBuf,
+    temp_dir: PathBuf,
+    committed: bool,
+}
+
+impl IncrementalPublishRollback {
+    fn new(marker_path: &Path, album_dir: &Path, temp_dir: &Path) -> Result<Self, PublishError> {
+        let rollback = Self {
+            actions: Vec::new(),
+            durable_actions: Vec::new(),
+            marker_path: marker_path.to_path_buf(),
+            album_dir: album_dir.to_path_buf(),
+            temp_dir: temp_dir.to_path_buf(),
+            committed: false,
+        };
+        rollback.persist_marker()?;
+        Ok(rollback)
+    }
+
+    fn commit(&mut self) -> Result<(), PublishError> {
+        remove_file_if_exists(&self.marker_path).map_err(|err| {
+            PublishError::RollbackFailed(format!(
+                "could not remove incremental publish recovery marker {} after successful publish: {err}",
+                self.marker_path.display()
+            ))
+        })?;
+        sync_parent_dir_best_effort(&self.marker_path);
+        self.committed = true;
+        self.actions.clear();
+        self.durable_actions.clear();
+        Ok(())
+    }
+
+    fn record_created_file(&mut self, final_path: &Path) -> Result<(), PublishError> {
+        let final_rel = checked_relative_path(&self.album_dir, final_path)?;
+        self.actions
+            .push(IncrementalRollbackAction::RemoveCreatedFile(final_path.to_path_buf()));
+        self.durable_actions
+            .push(IncrementalRecoveryActionMarker::RemoveCreatedFile { final_rel });
+        if let Err(err) = self.persist_marker() {
+            self.actions.pop();
+            self.durable_actions.pop();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn snapshot_destination(&mut self, final_path: &Path) -> Result<(), PublishError> {
+        if final_path.exists() {
+            let backup_path = unique_path(&self.temp_dir, ".incremental-rollback");
+            copy_incremental_backup_snapshot(final_path, &backup_path)?;
+            let final_rel = checked_relative_path(&self.album_dir, final_path)?;
+            let backup_rel = checked_relative_path(&self.temp_dir, &backup_path)?;
+            self.actions.push(IncrementalRollbackAction::RestoreOriginalFile {
+                backup_path,
+                final_path: final_path.to_path_buf(),
+            });
+            self.durable_actions
+                .push(IncrementalRecoveryActionMarker::RestoreOriginalFile {
+                    final_rel,
+                    backup_rel,
+                });
+            if let Err(err) = self.persist_marker() {
+                if let Some(IncrementalRollbackAction::RestoreOriginalFile { backup_path, .. }) = self.actions.pop() {
+                    let _ = remove_file_if_exists(&backup_path);
+                    sync_parent_dir_best_effort(&backup_path);
+                }
+                self.durable_actions.pop();
+                return Err(err);
+            }
+        } else {
+            self.record_created_file(final_path)?;
+        }
+        Ok(())
+    }
+
+    fn rollback_best_effort(&mut self) -> Result<(), PublishError> {
+        if self.committed {
+            return Ok(());
+        }
+
+        let mut failures = Vec::new();
+        for action in self.actions.iter().rev() {
+            match action {
+                IncrementalRollbackAction::RemoveCreatedFile(path) => {
+                    if let Err(err) = remove_file_if_exists(path) {
+                        failures.push(format!("remove {}: {err}", path.display()));
+                    } else {
+                        sync_parent_dir_best_effort(path);
+                    }
+                }
+                IncrementalRollbackAction::RestoreOriginalFile {
+                    backup_path,
+                    final_path,
+                } => {
+                    if let Err(err) = restore_incremental_backup(backup_path, final_path) {
+                        failures.push(format!(
+                            "restore {} from {}: {err}",
+                            final_path.display(),
+                            backup_path.display()
+                        ));
+                    } else {
+                        sync_parent_dir_best_effort(final_path);
+                    }
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            if let Err(err) = remove_file_if_exists(&self.marker_path) {
+                failures.push(format!(
+                    "remove recovery marker {}: {err}",
+                    self.marker_path.display()
+                ));
+            } else {
+                sync_parent_dir_best_effort(&self.marker_path);
+            }
+        }
+        if failures.is_empty() {
+            self.actions.clear();
+            self.durable_actions.clear();
+            Ok(())
+        } else {
+            Err(PublishError::RollbackFailed(failures.join("; ")))
+        }
+    }
+
+    fn persist_marker(&self) -> Result<(), PublishError> {
+        let temp_dir_name = self
+            .temp_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                PublishError::RollbackFailed(format!(
+                    "incremental publish temp directory has no valid file name: {}",
+                    self.temp_dir.display()
+                ))
+            })?
+            .to_string();
+        let marker = IncrementalPublishRecoveryMarker {
+            version: 1,
+            album_dir_name: album_dir_marker_name(&self.album_dir)?,
+            temp_dir_name,
+            actions: self.durable_actions.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&marker).map_err(|err| {
+            PublishError::RollbackFailed(format!(
+                "could not serialize incremental publish recovery marker {}: {err}",
+                self.marker_path.display()
+            ))
+        })?;
+        write_bytes_atomically(&self.marker_path, &bytes).map_err(|err| {
+            PublishError::RollbackFailed(format!(
+                "could not install incremental publish recovery marker {}: {err}",
+                self.marker_path.display()
+            ))
+        })
+    }
+}
+
+fn checked_relative_path(root: &Path, path: &Path) -> Result<PathBuf, PublishError> {
+    let rel = path.strip_prefix(root).map_err(|_| {
+        PublishError::PathOutsideOutputRoot(path.display().to_string())
+    })?;
+    reject_escaping_path(rel).map_err(PublishError::PathOutsideOutputRoot)?;
+    if rel.components().next().is_none() {
+        return Err(PublishError::PathOutsideOutputRoot(path.display().to_string()));
+    }
+    Ok(rel.to_path_buf())
+}
+
+fn marker_relative_path(marker_path: &Path, rel: &Path) -> Result<PathBuf, PublishError> {
+    reject_escaping_path(rel).map_err(|err| {
+        PublishError::RollbackFailed(format!(
+            "incremental publish recovery marker {} contains invalid relative path {}: {err}",
+            marker_path.display(),
+            rel.display()
+        ))
+    })?;
+    if rel.components().next().is_none() {
+        return Err(PublishError::RollbackFailed(format!(
+            "incremental publish recovery marker {} contains an empty relative path",
+            marker_path.display()
+        )));
+    }
+    Ok(rel.to_path_buf())
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn restore_incremental_backup(backup_path: &Path, final_path: &Path) -> io::Result<()> {
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let restore_path = unique_path(
+        parent_dir_or_current(final_path),
+        ".incremental-restore",
+    );
+    copy_file_create_new_synced_io(backup_path, &restore_path)?;
+    remove_file_if_exists(final_path)?;
+    fs::rename(&restore_path, final_path).or_else(|err| {
+        let _ = fs::remove_file(&restore_path);
+        Err(err)
+    })?;
+    sync_parent_dir(final_path)
+}
+
+fn publish_incremental_audio_entry(
+    src: &Path,
+    dst: &Path,
+    rollback: &mut IncrementalPublishRollback,
+) -> Result<(), PublishError> {
+    if dst.exists() {
+        return Err(PublishError::DestinationExists(dst.display().to_string()));
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(PublishError::Io)?;
+    }
+    rollback.record_created_file(dst)?;
+
+    match fs::hard_link(src, dst) {
+        Ok(()) => {
+            fs::remove_file(src).map_err(PublishError::Io)?;
+            sync_parent_dir_best_effort(dst);
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            Err(PublishError::DestinationExists(dst.display().to_string()))
+        }
+        Err(_) => copy_incremental_audio_create_new(src, dst),
+    }
+}
+
+fn copy_incremental_audio_create_new(src: &Path, dst: &Path) -> Result<(), PublishError> {
+    copy_file_create_new_synced(src, dst)?;
+    fs::remove_file(src).map_err(PublishError::Io)?;
+    Ok(())
+}
+
+fn copy_incremental_backup_snapshot(src: &Path, dst: &Path) -> Result<(), PublishError> {
+    copy_file_create_new_synced_io(src, dst).map_err(|err| {
+        PublishError::RollbackFailed(format!(
+            "could not create durable incremental rollback snapshot {} from {}: {err}",
+            dst.display(),
+            src.display()
+        ))
+    })
+}
+
+fn copy_file_create_new_synced(src: &Path, dst: &Path) -> Result<(), PublishError> {
+    copy_file_create_new_synced_io(src, dst).map_err(|err| {
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            PublishError::DestinationExists(dst.display().to_string())
+        } else {
+            PublishError::Io(err)
+        }
+    })
+}
+
+fn copy_file_create_new_synced_io(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut input = fs::File::open(src)?;
+    let mut output = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+    {
+        Ok(output) => output,
+        Err(err) => return Err(err),
+    };
+
+    let result = (|| -> io::Result<()> {
+        io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        sync_parent_dir(dst)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        drop(output);
+        let _ = remove_file_if_exists(dst);
+        sync_parent_dir_best_effort(dst);
+    }
+
+    result
+}
+
+fn append_incremental_conversion_log(
+    src: &Path,
+    dst: &Path,
+    rollback: &mut IncrementalPublishRollback,
+) -> Result<(), PublishError> {
+    if dst.is_dir() {
+        return Err(PublishError::DestinationExists(dst.display().to_string()));
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(PublishError::Io)?;
+    }
+    rollback.snapshot_destination(dst)?;
+
+    let src_len = fs::metadata(src).map_err(PublishError::Io)?.len();
+    let dst_len = match fs::metadata(dst) {
+        Ok(metadata) => metadata.len(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(PublishError::Io(err)),
+    };
+    let needs_separator = dst_len > 0 && src_len > 0 && !file_ends_with_newline(dst)?;
+
+    let mut input = fs::File::open(src).map_err(PublishError::Io)?;
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dst)
+        .map_err(PublishError::Io)?;
+    if needs_separator {
+        use std::io::Write;
+        output.write_all(b"\n").map_err(PublishError::Io)?;
+    }
+    io::copy(&mut input, &mut output).map_err(PublishError::Io)?;
+    output.sync_all().map_err(PublishError::Io)?;
+    fs::remove_file(src).map_err(PublishError::Io)?;
+    sync_parent_dir_best_effort(dst);
+    Ok(())
+}
+
+fn file_ends_with_newline(path: &Path) -> Result<bool, PublishError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path).map_err(PublishError::Io)?;
+    let len = file.metadata().map_err(PublishError::Io)?.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1)).map_err(PublishError::Io)?;
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).map_err(PublishError::Io)?;
+    Ok(byte[0] == b'\n')
+}
+
+fn replace_incremental_sidecar_entry(
+    src: &Path,
+    dst: &Path,
+    rollback: &mut IncrementalPublishRollback,
+) -> Result<(), PublishError> {
+    if dst.is_dir() {
+        return Err(PublishError::DestinationExists(dst.display().to_string()));
+    }
+    let parent = parent_dir_or_current(dst);
+    fs::create_dir_all(parent).map_err(PublishError::Io)?;
+
+    // Stage the replacement in the destination directory and record it in the
+    // durable rollback marker before creating it. That gives recovery a concrete
+    // cleanup action if the process crashes before the final install step.
+    let replacement_path = unique_path(parent, ".incremental-sidecar-replace");
+    rollback.record_created_file(&replacement_path)?;
+    copy_file_create_new_synced(src, &replacement_path)?;
+
+    // Snapshot the old destination after the new bytes are safely staged but
+    // before the destination name is changed. On Unix, rename over an existing
+    // file is atomic, so readers never observe a missing sidecar. Platforms
+    // without overwrite-rename fall back to remove+rename, guarded by the same
+    // durable backup/restore marker used for crash recovery.
+    rollback.snapshot_destination(dst)?;
+    install_incremental_sidecar_replacement(&replacement_path, dst)?;
+    fs::remove_file(src).map_err(PublishError::Io)?;
+    Ok(())
+}
+
+fn install_incremental_sidecar_replacement(
+    replacement_path: &Path,
+    dst: &Path,
+) -> Result<(), PublishError> {
+    match fs::rename(replacement_path, dst) {
+        Ok(()) => {
+            sync_parent_dir_best_effort(dst);
+            Ok(())
+        }
+        Err(err) if should_fallback_to_remove_then_rename_for_replace(&err, dst) => {
+            remove_file_if_exists(dst).map_err(PublishError::Io)?;
+            fs::rename(replacement_path, dst).map_err(PublishError::Io)?;
+            sync_parent_dir_best_effort(dst);
+            Ok(())
+        }
+        Err(err) => Err(PublishError::Io(err)),
+    }
+}
+
+fn should_fallback_to_remove_then_rename_for_replace(err: &io::Error, dst: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        dst.exists()
+            && matches!(
+                err.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+            )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (err, dst);
+        false
+    }
+}
+
+fn write_incremental_manifest_nonfatal(
+    plan: &PublishPlan,
+    manifest: Option<&super::manifest::ConversionManifest>,
+) -> Option<PathBuf> {
+    let manifest = manifest?;
+    match super::manifest::write_manifest_for_publish(&plan.album_dir, &plan.album_dir, manifest) {
+        Ok(_written_manifest_path) => Some(super::manifest::manifest_path(&plan.album_dir)),
+        Err(err) => {
+            log::warn!("manifest write failed during incremental publish (non-fatal): {err}");
+            None
+        }
+    }
 }
 
 // ===========================================================================
@@ -10234,6 +10875,126 @@ fn repair_interrupted_publish(album_dir: &Path, marker_path: &Path) -> Result<()
     )))
 }
 
+fn repair_interrupted_incremental_publish(
+    album_dir: &Path,
+    marker_path: &Path,
+) -> Result<(), PublishError> {
+    if !marker_path.exists() {
+        return Ok(());
+    }
+
+    let marker_text = fs::read_to_string(marker_path).map_err(PublishError::Io)?;
+    let marker = serde_json::from_str::<IncrementalPublishRecoveryMarker>(&marker_text).map_err(|err| {
+        PublishError::RollbackFailed(format!(
+            "could not parse incremental publish recovery marker {}: {err}",
+            marker_path.display()
+        ))
+    })?;
+    let temp_dir = validate_incremental_marker(album_dir, marker_path, &marker)?;
+
+    for action in marker.actions.iter().rev() {
+        match action {
+            IncrementalRecoveryActionMarker::RemoveCreatedFile { final_rel } => {
+                let final_rel = marker_relative_path(marker_path, final_rel)?;
+                let final_path = album_dir.join(final_rel);
+                remove_file_if_exists(&final_path).map_err(|err| {
+                    PublishError::RollbackFailed(format!(
+                        "could not remove incomplete incremental publish output {}: {err}",
+                        final_path.display()
+                    ))
+                })?;
+                sync_parent_dir_best_effort(&final_path);
+            }
+            IncrementalRecoveryActionMarker::RestoreOriginalFile {
+                final_rel,
+                backup_rel,
+            } => {
+                let final_rel = marker_relative_path(marker_path, final_rel)?;
+                let backup_rel = marker_relative_path(marker_path, backup_rel)?;
+                let final_path = album_dir.join(final_rel);
+                let backup_path = temp_dir.join(backup_rel);
+                if !backup_path.exists() {
+                    return Err(PublishError::RollbackFailed(format!(
+                        "incremental publish recovery marker {} requires missing backup {}",
+                        marker_path.display(),
+                        backup_path.display()
+                    )));
+                }
+                restore_incremental_backup(&backup_path, &final_path).map_err(|err| {
+                    PublishError::RollbackFailed(format!(
+                        "could not restore {} from incremental backup {}: {err}",
+                        final_path.display(),
+                        backup_path.display()
+                    ))
+                })?;
+                sync_parent_dir_best_effort(&final_path);
+            }
+        }
+    }
+
+    if temp_dir.exists() {
+        if temp_dir.is_dir() {
+            fs::remove_dir_all(&temp_dir).map_err(PublishError::Io)?;
+        } else {
+            fs::remove_file(&temp_dir).map_err(PublishError::Io)?;
+        }
+    }
+    remove_file_if_exists(marker_path).map_err(PublishError::Io)?;
+    sync_parent_dir_best_effort(marker_path);
+    Ok(())
+}
+
+fn validate_incremental_marker(
+    album_dir: &Path,
+    marker_path: &Path,
+    marker: &IncrementalPublishRecoveryMarker,
+) -> Result<PathBuf, PublishError> {
+    if marker.version != 1 {
+        return Err(PublishError::RollbackFailed(format!(
+            "unsupported incremental publish recovery marker version {} in {}",
+            marker.version,
+            marker_path.display()
+        )));
+    }
+
+    let expected_album = album_dir_marker_name(album_dir)?;
+    if marker.album_dir_name != expected_album {
+        return Err(PublishError::RollbackFailed(format!(
+            "incremental publish recovery marker {} targets album {}, not {}",
+            marker_path.display(),
+            marker.album_dir_name,
+            expected_album
+        )));
+    }
+
+    let temp_name = PathBuf::from(&marker.temp_dir_name);
+    reject_escaping_path(&temp_name).map_err(|err| {
+        PublishError::RollbackFailed(format!(
+            "incremental publish recovery marker {} contains invalid temp name {}: {err}",
+            marker_path.display(),
+            marker.temp_dir_name
+        ))
+    })?;
+    if temp_name.components().count() != 1 {
+        return Err(PublishError::RollbackFailed(format!(
+            "incremental publish recovery marker {} contains non-leaf temp name {}",
+            marker_path.display(),
+            marker.temp_dir_name
+        )));
+    }
+
+    let expected_prefix = format!(".{expected_album}.tmp-");
+    if !marker.temp_dir_name.starts_with(&expected_prefix) {
+        return Err(PublishError::RollbackFailed(format!(
+            "incremental publish recovery marker {} points at non-matching temp directory {}",
+            marker_path.display(),
+            marker.temp_dir_name
+        )));
+    }
+
+    Ok(parent_dir_or_current(album_dir).join(temp_name))
+}
+
 fn backup_dir_from_marker(
     album_dir: &Path,
     marker_path: &Path,
@@ -10420,14 +11181,14 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn acquire_publish_lock(album_dir: &Path) -> Result<FileLock, PublishError> {
-    let lock_path = album_lock_path(album_dir);
-    acquire_file_lock(&lock_path, "album directory is locked by another process").map_err(|err| {
-        match err {
-            LockAcquireError::Busy(message) => PublishError::DestinationExists(message),
-            LockAcquireError::Io(err) => PublishError::Io(err),
-        }
-    })
+fn acquire_publish_lock(album_dir: &Path) -> Result<AlbumPublishLock, PublishError> {
+    let hidden_lock_path = album_lock_path(album_dir);
+    let legacy_lock_path = legacy_album_lock_path(album_dir);
+
+    let hidden = acquire_blocking_file_lock(&hidden_lock_path, false).map_err(PublishError::Io)?;
+    remove_lock_path_best_effort(&legacy_lock_path);
+
+    Ok(AlbumPublishLock { hidden: Some(hidden) })
 }
 
 fn acquire_run_lock(
@@ -10458,8 +11219,9 @@ fn acquire_file_lock(lock_path: &Path, busy_message: &str) -> Result<FileLock, L
 
     match file.try_lock_exclusive() {
         Ok(()) => Ok(FileLock {
-            file,
+            file: Some(file),
             path: lock_path.to_path_buf(),
+            remove_on_drop: true,
         }),
         Err(err) if is_lock_contention(&err) => {
             Err(LockAcquireError::Busy(busy_message.to_string()))
@@ -10468,7 +11230,31 @@ fn acquire_file_lock(lock_path: &Path, busy_message: &str) -> Result<FileLock, L
     }
 }
 
+fn acquire_blocking_file_lock(lock_path: &Path, remove_on_drop: bool) -> io::Result<FileLock> {
+    let parent = parent_dir_or_current(lock_path);
+    fs::create_dir_all(parent)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lock_path)?;
+
+    file.lock_exclusive()?;
+    Ok(FileLock {
+        file: Some(file),
+        path: lock_path.to_path_buf(),
+        remove_on_drop,
+    })
+}
+
 fn album_lock_path(album_dir: &Path) -> PathBuf {
+    match album_dir.file_name().and_then(|name| name.to_str()) {
+        Some(name) => album_dir.with_file_name(format!(".{name}.lock")),
+        None => PathBuf::from(format!(".{}.lock", album_dir.display())),
+    }
+}
+
+fn legacy_album_lock_path(album_dir: &Path) -> PathBuf {
     match album_dir.file_name().and_then(|name| name.to_str()) {
         Some(name) => album_dir.with_file_name(format!("{name}.lock")),
         None => PathBuf::from(format!("{}.lock", album_dir.display())),
@@ -10503,14 +11289,53 @@ enum LockAcquireError {
 }
 
 struct FileLock {
-    file: fs::File,
+    file: Option<fs::File>,
     path: PathBuf,
+    remove_on_drop: bool,
+}
+
+struct AlbumPublishLock {
+    hidden: Option<FileLock>,
+}
+
+impl Drop for AlbumPublishLock {
+    fn drop(&mut self) {
+        if let Some(hidden) = self.hidden.take() {
+            drop(hidden);
+        }
+    }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
-        let _ = fs::remove_file(&self.path);
+        #[cfg(unix)]
+        {
+            if self.remove_on_drop {
+                remove_lock_path_best_effort(&self.path);
+            }
+            if let Some(file) = self.file.take() {
+                let _ = file.unlock();
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            if let Some(file) = self.file.take() {
+                let _ = file.unlock();
+                drop(file);
+            }
+            if self.remove_on_drop {
+                remove_lock_path_best_effort(&self.path);
+            }
+        }
+    }
+}
+
+fn remove_lock_path_best_effort(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent_dir_best_effort(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {}
     }
 }
 
@@ -13674,6 +14499,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 final_path: fixture.final_paths[0].clone(),
                 role: PublishRole::Audio,
             }],
+            source_audio_track_count: 1,
         };
         let publish = fixture.album.req.publish.clone();
         let staging = fixture.album.staging;
@@ -13705,6 +14531,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 final_path: fixture.final_paths[0].clone(),
                 role: PublishRole::Audio,
             }],
+            source_audio_track_count: 1,
         };
 
         let published = publish_album_output(retry_staging, &retry_plan, publish, None)
@@ -13747,6 +14574,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 final_path: fixture.final_paths[0].clone(),
                 role: PublishRole::Audio,
             }],
+            source_audio_track_count: 1,
         };
         let publish = fixture.album.req.publish.clone();
         let staging = fixture.album.staging;
@@ -13756,6 +14584,643 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(!marker_path.exists());
         assert!(published.album_dir.join("01.flac").exists());
         assert!(!backup_dir.exists(), "repair consumed the old backup before publish");
+    }
+
+    fn incremental_test_publish_policy() -> PublishPolicy {
+        PublishPolicy {
+            overwrite: OverwritePolicy::FailIfExists,
+            same_filesystem_required: false,
+            write_manifest: false,
+        }
+    }
+
+    fn incremental_test_staging(
+        root: &Path,
+        name: &str,
+        audio_name: &str,
+        audio_bytes: &[u8],
+        log_bytes: &[u8],
+    ) -> (StagingDir, PathBuf, PathBuf) {
+        let staging = StagingDir::new(root.join(name), name.to_string());
+        let audio = staging.root.join(audio_name);
+        let log = staging.root.join("conversion.log");
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        std::fs::write(&audio, audio_bytes).expect("staged audio");
+        std::fs::write(&log, log_bytes).expect("staged conversion log");
+        (staging, audio, log)
+    }
+
+    fn incremental_single_track_plan(
+        album_dir: &Path,
+        staged_audio: PathBuf,
+        audio_name: &str,
+        staged_log: PathBuf,
+    ) -> PublishPlan {
+        PublishPlan {
+            album_dir: album_dir.to_path_buf(),
+            entries: vec![
+                PublishEntry {
+                    staged_path: staged_audio,
+                    final_path: album_dir.join(audio_name),
+                    role: PublishRole::Audio,
+                },
+                PublishEntry {
+                    staged_path: staged_log,
+                    final_path: album_dir.join("conversion.log"),
+                    role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                },
+            ],
+            source_audio_track_count: 1,
+        }
+    }
+
+
+    fn incremental_single_track_plan_with_cue(
+        album_dir: &Path,
+        staged_audio: PathBuf,
+        audio_name: &str,
+        staged_log: PathBuf,
+        staged_cue: PathBuf,
+    ) -> PublishPlan {
+        PublishPlan {
+            album_dir: album_dir.to_path_buf(),
+            entries: vec![
+                PublishEntry {
+                    staged_path: staged_audio,
+                    final_path: album_dir.join(audio_name),
+                    role: PublishRole::Audio,
+                },
+                PublishEntry {
+                    staged_path: staged_log,
+                    final_path: album_dir.join("conversion.log"),
+                    role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                },
+                PublishEntry {
+                    staged_path: staged_cue,
+                    final_path: album_dir.join("album.cue"),
+                    role: PublishRole::Sidecar(SidecarKind::CueSheet),
+                },
+            ],
+            source_audio_track_count: 1,
+        }
+    }
+
+    fn conversion_related_file_names(album_dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(album_dir)
+            .expect("album dir")
+            .map(|entry| entry.expect("album entry").file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains("conversion"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn sequential_single_file_publishes_share_album_folder_and_append_conversion_log() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let publish = incremental_test_publish_policy();
+
+        let (first_staging, first_audio, first_log) = incremental_test_staging(
+            temp.path(),
+            "stage-first",
+            "01.flac",
+            b"audio-one",
+            b"first log without trailing newline",
+        );
+        let first_plan = incremental_single_track_plan(&album_dir, first_audio, "01.flac", first_log);
+        let first = publish_album_output(first_staging, &first_plan, publish.clone(), None)
+            .expect("first publish creates the album folder");
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+
+        let (second_staging, second_audio, second_log) = incremental_test_staging(
+            temp.path(),
+            "stage-second",
+            "02.flac",
+            b"audio-two",
+            b"second log\n",
+        );
+        let second_plan = incremental_single_track_plan(&album_dir, second_audio, "02.flac", second_log);
+        let second = publish_album_output(second_staging, &second_plan, publish, None)
+            .expect("second independent track appends to the existing album folder");
+
+        assert_eq!(second.entries.len(), 2);
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+        assert_eq!(std::fs::read(album_dir.join("02.flac")).unwrap(), b"audio-two");
+        let log = std::fs::read_to_string(album_dir.join("conversion.log")).expect("conversion log");
+        assert!(log.contains("first log without trailing newline\nsecond log"));
+        assert_eq!(conversion_related_file_names(&album_dir), vec!["conversion.log".to_string()]);
+    }
+
+    #[test]
+    fn concurrent_single_file_publishes_share_album_folder_and_append_one_conversion_log() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let publish = incremental_test_publish_policy();
+
+        let (first_staging, first_audio, first_log) = incremental_test_staging(
+            temp.path(),
+            "stage-concurrent-first",
+            "01.flac",
+            b"concurrent-audio-one",
+            b"first concurrent log\n",
+        );
+        let first_plan = incremental_single_track_plan(&album_dir, first_audio, "01.flac", first_log);
+
+        let (second_staging, second_audio, second_log) = incremental_test_staging(
+            temp.path(),
+            "stage-concurrent-second",
+            "02.flac",
+            b"concurrent-audio-two",
+            b"second concurrent log\n",
+        );
+        let second_plan = incremental_single_track_plan(&album_dir, second_audio, "02.flac", second_log);
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let first_start = start.clone();
+        let first_publish = publish.clone();
+        let first_handle = std::thread::spawn(move || {
+            first_start.wait();
+            publish_album_output(first_staging, &first_plan, first_publish, None)
+        });
+
+        let second_start = start.clone();
+        let second_handle = std::thread::spawn(move || {
+            second_start.wait();
+            publish_album_output(second_staging, &second_plan, publish, None)
+        });
+
+        start.wait();
+        let first = first_handle
+            .join()
+            .expect("first publish thread joins")
+            .expect("first concurrent publish succeeds");
+        let second = second_handle
+            .join()
+            .expect("second publish thread joins")
+            .expect("second concurrent publish succeeds");
+
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(second.entries.len(), 2);
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"concurrent-audio-one");
+        assert_eq!(std::fs::read(album_dir.join("02.flac")).unwrap(), b"concurrent-audio-two");
+        let log = std::fs::read_to_string(album_dir.join("conversion.log")).expect("conversion log");
+        assert_eq!(log.matches("first concurrent log\n").count(), 1);
+        assert_eq!(log.matches("second concurrent log\n").count(), 1);
+        assert_eq!(conversion_related_file_names(&album_dir), vec!["conversion.log".to_string()]);
+        assert!(album_lock_path(&album_dir).exists(), "publish lock uses a hidden stable file");
+        assert!(
+            !legacy_album_lock_path(&album_dir).exists(),
+            "publish must not leave a visible Album.lock file"
+        );
+    }
+
+    #[test]
+    fn publish_lock_uses_hidden_stable_file_and_removes_stale_visible_lock() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let hidden_lock = album_lock_path(&album_dir);
+        let legacy_lock = legacy_album_lock_path(&album_dir);
+        std::fs::write(&legacy_lock, b"stale visible lock").expect("legacy visible lock");
+        let publish = incremental_test_publish_policy();
+
+        let (staging, staged_audio, staged_log) = incremental_test_staging(
+            temp.path(),
+            "stage-hidden-lock",
+            "01.flac",
+            b"audio-one",
+            b"lock cleanup log\n",
+        );
+        let plan = incremental_single_track_plan(&album_dir, staged_audio, "01.flac", staged_log);
+        publish_album_output(staging, &plan, publish, None).expect("publish succeeds");
+
+        assert!(hidden_lock.exists(), "publish lock uses the hidden stable lock path");
+        assert!(
+            !legacy_lock.exists(),
+            "publish removes stale visible Album.lock files because old-build compatibility is not supported"
+        );
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+    }
+
+    #[test]
+    fn incremental_single_file_publish_rejects_existing_audio_file_under_fail_if_exists() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let publish = incremental_test_publish_policy();
+
+        let (first_staging, first_audio, first_log) = incremental_test_staging(
+            temp.path(),
+            "stage-first-collision",
+            "01.flac",
+            b"original audio",
+            b"first log\n",
+        );
+        let first_plan = incremental_single_track_plan(&album_dir, first_audio, "01.flac", first_log);
+        publish_album_output(first_staging, &first_plan, publish.clone(), None).expect("first publish");
+
+        let (second_staging, second_audio, second_log) = incremental_test_staging(
+            temp.path(),
+            "stage-second-collision",
+            "01.flac",
+            b"replacement audio must not publish",
+            b"second log must not append\n",
+        );
+        let second_plan = incremental_single_track_plan(&album_dir, second_audio, "01.flac", second_log);
+        let err = publish_album_output(second_staging, &second_plan, publish, None)
+            .expect_err("same final audio file must fail under FailIfExists");
+
+        assert!(matches!(err, PublishError::DestinationExists(path) if path == album_dir.join("01.flac").display().to_string()));
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"original audio");
+        let log = std::fs::read_to_string(album_dir.join("conversion.log")).expect("conversion log");
+        assert!(!log.contains("second log must not append"));
+    }
+
+    #[test]
+    fn incremental_sidecar_failure_does_not_publish_audio_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(album_dir.join("conversion.log")).expect("conversion log collision dir");
+        let publish = incremental_test_publish_policy();
+
+        let (staging, staged_audio, staged_log) = incremental_test_staging(
+            temp.path(),
+            "stage-sidecar-failure",
+            "02.flac",
+            b"audio-two must not strand",
+            b"second log must not append\n",
+        );
+        let plan = incremental_single_track_plan(&album_dir, staged_audio, "02.flac", staged_log);
+        let err = publish_album_output(staging, &plan, publish, None)
+            .expect_err("conversion.log directory collision fails before exposing audio");
+
+        assert!(matches!(err, PublishError::DestinationExists(path) if path == album_dir.join("conversion.log").display().to_string()));
+        assert!(!album_dir.join("02.flac").exists(), "failed sidecar publish must not leave audio behind");
+        assert!(album_dir.join("conversion.log").is_dir(), "pre-existing sidecar collision is unchanged");
+    }
+
+    #[test]
+    fn incremental_publish_rolls_back_sidecar_append_if_audio_publish_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&album_dir).expect("existing album folder");
+        std::fs::write(album_dir.join("01.flac"), b"audio-one").expect("existing track");
+        std::fs::write(album_dir.join("conversion.log"), b"original log\n").expect("existing log");
+        let publish = incremental_test_publish_policy();
+
+        let staging = StagingDir::new(
+            temp.path().join("stage-audio-failure"),
+            "stage-audio-failure".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let staged_audio_dir = staging.root.join("02.flac");
+        std::fs::create_dir_all(&staged_audio_dir).expect("invalid staged audio dir");
+        let staged_log = staging.root.join("conversion.log");
+        std::fs::write(&staged_log, b"second log must roll back\n").expect("staged log");
+        let plan = incremental_single_track_plan(&album_dir, staged_audio_dir, "02.flac", staged_log);
+
+        let _err = publish_album_output(staging, &plan, publish, None)
+            .expect_err("invalid staged audio fails after sidecar append attempt");
+
+        assert!(!album_dir.join("02.flac").exists(), "failed audio publish must not leave audio behind");
+        assert_eq!(
+            std::fs::read(album_dir.join("conversion.log")).expect("conversion log"),
+            b"original log\n",
+            "sidecar append must be rolled back when the incremental publish fails"
+        );
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+    }
+
+    #[test]
+    fn incremental_rollback_snapshot_uses_create_new_synced_backup_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("conversion.log");
+        let backup = temp.path().join(".incremental-rollback-log");
+        std::fs::write(&source, b"original log\n").expect("source");
+
+        copy_incremental_backup_snapshot(&source, &backup).expect("snapshot succeeds");
+        assert_eq!(
+            std::fs::read(&backup).expect("backup"),
+            b"original log\n",
+            "rollback snapshot must contain the source bytes"
+        );
+
+        std::fs::write(&source, b"new log\n").expect("changed source");
+        let err = copy_incremental_backup_snapshot(&source, &backup)
+            .expect_err("snapshot backup path must use create-new semantics");
+        assert!(
+            matches!(
+                &err,
+                PublishError::RollbackFailed(message)
+                    if message.contains("durable incremental rollback snapshot")
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&backup).expect("backup after failed overwrite"),
+            b"original log\n",
+            "failed snapshot must not overwrite an existing rollback backup"
+        );
+    }
+
+    #[test]
+    fn interrupted_incremental_publish_recovery_removes_partial_track_and_restores_log_before_retry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&album_dir).expect("existing album folder");
+        std::fs::write(album_dir.join("01.flac"), b"audio-one").expect("existing track");
+        std::fs::write(album_dir.join("02.flac"), b"partial crash audio").expect("partial track");
+        std::fs::write(album_dir.join("conversion.log"), b"original log\ncrash log\n")
+            .expect("half-appended log");
+
+        let temp_dir = out.join(".Album.tmp-crash");
+        std::fs::create_dir_all(&temp_dir).expect("incremental recovery temp");
+        std::fs::write(temp_dir.join(".incremental-rollback-log"), b"original log\n")
+            .expect("log backup");
+        let marker_path = out.join(".Album.incremental-publish-in-progress");
+        let marker = serde_json::json!({
+            "version": 1,
+            "album_dir_name": "Album",
+            "temp_dir_name": ".Album.tmp-crash",
+            "actions": [
+                {
+                    "action": "restore_original_file",
+                    "final_rel": "conversion.log",
+                    "backup_rel": ".incremental-rollback-log"
+                },
+                {
+                    "action": "remove_created_file",
+                    "final_rel": "02.flac"
+                }
+            ]
+        });
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap())
+            .expect("incremental marker");
+
+        let publish = incremental_test_publish_policy();
+        let (retry_staging, retry_audio, retry_log) = incremental_test_staging(
+            temp.path(),
+            "stage-retry-after-crash",
+            "02.flac",
+            b"retry audio",
+            b"retry log\n",
+        );
+        let retry_plan = incremental_single_track_plan(&album_dir, retry_audio, "02.flac", retry_log);
+        let published = publish_album_output(retry_staging, &retry_plan, publish, None)
+            .expect("retry repairs interrupted incremental publish before FailIfExists checks");
+
+        assert_eq!(published.entries.len(), 2);
+        assert!(!marker_path.exists(), "recovery marker is consumed");
+        assert!(!temp_dir.exists(), "recovery temp is consumed");
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+        assert_eq!(std::fs::read(album_dir.join("02.flac")).unwrap(), b"retry audio");
+        assert_eq!(
+            std::fs::read(album_dir.join("conversion.log")).expect("conversion log"),
+            b"original log\nretry log\n",
+            "crash-era append is rolled back before retry appends its own log"
+        );
+    }
+
+    #[test]
+    fn incremental_non_log_sidecar_replacement_rolls_back_if_audio_publish_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&album_dir).expect("existing album folder");
+        std::fs::write(album_dir.join("01.flac"), b"audio-one").expect("existing track");
+        std::fs::write(album_dir.join("conversion.log"), b"original log
+").expect("existing log");
+        std::fs::write(album_dir.join("album.cue"), b"original cue
+").expect("existing cue");
+        let publish = incremental_test_publish_policy();
+
+        let staging = StagingDir::new(
+            temp.path().join("stage-cue-rollback"),
+            "stage-cue-rollback".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let staged_audio_dir = staging.root.join("02.flac");
+        std::fs::create_dir_all(&staged_audio_dir).expect("invalid staged audio dir");
+        let staged_log = staging.root.join("conversion.log");
+        let staged_cue = staging.root.join("album.cue");
+        std::fs::write(&staged_log, b"second log must roll back
+").expect("staged log");
+        std::fs::write(&staged_cue, b"replacement cue must roll back
+").expect("staged cue");
+        let plan = incremental_single_track_plan_with_cue(
+            &album_dir,
+            staged_audio_dir,
+            "02.flac",
+            staged_log,
+            staged_cue,
+        );
+
+        let _err = publish_album_output(staging, &plan, publish, None)
+            .expect_err("invalid staged audio fails after sidecar replacement attempt");
+
+        assert!(!album_dir.join("02.flac").exists(), "failed publish must not leave audio behind");
+        assert_eq!(
+            std::fs::read(album_dir.join("conversion.log")).expect("conversion log"),
+            b"original log
+",
+            "conversion log append must roll back"
+        );
+        assert_eq!(
+            std::fs::read(album_dir.join("album.cue")).expect("cue sheet"),
+            b"original cue
+",
+            "non-log sidecar replacement must roll back"
+        );
+        assert!(
+            std::fs::read_dir(&album_dir)
+                .expect("album dir")
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".incremental-sidecar-replace")),
+            "staged replacement sidecar must be removed on rollback"
+        );
+    }
+
+    #[test]
+    fn interrupted_incremental_sidecar_replacement_recovery_restores_sidecar_before_retry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&album_dir).expect("existing album folder");
+        std::fs::write(album_dir.join("01.flac"), b"audio-one").expect("existing track");
+        std::fs::write(album_dir.join("02.flac"), b"partial crash audio").expect("partial track");
+        std::fs::write(album_dir.join("conversion.log"), b"original log
+").expect("existing log");
+        std::fs::write(album_dir.join("album.cue"), b"crash-era cue
+").expect("crash cue");
+        std::fs::write(
+            album_dir.join(".incremental-sidecar-replace-crash"),
+            b"prepared replacement cue
+",
+        )
+        .expect("prepared replacement temp");
+
+        let temp_dir = out.join(".Album.tmp-cue-crash");
+        std::fs::create_dir_all(&temp_dir).expect("incremental recovery temp");
+        std::fs::write(temp_dir.join(".incremental-rollback-cue"), b"original cue
+")
+            .expect("cue backup");
+        let marker_path = out.join(".Album.incremental-publish-in-progress");
+        let marker = serde_json::json!({
+            "version": 1,
+            "album_dir_name": "Album",
+            "temp_dir_name": ".Album.tmp-cue-crash",
+            "actions": [
+                {
+                    "action": "remove_created_file",
+                    "final_rel": ".incremental-sidecar-replace-crash"
+                },
+                {
+                    "action": "restore_original_file",
+                    "final_rel": "album.cue",
+                    "backup_rel": ".incremental-rollback-cue"
+                },
+                {
+                    "action": "remove_created_file",
+                    "final_rel": "02.flac"
+                }
+            ]
+        });
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap())
+            .expect("incremental marker");
+
+        let publish = incremental_test_publish_policy();
+        let (retry_staging, retry_audio, retry_log) = incremental_test_staging(
+            temp.path(),
+            "stage-retry-after-cue-crash",
+            "02.flac",
+            b"retry audio",
+            b"retry log
+",
+        );
+        let retry_cue = retry_staging.root.join("album.cue");
+        std::fs::write(&retry_cue, b"retry cue
+").expect("retry cue");
+        let retry_plan = incremental_single_track_plan_with_cue(
+            &album_dir,
+            retry_audio,
+            "02.flac",
+            retry_log,
+            retry_cue,
+        );
+        let published = publish_album_output(retry_staging, &retry_plan, publish, None)
+            .expect("retry repairs interrupted sidecar replacement before publishing");
+
+        assert_eq!(published.entries.len(), 3);
+        assert!(!marker_path.exists(), "recovery marker is consumed");
+        assert!(!temp_dir.exists(), "recovery temp is consumed");
+        assert!(
+            !album_dir.join(".incremental-sidecar-replace-crash").exists(),
+            "crash-era staged sidecar replacement is removed"
+        );
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+        assert_eq!(std::fs::read(album_dir.join("02.flac")).unwrap(), b"retry audio");
+        assert_eq!(
+            std::fs::read(album_dir.join("album.cue")).expect("cue sheet"),
+            b"retry cue
+",
+            "recovery restores the old cue before retry installs the retry cue"
+        );
+        assert_eq!(
+            std::fs::read(album_dir.join("conversion.log")).expect("conversion log"),
+            b"original log
+retry log
+"
+        );
+    }
+
+    #[test]
+    fn multi_track_album_publish_still_fails_when_album_folder_exists() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&album_dir).expect("existing album folder");
+        let publish = incremental_test_publish_policy();
+        let staging = StagingDir::new(temp.path().join("stage-multi"), "stage-multi".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let staged_one = staging.root.join("01.flac");
+        let staged_two = staging.root.join("02.flac");
+        std::fs::write(&staged_one, b"one").expect("staged one");
+        std::fs::write(&staged_two, b"two").expect("staged two");
+        let plan = PublishPlan {
+            album_dir: album_dir.clone(),
+            entries: vec![
+                PublishEntry {
+                    staged_path: staged_one,
+                    final_path: album_dir.join("01.flac"),
+                    role: PublishRole::Audio,
+                },
+                PublishEntry {
+                    staged_path: staged_two,
+                    final_path: album_dir.join("02.flac"),
+                    role: PublishRole::Audio,
+                },
+            ],
+            source_audio_track_count: 2,
+        };
+
+        let err = publish_album_output(staging, &plan, publish, None)
+            .expect_err("multi-track album-level publish still rejects an existing folder");
+
+        assert!(matches!(err, PublishError::DestinationExists(path) if path == album_dir.display().to_string()));
+        assert!(!album_dir.join("01.flac").exists());
+        assert!(!album_dir.join("02.flac").exists());
+    }
+
+    #[test]
+    fn merged_multi_track_single_audio_publish_still_uses_album_level_collision_protection() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&album_dir).expect("existing album folder");
+        let publish = incremental_test_publish_policy();
+        let staging = StagingDir::new(temp.path().join("stage-merged"), "stage-merged".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let staged_audio = staging.root.join("album.flac");
+        let staged_log = staging.root.join("conversion.log");
+        std::fs::write(&staged_audio, b"merged album audio").expect("staged merged audio");
+        std::fs::write(&staged_log, b"merged log\n").expect("staged merged log");
+        let plan = PublishPlan {
+            album_dir: album_dir.clone(),
+            entries: vec![
+                PublishEntry {
+                    staged_path: staged_audio,
+                    final_path: album_dir.join("album.flac"),
+                    role: PublishRole::Audio,
+                },
+                PublishEntry {
+                    staged_path: staged_log,
+                    final_path: album_dir.join("conversion.log"),
+                    role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                },
+            ],
+            source_audio_track_count: 2,
+        };
+
+        let err = publish_album_output(staging, &plan, publish, None)
+            .expect_err("merged multi-track output must not use incremental single-track publish");
+
+        assert!(matches!(err, PublishError::DestinationExists(path) if path == album_dir.display().to_string()));
+        assert!(!album_dir.join("album.flac").exists());
+        assert!(!album_dir.join("conversion.log").exists());
     }
 
     #[test]

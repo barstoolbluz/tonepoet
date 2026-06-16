@@ -1341,10 +1341,20 @@ pub struct ArtifactSet {
     pub sidecars: Vec<SidecarArtifact>,
 }
 
+fn default_publish_source_audio_track_count() -> usize {
+    0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishPlan {
     pub album_dir: PathBuf,
     pub entries: Vec<PublishEntry>,
+    /// Number of source tracks represented by this publish plan's audio
+    /// payload. This is intentionally distinct from the number of final audio
+    /// files: a merged multi-track album can have one final audio file while
+    /// still requiring album-level collision protection under FailIfExists.
+    #[serde(default = "default_publish_source_audio_track_count")]
+    pub source_audio_track_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
