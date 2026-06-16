@@ -2782,7 +2782,6 @@ enum CueQueueDecision {
 #[derive(Debug)]
 struct CueQueueAnalysis {
     referenced_audio: Vec<PathBuf>,
-    resolved_tracks: Vec<(u32, PathBuf, u32)>,
     track_count_by_audio_key: BTreeMap<PathBuf, usize>,
 }
 
@@ -2818,6 +2817,7 @@ fn cue_queue_decision_for_path(cue_path: &Path) -> Result<CueQueueDecision, Stri
 /// referenced files, because once the CUE provides split points for any audio
 /// file, the materializer owns the complete CUE track index and raw audio paths
 /// must not be queued separately.
+#[cfg(test)]
 pub(crate) fn cue_referenced_audio_paths_to_suppress_for_queue(
     cue_path: &Path,
 ) -> Result<Vec<PathBuf>, String> {
@@ -2907,7 +2907,6 @@ fn analyze_cue_for_queue(cue_path: &Path) -> Result<CueQueueAnalysis, String> {
 
     Ok(CueQueueAnalysis {
         referenced_audio,
-        resolved_tracks,
         track_count_by_audio_key,
     })
 }

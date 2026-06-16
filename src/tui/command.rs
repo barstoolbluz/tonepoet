@@ -4869,16 +4869,6 @@ pub fn select_default_disc_presentation_index(
         .map(|(index, _)| index)
 }
 
-fn select_dvdv_toc_presentation(
-    contents: &crate::disc::model::DiscContents,
-) -> Option<&crate::disc::model::DiscPresentation> {
-    let index = select_default_disc_presentation_index(contents)?;
-    contents
-        .presentations
-        .get(index)
-        .filter(|presentation| dvdv_presentation_has_complete_positive_durations(presentation))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct DvdvTocScore {
     duration_complete: bool,

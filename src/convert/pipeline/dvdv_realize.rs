@@ -1331,10 +1331,6 @@ fn is_unstructured_stream_id(stream_id: u8) -> bool {
     )
 }
 
-fn is_dvdv_audio_private_substream(substream: u8) -> bool {
-    matches!(substream, 0x80..=0x8F | 0xA0..=0xA7)
-}
-
 fn checked_dvdv_private_substream_id(
     audio_coding: DvdVideoAudioCoding,
     audio_stream_index: u8,
