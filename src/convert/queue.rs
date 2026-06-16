@@ -1,6 +1,7 @@
 //! Conversion queue management
 
 use super::formats::{AudioFormat, ConversionOptions, FileFormat};
+use super::pipeline::CueSidecarPolicy;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -170,6 +171,12 @@ pub struct ConversionItem {
     /// projecting through the legacy option surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_settings: Option<tonepoet_pipeline::PipelineSettings>,
+    /// Queue-time override for CUE sidecar detection. Used when browse queue
+    /// expansion has already evaluated and suppressed a sibling CUE as a
+    /// metadata artifact, so downstream source detection must not discover it
+    /// again as a split-source sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_sidecar_override: Option<CueSidecarPolicy>,
     /// New pipeline request (populated during migration; legacy fields
     /// remain until PR 10 finishes CLI/TUI surface).
     #[serde(default)]
@@ -203,6 +210,7 @@ impl Default for ConversionItem {
             selected: false,
             archive_password: None,
             pipeline_settings: None,
+            cue_sidecar_override: None,
             pipeline_request: None,
             active_tracks: BTreeMap::new(),
             closed_track_epochs: BTreeMap::new(),
@@ -235,11 +243,24 @@ impl ConversionItem {
             selected: false,
             archive_password,
             pipeline_settings,
+            cue_sidecar_override: None,
             pipeline_request: None,
             active_tracks: BTreeMap::new(),
             closed_track_epochs: BTreeMap::new(),
             tracks_collapsed: false,
         }
+    }
+
+    /// Create a new conversion item with a queue-time CUE sidecar policy override.
+    pub fn new_with_cue_sidecar_override(
+        input_path: PathBuf,
+        input_format: FileFormat,
+        options: ConversionOptions,
+        cue_sidecar_override: Option<CueSidecarPolicy>,
+    ) -> Self {
+        let mut item = Self::new(input_path, input_format, options);
+        item.cue_sidecar_override = cue_sidecar_override;
+        item
     }
 
     /// Create a new conversion item with exact Chunk 1 planner settings attached.
@@ -251,6 +272,26 @@ impl ConversionItem {
     ) -> Self {
         options.pipeline_settings = Some(settings.clone());
         let mut item = Self::new(input_path, input_format, options);
+        item.pipeline_settings = Some(settings);
+        item
+    }
+
+    /// Create a new conversion item with exact Chunk 1 planner settings and
+    /// a queue-time CUE sidecar policy override attached before insertion.
+    pub fn new_with_pipeline_settings_and_cue_sidecar_override(
+        input_path: PathBuf,
+        input_format: FileFormat,
+        mut options: ConversionOptions,
+        settings: tonepoet_pipeline::PipelineSettings,
+        cue_sidecar_override: Option<CueSidecarPolicy>,
+    ) -> Self {
+        options.pipeline_settings = Some(settings.clone());
+        let mut item = Self::new_with_cue_sidecar_override(
+            input_path,
+            input_format,
+            options,
+            cue_sidecar_override,
+        );
         item.pipeline_settings = Some(settings);
         item
     }
@@ -329,7 +370,24 @@ impl ConversionQueue {
     /// `PipelineSettings` should leave the item `NotConfigured` and call
     /// `set_pipeline_settings()` before marking it `Queued`.
     pub fn add_item(&mut self, path: PathBuf, format: FileFormat, options: ConversionOptions) {
-        let item = ConversionItem::new(path, format, options);
+        self.add_item_with_cue_sidecar_override(path, format, options, None);
+    }
+
+    /// Add an item to the queue with a CUE sidecar policy override attached
+    /// before the item enters the queue.
+    pub fn add_item_with_cue_sidecar_override(
+        &mut self,
+        path: PathBuf,
+        format: FileFormat,
+        options: ConversionOptions,
+        cue_sidecar_override: Option<CueSidecarPolicy>,
+    ) {
+        let item = ConversionItem::new_with_cue_sidecar_override(
+            path,
+            format,
+            options,
+            cue_sidecar_override,
+        );
         debug_assert!(
             item.pipeline_settings.is_some() || item.pipeline_request.is_some(),
             "ConversionQueue::add_item requires full PipelineSettings for production queued work; use add_item_with_pipeline_settings"
@@ -350,6 +408,26 @@ impl ConversionQueue {
         settings: tonepoet_pipeline::PipelineSettings,
     ) {
         let item = ConversionItem::new_with_pipeline_settings(path, format, options, settings);
+        self.items.push_back(item);
+    }
+
+    /// Add an item to the queue with exact Chunk 1 planner settings and a CUE
+    /// sidecar policy override attached before insertion.
+    pub fn add_item_with_pipeline_settings_and_cue_sidecar_override(
+        &mut self,
+        path: PathBuf,
+        format: FileFormat,
+        options: ConversionOptions,
+        settings: tonepoet_pipeline::PipelineSettings,
+        cue_sidecar_override: Option<CueSidecarPolicy>,
+    ) {
+        let item = ConversionItem::new_with_pipeline_settings_and_cue_sidecar_override(
+            path,
+            format,
+            options,
+            settings,
+            cue_sidecar_override,
+        );
         self.items.push_back(item);
     }
 
@@ -654,5 +732,81 @@ impl ConversionQueue {
 impl Default for ConversionQueue {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod cue_sidecar_override_queue_tests {
+    use super::*;
+
+    #[test]
+    fn conversion_queue_stores_cue_sidecar_override_at_insertion_time() {
+        let mut queue = ConversionQueue::new();
+        let mut options = ConversionOptions::default();
+        options.pipeline_settings = Some(tonepoet_pipeline::PipelineSettings::default());
+
+        queue.add_item_with_cue_sidecar_override(
+            PathBuf::from("/tmp/album/01.flac"),
+            FileFormat::Audio(AudioFormat::Flac),
+            options,
+            Some(CueSidecarPolicy::EmbeddedOnly),
+        );
+
+        let items = queue.all_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].cue_sidecar_override, Some(CueSidecarPolicy::EmbeddedOnly));
+    }
+
+    #[test]
+    fn same_path_inserted_later_without_artifact_metadata_has_no_stale_override() {
+        let path = PathBuf::from("/tmp/album/01.flac");
+        let mut options = ConversionOptions::default();
+        options.pipeline_settings = Some(tonepoet_pipeline::PipelineSettings::default());
+
+        let first = ConversionItem::new_with_cue_sidecar_override(
+            path.clone(),
+            FileFormat::Audio(AudioFormat::Flac),
+            options.clone(),
+            Some(CueSidecarPolicy::EmbeddedOnly),
+        );
+        assert_eq!(first.cue_sidecar_override, Some(CueSidecarPolicy::EmbeddedOnly));
+
+        let second = ConversionItem::new_with_cue_sidecar_override(
+            path,
+            FileFormat::Audio(AudioFormat::Flac),
+            options,
+            None,
+        );
+        assert_eq!(second.cue_sidecar_override, None);
+    }
+
+    #[test]
+    fn cue_sidecar_override_round_trips_through_queue_item_serde_when_present() {
+        let mut item = ConversionItem::default();
+        item.id = "serde-cue-override".to_string();
+        item.input_path = PathBuf::from("/tmp/album/01.flac");
+        item.cue_sidecar_override = Some(CueSidecarPolicy::EmbeddedOnly);
+
+        let json = serde_json::to_string(&item).expect("serialize item with override");
+        assert!(json.contains("cue_sidecar_override"));
+
+        let decoded: ConversionItem = serde_json::from_str(&json).expect("deserialize item");
+        assert_eq!(decoded.cue_sidecar_override, Some(CueSidecarPolicy::EmbeddedOnly));
+    }
+
+    #[test]
+    fn legacy_queue_item_without_cue_sidecar_override_deserializes_as_none() {
+        let mut item = ConversionItem::default();
+        item.id = "serde-legacy-no-override".to_string();
+        item.input_path = PathBuf::from("/tmp/album/01.flac");
+
+        let mut value = serde_json::to_value(&item).expect("serialize baseline item");
+        value
+            .as_object_mut()
+            .expect("item serializes as object")
+            .remove("cue_sidecar_override");
+
+        let decoded: ConversionItem = serde_json::from_value(value).expect("deserialize legacy item");
+        assert_eq!(decoded.cue_sidecar_override, None);
     }
 }

@@ -14,7 +14,6 @@ use crate::convert::simple_wizard::DitherType;
 const CD_FRAMES_PER_SECOND: f64 = 75.0;
 const CD_TOC_PREGAP_FRAMES: u32 = 150;
 
-
 /// Full list of command-mode tokens (including aliases) recognised by
 /// `parse_command`. Used by the tab-completion machinery.
 ///
@@ -1257,6 +1256,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     Ok(i) => i,
                     Err(e) => {
                         app.convert.set_source_mode(SourceMode::Empty);
+                        app.convert.source.cue_artifact_audio.clear();
                         app.set_status(format!("Probe error: {}", e));
                         return;
                     }
@@ -4035,12 +4035,19 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
 
     match app.current_screen {
         AppScreen::Browse => {
-            let paths = app.browse.collect_selection_for_queue();
+            let expansion = app.browse.collect_selection_for_queue();
+            let paths = expansion.paths.clone();
 
             if paths.is_empty() {
                 app.set_status("queue: no selection");
                 return;
             }
+
+            // Keep queue-expansion CUE policy metadata local until the Convert
+            // source mode is ready to publish. Probe and preset loading may
+            // fail below; on those failure paths, the existing Convert source
+            // state must remain untouched.
+            let cue_artifact_audio = expansion.cue_artifact_audio.clone();
 
             let first = paths[0].clone();
             let path_count = paths.len();
@@ -4140,7 +4147,12 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
                     // Unreachable given paths.is_empty() check above.
                 }
             }
+            // Publish the source mode and its queue-expansion metadata at the
+            // same success boundary. This keeps aborted Browse -> Convert flows
+            // from leaving CUE sidecar override metadata attached to an older
+            // Convert source mode.
             app.convert.set_source_mode(mode);
+            app.convert.source.cue_artifact_audio = cue_artifact_audio;
             app.convert.apply_source_defaults();
             app.recent.record_use_with_db(&first, &app.db);
 
@@ -4225,6 +4237,17 @@ fn apply_multitrack_convert_state_to_source_options(
     };
 
     super::disc_browser::apply_source_mode_disc_selection_to_source_options(mode, source);
+}
+
+/// Apply a queue-time CUE sidecar override to source options after any
+/// Convert-screen source transforms have run.
+fn apply_queue_item_cue_sidecar_override_to_source_options(
+    item: &crate::convert::ConversionItem,
+    source: &mut crate::convert::pipeline::SourceOptions,
+) {
+    if let Some(cue_sidecar_override) = item.cue_sidecar_override {
+        source.cue_sidecar = cue_sidecar_override;
+    }
 }
 
 /// Apply the selected disc presentation stored in the Convert source mode to
@@ -4355,8 +4378,16 @@ fn execute_commit_with_source_options_transform(
     );
     let format_name = options.output_format.name();
 
-    // Enqueue the whole batch via the shared helper.
-    let outcome = super::convert_actions::commit_batch(app, &batch, &options);
+    // Enqueue the whole batch via the shared helper. CUE sidecar override
+    // metadata lives on the Convert source state, because that state is the
+    // ownership boundary between Browse expansion and Commit.
+    let cue_artifact_audio = app.convert.source.cue_artifact_audio.clone();
+    let outcome = super::convert_actions::commit_batch_with_cue_artifacts(
+        app,
+        &batch,
+        &cue_artifact_audio,
+        &options,
+    );
 
     // Nothing enqueued → don't clear state or navigate; user sees error.
     if outcome.enqueued == 0 {
@@ -4451,6 +4482,7 @@ fn execute_commit_with_source_options_transform(
                 if let Some(ref pw) = item.archive_password {
                     item_source.archive_password = Some(SecretString::new(pw.clone()));
                 }
+                apply_queue_item_cue_sidecar_override_to_source_options(item, &mut item_source);
 
                 if let Some(existing_req) = item.pipeline_request.as_mut() {
                     // `commit_batch()` may already have attached a full
@@ -4544,6 +4576,7 @@ fn execute_commit_with_source_options_transform(
 
     // Clear source pane so a subsequent `:queue` arrives fresh.
     app.convert.set_source_mode(SourceMode::Empty);
+    app.convert.source.cue_artifact_audio.clear();
     app.convert.metadata = MetadataState::default();
     let _ = app.db.clear_batch_state();
 
@@ -6675,5 +6708,99 @@ mod tags_mb_args_tests {
             parse(r#"--catno "SRGS 4520"#),
             Command::Unknown(_)
         ));
+    }
+}
+
+
+#[cfg(test)]
+mod execute_queue_state_consistency_tests {
+    #[test]
+    fn execute_queue_does_not_publish_cue_metadata_before_successful_source_mode_update() {
+        let source = include_str!("command.rs");
+        let execute_queue_start = source
+            .find("fn execute_queue(")
+            .expect("execute_queue should exist");
+        let library_arm_start = source[execute_queue_start..]
+            .find("AppScreen::Library =>")
+            .map(|offset| execute_queue_start + offset)
+            .expect("Browse arm should be followed by Library arm");
+        let browse_arm = &source[execute_queue_start..library_arm_start];
+
+        let local_capture = browse_arm
+            .find("let cue_artifact_audio = expansion.cue_artifact_audio.clone();")
+            .expect("queue expansion metadata should first be captured locally");
+        let probe_error_return = browse_arm
+            .find("app.set_status(format!(\"probe error: {}\", e));")
+            .expect("probe failure branch should still return before Convert source publication");
+        let preset_error_return = browse_arm
+            .find("if let Err(msg) = load_preset_into_pills(app, name)")
+            .expect("preset failure branch should still return before Convert source publication");
+        let source_mode_publish = browse_arm
+            .find("app.convert.set_source_mode(mode);")
+            .expect("source mode should be published explicitly");
+        let cue_metadata_publish = browse_arm
+            .find("app.convert.source.cue_artifact_audio = cue_artifact_audio;")
+            .expect("CUE artifact metadata should be published explicitly");
+
+        assert!(
+            local_capture < probe_error_return,
+            "metadata should be captured locally before fallible probe work"
+        );
+        assert!(
+            probe_error_return < source_mode_publish,
+            "probe failure must return before source mode publication"
+        );
+        assert!(
+            preset_error_return < source_mode_publish,
+            "preset failure must return before source mode publication"
+        );
+        assert!(
+            source_mode_publish < cue_metadata_publish,
+            "CUE artifact metadata must be published at the same success boundary as the source mode"
+        );
+
+        let before_source_mode_publish = &browse_arm[..source_mode_publish];
+        assert!(
+            !before_source_mode_publish.contains("app.convert.source.cue_artifact_audio ="),
+            "execute_queue must not assign Convert CUE metadata before source mode publication"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cue_sidecar_override_source_transform_tests {
+    use super::*;
+
+    fn source_options_with_transform_applied() -> crate::convert::pipeline::SourceOptions {
+        let mut source = crate::convert::pipeline::SourceOptions {
+            archive_password: None,
+            sacd_area: None,
+            dvda_group: None,
+            dvda_group_selection: crate::convert::pipeline::DvdaGroupSelection::Default,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+            cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+            track_selection: crate::convert::pipeline::TrackSelection::All,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
+        };
+        source.cue_sidecar = crate::convert::pipeline::CueSidecarPolicy::PreferEmbedded;
+        source
+    }
+
+    #[test]
+    fn cue_override_is_reapplied_after_source_option_transform() {
+        let mut item = crate::convert::ConversionItem::default();
+        item.cue_sidecar_override = Some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly);
+        let mut source = source_options_with_transform_applied();
+
+        apply_queue_item_cue_sidecar_override_to_source_options(&item, &mut source);
+
+        assert_eq!(
+            source.cue_sidecar,
+            crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly
+        );
     }
 }

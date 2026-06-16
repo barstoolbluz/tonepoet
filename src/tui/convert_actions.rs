@@ -504,6 +504,26 @@ pub fn commit_batch(
     paths: &[std::path::PathBuf],
     options: &ConversionOptions,
 ) -> CommitOutcome {
+    commit_batch_with_cue_artifacts(app, paths, &std::collections::HashSet::new(), options)
+}
+
+fn cue_sidecar_override_for_commit_path(
+    path: &std::path::Path,
+    cue_artifact_audio: &std::collections::HashSet<std::path::PathBuf>,
+) -> Option<crate::convert::pipeline::CueSidecarPolicy> {
+    cue_artifact_audio
+        .contains(path)
+        .then_some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly)
+}
+
+/// Commit a batch and mark paths whose sibling CUE was already suppressed by
+/// browse expansion as sidecar-CUE metadata artifacts.
+pub fn commit_batch_with_cue_artifacts(
+    app: &mut AppState,
+    paths: &[std::path::PathBuf],
+    cue_artifact_audio: &std::collections::HashSet<std::path::PathBuf>,
+    options: &ConversionOptions,
+) -> CommitOutcome {
     let existing = app.manager.get_items_clone();
     let mut outcome = CommitOutcome::default();
 
@@ -543,10 +563,15 @@ pub fn commit_batch(
             None
         };
 
-        match app
-            .manager
-            .add_file_ready_for_processing(path.clone(), options.clone(), archive_pw)
-        {
+        let cue_sidecar_override =
+            cue_sidecar_override_for_commit_path(path, cue_artifact_audio);
+
+        match app.manager.add_file_ready_for_processing_with_cue_sidecar_override(
+            path.clone(),
+            options.clone(),
+            archive_pw,
+            cue_sidecar_override,
+        ) {
             Ok(_) => outcome.enqueued += 1,
             Err(_) => outcome.errors += 1,
         }
@@ -870,4 +895,30 @@ mod lifecycle_forwarder_tests {
         assert_eq!(settings.dither_type, pipeline_enums::DitherType::Shibata);
     }
 
+}
+
+#[cfg(test)]
+mod cue_sidecar_commit_metadata_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    #[test]
+    fn commit_override_is_computed_only_from_current_batch_metadata() {
+        let path = PathBuf::from("/tmp/album/01.flac");
+        let mut artifact_audio = HashSet::new();
+        artifact_audio.insert(path.clone());
+
+        assert_eq!(
+            cue_sidecar_override_for_commit_path(&path, &artifact_audio),
+            Some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly)
+        );
+
+        let later_no_artifact_batch = HashSet::new();
+        assert_eq!(
+            cue_sidecar_override_for_commit_path(&path, &later_no_artifact_batch),
+            None,
+            "a later batch with the same path vector must not inherit stale artifact metadata"
+        );
+    }
 }

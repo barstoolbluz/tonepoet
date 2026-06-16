@@ -524,6 +524,28 @@ impl ConversionManager {
         options: ConversionOptions,
         archive_password: Option<String>,
     ) -> ConversionResult<String> {
+        self.add_file_ready_for_processing_with_cue_sidecar_override(
+            file,
+            options,
+            archive_password,
+            None,
+        )
+    }
+
+    /// Add a file that is already configured and ready for processing,
+    /// optionally attaching a queue-time CUE sidecar policy override.
+    ///
+    /// The override is written to the `ConversionItem` before insertion into
+    /// the shared queue. Callers use this when browse queue expansion already
+    /// evaluated a sibling CUE and classified it as a metadata artifact, so the
+    /// downstream materializer must not rediscover that sidecar later.
+    pub fn add_file_ready_for_processing_with_cue_sidecar_override(
+        &mut self,
+        file: std::path::PathBuf,
+        options: ConversionOptions,
+        archive_password: Option<String>,
+        cue_sidecar_override: Option<crate::convert::pipeline::CueSidecarPolicy>,
+    ) -> ConversionResult<String> {
         let format = FormatDetector::detect(&file)?;
         // Use try_write() instead of blocking_write() to avoid panic in async context
         let mut queue = self.queue.try_write().map_err(|_| {
@@ -531,7 +553,12 @@ impl ConversionManager {
         })?;
 
         // Create item and mark as Queued (ready for processing)
-        let mut item = ConversionItem::new(file.clone(), format, options);
+        let mut item = ConversionItem::new_with_cue_sidecar_override(
+            file.clone(),
+            format,
+            options,
+            cue_sidecar_override,
+        );
         item.archive_password = archive_password;
         item.status = ConversionStatus::Queued;
         let id = item.id.clone();

@@ -23,11 +23,17 @@ use crate::convert::pipeline::{
 use crate::convert::{ConversionError, ConversionItem, ConversionResult};
 
 pub fn build_pipeline_request(item: &ConversionItem) -> ConversionResult<PipelineRequest> {
-    // Return a prebuilt PipelineRequest with full PipelineSettings — bypass all builders.
-    if let Some(request) = item.pipeline_request.clone() {
+    // Return a prebuilt PipelineRequest with full PipelineSettings, while still
+    // honoring queue-time source overrides. The request may have been built
+    // before browse expansion attached its sidecar-CUE decision, so the
+    // ConversionItem remains authoritative for this field.
+    if let Some(mut request) = item.pipeline_request.clone() {
         request.settings.validate().map_err(|err| {
             ConversionError::ValidationError(format!("invalid prebuilt pipeline settings: {err}"))
         })?;
+        if let Some(cue_sidecar_override) = item.cue_sidecar_override {
+            request.source.cue_sidecar = cue_sidecar_override;
+        }
         return Ok(request);
     }
 
@@ -88,7 +94,9 @@ pub fn build_pipeline_request_from_settings(
                 .to_path_buf()
         });
 
-    let cue_policy = cue_policy_for_input_path(&item.input_path);
+    let cue_policy = item
+        .cue_sidecar_override
+        .unwrap_or_else(|| cue_policy_for_input_path(&item.input_path));
 
     Ok(PipelineRequest {
         job_id: format!("job-{}", item.id),
@@ -645,4 +653,51 @@ fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod cue_sidecar_override_request_tests {
+    use super::*;
+    use crate::convert::queue::ConversionItem;
+
+    fn item_with_settings(path: &str) -> ConversionItem {
+        let mut item = ConversionItem::default();
+        item.id = "cue-sidecar-test".to_string();
+        item.input_path = PathBuf::from(path);
+        item.options.pipeline_settings = Some(PipelineSettings::default());
+        item.pipeline_settings = Some(PipelineSettings::default());
+        item
+    }
+
+    #[test]
+    fn conversion_item_override_is_copied_to_pipeline_request_source() {
+        let mut item = item_with_settings("/tmp/album/01.flac");
+        item.cue_sidecar_override = Some(CueSidecarPolicy::EmbeddedOnly);
+
+        let request = build_pipeline_request(&item).expect("build request with override");
+
+        assert_eq!(request.source.cue_sidecar, CueSidecarPolicy::EmbeddedOnly);
+    }
+
+    #[test]
+    fn explicit_individual_audio_without_override_uses_default_prefer_embedded_policy() {
+        let item = item_with_settings("/tmp/album/01.flac");
+
+        let request = build_pipeline_request(&item).expect("build request without override");
+
+        assert_eq!(request.source.cue_sidecar, CueSidecarPolicy::PreferEmbedded);
+    }
+
+    #[test]
+    fn prebuilt_pipeline_request_still_honors_item_override() {
+        let mut item = item_with_settings("/tmp/album/01.flac");
+        let mut prebuilt = build_pipeline_request(&item).expect("build base prebuilt request");
+        prebuilt.source.cue_sidecar = CueSidecarPolicy::PreferSidecar;
+        item.pipeline_request = Some(prebuilt);
+        item.cue_sidecar_override = Some(CueSidecarPolicy::EmbeddedOnly);
+
+        let request = build_pipeline_request(&item).expect("build request from prebuilt path");
+
+        assert_eq!(request.source.cue_sidecar, CueSidecarPolicy::EmbeddedOnly);
+    }
 }

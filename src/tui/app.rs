@@ -1176,6 +1176,15 @@ pub struct SourceState {
     /// Prevents N probes during rapid navigation — only fires once
     /// the cursor has been still for 150ms.
     pub batch_probe_debounce: Option<(PathBuf, std::time::Instant)>,
+    /// Audio paths whose sibling sidecar CUE was already evaluated by browse
+    /// queue expansion and classified as a metadata artifact. This metadata is
+    /// part of the Convert source payload, not process-global state: the user
+    /// reviews this exact payload and `:commit` consumes it for these paths.
+    ///
+    /// Commit maps these paths to `CueSidecarPolicy::EmbeddedOnly` on the
+    /// resulting `ConversionItem`, so downstream detection skips sidecar CUE
+    /// discovery while still honoring embedded CUESHEET tags.
+    pub cue_artifact_audio: std::collections::HashSet<PathBuf>,
 }
 
 impl Default for SourceState {
@@ -1185,6 +1194,7 @@ impl Default for SourceState {
             advanced_open: false,
             batch_probe_pending: None,
             batch_probe_debounce: None,
+            cue_artifact_audio: std::collections::HashSet::new(),
         }
     }
 }

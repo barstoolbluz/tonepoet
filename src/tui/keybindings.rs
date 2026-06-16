@@ -10689,18 +10689,20 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         _ => None,
     };
 
-    let (remaining_paths, new_cursor) = match &mut app.convert.source.mode {
+    let (remaining_paths, new_cursor, _removed_path) = match &mut app.convert.source.mode {
         SourceMode::Batch { paths, cursor, .. } if !paths.is_empty() => {
             let idx = (*cursor).min(paths.len() - 1);
-            paths.remove(idx);
+            let removed_path = paths.remove(idx);
+            app.convert.source.cue_artifact_audio.remove(&removed_path);
             let new_cursor = idx.min(paths.len().saturating_sub(1));
-            (paths.clone(), new_cursor)
+            (paths.clone(), new_cursor, removed_path)
         }
         _ => return,
     };
 
     if remaining_paths.is_empty() {
         app.convert.set_source_mode(SourceMode::Empty);
+        app.convert.source.cue_artifact_audio.clear();
         return;
     }
 

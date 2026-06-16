@@ -1,6 +1,6 @@
 //! File browser state and directory scanning
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1490,25 +1490,25 @@ impl BrowseState {
     ///
     /// The expansion helper (`expand_paths_to_audio`) is screen-agnostic
     /// so Library and future screens can reuse the same logic.
-    pub fn collect_selection_for_queue(&self) -> Vec<PathBuf> {
+    pub fn collect_selection_for_queue(&self) -> QueueExpansionResult {
         if !self.multi_selected.is_empty() {
-            return expand_paths_to_audio(&self.multi_selected);
+            return expand_paths_to_audio_with_metadata(&self.multi_selected);
         }
         if let Some(entry) = self.selected_entry() {
             match &entry.kind {
                 EntryKind::AudioFile(_) | EntryKind::Archive => {
-                    return vec![entry.path.clone()];
+                    return QueueExpansionResult { paths: vec![entry.path.clone()], cue_artifact_audio: HashSet::new() };
                 }
                 EntryKind::OtherFile if is_cue_sheet_path(&entry.path) => {
-                    return vec![entry.path.clone()];
+                    return QueueExpansionResult { paths: vec![entry.path.clone()], cue_artifact_audio: HashSet::new() };
                 }
                 EntryKind::Directory => {
-                    return expand_paths_to_audio(&[entry.path.clone()]);
+                    return expand_paths_to_audio_with_metadata(&[entry.path.clone()]);
                 }
                 _ => {}
             }
         }
-        Vec::new()
+        QueueExpansionResult::default()
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -2513,7 +2513,54 @@ fn extract_tag_sort_key(path: &Path, sort: SearchSort) -> String {
     val.unwrap_or_default().to_lowercase()
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueExpansionResult {
+    /// Paths to queue for conversion, in deterministic browse order.
+    pub paths: Vec<PathBuf>,
+    /// Audio paths whose sibling sidecar CUE was already classified as a
+    /// metadata artifact during queue expansion. Downstream conversion must
+    /// skip sidecar CUE discovery for these paths while still honoring
+    /// embedded CUESHEET tags.
+    pub cue_artifact_audio: HashSet<PathBuf>,
+}
+
+impl QueueExpansionResult {
+    #[must_use]
+    pub fn into_paths(self) -> Vec<PathBuf> {
+        self.paths
+    }
+}
+
+impl std::ops::Deref for QueueExpansionResult {
+    type Target = [PathBuf];
+
+    fn deref(&self) -> &Self::Target {
+        &self.paths
+    }
+}
+
+impl IntoIterator for QueueExpansionResult {
+    type Item = PathBuf;
+    type IntoIter = std::vec::IntoIter<PathBuf>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.paths.into_iter()
+    }
+}
+
+/// Expands files/directories to queueable audio paths using the historical
+/// `Vec<PathBuf>` API. Keep this wrapper for non-queue call sites (metadata
+/// editor, AccurateRip, context menu actions, and other tree-local utilities)
+/// that only need paths and should not own conversion policy metadata.
 pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
+    expand_paths_to_audio_with_metadata(paths).into_paths()
+}
+
+/// Expands files/directories for conversion queue construction and carries
+/// sidecar-CUE suppression metadata alongside the path list. Queue-building
+/// callers must use this result; non-queue callers should use
+/// `expand_paths_to_audio()` above to preserve the old API contract.
+pub fn expand_paths_to_audio_with_metadata(paths: &[PathBuf]) -> QueueExpansionResult {
     let mut plan = QueueExpansionPlan::default();
     for path in paths {
         collect_queue_candidates(path, &mut plan);
@@ -2523,42 +2570,154 @@ pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
 
 /// Directory/file expansion plan for conversion queue inputs.
 ///
-/// Build the whole candidate set before deciding what to queue. A CUE in a
-/// parent directory can reference audio in a child directory, a sibling via
-/// `../`, or an explicitly selected file outside the selected directory. A
-/// depth-first "push while walking" implementation cannot be idempotent for
-/// those layouts because it may push the referenced audio before seeing the CUE.
+/// Build the whole candidate set before deciding what to queue. A split-source
+/// CUE discovered late in a directory walk can suppress audio discovered earlier,
+/// so queue decisions must happen after collection to stay idempotent.
 #[derive(Default)]
 struct QueueExpansionPlan {
-    cue_sheets: Vec<PathBuf>,
+    cue_sheets: Vec<CueQueueCandidate>,
     queueable_non_cue: Vec<PathBuf>,
+    queueable_non_cue_keys: HashSet<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct CueQueueCandidate {
+    path: PathBuf,
+    path_key: PathBuf,
+    explicit: bool,
 }
 
 impl QueueExpansionPlan {
-    fn add_file(&mut self, path: PathBuf) {
+    fn add_explicit_file(&mut self, path: PathBuf) {
+        self.add_file(path, true);
+    }
+
+    fn add_discovered_file(&mut self, path: PathBuf) {
+        self.add_file(path, false);
+    }
+
+    fn add_file(&mut self, path: PathBuf, explicit: bool) {
         if is_cue_sheet_path(&path) {
-            push_unique_path(&mut self.cue_sheets, path);
+            self.add_cue_sheet(path, explicit);
         } else if is_queueable_file(&path) {
-            push_unique_path(&mut self.queueable_non_cue, path);
+            push_unique_path_with_keys(
+                &mut self.queueable_non_cue,
+                &mut self.queueable_non_cue_keys,
+                path,
+            );
         }
     }
 
-    fn into_queue_paths(self) -> Vec<PathBuf> {
-        let referenced_audio = cue_referenced_audio_paths(&self.cue_sheets);
-        let mut result = Vec::new();
-
-        for cue in self.cue_sheets {
-            push_unique_path(&mut result, cue);
+    fn add_cue_sheet(&mut self, path: PathBuf, explicit: bool) {
+        let path_key = queue_path_key(&path);
+        if let Some(existing) = self
+            .cue_sheets
+            .iter_mut()
+            .find(|existing| existing.path_key == path_key)
+        {
+            existing.explicit |= explicit;
+            return;
         }
 
-        for path in self.queueable_non_cue {
-            if is_audio_file_path(&path) && path_list_contains(&referenced_audio, &path) {
+        self.cue_sheets.push(CueQueueCandidate {
+            path,
+            path_key,
+            explicit,
+        });
+    }
+
+    fn into_queue_paths(self) -> QueueExpansionResult {
+        let QueueExpansionPlan {
+            cue_sheets,
+            queueable_non_cue,
+            queueable_non_cue_keys: _,
+        } = self;
+
+        let mut result = Vec::new();
+        let mut result_keys = HashSet::new();
+        let mut suppressed_audio_keys = HashSet::new();
+        let mut cue_artifact_audio_keys = HashSet::new();
+
+        for cue in cue_sheets {
+            match cue_queue_decision_for_path(&cue.path) {
+                Ok(CueQueueDecision::SplitSource { referenced_audio }) => {
+                    push_unique_path_with_keys(&mut result, &mut result_keys, cue.path);
+                    for path in referenced_audio {
+                        suppressed_audio_keys.insert(queue_path_key(&path));
+                    }
+                }
+                Ok(CueQueueDecision::MetadataArtifact { referenced_audio }) => {
+                    if cue.explicit {
+                        push_unique_path_with_keys(&mut result, &mut result_keys, cue.path);
+                    } else {
+                        for path in referenced_audio {
+                            cue_artifact_audio_keys.insert(queue_path_key(&path));
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "CUE {} is not safe to queue from folder expansion; suppressing it and marking sibling audio to skip sidecar CUE detection: {}",
+                        cue.path.display(),
+                        err
+                    );
+                    if cue.explicit {
+                        push_unique_path_with_keys(&mut result, &mut result_keys, cue.path);
+                    } else {
+                        mark_sibling_audio_as_cue_artifacts(
+                            &cue.path,
+                            &queueable_non_cue,
+                            &mut cue_artifact_audio_keys,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut cue_artifact_audio = HashSet::new();
+        for path in queueable_non_cue {
+            // Suppression applies to explicitly selected audio too when the
+            // same expansion also contains an explicit split-source CUE that
+            // references it. The explicit CUE selection is honored, and the
+            // referenced audio is omitted by design to avoid converting the
+            // same source twice through both the CUE materializer and the
+            // raw audio-file path.
+            let path_key = queue_path_key(&path);
+            if is_audio_file_path(&path) && suppressed_audio_keys.contains(&path_key) {
                 continue;
             }
-            push_unique_path(&mut result, path);
+            if is_audio_file_path(&path) && cue_artifact_audio_keys.contains(&path_key) {
+                cue_artifact_audio.insert(path.clone());
+            }
+            push_unique_path_with_keys(&mut result, &mut result_keys, path);
         }
 
-        result
+        QueueExpansionResult {
+            paths: result,
+            cue_artifact_audio,
+        }
+    }
+}
+
+fn mark_sibling_audio_as_cue_artifacts(
+    cue_path: &Path,
+    queueable_non_cue: &[PathBuf],
+    cue_artifact_audio_keys: &mut HashSet<PathBuf>,
+) {
+    let Some(cue_parent) = cue_path.parent().map(queue_path_key) else {
+        return;
+    };
+
+    for path in queueable_non_cue {
+        if !is_audio_file_path(path) {
+            continue;
+        }
+        let Some(audio_parent) = path.parent().map(queue_path_key) else {
+            continue;
+        };
+        if audio_parent == cue_parent {
+            cue_artifact_audio_keys.insert(queue_path_key(path));
+        }
     }
 }
 
@@ -2566,7 +2725,7 @@ fn collect_queue_candidates(path: &Path, plan: &mut QueueExpansionPlan) {
     if path.is_dir() {
         collect_queue_candidates_recursive(path, plan);
     } else {
-        plan.add_file(path.to_path_buf());
+        plan.add_explicit_file(path.to_path_buf());
     }
 }
 
@@ -2600,49 +2759,90 @@ fn collect_queue_candidates_recursive(dir: &Path, plan: &mut QueueExpansionPlan)
     files.sort();
 
     for file in files {
-        plan.add_file(file);
+        plan.add_discovered_file(file);
     }
     for child in dirs {
         collect_queue_candidates_recursive(&child, plan);
     }
 }
 
-fn cue_referenced_audio_paths(cue_paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut referenced = Vec::new();
-    for cue_path in cue_paths {
-        match materializable_cue_referenced_audio_paths_for_queue(cue_path) {
-            Ok(paths) => {
-                for path in paths {
-                    push_unique_path(&mut referenced, path);
-                }
-            }
-            Err(err) => {
-                log::warn!(
-                    "CUE {} is not materializer-compatible; not suppressing any referenced audio files: {}",
-                    cue_path.display(),
-                    err
-                );
-            }
-        }
-    }
-    referenced
+#[derive(Debug)]
+enum CueQueueDecision {
+    /// The CUE provides track boundaries that are not represented by the
+    /// referenced audio file set alone. Queue the CUE and suppress every audio
+    /// file it references so the materializer is the single source of tracks.
+    SplitSource { referenced_audio: Vec<PathBuf> },
+    /// The CUE points one-to-one at already-split tracks. For folder expansion,
+    /// queue the audio files and suppress the CUE as a metadata artifact. This
+    /// also covers a one-track image CUE: with no split points to materialize,
+    /// the image file itself is the queueable source and the CUE is metadata.
+    MetadataArtifact { referenced_audio: Vec<PathBuf> },
 }
 
-pub(crate) fn materializable_cue_referenced_audio_paths_for_queue(
+#[derive(Debug)]
+struct CueQueueAnalysis {
+    referenced_audio: Vec<PathBuf>,
+    resolved_tracks: Vec<(u32, PathBuf, u32)>,
+    track_count_by_audio_key: BTreeMap<PathBuf, usize>,
+}
+
+fn cue_queue_decision_for_path(cue_path: &Path) -> Result<CueQueueDecision, String> {
+    let analysis = analyze_cue_for_queue(cue_path)?;
+
+    // A CUE is a split source as soon as it provides split points for at least
+    // one referenced audio file. Mixed layouts can also reference one-track
+    // bonus files; once the CUE is a split source, suppress every referenced
+    // audio file so the materializer owns the complete track index and the
+    // queue never double-converts the one-track references.
+    let has_split_source = analysis
+        .track_count_by_audio_key
+        .values()
+        .any(|track_count| *track_count > 1);
+
+    if has_split_source {
+        Ok(CueQueueDecision::SplitSource {
+            referenced_audio: analysis.referenced_audio,
+        })
+    } else {
+        Ok(CueQueueDecision::MetadataArtifact {
+            referenced_audio: analysis.referenced_audio,
+        })
+    }
+}
+
+/// Return audio paths that queue expansion should suppress for a CUE.
+///
+/// This is deliberately a suppression helper, not a generic "materializable"
+/// query: metadata-artifact CUEs return an empty list, while split-source CUEs
+/// return every referenced audio path. In mixed layouts that includes one-track
+/// referenced files, because once the CUE provides split points for any audio
+/// file, the materializer owns the complete CUE track index and raw audio paths
+/// must not be queued separately.
+pub(crate) fn cue_referenced_audio_paths_to_suppress_for_queue(
     cue_path: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    match cue_queue_decision_for_path(cue_path)? {
+        CueQueueDecision::SplitSource { referenced_audio } => Ok(referenced_audio),
+        CueQueueDecision::MetadataArtifact { .. } => Ok(Vec::new()),
+    }
+}
+
+fn analyze_cue_for_queue(cue_path: &Path) -> Result<CueQueueAnalysis, String> {
     let sheet = crate::tui::cue_parser::parse_cue_file(cue_path)
         .map_err(|err| format!("failed to parse CUE: {err}"))?;
     let parent = cue_path
         .parent()
         .ok_or_else(|| "CUE path has no parent directory".to_string())?;
+    let parent_key = queue_path_key(parent);
 
     if sheet.tracks.is_empty() {
         return Err("CUE sheet has no tracks".to_string());
     }
 
-    let mut referenced = Vec::new();
+    let mut referenced_audio = Vec::new();
+    let mut referenced_audio_keys = HashSet::new();
     let mut resolved_tracks = Vec::with_capacity(sheet.tracks.len());
+    let mut track_count_by_audio_key = BTreeMap::new();
     for track in &sheet.tracks {
         let index01 = track
             .index01_frames
@@ -2679,30 +2879,43 @@ pub(crate) fn materializable_cue_referenced_audio_paths_for_queue(
             ));
         }
 
-        push_unique_path(&mut referenced, resolved.clone());
+        // Folder expansion intentionally accepts only CUE references to audio
+        // in the exact same directory as the CUE. Some valid CUE layouts keep
+        // the image under a child directory, but the queue heuristic chooses a
+        // conservative boundary here: cross-directory references are treated as
+        // unsafe metadata artifacts so a folder conversion does not unexpectedly
+        // materialize audio outside the CUE's sibling file set. Explicit CUE
+        // selection is still honored by `into_queue_paths()`.
+        if !is_same_directory_key_for_queue(&parent_key, &resolved) {
+            return Err(format!(
+                "track {} FILE reference {:?} resolved outside the CUE directory: {}",
+                track.number,
+                file_ref,
+                resolved.display()
+            ));
+        }
+
+        let resolved_key = queue_path_key(&resolved);
+        if referenced_audio_keys.insert(resolved_key.clone()) {
+            referenced_audio.push(resolved.clone());
+        }
+        *track_count_by_audio_key.entry(resolved_key).or_insert(0) += 1;
         resolved_tracks.push((track.number, resolved, index01));
     }
 
     validate_queue_cue_index_order(&resolved_tracks)?;
 
-    let shared_images: Vec<PathBuf> = referenced
-        .into_iter()
-        .filter(|candidate| {
-            resolved_tracks
-                .iter()
-                .filter(|(_, resolved_path, _)| same_path_for_queue(resolved_path, candidate))
-                .count()
-                > 1
-        })
-        .collect();
-
-    Ok(shared_images)
+    Ok(CueQueueAnalysis {
+        referenced_audio,
+        resolved_tracks,
+        track_count_by_audio_key,
+    })
 }
 
 fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Result<(), String> {
-    let mut previous_by_file: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    let mut previous_by_file: BTreeMap<PathBuf, (u32, u32)> = BTreeMap::new();
     for (track_number, path, index01) in resolved_tracks {
-        let key = deterministic_path_sort_key(path);
+        let key = queue_path_key(path);
         if let Some((previous_track, previous_index)) = previous_by_file.get(&key) {
             if index01 <= previous_index {
                 return Err(format!(
@@ -2792,7 +3005,8 @@ fn collect_audio_reference_candidates(
         .filter(|path| path.is_file() && is_audio_file_path(path) && matches_reference(path))
         .collect();
     candidates.sort_by_key(|path| deterministic_path_sort_key(path));
-    candidates.dedup_by(|left, right| same_path_for_queue(left, right));
+    let mut seen = HashSet::new();
+    candidates.retain(|path| seen.insert(queue_path_key(path)));
     candidates
 }
 
@@ -2810,6 +3024,15 @@ fn deterministic_path_sort_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// Stable key for queue path comparisons.
+///
+/// Existing files are canonicalized once before set/map operations so queue
+/// expansion avoids repeated filesystem lookups in inner loops. The fallback
+/// preserves the old behavior for paths that cannot be canonicalized.
+fn queue_path_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn format_candidate_paths_for_log(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -2818,23 +3041,37 @@ fn format_candidate_paths_for_log(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if !path_list_contains(paths, &candidate) {
+fn push_unique_path_with_keys(
+    paths: &mut Vec<PathBuf>,
+    keys: &mut HashSet<PathBuf>,
+    candidate: PathBuf,
+) {
+    if keys.insert(queue_path_key(&candidate)) {
         paths.push(candidate);
     }
 }
 
+#[cfg(test)]
 fn path_list_contains(paths: &[PathBuf], candidate: &Path) -> bool {
     paths
         .iter()
         .any(|existing| same_path_for_queue(existing, candidate))
 }
 
+#[cfg(test)]
 fn same_path_for_queue(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+fn is_same_directory_key_for_queue(left_key: &Path, right_file: &Path) -> bool {
+    let Some(right) = right_file.parent() else {
+        return false;
+    };
+
+    queue_path_key(right) == left_key
 }
 
 
@@ -3183,7 +3420,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_paths_to_audio_suppresses_parent_cue_referenced_child_audio() {
+    fn expand_paths_to_audio_suppresses_child_directory_split_source_cue_by_design() {
         let td = tempfile::tempdir().expect("tempdir");
         let subdir = td.path().join("disc");
         std::fs::create_dir(&subdir).unwrap();
@@ -3204,13 +3441,17 @@ mod tests {
         .unwrap();
 
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
-        assert!(path_list_contains(&expanded, &cue));
+        // Same-directory references are required by design. This suppresses
+        // some materializable layouts, such as `album.cue` + `disc/image.flac`,
+        // in favor of queueing discovered audio files without crossing the
+        // CUE directory boundary.
+        assert!(!path_list_contains(&expanded, &cue));
         assert!(path_list_contains(&expanded, &loose));
-        assert!(!path_list_contains(&expanded, &image));
+        assert!(path_list_contains(&expanded, &image));
     }
 
     #[test]
-    fn expand_paths_to_audio_suppresses_explicit_external_audio_referenced_by_cue() {
+    fn expand_paths_to_audio_suppresses_cue_that_references_external_audio() {
         let td = tempfile::tempdir().expect("tempdir");
         let cue_dir = td.path().join("cue_dir");
         std::fs::create_dir(&cue_dir).unwrap();
@@ -3229,12 +3470,12 @@ mod tests {
         .unwrap();
 
         let expanded = expand_paths_to_audio(&[cue_dir, external.clone()]);
-        assert!(path_list_contains(&expanded, &cue));
-        assert!(!path_list_contains(&expanded, &external));
+        assert!(!path_list_contains(&expanded, &cue));
+        assert!(path_list_contains(&expanded, &external));
     }
 
     #[test]
-    fn expand_paths_to_audio_keeps_all_ambiguous_stem_matches() {
+    fn expand_paths_to_audio_suppresses_ambiguous_cue_and_keeps_audio() {
         let td = tempfile::tempdir().expect("tempdir");
         let cue = td.path().join("album.cue");
         let flac = td.path().join("album.flac");
@@ -3251,13 +3492,13 @@ mod tests {
         .unwrap();
 
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
-        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &cue));
         assert!(path_list_contains(&expanded, &flac));
         assert!(path_list_contains(&expanded, &wav));
     }
 
     #[test]
-    fn expand_paths_to_audio_suppresses_subdirectory_extension_mismatch_reference() {
+    fn expand_paths_to_audio_suppresses_cue_with_subdirectory_reference() {
         let td = tempfile::tempdir().expect("tempdir");
         let disc = td.path().join("disc");
         std::fs::create_dir(&disc).unwrap();
@@ -3276,12 +3517,12 @@ mod tests {
         .unwrap();
 
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
-        assert!(path_list_contains(&expanded, &cue));
-        assert!(!path_list_contains(&expanded, &image));
+        assert!(!path_list_contains(&expanded, &cue));
+        assert!(path_list_contains(&expanded, &image));
     }
 
     #[test]
-    fn expand_paths_to_audio_does_not_suppress_audio_for_cue_missing_index01() {
+    fn expand_paths_to_audio_suppresses_cue_missing_index01_and_keeps_audio() {
         let td = tempfile::tempdir().expect("tempdir");
         let cue = td.path().join("album.cue");
         let image = td.path().join("album.flac");
@@ -3296,12 +3537,12 @@ mod tests {
         .unwrap();
 
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
-        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &cue));
         assert!(path_list_contains(&expanded, &image));
     }
 
     #[test]
-    fn expand_paths_to_audio_does_not_suppress_audio_for_non_increasing_cue_indexes() {
+    fn expand_paths_to_audio_suppresses_non_increasing_cue_and_keeps_audio() {
         let td = tempfile::tempdir().expect("tempdir");
         let cue = td.path().join("album.cue");
         let image = td.path().join("album.flac");
@@ -3318,13 +3559,13 @@ mod tests {
         .unwrap();
 
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
-        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &cue));
         assert!(path_list_contains(&expanded, &image));
     }
 
 
     #[test]
-    fn materializable_cue_returns_no_suppression_for_per_track_stem_matched_audio() {
+    fn materializable_cue_suppresses_per_track_cue_and_keeps_stem_matched_audio() {
         let td = tempfile::tempdir().expect("tempdir");
         let cue = td.path().join("album.cue");
         let track1 = td.path().join("01.flac");
@@ -3343,18 +3584,18 @@ FILE "02.wav" WAVE
         )
         .unwrap();
 
-        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+        let referenced = cue_referenced_audio_paths_to_suppress_for_queue(&cue)
             .expect("per-track CUE should be materializer-compatible");
         assert!(referenced.is_empty());
 
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
-        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &cue));
         assert!(path_list_contains(&expanded, &track1));
         assert!(path_list_contains(&expanded, &track2));
     }
 
     #[test]
-    fn materializable_cue_returns_no_suppression_for_frostbite_style_split_pregap() {
+    fn materializable_cue_suppresses_frostbite_style_per_track_cue() {
         let td = tempfile::tempdir().expect("tempdir");
         let cue = td.path().join("Frostbite.cue");
         let track1 = td.path().join("01 - If You Love Me Like You Say.flac");
@@ -3374,12 +3615,12 @@ FILE "02 - Blue Monday Hangover.wav" WAVE
         )
         .unwrap();
 
-        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+        let referenced = cue_referenced_audio_paths_to_suppress_for_queue(&cue)
             .expect("Frostbite-style per-track CUE should be materializer-compatible");
         assert!(referenced.is_empty());
 
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
-        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &cue));
         assert!(path_list_contains(&expanded, &track1));
         assert!(path_list_contains(&expanded, &track2));
     }
@@ -3401,12 +3642,12 @@ FILE "02 - Blue Monday Hangover.wav" WAVE
         )
         .unwrap();
 
-        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+        let referenced = cue_referenced_audio_paths_to_suppress_for_queue(&cue)
             .expect("single-image CUE should be materializer-compatible");
         assert_eq!(referenced.len(), 1);
         assert!(path_list_contains(&referenced, &image));
 
-        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
         assert!(path_list_contains(&expanded, &cue));
         assert!(!path_list_contains(&expanded, &image));
     }
@@ -3439,7 +3680,7 @@ FILE "side-b.wav" WAVE
         )
         .unwrap();
 
-        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+        let referenced = cue_referenced_audio_paths_to_suppress_for_queue(&cue)
             .expect("multi-image CUE should be materializer-compatible");
         assert_eq!(referenced.len(), 2);
         assert!(path_list_contains(&referenced, &side_a));
@@ -3452,7 +3693,7 @@ FILE "side-b.wav" WAVE
     }
 
     #[test]
-    fn materializable_cue_suppresses_only_shared_audio_in_mixed_layout() {
+    fn materializable_cue_with_any_shared_file_is_split_source_and_suppresses_all_references() {
         let td = tempfile::tempdir().expect("tempdir");
         let cue = td.path().join("album.cue");
         let main = td.path().join("album-main.flac");
@@ -3490,18 +3731,292 @@ FILE "10 - Live Version.wav" WAVE
         )
         .unwrap();
 
-        let referenced = materializable_cue_referenced_audio_paths_for_queue(&cue)
+        let referenced = cue_referenced_audio_paths_to_suppress_for_queue(&cue)
             .expect("mixed-layout CUE should be materializer-compatible");
-        assert_eq!(referenced.len(), 1);
+        assert_eq!(referenced.len(), 3);
         assert!(path_list_contains(&referenced, &main));
-        assert!(!path_list_contains(&referenced, &bonus));
-        assert!(!path_list_contains(&referenced, &live));
+        assert!(path_list_contains(&referenced, &bonus));
+        assert!(path_list_contains(&referenced, &live));
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &main));
+        assert!(!path_list_contains(&expanded, &bonus));
+        assert!(!path_list_contains(&expanded, &live));
+        assert!(expanded.cue_artifact_audio.is_empty());
+    }
+
+
+    #[test]
+    fn expand_paths_to_audio_queues_tracks_and_suppresses_twelve_track_cue_artifact() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        let mut cue_text = String::new();
+        let mut tracks = Vec::new();
+
+        for number in 1..=12 {
+            let stem = format!("{number:02}");
+            let audio = td.path().join(format!("{stem}.flac"));
+            std::fs::write(&audio, b"not real flac").unwrap();
+            tracks.push(audio);
+            cue_text.push_str(&format!(
+                "FILE \"{stem}.wav\" WAVE\n  TRACK {number:02} AUDIO\n    INDEX 01 00:00:00\n"
+            ));
+        }
+
+        std::fs::write(&cue, cue_text).unwrap();
+
+        let referenced = cue_referenced_audio_paths_to_suppress_for_queue(&cue)
+            .expect("per-track CUE should be materializer-compatible");
+        assert!(referenced.is_empty());
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert_eq!(expanded.len(), tracks.len());
+        assert!(!path_list_contains(&expanded, &cue));
+        for track in tracks {
+            assert!(path_list_contains(&expanded, &track));
+            assert!(
+                expanded.cue_artifact_audio.contains(&track),
+                "per-track audio must carry EmbeddedOnly override metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_paths_to_audio_marks_sibling_audio_when_nonexplicit_cue_errors() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("broken.cue");
+        let track1 = td.path().join("01.flac");
+        let track2 = td.path().join("02.flac");
+        let nested = td.path().join("nested");
+        let nested_track = nested.join("03.flac");
+
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(&track1, b"not real flac").unwrap();
+        std::fs::write(&track2, b"not real flac").unwrap();
+        std::fs::write(&nested_track, b"not real flac").unwrap();
+        std::fs::write(&cue, "this is not a cue sheet").unwrap();
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert!(!path_list_contains(&expanded, &cue));
+        assert!(path_list_contains(&expanded, &track1));
+        assert!(path_list_contains(&expanded, &track2));
+        assert!(path_list_contains(&expanded, &nested_track));
+        assert!(
+            expanded.cue_artifact_audio.contains(&track1),
+            "audio next to an error-classified non-explicit CUE must carry EmbeddedOnly override metadata"
+        );
+        assert!(
+            expanded.cue_artifact_audio.contains(&track2),
+            "audio next to an error-classified non-explicit CUE must carry EmbeddedOnly override metadata"
+        );
+        assert!(
+            !expanded.cue_artifact_audio.contains(&nested_track),
+            "CUE error fallback only applies to sibling audio that downstream sidecar discovery could associate with the CUE"
+        );
+    }
+
+    #[test]
+    fn expand_paths_to_audio_queues_side_cues_and_suppresses_side_images() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a_cue = td.path().join("side_a.cue");
+        let side_b_cue = td.path().join("side_b.cue");
+        let side_a = td.path().join("side_a.wav");
+        let side_b = td.path().join("side_b.wav");
+        std::fs::write(&side_a, b"not real wav").unwrap();
+        std::fs::write(&side_b, b"not real wav").unwrap();
+        std::fs::write(
+            &side_a_cue,
+            r#"FILE "side_a.wav" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &side_b_cue,
+            r#"FILE "side_b.wav" WAVE
+  TRACK 03 AUDIO
+    INDEX 01 00:00:00
+  TRACK 04 AUDIO
+    INDEX 01 04:00:00
+"#,
+        )
+        .unwrap();
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &side_a_cue));
+        assert!(path_list_contains(&expanded, &side_b_cue));
+        assert!(!path_list_contains(&expanded, &side_a));
+        assert!(!path_list_contains(&expanded, &side_b));
+    }
+
+    #[test]
+    fn expand_paths_to_audio_suppresses_unparseable_cue_and_keeps_audio() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("broken.cue");
+        let audio = td.path().join("track.flac");
+        std::fs::write(&cue, b"this is not a cue sheet").unwrap();
+        std::fs::write(&audio, b"not real flac").unwrap();
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(!path_list_contains(&expanded, &cue));
+        assert!(path_list_contains(&expanded, &audio));
+    }
+
+    #[test]
+    fn expand_paths_to_audio_always_queues_explicit_cue_selection() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("broken.cue");
+        std::fs::write(&cue, b"this is not a cue sheet").unwrap();
+
+        let expanded = expand_paths_to_audio(&[cue.clone()]);
+        assert_eq!(expanded.len(), 1);
+        assert!(path_list_contains(&expanded, &cue));
+    }
+
+
+    #[test]
+    fn split_source_cue_resolves_case_insensitive_stem_matched_audio() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        let image = td.path().join("album.FLAC");
+        std::fs::write(&image, b"not real flac").unwrap();
+        std::fs::write(
+            &cue,
+            r#"FILE "ALBUM.WAV" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:12:00
+"#,
+        )
+        .unwrap();
+
+        let referenced = cue_referenced_audio_paths_to_suppress_for_queue(&cue)
+            .expect("case-insensitive stem match should resolve the image");
+        assert_eq!(referenced.len(), 1);
+        assert!(path_list_contains(&referenced, &image));
 
         let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
         assert!(path_list_contains(&expanded, &cue));
-        assert!(!path_list_contains(&expanded, &main));
-        assert!(path_list_contains(&expanded, &bonus));
-        assert!(path_list_contains(&expanded, &live));
+        assert!(!path_list_contains(&expanded, &image));
+    }
+
+    #[test]
+    fn two_split_source_cues_can_reference_same_image_and_suppress_it_once() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue_a = td.path().join("album-main.cue");
+        let cue_b = td.path().join("album-alt.cue");
+        let image = td.path().join("album.flac");
+        std::fs::write(&image, b"not real flac").unwrap();
+        std::fs::write(
+            &cue_a,
+            r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &cue_b,
+            r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 04:00:00
+"#,
+        )
+        .unwrap();
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &cue_a));
+        assert!(path_list_contains(&expanded, &cue_b));
+        assert!(!path_list_contains(&expanded, &image));
+    }
+
+    #[test]
+    fn split_source_cue_suppresses_audio_shared_with_artifact_cue() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let split_cue = td.path().join("album.cue");
+        let artifact_cue = td.path().join("album-index.cue");
+        let image = td.path().join("album.flac");
+        std::fs::write(&image, b"not real flac").unwrap();
+        std::fs::write(
+            &split_cue,
+            r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &artifact_cue,
+            r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        )
+        .unwrap();
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&expanded, &split_cue));
+        assert!(!path_list_contains(&expanded, &artifact_cue));
+        assert!(!path_list_contains(&expanded, &image));
+    }
+
+    #[test]
+    fn one_track_image_cue_is_metadata_artifact_by_design() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        let image = td.path().join("album.flac");
+        std::fs::write(&image, b"not real flac").unwrap();
+        std::fs::write(
+            &cue,
+            r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        )
+        .unwrap();
+
+        let referenced = cue_referenced_audio_paths_to_suppress_for_queue(&cue)
+            .expect("one-track image CUE should parse but provide no split points");
+        assert!(referenced.is_empty());
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert_eq!(expanded.len(), 1);
+        assert!(!path_list_contains(&expanded, &cue));
+        assert!(path_list_contains(&expanded, &image));
+    }
+
+    #[test]
+    fn explicit_split_source_cue_suppresses_explicit_audio_by_design() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        let image = td.path().join("album.flac");
+        std::fs::write(&image, b"not real flac").unwrap();
+        std::fs::write(
+            &cue,
+            r#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:12:00
+"#,
+        )
+        .unwrap();
+
+        let expanded = expand_paths_to_audio(&[cue.clone(), image.clone()]);
+        assert_eq!(expanded.len(), 1);
+        assert!(path_list_contains(&expanded, &cue));
+        assert!(!path_list_contains(&expanded, &image));
     }
 
 }
