@@ -5470,6 +5470,7 @@ fn build_conversion_log(
         &mut log,
         source,
         req,
+        &tracks,
         resampling_applies,
         bit_depth_change_applies,
         dithering_applies,
@@ -5774,6 +5775,7 @@ fn append_conversion_settings_section(
     log: &mut String,
     source: &PreparedSource,
     req: &PipelineRequest,
+    tracks: &[&TrackRecord],
     resampling_applies: bool,
     bit_depth_change_applies: bool,
     dithering_applies: bool,
@@ -5786,7 +5788,7 @@ fn append_conversion_settings_section(
             "Target sample rate",
             target_sample_rate_setting_label(source, settings),
         );
-        push_kv_line(log, "Preferred resampler tool", preferred_resampler_label(settings));
+        push_kv_line(log, "Resampler", actual_resampler_label(tracks, settings));
     }
     if bit_depth_change_applies {
         push_kv_line(
@@ -6484,6 +6486,43 @@ fn preferred_resampler_label(settings: &tonepoet_pipeline::PipelineSettings) -> 
         ResamplerFamily::Soxr => "soxr",
         ResamplerFamily::Auto => "Auto",
     }
+}
+
+/// Derive the actual resampler tool from executed track commands.
+///
+/// Scans track records for the command that performed resampling or DSD→PCM
+/// conversion and returns its tool name. Falls back to the user's preference
+/// if no resampling command is found (defensive — shouldn't happen when
+/// `resampling_applies` is true).
+fn actual_resampler_label(
+    tracks: &[&TrackRecord],
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> &'static str {
+    // SSRC is unambiguous: if the SSRC binary ran, it was the resampler.
+    // Check this first to avoid false-matching on preprocessing commands
+    // like "Decode to PCM for SSRC" which use ffmpeg, not SSRC itself.
+    for track in tracks {
+        if track.commands.iter().any(|c| matches!(c.binary, ToolBinary::Ssrc)) {
+            return "SSRC";
+        }
+    }
+    // Look for DSD→PCM or resampling commands by description.
+    for track in tracks {
+        for command in &track.commands {
+            let desc = match command.description.as_deref() {
+                Some(d) => d,
+                None => continue,
+            };
+            if desc.contains("DSD to PCM") || desc.contains("resampl") || desc.contains("Resampl") {
+                return match command.binary {
+                    ToolBinary::Sox => "SoX",
+                    ToolBinary::Ffmpeg => "soxr",
+                    _ => preferred_resampler_label(settings),
+                };
+            }
+        }
+    }
+    preferred_resampler_label(settings)
 }
 
 fn target_sample_rate_setting_label(
@@ -12038,7 +12077,7 @@ mod conversion_log_tests {
 
         let req = log_test_request();
         let no_resample_log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-        assert!(!no_resample_log.contains("Preferred resampler tool"));
+        assert!(!no_resample_log.contains("Resampler:"));
         assert!(!no_resample_log.contains("SSRC profile"));
 
         let mut resample_req = log_test_request();
@@ -12049,7 +12088,7 @@ mod conversion_log_tests {
         resample_req.settings.ssrc.dither_id = Some(2);
         resample_req.settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
         let resample_log = build_conversion_log(&outcome, &source, &resample_req, &artifacts, None);
-        assert!(resample_log.contains("Preferred resampler tool: SSRC"));
+        assert!(resample_log.contains("Resampler: SSRC"));
         assert!(resample_log.contains("SSRC attenuation: 1.5 dB"));
         assert!(resample_log.contains("SSRC minimum phase: Yes"));
         assert!(resample_log.contains("SSRC dither ID: 2"));
@@ -12073,7 +12112,7 @@ mod conversion_log_tests {
         req.settings.soxr_resampler.phase = Some(45);
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("Preferred resampler tool: soxr"));
+        assert!(log.contains("Resampler: soxr"));
         assert!(log.contains("Soxr quality preset: very high"));
         assert!(log.contains("Soxr cutoff override: 0.97"));
         assert!(log.contains("Soxr phase response: 45"));
@@ -12318,7 +12357,7 @@ mod conversion_log_tests {
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Target sample rate: 88.2kHz"));
-        assert!(log.contains("Preferred resampler tool"));
+        assert!(log.contains("Resampler:"));
         assert!(log.contains("Conversion: DSD64 DSD → 88.2kHz FLAC"));
         assert!(!log.contains("Conversion: DSD64 DSD → 2822.4kHz FLAC"));
     }
