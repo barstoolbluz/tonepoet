@@ -5422,6 +5422,7 @@ fn build_conversion_log(
 
     log.push_str("TONEPOET CONVERSION LOG\n");
     log.push_str("=======================\n");
+    push_kv_line(&mut log, "Version", env!("CARGO_PKG_VERSION"));
     push_kv_line(
         &mut log,
         "Generated (UTC)",
