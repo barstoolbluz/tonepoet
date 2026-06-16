@@ -854,15 +854,35 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
 /// Validate the encoded output's sample count against expected samples.
 ///
 /// Lossless PCM-preserving targets (FLAC, WAV, AIFF, WavPack, ALAC) must
-/// preserve the staged CUE segment's sample count after final encode. Exact
-/// `duration_ts` probes must match exactly. Duration-only probes get a narrow
-/// one-millisecond sample tolerance to cover container/probe rounding. Lossy
-/// formats and DSD are skipped because codec padding or a different sample
-/// model makes strict comparison invalid.
+/// preserve the staged segment's duration after final encode. Same-rate
+/// encodes validate against the source-rate sample count exactly when ffprobe
+/// reports exact `duration_ts`. Resampled encodes validate against the
+/// target-rate sample count with a one-sample endpoint tolerance. Duration-only
+/// probes get a narrow one-millisecond sample tolerance to cover
+/// container/probe rounding. Lossy formats and DSD are skipped because codec
+/// padding or a different sample model makes strict comparison invalid.
 ///
 /// Returns the actual probed sample count on success, the original expected
 /// sample count when validation is intentionally skipped for a non-lossless
-/// target, or a track-validation error when a lossless final output drifts.
+/// target, or a track-validation error when a lossless final output drifts
+/// or lands at the wrong sample rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostEncodeSampleExpectation {
+    samples: u64,
+    sample_rate: Option<u32>,
+    resampled: bool,
+}
+
+impl PostEncodeSampleExpectation {
+    fn same_rate(samples: u64, sample_rate: Option<u32>) -> Self {
+        Self {
+            samples,
+            sample_rate,
+            resampled: false,
+        }
+    }
+}
+
 #[allow(dead_code)]
 async fn validate_encoded_output(
     out_path: &Path,
@@ -873,7 +893,7 @@ async fn validate_encoded_output(
 ) -> Result<Option<u64>, ConvertError> {
     validate_encoded_output_with_tool_limits(
         out_path,
-        expected_samples,
+        expected_samples.map(|samples| PostEncodeSampleExpectation::same_rate(samples, None)),
         target_format,
         runner,
         cancel,
@@ -884,7 +904,7 @@ async fn validate_encoded_output(
 
 async fn validate_encoded_output_with_tool_limits(
     out_path: &Path,
-    expected_samples: Option<u64>,
+    expected_samples: Option<PostEncodeSampleExpectation>,
     target_format: &tonepoet_pipeline::AudioFormat,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
@@ -895,7 +915,7 @@ async fn validate_encoded_output_with_tool_limits(
     };
 
     if !requires_lossless_post_encode_sample_validation(target_format) {
-        return Ok(Some(expected));
+        return Ok(Some(expected.samples));
     }
 
     let probe = probe_realized_segment_with_tool_limits(
@@ -919,13 +939,24 @@ async fn validate_encoded_output_with_tool_limits(
         ))
     })?;
 
-    let delta = actual.abs_diff(expected);
-    let allowed = encoded_output_sample_tolerance(&probe);
+    if let Some(expected_rate) = expected.sample_rate {
+        if probe.sample_rate != expected_rate {
+            return Err(ConvertError::TrackValidation(format!(
+                "post-encode sample rate mismatch for lossless output {}: expected {expected_rate}, got {}",
+                out_path.display(),
+                probe.sample_rate
+            )));
+        }
+    }
+
+    let delta = actual.abs_diff(expected.samples);
+    let allowed = encoded_output_sample_tolerance(&probe, expected.resampled);
 
     if delta > allowed {
         return Err(ConvertError::TrackValidation(format!(
-            "post-encode sample drift for lossless output {}: expected {expected}, got {actual}, allowed {allowed}",
-            out_path.display()
+            "post-encode sample drift for lossless output {}: expected {}, got {actual}, allowed {allowed}",
+            out_path.display(),
+            expected.samples
         )));
     }
 
@@ -939,14 +970,23 @@ fn requires_lossless_post_encode_sample_validation(target_format: &tonepoet_pipe
     ) && target_format.is_pcm_lossless()
 }
 
-fn encoded_output_sample_tolerance(probe: &RealizedProbe) -> u64 {
-    if probe.exact {
+fn encoded_output_sample_tolerance(probe: &RealizedProbe, resampled: bool) -> u64 {
+    let probe_tolerance = if probe.exact {
         0
     } else {
         // Duration-only probes are a fallback for containers/tools that do not
         // expose exact `duration_ts`; allow at most one millisecond of sample
         // rounding at the probed sample rate.
         (probe.sample_rate / 1000).max(1) as u64
+    };
+
+    if resampled {
+        // Integer-rate conversion can land one sample to either side of the
+        // mathematically rounded target length depending on the resampler's
+        // endpoint convention. Same-rate passthrough remains exact.
+        probe_tolerance.max(1)
+    } else {
+        probe_tolerance
     }
 }
 
@@ -2022,7 +2062,7 @@ async fn convert_one_track_work(
                 let post_encode_expected_samples = match post_encode_expected_samples_for_track(
                     &track,
                     &realized_input,
-                    &req.settings.target_format,
+                    &req.settings,
                     &runner,
                     &cancel,
                     tool_concurrency_limits.as_ref(),
@@ -2091,7 +2131,9 @@ async fn convert_one_track_work(
                     track_id: track.id.clone(),
                     staged_path,
                     final_path,
-                    samples: actual_samples.or(post_encode_expected_samples).or(track.expected_samples),
+                    samples: actual_samples
+                        .or(post_encode_expected_samples.map(|expectation| expectation.samples))
+                        .or(track.expected_samples),
                     metadata_satisfaction: executed.metadata_satisfaction,
                     metadata_required: executed.metadata_required,
                 };
@@ -2116,17 +2158,52 @@ async fn convert_one_track_work(
 async fn post_encode_expected_samples_for_track(
     track: &PreparedTrack,
     realized_input: &Path,
-    target_format: &tonepoet_pipeline::AudioFormat,
+    settings: &tonepoet_pipeline::PipelineSettings,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
-) -> Result<Option<u64>, ConvertError> {
-    if !requires_lossless_post_encode_sample_validation(target_format) {
-        return Ok(track.expected_samples);
+) -> Result<Option<PostEncodeSampleExpectation>, ConvertError> {
+    if !requires_lossless_post_encode_sample_validation(&settings.target_format) {
+        return Ok(track.expected_samples.map(|samples| {
+            PostEncodeSampleExpectation::same_rate(samples, track.scalar_sample_rate())
+        }));
     }
 
     if !matches!(track.source_ref, TrackSourceRef::DvdaTrack { .. }) {
-        return Ok(track.expected_samples);
+        let source_sample_rate = if should_probe_realized_input_for_missing_source_rate(
+            track,
+            settings,
+        ) {
+            let probe = probe_realized_segment_with_tool_limits(
+                realized_input,
+                runner,
+                cancel,
+                tool_concurrency_limits,
+            )
+            .await
+            .map_err(|err| {
+                ConvertError::TrackValidation(format!(
+                    "post-encode sample reference probe failed for realized input {} while resolving missing source sample rate: {err}",
+                    realized_input.display()
+                ))
+            })?;
+
+            log::info!(
+                "post-encode validation resolved missing source sample rate from realized input probe: track={}, sample_rate={}",
+                track.id.source_ordinal,
+                probe.sample_rate
+            );
+            Some(probe.sample_rate)
+        } else {
+            track.scalar_sample_rate()
+        };
+
+        return Ok(post_encode_sample_expectation_from_source(
+            track,
+            track.expected_samples,
+            source_sample_rate,
+            settings,
+        ));
     }
 
     let probe = probe_realized_segment_with_tool_limits(
@@ -2176,7 +2253,58 @@ async fn post_encode_expected_samples_for_track(
         }
     }
 
-    Ok(Some(actual_samples))
+    Ok(post_encode_sample_expectation_from_source(
+        track,
+        Some(actual_samples),
+        Some(probe.sample_rate),
+        settings,
+    ))
+}
+
+fn post_encode_sample_expectation_from_source(
+    track: &PreparedTrack,
+    samples: Option<u64>,
+    source_sample_rate: Option<u32>,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<PostEncodeSampleExpectation> {
+    let samples = samples?;
+    let target_sample_rate = resolved_target_rate_hz(track, settings);
+
+    match (source_sample_rate, target_sample_rate) {
+        (Some(source_rate), Some(target_rate))
+            if source_rate != 0 && source_rate != target_rate =>
+        {
+            Some(PostEncodeSampleExpectation {
+                samples: resampled_sample_count(samples, source_rate, target_rate)?,
+                sample_rate: Some(target_rate),
+                resampled: true,
+            })
+        }
+        _ => Some(PostEncodeSampleExpectation::same_rate(
+            samples,
+            target_sample_rate.or(source_sample_rate),
+        )),
+    }
+}
+
+fn should_probe_realized_input_for_missing_source_rate(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    track.expected_samples.is_some()
+        && track.scalar_sample_rate().is_none()
+        && matches!(settings.target_sample_rate, RateTarget::PcmHz(_))
+}
+
+fn resampled_sample_count(samples: u64, source_rate: u32, target_rate: u32) -> Option<u64> {
+    if source_rate == 0 {
+        return None;
+    }
+
+    let numerator = (samples as u128).checked_mul(target_rate as u128)?;
+    let denominator = source_rate as u128;
+    let rounded = numerator.checked_add(denominator / 2)?.checked_div(denominator)?;
+    u64::try_from(rounded).ok()
 }
 
 #[allow(dead_code)]
@@ -8556,7 +8684,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
                 let post_encode_expected_samples = match post_encode_expected_samples_for_track(
                     &realized.track,
                     &realized.realized_path,
-                    &realized.req.settings.target_format,
+                    &realized.req.settings,
                     &runner,
                     &realized.cancel,
                     tool_concurrency_limits.as_ref(),
@@ -8624,7 +8752,9 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
                     track_id: realized.track.id.clone(),
                     staged_path,
                     final_path: realized.final_path,
-                    samples: actual_samples.or(post_encode_expected_samples).or(realized.track.expected_samples),
+                    samples: actual_samples
+                        .or(post_encode_expected_samples.map(|expectation| expectation.samples))
+                        .or(realized.track.expected_samples),
                     metadata_satisfaction: executed.metadata_satisfaction,
                     metadata_required: executed.metadata_required,
                     planned_command_hash: executed.command_hash,
@@ -15286,6 +15416,13 @@ mod validate_encoded_output_tests {
         runner
     }
 
+    fn flac_settings_with_rate(target_rate: RateTarget) -> tonepoet_pipeline::PipelineSettings {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        settings.target_sample_rate = target_rate;
+        settings
+    }
+
     fn dvda_validation_test_track(expected_samples: Option<u64>) -> PreparedTrack {
         PreparedTrack {
             id: TrackId {
@@ -15342,6 +15479,21 @@ mod validate_encoded_output_tests {
         }
     }
 
+    fn non_dvda_validation_test_track(
+        expected_samples: Option<u64>,
+        sample_rate: Option<u32>,
+    ) -> PreparedTrack {
+        let mut track = dvda_validation_test_track(expected_samples);
+        track.source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
+        track.sample_rate = sample_rate;
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            sample_rate,
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        );
+        track
+    }
+
     #[tokio::test]
     async fn dvda_post_encode_reference_uses_realized_wav_samples() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -15351,10 +15503,12 @@ mod validate_encoded_output_tests {
         let cancel = CancellationToken::new();
         let track = dvda_validation_test_track(Some(126_912_000));
 
+        let settings = flac_settings_with_rate(RateTarget::Source);
+
         let result = post_encode_expected_samples_for_track(
             &track,
             &realized,
-            &tonepoet_pipeline::AudioFormat::Flac,
+            &settings,
             &runner,
             &cancel,
             None,
@@ -15362,8 +15516,313 @@ mod validate_encoded_output_tests {
         .await
         .expect("DVD-Audio reference probe should pass");
 
-        assert_eq!(result, Some(126_911_360));
+        assert_eq!(
+            result,
+            Some(PostEncodeSampleExpectation::same_rate(126_911_360, Some(192_000)))
+        );
         assert_eq!(runner.transcript().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dvda_resampled_target_scales_realized_wav_reference_samples() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let realized = temp.path().join("track.wav");
+        std::fs::write(&realized, b"fake-wav").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(192_000, 126_911_360));
+        let cancel = CancellationToken::new();
+        let track = dvda_validation_test_track(Some(126_912_000));
+
+        let settings = flac_settings_with_rate(RateTarget::PcmHz(88_200));
+
+        let result = post_encode_expected_samples_for_track(
+            &track,
+            &realized,
+            &settings,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("DVD-Audio resampled reference probe should pass");
+
+        assert_eq!(
+            result,
+            Some(PostEncodeSampleExpectation {
+                samples: 58_299_906,
+                sample_rate: Some(88_200),
+                resampled: true,
+            })
+        );
+        assert_eq!(runner.transcript().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_pcm_target_with_missing_source_rate_probes_realized_input() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let realized = temp.path().join("track.wav");
+        std::fs::write(&realized, b"fake-wav").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(96_000, 21_455_826));
+        let cancel = CancellationToken::new();
+        let track = non_dvda_validation_test_track(Some(21_455_826), None);
+        let settings = flac_settings_with_rate(RateTarget::PcmHz(88_200));
+
+        let result = post_encode_expected_samples_for_track(
+            &track,
+            &realized,
+            &settings,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("missing source rate should be resolved from realized input");
+
+        assert_eq!(
+            result,
+            Some(PostEncodeSampleExpectation {
+                samples: 19_712_540,
+                sample_rate: Some(88_200),
+                resampled: true,
+            })
+        );
+        assert_eq!(runner.transcript().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_source_rate_without_explicit_pcm_target_keeps_unrated_same_rate_reference() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let realized = temp.path().join("track.wav");
+        std::fs::write(&realized, b"fake-wav").expect("write");
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let track = non_dvda_validation_test_track(Some(1_234_567), None);
+        let settings = flac_settings_with_rate(RateTarget::Source);
+
+        let result = post_encode_expected_samples_for_track(
+            &track,
+            &realized,
+            &settings,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("source-rate target with unknown source rate should keep an unrated reference");
+
+        assert_eq!(
+            result,
+            Some(PostEncodeSampleExpectation::same_rate(1_234_567, None))
+        );
+        assert_eq!(runner.transcript().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_pcm_target_with_missing_source_rate_equal_to_probe_keeps_strict_same_rate_reference() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let realized = temp.path().join("track.wav");
+        std::fs::write(&realized, b"fake-wav").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(88_200, 1_234_567));
+        let cancel = CancellationToken::new();
+        let track = non_dvda_validation_test_track(Some(1_234_567), None);
+        let settings = flac_settings_with_rate(RateTarget::PcmHz(88_200));
+
+        let result = post_encode_expected_samples_for_track(
+            &track,
+            &realized,
+            &settings,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("missing source rate should be resolved even when the explicit target matches it");
+
+        assert_eq!(
+            result,
+            Some(PostEncodeSampleExpectation::same_rate(1_234_567, Some(88_200)))
+        );
+        assert_eq!(runner.transcript().len(), 1);
+    }
+
+    #[test]
+    fn explicit_pcm_target_equal_to_known_source_keeps_strict_same_rate_reference() {
+        let track = non_dvda_validation_test_track(Some(1_000_000), Some(48_000));
+        let settings = flac_settings_with_rate(RateTarget::PcmHz(48_000));
+
+        let result = post_encode_sample_expectation_from_source(
+            &track,
+            track.expected_samples,
+            track.scalar_sample_rate(),
+            &settings,
+        );
+
+        assert_eq!(
+            result,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000)))
+        );
+    }
+
+    #[test]
+    fn resampled_expectation_scales_source_samples_to_target_rate() {
+        let track = dvda_validation_test_track(Some(21_455_826));
+        let settings = flac_settings_with_rate(RateTarget::PcmHz(88_200));
+
+        let result = post_encode_sample_expectation_from_source(
+            &track,
+            track.expected_samples,
+            Some(96_000),
+            &settings,
+        );
+
+        assert_eq!(
+            result,
+            Some(PostEncodeSampleExpectation {
+                samples: 19_712_540,
+                sample_rate: Some(88_200),
+                resampled: true,
+            })
+        );
+    }
+
+    #[test]
+    fn resampled_expectation_handles_additional_rate_ratios_with_rounding() {
+        for (source_samples, source_rate, target_rate, expected_samples) in [
+            (1_000_001, 44_100, 48_000, 1_088_436),
+            (1_000_001, 48_000, 44_100, 918_751),
+            (126_911_360, 192_000, 44_100, 29_149_953),
+            (123_456_789, 44_100, 96_000, 268_749_473),
+            (123_456_789, 176_400, 88_200, 61_728_395),
+        ] {
+            let track = non_dvda_validation_test_track(Some(source_samples), Some(source_rate));
+            let settings = flac_settings_with_rate(RateTarget::PcmHz(target_rate));
+
+            let result = post_encode_sample_expectation_from_source(
+                &track,
+                track.expected_samples,
+                track.scalar_sample_rate(),
+                &settings,
+            );
+
+            assert_eq!(
+                result,
+                Some(PostEncodeSampleExpectation {
+                    samples: expected_samples,
+                    sample_rate: Some(target_rate),
+                    resampled: true,
+                }),
+                "{source_rate} Hz -> {target_rate} Hz should round {source_samples} samples to {expected_samples}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resampled_lossless_exact_probe_accepts_rounded_target_sample_count() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(88_200, 19_712_540));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation {
+                samples: 19_712_540,
+                sample_rate: Some(88_200),
+                resampled: true,
+            }),
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result.expect("resampled validation should pass"),
+            Some(19_712_540)
+        );
+    }
+
+    #[tokio::test]
+    async fn resampled_lossless_exact_probe_allows_one_sample_endpoint_difference() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(88_200, 19_712_541));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation {
+                samples: 19_712_540,
+                sample_rate: Some(88_200),
+                resampled: true,
+            }),
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result.expect("one-sample resampler difference should pass"),
+            Some(19_712_541)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_same_rate_lossless_exact_probe_rejects_one_sample_drift() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(48_000, 1_000_001));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ConvertError::TrackValidation(message))
+                if message.contains("post-encode sample drift") && message.contains("allowed 0")
+        ));
+    }
+
+    #[tokio::test]
+    async fn resampled_lossless_rejects_output_sample_rate_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(96_000, 19_712_540));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation {
+                samples: 19_712_540,
+                sample_rate: Some(88_200),
+                resampled: true,
+            }),
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ConvertError::TrackValidation(message))
+                if message.contains("post-encode sample rate mismatch")
+        ));
     }
 
     #[tokio::test]
