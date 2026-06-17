@@ -871,6 +871,9 @@ struct PostEncodeSampleExpectation {
     samples: u64,
     sample_rate: Option<u32>,
     resampled: bool,
+    /// SSRC filter tail allowance. SSRC's brick-wall FIR appends up to
+    /// `fft_length - 1` samples to the output. `None` for non-SSRC paths.
+    ssrc_fft_length: Option<u64>,
 }
 
 impl PostEncodeSampleExpectation {
@@ -879,6 +882,7 @@ impl PostEncodeSampleExpectation {
             samples,
             sample_rate,
             resampled: false,
+            ssrc_fft_length: None,
         }
     }
 }
@@ -950,7 +954,7 @@ async fn validate_encoded_output_with_tool_limits(
     }
 
     let delta = actual.abs_diff(expected.samples);
-    let allowed = encoded_output_sample_tolerance(&probe, expected.resampled);
+    let allowed = encoded_output_sample_tolerance(&probe, &expected);
 
     if delta > allowed {
         return Err(ConvertError::TrackValidation(format!(
@@ -970,7 +974,7 @@ fn requires_lossless_post_encode_sample_validation(target_format: &tonepoet_pipe
     ) && target_format.is_pcm_lossless()
 }
 
-fn encoded_output_sample_tolerance(probe: &RealizedProbe, resampled: bool) -> u64 {
+fn encoded_output_sample_tolerance(probe: &RealizedProbe, expected: &PostEncodeSampleExpectation) -> u64 {
     let probe_tolerance = if probe.exact {
         0
     } else {
@@ -980,14 +984,17 @@ fn encoded_output_sample_tolerance(probe: &RealizedProbe, resampled: bool) -> u6
         (probe.sample_rate / 1000).max(1) as u64
     };
 
-    if resampled {
-        // Integer-rate conversion can land one sample to either side of the
-        // mathematically rounded target length depending on the resampler's
-        // endpoint convention. Same-rate passthrough remains exact.
-        probe_tolerance.max(1)
-    } else {
-        probe_tolerance
-    }
+    let resampler_tolerance = match expected.ssrc_fft_length {
+        // SSRC's brick-wall FIR filter appends up to FFT_length - 1 samples
+        // of filter tail to the output. The exact tail depends on the rate
+        // ratio but never exceeds this bound.
+        Some(fft_len) => fft_len.saturating_sub(1),
+        // Non-SSRC resamplers (soxr, sox): ±1 for endpoint rounding.
+        None if expected.resampled => 1,
+        None => 0,
+    };
+
+    probe_tolerance.max(resampler_tolerance)
 }
 
 fn samples_from_stream_duration_ts(stream: &serde_json::Value, sample_rate: u32) -> Option<u64> {
@@ -2274,10 +2281,12 @@ fn post_encode_sample_expectation_from_source(
         (Some(source_rate), Some(target_rate))
             if source_rate != 0 && source_rate != target_rate =>
         {
+            let ssrc_fft_length = ssrc_fft_length_for_settings(settings);
             Some(PostEncodeSampleExpectation {
                 samples: resampled_sample_count(samples, source_rate, target_rate)?,
                 sample_rate: Some(target_rate),
                 resampled: true,
+                ssrc_fft_length,
             })
         }
         _ => Some(PostEncodeSampleExpectation::same_rate(
@@ -2285,6 +2294,23 @@ fn post_encode_sample_expectation_from_source(
             target_sample_rate.or(source_sample_rate),
         )),
     }
+}
+
+/// Returns the SSRC FFT length when SSRC is the active resampler for these
+/// settings, or `None` for non-SSRC resampling paths.
+fn ssrc_fft_length_for_settings(
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<u64> {
+    let uses_ssrc = settings.ssrc.force
+        || settings.nyquist_transition == tonepoet_pipeline::NyquistTransition::BrickWall;
+    if !uses_ssrc {
+        return None;
+    }
+    let profile = tonepoet_pipeline::mapping::ssrc_profile(
+        settings.ssrc,
+        settings.resample_quality,
+    );
+    Some(profile.fft_length())
 }
 
 fn should_probe_realized_input_for_missing_source_rate(

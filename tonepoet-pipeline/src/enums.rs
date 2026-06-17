@@ -586,6 +586,21 @@ impl SsrcProfile {
             Self::Lightning => "lightning",
         }
     }
+
+    /// FFT length for this profile. SSRC's brick-wall filter appends up to
+    /// `fft_length - 1` samples of filter tail to the output.
+    #[must_use]
+    pub const fn fft_length(self) -> u64 {
+        match self {
+            Self::Insane => 262144,
+            Self::High => 65536,
+            Self::Long => 32768,
+            Self::Standard => 16384,
+            Self::Short => 4096,
+            Self::Fast => 1024,
+            Self::Lightning => 256,
+        }
+    }
 }
 
 /// SSRC probability distribution function for dithering.
