@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -98,24 +98,24 @@ fn metadata_title_line<'a>(
     maximized: bool,
 ) -> Line<'a> {
     let title = " metadata ";
-    let indicator = if maximized { "◼" } else { "◻" };
+    let indicator = if maximized { "▾" } else { "▸" };
+    let bar_style = Style::default().fg(Color::Black).bg(border_color);
     let left_spans = vec![
-        Span::styled("╒ ", theme::border(border_color)),
-        Span::styled(indicator, theme::border(border_color)),
-        Span::styled(title, theme::border(border_color)),
+        Span::styled("┌", theme::border(border_color)),
+        Span::styled(format!(" {indicator}{title}"), bar_style),
     ];
     let right_spans = vec![
-        Span::styled("a", theme::muted()),
-        Span::styled("dvanced", theme::border(border_color)),
-        Span::styled(" ╕", theme::border(border_color)),
+        Span::styled("a", Style::default().fg(theme::TEXT_MUTED).bg(border_color)),
+        Span::styled("dvanced ", bar_style),
+        Span::styled("┐", theme::border(border_color)),
     ];
     let fixed_width = Line::from(left_spans.clone()).width()
         + Line::from(right_spans.clone()).width();
     let fill_count = width.saturating_sub(fixed_width);
     let mut spans = left_spans;
     spans.push(Span::styled(
-        "═".repeat(fill_count),
-        theme::border(border_color),
+        " ".repeat(fill_count),
+        bar_style,
     ));
     spans.extend(right_spans);
     Line::from(spans)
