@@ -5922,7 +5922,6 @@ fn append_ssrc_settings(log: &mut String, settings: &tonepoet_pipeline::Pipeline
     if let Some(pdf_type) = ssrc.pdf_type {
         push_kv_line(log, "SSRC PDF type", ssrc_pdf_type_label(pdf_type));
     }
-    push_kv_line(log, "SSRC insane mode", yes_no(ssrc.insane_mode));
 }
 
 fn append_sox_resampler_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
