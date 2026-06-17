@@ -640,7 +640,7 @@ fn has_extension(path: &Path, expected: &str) -> bool {
 }
 
 /// Expand a leading `~` or `~/` to the user's home directory.
-fn expand_tilde(path: &Path) -> PathBuf {
+pub(crate) fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s == "~" {
         if let Some(home) = std::env::var_os("HOME") {

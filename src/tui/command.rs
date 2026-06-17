@@ -4495,12 +4495,14 @@ fn execute_commit_with_source_options_transform(
                     existing_req.job_id = format!("job-{}", item.id);
                     existing_req.source = item_source;
                 } else {
-                    let output_root = options.output_dir.clone().unwrap_or_else(|| {
-                        item.input_path
-                            .parent()
-                            .unwrap_or(std::path::Path::new("."))
-                            .to_path_buf()
-                    });
+                    let output_root = options.output_dir.clone()
+                        .map(|p| crate::convert::pipeline::unified_request::expand_tilde(&p))
+                        .unwrap_or_else(|| {
+                            item.input_path
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .to_path_buf()
+                        });
                     item.pipeline_request = Some(PipelineRequest {
                         worker_count: None,
                         job_id: format!("job-{}", item.id),
